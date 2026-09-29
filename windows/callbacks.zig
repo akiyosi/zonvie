@@ -54,7 +54,7 @@ fn failFlush(app: *App) void {
 /// Post `msg` to the main window unless one is already pending: `flag` is
 /// claimed false -> true here, the handler clears it, and a failed post (or no
 /// window yet) clears it again so the next flush retries.
-fn postCoalesced(app: *App, flag: *std.atomic.Value(bool), msg: c.UINT) void {
+pub fn postCoalesced(app: *App, flag: *std.atomic.Value(bool), msg: c.UINT) void {
     if (flag.cmpxchgStrong(false, true, .release, .monotonic) != null) return;
     const hwnd = app.hwnd orelse {
         flag.store(false, .release);
@@ -752,40 +752,12 @@ pub fn onVerticesRow(
                 // TBS: COW detach + write to slot, mark dirty.
                 if (ext_win.surf.tbs.is_in_flush) {
                     const ws = ext_win.surf.tbs.writeSet();
-                    ws.row_mode = true;
                     ws.rows = total_rows;
                     ws.cols = total_cols;
                     // External windows own a separate pool, so they need the
                     // same layout/peak observations as the main grid above.
                     ext_win.surf.tbs.pool.noteLayoutWidth(total_cols);
-                    if (!ws.ensureRowStorage(app.alloc, row_start)) {
-                        failFlush(app);
-                        return;
-                    }
-                    if (ext_win.surf.tbs.cowDetachRow(app.alloc, row_start)) |slot| {
-                        slot.verts.clearRetainingCapacity();
-                        if (verts_ptr != null and vert_count != 0) {
-                            // OOM after clear: slot left empty.
-                            slot.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch failFlush(app);
-                        }
-                        ext_win.surf.tbs.pool.noteRowVerts(vert_count);
-                        slot.origin_row = row_start;
-                        slot.ver +%= 1;
-                    } else {
-                        // COW detach failed: write set keeps stale slot content.
-                        failFlush(app);
-                    }
-                    if (row_start < ext_win.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                        if (!ext_win.surf.tbs.markFlushRowChanged(row_start)) failFlush(app);
-                    } else if (total_rows > ext_win.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                        if (!ext_win.surf.tbs.prepareRowSyncTracking(app.alloc, total_rows)) {
-                            failFlush(app);
-                            return;
-                        }
-                        if (row_start < ext_win.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                            if (!ext_win.surf.tbs.markFlushRowChanged(row_start)) failFlush(app);
-                        }
-                    }
+                    if (!ext_win.surf.tbs.writeFlushRow(app.alloc, row_start, if (verts_ptr) |p| p[0..vert_count] else &.{})) failFlush(app);
                 }
             } else if (row_count == 0) {
                 // A zero-cell layout (zonvie_core.h): no row content survives.
@@ -886,7 +858,6 @@ pub fn onVerticesRow(
                 // AFTER the content update succeeds — the keep-old failure
                 // paths below must not pair the old capture with new dims.
                 const pv = &app.pending_external_verts.items[idx];
-                pv.surface.row_mode = true;
                 if (row_count == 0) {
                     // A zero-cell layout: no row content survives.
                     _ = pv.surface.truncateRows(app.alloc, 0);
@@ -918,7 +889,6 @@ pub fn onVerticesRow(
                     .metrics_gen = app.shared_metrics_gen,
                     .surface = .{ .rows = total_rows, .cols = total_cols },
                 };
-                new_pv.surface.row_mode = true;
                 if (row_count == 1) {
                     if (!storeSurfaceRowVerts(app.alloc, &new_pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
                         // Free the partially built entry (row storage may
@@ -1025,9 +995,6 @@ pub fn onVerticesRow(
         if (layout_only) {
             app.surf.tbs.requireFullRowSync();
             write_set.releaseAllSlots(app.alloc, &app.surf.tbs.pool);
-            for (write_set.row_map.items) |*mapping| {
-                mapping.slot = app_mod.SLOT_NONE;
-            }
         }
     }
 
@@ -1074,49 +1041,7 @@ pub fn onVerticesRow(
 
         // TBS: COW detach + write to slot, mark flush_dirty.
         if (app.surf.tbs.is_in_flush) {
-            const ws = app.surf.tbs.writeSet();
-            ws.row_mode = true;
-            if (!ws.ensureRowStorage(app.alloc, row)) {
-                failFlush(app);
-                return;
-            }
-            if (app.surf.tbs.cowDetachRow(app.alloc, row)) |slot| {
-                slot.verts.clearRetainingCapacity();
-                if (verts_ptr != null and vert_count != 0) {
-                    // Slot left empty after clear on failure: abort so the
-                    // core re-sends this row instead of committing a blank.
-                    slot.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch failFlush(app);
-                }
-                app.surf.tbs.pool.noteRowVerts(vert_count);
-                slot.origin_row = row;
-                slot.ver +%= 1;
-            } else {
-                // COW detach failed (OOM): the write set still references
-                // the previous slot content for this row — committing it
-                // would publish a stale row as if it were current.
-                failFlush(app);
-            }
-            if (row < app.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                if (!app.surf.tbs.markFlushRowChanged(row)) failFlush(app);
-            } else if (ws.rows > app.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                // The slot was already rebound above, so the write set holds the
-                // new vertices while nothing records the row as changed —
-                // commitFlush would drop it behind the same bounds test and the
-                // paint would skip it, leaving the previous pixels on screen.
-                // Grow the tracking bitmap and mark, mirroring the external-grid
-                // path in onVerticesRow.
-                if (!app.surf.tbs.prepareRowSyncTracking(app.alloc, ws.rows)) {
-                    failFlush(app);
-                    return;
-                }
-                if (row < app.surf.tbs.sparse_sync.flush_dirty.bit_length) {
-                    if (!app.surf.tbs.markFlushRowChanged(row)) failFlush(app);
-                } else {
-                    failFlush(app);
-                }
-            } else {
-                failFlush(app);
-            }
+            if (!app.surf.tbs.writeFlushRow(app.alloc, row, if (verts_ptr) |p| p[0..vert_count] else &.{})) failFlush(app);
         }
     } else if (row_count > 1) {
         // Multi-row path: the vertex array covers multiple rows but we cannot
@@ -1247,8 +1172,7 @@ pub fn onGridRowScroll(
     // overwritten by the row callbacks later in this flush.
     for (app.pending_external_verts.items) |*pv| {
         if (pv.grid_id != grid_id) continue;
-        if (!pv.surface.row_mode or
-            total_rows == 0 or
+        if (total_rows == 0 or
             row_start >= total_rows or
             row_end > total_rows or
             pv.surface.row_verts.items.len < total_rows)
@@ -2296,24 +2220,12 @@ pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) c
     // SendMessage(WM_SETTEXT), which blocks with grid_mu held.
     const hwnd = app.hwnd orelse return;
 
-    // Truncate UTF-8 input to fit the pending_title buffer (511 UTF-16 units + null).
-    // If the full title doesn't fit, progressively shorten the UTF-8 slice at
-    // codepoint boundaries until it fits, so we always get a partial update
-    // rather than silently dropping the title.
+    // Bounded before converting (one slot kept for the null); an invalid
+    // UTF-8 title keeps its valid prefix.
+    const cap = app.pending_title.len - 1;
+    const src = app_mod.utf8ValidPrefix(title, cap);
     app.mu.lockUncancelable(core.clock.io());
-    var src = title;
-    var wide_len: usize = 0;
-    while (src.len > 0) {
-        wide_len = std.unicode.utf8ToUtf16Le(&app.pending_title, src) catch {
-            // Shorten src by one codepoint from the end and retry.
-            var trim = src.len - 1;
-            while (trim > 0 and (src[trim] & 0xC0) == 0x80) trim -= 1;
-            src = src[0..trim];
-            continue;
-        };
-        break;
-    }
-    const clamped_len = @min(wide_len, app.pending_title.len - 1);
+    const clamped_len = std.unicode.utf8ToUtf16Le(app.pending_title[0..cap], src) catch 0;
     app.pending_title[clamped_len] = 0; // null terminate
     app.pending_title_len = clamped_len;
     app.mu.unlock(core.clock.io());
@@ -2572,7 +2484,7 @@ pub fn queueExternalWindowResizes(
         const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
         var content_w: c_int = @as(c_int, @intCast(ext_win.surf.surface.cols * cell_w)) + insets.w;
         const content_h: c_int = @as(c_int, @intCast(ext_win.surf.surface.rows * cell_h)) + insets.h;
-        if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd));
+        if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd), external_windows.cmdlineScreenMarginPx(app));
 
         // This window's actual style and DPI: WS_OVERLAPPEDWINDOW has a frame
         // WS_POPUP does not, and its height depends on the window's monitor.

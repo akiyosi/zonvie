@@ -12,6 +12,7 @@ pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
+const external_windows = @import("ui/external_windows.zig");
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
@@ -58,7 +59,6 @@ pub const zonvie_core_popupmenu_top = core.zonvie_core_popupmenu_top;
 pub const zonvie_core_cmdline_popupmenu_top = core.zonvie_core_cmdline_popupmenu_top;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
-pub const zonvie_core_process_pending_msg_scroll_retry_needed = core.zonvie_core_process_pending_msg_scroll_retry_needed;
 pub const zonvie_core_send_mouse_input = core.zonvie_core_send_mouse_input;
 pub const zonvie_core_update_layout_px = core.zonvie_core_update_layout_px;
 pub const zonvie_core_set_screen_cols = core.zonvie_core_set_screen_cols;
@@ -130,6 +130,37 @@ pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
     // codepoint boundary.
     while (n > 0 and (s[n - 1] & 0xC0) == 0x80) n -= 1;
     return n;
+}
+
+/// The longest valid UTF-8 prefix of `s` that converts to at most
+/// `max_utf16` UTF-16 units. utf8ToUtf16Le rejects invalid input and does not
+/// bound its destination.
+pub fn utf8ValidPrefix(s: []const u8, max_utf16: usize) []const u8 {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
+        if (n > s.len - i) break;
+        _ = std.unicode.utf8Decode(s[i..][0..n]) catch break;
+        const w: usize = if (n == 4) 2 else 1;
+        if (units + w > max_utf16) break;
+        units += w;
+        i += n;
+    }
+    return s[0..i];
+}
+
+test "utf8ValidPrefix stops at the UTF-16 bound and at invalid UTF-8" {
+    try std.testing.expectEqualStrings("abc", utf8ValidPrefix("abc", 8));
+    // Counted in UTF-16 units, not bytes: "あい" is 6 bytes but 2 units.
+    try std.testing.expectEqualStrings("あい", utf8ValidPrefix("あい", 2));
+    try std.testing.expectEqualStrings("あ", utf8ValidPrefix("あい", 1));
+    // A supplementary character takes two units and is not split.
+    try std.testing.expectEqualStrings("a", utf8ValidPrefix("a\u{1F600}", 2));
+    try std.testing.expectEqualStrings("ab", utf8ValidPrefix("ab\xffcd", 8));
+    // A latin1 "é" (0xE9) starts a 3-byte sequence it does not complete.
+    try std.testing.expectEqualStrings("caf", utf8ValidPrefix("caf\xe9.txt", 16));
+    try std.testing.expectEqualStrings("", utf8ValidPrefix("\x80", 4));
 }
 
 /// Basename of a path-like name: the part after the last '/' or '\\',
@@ -321,8 +352,6 @@ pub const DEVICE_LOST_RETRY_INTERVAL_MS: c.UINT = 1000;
 pub const TIMER_FLUSH_RETRY: c.UINT_PTR = 16;
 pub const FLUSH_RETRY_INTERVAL_MS: c.UINT = LOCK_RETRY_INTERVAL_MS;
 pub const FLUSH_RETRY_MAX_MS: u32 = 2000;
-/// One-shot completion retry for throttled message-grid scrolling.
-pub const TIMER_MSG_SCROLL_RETRY: c.UINT_PTR = 17;
 /// Replays an external WM_SIZE that arrived while device recovery held the
 /// App/renderer generation in an unpublished state.
 pub const TIMER_EXTERNAL_SIZE_REPLAY: c.UINT_PTR = 18;
@@ -339,7 +368,6 @@ pub const COPY_BUTTON_REVERT_MS: c.UINT = 800;
 pub const TIMER_SCROLLBAR_DRAG_FLUSH: c.UINT_PTR = 22;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
-pub const MSG_SCROLL_RETRY_INTERVAL_MS: c.UINT = 16;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)
@@ -1362,6 +1390,30 @@ pub const TripleBufferedSurface = struct {
         }
 
         return true;
+    }
+
+    /// One core row into the open flush's write set: detach, write, mark it
+    /// changed. A row past `ws.rows` is ignored. False means the caller must
+    /// abort the flush: a row written but not marked is dropped by commitFlush
+    /// and skipped by the paint, and a failed detach or append would publish a
+    /// stale or blank row.
+    pub fn writeFlushRow(self: *TripleBufferedSurface, alloc: std.mem.Allocator, row: u32, verts: []const Vertex) bool {
+        const ws = self.writeSet();
+        if (ws.rows != 0 and row >= ws.rows) return true;
+        ws.row_mode = true;
+        if (!ws.ensureRowStorage(alloc, row)) return false;
+        const slot = self.cowDetachRow(alloc, row) orelse return false;
+        slot.verts.clearRetainingCapacity();
+        slot.verts.appendSlice(alloc, verts) catch return false;
+        self.pool.noteRowVerts(verts.len);
+        slot.origin_row = row;
+        slot.ver +%= 1;
+        if (row >= self.sparse_sync.flush_dirty.bit_length) {
+            if (ws.rows <= self.sparse_sync.flush_dirty.bit_length) return false;
+            if (!self.prepareRowSyncTracking(alloc, ws.rows)) return false;
+            if (row >= self.sparse_sync.flush_dirty.bit_length) return false;
+        }
+        return self.markFlushRowChanged(row);
     }
 
     /// COW detach: prepare a slot for exclusive write access.
@@ -2476,7 +2528,7 @@ pub const ExternalWindow = struct {
     // (see ExternalWndProc's WM_DPICHANGED case for why).
     dpi_scale: f32 = 1.0,
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
-    flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
+    decorated_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // drawDecoratedExternalSurface's output
 
 
     // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
@@ -2542,7 +2594,7 @@ pub const ExternalWindow = struct {
         // Now safe to release D3D resources
         self.paint_scratch.deinit(alloc);
         self.paint_row_ranges.deinit(alloc);
-        self.flat_draw_scratch.deinit(alloc);
+        self.decorated_scratch.deinit(alloc);
         self.surf.surface.deinitCpuState(alloc);
         self.surf.paint.deinit(alloc, row_vb_budget);
         self.surf.tbs.deinit(alloc); // Handles slot release + pool deinit
@@ -6411,14 +6463,8 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     // The cmdline's width budget goes in first so the flush the layout update
     // retries already sizes the cmdline with it.
     if (app.hwnd) |main_hwnd| {
-        const copy_button_w: u32 = if (app.config.cmdline.copy_button)
-            @intCast(@max(0, app.scalePx(@as(c_int, COPY_BUTTON_MARGIN_LEFT + COPY_BUTTON_SIZE + COPY_BUTTON_MARGIN_RIGHT))))
-        else
-            0;
         // Chrome that sits beside the cmdline grid inside its own window.
-        // DPI-scaled as external_windows.externalSurfaceInsetsPx sizes it.
-        const cmdline_chrome_w: u32 = @as(u32, @intCast(@max(0, app.scalePx(@as(c_int, CMDLINE_PADDING)) * 2 +
-            app.scalePx(@as(c_int, CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT))))) + copy_button_w;
+        const cmdline_chrome_w: u32 = @intCast(@max(0, external_windows.externalSurfaceInsetsPx(app, CMDLINE_GRID_ID, app.dpi_scale).w));
 
         var work_w: u32 = 0;
         if (c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST)) |mon| {
@@ -6430,7 +6476,7 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         var wr: c.RECT = undefined;
         if (c.GetWindowRect(main_hwnd, &wr) != 0) main_w = @intCast(@max(1, wr.right - wr.left));
 
-        const budget = core.frontend_rules.cmdlineCols(work_w, main_w, cmdline_chrome_w, CMDLINE_SCREEN_MARGIN, cw);
+        const budget = core.frontend_rules.cmdlineCols(work_w, main_w, cmdline_chrome_w, @intCast(@max(0, external_windows.cmdlineScreenMarginPx(app))), cw);
         if (budget.screen_cols != 0) core.zonvie_core_set_screen_cols(app.corep, budget.screen_cols);
         if (budget.default_cols != 0) core.zonvie_core_set_cmdline_default_cols(app.corep, budget.default_cols);
     }
@@ -6468,6 +6514,24 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
             .{ rows, cols, cw, ch, w, h },
         );
     }
+}
+
+test "writeFlushRow ignores a row past the write set and marks the one it writes" {
+    const alloc = std.testing.allocator;
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+    try std.testing.expect(tbs.beginFlush(alloc));
+    const ws = tbs.writeSet();
+    ws.rows = 2;
+    try std.testing.expect(tbs.prepareRowSyncTracking(alloc, 2));
+
+    try std.testing.expect(tbs.writeFlushRow(alloc, 5, &.{}));
+    try std.testing.expect(ws.row_map.items.len <= 2);
+
+    try std.testing.expect(tbs.writeFlushRow(alloc, 1, &.{}));
+    try std.testing.expectEqual(@as(usize, 2), ws.row_map.items.len);
+    try std.testing.expect(tbs.sparse_sync.flush_dirty.isSet(1));
+    tbs.commitFlush(alloc);
 }
 
 test "a layer's cursor row is repainted over the layers above it" {

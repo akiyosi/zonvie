@@ -2418,23 +2418,10 @@ pub export fn WndProc(
                                 break :non_row;
                             };
                             render_ok = true;
-                            // Non-row-mode equivalent of row-mode's
-                            // (back_tex_valid_snapshot AND preserve_back) OR rendered_complete.
-                            //
-                            // draw_preserved: drawEx actually preserved back_tex this paint.
-                            //   drawEx clears whenever
-                            //     !has_presented_once OR dirty == null OR opacity < 1.0,
-                            //   so all three conditions must hold for the previous validity
-                            //   to carry forward. (has_presented_once is true after a
-                            //   successful present so is not re-checked here.)
-                            //
-                            // rendered_complete: drawEx just did a full redraw.
-                            //   dirty == null is the "full redraw" indicator
-                            //   for non-row-mode (no scissor restriction). !seed_pending
-                            //   is the proxy for "the frame covers the whole grid".
-                            //   Without dirty == null, a transparent partial-dirty paint
-                            //   would clear and only draw within the scissor — bv would
-                            //   then be claimed on an incomplete back_tex.
+                            // No row is committed yet, so a background-only
+                            // frame is the whole content: back_tex is valid if
+                            // drawEx kept a valid one (it clears on dirty ==
+                            // null or opacity < 1.0) or redrew all of it.
                             const draw_preserved =
                                 back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
                             const rendered_complete =
@@ -3056,22 +3043,6 @@ pub export fn WndProc(
                             .empty_damage_presents_all = true,
                         };
                         const allow_present = render_helpers.presentGate(present_in).verdict == .present;
-
-                        // When scrollBackTex shifted back_tex content, the entire scroll
-                        // region changed in back_tex. Add it to present_rects so the
-                        // CopySubresourceRegion in present copies the shifted pixels
-                        // to all swapchain buffers.
-                        // Only into a list that already names rects: an empty
-                        // one means "present everything" (chrome included),
-                        // which covers this region, and adding the region
-                        // would narrow it to a partial present without the
-                        // chrome bands.
-                        if (pass.scroll_damage) |sr| if (present_rects.items.len != 0) {
-                            present.add(sr);
-                            // applyScrollShift clips this rect to the renderer
-                            // width but not to the client height.
-                            present.clamp(g.width, g.height);
-                        };
 
                         if (log_enabled) applog.appLog(
                             "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
@@ -4306,15 +4277,6 @@ pub export fn WndProc(
                     }
                 } else {
                     _ = c.KillTimer(hwnd, app_mod.TIMER_FLUSH_RETRY);
-                }
-            } else if (wParam == app_mod.TIMER_MSG_SCROLL_RETRY) {
-                _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_SCROLL_RETRY);
-                if (getApp(hwnd)) |app| {
-                    if (app.corep) |corep| {
-                        if (app_mod.zonvie_core_process_pending_msg_scroll_retry_needed(corep)) {
-                            _ = c.SetTimer(hwnd, app_mod.TIMER_MSG_SCROLL_RETRY, app_mod.MSG_SCROLL_RETRY_INTERVAL_MS, null);
-                        }
-                    }
                 }
             } else if (wParam == app_mod.TIMER_MSG_THROTTLE) {
                 _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_THROTTLE);
@@ -5633,7 +5595,7 @@ pub export fn WndProc(
 
         c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP, c.WM_XBUTTONUP => {
             if (getApp(hwnd)) |app| {
-                const rel = input.takeButtonRelease(app, msg);
+                const rel = input.takeButtonRelease(app, msg, wParam);
                 // A press the editor received is released to it, wherever the
                 // pointer is now: the chrome branches below kept the release
                 // (and, for right and middle, the capture) from a drag that

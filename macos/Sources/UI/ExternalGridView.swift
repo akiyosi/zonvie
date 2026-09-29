@@ -737,9 +737,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
     override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
-        let scale = backingScale
-        let pointPx = CGPoint(x: location.x * scale, y: bounds.height * scale - location.y * scale)
-        return resolveInputTarget(pointPx: pointPx, requireScrollable: false)
+        resolveInputTarget(pointPx: surfacePointPx(atViewPoint: location), requireScrollable: false)
     }
 
 
@@ -2018,14 +2016,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // occlusion observer in viewDidMoveToWindow, and by commitFlush on
             // any new content.
             //
-            // hasPresentedOnce gates it: occlusionState is published
-            // asynchronously by the window server, so a window that was
-            // just ordered in still reports "not visible" for a frame or
-            // two. Parking there would leave a brand-new cmdline or
-            // popupmenu panel empty until the notification lands — and a
-            // window with nothing on screen yet has no stale content worth
-            // protecting, so it is allowed to pay the acquire once.
-            switch hasPresentedOnce ? visibilityGate() : .draw {
+            // Before the first present only a miniaturized window is
+            // refused: parking on the lagging occlusionState would leave a
+            // brand-new cmdline or popupmenu panel empty until the
+            // notification lands, and a window with nothing on screen yet
+            // has no stale content worth protecting.
+            switch visibilityGate(unpresentedMayDraw: !hasPresentedOnce) {
             case .draw:
                 break
             case .unsettled:
@@ -2034,22 +2030,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 return
             case .hidden:
                 ZonvieCore.appLog("[ext_draw_skip] gridId=\(gridId) window not visible; skipping frame")
-                deactivateSurfaceDrawLoop()
+                parkDrawLoopWhenHidden()
                 return
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
                 ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) early return: drawableSize invalid (\(view.drawableSize))")
-                return
-            }
-
-            // Skip rendering for minimized windows. Reached only before the
-            // first present, when the guard above stands down.
-            // No frame-completion notification is needed here: unlike
-            // MetalTerminalView (which uses redrawPending/didDrawFrame to
-            // gate future redraws), ExternalGridView is driven directly
-            // by setNeedsDisplay with no coalescing gate.
-            if let window = view.window, window.isMiniaturized {
                 return
             }
 
@@ -2572,13 +2558,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             )
 
             // Glow disables partial-redraw optimizations to prevent additive
-            // bloom composite from accumulating brightness. It is also disabled
-            // for smooth-scroll frames masked against a fixed float: the bloom
-            // pass blurs a flattened surface and cannot keep the z-order
-            // boundary between shifted content and that float. Same test as
-            // the main renderer: a non-empty fixed-float mask.
-            let glowEnabled = (core?.isGlowEnabled() ?? false)
-                && !(smoothScrolling && !fixedFloatMask.bands.isEmpty)
+            // bloom composite from accumulating brightness.
+            let glowEnabled = SurfaceFixedFloatMask.permitsGlow(
+                configured: core?.isGlowEnabled() ?? false, smoothScrolling: smoothScrolling,
+                bands: fixedFloatMask.bands)
 
             let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
@@ -3682,13 +3665,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let resolve = { (r: Int32, c: Int32) in
             core.resolvePointerGrid(surfaceId: self.gridId, row: r, col: c, requireScrollable: requireScrollable)
         }
-        let hit = resolve(row, col)
+        var hit = resolve(row, col)
 
         var followers: [Int64: CGFloat] = [:]
+        var layers: [SurfaceLayer] = []
         if scroll.hasOffsets {
             let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
             lock.lock()
-            let layers = committedSurfaceLayers
+            layers = committedSurfaceLayers
             lock.unlock()
             for layer in layers where layer.gridId != gridId {
                 let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH, scroll: scroll)
@@ -3698,34 +3682,25 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 if displacedPx != 0 { followers[layer.gridId] = displacedPx }
             }
         }
-        if let displaced = resolveDisplacedFollowerHit(
+        switch resolveDisplacedFollowerHit(
             pointPxY: pointPx.y,
             cellHeightPx: cellH,
             globalCol: col,
             staticGridId: hit?.gridId ?? gridId,
             followers: followers,
-            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
-            resolve: resolve
-        ) {
-            guard displaced.gridId == 1 else { return displaced }
-            // "What is drawn there now" names grid 1, which Neovim resolves
-            // over every window; here the root is named explicitly, so a
-            // static float under the moved one is looked up first.
-            if !requireScrollable {
-                lock.lock()
-                let layers = committedSurfaceLayers
-                lock.unlock()
-                let px = Float(pointPx.x), py = Float(pointPx.y)
-                if let under = layers.last(where: { l in
-                    l.gridId != gridId && followers[l.gridId] == nil && l.mouseEnabled
-                        && px >= l.originPx.x && px < l.originPx.x + Float(l.cols) * Float(cellW)
-                        && py >= l.originPx.y && py < l.originPx.y + Float(l.rows) * Float(cellH)
-                }) {
-                    return (under.gridId, Int32((py - under.originPx.y) / Float(cellH)),
-                            Int32((px - under.originPx.x) / Float(cellW)))
-                }
+            paintRankOf: { id in layers.first { $0.gridId == id }?.z },
+            resolve: resolve,
+            resolveExcluding: { r, c, excluded in
+                core.resolvePointerGrid(surfaceId: self.gridId, row: r, col: c,
+                                        requireScrollable: requireScrollable, excluding: excluded)
             }
-            return resolveRootTarget(pointPx: pointPx)
+        ) {
+        case let .follower(gridId, row, col)?:
+            return (gridId, row, col)
+        case let .uncovered(under)?:
+            hit = under
+        case nil:
+            break
         }
 
         guard let hit, let info = grids.first(where: { $0.gridId == hit.gridId }) else {

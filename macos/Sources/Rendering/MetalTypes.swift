@@ -3304,9 +3304,11 @@ func scrollAdjustedLocalRow(
 /// Each follower is tested where it is drawn: the pixel is moved back by its
 /// displacement and `resolve` — the core's resolver — is asked about the cell
 /// it came from, so the core's rules (mouse_enabled, order) still decide. The
-/// highest such follower wins over the static hit if it is above it. A static
-/// hit that names a follower which has moved off the cell names what is drawn
-/// there now instead: the window behind, which Neovim resolves from grid 1.
+/// follower drawn in front (paint rank, then grid id) wins over the static hit
+/// if it is drawn above it. A static hit that names a follower which has moved
+/// off the cell is re-resolved with the displaced followers left out, which is
+/// what is drawn there now. Grid 1 cannot stand in for that: Neovim resolves
+/// it to splits only, skipping any float underneath.
 ///
 /// Returns nil when the static hit stands.
 func resolveDisplacedFollowerHit(
@@ -3315,28 +3317,38 @@ func resolveDisplacedFollowerHit(
     globalCol: Int32,
     staticGridId: Int64,
     followers: [Int64: CGFloat],
-    zindexOf: (Int64) -> Int64?,
-    resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)?
-) -> (gridId: Int64, row: Int32, col: Int32)? {
+    paintRankOf: (Int64) -> Int?,
+    resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)?,
+    resolveExcluding: (Int32, Int32, (Int64) -> Bool) -> (gridId: Int64, row: Int32, col: Int32)?
+) -> DisplacedFollowerHit? {
     guard cellHeightPx > 0, !followers.isEmpty else { return nil }
     let minDisplacementPx: CGFloat = 0.5
-    var best: (gridId: Int64, row: Int32, col: Int32, zindex: Int64)?
+    var best: (gridId: Int64, row: Int32, col: Int32, rank: Int)?
     for (followerId, offsetPx) in followers where abs(offsetPx) >= minDisplacementPx {
-        guard let zindex = zindexOf(followerId) else { continue }
+        guard let rank = paintRankOf(followerId) else { continue }
         let sourceRow = Int32(((pointPxY - offsetPx) / cellHeightPx).rounded(.down))
         guard let hit = resolve(sourceRow, globalCol), hit.gridId == followerId else { continue }
-        if best == nil || zindex > best!.zindex {
-            best = (followerId, hit.row, hit.col, zindex)
-        }
+        if let b = best, (rank, followerId) <= (b.rank, b.gridId) { continue }
+        best = (followerId, hit.row, hit.col, rank)
     }
     let staticMoved = abs(followers[staticGridId] ?? 0) >= minDisplacementPx
-    if let best, staticMoved || best.zindex > (zindexOf(staticGridId) ?? 0) {
-        return (best.gridId, best.row, best.col)
+    if let best, staticMoved || best.rank > (paintRankOf(staticGridId) ?? Int.min) {
+        return .follower(gridId: best.gridId, row: best.row, col: best.col)
     }
     if staticMoved {
-        return (1, Int32((pointPxY / cellHeightPx).rounded(.down)), globalCol)
+        return .uncovered(resolveExcluding(Int32((pointPxY / cellHeightPx).rounded(.down)), globalCol) {
+            abs(followers[$0] ?? 0) >= minDisplacementPx
+        })
     }
     return nil
+}
+
+enum DisplacedFollowerHit {
+    /// A follower drawn under the point, in its own cells.
+    case follower(gridId: Int64, row: Int32, col: Int32)
+    /// Replaces the static hit (nil: nothing is under the point); the caller
+    /// treats it as it would the static hit.
+    case uncovered((gridId: Int64, row: Int32, col: Int32)?)
 }
 
 /// A float's two running counters as they stood when its debt was last zero,
@@ -3690,10 +3702,14 @@ final class SurfaceFixedFloatMask {
         layer.isFloat && layer.gridId != rootGridId && !layer.followsScroll
     }
 
-    /// Whether a surface's committed layers hold more fixed floats than a
-    /// mask can represent: the rects `update` would be handed while a scroll
-    /// eases are exactly these. Answerable before any offset is applied, so a
-    /// surface can drop its transform in the same snapshot that latches it.
+    /// Glow is off while a scroll eases against a fixed float: the bloom pass
+    /// blurs a flattened surface and cannot keep the z-order boundary between
+    /// shifted content and that float.
+    static func permitsGlow(configured: Bool, smoothScrolling: Bool,
+                            bands: [GridSurfaceRenderer.FixedFloatBand]) -> Bool {
+        configured && !(smoothScrolling && !bands.isEmpty)
+    }
+
     /// Put `offsets` on the mask's scale: each grid's paint rank among
     /// `layers`, 0 for a grid that is not one (the root). The shader drops a
     /// scrolled fragment under an interval with a strictly higher z, so a
@@ -3707,6 +3723,10 @@ final class SurfaceFixedFloatMask {
         }
     }
 
+    /// Whether a surface's committed layers hold more fixed floats than a
+    /// mask can represent: the rects `update` would be handed while a scroll
+    /// eases are exactly these. Answerable before any offset is applied, so a
+    /// surface can drop its transform in the same snapshot that latches it.
     static func overflows(layers: [SurfaceLayer], rootGridId: Int64) -> Bool {
         var count = 0
         for layer in layers where masks(layer, rootGridId: rootGridId) {

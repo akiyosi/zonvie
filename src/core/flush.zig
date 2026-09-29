@@ -4859,12 +4859,14 @@ const CmdlineLine = struct {
 
 /// Cmdline grid width for content `line_width` columns wide: the frontend's
 /// default width (chrome already subtracted), grown up to screen_cols, past
-/// which the content scrolls. Without a frontend default, the main grid's.
+/// which the content scrolls. Either one unset: the main grid's cols.
 fn cmdlineGridWidth(g: *const grid_mod.Grid, line_width: u32) u32 {
     const min_width: u32 = if (g.cmdline_default_cols > 0)
         g.cmdline_default_cols
     else if (g.cols > 0) g.cols else 80;
-    const max_width: u32 = if (g.screen_cols > 0) g.screen_cols else min_width;
+    const max_width: u32 = if (g.screen_cols > 0)
+        g.screen_cols
+    else if (g.cols > 0) g.cols else min_width;
     return @min(@max(line_width + 1, min_width), max_width); // +1 for the cursor
 }
 
@@ -5756,6 +5758,9 @@ pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
         if (self.msg_history_retry_at) |retry_at| {
             consider(&earliest, retry_at);
         }
+        if (self.msg_scroll_pending) {
+            consider(&earliest, self.msg_scroll_last_send + msg_scroll_throttle_ns);
+        }
     }
     if (self.atlas_negative_retry_at) |retry_at| {
         consider(&earliest, retry_at);
@@ -6637,22 +6642,13 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
     if (new_offset != self.msg_scroll_offset) {
         self.msg_scroll_offset = new_offset;
 
-        // Throttle vertex updates to ~60fps (16ms)
         const now = clock.nowNs();
-        const throttle_ns: i128 = 16 * std.time.ns_per_ms;
-        const elapsed = now - self.msg_scroll_last_send;
-
-        if (elapsed >= throttle_ns) {
+        if (now - self.msg_scroll_last_send >= msg_scroll_throttle_ns) {
             self.log.write("[msg] handleMsgGridScroll: {s} offset {d} (send)\n", .{ direction, new_offset });
-            if (runMsgGridScrollFlush(self, new_offset)) {
-                self.msg_scroll_last_send = now;
-                self.msg_scroll_pending = false;
-            } else {
-                // Aborted (e.g. atlas reset mid-bracket) — retry once a full
-                // flush has resent everything; msg_scroll_offset already
-                // holds the target so the retry picks it up automatically.
-                self.msg_scroll_pending = true;
-            }
+            // An aborted attempt (e.g. atlas reset mid-bracket) counts too:
+            // its retry is due a throttle window later, not at once.
+            self.msg_scroll_last_send = now;
+            self.msg_scroll_pending = !runMsgGridScrollFlush(self, new_offset);
         } else {
             // Mark pending - will be processed on next throttle window or flush
             self.msg_scroll_pending = true;
@@ -6681,6 +6677,11 @@ pub fn handleMsgHistoryScroll(self: *Core, direction: []const u8) void {
     };
 }
 
+/// The msg_show float's wheel sends at most one flush per window; a wheel
+/// inside it leaves msg_scroll_pending, which nextMsgTimeoutNs turns into a
+/// deadline the frontends' one message timer serves.
+pub const msg_scroll_throttle_ns: i128 = 16 * std.time.ns_per_ms;
+
 /// Process pending scroll update (called from flush or timer).
 pub fn processPendingMsgScroll(self: *Core) void {
     if (!self.msg_scroll_pending) return;
@@ -6694,12 +6695,10 @@ pub fn processPendingMsgScroll(self: *Core) void {
     }
 
     self.log.write("[msg] processPendingMsgScroll: offset {d}\n", .{self.msg_scroll_offset});
-    if (runMsgGridScrollFlush(self, self.msg_scroll_offset)) {
-        self.msg_scroll_last_send = clock.nowNs();
-        self.msg_scroll_pending = false;
-    }
-    // Aborted: leave msg_scroll_pending = true so a later retry (next
-    // throttle window, or the next explicit call) picks it up again.
+    // Aborted: still pending, and due again a throttle window after this
+    // attempt, so the message timer does not re-arm at 0 ms.
+    self.msg_scroll_last_send = clock.nowNs();
+    self.msg_scroll_pending = !runMsgGridScrollFlush(self, self.msg_scroll_offset);
 }
 
 /// Hide msg_show external grid.
@@ -6921,6 +6920,9 @@ pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
     self.log.write("[msg] sendMsgStatus({s}) chunks={d} routed to view={s}\n", .{ @tagName(channel), chunks.len, @tagName(route_result.view) });
 
     if (route_result.view == .none) return; // Don't show anything
+    // A notification is an event, not a state: an emptied status has
+    // nothing to post, and nothing to clear.
+    if (route_result.view == .notification and chunks.len == 0) return;
 
     const cb = switch (channel) {
         .showmode => self.cb.on_msg_showmode,
@@ -7450,6 +7452,14 @@ fn expectCmdlineGrid(core: *Core, expected: []const u8) !void {
         std.debug.print("ACTUAL<<<\n{s}>>>\n", .{buf.items});
         return e;
     };
+}
+
+test "without a frontend screen width the cmdline grows to the main grid's cols" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+    core.setScreenColsLocked(0);
+    try std.testing.expectEqual(@as(u32, 51), cmdlineGridWidth(&core.grid, 50));
+    try std.testing.expectEqual(@as(u32, 80), cmdlineGridWidth(&core.grid, 200));
 }
 
 fn initCmdlineTestCore() !Core {
@@ -11836,6 +11846,20 @@ test "a zero-timeout message stays un-armed across a hover cycle" {
     try std.testing.expect(core.msg_show_auto_hide_at == null);
 }
 
+test "a throttled msg float scroll is a deadline one throttle window after the last send" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    core.msg_scroll_last_send = 1_000;
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+    core.msg_scroll_pending = true;
+    try std.testing.expectEqual(@as(?i128, 1_000 + msg_scroll_throttle_ns), nextMsgTimeoutNs(&core));
+    // Nothing left to scroll: the retry clears the flag, and the deadline goes.
+    processPendingMsgScroll(&core);
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+}
+
 test "hiding the history grid drops its retry deadline" {
     // nextMsgTimeoutNs reads msg_history_retry_at unconditionally, but only
     // the history_dirty block clears it. An auto-hide landing between a
@@ -12521,6 +12545,37 @@ test "each status channel reaches its own route and its own callback" {
     checkMsgAutoHideTimeout(&core);
     try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
     try std.testing.expectEqual(@as(u32, 2), state.showcmd_calls);
+}
+
+test "a status routed to notification posts its text but not its clearing" {
+    const State = struct {
+        calls: u32 = 0,
+        fn onShowmode(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = view;
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_showmode }, .view = .notification },
+    };
+    core.msg_config.messages.routes = &routes;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_msg_showmode = State.onShowmode;
+
+    try core.grid.setMsgStatus(.showmode, &.{.{ .hl_id = 0, .text = "-- INSERT --" }});
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try core.grid.setMsgStatus(.showmode, &.{});
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
 }
 
 test "the internal and ABI message view enums agree name for name and value for value" {

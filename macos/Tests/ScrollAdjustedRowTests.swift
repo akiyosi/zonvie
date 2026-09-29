@@ -76,33 +76,83 @@ private let plain = GridRowBand(startRow: 0, rows: 10, marginTop: 0, marginBotto
 /// offset of its own. The hit test has to find it where it is drawn — through
 /// the core, at the cell the drawn pixel came from — and must not keep naming
 /// it where it no longer is.
+private typealias Hit = (gridId: Int64, row: Int32, col: Int32)
+
+private func followerId(_ r: DisplacedFollowerHit?) -> Int64 {
+    if case let .follower(gridId, _, _)? = r { return gridId }
+    return -1
+}
+
+private func uncoveredId(_ r: DisplacedFollowerHit?) -> Int64 {
+    if case let .uncovered(under)? = r { return under?.gridId ?? 0 }
+    return -1
+}
+
 private func verifyDisplacedFollowerHit() {
-    // Float 7 (z 50) placed on rows 4..6, drawn two rows lower (40px) mid-ease.
-    // The core resolver, as the stub answers it: rows 4..6 are the float,
-    // everything else window 2.
-    let resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)? = { row, col in
-        (4...6).contains(row) ? (7, row - 4, col) : (2, row, col)
+    // Float 7 (paint rank 5) placed on rows 4..6, drawn two rows lower (40px)
+    // mid-ease. A static float 9 (rank 3) lies under row 4. The core
+    // resolver, as the stub answers it: 7 over 9 over window 2, minus any grid
+    // `excluded` names.
+    let resolveExcluding: (Int32, Int32, (Int64) -> Bool) -> Hit? = { row, col, excluded in
+        if (4...6).contains(row), !excluded(7) { return (7, row - 4, col) }
+        if row == 4, !excluded(9) { return (9, row - 4, col) }
+        return (2, row, col)
     }
-    let zindexOf: (Int64) -> Int64? = { $0 == 7 ? 50 : 0 }
+    let resolve: (Int32, Int32) -> Hit? = { resolveExcluding($0, $1) { _ in false } }
+    let rankOf: (Int64) -> Int? = { [7: 5, 9: 3, 2: 1][$0] }
 
     // Row 7 on screen is where float row 1 is drawn now.
     let drawn = resolveDisplacedFollowerHit(
-        pointPxY: 150, cellHeightPx: cell, globalCol: 3,
-        staticGridId: 2, followers: [7: 40], zindexOf: zindexOf, resolve: resolve)
-    expect(Int32(drawn?.gridId ?? -1), 7, "a press where the follower is drawn names it")
-    expect(drawn?.row ?? -1, 1, "at the row that pixel came from")
+        pointPxY: 150, cellHeightPx: cell, globalCol: 3, staticGridId: 2, followers: [7: 40],
+        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+    expect(Int32(followerId(drawn)), 7, "a press where the follower is drawn names it")
+    if case let .follower(_, row, _)? = drawn { expect(row, 1, "at the row that pixel came from") }
 
-    // Row 4 on screen: the float's placement, which it has moved off.
+    // Row 4 on screen: the float's placement, which it has moved off. The
+    // static float under it is what is drawn there now, not grid 1.
     let vacated = resolveDisplacedFollowerHit(
-        pointPxY: 90, cellHeightPx: cell, globalCol: 3,
-        staticGridId: 7, followers: [7: 40], zindexOf: zindexOf, resolve: resolve)
-    expect(Int32(vacated?.gridId ?? -1), 1, "the vacated placement goes to grid 1, the window behind")
+        pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 40],
+        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+    expect(Int32(uncoveredId(vacated)), 9, "the vacated placement goes to the float behind it")
+
+    // Row 5, also vacated: nothing but the window behind.
+    let vacatedSplit = resolveDisplacedFollowerHit(
+        pointPxY: 110, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 40],
+        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+    expect(Int32(uncoveredId(vacatedSplit)), 2, "then the window behind")
 
     // Not displaced: the static answer stands.
     let still = resolveDisplacedFollowerHit(
-        pointPxY: 90, cellHeightPx: cell, globalCol: 3,
-        staticGridId: 7, followers: [7: 0.1], zindexOf: zindexOf, resolve: resolve)
+        pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 0.1],
+        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
     expect(still == nil ? 1 : 0, 1, "an undisplaced follower leaves the static hit alone")
+
+    // Equal Neovim zindex, different paint rank: follower 8 is drawn in front
+    // of static float 9 where they overlap, so it takes the press. Follower 8
+    // sits on rows 4..5, drawn a row lower; row 5 on screen is its row 0.
+    let overlap: (Int32, Int32, (Int64) -> Bool) -> Hit? = { row, col, excluded in
+        if (4...5).contains(row), !excluded(8) { return (8, row - 4, col) }
+        if (4...5).contains(row), !excluded(9) { return (9, row - 4, col) }
+        return (2, row, col)
+    }
+    let overlapRank: (Int64) -> Int? = { [8: 4, 9: 3, 2: 1][$0] }
+    let front = resolveDisplacedFollowerHit(
+        pointPxY: 110, cellHeightPx: cell, globalCol: 3, staticGridId: 9, followers: [8: 20],
+        paintRankOf: overlapRank, resolve: { overlap($0, $1) { _ in false } }, resolveExcluding: overlap)
+    expect(Int32(followerId(front)), 8, "the follower drawn in front takes the press")
+
+    // Two followers drawn over the same pixel: the higher paint rank wins,
+    // whatever order the dictionary yields them in.
+    let both: (Int32, Int32) -> Hit? = { row, col in
+        row == 2 ? (10, 0, col) : row == 3 ? (11, 0, col) : (2, row, col)
+    }
+    for _ in 0..<8 {
+        let pick = resolveDisplacedFollowerHit(
+            pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 2, followers: [10: 40, 11: 20],
+            paintRankOf: { [10: 6, 11: 7, 2: 1][$0] }, resolve: both,
+            resolveExcluding: { r, c, _ in both(r, c) })
+        expect(Int32(followerId(pick)), 11, "the follower painted in front wins")
+    }
 }
 
 /// Horizontal input was read only to drop an all-zero event and never sent,

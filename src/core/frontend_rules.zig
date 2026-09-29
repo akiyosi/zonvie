@@ -126,6 +126,47 @@ pub fn cliNextIsValue(next: ?[]const u8) bool {
     return !std.mem.startsWith(u8, n, "-");
 }
 
+/// Copy `src` into `dst`; when it does not fit, cut at a UTF-8 boundary and
+/// end with '…' so the reader sees text is missing. Returns the bytes written.
+pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
+    if (src.len <= dst.len) {
+        @memcpy(dst[0..src.len], src);
+        return src.len;
+    }
+    const marker = "\u{2026}";
+    if (dst.len < marker.len) return 0;
+    var cut = dst.len - marker.len;
+    while (cut > 0 and (src[cut] & 0xC0) == 0x80) cut -= 1;
+    @memcpy(dst[0..cut], src[0..cut]);
+    @memcpy(dst[cut..][0..marker.len], marker);
+    return cut + marker.len;
+}
+
+/// Lines a mini window shows; noice.nvim's views.mini max_height.
+pub const mini_max_lines = 10;
+
+/// Mini content as shown: a trailing newline dropped, and past
+/// `mini_max_lines` lines the first nine plus a "…(N more lines)" summary
+/// line. Content past `dst` is cut by copyUtf8Truncated. Returns the bytes
+/// written.
+pub fn clampMiniContent(dst: []u8, content: []const u8) usize {
+    const src = if (content.len > 0 and content[content.len - 1] == '\n') content[0 .. content.len - 1] else content;
+    const lines = std.mem.count(u8, src, "\n") + 1;
+    if (lines <= mini_max_lines) return copyUtf8Truncated(dst, src);
+    const kept = mini_max_lines - 1;
+    var head_end: usize = 0;
+    for (0..kept) |n| {
+        const nl = std.mem.indexOfScalarPos(u8, src, head_end, '\n').?;
+        head_end = if (n + 1 == kept) nl else nl + 1;
+    }
+    var summary_buf: [48]u8 = undefined;
+    const summary = std.fmt.bufPrint(&summary_buf, "\n\u{2026}({d} more lines)", .{lines - kept}) catch unreachable;
+    if (dst.len < summary.len) return copyUtf8Truncated(dst, src[0..head_end]);
+    const head_len = copyUtf8Truncated(dst[0 .. dst.len - summary.len], src[0..head_end]);
+    @memcpy(dst[head_len..][0..summary.len], summary);
+    return head_len + summary.len;
+}
+
 /// A message or cmdline panel's background from Normal's (sRGB 0..1): HSB
 /// brightness moved 0.05 toward the middle, hue and saturation kept. With
 /// both kept, that is RGB scaled by the brightness ratio.
@@ -155,7 +196,7 @@ pub fn nvimArgIsFile(prev: ?[]const u8, arg: []const u8, after_dash_dash: bool) 
     if (arg.len == 0) return false;
     if (after_dash_dash) return !std.mem.eql(u8, arg, "-");
     if (arg[0] == '-' or arg[0] == '+') return false;
-    const takes_value = [_][]const u8{ "-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime" };
+    const takes_value = [_][]const u8{ "-u", "-i", "-c", "-S", "-s", "-t", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime" };
     if (prev) |p| for (takes_value) |o| if (std.mem.eql(u8, p, o)) return false;
     return true;
 }
@@ -168,6 +209,7 @@ test "nvimArgIsFile keeps flags, commands and option values out of the file list
     try std.testing.expect(!nvimArgIsFile(null, "+10", false));
     try std.testing.expect(!nvimArgIsFile("-u", "NONE", false));
     try std.testing.expect(!nvimArgIsFile("--cmd", "set nu", false));
+    try std.testing.expect(!nvimArgIsFile("-t", "main", false));
     try std.testing.expect(!nvimArgIsFile(null, "", false));
     try std.testing.expect(nvimArgIsFile(null, "-u", true));
     try std.testing.expect(nvimArgIsFile(null, "+10", true));
