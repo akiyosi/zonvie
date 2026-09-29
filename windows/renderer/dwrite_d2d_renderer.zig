@@ -2687,12 +2687,29 @@ test "every [font] family feature is kept beside the default features" {
 /// different family, i.e. the font is not installed.
 fn initInstalledFontForTest(alloc: std.mem.Allocator, family: []const u8, spec: []const u8) !?Renderer {
     const hwnd = c.GetDesktopWindow() orelse return null;
+    refreshSystemFontsForTest();
     var r = Renderer.initMetrics(alloc, hwnd, spec, 14, false) catch return missingTestFont(family);
     if (!std.mem.eql(u8, r.font_name_utf8[0..r.font_name_utf8_len], family)) {
         r.deinit();
         return missingTestFont(family);
     }
     return r;
+}
+
+/// CI registers its fonts per user without a WM_FONTCHANGE, so the shared
+/// factory's cached system collection may predate them; an update check
+/// refreshes the collection every later lookup on that factory sees.
+fn refreshSystemFontsForTest() void {
+    var factory: ?*c.IDWriteFactory = null;
+    if (c.DWriteCreateFactory(
+        c.DWRITE_FACTORY_TYPE_SHARED,
+        @as(*const c.GUID, @ptrCast(&IID_IDWriteFactory_ZONVIE)),
+        @ptrCast(&factory),
+    ) != 0 or factory == null) return;
+    defer safeRelease(factory);
+    const get_fc_fn = factory.?.lpVtbl.*.GetSystemFontCollection orelse return;
+    var fc: ?*c.IDWriteFontCollection = null;
+    if (c.SUCCEEDED(get_fc_fn(factory.?, &fc, c.TRUE))) safeRelease(fc);
 }
 
 /// Families CI installs at a pinned version (.github/workflows/test.yml).
