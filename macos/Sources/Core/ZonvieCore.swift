@@ -782,7 +782,7 @@ final class ZonvieCore {
                 let fl = flags
                 let tr = Int(totalRows)
                 let tc = Int(totalCols)
-                let isCursorUpdate = (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
+                let isCursorUpdate = VertexRowUpdate(flags: fl) == .cursorOnly
 
                 // Set by whichever route accepted the work. guicursor carries a
                 // blink cadence per mode, so a cursor update has to refresh it,
@@ -856,7 +856,7 @@ final class ZonvieCore {
                             totalCols: tc
                         )
                         // First-row config (UI work) deferred to main thread
-                        if rs == 0 && fl & 2 == 0 {
+                        if rs == 0 && !isCursorUpdate {
                             // Extract four scalar color components while the
                             // callback pointer is valid. Copying the entire row
                             // here allocated on the grid_mu redraw hot path and
@@ -903,9 +903,7 @@ final class ZonvieCore {
                             // belong to the previous session (close dispatch
                             // pending on main). Skip cursor-only updates: cursor
                             // vertices carry the cursor fg color as bg.
-                            let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                            if fl & 2 == 0, rs == 0,
-                               let bgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor {
+                            if !isCursorUpdate, rs == 0, let bgColor = prepared.bgColor {
                                 DispatchQueue.main.async { [weak core] in
                                     guard let core = core else { return }
                                     core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
@@ -2387,15 +2385,33 @@ final class ZonvieCore {
             }
 
             ZonvieCore.appLog("[devcontainer] Polling for completion...")
+            // A cancelled start keeps polling until `up` (which keeps running)
+            // writes its marker, so the marker and log are still removed --
+            // for 30 minutes at most: an `up` that was killed never writes one.
+            var cancelledPolls = 0
             while true {
                 Thread.sleep(forTimeInterval: 1.0)
+                let done = FileManager.default.fileExists(atPath: doneFile)
+                let failed = !done && FileManager.default.fileExists(atPath: failFile)
                 if isCancelled() {
-                    ZonvieCore.appLog("[devcontainer] start cancelled; stop polling")
+                    cancelledPolls += 1
+                    if cancelledPolls > 1800 && !done && !failed {
+                        try? FileManager.default.removeItem(atPath: upLogFile)
+                        ZonvieCore.appLog("[devcontainer] cancelled start: stopped waiting for up")
+                        break
+                    }
+                }
+                if (done || failed) && isCancelled() {
+                    try? FileManager.default.removeItem(atPath: doneFile)
+                    try? FileManager.default.removeItem(atPath: failFile)
+                    try? FileManager.default.removeItem(atPath: upLogFile)
+                    ZonvieCore.appLog("[devcontainer] up finished after the start was cancelled")
                     break
                 }
 
-                if FileManager.default.fileExists(atPath: doneFile) {
+                if done {
                     try? FileManager.default.removeItem(atPath: doneFile)
+                    try? FileManager.default.removeItem(atPath: upLogFile)
                     ZonvieCore.appLog("[devcontainer] up completed successfully")
 
                     DispatchQueue.main.async { [weak self] in
@@ -2405,12 +2421,13 @@ final class ZonvieCore {
                     break
                 }
 
-                if FileManager.default.fileExists(atPath: failFile) {
+                if failed {
                     try? FileManager.default.removeItem(atPath: failFile)
 
                     // Surface the failure reason (up output was captured to
                     // upLogFile) into the app log, and show the tail to the user.
                     let fullLog = (try? String(contentsOfFile: upLogFile, encoding: .utf8)) ?? ""
+                    try? FileManager.default.removeItem(atPath: upLogFile)
                     let tail = fullLog.split(separator: "\n").suffix(20).joined(separator: "\n")
                     ZonvieCore.appLog("[devcontainer] up failed. Output tail:\n\(tail)")
 
@@ -2876,7 +2893,7 @@ final class ZonvieCore {
 
     /// Ends this session without asking nvim: the app for the last session,
     /// else only its window.
-    private func endSession() {
+    func endSession() {
         if SessionManager.shared.sessions.count <= 1 {
             AppDelegate.terminateApp()
         } else if let win = terminalView?.window {
@@ -3701,11 +3718,6 @@ final class ZonvieCore {
         return (name, Double(pointSize), features)
     }
 
-    private static func parseGuiFontEntry(_ entry: String, configSize: Double, sizeExplicit: Bool) -> (String, Double, String)? {
-        guard let c = parseFontCandidate(entry, defaultSize: configSize, sizeExplicit: sizeExplicit) else { return nil }
-        return (c.name, c.size, c.features)
-    }
-
     private func onGuiFont(bytes: UnsafePointer<UInt8>, len: Int) {
         guard let view = terminalView else { return }
 
@@ -3787,27 +3799,27 @@ final class ZonvieCore {
             }
         } else {
             for candidate in candidates {
-                guard let parsed = Self.parseGuiFontEntry(String(candidate), configSize: configSize, sizeExplicit: sizeExplicit) else {
+                guard let parsed = Self.parseFontCandidate(String(candidate), defaultSize: configSize, sizeExplicit: sizeExplicit) else {
                     continue
                 }
-                if Self.isFontAvailable(parsed.0) {
-                    name = parsed.0
-                    size = parsed.1
-                    features = parsed.2
+                if Self.isFontAvailable(parsed.name) {
+                    name = parsed.name
+                    size = parsed.size
+                    features = parsed.features
                     found = true
                     Self.appLog("[onGuiFont] selected '\(name)' size=\(size) features='\(features)'")
                     break
                 }
-                Self.appLog("[onGuiFont] skipped unavailable font '\(parsed.0)'")
+                Self.appLog("[onGuiFont] skipped unavailable font '\(parsed.name)'")
             }
 
             // Single-entry payload (no newline) — use as-is even if not "available"
             // to preserve backward compatibility with direct :set guifont=... usage.
             if !found && candidates.count == 1 {
-                if let parsed = Self.parseGuiFontEntry(String(candidates[0]), configSize: configSize, sizeExplicit: sizeExplicit) {
-                    name = parsed.0
-                    size = parsed.1
-                    features = parsed.2
+                if let parsed = Self.parseFontCandidate(String(candidates[0]), defaultSize: configSize, sizeExplicit: sizeExplicit) {
+                    name = parsed.name
+                    size = parsed.size
+                    features = parsed.features
                     found = true
                     Self.appLog("[onGuiFont] single candidate, using '\(name)' size=\(size)")
                 }
@@ -4259,6 +4271,9 @@ final class ZonvieCore {
         hideMessageWindow()
         hidePromptWindow()
         for state in miniWindows.values { state.window?.orderOut(nil) }
+        // close() does not detach the views, and the key's keyUp now reaches
+        // another session: nothing else would stop the repeat display link.
+        keyInput.disarmKeyRepeatSynthesis("session closed")
         win.close()
     }
 
@@ -4840,21 +4855,19 @@ final class ZonvieCore {
     /// workaround used by kitty, Ghostty, and Neovide.
     private static let transparentShadowedWindowBackground = NSColor.white.withAlphaComponent(0.001)
 
-    /// Message window for ext_messages (top-right for echo/error/warning)
-    private var extFloatWindow: NSWindow?
-    /// Message text field for ext_messages
-    private var messageTextField: NSTextField?
-    /// Message container view for ext_messages
-    private var messageContainerView: NSView?
+    typealias TextPanel = (window: NSWindow, container: NSView, textField: NSTextField)
+
+    /// Message panel for ext_messages (top-right for echo/error/warning)
+    private var messagePanel: TextPanel?
+    private var extFloatWindow: NSWindow? { messagePanel?.window }
     /// Work item for message auto-hide timer (timeout_ms based)
     private var messageAutoHideWorkItem: DispatchWorkItem?
     /// Pending messages for stack display (echo/error/warning only)
     private var pendingMessages: [(kind: String, content: String, hlId: Int32)] = []
 
-    /// Prompt window for confirm-view messages (centred on the app window)
-    private var promptWindow: NSWindow?
-    private var promptTextField: NSTextField?
-    private var promptContainerView: NSView?
+    /// Prompt panel for confirm-view messages (centred on the app window)
+    private var promptPanel: TextPanel?
+    private var promptWindow: NSWindow? { promptPanel?.window }
 
     // MARK: - Mini View System (showmode/showcmd/ruler)
 
@@ -4939,11 +4952,12 @@ final class ZonvieCore {
                 )
             }
             self.externalWindowWinIds[gridId] = win
+            let request = PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration)
 
             guard let mainView = self.terminalView else {
                 ZonvieCore.appLog("[external_window] no terminalView, queuing request for gridId=\(gridId)")
                 self.queuePendingExternalWindowRequest(
-                    PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration),
+                    request,
                     retryAfter: nil
                 )
                 return
@@ -5002,7 +5016,7 @@ final class ZonvieCore {
                   renderer.shared.sampler != nil else {
                 ZonvieCore.appLog("[external_window] renderer pipelines not ready, queuing request for gridId=\(gridId)")
                 self.queuePendingExternalWindowRequest(
-                    PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration),
+                    request,
                     retryAfter: renderer.shared.pipelineRetryDelay()
                 )
                 return
@@ -5012,7 +5026,7 @@ final class ZonvieCore {
                 let retryDelay = self.nextExternalResourceRetryDelay(gridId: gridId)
                 ZonvieCore.appLog("[external_window] required Metal resources unavailable; retrying gridId=\(gridId) in \(retryDelay)s")
                 self.queuePendingExternalWindowRequest(
-                    PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration),
+                    request,
                     retryAfter: retryDelay
                 )
                 return
@@ -5909,12 +5923,29 @@ final class ZonvieCore {
         return background.withAlphaComponent(CGFloat(ZonvieConfig.shared.backgroundAlpha) * 0.8).cgColor
     }
 
+    /// The font both text panels use: 85% of the editor cell, at least 12pt.
+    private static func textPanelFont(cellHeightPx: Float, scale: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: max(12, (CGFloat(cellHeightPx) / scale) * 0.85), weight: .regular)
+    }
+
+    /// A text panel's width for `content`, and the text's wrapped height.
+    private static func measureTextPanel(_ content: String, font: NSFont, maxWidth: CGFloat,
+                                         padding: CGFloat) -> (width: CGFloat, textHeight: CGFloat) {
+        let box = content.boundingRect(
+            with: CGSize(width: maxWidth - (padding * 2), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font],
+            context: nil
+        )
+        return (max(100, min(maxWidth, box.width + (padding * 2) + 10)), box.height)
+    }
+
     /// The borderless text panel the ext-float toast and the confirm prompt
     /// share. Every call applies the current font and colours, so a guifont or
     /// colorscheme change reaches a panel that already exists. The caller
     /// orders it in (orderPanelFront).
     private static func showTextPanel(
-        existing: (window: NSWindow, container: NSView, textField: NSTextField)?,
+        existing: TextPanel?,
         frame: NSRect,
         content: String,
         font: NSFont,
@@ -5923,7 +5954,7 @@ final class ZonvieCore {
         border: NSColor,
         borderWidth: CGFloat,
         padding: CGFloat
-    ) -> (window: NSWindow, container: NSView, textField: NSTextField) {
+    ) -> TextPanel {
         let textFrame = NSRect(x: padding, y: padding, width: frame.width - (padding * 2), height: frame.height - (padding * 2))
         if let existing {
             existing.textField.stringValue = content
@@ -7798,7 +7829,7 @@ final class ZonvieCore {
     }
 
     /// Configure an NSTextField label so explicit `\n` in stringValue produces
-    /// multiple visible lines. Must be called for both create and update paths.
+    /// multiple visible lines. Called after each stringValue change.
     private func configureMiniLabelForMultiline(_ label: NSTextField) {
         label.usesSingleLineMode = false
         label.maximumNumberOfLines = 0
@@ -7825,9 +7856,9 @@ final class ZonvieCore {
     ///   - rawContent: The content to display, before the mini line bound
     ///   - timeout: Optional timeout in seconds (nil = use default, 0 = no auto-hide)
     private func updateMini(_ miniId: MiniWindowId, content rawContent: String, timeout: Double? = nil) {
-        guard let mainWindow = terminalView?.window else { return }
-
         let content = clampMiniContent(rawContent)
+        // Hiding needs no main window; showing is sized and placed by it.
+        guard content.isEmpty || terminalView?.window != nil else { return }
 
         miniWindows[miniId]?.hideWorkItem?.cancel()
         miniWindows[miniId]?.hideWorkItem = nil
@@ -7840,22 +7871,23 @@ final class ZonvieCore {
             updateMiniPositions()
             return
         }
+        guard let mainWindow = terminalView?.window else { return }
 
         let normalFg = getNormalForegroundColor()
         let normalBg = getNormalBackgroundColor()
 
-        if var state = miniWindows[miniId], let window = state.window, let label = state.label {
-            state.content = content
+        if miniWindows[miniId]?.window == nil || miniWindows[miniId]?.label == nil {
+            miniWindows[miniId] = createMiniWindow()
+        }
+        if let window = miniWindows[miniId]?.window, let label = miniWindows[miniId]?.label {
+            miniWindows[miniId]?.content = content
             let font = miniFont(mainWindow: mainWindow)
             label.stringValue = content
             label.font = font
             label.textColor = normalFg
-            miniWindows[miniId] = state
+            window.contentView?.layer?.backgroundColor = Self.miniPanelBackground(normalBg)
 
-            if let containerView = window.contentView {
-                containerView.layer?.backgroundColor = Self.miniPanelBackground(normalBg)
-            }
-
+            // Window box wraps tightly around the font's actual rendered metrics.
             let size = miniWindowSize(
                 content: content,
                 font: font,
@@ -7868,9 +7900,6 @@ final class ZonvieCore {
 
             configureMiniLabelForMultiline(label)
             label.alignment = .left
-        } else {
-            let state = createMiniWindow(for: miniId, content: content, mainWindow: mainWindow, fgColor: normalFg, bgColor: normalBg)
-            miniWindows[miniId] = state
         }
 
         updateMiniPositions()
@@ -7887,11 +7916,7 @@ final class ZonvieCore {
 
         if let timeout = timeout, timeout > 0 {
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
-                self.miniWindows[miniId]?.window?.orderOut(nil)
-                self.miniWindows[miniId]?.content = ""
-                self.miniWindows[miniId]?.hideWorkItem = nil
-                self.updateMiniPositions()
+                self?.updateMini(miniId, content: "")
             }
             miniWindows[miniId]?.hideWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: workItem)
@@ -7912,22 +7937,9 @@ final class ZonvieCore {
         return NSFont.monospacedSystemFont(ofSize: max(10, cellHeightPt * 0.6), weight: .regular)
     }
 
-    private func createMiniWindow(
-        for miniId: MiniWindowId,
-        content: String,
-        mainWindow: NSWindow,
-        fgColor: NSColor,
-        bgColor: NSColor
-    ) -> MiniWindowState {
-        let font = miniFont(mainWindow: mainWindow)
-
-        // Window box wraps tightly around the font's actual rendered metrics.
-        let size = miniWindowSize(
-            content: content,
-            font: font,
-            maxWidth_pt: mainWindow.frame.width
-        )
-        let windowRect = NSRect(x: 0, y: 0, width: size.width_pt, height: size.height_pt)
+    /// An empty mini window; updateMini sets its content, colors and size.
+    private func createMiniWindow() -> MiniWindowState {
+        let windowRect = NSRect(x: 0, y: 0, width: 40, height: 20)
 
         let window = NSWindow(
             contentRect: windowRect,
@@ -7945,17 +7957,11 @@ final class ZonvieCore {
 
         let containerView = NSView(frame: NSRect(origin: .zero, size: windowRect.size))
         containerView.wantsLayer = true
-        containerView.layer?.backgroundColor = Self.miniPanelBackground(bgColor)
 
-        // Label (left-aligned, multi-line capable so explicit \n shows all lines)
-        let label = NSTextField(labelWithString: content)
-        label.font = font
-        label.textColor = fgColor
+        let label = NSTextField(labelWithString: "")
         label.backgroundColor = .clear
         label.isBordered = false
         label.isEditable = false
-        label.alignment = .left
-        configureMiniLabelForMultiline(label)
         label.translatesAutoresizingMaskIntoConstraints = false
         containerView.addSubview(label)
 
@@ -7971,7 +7977,6 @@ final class ZonvieCore {
         var state = MiniWindowState()
         state.window = window
         state.label = label
-        state.content = content
         return state
     }
 
@@ -8086,16 +8091,13 @@ final class ZonvieCore {
 
     private func showMessageWindow(kind: String, content: String, hlId: Int32) {
         guard let mainView = self.terminalView,
-              let renderer = mainView.renderer,
-              let screen = NSScreen.main else {
-            ZonvieCore.appLog("[msg_window] no terminalView, renderer, or screen")
+              let renderer = mainView.renderer else {
+            ZonvieCore.appLog("[msg_window] no terminalView or renderer")
             return
         }
 
-        let cellH = CGFloat(renderer.cellHeightPx)
-        let scale = mainView.window?.backingScaleFactor ?? 1.0
-        let fontSize = max(12, (cellH / scale) * 0.85)
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let font = Self.textPanelFont(cellHeightPx: renderer.cellHeightPx,
+                                      scale: mainView.window?.backingScaleFactor ?? 1.0)
 
         let fgColor = getColorForMessageKind(kind, hlId: hlId)
         let normalBg = self.getNormalBackgroundColor()
@@ -8139,38 +8141,19 @@ final class ZonvieCore {
         padding: CGFloat,
         targetFrame: NSRect
     ) {
-        let textAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: fgColor
-        ]
-        let maxWidth = min(targetFrame.width * 0.8, 600.0)
-        let constraintRect = CGSize(width: maxWidth - (padding * 2), height: .greatestFiniteMagnitude)
-        let boundingBox = content.boundingRect(
-            with: constraintRect,
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: textAttributes,
-            context: nil
-        )
-
-        let windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
-        let windowHeight = max(30, boundingBox.height + (padding * 2) + 4)
+        let size = Self.measureTextPanel(content, font: font,
+                                         maxWidth: min(targetFrame.width * 0.8, 600.0), padding: padding)
+        let windowHeight = max(30, size.textHeight + (padding * 2) + 4)
 
         // Top-right of the target frame, by the core rule msg_show uses
-        let frame = messageFloatFrame(size: NSSize(width: windowWidth, height: windowHeight), below: nil)
+        let frame = messageFloatFrame(size: NSSize(width: size.width, height: windowHeight), below: nil)
 
-        var existing: (window: NSWindow, container: NSView, textField: NSTextField)? = nil
-        if let window = self.extFloatWindow,
-           let containerView = self.messageContainerView,
-           let textField = self.messageTextField {
-            existing = (window, containerView, textField)
-        }
+        let existing = messagePanel
         let panel = Self.showTextPanel(
             existing: existing, frame: frame, content: content, font: font,
             fg: fgColor, bg: bgColor, border: borderColor, borderWidth: 1.0, padding: padding)
         orderPanelFront(panel.window)
-        self.extFloatWindow = panel.window
-        self.messageContainerView = panel.container
-        self.messageTextField = panel.textField
+        messagePanel = panel
         ZonvieCore.appLog("[msg_window] \(existing == nil ? "created" : "updated"): '\(content.prefix(50))...'")
     }
 
@@ -8198,10 +8181,7 @@ final class ZonvieCore {
             return
         }
 
-        let cellH = CGFloat(renderer.cellHeightPx)
-        let scale = mainWindow.backingScaleFactor
-        let fontSize = max(12, (cellH / scale) * 0.85)
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let font = Self.textPanelFont(cellHeightPx: renderer.cellHeightPx, scale: mainWindow.backingScaleFactor)
 
         let fgColor = getColorForMessageKind("return_prompt", hlId: hlId)
         let normalBg = self.getNormalBackgroundColor()
@@ -8213,23 +8193,11 @@ final class ZonvieCore {
 
         let maxWidth: CGFloat = isConfirm ? min(appFrame.width - 40, 800.0) : min(appFrame.width * 0.8, 600.0)
 
-        let textAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: fgColor
-        ]
-
-        let constraintRect = CGSize(width: maxWidth - (padding * 2), height: .greatestFiniteMagnitude)
-        let boundingBox = content.boundingRect(
-            with: constraintRect,
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: textAttributes,
-            context: nil
-        )
-
-        let windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
+        let size = Self.measureTextPanel(content, font: font, maxWidth: maxWidth, padding: padding)
+        let windowWidth = size.width
         let windowHeight = isConfirm ?
-            max(200, min(boundingBox.height + (padding * 2) + 4, appFrame.height - 100)) :
-            max(30, boundingBox.height + (padding * 2) + 4)
+            max(200, min(size.textHeight + (padding * 2) + 4, appFrame.height - 100)) :
+            max(30, size.textHeight + (padding * 2) + 4)
 
         let frame = NSRect(
             x: appFrame.midX - windowWidth / 2,
@@ -8238,19 +8206,12 @@ final class ZonvieCore {
             height: windowHeight
         )
 
-        var existing: (window: NSWindow, container: NSView, textField: NSTextField)? = nil
-        if let window = self.promptWindow,
-           let containerView = self.promptContainerView,
-           let textField = self.promptTextField {
-            existing = (window, containerView, textField)
-        }
+        let existing = promptPanel
         let panel = Self.showTextPanel(
             existing: existing, frame: frame, content: content, font: font,
             fg: fgColor, bg: adjustedBg, border: borderColor, borderWidth: 2.0, padding: padding)
         orderPanelFront(panel.window)
-        self.promptWindow = panel.window
-        self.promptContainerView = panel.container
-        self.promptTextField = panel.textField
+        promptPanel = panel
         ZonvieCore.appLog("[prompt_window] \(existing == nil ? "created" : "updated"): '\(content.prefix(50))...' frame=\(frame)")
     }
 

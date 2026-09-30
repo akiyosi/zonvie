@@ -1641,7 +1641,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     /// Submit vertices for one row into the write set during a flush bracket.
-    /// With ZONVIE_VERT_UPDATE_CURSOR (2) they go to the dedicated cursor
+    /// A cursor-only update goes to the dedicated cursor
     /// buffer instead, outside the row buffers and so immune to the GPU scroll
     /// copy (no cursor ghosts).
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32 = 1, totalRows: Int, totalCols: Int) {
@@ -1659,11 +1659,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         gridRows = UInt32(totalRows)
         gridCols = UInt32(totalCols)
 
-        let isCursorUpdate = (flags & 2) != 0  // ZONVIE_VERT_UPDATE_CURSOR
-        if isCursorUpdate {
+        switch VertexRowUpdate(flags: flags) {
+        case .main: break
+        case .cursorOnly:
             // commitFlush publishes the slot with the commit revision it bumps.
             submitLayerCursor(gridId: gridId, ptr: ptr, count: count, rootRow: rowStart)
             return
+        case .none: return
         }
 
 
@@ -3380,11 +3382,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             }
         }
     }
-
-    // MARK: - Post-Process Bloom (Neon Glow) — uses shared encodeSurfaceBloomPasses()
-
-    // MARK: - Private
-
 
     // MARK: - Smooth Scroll
 

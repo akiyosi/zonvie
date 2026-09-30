@@ -218,18 +218,23 @@ pub fn main() u8 {
     if (askpass_mode_len > 0) {
         // Askpass mode: output password to stdout and exit
         // First check if password is pre-set in environment
-        var pwd_buf: [256]u8 = undefined;
-        const pwd_len = c.GetEnvironmentVariableA("ZONVIE_SSH_PASSWORD", &pwd_buf, pwd_buf.len);
+        var pwd_w: [256]u16 = undefined;
+        defer std.crypto.secureZero(u16, &pwd_w);
+        // Every UTF-16 unit takes at most 3 UTF-8 bytes.
+        var pwd_utf8: [pwd_w.len * 3]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pwd_utf8);
+        const pwd_len = c.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_SSH_PASSWORD"), &pwd_w, pwd_w.len);
 
         // Attach to parent console for stdout output
         _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
         const stdout = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
 
-        if (pwd_len > 0 and pwd_len < pwd_buf.len) {
+        if (pwd_len > 0 and pwd_len < pwd_w.len) {
             // Use pre-set password
+            const utf8_len = std.unicode.utf16LeToUtf8(&pwd_utf8, pwd_w[0..pwd_len]) catch 0;
             if (stdout != c.INVALID_HANDLE_VALUE) {
                 var written: c.DWORD = 0;
-                _ = c.WriteFile(stdout, &pwd_buf, pwd_len, &written, null);
+                _ = c.WriteFile(stdout, &pwd_utf8, @intCast(utf8_len), &written, null);
                 _ = c.WriteFile(stdout, "\n", 1, &written, null);
             }
         } else {
@@ -278,24 +283,15 @@ pub fn main() u8 {
             // Use GetSaveFileNameW trick or simple MessageBox + clipboard workaround
             // For now, use a simple approach: create a tiny window with password field
             var password: [256]u16 = undefined;
+            defer std.crypto.secureZero(u16, &password);
             password[0] = 0;
             const dialog_result = dialogs.showPasswordInputDialog(&prompt_buf, &password);
 
             if (dialog_result and stdout != c.INVALID_HANDLE_VALUE) {
-                // Convert UTF-16 password to UTF-8 and write to stdout
-                var utf8_pwd: [512]u8 = undefined;
-                var utf8_len: usize = 0;
-                for (password) |wch| {
-                    if (wch == 0) break;
-                    if (wch < 0x80) {
-                        if (utf8_len < utf8_pwd.len) {
-                            utf8_pwd[utf8_len] = @truncate(wch);
-                            utf8_len += 1;
-                        }
-                    }
-                }
+                const wlen = std.mem.indexOfScalar(u16, &password, 0) orelse password.len;
+                const utf8_len = std.unicode.utf16LeToUtf8(&pwd_utf8, password[0..wlen]) catch 0;
                 var written: c.DWORD = 0;
-                _ = c.WriteFile(stdout, &utf8_pwd, @intCast(utf8_len), &written, null);
+                _ = c.WriteFile(stdout, &pwd_utf8, @intCast(utf8_len), &written, null);
                 _ = c.WriteFile(stdout, "\n", 1, &written, null);
             }
         }

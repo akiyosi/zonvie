@@ -516,7 +516,10 @@ typedef struct zonvie_msg_chunk {
 } zonvie_msg_chunk;
 
 /* Called when a message should be shown.
-   view: routed view type from config
+   view: routed view type from config: MINI, CONFIRM or NOTIFICATION. The
+         core draws EXT_FLOAT messages on its own grid and sends SPLIT to
+         Neovim; EXT_FLOAT reaches this callback only for the config.toml
+         error (replace_last and append 0), SPLIT never.
    kind: message kind (e.g., "echo", "emsg", "wmsg", etc.), or the synthetic
          "_msg_history" for :messages output routed to this callback
    content: array of highlighted chunks

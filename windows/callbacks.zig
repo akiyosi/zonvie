@@ -1161,16 +1161,25 @@ pub fn onGridRowScroll(
         return;
     }
 
+    if (total_rows == 0 or row_start >= total_rows or row_end > total_rows) {
+        core.zonvie_core_force_resend_locked(app.corep);
+        failFlush(app);
+        return;
+    }
+    const region_height: u32 = row_end - row_start;
+    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
+    if (abs_rows == 0 or abs_rows >= region_height) {
+        core.zonvie_core_force_resend_locked(app.corep);
+        failFlush(app);
+        return;
+    }
+
     // A pre-window/replacement capture is the frontend's only copy of rows the
     // core omits on its scroll fast path. Shift it before the vacated rows are
     // overwritten by the row callbacks later in this flush.
     for (app.pending_external_verts.items) |*pv| {
         if (pv.grid_id != grid_id) continue;
-        if (total_rows == 0 or
-            row_start >= total_rows or
-            row_end > total_rows or
-            pv.surface.row_verts.items.len < total_rows)
-        {
+        if (pv.surface.row_verts.items.len < total_rows) {
             core.zonvie_core_force_resend_locked(app.corep);
             failFlush(app);
             return;
@@ -1183,14 +1192,6 @@ pub fn onGridRowScroll(
                 failFlush(app);
                 return;
             }
-        }
-
-        const region_height: u32 = row_end - row_start;
-        const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
-        if (abs_rows == 0 or abs_rows >= region_height) {
-            core.zonvie_core_force_resend_locked(app.corep);
-            failFlush(app);
-            return;
         }
 
         const last_row = row_end - 1;
@@ -1237,20 +1238,6 @@ pub fn onGridRowScroll(
 
     ext_win.surf.surface.rows = total_rows;
     ext_win.surf.surface.cols = total_cols;
-
-    if (total_rows == 0 or row_start >= total_rows or row_end > total_rows) {
-        core.zonvie_core_force_resend_locked(app.corep);
-        failFlush(app);
-        return;
-    }
-
-    const region_height: u32 = row_end - row_start;
-    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
-    if (abs_rows == 0 or abs_rows >= region_height) {
-        core.zonvie_core_force_resend_locked(app.corep);
-        failFlush(app);
-        return;
-    }
 
     // Reserve the dirty tracking BEFORE any mutation below: aborting after
     // the slot remap would leave it applied while the core retries the same
