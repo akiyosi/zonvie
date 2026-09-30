@@ -1516,7 +1516,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
-            inflightRowBuffers: { self.inflightRowBuffers(gridId: gridId, atSlot: $0) }
+            inflightRowBuffers: { self.inflightRowBuffers(gridId: gridId, atSlot: $0) },
+            // Layer rows register no capacity requirement, so the retry's
+            // provisioner would never see the refusal; latch it here.
+            onBudgetRefused: {
+                self.lock.lock()
+                self.rowCapacity.hardFailure = true
+                self.lock.unlock()
+            }
         )
         if !submitted {
             // Same contract as the root grid's submitVerticesRowRaw: a row that

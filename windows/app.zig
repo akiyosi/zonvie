@@ -2115,6 +2115,25 @@ pub const LayerGridState = struct {
         self.staged_rows_len = 0;
     }
 
+    /// Free rows `start..` and drop them from the arrays, keeping capacity.
+    /// Returns the GPU bytes released, which the caller owes the row budget.
+    pub fn releaseRowsFrom(self: *LayerGridState, alloc: std.mem.Allocator, start: usize) usize {
+        if (start >= self.rows_buf.items.len) return 0;
+        var bytes: usize = 0;
+        for (self.rows_buf.items[start..]) |*rv| {
+            rv.verts.deinit(alloc);
+            if (rv.vb) |vb| {
+                _ = vb.*.lpVtbl.*.Release.?(@ptrCast(vb));
+                bytes += rv.vb_bytes;
+            }
+            rv.* = .{};
+        }
+        self.rows_buf.items.len = start;
+        self.origin_rows.items.len = @min(self.origin_rows.items.len, start);
+        self.drawn_origin_rows.items.len = @min(self.drawn_origin_rows.items.len, start);
+        return bytes;
+    }
+
     /// Rows the arrays will hold once this flush is applied.
     fn plannedRows(self: *const LayerGridState) usize {
         return @max(self.rows_buf.items.len, self.staged_rows_len);
@@ -2197,6 +2216,7 @@ pub const LayerGridState = struct {
         const need = self.plannedRows();
         self.rows_buf.ensureTotalCapacity(alloc, need) catch return false;
         self.origin_rows.ensureTotalCapacity(alloc, need) catch return false;
+        self.drawn_origin_rows.ensureTotalCapacity(alloc, need) catch return false;
         if (self.dirty_rows.bit_length < need) {
             self.dirty_rows.resize(alloc, need, false) catch return false;
         }
@@ -2207,8 +2227,9 @@ pub const LayerGridState = struct {
     }
 
     /// Publish after prepareCommit succeeded for every grid. Caller holds
-    /// App.mu throughout preparation and publication.
-    pub fn applyStaged(self: *LayerGridState, alloc: std.mem.Allocator) bool {
+    /// App.mu throughout preparation and publication. GPU bytes freed by a
+    /// shrink are added to `released_vb_bytes`.
+    pub fn applyStaged(self: *LayerGridState, alloc: std.mem.Allocator, released_vb_bytes: *std.atomic.Value(usize)) bool {
         defer self.discardStaged();
         if (self.staged_len == 0) return true;
         const need = self.plannedRows();
@@ -2248,6 +2269,9 @@ pub const LayerGridState = struct {
                 },
             }
         }
+        // total_rows is authoritative: rows past it left the grid and are
+        // never drawn, so their storage goes now rather than at destroy.
+        _ = released_vb_bytes.fetchAdd(self.releaseRowsFrom(alloc, self.staged.items[self.staged_len - 1].total_rows), .acq_rel);
         // Rows and origins both moved; any plan taken before this point was
         // made against a frame that no longer exists.
         self.content_gen +%= 1;
@@ -3205,11 +3229,13 @@ pub fn drawRowModeSetupAndRowsFromSlots(
 /// the next paint maps a buffer created on the dead device.
 pub fn detachOneLayerGridVB(
     layer_grids: *std.AutoHashMapUnmanaged(i64, *LayerGridState),
+    released_vb_bytes: *std.atomic.Value(usize),
 ) ?*c.ID3D11Buffer {
     var it = layer_grids.valueIterator();
     while (it.next()) |state| {
         for (state.*.rows_buf.items) |*rv| {
             if (rv.vb) |vb| {
+                _ = released_vb_bytes.fetchAdd(rv.vb_bytes, .acq_rel);
                 rv.vb = null;
                 rv.vb_bytes = 0;
                 rv.uploaded_gen = 0;
@@ -3993,6 +4019,7 @@ pub fn failRowVbBudget(app: *App, layers: []const SurfaceLayer) void {
 const LayerRowOutcome = struct {
     encoded: bool,
     failed: bool = false,
+    budget_exceeded: bool = false,
 };
 
 /// What a surface's whole layer draw produced. A frame is incomplete when rows
@@ -4002,6 +4029,8 @@ const LayerRowOutcome = struct {
 /// may be presented.
 pub const LayerDrawOutcome = struct {
     failed_rows: u32 = 0,
+    /// Some of the failed rows were refused by the row VB budget.
+    budget_exceeded: bool = false,
     stale_layers: u32 = 0,
     stale_layout: bool = false,
     stale_commit: bool = false,
@@ -4091,8 +4120,8 @@ fn drawLayerRow(
     if (rv.verts.items.len == 0) return .{ .encoded = encoded };
 
     const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
-    g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch
-        return .{ .encoded = encoded, .failed = true };
+    ensureBudgetedRowVertexBuffer(g, d.row_vb_budget, d.layer_row_vb_retained_bytes, &rv.vb, &rv.vb_bytes, need_bytes) catch |e|
+        return .{ .encoded = encoded, .failed = true, .budget_exceeded = e == error.RowVBPhysicalBudgetExceeded };
     const vb = rv.vb orelse return .{ .encoded = encoded, .failed = true };
     if (rv.uploaded_gen != rv.gen) {
         g.uploadVertsToVB(vb, rv.verts.items) catch
@@ -4129,6 +4158,8 @@ const LayerRowDrawCtx = struct {
     row_h_px: i32,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
+    row_vb_budget: *RowVBPhysicalBudget,
+    layer_row_vb_retained_bytes: *usize,
 };
 
 /// Draw the surface's non-root layers, back-to-front, on top of the root grid.
@@ -4160,6 +4191,7 @@ pub fn drawSurfaceLayers(
         return .{ .stale_layers = stale };
     }
     var failed_rows: u32 = 0;
+    var budget_exceeded = false;
     for (layers[1..]) |layer| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
@@ -4184,6 +4216,8 @@ pub fn drawSurfaceLayers(
             .row_h_px = row_h_px,
             .ctx_ptr = ctx_ptr,
             .rs_set_sc_fn = rs_set_sc_fn,
+            .row_vb_budget = &app.row_vb_budget,
+            .layer_row_vb_retained_bytes = &app.layer_row_vb_retained_bytes,
         };
 
         var encoded: u32 = 0;
@@ -4193,6 +4227,7 @@ pub fn drawSurfaceLayers(
                 const out = drawLayerRow(g, state, ri, d);
                 if (out.encoded) encoded += 1;
                 if (out.failed) failed_rows += 1;
+                if (out.budget_exceeded) budget_exceeded = true;
             }
         } else {
             // The band this layer's GPU copy vacated, before the rows: the
@@ -4221,6 +4256,7 @@ pub fn drawSurfaceLayers(
                 const out = drawLayerRow(g, state, ri, d);
                 if (out.encoded) encoded += 1;
                 if (out.failed) failed_rows += 1;
+                if (out.budget_exceeded) budget_exceeded = true;
             }
         }
         if (log_enabled) applog.appLog(
@@ -4230,7 +4266,7 @@ pub fn drawSurfaceLayers(
     }
     // Restore the surface's own pixel space for whatever draws next.
     g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
-    return .{ .failed_rows = failed_rows };
+    return .{ .failed_rows = failed_rows, .budget_exceeded = budget_exceeded };
 }
 
 pub const CursorOverlayParams = struct {
@@ -4255,6 +4291,9 @@ pub const CursorOverlayParams = struct {
     /// The cursor's row in its own layer, when the cursor is not on the root
     /// grid. Blink-off redraws this instead of the root's (empty) row.
     cursor_layer_row: ?*RowVerts = null,
+    /// What `cursor_layer_row`'s buffer is charged to.
+    row_vb_budget: *RowVBPhysicalBudget,
+    layer_row_vb_retained_bytes: *usize,
     /// How far a row-shift hint moved that row's vertices from where they
     /// were built; the layer draw applies the same offset.
     cursor_layer_row_dy_px: f32 = 0,
@@ -4289,7 +4328,7 @@ fn redrawCursorRowContent(
     if (p.cursor_layer_row) |lr| {
         if (lr.verts.items.len == 0) return;
         const need_bytes = lr.verts.items.len * @sizeOf(Vertex);
-        try g.ensureExternalVertexBuffer(&lr.vb, &lr.vb_bytes, need_bytes);
+        try ensureBudgetedRowVertexBuffer(g, p.row_vb_budget, p.layer_row_vb_retained_bytes, &lr.vb, &lr.vb_bytes, need_bytes);
         const lvb = lr.vb orelse return error.CursorRowVertexBufferMissing;
         if (lr.uploaded_gen != lr.gen) {
             try g.uploadVertsToVB(lvb, lr.verts.items);
@@ -4765,6 +4804,10 @@ pub fn drawSurfaceRowFrame(
     const log_enabled = in.log_enabled;
     const row_h_px = in.draw_params.row_h_px;
 
+    // Return what the core thread freed before anything is charged.
+    const freed = app.layer_row_vb_released_bytes.swap(0, .acq_rel);
+    app.row_vb_budget.release(&app.layer_row_vb_retained_bytes, freed);
+
     // TBS lock-free draw: the committed set is protected by refcount, so no
     // app.mu is needed during VB upload + draw.
     out.rows = drawRowModeSetupAndRowsFromSlots(
@@ -4843,6 +4886,7 @@ pub fn drawSurfaceRowFrame(
                 out.rows.rs_set_sc_fn,
                 log_enabled,
             );
+            if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
             // Their pixels are in back_tex now; the present rects for this
             // frame were already built by the caller. Only a layer that got
             // one of those rects has its dirty flag consumed here: a layer the
@@ -4898,6 +4942,8 @@ pub fn drawSurfaceRowFrame(
             .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
             .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
             .cursor_layer_row = cursor_layer_row,
+            .row_vb_budget = &app.row_vb_budget,
+            .layer_row_vb_retained_bytes = &app.layer_row_vb_retained_bytes,
             .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
             .ctx_ptr = out.rows.ctx_ptr,
             .rs_set_sc_fn = out.rows.rs_set_sc_fn,
@@ -4905,6 +4951,7 @@ pub fn drawSurfaceRowFrame(
             .row_already_redrawn = cursor_row_redrawn,
         }) catch |e| {
             out.cursor_overlay_failed = true;
+            if (e == error.RowVBPhysicalBudgetExceeded) out.row_vb_budget_exceeded = true;
             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
         };
         // Paired with the row drawCursorOverlay just recorded, so the next
@@ -5367,6 +5414,12 @@ pub const App = struct {
     // Shared by every surface's row buffers.
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
+    // Layer-grid row buffers belong to no surface, so together they are
+    // charged as one. The budget is paint-thread state; the core thread frees
+    // layer buffers and leaves their bytes in `released`, which every row
+    // frame returns before its first charge.
+    layer_row_vb_retained_bytes: usize = 0,
+    layer_row_vb_released_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
@@ -6677,6 +6730,38 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
     try std.testing.expect(states[2].draw_rows.isSet(0));
 }
 
+test "applyStaged allocates nothing once prepareCommit succeeded" {
+    // Publication runs after other grids already published; a failure there
+    // would leave the flush half-applied.
+    const alloc = std.testing.allocator;
+    var state = LayerGridState{};
+    defer state.deinit(alloc);
+    try std.testing.expect(state.stageRow(alloc, 2, &.{}, 3, 4));
+    try std.testing.expect(state.prepareCommit(alloc));
+    var released = std.atomic.Value(usize).init(0);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expect(state.applyStaged(failing.allocator(), &released));
+    try std.testing.expectEqual(@as(usize, 3), state.drawn_origin_rows.items.len);
+}
+
+test "a layer that shrinks drops the rows past its height" {
+    const alloc = std.testing.allocator;
+    var state = LayerGridState{};
+    defer state.deinit(alloc);
+    var released = std.atomic.Value(usize).init(0);
+    for (0..3) |r| try std.testing.expect(state.stageRow(alloc, @intCast(r), &.{}, 3, 4));
+    try std.testing.expect(state.prepareCommit(alloc));
+    try std.testing.expect(state.applyStaged(alloc, &released));
+    try std.testing.expectEqual(@as(usize, 3), state.rows_buf.items.len);
+
+    try std.testing.expect(state.stageRow(alloc, 0, &.{}, 1, 4));
+    try std.testing.expect(state.prepareCommit(alloc));
+    try std.testing.expect(state.applyStaged(alloc, &released));
+    try std.testing.expectEqual(@as(usize, 1), state.rows_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.origin_rows.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.drawn_origin_rows.items.len);
+}
+
 test "a layer plan is refused once the core republishes the rows under it" {
     // planLayerFrame and drawSurfaceLayers run under two separate App.mu
     // holds, so a flush can commit in between. The plan's GPU copy and redraw
@@ -6732,7 +6817,8 @@ test "a layer plan is refused once the core republishes the rows under it" {
     // The core commits the next flush in the gap between plan and draw.
     try std.testing.expect(state.stageRow(alloc, 1, &.{}, 3, 4));
     try std.testing.expect(state.prepareCommit(alloc));
-    try std.testing.expect(state.applyStaged(alloc));
+    var released = std.atomic.Value(usize).init(0);
+    try std.testing.expect(state.applyStaged(alloc, &released));
 
     try std.testing.expectEqual(@as(u32, 1), staleLayerPlans(&app, &layers));
     // And the plan it spent is put back for the next paint.
@@ -6906,7 +6992,8 @@ test "a layer frame is refused once the core republishes the root rows beside it
         fn publishLayerRow(s: *LayerGridState, a: std.mem.Allocator, value: f32) !void {
             try std.testing.expect(s.stageRow(a, 0, &.{marker(value)}, 3, 4));
             try std.testing.expect(s.prepareCommit(a));
-            try std.testing.expect(s.applyStaged(a));
+            var released = std.atomic.Value(usize).init(0);
+            try std.testing.expect(s.applyStaged(a, &released));
         }
 
         fn layerMarker(s: *const LayerGridState) f32 {

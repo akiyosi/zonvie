@@ -306,6 +306,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 self.lock.lock()
                 defer { self.lock.unlock() }
                 return surfaceInflightRowBuffers(sets: sets, gpuInFlightCount: self.gpuInFlightCount, slot: slot)
+            },
+            // Layer rows register no capacity requirement, so the retry's
+            // provisioner would never see the refusal; latch it here.
+            onBudgetRefused: {
+                self.lock.lock()
+                self.rowCapacity.hardFailure = true
+                self.lock.unlock()
             }
         )
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_staged surface=\(gridId) grid=\(id) row=\(rowStart) vertices=\(count) accepted=\(submitted)")
