@@ -2089,6 +2089,10 @@ pub export fn zonvie_core_spawn_arg_quote(arg: ?[*]const u8, len: usize) callcon
     return q;
 }
 
+pub export fn zonvie_core_snap_terminal_px(desired_px: u32, cell_px: u32) callconv(.c) u32 {
+    return frontend_rules.snapTerminalPx(desired_px, cell_px);
+}
+
 pub export fn zonvie_core_config_help() callconv(.c) [*:0]const u8 {
     return config.config_help.ptr;
 }

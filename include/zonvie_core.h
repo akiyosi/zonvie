@@ -1862,6 +1862,16 @@ ZONVIE_API uint32_t zonvie_core_display_width(const char *text, size_t len);
    Pure — no core pointer, no lock. */
 ZONVIE_API int32_t zonvie_core_spawn_arg_quote(const char *arg, size_t len);
 
+/* The window's terminal-area size in `desired_px`, in pixels along one axis,
+   shrunk to the largest multiple of `cell_px` that still fits (at least one
+   cell when desired_px > 0). Apply it to a size that only a user or system
+   resize updates, never to the frontend's own snap result: snapping a snap
+   is not idempotent across two different cell sizes, and would lose a strip
+   on every reapply.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API uint32_t zonvie_core_snap_terminal_px(uint32_t desired_px, uint32_t cell_px);
+
 /* The CONFIG section of `--help` (every key this platform reads, with its
    defaults; lines indented four spaces) and the commented-out config.toml
    `--install` writes (each value this platform's default). Static,

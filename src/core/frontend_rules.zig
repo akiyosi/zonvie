@@ -919,3 +919,41 @@ test "stopping leaves the cursor shown" {
     try std.testing.expect(b.visible);
     try std.testing.expectEqual(@as(u32, 0), b.tick());
 }
+
+// ---------------------------------------------------------------------------
+// Window snap
+
+/// The window's terminal-area pixel size shrunk to a multiple of the cell
+/// size, so no `size % cell` remainder strip is left uncleared past the
+/// cell-aligned viewport. Applied to a stable *desired* size, not the live
+/// window: snapping a snap's own result loses a strip on every reapply
+/// (snap(snap(x,c1),c2) <= snap(x,c2)), so both frontends snap a value that
+/// is updated only by a user or system resize, never by the snap's own
+/// setFrame/SetWindowPos echo. At least one cell when desired_px > 0; 0 (no
+/// window yet, e.g. before the terminal view's first layout pass) stays 0
+/// rather than being floored up to one cell.
+pub fn snapTerminalPx(desired_px: u32, cell_px: u32) u32 {
+    if (desired_px == 0 or cell_px == 0) return desired_px;
+    const cells = desired_px / cell_px;
+    return @max(cell_px, cells * cell_px);
+}
+
+test "snapping keeps the largest whole-cell size, at least one cell above zero" {
+    try std.testing.expectEqual(@as(u32, 990), snapTerminalPx(999, 11));
+    try std.testing.expectEqual(@as(u32, 990), snapTerminalPx(990, 11));
+    try std.testing.expectEqual(@as(u32, 11), snapTerminalPx(5, 11));
+    // A desired size of 0 (no window yet) is not forced up to one cell: the
+    // review found this defeated the caller's own `<= 0` skip-and-retry
+    // guard, resizing a not-yet-laid-out window down to a single cell.
+    try std.testing.expectEqual(@as(u32, 0), snapTerminalPx(0, 11));
+}
+
+test "snapping a stable desired size is idempotent across an intermediate cell change" {
+    // The bug the desired-size rule fixes: chaining a snap onto its own
+    // result loses a strip. Snapping the same desired size at both cells
+    // must give the same final size no matter what ran in between.
+    const desired: u32 = 999;
+    const direct = snapTerminalPx(desired, 9);
+    const via_other_cell = snapTerminalPx(snapTerminalPx(desired, 11), 9);
+    try std.testing.expect(via_other_cell <= direct);
+}

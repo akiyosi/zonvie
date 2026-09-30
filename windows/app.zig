@@ -5540,6 +5540,19 @@ pub const App = struct {
     // Timestamp of last WM_SIZE (ns since epoch).
     last_resize_ns: i128 = 0,
 
+    /// The user's *desired* main-window terminal content size, in pixels,
+    /// that WM_APP_SNAP_MAIN_WINDOW snaps. Set from a genuine WM_SIZE (user
+    /// drag, zoom, system resize) and left untouched by the snap's own
+    /// resize echo, mirroring macOS's desiredTermPx (ZonvieCore.swift). Zero
+    /// means unset (before the first WM_SIZE). UI thread only.
+    desired_content_w_px: u32 = 0,
+    desired_content_h_px: u32 = 0,
+    /// Content size the last snap set the window to, so WM_SIZE can tell its
+    /// own resize echo from a genuine user resize (mirrors lastSnappedTermPx).
+    /// UI thread only.
+    last_snapped_content_w_px: u32 = 0,
+    last_snapped_content_h_px: u32 = 0,
+
     /// Which buttons' presses reached the editor, and the one drags are
     /// reported as (owner: 0 none, 1 left, 2 right, 3 middle, 4 x1, 5 x2).
     press_claim: core.frontend_rules.PressClaim = .{},
