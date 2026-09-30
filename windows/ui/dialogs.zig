@@ -595,6 +595,20 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     g_devcontainer_up_done.store(true, .seq_cst);
 }
 
+/// Retry OpenClipboard a few times: another process (a clipboard manager,
+/// rdpclip, Office) can hold the exclusive clipboard lock for a few
+/// milliseconds. Runs on the UI thread, off any render path; blocks for at
+/// most (max_attempts - 1) * retry_interval_ms.
+fn openClipboardWithRetry(hwnd: c.HWND) bool {
+    var attempts: u8 = 0;
+    while (true) {
+        if (c.OpenClipboard(hwnd) != 0) return true;
+        attempts += 1;
+        if (attempts >= render_helpers.clipboard_open_max_attempts) return false;
+        c.Sleep(render_helpers.clipboard_open_retry_interval_ms);
+    }
+}
+
 /// Handle clipboard get on UI thread (called via WM_APP_CLIPBOARD_GET)
 pub fn handleClipboardGetOnUIThread(app: *App, seq: u32) void {
     app.clipboard_mu.lockUncancelable(core.clock.io());
@@ -607,9 +621,12 @@ pub fn handleClipboardGetOnUIThread(app: *App, seq: u32) void {
 
     const hwnd = app.hwnd orelse null;
 
-    // Open clipboard
-    if (c.OpenClipboard(hwnd) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: OpenClipboard failed\n", .{});
+    // Open clipboard. Still busy after retries is a real failure, not
+    // "success, empty" — the caller must not treat a transiently locked
+    // clipboard as an empty register.
+    if (!openClipboardWithRetry(hwnd)) {
+        if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: OpenClipboard failed (busy)\n", .{});
+        app.clipboard_result = 0;
         return;
     }
     defer _ = c.CloseClipboard();
@@ -690,8 +707,8 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
     }
 
     // Open clipboard
-    if (c.OpenClipboard(owner_hwnd) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: OpenClipboard failed\n", .{});
+    if (!openClipboardWithRetry(owner_hwnd)) {
+        if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: OpenClipboard failed (busy)\n", .{});
         return false;
     }
     defer _ = c.CloseClipboard();

@@ -4812,9 +4812,46 @@ fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
     self.log.write("[{s}] overflow map update failed: {any}\n", .{ scope, err });
 }
 
+/// The cluster at content byte offset `pos` (global across chunks): its
+/// display cells (the cmdline's caret rule) and its length in bytes. Null
+/// when `pos` is at or past the end of the content.
+fn cmdlineClusterAtPos(content: []const grid_mod.CmdlineChunk, pos: u32) ?struct { cells: u32, byte_len: u32 } {
+    var skip: usize = pos;
+    for (content) |chunk| {
+        if (skip >= chunk.text.len) {
+            skip -= chunk.text.len;
+            continue;
+        }
+        const c = scanEmojiCluster(chunk.text, skip);
+        if (c.codepoint_count == 0) return null;
+        return .{ .cells = clusterCells(c, .caret, 0), .byte_len = @intCast(c.end_byte - skip) };
+    }
+    return null;
+}
+
+/// Write content bytes [start, end) (global across chunks, end null = to the
+/// end) through `w`, each chunk keeping its own highlight.
+fn writeCmdlineContentRange(w: *CellWriter, content: []const grid_mod.CmdlineChunk, start: u32, end: ?u32) !bool {
+    var chunk_start: u32 = 0;
+    for (content) |chunk| {
+        const chunk_len: u32 = @intCast(chunk.text.len);
+        const chunk_end = chunk_start + chunk_len;
+        defer chunk_start = chunk_end;
+        if (chunk_end <= start) continue;
+        if (end) |e| if (chunk_start >= e) break;
+        const lo = if (start > chunk_start) start - chunk_start else 0;
+        const hi = if (end) |e| @min(chunk_len, e - chunk_start) else chunk_len;
+        if (lo >= hi) continue;
+        if (!try w.text(chunk.text[lo..hi], chunk.hl_id)) return false;
+    }
+    return true;
+}
+
 /// One cmdline state's line before horizontal scroll: firstc, prompt, indent,
-/// content (control characters as ^X) and special_char. The single-line and
-/// block paths both measure and write it through this and CellWriter.
+/// content (control characters as ^X) and special_char, drawn at the cursor
+/// per :help ui-cmdline (shift=true inserts it there, false overwrites the
+/// cluster at the cursor). The single-line and block paths both measure and
+/// write it through this and CellWriter.
 const CmdlineLine = struct {
     width: u32,
     /// Display column of the byte offset `pos`.
@@ -4831,9 +4868,19 @@ const CmdlineLine = struct {
         lead += countDisplayWidth(state.prompt);
         lead += state.indent;
 
+        const at_cursor = cmdlineClusterAtPos(state.content.items, state.pos);
+
+        const special_char = state.getSpecialChar();
         var width = lead;
         for (state.content.items) |chunk| width += countDisplayWidth(chunk.text);
-        if (!has_control_chars) width += countDisplayWidth(state.getSpecialChar());
+        if (!has_control_chars) {
+            width += countDisplayWidth(special_char);
+            // Overwriting (shift=false) replaces the cluster at the cursor
+            // rather than adding to the line.
+            if (special_char.len > 0 and !state.special_shift) {
+                if (at_cursor) |c| width -= c.cells;
+            }
+        }
 
         var cursor_col = lead;
         var bytes_remaining: u32 = state.pos;
@@ -4856,17 +4903,7 @@ const CmdlineLine = struct {
             break;
         }
 
-        var cursor_cells: u32 = 1;
-        var skip: usize = state.pos;
-        for (state.content.items) |chunk| {
-            if (skip >= chunk.text.len) {
-                skip -= chunk.text.len;
-                continue;
-            }
-            const c = scanEmojiCluster(chunk.text, skip);
-            if (c.codepoint_count > 0) cursor_cells = clusterCells(c, .caret, 0);
-            break;
-        }
+        const cursor_cells: u32 = if (at_cursor) |c| c.cells else 1;
         return .{ .width = width, .cursor_col = cursor_col, .cursor_cells = cursor_cells, .has_control_chars = has_control_chars };
     }
 };
@@ -4998,10 +5035,23 @@ fn writeCmdlineLine(w: *CellWriter, state: *const grid_mod.CmdlineState, has_con
     while (i < state.indent) : (i += 1) {
         if (!w.cell(' ', 0)) return;
     }
-    for (state.content.items) |chunk| {
-        if (!try w.text(chunk.text, chunk.hl_id)) return;
+    if (has_control_chars) {
+        for (state.content.items) |chunk| {
+            if (!try w.text(chunk.text, chunk.hl_id)) return;
+        }
+        return;
     }
-    if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0);
+    // special_char draws at the cursor: shift inserts it there and pushes
+    // the rest right; no-shift overwrites the cluster at the cursor. Nothing
+    // to skip when there is no special_char to draw.
+    const special_char = state.getSpecialChar();
+    const skip_bytes: u32 = if (special_char.len > 0 and !state.special_shift)
+        (if (cmdlineClusterAtPos(state.content.items, state.pos)) |c| c.byte_len else 0)
+    else
+        0;
+    if (!try writeCmdlineContentRange(w, state.content.items, 0, state.pos)) return;
+    if (!try w.text(special_char, 0)) return;
+    _ = try writeCmdlineContentRange(w, state.content.items, state.pos + skip_bytes, null);
 }
 
 /// Check for cmdline state changes and create/update/close external float window via Neovim API.
@@ -5225,6 +5275,14 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
         return false;
     };
 
+    // Save current cursor position before switching to cmdline, as the
+    // single-line path does: sendCmdlineHide's fallback restore reads it.
+    if (self.grid.cursor_grid != cmdline_grid_id) {
+        self.pre_cmdline_cursor_grid = self.grid.cursor_grid;
+        self.pre_cmdline_cursor_row = self.grid.cursor_row;
+        self.pre_cmdline_cursor_col = self.grid.cursor_col;
+    }
+
     // Set cursor position (on the last row - current cmdline line)
     self.grid.cursor_grid = cmdline_grid_id;
     self.grid.cursor_row = if (current_line_visible) block_line_count else block_line_count -| 1;
@@ -5439,10 +5497,12 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     }
     if (max_word_w < 10) max_word_w = 10; // minimum word column
 
-    // Total width: 1(pad) + word + gap? + kind? + gap? + menu? + 1(pad)
+    // Total width: 1(pad) + word + gap? + kind? + gap? + menu? + 1(pad),
+    // capped at the screen width as Neovim's own popupmenu is.
     var width: u32 = 1 + max_word_w + 1; // left pad + word + right pad
     if (max_kind_w > 0) width += 1 + max_kind_w; // gap + kind
     if (max_menu_w > 0) width += 1 + max_menu_w; // gap + menu
+    width = @min(width, self.grid.cmdlineMaxCols());
 
     // Limit height to reasonable number
     const max_height: u32 = 15;
@@ -7511,12 +7571,14 @@ test "cmdline single-line output: caret notation, wide chars, prompt, indent, sp
         \\
     );
 
+    // special_char draws at the cursor (pos=1, on 'b') and, shift=false,
+    // overwrites it rather than appending at the line's end.
     try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "abc" }}, 1, ':', "", 0, 1, 0);
     core.grid.setCmdlineSpecialChar("\u{3042}", false, 1);
     notifyCmdlineChanges(&core);
     try expectCmdlineGrid(&core,
         \\1x12 cur=0,2 off=0
-        \\3a 61 62 63 3042 0
+        \\3a 61 3042 0 63
         \\
     );
 
@@ -7582,6 +7644,66 @@ test "the cmdline writes clusters by the popupmenu and message panels' rule" {
     try std.testing.expectEqual(@as(u32, 0x3070), core.grid.getCellGrid(grid_mod.CMDLINE_GRID_ID, 0, 1).cp);
 }
 
+test "cmdline_special_char draws at the cursor: shift inserts, no-shift overwrites" {
+    // Neovim's UI spec (ui-events cmdline_special_char) and putcmdline():
+    // Ctrl_V sends shift=true ('^' pushes the rest right, ex_getln.c:2304);
+    // the digraph partial-key display sends shift=false (input.c:3018,
+    // overwrites the char at the cursor).
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    // ":abcdef", cursor left 3 (pos=3, on 'd'), Ctrl_V: "^" is inserted
+    // before 'd' and the cursor sits on it, as Neovim shows ":abc^def".
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "abcdef" }}, 3, ':', "", 0, 1, 0);
+    core.grid.setCmdlineSpecialChar("^", true, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,4 off=0
+        \\3a 61 62 63 5e 64 65 66
+        \\
+    );
+
+    // Same position, shift=false: '^' overwrites 'd' instead of pushing it.
+    core.grid.setCmdlineSpecialChar("^", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,4 off=0
+        \\3a 61 62 63 5e 65 66
+        \\
+    );
+
+    // At the end of the line there is nothing to overwrite either way.
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "abc" }}, 3, ':', "", 0, 1, 0);
+    core.grid.setCmdlineSpecialChar("?", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,4 off=0
+        \\3a 61 62 63 3f
+        \\
+    );
+}
+
+test "a block cmdline saves the pre-cmdline cursor, as the single-line path does" {
+    // sendCmdlineHide falls back to this when Neovim does not send
+    // grid_cursor_goto after cmdline_hide (a documented Neovim quirk). The
+    // block path moved the cursor onto the cmdline grid without saving it,
+    // so that fallback restored a stale position from an earlier session.
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    core.grid.cursor_grid = 1;
+    core.grid.cursor_row = 3;
+    core.grid.cursor_col = 7;
+
+    const line0 = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "a" }};
+    try core.grid.setCmdlineBlockShow(&.{&line0});
+    notifyCmdlineChanges(&core);
+
+    try std.testing.expectEqual(@as(i64, 1), core.pre_cmdline_cursor_grid);
+    try std.testing.expectEqual(@as(u32, 3), core.pre_cmdline_cursor_row);
+    try std.testing.expectEqual(@as(u32, 7), core.pre_cmdline_cursor_col);
+}
+
 test "cmdline block output: block lines and the current line" {
     var core = try initCmdlineTestCore();
     defer core.deinitForTest();
@@ -7589,6 +7711,8 @@ test "cmdline block output: block lines and the current line" {
     const line0 = [_]grid_mod.CmdlineChunk{.{ .hl_id = 3, .text = "a\x01b" }};
     const line1 = [_]grid_mod.CmdlineChunk{ .{ .hl_id = 4, .text = "\u{3042}\u{1F44D}" }, .{ .hl_id = 0, .text = "\x7fz" } };
     try core.grid.setCmdlineBlockShow(&.{ &line0, &line1 });
+    // Cursor at pos=1, on the 'あ' after 'q': shift=false overwrites it with
+    // 'x' instead of appending 'x' past the line's end.
     try core.grid.setCmdlineShow(&.{.{ .hl_id = 8, .text = "q\u{3042}" }}, 1, ':', "p", 1, 1, 9);
     core.grid.setCmdlineSpecialChar("x", false, 1);
     notifyCmdlineChanges(&core);
@@ -7596,7 +7720,7 @@ test "cmdline block output: block lines and the current line" {
         \\3x12 cur=2,4 off=0
         \\61:3 5e:3 41:3 62:3
         \\3042:4 0:4 1f44d:4 0:4 5e 3f 7a
-        \\3a 70:9 20 71:8 3042:8 0:8 78
+        \\3a 70:9 20 71:8 78
         \\
     );
 
@@ -7655,6 +7779,22 @@ test "a TAB in a popupmenu item is two spaces, as Neovim's own popupmenu draws i
     for (want, 1..) |cp, col| try std.testing.expectEqual(cp, core.grid.getCellGrid(pgid, 0, @intCast(col)).cp);
     const menu_want = [_]u32{ 'x', ' ', ' ', 'y' };
     for (menu_want, 12..) |cp, col| try std.testing.expectEqual(cp, core.grid.getCellGrid(pgid, 0, @intCast(col)).cp);
+}
+
+test "the popupmenu grid is capped at the screen width, as Neovim's own popupmenu is" {
+    // Neovim's pum_create_scrollbar and pum_redraw stay inside Columns; a
+    // long completion item's menu text must not run the grid past screen_cols.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.grid.screen_cols = 40;
+
+    var items = [_]grid_mod.PopupmenuItem{.{ .word = "w", .menu = "m" ** 200 }};
+    const pgid = grid_mod.POPUPMENU_GRID_ID;
+    try core.grid.setPopupmenuShow(&items, 0, 0, 0, 1);
+    try std.testing.expect(sendPopupmenuShow(&core));
+
+    try std.testing.expect(panelCols(&core, pgid) <= 40);
 }
 
 test "the popupmenu window moves only when the selection leaves it" {

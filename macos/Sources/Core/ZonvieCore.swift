@@ -2449,7 +2449,12 @@ final class ZonvieCore {
         ZonvieCore.appLog("[devcontainer] Starting exec: \(String(cString: cmd))")
 
         applyCoreStartOptions()
-        didStart = zonvie_core_start(core, cmd, rows, cols) == 0
+        let rc = zonvie_core_start(core, cmd, rows, cols)
+        didStart = rc == 0
+        if rc != 0 {
+            failDevcontainerStart("Neovim could not be started (rc=\(rc)).")
+            return
+        }
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
         // here. The rows/cols passed in from ViewController are placeholders
         // (1×1) — calling notify with them would race with the legitimate
@@ -2882,7 +2887,11 @@ final class ZonvieCore {
         if SessionManager.shared.sessions.count > 1 {
             endSession()
         } else {
-            Darwin.exit(1)
+            // Same last-session exit onExitFromNvim uses: the window frame
+            // and UserDefaults must not be lost just because nvim never
+            // started (--dialog, a devcontainer or SSH start failure).
+            ZonvieCore.exitCode = 1
+            stopAppAsLastSession()
         }
     }
 
@@ -3994,6 +4003,8 @@ final class ZonvieCore {
     private func snapMainWindowContentToCell() {
         guard let view = terminalView else { return }
         guard let window = view.window else { return }
+        // Don't fight a maximized/full-screen window's OS-managed size.
+        guard !window.isZoomed, !window.styleMask.contains(.fullScreen) else { return }
         guard let renderer = view.renderer else { return }
         let (cellWPx, cellHPx) = renderer.coreCellPx
         let scale = window.backingScaleFactor
@@ -4015,8 +4026,8 @@ final class ZonvieCore {
 
         let baseWPx = Int((baseContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
         let baseHPx = Int((baseContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
-        let snappedWPx = (baseWPx / cellWPx) * cellWPx
-        let snappedHPx = (baseHPx / cellHPx) * cellHPx
+        let snappedWPx = Int(zonvie_core_snap_terminal_px(UInt32(baseWPx), UInt32(cellWPx)))
+        let snappedHPx = Int(zonvie_core_snap_terminal_px(UInt32(baseHPx), UInt32(cellHPx)))
         if snappedWPx <= 0 || snappedHPx <= 0 { return }
 
         // No-op when the window already holds the target terminal size on both
@@ -4207,23 +4218,31 @@ final class ZonvieCore {
                 return
             }
 
-            if let win = self.terminalView?.window { Self.saveWindowFrame(win) }
-            // Last session (or headless): stop the run loop directly so
-            // app.run() returns to main.swift for Darwin.exit(exitCode).
-            NSApp.stop(nil)
-            let event = NSEvent.otherEvent(
-                with: .applicationDefined,
-                location: .zero,
-                modifierFlags: [],
-                timestamp: 0,
-                windowNumber: 0,
-                context: nil,
-                subtype: 0,
-                data1: 0,
-                data2: 0
-            )
-            if let event { NSApp.postEvent(event, atStart: true) }
+            self.stopAppAsLastSession()
         }
+    }
+
+    /// Ends the process as the last (or only) session: saves the window
+    /// frame, then stops the run loop so app.run() returns to main.swift's
+    /// Darwin.exit(ZonvieCore.getExitCode()), which also flushes UserDefaults
+    /// (a C exit() skips cfprefsd's natural drain). Callers set exitCode
+    /// first; onExitFromNvim already did through its ZonvieCore.exitCode
+    /// assignment above.
+    private func stopAppAsLastSession() {
+        if let win = terminalView?.window { Self.saveWindowFrame(win) }
+        NSApp.stop(nil)
+        let event = NSEvent.otherEvent(
+            with: .applicationDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 0,
+            data1: 0,
+            data2: 0
+        )
+        if let event { NSApp.postEvent(event, atStart: true) }
     }
 
     private var sessionWindowClosed = false
@@ -7472,11 +7491,11 @@ final class ZonvieCore {
 
         // `needed` is the full text size, not the bytes written: the grid can
         // grow between the two calls (grid_mu is released in between).
-        guard needed > 0,
-              let text = String(bytes: buffer[0..<min(Int(needed), buffer.count)], encoding: .utf8) else {
+        guard needed > 0 else {
             ZonvieCore.appLog("[copy_button] gridId=\(gridId) had no text to copy")
             return
         }
+        let text = String(decoding: buffer[0..<min(Int(needed), buffer.count)], as: UTF8.self)
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -8263,7 +8282,7 @@ final class ZonvieCore {
                 let tab = tabs[i]
                 let name: String
                 if let namePtr = tab.name, tab.name_len > 0 {
-                    name = String(bytes: UnsafeBufferPointer(start: namePtr, count: Int(tab.name_len)), encoding: .utf8) ?? ""
+                    name = String(decoding: UnsafeBufferPointer(start: namePtr, count: Int(tab.name_len)), as: UTF8.self)
                 } else {
                     name = ""
                 }

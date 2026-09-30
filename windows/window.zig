@@ -3402,6 +3402,22 @@ pub export fn WndProc(
                 app.last_cursor_rect_px = null;
                 // Always keep rows/cols in sync with current client size on resize.
                 updateRowsColsFromClientForce(hwnd, app);
+
+                // Track the desired terminal content size that
+                // WM_APP_SNAP_MAIN_WINDOW snaps (mirrors macOS's
+                // desiredTermPx). Skip when this WM_SIZE is the echo of our
+                // own snap's SetWindowPos (content matches
+                // last_snapped_content_*_px) so it does not overwrite the
+                // desired size with the already-shrunk result.
+                {
+                    const dcontent = app_mod.contentSizePx(hwnd, app);
+                    if (dcontent.w != app.last_snapped_content_w_px or
+                        dcontent.h != app.last_snapped_content_h_px)
+                    {
+                        app.desired_content_w_px = dcontent.w;
+                        app.desired_content_h_px = dcontent.h;
+                    }
+                }
                 app.mu.unlock(core.clock.io());
 
                 var rc: c.RECT = undefined;
@@ -3817,7 +3833,7 @@ pub export fn WndProc(
                             }
                         },
                         .notification => {
-                            if (app.tray_icon) |*tray| tray.showBalloon("Neovim", dm.text[0..dm.text_len]);
+                            if (app.ensureTray(hwnd)) app.tray_icon.?.showBalloon("Neovim", dm.text[0..dm.text_len]);
                         },
                         // The core draws split itself; its statuses arrive as mini.
                         .split, .none => {},
@@ -4091,9 +4107,19 @@ pub export fn WndProc(
             // would deadlock if invoked from the RPC thread (which already
             // holds grid_mu via handleRedraw).
             //
-            // No-op when the remainder is already zero on both axes, so
-            // this does not interfere with steady-state user resizes.
+            // Snaps app.desired_content_*_px (set from genuine WM_SIZE, see
+            // there), not the live content: chaining a snap onto the previous
+            // snap's already-shrunk result only ever shrinks and never grows
+            // back, since snap(snap(x, c1), c2) <= snap(x, c2). Mirrors
+            // macOS's snapMainWindowContentToCell / desiredTermPx.
+            //
+            // No-op when the window already holds the snapped size, so this
+            // does not interfere with steady-state user resizes.
             if (getApp(hwnd)) |app| {
+                // Do not resize a maximized window: SetWindowPos here would
+                // shrink it while Windows still reports it as zoomed.
+                if (c.IsZoomed(hwnd) != 0) return 0;
+
                 var window_rc: c.RECT = undefined;
                 if (c.GetWindowRect(hwnd, &window_rc) == 0) return 0;
 
@@ -4105,28 +4131,36 @@ pub export fn WndProc(
 
                 // The terminal area, not the whole client: sidebar, titlebar
                 // tabs and an "always" scrollbar keep their size, as in
-                // WM_APP_RESIZE_TO_GRID. Shrinking the window by the content's
-                // remainder removes it; the chrome is unaffected.
+                // WM_APP_RESIZE_TO_GRID.
                 const content = app_mod.contentSizePx(hwnd, app);
-                if (content.w < cell_w or content.h < cell_h) return 0;
-                const rem_w: i32 = @intCast(content.w % cell_w);
-                const rem_h: i32 = @intCast(content.h % cell_h);
-                if (rem_w == 0 and rem_h == 0) return 0;
+                const snap = render_helpers.snapMainWindowOuterSize(
+                    @intCast(window_rc.right - window_rc.left),
+                    @intCast(window_rc.bottom - window_rc.top),
+                    content.w,
+                    content.h,
+                    app.desired_content_w_px,
+                    app.desired_content_h_px,
+                    cell_w,
+                    cell_h,
+                ) orelse return 0;
 
-                const new_outer_w: c_int = (window_rc.right - window_rc.left) - rem_w;
-                const new_outer_h: c_int = (window_rc.bottom - window_rc.top) - rem_h;
+                // Record before SetWindowPos so the WM_SIZE echo it triggers
+                // is recognized there and does not overwrite
+                // desired_content_*_px with this already-snapped result.
+                app.last_snapped_content_w_px = snap.snapped_content_w;
+                app.last_snapped_content_h_px = snap.snapped_content_h;
 
                 if (applog.isEnabled()) applog.appLog(
-                    "[win] WM_APP_SNAP_MAIN_WINDOW: content=({d},{d}) remainder=({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
-                    .{ content.w, content.h, rem_w, rem_h, cell_w, cell_h, new_outer_w, new_outer_h },
+                    "[win] WM_APP_SNAP_MAIN_WINDOW: content=({d},{d}) desired=({d},{d}) snapped=({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
+                    .{ content.w, content.h, app.desired_content_w_px, app.desired_content_h_px, snap.snapped_content_w, snap.snapped_content_h, cell_w, cell_h, snap.outer_w, snap.outer_h },
                 );
                 _ = c.SetWindowPos(
                     hwnd,
                     null,
                     0,
                     0,
-                    new_outer_w,
-                    new_outer_h,
+                    snap.outer_w,
+                    snap.outer_h,
                     c.SWP_NOZORDER | c.SWP_NOMOVE | c.SWP_NOACTIVATE,
                 );
             }
@@ -5993,8 +6027,13 @@ pub export fn WndProc(
             // Explorer restarted and dropped every tray icon: re-add ours.
             if (getApp(hwnd)) |app| {
                 if (msg == app.taskbar_created_msg and app.taskbar_created_msg != 0) {
+                    // Re-adds an icon Explorer dropped; also covers a first
+                    // NIM_ADD that failed because Explorer was not up yet
+                    // (tray_icon exists with added=false, or not yet created).
                     if (app.tray_icon) |*tray| {
-                        if (tray.added) _ = tray.readd();
+                        _ = tray.readd();
+                    } else {
+                        _ = app.ensureTray(hwnd);
                     }
                     return 0;
                 }
