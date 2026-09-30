@@ -1441,7 +1441,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // Publish staged rows and placements under the same app.mu hold.
         var layer_commit_it = app.layer_grids.iterator();
         while (layer_commit_it.next()) |entry| {
-            const applied = entry.value_ptr.*.applyStaged(app.alloc);
+            const applied = entry.value_ptr.*.applyStaged(app.alloc, &app.layer_row_vb_released_bytes);
             std.debug.assert(applied);
         }
         invalidateMovedLayersLocked(app, &app.surf.tbs);
@@ -1471,6 +1471,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         for (app.pending_grid_destroys.items) |grid_id| {
             traceRender(app, "event=destroy_release grid={d} storage_present={}\n", .{ grid_id, app.layer_grids.contains(grid_id) });
             if (app.layer_grids.fetchRemove(grid_id)) |kv| {
+                _ = app.layer_row_vb_released_bytes.fetchAdd(kv.value.releaseRowsFrom(app.alloc, 0), .acq_rel);
                 kv.value.deinit(app.alloc);
                 app.alloc.destroy(kv.value);
             }
@@ -2588,6 +2589,7 @@ pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     if (!app.core_flush_active.load(.acquire)) {
         traceRender(app, "event=destroy_now grid={d}\n", .{grid_id});
         if (app.layer_grids.fetchRemove(grid_id)) |kv| {
+            _ = app.layer_row_vb_released_bytes.fetchAdd(kv.value.releaseRowsFrom(app.alloc, 0), .acq_rel);
             kv.value.deinit(app.alloc);
             app.alloc.destroy(kv.value);
         }

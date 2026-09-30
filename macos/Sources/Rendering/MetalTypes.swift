@@ -2680,7 +2680,8 @@ func ensureSurfaceRowBuffer(
     vertexCount: Int,
     maxRowBuffers: Int,
     allowAllocation: Bool = true,
-    inflightRowBuffers: (MTLBuffer?, MTLBuffer?) = (nil, nil)
+    inflightRowBuffers: (MTLBuffer?, MTLBuffer?) = (nil, nil),
+    onBudgetRefused: () -> Void = {}
 ) -> MTLBuffer? {
     guard row >= 0 && row < maxRowBuffers else { return nil }
     if allowAllocation {
@@ -2807,7 +2808,21 @@ func ensureSurfaceRowBuffer(
                 // Allocate a fresh buffer into the primary slot. Old contents
                 // (if any) are dropped from this set; ARC will eventually
                 // release once other sets drop their COW references.
-                let newBuf = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                // Charged to the process ledger like the provisioner's own
+                // allocations. A refusal is terminal, not an allocation
+                // failure a retry could get past, so the caller is told.
+                let budget = SurfaceRowProvisionBudget.shared
+                var newBuf: MTLBuffer?
+                if let reservation = budget.reserve(bytes: nextCap, bufferCount: 1) {
+                    newBuf = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                    if let newBuf {
+                        _ = budget.complete(reservation, createdBuffers: [newBuf])
+                    } else {
+                        budget.cancel(reservation)
+                    }
+                } else {
+                    onBudgetRefused()
+                }
                 if newBuf == nil {
                     bufferSet.rowState.capacities[row] = 0
                     bufferSet.rowState.buffers[row] = nil
@@ -3105,7 +3120,8 @@ func submitSurfaceRowVertices(
     totalRows: Int,
     totalCols: Int,
     allowAllocation: Bool = true,
-    inflightRowBuffers: (Int) -> (MTLBuffer?, MTLBuffer?) = { _ in (nil, nil) }
+    inflightRowBuffers: (Int) -> (MTLBuffer?, MTLBuffer?) = { _ in (nil, nil) },
+    onBudgetRefused: () -> Void = {}
 ) -> Bool {
     let columnsContracted =
         (sourceSet?.knownTotalCols ?? 0) > totalCols || target.knownTotalCols > totalCols
@@ -3151,7 +3167,8 @@ func submitSurfaceRowVertices(
         vertexCount: count,
         maxRowBuffers: maxRowBuffers,
         allowAllocation: allowAllocation,
-        inflightRowBuffers: inflightRowBuffers(slot)
+        inflightRowBuffers: inflightRowBuffers(slot),
+        onBudgetRefused: onBudgetRefused
     ) else {
         target.rowState.counts[slot] = 0
         return false
