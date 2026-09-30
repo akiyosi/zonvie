@@ -1845,8 +1845,10 @@ ZONVIE_API bool zonvie_core_nvim_arg_is_file(const char *prev, size_t prev_len,
                                              bool after_dash_dash);
 
 /* The cells UTF-8 `text` takes on the grid: 2 per wide (CJK, Hangul,
-   fullwidth) character and per emoji cluster, 2 per control character (^X),
-   1 otherwise. The rule the core lays out the cmdline and messages with.
+   fullwidth) character and per emoji cluster, 2 per control character (^X,
+   a TAB included), 1 otherwise. The rule the core lays out the cmdline with;
+   its message panels run a TAB to the next multiple of 8 and its popupmenu
+   draws it as two spaces.
 
    Pure — no core pointer, no lock. */
 ZONVIE_API uint32_t zonvie_core_display_width(const char *text, size_t len);
@@ -2440,7 +2442,9 @@ typedef struct {
     float timeout;  // auto-hide after this many seconds; 0 = no auto-hide
 } zonvie_route_result;
 
-// Load config from file path.
+// Load config from file path, and apply what the core owns: [performance]
+// cache and atlas sizes (the atlas only before zonvie_core_start) and
+// [input] option_as_meta.
 // Returns 1 on success, 0 on failure.
 ZONVIE_API int zonvie_core_load_config(
     zonvie_core *core,

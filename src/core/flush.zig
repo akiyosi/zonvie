@@ -4814,11 +4814,14 @@ fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
 
 /// One cmdline state's line before horizontal scroll: firstc, prompt, indent,
 /// content (control characters as ^X) and special_char. The single-line and
-/// block paths both measure and write it through this and CmdlineRowWriter.
+/// block paths both measure and write it through this and CellWriter.
 const CmdlineLine = struct {
     width: u32,
     /// Display column of the byte offset `pos`.
     cursor_col: u32,
+    /// Cells of the cluster at `pos` (1 past the end): the window must hold
+    /// all of them, since a cluster is written whole or not at all.
+    cursor_cells: u32,
     /// Caret notation in the content suppresses special_char.
     has_control_chars: bool,
 
@@ -4846,13 +4849,25 @@ const CmdlineLine = struct {
             while (byte_i < text.len and bytes_remaining > 0) {
                 const cluster = scanEmojiCluster(text, byte_i);
                 if (cluster.codepoint_count == 0) break;
-                cursor_col += if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) 2 else cluster.display_width;
+                cursor_col += clusterCells(cluster, .caret, 0);
                 bytes_remaining -|= @intCast(cluster.end_byte - byte_i);
                 byte_i = cluster.end_byte;
             }
             break;
         }
-        return .{ .width = width, .cursor_col = cursor_col, .has_control_chars = has_control_chars };
+
+        var cursor_cells: u32 = 1;
+        var skip: usize = state.pos;
+        for (state.content.items) |chunk| {
+            if (skip >= chunk.text.len) {
+                skip -= chunk.text.len;
+                continue;
+            }
+            const c = scanEmojiCluster(chunk.text, skip);
+            if (c.codepoint_count > 0) cursor_cells = clusterCells(c, .caret, 0);
+            break;
+        }
+        return .{ .width = width, .cursor_col = cursor_col, .cursor_cells = cursor_cells, .has_control_chars = has_control_chars };
     }
 };
 
@@ -4869,11 +4884,12 @@ fn cmdlineGridWidth(g: *const grid_mod.Grid, line_width: u32) u32 {
 }
 
 /// Horizontal scroll of a `width`-column cmdline window: `prev` moves only
-/// when the cursor cell leaves the window, and never past the content's end.
-fn cmdlineScrollOffset(prev: u32, cursor_col: u32, line_width: u32, width: u32) u32 {
+/// when the cursor's `cursor_cells` leave the window, and never past the
+/// content's end.
+fn cmdlineScrollOffset(prev: u32, cursor_col: u32, cursor_cells: u32, line_width: u32, width: u32) u32 {
     var off = prev;
-    if (cursor_col + 1 > off + width) {
-        off = cursor_col + 1 - width;
+    if (cursor_col + cursor_cells > off + width) {
+        off = cursor_col + cursor_cells - width;
     } else if (cursor_col < off) {
         off = cursor_col;
     }
@@ -4881,69 +4897,112 @@ fn cmdlineScrollOffset(prev: u32, cursor_col: u32, line_width: u32, width: u32) 
     return @min(off, max_off);
 }
 
-/// Writes one cmdline grid row left to right, skipping the first
-/// `scroll_offset` display columns. Each write returns false once the row
-/// is full; nothing after that is written.
-const CmdlineRowWriter = struct {
+/// How a TAB is laid out: the cmdline shows ^I; Neovim's own popupmenu draws
+/// two spaces (popupmenu.c pum_redraw, measured with vim_strsize); messages
+/// run to the next multiple of 8, as Neovim's message area does.
+const TabRule = enum { caret, two_spaces, tab_stops };
+
+/// Cells one cluster takes at display column `col` of its text: a TAB by
+/// `tab`, another control character as ^X, else its display width.
+fn clusterCells(c: EmojiCluster, tab: TabRule, col: u32) u32 {
+    if (c.first_cp == '\t') return switch (tab) {
+        .caret, .two_spaces => 2,
+        .tab_stops => 8 - col % 8,
+    };
+    if (c.first_cp < 0x20 or c.first_cp == 0x7F) return 2;
+    return c.display_width;
+}
+
+/// The one text writer for core-drawn grids (cmdline, popupmenu, message
+/// panels): one row, left to right, from `col` up to `limit` (exclusive),
+/// after skipping the first `skip` display columns (the cmdline's horizontal
+/// scroll). A cluster is written whole (NFC-composed, wide ones with their
+/// placeholder) or not at all: one that does not fit ends the row, and one
+/// the skip cuts shows its visible part as spaces. Cells are laid out as
+/// textCells measures them. Each write returns false once the row is full.
+const CellWriter = struct {
     grid: *grid_mod.Grid,
+    grid_id: i64,
     row: u32,
-    scroll_offset: u32,
-    width: u32,
-    logical_col: u32 = 0,
-    grid_col: u32 = 0,
+    col: u32,
+    limit: u32,
+    tab: TabRule,
+    skip: u32 = 0,
+    logical: u32 = 0,
 
-    fn cell(w: *CmdlineRowWriter, cp: u32, hl_id: u32) bool {
-        if (w.logical_col >= w.scroll_offset) {
-            if (w.grid_col >= w.width) return false;
-            w.grid.putCellGrid(grid_mod.CMDLINE_GRID_ID, w.row, w.grid_col, cp, hl_id);
-            w.grid_col += 1;
+    const Take = struct { visible: u32, cut: bool };
+
+    fn take(w: *CellWriter, n: u32) ?Take {
+        const hidden: u32 = if (w.logical >= w.skip) 0 else @min(n, w.skip - w.logical);
+        const visible = n - hidden;
+        if (w.col + visible > w.limit) return null;
+        return .{ .visible = visible, .cut = hidden > 0 and visible > 0 };
+    }
+
+    fn fill(w: *CellWriter, cp: u32, n: u32, hl_id: u32) void {
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            w.grid.putCellGrid(w.grid_id, w.row, w.col, cp, hl_id);
+            w.col += 1;
         }
-        w.logical_col += 1;
+    }
+
+    /// One single-width cell.
+    fn cell(w: *CellWriter, cp: u32, hl_id: u32) bool {
+        const t = w.take(1) orelse return false;
+        if (t.visible == 1) w.fill(cp, 1, hl_id);
+        w.logical += 1;
         return true;
     }
 
-    fn cluster(w: *CmdlineRowWriter, cp: u32, hl_id: u32, extras: []const u32) !bool {
-        if (w.logical_col >= w.scroll_offset) {
-            if (w.grid_col >= w.width) return false;
-            try w.grid.putCellGridCluster(grid_mod.CMDLINE_GRID_ID, w.row, w.grid_col, cp, hl_id, extras);
-            w.grid_col += 1;
-        }
-        w.logical_col += 1;
-        return true;
-    }
-
-    /// Control characters go out as ^X and ^?, the two cells
-    /// countDisplayWidth measures them as.
-    fn text(w: *CmdlineRowWriter, s: []const u8, hl_id: u32) !bool {
+    fn text(w: *CellWriter, s: []const u8, hl_id: u32) !bool {
+        const start = w.logical;
         var byte_i: usize = 0;
         while (byte_i < s.len) {
             const c = scanEmojiCluster(s, byte_i);
             if (c.codepoint_count == 0) break;
-            if (c.first_cp < 0x20 or c.first_cp == 0x7F) {
-                if (!w.cell('^', hl_id)) return false;
-                if (!w.cell(if (c.first_cp == 0x7F) '?' else '@' + c.first_cp, hl_id)) return false;
-            } else {
-                if (!try w.cluster(c.first_cp, hl_id, c.extras[0..c.extras_len])) return false;
-                if (c.display_width >= 2 and !w.cell(0, hl_id)) return false;
+            const n = clusterCells(c, w.tab, w.logical - start);
+            const t = w.take(n) orelse return false;
+            if (t.cut) {
+                w.fill(' ', t.visible, hl_id);
+            } else if (t.visible > 0) {
+                if (c.first_cp == '\t' and w.tab != .caret) {
+                    w.fill(' ', n, hl_id);
+                } else if (c.first_cp < 0x20 or c.first_cp == 0x7F) {
+                    w.fill('^', 1, hl_id);
+                    w.fill(if (c.first_cp == 0x7F) '?' else '@' + c.first_cp, 1, hl_id);
+                } else {
+                    // NFD marks composed where known, so the rasterizer gets
+                    // one precomposed codepoint (U+306F U+3099 -> U+3070);
+                    // otherwise the whole cluster goes out transactionally.
+                    const extras = c.extras[0..c.extras_len];
+                    const cp = if (extras.len > 0) composeNFC(c.first_cp, extras) else c.first_cp;
+                    try w.grid.putCellGridCluster(w.grid_id, w.row, w.col, cp, hl_id, if (cp == c.first_cp) extras else &.{});
+                    w.col += 1;
+                    w.fill(0, n - 1, hl_id);
+                }
             }
+            w.logical += n;
             byte_i = c.end_byte;
         }
         return true;
     }
-
-    fn line(w: *CmdlineRowWriter, state: *const grid_mod.CmdlineState, has_control_chars: bool) !void {
-        if (state.firstc != 0 and !w.cell(state.firstc, 0)) return;
-        if (!try w.text(state.prompt, state.prompt_hl_id)) return;
-        var i: u32 = 0;
-        while (i < state.indent) : (i += 1) {
-            if (!w.cell(' ', 0)) return;
-        }
-        for (state.content.items) |chunk| {
-            if (!try w.text(chunk.text, chunk.hl_id)) return;
-        }
-        if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0);
-    }
 };
+
+/// One cmdline state's line: firstc, prompt, indent, content and
+/// special_char, as CmdlineLine.of measures it.
+fn writeCmdlineLine(w: *CellWriter, state: *const grid_mod.CmdlineState, has_control_chars: bool) !void {
+    if (state.firstc != 0 and !w.cell(state.firstc, 0)) return;
+    if (!try w.text(state.prompt, state.prompt_hl_id)) return;
+    var i: u32 = 0;
+    while (i < state.indent) : (i += 1) {
+        if (!w.cell(' ', 0)) return;
+    }
+    for (state.content.items) |chunk| {
+        if (!try w.text(chunk.text, chunk.hl_id)) return;
+    }
+    if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0);
+}
 
 /// Check for cmdline state changes and create/update/close external float window via Neovim API.
 /// The cmdline is rendered by Neovim in an external float window.
@@ -5031,7 +5090,7 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         const width = cmdlineGridWidth(&self.grid, display_width);
 
         const cursor_display_col = line.cursor_col;
-        const scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_display_col, display_width, width);
+        const scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_display_col, line.cursor_cells, display_width, width);
         state.scroll_offset = scroll_offset;
 
         // Create or resize cmdline grid
@@ -5041,8 +5100,8 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         };
         self.grid.clearGrid(cmdline_grid_id);
 
-        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = 0, .scroll_offset = scroll_offset, .width = width };
-        writer.line(state, line.has_control_chars) catch |e| {
+        var writer: CellWriter = .{ .grid = &self.grid, .grid_id = grid_mod.CMDLINE_GRID_ID, .row = 0, .col = 0, .limit = width, .tab = .caret, .skip = scroll_offset };
+        writeCmdlineLine(&writer, state, line.has_control_chars) catch |e| {
             abortClusterUpdate(self, "cmdline", e);
             return;
         };
@@ -5105,6 +5164,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     }
 
     var cursor_col: u32 = 0;
+    var cursor_cells: u32 = 1;
     var current_has_control_chars = false;
     var current_state: ?*grid_mod.CmdlineState = null;
 
@@ -5115,6 +5175,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
             current_has_control_chars = line.has_control_chars;
             widest = @max(widest, line.width);
             cursor_col = line.cursor_col;
+            cursor_cells = line.cursor_cells;
         }
     }
 
@@ -5123,7 +5184,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     const max_width = cmdlineGridWidth(&self.grid, widest);
     var scroll_offset: u32 = 0;
     if (current_state) |state| {
-        scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_col, widest, max_width);
+        scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_col, cursor_cells, widest, max_width);
         state.scroll_offset = scroll_offset;
         cursor_col -|= scroll_offset;
     }
@@ -5140,7 +5201,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     self.grid.clearGrid(cmdline_grid_id);
 
     for (block_lines, 0..) |line, row_idx| {
-        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = @intCast(row_idx), .scroll_offset = scroll_offset, .width = max_width };
+        var writer: CellWriter = .{ .grid = &self.grid, .grid_id = grid_mod.CMDLINE_GRID_ID, .row = @intCast(row_idx), .col = 0, .limit = max_width, .tab = .caret, .skip = scroll_offset };
         for (line.items) |chunk| {
             const more = writer.text(chunk.text, chunk.hl_id) catch |e| {
                 abortClusterUpdate(self, "cmdline_block", e);
@@ -5151,8 +5212,8 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     }
 
     if (current_state) |state| {
-        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = block_line_count, .scroll_offset = scroll_offset, .width = max_width };
-        writer.line(state, current_has_control_chars) catch |e| {
+        var writer: CellWriter = .{ .grid = &self.grid, .grid_id = grid_mod.CMDLINE_GRID_ID, .row = block_line_count, .col = 0, .limit = max_width, .tab = .caret, .skip = scroll_offset };
+        writeCmdlineLine(&writer, state, current_has_control_chars) catch |e| {
             abortClusterUpdate(self, "cmdline_block", e);
             return false;
         };
@@ -5369,9 +5430,9 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     var max_kind_w: u32 = 0;
     var max_menu_w: u32 = 0;
     for (items) |item| {
-        const ww = textCells(item.word);
-        const kw = textCells(item.kind);
-        const mw = textCells(item.menu);
+        const ww = textCells(item.word, .two_spaces);
+        const kw = textCells(item.kind, .two_spaces);
+        const mw = textCells(item.menu, .two_spaces);
         if (ww > max_word_w) max_word_w = ww;
         if (kw > max_kind_w) max_kind_w = kw;
         if (mw > max_menu_w) max_menu_w = mw;
@@ -5425,14 +5486,14 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 
         // Column layout: | 1 pad | word (max_word_w) | 1 gap | kind (max_kind_w) | 1 gap | menu (max_menu_w) | 1 pad |
         var col: u32 = 1; // left padding
-        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id) catch |e| {
+        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id, .two_spaces) catch |e| {
             abortClusterUpdate(self, "popupmenu", e);
             return false;
         };
 
         if (max_kind_w > 0) {
             col = 1 + max_word_w + 1; // jump to kind column start
-            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id) catch |e| {
+            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id, .two_spaces) catch |e| {
                 abortClusterUpdate(self, "popupmenu", e);
                 return false;
             };
@@ -5440,7 +5501,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 
         if (max_menu_w > 0) {
             col = 1 + max_word_w + (if (max_kind_w > 0) 1 + max_kind_w else @as(u32, 0)) + 1; // jump to menu column start
-            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id) catch |e| {
+            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id, .two_spaces) catch |e| {
                 abortClusterUpdate(self, "popupmenu", e);
                 return false;
             };
@@ -5468,68 +5529,12 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     return true;
 }
 
-/// Write a UTF-8 string to grid cells starting at (row, start_col).
-/// Uses scanEmojiCluster to handle grapheme clusters (including NFD
-/// combining characters like U+306F U+3099 = ば) as single display units.
-/// NFD combining kana voicing marks are composed to NFC so the rasterizer
-/// receives a single precomposed codepoint (e.g., U+3070 ば, not U+306F は).
-/// Cells as textCells measures them: a TAB as spaces to the next multiple of
-/// 8 from `start_col`, as Neovim shows it in messages, other control
-/// characters as ^X and ^?. Returns the column after the last written cell.
-fn writeUtf8ToGrid(self: *Core, grid_id: i64, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) !u32 {
-    if (text.len == 0) return start_col;
-    var col = start_col;
-    var byte_i: usize = 0;
-    while (byte_i < text.len) {
-        const cluster = scanEmojiCluster(text, byte_i);
-        if (cluster.codepoint_count == 0) break;
-        if (cluster.first_cp == '\t') {
-            const next = start_col + ((col - start_col) / 8 + 1) * 8;
-            if (next > col_limit) break;
-            while (col < next) : (col += 1) self.grid.putCellGrid(grid_id, row, col, ' ', hl_id);
-            byte_i = cluster.end_byte;
-            continue;
-        }
-        if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
-            if (col + 2 > col_limit) break;
-            self.grid.putCellGrid(grid_id, row, col, '^', hl_id);
-            self.grid.putCellGrid(grid_id, row, col + 1, if (cluster.first_cp == 0x7F) '?' else '@' + cluster.first_cp, hl_id);
-            col += 2;
-            byte_i = cluster.end_byte;
-            continue;
-        }
-        const dw = cluster.display_width;
-        // Ensure room for the full cluster width (body + placeholders)
-        if (col + dw > col_limit) break;
-
-        // Try NFC composition for NFD combining marks so the rasterizer
-        // gets a single precomposed codepoint.
-        const cp = if (cluster.extras_len > 0)
-            composeNFC(cluster.first_cp, cluster.extras[0..cluster.extras_len])
-        else
-            cluster.first_cp;
-
-        // If NFC composition consumed the extras (cp != base), no overflow
-        // is needed. Otherwise publish the complete cluster transactionally.
-        try self.grid.putCellGridCluster(
-            grid_id,
-            row,
-            col,
-            cp,
-            hl_id,
-            if (cp == cluster.first_cp) cluster.extras[0..cluster.extras_len] else &.{},
-        );
-
-        col += 1;
-        // Fill remaining cells with placeholder (cp=0) for wide characters
-        var p: u32 = 1;
-        while (p < dw) : (p += 1) {
-            self.grid.putCellGrid(grid_id, row, col, 0, hl_id);
-            col += 1;
-        }
-        byte_i = cluster.end_byte;
-    }
-    return col;
+/// Write `text` into (row, start_col..col_limit) through CellWriter, TABs
+/// by `tab`. Returns the column after the last written cell.
+fn writeUtf8ToGrid(self: *Core, grid_id: i64, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32, tab: TabRule) !u32 {
+    var w: CellWriter = .{ .grid = &self.grid, .grid_id = grid_id, .row = row, .col = start_col, .limit = col_limit, .tab = tab };
+    _ = try w.text(text, hl_id);
+    return w.col;
 }
 
 /// Try to compose a base codepoint with combining marks into a single
@@ -6368,7 +6373,7 @@ pub fn buildMsgLineCache(self: *Core) bool {
 
                     // Finish current line (skip leading empty lines)
                     if (current_line.len > 0 or build.items.len > 0) {
-                        max_width = @max(max_width, textCells(current_line.data[0..current_line.len]));
+                        max_width = @max(max_width, textCells(current_line.data[0..current_line.len], .tab_stops));
                         build.append(self.alloc, current_line) catch return false;
                     }
                     current_line = .{};
@@ -6387,7 +6392,7 @@ pub fn buildMsgLineCache(self: *Core) bool {
 
         // Finish last line of this message
         if (current_line.len > 0 or build.items.len == 0) {
-            max_width = @max(max_width, textCells(current_line.data[0..current_line.len]));
+            max_width = @max(max_width, textCells(current_line.data[0..current_line.len], .tab_stops));
             build.append(self.alloc, current_line) catch return false;
         }
     }
@@ -6436,7 +6441,7 @@ fn beginMsgPanelGrid(self: *Core, grid_id: i64, height: u32, width: u32) !void {
 /// and stopping before the right one, by the rule the panel was measured
 /// with (textCells).
 fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) !void {
-    _ = try writeUtf8ToGrid(self, grid_id, row, 1, line, width - 1, 0);
+    _ = try writeUtf8ToGrid(self, grid_id, row, 1, line, width - 1, 0, .tab_stops);
 }
 
 /// Register a message panel as an external grid at the top-right sentinel
@@ -7012,7 +7017,7 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
                 if (copy_len < seg.len) line_full = true;
                 const p = nl orelse break;
                 line_lens[line_count % ring_len] = line_len;
-                max_width = @max(max_width, textCells(line[0..line_len]));
+                max_width = @max(max_width, textCells(line[0..line_len], .tab_stops));
                 line_count += 1;
                 line_len = 0;
                 line_full = false;
@@ -7023,7 +7028,7 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
         prev_line_open = line_len > 0 or line_count == first_line;
         if (prev_line_open) {
             line_lens[line_count % ring_len] = line_len;
-            max_width = @max(max_width, textCells(lines[line_count % ring_len][0..line_len]));
+            max_width = @max(max_width, textCells(lines[line_count % ring_len][0..line_len], .tab_stops));
             line_count += 1;
         }
     }
@@ -7525,9 +7530,10 @@ test "cmdline single-line output: caret notation, wide chars, prompt, indent, sp
         \\
     );
 
-    // Wider than screen_cols: a wide char straddles the left edge.
+    // Wider than screen_cols: a wide char straddles the left edge. Its
+    // visible half is a space, not a bare placeholder cell.
     const long = "a" ++ "\u{3042}" ** 15;
-    const long_row = "0:3" ++ " 3042:3 0:3" ** 9 ++ "\n";
+    const long_row = "20:3" ++ " 3042:3 0:3" ** 9 ++ "\n";
     try core.grid.setCmdlineShow(&.{.{ .hl_id = 3, .text = long }}, long.len, ':', "", 0, 1, 0);
     notifyCmdlineChanges(&core);
     try expectCmdlineGrid(&core, "1x20 cur=0,19 off=13\n" ++ long_row);
@@ -7540,15 +7546,40 @@ test "cmdline single-line output: caret notation, wide chars, prompt, indent, sp
     notifyCmdlineChanges(&core);
     try expectCmdlineGrid(&core, "1x20 cur=0,0 off=2\n3042:3 0:3" ++ " 3042:3 0:3" ** 9 ++ "\n");
 
-    // A caret pair straddles the left edge.
+    // A caret pair straddles the left edge: its visible half is a space too,
+    // not a lone 'A'.
     const carets = "\x01" ** 12;
-    const carets_row = "41:2" ++ " 5e:2 41:2" ** 9 ++ "\n";
+    const carets_row = "20:2" ++ " 5e:2 41:2" ** 9 ++ "\n";
     try core.grid.setCmdlineShow(&.{.{ .hl_id = 2, .text = carets }}, carets.len, ':', "", 0, 1, 0);
     notifyCmdlineChanges(&core);
     try expectCmdlineGrid(&core, "1x20 cur=0,19 off=6\n" ++ carets_row);
     core.grid.setCmdlinePos(5, 1);
     notifyCmdlineChanges(&core);
     try expectCmdlineGrid(&core, "1x20 cur=0,5 off=6\n" ++ carets_row);
+}
+
+test "the cmdline writes clusters by the popupmenu and message panels' rule" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    // A wide char that does not fit the last column is not written: no half
+    // glyph overhangs the cmdline's right edge.
+    const edge = "a" ** 18 ++ "\u{3042}";
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = edge }}, 0, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,1 off=0\n3a" ++ " 61" ** 18 ++ "\n");
+
+    // The cursor on a wide char at the right edge scrolls it into view: the
+    // char is written whole or not at all, so the window must hold all of it.
+    const under = "a" ** 18 ++ "\u{3042}b";
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = under }}, 18, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,18 off=1\n" ++ "61 " ** 18 ++ "3042 0\n");
+
+    // NFD kana are composed, as in the other core-drawn grids.
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "\u{306F}\u{3099}" }}, 0, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try std.testing.expectEqual(@as(u32, 0x3070), core.grid.getCellGrid(grid_mod.CMDLINE_GRID_ID, 0, 1).cp);
 }
 
 test "cmdline block output: block lines and the current line" {
@@ -7604,6 +7635,26 @@ test "cmdline block output: block lines and the current line" {
         \\30:1 31:1 32:1 33:1 34:1 35:1 36:1 37:1 38:1 39:1 3042:1 0:1 5e:1 41:1
         \\
     );
+}
+
+test "a TAB in a popupmenu item is two spaces, as Neovim's own popupmenu draws it" {
+    // popupmenu.c measures items with vim_strsize (TAB = 2) and pum_redraw
+    // puts "  " for a TAB. Message panels run TABs to a tab stop instead; the
+    // popupmenu must not.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    var items = [_]grid_mod.PopupmenuItem{.{ .word = "a\tb", .menu = "x\ty" }};
+    const pgid = grid_mod.POPUPMENU_GRID_ID;
+    try core.grid.setPopupmenuShow(&items, 0, 0, 0, 1);
+    try std.testing.expect(sendPopupmenuShow(&core));
+
+    // | pad | word (min 10) | gap | menu (4 = x, TAB 2, y) | pad |
+    try std.testing.expectEqual(@as(u32, 1 + 10 + 1 + 4 + 1), core.grid.sub_grids.get(pgid).?.cols);
+    const want = [_]u32{ 'a', ' ', ' ', 'b' };
+    for (want, 1..) |cp, col| try std.testing.expectEqual(cp, core.grid.getCellGrid(pgid, 0, @intCast(col)).cp);
+    const menu_want = [_]u32{ 'x', ' ', ' ', 'y' };
+    for (menu_want, 12..) |cp, col| try std.testing.expectEqual(cp, core.grid.getCellGrid(pgid, 0, @intCast(col)).cp);
 }
 
 test "the popupmenu window moves only when the selection leaves it" {
@@ -7798,39 +7849,23 @@ pub fn isWideChar(cp: u32) bool {
     return false;
 }
 
-/// The cells writeUtf8ToGrid writes `s` in: countDisplayWidth, except a TAB
-/// runs to the next multiple of 8 from the start of `s`.
-fn textCells(s: []const u8) u32 {
+/// The cells CellWriter writes `s` in, TABs by `tab`.
+fn textCells(s: []const u8, tab: TabRule) u32 {
     var count: u32 = 0;
     var byte_i: usize = 0;
     while (byte_i < s.len) {
         const cluster = scanEmojiCluster(s, byte_i);
         if (cluster.codepoint_count == 0) break;
-        count = if (cluster.first_cp == '\t')
-            (count / 8 + 1) * 8
-        else if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) count + 2 else count + cluster.display_width;
+        count += clusterCells(cluster, tab, count);
         byte_i = cluster.end_byte;
     }
     return count;
 }
 
-/// Count display width of a UTF-8 string, recognizing emoji clusters.
-/// Control characters (^X) take 2 columns. Emoji clusters take 2 columns.
-/// Wide CJK characters take 2 columns. Everything else takes 1 column.
+/// Count display width of a UTF-8 string, recognizing emoji clusters: the
+/// cmdline's rule (a TAB and other control characters as 2-cell ^X).
 pub fn countDisplayWidth(s: []const u8) u32 {
-    var count: u32 = 0;
-    var byte_i: usize = 0;
-    while (byte_i < s.len) {
-        const cluster = scanEmojiCluster(s, byte_i);
-        if (cluster.codepoint_count == 0) break;
-        if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
-            count += 2; // ^X notation
-        } else {
-            count += cluster.display_width;
-        }
-        byte_i = cluster.end_byte;
-    }
-    return count;
+    return textCells(s, .caret);
 }
 
 /// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
@@ -13542,7 +13577,7 @@ test "a message panel writes clusters and control characters in the cells it mea
     const line = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\x01\tx";
     const mgid = grid_mod.MESSAGE_GRID_ID;
     try seedMsgCacheLine(&core, line);
-    core.msg_cached_max_width = textCells(line);
+    core.msg_cached_max_width = textCells(line, .tab_stops);
     try std.testing.expectEqual(@as(u32, 9), core.msg_cached_max_width);
     try std.testing.expect(renderMsgGridFromCache(&core, 0));
 

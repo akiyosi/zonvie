@@ -324,6 +324,8 @@ pub const TIMER_COPY_BUTTON_REVERT: c.UINT_PTR = 21;
 pub const COPY_BUTTON_REVERT_MS: c.UINT = 800;
 /// One-shot trailing send of a knob drag position the throttle held back.
 pub const TIMER_SCROLLBAR_DRAG_FLUSH: c.UINT_PTR = 22;
+/// One-shot re-read for a copy click whose grid try-lock was busy.
+pub const TIMER_COPY_BUTTON_RETRY: c.UINT_PTR = 23;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 /// Tray icon init delay in milliseconds
@@ -1468,12 +1470,14 @@ pub const TrayIcon = struct {
     nid: c.NOTIFYICONDATAW,
     added: bool = false,
 
+    const icon_flags = c.NIF_ICON | c.NIF_TIP | c.NIF_MESSAGE;
+
     pub fn init(hwnd: c.HWND) TrayIcon {
         var nid: c.NOTIFYICONDATAW = std.mem.zeroes(c.NOTIFYICONDATAW);
         nid.cbSize = @sizeOf(c.NOTIFYICONDATAW);
         nid.hWnd = hwnd;
         nid.uID = 1;
-        nid.uFlags = c.NIF_ICON | c.NIF_TIP | c.NIF_MESSAGE;
+        nid.uFlags = icon_flags;
         nid.uCallbackMessage = WM_APP_TRAY;
         // Zonvie app icon (window class icon, resource ordinal 1) rather than the
         // generic IDI_APPLICATION. Shared HICON (no DestroyIcon needed);
@@ -1490,6 +1494,8 @@ pub const TrayIcon = struct {
     /// window to the tray must check this so they never hide with no icon.
     pub fn add(self: *TrayIcon) bool {
         if (!self.added) {
+            // showBalloon leaves NIF_INFO alone in uFlags.
+            self.nid.uFlags = icon_flags;
             if (c.Shell_NotifyIconW(c.NIM_ADD, &self.nid) == 0) {
                 if (applog.isEnabled()) applog.appLog("[tray] Shell_NotifyIconW(NIM_ADD) failed\n", .{});
                 return false;
@@ -1497,6 +1503,17 @@ pub const TrayIcon = struct {
             self.added = true;
             if (applog.isEnabled()) applog.appLog("[tray] added tray icon\n", .{});
         }
+        return self.added;
+    }
+
+    /// Put the icon back after the shell broadcast TaskbarCreated: after an
+    /// Explorer restart it is gone (NIM_ADD); on a broadcast that kept it,
+    /// NIM_ADD fails and NIM_MODIFY confirms it is still there.
+    pub fn readd(self: *TrayIcon) bool {
+        self.added = false;
+        if (self.add()) return true;
+        self.nid.uFlags = icon_flags;
+        self.added = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid) != 0;
         return self.added;
     }
 
@@ -1539,7 +1556,9 @@ pub const PendingMessageRequest = struct {
     replace_last: u32 = 0, // 1 = replace last message
     append: u32 = 0, // 1 = append to last message
     view_type: zonvie_msg_view_type = .ext_float, // Routing result
-    timeout: f32 = 4.0, // Timeout in seconds
+    timeout_ms: u32 = 4000, // 0 = no auto-hide
+    /// showmode / showcmd / ruler: the status channel; null for msg_show.
+    status: ?MiniWindowId = null,
     /// on_msg_clear, queued in order with the messages: the core resends the
     /// statuses it holds right after the clear.
     clear: bool = false,
@@ -1553,7 +1572,6 @@ pub const DisplayMessage = struct {
     kind_len: usize = 0,
     hl_id: u32 = 0,
     view_type: zonvie_msg_view_type = .ext_float,
-    timeout: f32 = 4.0,
 };
 
 /// Mini window type identifier (for routing)
@@ -2510,6 +2528,8 @@ pub const ExternalWindow = struct {
     // A copy just succeeded, so the button shows a checkmark instead of the
     // copy icon until TIMER_COPY_BUTTON_REVERT fires.
     copy_button_copied: bool = false,
+    // Reads left for the pending copy click (TIMER_COPY_BUTTON_RETRY).
+    copy_attempts_left: u8 = 0,
     // Pointer is over a message surface, reported to the core so it holds the
     // view's auto-hide countdown. Tracked here so an ordinary mouse move does
     // not take the core's grid lock on every WM_MOUSEMOVE.
@@ -3502,10 +3522,11 @@ pub const BaseViewport = struct {
 /// vertices are grid-local pixels against this width, so the cursor overlay
 /// has to build its layer transform from the same number the row pass used.
 pub fn rowModeViewportWidth(g: *d3d11.Renderer, params: RowModeDrawParams) u32 {
-    const vp_x_offset = params.content_x_offset orelse 0;
-    const sidebar_r_w = params.sidebar_right_width orelse 0;
-    const base_w = params.content_width orelse g.width;
-    return if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
+    return render_pipeline_helpers.contentViewportWidthPx(
+        params.content_width orelse g.width,
+        params.content_x_offset orelse 0,
+        params.sidebar_right_width orelse 0,
+    );
 }
 
 /// How far a row-shift hint moved this layer row's vertices from where they
@@ -5281,8 +5302,8 @@ pub const App = struct {
     message_window: ?MessageWindow = null,
     pending_messages: std.ArrayListUnmanaged(PendingMessageRequest) = .empty,
     display_messages: std.ArrayListUnmanaged(DisplayMessage) = .empty, // Stack of visible messages
-    /// showmode / showcmd / ruler routed to ext_float, by channel
-    /// (messages.statusChannel). UI thread.
+    /// showmode / showcmd / ruler routed to ext_float, indexed by
+    /// MiniWindowId. UI thread.
     status_messages: [3]?DisplayMessage = .{ null, null, null },
 
     // ext_tabline state
@@ -5706,6 +5727,9 @@ pub const App = struct {
 
     // Tray icon for OS notification (balloon notification)
     tray_icon: ?TrayIcon = null,
+    // RegisterWindowMessageW("TaskbarCreated"): the shell broadcasts it after
+    // Explorer restarts, which drops every notification icon. 0 = unregistered.
+    taskbar_created_msg: c.UINT = 0,
 
     d3d_init_thread: ?std.Thread = null,
     // Set before teardown joins d3d_init_thread. The worker owns any device it
@@ -5713,6 +5737,14 @@ pub const App = struct {
     d3d_init_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const AtlasResetAdmission = render_pipeline_helpers.AtlasResetAdmission;
+
+    /// Create the tray icon on first use, then register it. Never replaces an
+    /// existing TrayIcon: a fresh one would reset `added` and its NIM_ADD for
+    /// the same (hwnd, uID) would fail. Returns whether the icon is present.
+    pub fn ensureTray(self: *App, hwnd: c.HWND) bool {
+        if (self.tray_icon == null) self.tray_icon = TrayIcon.init(hwnd);
+        return self.tray_icon.?.add();
+    }
 
     /// Height of one grid row: the cell plus 'linespace'. Neovim allows
     /// 'linespace' to be negative to tighten rows under a font that reserves

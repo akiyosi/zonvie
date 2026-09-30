@@ -189,13 +189,8 @@ fn forwardedDropPaths(app: *App, corep: *app_mod.zonvie_core, payload: []const u
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
 const loadSystemCursor = input.loadSystemCursor;
 
-fn messageTimerMilliseconds(timeout_sec: f32) c.UINT {
-    if (!std.math.isFinite(timeout_sec) or timeout_sec <= 0) return 0;
-
-    const timeout_ms = @as(f64, timeout_sec) * 1000.0;
-    const max_timeout_ms: c.UINT = @intCast(c.USER_TIMER_MAXIMUM);
-    if (timeout_ms >= @as(f64, @floatFromInt(max_timeout_ms))) return max_timeout_ms;
-    return @intFromFloat(timeout_ms);
+fn messageTimerMilliseconds(timeout_ms: u32) c.UINT {
+    return @min(timeout_ms, @as(u32, c.USER_TIMER_MAXIMUM));
 }
 
 // DWM titlebar immersive-dark-mode attribute. Defined locally so the code
@@ -675,7 +670,6 @@ const BufferEntry = app_mod.BufferEntry;
 const MiniWindowId = app_mod.MiniWindowId;
 const MiniWindowState = app_mod.MiniWindowState;
 const MessageWindow = app_mod.MessageWindow;
-const TrayIcon = app_mod.TrayIcon;
 const PendingMessageRequest = app_mod.PendingMessageRequest;
 const DisplayMessage = app_mod.DisplayMessage;
 const ScrollbarGeometry = app_mod.ScrollbarGeometry;
@@ -1606,12 +1600,7 @@ fn loadConfigAndApplyCoreOptions(app: *App) void {
     if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
     core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
     core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
-    core.zonvie_core_set_glyph_cache_size(
-        app.corep,
-        app.config.performance.glyph_cache_ascii_size,
-        app.config.performance.glyph_cache_non_ascii_size,
-    );
-    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+    // [performance] sizes: zonvie_core_load_config.
 }
 
 fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
@@ -1906,6 +1895,7 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 app.hwnd = hwnd;
                 app.ui_thread_id = c.GetCurrentThreadId();
+                app.taskbar_created_msg = c.RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarCreated"));
 
                 // Set DPI scale early so that any scalePx() calls before
                 // WM_APP_DEFERRED_INIT (e.g. WM_NCHITTEST, initial layout)
@@ -2368,10 +2358,12 @@ pub export fn WndProc(
                         null;
                     const content_x_offset_i32: i32 = if (content_x_offset) |off| @intCast(off) else 0;
                     const content_y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                    const content_right_i32: i32 = if (content_width) |cw|
-                        content_x_offset_i32 + @as(i32, @intCast(cw))
-                    else
-                        client_for_content.right;
+                    const content_right_i32 = render_helpers.mainContentRightPx(
+                        content_width,
+                        client_width_u32,
+                        content_x_offset orelse 0,
+                        sidebar_right_width orelse 0,
+                    );
 
                     // Snap viewport height to cell boundaries to match core's NDC calculation.
                     // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
@@ -3738,7 +3730,6 @@ pub export fn WndProc(
                     dm.kind_len = req.kind_len;
                     dm.hl_id = req.hl_id;
                     dm.view_type = req.view_type;
-                    dm.timeout = req.timeout;
 
                     // Process based on view_type (each message is routed individually)
                     switch (req.view_type) {
@@ -3750,7 +3741,7 @@ pub export fn WndProc(
 
                             // Set auto-hide timer based on timeout (use separate timer for mini)
                             _ = c.KillTimer(hwnd, TIMER_MINI_AUTOHIDE);
-                            const timeout_ms = messageTimerMilliseconds(dm.timeout);
+                            const timeout_ms = messageTimerMilliseconds(req.timeout_ms);
                             if (timeout_ms > 0) {
                                 _ = c.SetTimer(hwnd, TIMER_MINI_AUTOHIDE, timeout_ms, null);
                             }
@@ -3776,11 +3767,11 @@ pub export fn WndProc(
                             // Confirm dialogs don't auto-hide (only kill message window timer, not mini)
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
-                        .ext_float => if (messages.statusChannel(kind_str)) |channel| {
+                        .ext_float => if (req.status) |status| {
                             // showmode/showcmd/ruler are state, not a log: each
                             // channel keeps its latest text and joins the toast
                             // below the stack without timing out.
-                            app.status_messages[channel] = if (dm.text_len == 0) null else dm;
+                            app.status_messages[@intFromEnum(status)] = if (dm.text_len == 0) null else dm;
                             messages.refreshToast(app);
                         } else {
                             // Floating window: the display stack. The rule is
@@ -3819,7 +3810,7 @@ pub export fn WndProc(
                             if (!messages.messageWindowIsConfirm(app)) {
                                 messages.showMessageWindowOnUIThread(app, dm, append_failed);
                                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                                const timeout_ms = messageTimerMilliseconds(dm.timeout);
+                                const timeout_ms = messageTimerMilliseconds(req.timeout_ms);
                                 if (timeout_ms > 0) {
                                     _ = c.SetTimer(hwnd, TIMER_MSG_AUTOHIDE, timeout_ms, null);
                                 }
@@ -4463,10 +4454,7 @@ pub export fn WndProc(
             } else if (wParam == TIMER_TRAY_INIT) {
                 _ = c.KillTimer(hwnd, TIMER_TRAY_INIT);
                 if (getApp(hwnd)) |app| {
-                    app.tray_icon = TrayIcon.init(hwnd);
-                    if (app.tray_icon) |*tray| {
-                        _ = tray.add();
-                    }
+                    _ = app.ensureTray(hwnd);
                     if (applog.isEnabled()) applog.appLog("[win] TIMER_TRAY_INIT: tray icon initialized\n", .{});
                 }
             } else if (wParam == TIMER_QUIT_TIMEOUT) {
@@ -4678,14 +4666,11 @@ pub export fn WndProc(
                     // A modal dialog would suspend the recovery loop until
                     // dismissed. Use the existing non-blocking tray channel so
                     // the next rebuild attempt starts immediately.
-                    if (app.tray_icon == null) app.tray_icon = TrayIcon.init(hwnd);
-                    if (app.tray_icon) |*tray| {
-                        if (tray.add()) {
-                            tray.showBalloon(
-                                "Zonvie",
-                                "GPU recovery is taking longer than expected. Zonvie will keep retrying; restart the app if the problem persists.",
-                            );
-                        }
+                    if (app.ensureTray(hwnd)) {
+                        app.tray_icon.?.showBalloon(
+                            "Zonvie",
+                            "GPU recovery is taking longer than expected. Zonvie will keep retrying; restart the app if the problem persists.",
+                        );
                     }
                 }
                 if (applog.isEnabled()) applog.appLog("[win] device-lost recovery attempt {d}\n", .{app.device_lost_recover_attempts});
@@ -5775,9 +5760,7 @@ pub export fn WndProc(
                     // cannot be added, do NOT hide — fall through to a normal quit
                     // so the process is never left behind an invisible window with
                     // no way back.
-                    if (app.tray_icon == null) app.tray_icon = TrayIcon.init(hwnd);
-                    const tray_ready = if (app.tray_icon) |*tray| tray.add() else false;
-                    if (tray_ready) {
+                    if (app.ensureTray(hwnd)) {
                         _ = c.ShowWindow(hwnd, c.SW_HIDE);
                         if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: hidden to tray (close_to_tray)\n", .{});
                         return 0;
@@ -6006,7 +5989,17 @@ pub export fn WndProc(
             return 0;
         },
 
-        else => {},
+        else => {
+            // Explorer restarted and dropped every tray icon: re-add ours.
+            if (getApp(hwnd)) |app| {
+                if (msg == app.taskbar_created_msg and app.taskbar_created_msg != 0) {
+                    if (app.tray_icon) |*tray| {
+                        if (tray.added) _ = tray.readd();
+                    }
+                    return 0;
+                }
+            }
+        },
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 }

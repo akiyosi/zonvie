@@ -29,6 +29,70 @@ test "device-loss recovery warning is one-shot and does not stop retries" {
     try std.testing.expect(!helpers.shouldWarnDeviceLostRecovery(5, true));
 }
 
+// Drives one copy click: reads until the lock is free at read `free_at`
+// (0 = never), returning the number of reads made and whether one copied.
+fn simulateCopyClick(free_at: u32) struct { reads: u32, copied: bool } {
+    var attempts_left = helpers.copy_text_max_attempts;
+    var reads: u32 = 0;
+    while (true) {
+        reads += 1;
+        if (reads == free_at) return .{ .reads = reads, .copied = true };
+        if (!helpers.copyTextRetryAfterBusy(&attempts_left)) return .{ .reads = reads, .copied = false };
+    }
+}
+
+// Expected values are macOS copyDecoratedGridContent's: attemptsLeft: 5,
+// `guard attemptsLeft > 1` before re-arming, asyncAfter(.now() + 0.02).
+test "copy button retries a busy grid lock like macOS: 5 reads, 20 ms apart" {
+    try std.testing.expectEqual(@as(u32, 20), helpers.copy_text_retry_interval_ms);
+
+    const first = simulateCopyClick(1);
+    try std.testing.expect(first.copied);
+    try std.testing.expectEqual(@as(u32, 1), first.reads);
+
+    // The lock frees on the second read: macOS copies, so must Windows.
+    const second = simulateCopyClick(2);
+    try std.testing.expect(second.copied);
+    try std.testing.expectEqual(@as(u32, 2), second.reads);
+
+    const last = simulateCopyClick(5);
+    try std.testing.expect(last.copied);
+    try std.testing.expectEqual(@as(u32, 5), last.reads);
+
+    // A lock that frees only on a sixth read is past macOS's budget.
+    const late = simulateCopyClick(6);
+    try std.testing.expect(!late.copied);
+    try std.testing.expectEqual(@as(u32, 5), late.reads);
+
+    const never = simulateCopyClick(0);
+    try std.testing.expect(!never.copied);
+    try std.testing.expectEqual(@as(u32, 5), never.reads);
+}
+
+// The row scissor must end where d3d11_renderer.drawEx's viewport ends:
+// viewport_x = content_x_offset, viewport_w = base - x_offset - sidebar_right,
+// base = content_width orelse the renderer (client) width.
+test "main paint row scissor right edge is the drawEx viewport's right edge" {
+    const Case = struct { cw: ?u32, client_w: u32, x_off: u32, side_r: u32, right: i32 };
+    const cases = [_]Case{
+        .{ .cw = null, .client_w = 1000, .x_off = 0, .side_r = 0, .right = 1000 },
+        // "always" scrollbar (12 px strip) only.
+        .{ .cw = 988, .client_w = 1000, .x_off = 0, .side_r = 0, .right = 988 },
+        // Left sidebar + "always" scrollbar: the sidebar is not counted twice.
+        .{ .cw = 988, .client_w = 1000, .x_off = 200, .side_r = 0, .right = 988 },
+        // Right sidebar without a scrollbar ends the viewport at its left edge.
+        .{ .cw = null, .client_w = 1000, .x_off = 0, .side_r = 150, .right = 850 },
+        .{ .cw = 988, .client_w = 1000, .x_off = 0, .side_r = 150, .right = 838 },
+    };
+    for (cases) |k| {
+        try std.testing.expectEqual(k.right, helpers.mainContentRightPx(k.cw, k.client_w, k.x_off, k.side_r));
+        try std.testing.expectEqual(
+            k.right,
+            @as(i32, @intCast(k.x_off + helpers.contentViewportWidthPx(k.cw orelse k.client_w, k.x_off, k.side_r))),
+        );
+    }
+}
+
 test "GPU buffer growth is geometric and bounded" {
     const max_bytes: usize = 64 * 1024 * 1024;
     try std.testing.expectEqual(@as(usize, 4096), helpers.geometricBufferCapacity(0, 1, max_bytes).?);

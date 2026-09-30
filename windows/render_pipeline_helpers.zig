@@ -157,6 +157,22 @@ pub fn retryEpochNeedsArm(failure_epoch: u64, success_epoch: u64, consumed_failu
     return failure_epoch > success_epoch and failure_epoch > consumed_failure_epoch;
 }
 
+/// Copy-button grid-text reads per click while the core's try-lock is busy
+/// (macOS copyDecoratedGridContent: attemptsLeft 5, 20 ms apart).
+pub const copy_text_max_attempts: u8 = 5;
+pub const copy_text_retry_interval_ms: u32 = 20;
+
+/// Consume the attempt that just hit a busy lock. True: arm another read
+/// copy_text_retry_interval_ms later. False: give up (the click is dropped).
+pub fn copyTextRetryAfterBusy(attempts_left: *u8) bool {
+    if (attempts_left.* <= 1) {
+        attempts_left.* = 0;
+        return false;
+    }
+    attempts_left.* -= 1;
+    return true;
+}
+
 /// Lifetime pins for Win32 operations whose underlying API may pump messages.
 /// Keeping the predicate platform-independent makes it testable without a
 /// live D3D device while App remains the owner of the concrete flags.
@@ -781,6 +797,17 @@ pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
         else
             0,
     };
+}
+
+/// Width of the content viewport drawEx binds at x_offset. `base_w` is a right
+/// edge measured from x=0 (the client width, less an "always" scrollbar).
+pub fn contentViewportWidthPx(base_w: u32, x_offset: u32, sidebar_right_w: u32) u32 {
+    return if (base_w > x_offset + sidebar_right_w) base_w - x_offset - sidebar_right_w else 1;
+}
+
+/// Right edge of the main paint's row scissors: the viewport's right edge.
+pub fn mainContentRightPx(content_width: ?u32, client_w: u32, x_offset: u32, sidebar_right_w: u32) i32 {
+    return @intCast(x_offset + contentViewportWidthPx(content_width orelse client_w, x_offset, sidebar_right_w));
 }
 
 pub const PaintPolicyInputs = struct {
