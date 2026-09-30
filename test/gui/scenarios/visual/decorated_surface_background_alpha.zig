@@ -258,14 +258,20 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
     // that captured a uniform rectangle, would otherwise satisfy the
     // overshoot assertion for the wrong reason.
     if (p.fg == p.bg) return error.NoTextRendered;
-    if (p.fg_px < min_fg_px) return error.TooLittleTextRendered;
+    const scale = @as(f64, @floatFromInt(img.w)) / cmd_win.bounds.w;
+    const min_fg_px: u32 = @intFromFloat(min_fg_px_2x * scale * scale / 4);
+    if (p.fg_px < min_fg_px) {
+        std.debug.print("[gui] {s}: {d} text pixels, need {d} at scale {d:.1}\n", .{ tag, p.fg_px, min_fg_px, scale });
+        return error.TooLittleTextRendered;
+    }
     return p;
 }
 
 /// Thirty 'l' stems at Menlo:h13 measure 1916 pixels at the text mode in
-/// both arms. A tenth of that is far below any run that drew the text and
-/// far above a blank or uniform capture.
-const min_fg_px: u32 = 190;
+/// both arms on a 2x display. A tenth of that is far below any run that drew
+/// the text and far above a blank or uniform capture. It scales with the
+/// area: a 1x display (the CI runner) measured 189.
+const min_fg_px_2x: f64 = 190;
 
 /// Floor for every row's panel luminance. Measured 228 in the no-shader arm
 /// and 240 in the shader arm, against 0 for the rows of the black text area
