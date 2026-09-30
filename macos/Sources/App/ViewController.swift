@@ -166,8 +166,8 @@ final class ViewController: NSViewController {
     }
 
     /// Present the interactive connection chooser (`--dialog`). On Connect the
-    /// chosen ConnectionConfig drives `core.start()`; on Cancel the app quits
-    /// (the user launched the picker deliberately and declined to connect).
+    /// chosen ConnectionConfig drives `core.start()`; on Cancel the session
+    /// ends (the app quits if it was the last one).
     private func presentConnectionDialog() {
         let menu = ConnectionMenuViewController()
         // `--ssh --dialog` / `--devcontainer --dialog`: seed the CLI startup
@@ -180,16 +180,10 @@ final class ViewController: NSViewController {
             self?.startWithConnection(cfg)
         }
         menu.onCancel = { [weak self] in
-            guard let self = self else { return }
-            if self.forceConnectDialog {
-                // New Session window cancelled: close just this window.
-                ZonvieCore.appLog("[ViewController] New Session cancelled: closing window")
-                self.view.window?.close()
-            } else {
-                // The user launched the picker deliberately and declined: quit.
-                ZonvieCore.appLog("[ViewController] --dialog: dialog cancelled, terminating")
-                AppDelegate.terminateApp()
-            }
+            // Other sessions may have started meanwhile (Cmd+N is not blocked
+            // by the sheet): end only this one unless it is the last.
+            ZonvieCore.appLog("[ViewController] connection dialog cancelled: ending session")
+            self?.core.endSession()
         }
         presentAsSheet(menu)
     }
@@ -255,14 +249,16 @@ final class ViewController: NSViewController {
     }
 
     /// Surface a synchronous start() / start_connect() failure to the user
-    /// and terminate. The C ABI returns 0 on success, -1 invalid handle,
-    /// -2 thread spawn failed, -3 invalid/unsupported listen address. In
+    /// and end the session (exit(1) if it is the only one). The C ABI returns
+    /// 0 on success, -1 invalid handle, -2 thread spawn failed,
+    /// -3 invalid/unsupported listen address. In
     /// every failure case the core thread did NOT start and on_exit will
     /// not fire, so without explicit handling the window would remain
     /// open with no backing nvim — the user sees an empty zombie window.
     private func handleCoreStartFailure(rc: Int32, context: String) {
-        ZonvieCore.appLog("[start] core start failed rc=\(rc) context=\(context); terminating")
+        ZonvieCore.appLog("[start] core start failed rc=\(rc) context=\(context)")
         DispatchQueue.main.async {
+            let lastSession = SessionManager.shared.sessions.count <= 1
             let alert = NSAlert()
             alert.messageText = "Zonvie failed to start"
             let reason: String
@@ -274,8 +270,13 @@ final class ViewController: NSViewController {
             }
             alert.informativeText = "\(reason)\nContext: \(context)."
             alert.alertStyle = .critical
-            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: lastSession ? "Quit" : "Close")
             _ = alert.runModal()
+            if SessionManager.shared.sessions.count > 1 {
+                ZonvieCore.appLog("[start] handleCoreStartFailure: ending this session only")
+                self.core.endSession()
+                return
+            }
             // Use Darwin.exit(1) instead of NSApp.terminate(nil) so the
             // shell sees a non-zero exit code for fatal startup failures.
             // NSApp.terminate(nil) runs the normal AppKit teardown and

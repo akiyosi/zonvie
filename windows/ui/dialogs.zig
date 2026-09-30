@@ -79,10 +79,14 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     _ = c.SetConsoleMode(hConsoleIn, console_mode & ~@as(c.DWORD, c.ENABLE_ECHO_INPUT));
 
     // Read password
-    var password_buf: [256]u8 = undefined;
+    var password_w: [256]u16 = undefined;
+    defer std.crypto.secureZero(u16, &password_w);
+    // Every UTF-16 unit takes at most 3 UTF-8 bytes.
+    var password_buf: [password_w.len * 3]u8 = undefined;
     defer std.crypto.secureZero(u8, &password_buf);
-    var read: c.DWORD = 0;
-    _ = c.ReadConsoleA(hConsoleIn, &password_buf, 255, &read, null);
+    var read_w: c.DWORD = 0;
+    _ = c.ReadConsoleW(hConsoleIn, &password_w, password_w.len, &read_w, null);
+    const read = std.unicode.utf16LeToUtf8(&password_buf, password_w[0..@min(read_w, password_w.len)]) catch 0;
 
     // Restore console mode
     _ = c.SetConsoleMode(hConsoleIn, console_mode);
