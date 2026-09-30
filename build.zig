@@ -710,10 +710,10 @@ pub fn build(b: *std.Build) !void {
 
     // GUI test driver (macOS and Windows hosts): launches the REAL zonvie
     // app against a shared `nvim --listen` server and observes OS windows
-    // (CGWindowList / EnumWindows). Local-only (real windows appear);
-    // `zig build gui-test` on the respective host.
+    // (CGWindowList / EnumWindows). Real windows appear; `zig build gui-test`
+    // on the respective host, locally, or on the Windows CI runner.
     if (host_os == .macos or host_os == .windows) {
-        const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (local only)");
+        const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (real windows appear)");
         const gui_mod = b.createModule(.{
             .target = target,
             .optimize = optimize,

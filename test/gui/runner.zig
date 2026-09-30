@@ -1,19 +1,31 @@
 // runner.zig — entrypoint for `zig build gui-test` (macOS and Windows hosts).
 //
 // Launches the REAL zonvie app: windows will appear on the current
-// desktop while tests run. Local-only; skips cleanly when the app build
-// or nvim is missing.
+// desktop while tests run. Skips cleanly when the app build or nvim is
+// missing, unless ZONVIE_GUI_REQUIRE is set (the Windows CI job).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const driver = @import("driver.zig");
 const testing = std.testing;
 
+/// CI sets ZONVIE_GUI_REQUIRE so a runner without nvim or the app fails
+/// instead of passing with nothing tested.
+fn missingPrereq() error{ SkipZigTest, GuiPrereqMissing } {
+    if (std.process.Environ.getAlloc(testing.environ, testing.allocator, "ZONVIE_GUI_REQUIRE")) |required| {
+        testing.allocator.free(required);
+        std.debug.print("[gui] ZONVIE_GUI_REQUIRE is set: failing\n", .{});
+        return error.GuiPrereqMissing;
+    } else |_| {}
+    std.debug.print("[gui] skipped\n", .{});
+    return error.SkipZigTest;
+}
+
 fn requirePrereqs() !void {
     const nvim = driver.resolveNvim(testing.allocator) catch |e| switch (e) {
         error.NvimNotFound => {
-            std.debug.print("[gui] skipped: nvim not found (set ZONVIE_TEST_NVIM)\n", .{});
-            return error.SkipZigTest;
+            std.debug.print("[gui] nvim not found (set ZONVIE_TEST_NVIM)\n", .{});
+            return missingPrereq();
         },
         else => return e,
     };
@@ -21,10 +33,10 @@ fn requirePrereqs() !void {
     const app = driver.resolveApp(testing.allocator) catch |e| switch (e) {
         error.AppNotFound => {
             std.debug.print(
-                "[gui] skipped: zonvie app not built at {s} (set ZONVIE_TEST_APP or build it first)\n",
+                "[gui] zonvie app not built at {s} (set ZONVIE_TEST_APP or build it first)\n",
                 .{driver.default_app_rel_path},
             );
-            return error.SkipZigTest;
+            return missingPrereq();
         },
         else => return e,
     };
