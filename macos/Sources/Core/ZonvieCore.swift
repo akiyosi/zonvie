@@ -782,7 +782,8 @@ final class ZonvieCore {
                 let fl = flags
                 let tr = Int(totalRows)
                 let tc = Int(totalCols)
-                let isCursorUpdate = VertexRowUpdate(flags: fl) == .cursorOnly
+                let update = VertexRowUpdate(flags: fl)
+                let isCursorUpdate = update == .cursorOnly
 
                 // Set by whichever route accepted the work. guicursor carries a
                 // blink cadence per mode, so a cursor update has to refresh it,
@@ -820,24 +821,30 @@ final class ZonvieCore {
                     // the same two questions with the same argument types.
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=1 grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
                     guard let renderer = core.terminalView?.renderer, core.beginMainFlushIfNeeded() else { return }
-                    if isCursorUpdate {
+                    switch update {
+                    case .main:
+                        renderer.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
+                            count: Int(vertCount), totalRows: tr, totalCols: tc)
+                    case .cursorOnly:
                         // The surface draws one cursor; remember which layer it
                         // belongs to so it is placed with that layer's transform.
                         renderer.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
-                    } else {
-                        renderer.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
-                            count: Int(vertCount), totalRows: tr, totalCols: tc)
+                    case .none:
+                        break
                     }
                     delivered = true
 
                 case .externalLayer(let hostView):
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=\(hostView.gridId) grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
                     guard core.beginExternalFlushIfNeeded(hostView) else { return }
-                    if isCursorUpdate {
-                        hostView.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
-                    } else {
+                    switch update {
+                    case .main:
                         hostView.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
                             count: Int(vertCount), totalRows: tr, totalCols: tc)
+                    case .cursorOnly:
+                        hostView.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
+                    case .none:
+                        break
                     }
                     delivered = true
                 case .externalRoot(let gridView):
@@ -857,25 +864,14 @@ final class ZonvieCore {
                         )
                         // First-row config (UI work) deferred to main thread
                         if rs == 0 && !isCursorUpdate {
-                            // Extract four scalar color components while the
-                            // callback pointer is valid. Copying the entire row
-                            // here allocated on the grid_mu redraw hot path and
-                            // retained that allocation in the main queue.
-                            // Configured even when the row carries no
-                            // background quad: under blur the core drops the
-                            // default-background runs of a surface root that
-                            // hosts a float, and skipping the configuration
-                            // then left the window's background unset (black).
-                            let background = ZonvieCore.extractExternalGridBackground(
-                                verts: verts,
-                                vertCount: Int(vertCount)
-                            )
+                            // Size only: a normal grid's background is the
+                            // core's default bg (resolveHlGroupBgColor), never
+                            // row 0's quads, which the core drops under blur.
                             DispatchQueue.main.async { [weak core] in
                                 guard let core = core else { return }
                                 core.configureExternalGridFromRow(
                                     gridId: gridId,
                                     gridView: gridView,
-                                    background: background,
                                     rows: totalRows,
                                     cols: totalCols
                                 )
@@ -1025,31 +1021,13 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onCmdlineHide(level: level)
             },
-            on_cmdline_pos: { ctx, pos, level in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onCmdlinePos(pos: pos, level: level)
-            },
-            on_cmdline_special_char: { ctx, c, cLen, shift, level in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onCmdlineSpecialChar(c: c, cLen: cLen, shift: shift != 0, level: level)
-            },
-            on_cmdline_block_show: { ctx, lines, lineCount in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onCmdlineBlockShow(lines: lines, lineCount: lineCount)
-            },
-            on_cmdline_block_append: { ctx, line, chunkCount in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onCmdlineBlockAppend(line: line, chunkCount: chunkCount)
-            },
-            on_cmdline_block_hide: { ctx in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onCmdlineBlockHide()
-            },
+            // The core never invokes these five: cmdline state reaches the
+            // screen as CMDLINE_GRID_ID, composed by flush.
+            on_cmdline_pos: nil,
+            on_cmdline_special_char: nil,
+            on_cmdline_block_show: nil,
+            on_cmdline_block_append: nil,
+            on_cmdline_block_hide: nil,
             // ext_popupmenu callbacks
             on_popupmenu_show: { ctx, items, itemCount, selected, row, col, gridId, colors in
                 guard let ctx else { return }
@@ -1061,11 +1039,8 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onPopupmenuHide()
             },
-            on_popupmenu_select: { ctx, selected in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onPopupmenuSelect(selected: selected)
-            },
+            // The core never invokes it.
+            on_popupmenu_select: nil,
             // ext_messages callbacks
             on_msg_show: { ctx, view, kind, kindLen, chunks, chunkCount, replaceLast, history, append, msgId, timeoutMs in
                 guard let ctx else { return }
@@ -1771,8 +1746,9 @@ final class ZonvieCore {
 
     /// Close a session whose start was requested but whose nvim cannot answer
     /// yet: a queued start or devcontainer exec is dropped, a devcontainer
-    /// poll stops waiting (its `devcontainer up` runs on), and deinit stops
-    /// anything already spawned once the window releases the ViewController.
+    /// poll only cleans up once `up` (which runs on) finishes, 30 minutes at
+    /// most, and deinit stops anything already spawned once the window
+    /// releases the ViewController.
     func cancelPendingStart(window win: NSWindow) {
         startCancelledFlag.withLock { $0 = true }
         progressWindow?.close()
@@ -2320,8 +2296,7 @@ final class ZonvieCore {
 
             if !dockerReady {
                 DispatchQueue.main.async { [weak self] in
-                    self?.updateProgressLabel("Error: Docker failed to start")
-                    self?.progressSpinner?.stopAnimation(nil)
+                    self?.failDevcontainerStart("Docker failed to start.")
                 }
                 return
             }
@@ -2378,8 +2353,7 @@ final class ZonvieCore {
             } catch {
                 ZonvieCore.appLog("[devcontainer] Process error: \(error.localizedDescription)")
                 DispatchQueue.main.async { [weak self] in
-                    self?.updateProgressLabel("Error: \(error.localizedDescription)")
-                    self?.progressSpinner?.stopAnimation(nil)
+                    self?.failDevcontainerStart(error.localizedDescription)
                 }
                 return
             }
@@ -2432,24 +2406,28 @@ final class ZonvieCore {
                     ZonvieCore.appLog("[devcontainer] up failed. Output tail:\n\(tail)")
 
                     DispatchQueue.main.async { [weak self] in
-                        guard let self = self, !self.startCancelled else { return }
-                        self.hideDevcontainerProgress()
-                        let alert = NSAlert()
-                        alert.messageText = "Devcontainer failed to start"
-                        alert.informativeText = tail.isEmpty
+                        self?.failDevcontainerStart(tail.isEmpty
                             ? "`devcontainer up` failed. See the log for details."
-                            : String(tail.suffix(800))
-                        alert.alertStyle = .critical
-                        alert.addButton(withTitle: "Close")
-                        alert.runModal()
-                        // No nvim in this window — close the session so the user
-                        // isn't stuck on a blank window (quits if it was the last).
-                        self.terminalView?.window?.close()
+                            : String(tail.suffix(800)))
                     }
                     break
                 }
             }
         }
+    }
+
+    /// No nvim ever started in this window: say why, then end the session
+    /// as any failed start does.
+    private func failDevcontainerStart(_ detail: String) {
+        guard !startCancelled else { return }
+        hideDevcontainerProgress()
+        let alert = NSAlert()
+        alert.messageText = "Devcontainer failed to start"
+        alert.informativeText = detail
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Close")
+        alert.runModal()
+        endFailedStart()
     }
 
     private func startDevcontainerExec(workspace: String, configPath: String?, rows: UInt32, cols: UInt32) {
@@ -2500,14 +2478,7 @@ final class ZonvieCore {
         // band crosses.
         setBlurEnabled(true)
         setInheritCwd(noforkMode)
-        let perfConfig = ZonvieConfig.shared.performance
-        zonvie_core_set_glyph_cache_size(
-            core,
-            UInt32(perfConfig.glyphCacheAsciiSize),
-            UInt32(perfConfig.glyphCacheNonAsciiSize)
-        )
-        zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
-        zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
+        // [performance] sizes and option_as_meta: zonvie_core_load_config.
     }
 
     /// Core logging follows the app's. The tier filters apply core-side,
@@ -2901,6 +2872,17 @@ final class ZonvieCore {
             // and queued callbacks can still reach it. Closing releases the
             // ViewController, and deinit stops and destroys the core.
             closeSessionWindow(win)
+        }
+    }
+
+    /// Ends a session whose nvim never started: only its window, or for the
+    /// last session exit(1), so a caller scripting around zonvie sees the
+    /// failure (NSApp.terminate would exit 0).
+    func endFailedStart() {
+        if SessionManager.shared.sessions.count > 1 {
+            endSession()
+        } else {
+            Darwin.exit(1)
         }
     }
 
@@ -5202,7 +5184,6 @@ final class ZonvieCore {
 
     private struct ExternalGridBackground {
         let rgba: SIMD4<Float>
-        let vertexIndex: Int
 
         var color: NSColor {
             NSColor(red: CGFloat(rgba.x), green: CGFloat(rgba.y), blue: CGFloat(rgba.z), alpha: CGFloat(rgba.w))
@@ -5225,43 +5206,36 @@ final class ZonvieCore {
                         vertex.color.1,
                         vertex.color.2,
                         vertex.color.3
-                    ),
-                    vertexIndex: i
+                    )
                 )
             }
         }
         return nil
     }
 
-    /// Configure background color and window layout for external grids.
+    /// Configure the window layout (and default-bg clear) for a normal external grid.
     private func configureExternalGridFromRow(
         gridId: Int64,
         gridView: ExternalGridView,
-        background: ExternalGridBackground?,
         rows: UInt32,
         cols: UInt32
     ) {
         precondition(Thread.isMainThread, "configureExternalGridFromRow must be called on the main thread")
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) rows=\(rows) cols=\(cols)")
 
-        let bgColor = background?.color
-        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) bgVertexIdx=\(background?.vertexIndex ?? -1) bgColor=\(String(describing: bgColor))")
-
         // No nested async hop: the resize must complete before
         // requestRedraw() so the drawable size stays in sync with the NDC viewport.
         guard let window = self.externalWindows[gridId] else {
             ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) window not found, saving pending config")
-            self.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: rows, cols: cols)
+            self.pendingExternalGridConfig[gridId] = (bgColor: nil, rows: rows, cols: cols)
             return
         }
-
-        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) applying bg color=\(bgColor)")
 
         self.applyExternalGridConfig(
             gridId: gridId,
             window: window,
             gridView: gridView,
-            bgColor: bgColor,
+            bgColor: nil,
             rows: rows,
             cols: cols
         )
@@ -6167,6 +6141,12 @@ final class ZonvieCore {
         if kind == .normal || kind == .cmdline {
             self.lastCursorGrid = gridId
         }
+        // Same rule as onCursorGridChanged, now that the window has its frame.
+        self.externalGridViewsLock.lock()
+        let suspects = self.externalGridViews.values.filter { $0 !== gridView }
+        self.externalGridViewsLock.unlock()
+        self.terminalView?.markOcclusionSuspect(ifCoveredBy: window)
+        for view in suspects { view.markOcclusionSuspect(ifCoveredBy: window) }
         // A session in the background must not take the key window from the
         // one the user is typing into (as onCursorGridChanged).
         if SessionManager.shared.isFront(self) {
@@ -7180,13 +7160,12 @@ final class ZonvieCore {
                 }
                 ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId) surface=\(surfaceId)")
             } else if self.classifyExternalGridKind(gridId) != .normal {
-                for view in suspects { view.markOcclusionSuspect() }
                 // Cursor moved onto a synthetic decorated grid (cmdline /
                 // popupmenu / message) whose host window is not registered yet:
                 // its creation runs in a later main-queue block and makes itself
                 // key on creation. Activating the main window here would steal
                 // front ordering away from a focused external float while the
-                // cmdline is being shown.
+                // cmdline is being shown. activateExternalWindow marks suspects.
                 ZonvieCore.appLog("[cursor_grid_changed] special grid \(gridId) not yet registered; skip main activation")
             } else {
                 if let mainWindow = self.terminalView?.window {
@@ -7287,27 +7266,29 @@ final class ZonvieCore {
         level: UInt32,
         promptHlId: UInt32
     ) {
-        // Build content string for logging
-        var contentStr = ""
-        if let content = content, contentCount > 0 {
-            for i in 0..<contentCount {
-                let chunk = content[i]
-                if let textPtr = chunk.text {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
+        // Log strings only when logging: this runs per keystroke under grid_mu.
+        if ZonvieCore.appLogEnabled {
+            var contentStr = ""
+            if let content = content, contentCount > 0 {
+                for i in 0..<contentCount {
+                    let chunk = content[i]
+                    if let textPtr = chunk.text {
+                        let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
+                        contentStr += text
+                    }
                 }
             }
-        }
 
-        let promptStr: String
-        if let prompt = prompt, promptLen > 0 {
-            promptStr = String(bytes: UnsafeBufferPointer(start: prompt, count: promptLen), encoding: .utf8) ?? ""
-        } else {
-            promptStr = ""
-        }
+            let promptStr: String
+            if let prompt = prompt, promptLen > 0 {
+                promptStr = String(bytes: UnsafeBufferPointer(start: prompt, count: promptLen), encoding: .utf8) ?? ""
+            } else {
+                promptStr = ""
+            }
 
-        let firstcChar = firstc > 0 ? String(UnicodeScalar(firstc)) : ""
-        ZonvieCore.appLog("[cmdline_show] level=\(level) firstc='\(firstcChar)'(\(firstc)) prompt='\(promptStr)' pos=\(pos) content='\(contentStr)'")
+            let firstcChar = firstc > 0 ? String(UnicodeScalar(firstc)) : ""
+            ZonvieCore.appLog("[cmdline_show] level=\(level) firstc='\(firstcChar)'(\(firstc)) prompt='\(promptStr)' pos=\(pos) content='\(contentStr)'")
+        }
 
         // Defer cmdlineFirstc write to main thread to avoid data race
         // (this callback runs on the Zig RPC thread).
@@ -7510,44 +7491,6 @@ final class ZonvieCore {
         }
     }
 
-    // Nothing below this line ever runs. Of the cmdline callbacks the core
-    // dispatches, only on_cmdline_show does; pos, special_char and the three
-    // block ones are never invoked, so these appLog lines have no output to
-    // produce. cmdline state goes into the grid instead (setCmdlinePos,
-    // setCmdlineBlockShow and friends), flush composes it into
-    // CMDLINE_GRID_ID, and it arrives here as an external window like any
-    // other grid — logged core-side on the way through.
-    //
-    // The C struct keeps the slots because removing them would shift every
-    // field after them in zonvie_callbacks; these stay pointed at them so an
-    // empty slot is not mistaken for a missing implementation.
-
-    private func onCmdlinePos(pos: UInt32, level: UInt32) {
-        ZonvieCore.appLog("[cmdline_pos] pos=\(pos) level=\(level)")
-    }
-
-    private func onCmdlineSpecialChar(c: UnsafePointer<UInt8>?, cLen: Int, shift: Bool, level: UInt32) {
-        let charStr: String
-        if let c = c, cLen > 0 {
-            charStr = String(bytes: UnsafeBufferPointer(start: c, count: cLen), encoding: .utf8) ?? ""
-        } else {
-            charStr = ""
-        }
-        ZonvieCore.appLog("[cmdline_special_char] c='\(charStr)' shift=\(shift) level=\(level)")
-    }
-
-    private func onCmdlineBlockShow(lines: UnsafePointer<zonvie_cmdline_block_line>?, lineCount: Int) {
-        ZonvieCore.appLog("[cmdline_block_show] lineCount=\(lineCount)")
-    }
-
-    private func onCmdlineBlockAppend(line: UnsafePointer<zonvie_cmdline_chunk>?, chunkCount: Int) {
-        ZonvieCore.appLog("[cmdline_block_append] chunkCount=\(chunkCount)")
-    }
-
-    private func onCmdlineBlockHide() {
-        ZonvieCore.appLog("[cmdline_block_hide]")
-    }
-
     // MARK: - ext_popupmenu callbacks
 
     private func onPopupmenuShow(
@@ -7573,10 +7516,6 @@ final class ZonvieCore {
     private func onPopupmenuHide() {
         ZonvieCore.appLog("[popupmenu_hide]")
         self.popupmenuBgColor = nil
-    }
-
-    private func onPopupmenuSelect(selected: Int32) {
-        ZonvieCore.appLog("[popupmenu_select] selected=\(selected)")
     }
 
     // MARK: - OS Notification (UserNotifications)
@@ -7791,7 +7730,7 @@ final class ZonvieCore {
         for i in 0..<chunkCount {
             let chunk = chunks[i]
             if let textPtr = chunk.text, chunk.text_len > 0 {
-                out += String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
+                out += String(decoding: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), as: UTF8.self)
             }
         }
         return out

@@ -2831,7 +2831,13 @@ pub export fn zonvie_core_load_config(
     // Reset config error notification flag so new errors get reported
     box.core.config_error_sent = false;
 
-    // Apply performance settings to core
+    applyLoadedConfig(p.?, box);
+    return 1;
+}
+
+/// The loaded config's settings the core owns: [performance] cache and atlas
+/// sizes and [input] option_as_meta.
+fn applyLoadedConfig(p: *zonvie_core, box: *CoreBox) void {
     const new_hl_size = box.msg_config.performance.hl_cache_size;
     if (new_hl_size != box.core.hl_cache_size) {
         box.core.hl_cache_size = new_hl_size;
@@ -2841,8 +2847,36 @@ pub export fn zonvie_core_load_config(
     if (new_shape_size != box.core.shape_cache_size) {
         box.core.setShapeCacheSize(new_shape_size);
     }
+    // The rest of [performance] and [input] option_as_meta: each frontend
+    // read them back out of its own copy of this file and pushed them.
+    const perf = box.msg_config.performance;
+    zonvie_core_set_glyph_cache_size(p, perf.glyph_cache_ascii_size, perf.glyph_cache_non_ascii_size);
+    zonvie_core_set_atlas_size(p, perf.atlas_size);
+    box.core.option_as_meta.store(@intFromEnum(box.msg_config.input.option_as_meta), .release);
+}
 
-    return 1;
+test "a loaded config applies its cache, atlas and option_as_meta settings to the core" {
+    // Each frontend used to push these after load_config from its own copy
+    // of the file; the core now applies them itself. Every value differs
+    // from its default so an unapplied one shows.
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+    box.msg_config.deinit();
+    box.msg_config = .{ .alloc = box.allocator() };
+    try box.msg_config.parseToml(
+        \\[performance]
+        \\glyph_cache_ascii_size = 256
+        \\glyph_cache_non_ascii_size = 4096
+        \\atlas_size = 4096
+        \\[input]
+        \\option_as_meta = "none"
+    );
+    applyLoadedConfig(p, box);
+    try std.testing.expectEqual(@as(u32, 256), box.core.glyph_cache_ascii_size);
+    try std.testing.expectEqual(@as(u32, 4096), box.core.glyph_cache_non_ascii_size);
+    try std.testing.expectEqual(@as(u32, 4096), box.core.atlas_w);
+    try std.testing.expectEqual(@as(u8, 1), box.core.option_as_meta.load(.acquire));
 }
 
 /// Route a message to the appropriate view based on config.

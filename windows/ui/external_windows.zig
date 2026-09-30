@@ -329,38 +329,64 @@ fn hitTestCopyButton(hwnd: c.HWND, app: *App, grid_id: i64, x: i32, y: i32) bool
     return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
 
-/// Copy a decorated surface's rendered text to the clipboard. Returns true
+const CopyTextResult = enum { copied, lock_busy, failed };
+
+/// Copy a decorated surface's rendered text to the clipboard. `.copied` only
 /// when text actually reached the clipboard, so the caller can show the
 /// post-copy acknowledgement only for a copy that happened.
 ///
 /// The text comes straight from the core's grid, so what lands on the
 /// clipboard is exactly what the surface displays. The core holds its grid
-/// lock for the whole of handleRedraw, so the read is a try-lock and a
-/// contended click is simply dropped rather than stalling the UI thread.
-fn copyExternalSurfaceText(hwnd: c.HWND, app: *App, grid_id: i64) bool {
+/// lock for the whole of handleRedraw, so the read is a try-lock; a busy lock
+/// reports `.lock_busy` for the caller to retry rather than stall the UI thread.
+fn copyExternalSurfaceText(hwnd: c.HWND, app: *App, grid_id: i64) CopyTextResult {
     // Sized for a cmdline / notification; a longer :messages history falls
     // back to a heap buffer of the exact size the core reports.
     var stack_buf: [4096]u8 = undefined;
     const needed = core.zonvie_core_try_get_grid_text(app.corep, grid_id, &stack_buf, stack_buf.len);
-    if (needed < 0) {
-        if (applog.isEnabled()) applog.appLog("[win] copy_button: grid lock unavailable grid_id={d}\n", .{grid_id});
-        return false;
-    }
-    if (needed == 0) return false;
+    if (needed < 0) return .lock_busy;
+    if (needed == 0) return .failed;
 
     const len: usize = @intCast(needed);
     if (len <= stack_buf.len) {
-        return dialogs.setClipboardTextUtf8(hwnd, stack_buf[0..len]);
+        return if (dialogs.setClipboardTextUtf8(hwnd, stack_buf[0..len])) .copied else .failed;
     }
 
     const heap_buf = app.alloc.alloc(u8, len) catch {
         if (applog.isEnabled()) applog.appLog("[win] copy_button: allocation failed len={d}\n", .{len});
-        return false;
+        return .failed;
     };
     defer app.alloc.free(heap_buf);
     const second = core.zonvie_core_try_get_grid_text(app.corep, grid_id, heap_buf.ptr, heap_buf.len);
-    if (second <= 0) return false;
-    return dialogs.setClipboardTextUtf8(hwnd, heap_buf[0..@min(len, @as(usize, @intCast(second)))]);
+    if (second < 0) return .lock_busy;
+    if (second == 0) return .failed;
+    const ok = dialogs.setClipboardTextUtf8(hwnd, heap_buf[0..@min(len, @as(usize, @intCast(second)))]);
+    return if (ok) .copied else .failed;
+}
+
+/// One copy-button read. A busy grid lock re-arms TIMER_COPY_BUTTON_RETRY
+/// until the click's attempts run out (the macOS rule); the checkmark shows
+/// only for a copy that happened.
+fn runCopyAttempt(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64) void {
+    switch (copyExternalSurfaceText(hwnd, app, grid_id)) {
+        .copied => {
+            ext_win.copy_attempts_left = 0;
+            // Brief acknowledgement so the click has visible feedback even
+            // though the surface itself does not change. A repeat click
+            // re-arms the same timer id, which simply extends the checkmark.
+            ext_win.copy_button_copied = true;
+            _ = c.SetTimer(hwnd, app_mod.TIMER_COPY_BUTTON_REVERT, app_mod.COPY_BUTTON_REVERT_MS, null);
+            _ = c.InvalidateRect(hwnd, null, c.FALSE);
+        },
+        .lock_busy => {
+            if (render_pipeline_helpers.copyTextRetryAfterBusy(&ext_win.copy_attempts_left)) {
+                _ = c.SetTimer(hwnd, app_mod.TIMER_COPY_BUTTON_RETRY, render_pipeline_helpers.copy_text_retry_interval_ms, null);
+            } else if (applog.isEnabled()) {
+                applog.appLog("[win] copy_button: gave up, grid lock unavailable grid_id={d}\n", .{grid_id});
+            }
+        },
+        .failed => ext_win.copy_attempts_left = 0,
+    }
 }
 
 /// Append the copy-content icon (or, just after a copy, the acknowledgement
@@ -2563,20 +2589,10 @@ pub export fn ExternalWndProc(
                     ext_window.?.copy_button_pressed = false;
                     if (copy_pressed) {
                         if (!hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
-                        if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
-                            // Brief acknowledgement so the click has visible
-                            // feedback even though the surface itself does not
-                            // change. A repeat click re-arms the same timer id,
-                            // which simply extends the checkmark.
-                            ext_window.?.copy_button_copied = true;
-                            _ = c.SetTimer(
-                                hwnd,
-                                app_mod.TIMER_COPY_BUTTON_REVERT,
-                                app_mod.COPY_BUTTON_REVERT_MS,
-                                null,
-                            );
-                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                        }
+                        // A new click restarts the retry budget.
+                        _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_RETRY);
+                        ext_window.?.copy_attempts_left = render_pipeline_helpers.copy_text_max_attempts;
+                        runCopyAttempt(hwnd, app, ext_window.?, grid_id.?);
                         return 0;
                     }
                     if (editor_target) {
@@ -2712,7 +2728,12 @@ pub export fn ExternalWndProc(
                     }
                     return 0;
                 }
-                if (app.device_lost_recovering) return 0;
+                if (app.device_lost_recovering) {
+                    // A copy retried after recovery would land seconds after
+                    // the click; drop it (the next click starts over).
+                    if (timer_id == app_mod.TIMER_COPY_BUTTON_RETRY) _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_RETRY);
+                    return 0;
+                }
 
                 const hit = findExternalWindowByHwnd(app, hwnd);
                 const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
@@ -2727,6 +2748,10 @@ pub export fn ExternalWndProc(
                             ext_win.copy_button_copied = false;
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
+                        return 0;
+                    } else if (timer_id == app_mod.TIMER_COPY_BUTTON_RETRY) {
+                        _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_RETRY);
+                        if (ext_win.copy_attempts_left > 0) runCopyAttempt(hwnd, app, ext_win, grid_id.?);
                         return 0;
                     }
                 }

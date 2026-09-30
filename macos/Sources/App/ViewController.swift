@@ -272,22 +272,7 @@ final class ViewController: NSViewController {
             alert.alertStyle = .critical
             alert.addButton(withTitle: lastSession ? "Quit" : "Close")
             _ = alert.runModal()
-            if SessionManager.shared.sessions.count > 1 {
-                ZonvieCore.appLog("[start] handleCoreStartFailure: ending this session only")
-                self.core.endSession()
-                return
-            }
-            // Use Darwin.exit(1) instead of NSApp.terminate(nil) so the
-            // shell sees a non-zero exit code for fatal startup failures.
-            // NSApp.terminate(nil) runs the normal AppKit teardown and
-            // returns 0, which would mask the failure for callers
-            // scripting around `zonvie --connect-nvim=...`. The specific
-            // failure reason (rc value, context) is surfaced via the
-            // NSAlert text above, not via the exit code — exit codes are
-            // a binary success/failure signal, matching the rest of
-            // zonvie's CLI validation paths.
-            ZonvieCore.appLog("[start] handleCoreStartFailure: exit(1)")
-            Darwin.exit(1)
+            self.core.endFailedStart()
         }
     }
 
