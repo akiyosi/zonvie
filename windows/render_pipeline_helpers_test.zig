@@ -69,6 +69,40 @@ test "copy button retries a busy grid lock like macOS: 5 reads, 20 ms apart" {
     try std.testing.expectEqual(@as(u32, 5), never.reads);
 }
 
+// Chrome delta (outer minus content) is 20x40 throughout: window_rc is 20 px
+// wider and 40 px taller than the content area.
+test "main window snap grows back to the desired size after a font shrink then regrow" {
+    const outer_w: i32 = 1020;
+    const outer_h: i32 = 1040;
+
+    // Font shrinks from cell 9 to cell 11: content 1000 -> remainder trimmed
+    // to 990 (1000/11=90*11=990). desired stays at the original 1000 (unset
+    // -> bootstrap from live content on the first call).
+    const shrink = helpers.snapMainWindowOuterSize(outer_w, outer_h, 1000, 1000, 0, 0, 11, 11).?;
+    try std.testing.expectEqual(@as(u32, 990), shrink.snapped_content_w);
+    try std.testing.expectEqual(@as(u32, 990), shrink.snapped_content_h);
+    try std.testing.expectEqual(@as(i32, 1010), shrink.outer_w);
+    try std.testing.expectEqual(@as(i32, 1030), shrink.outer_h);
+
+    // Font returns to cell 9. If the desired size were the just-snapped 990
+    // (the live-content bug), it would stay at 990 (990 % 9 == 0). Snapping
+    // the ORIGINAL desired 1000 returns to 999, not 990.
+    const regrow = helpers.snapMainWindowOuterSize(1010, 1030, 990, 990, 1000, 1000, 9, 9).?;
+    try std.testing.expectEqual(@as(u32, 999), regrow.snapped_content_w);
+    try std.testing.expectEqual(@as(u32, 999), regrow.snapped_content_h);
+}
+
+test "main window snap is a no-op once the window already holds the snapped size" {
+    // content already a multiple of the cell on both axes.
+    try std.testing.expect(helpers.snapMainWindowOuterSize(1000, 1000, 990, 990, 990, 990, 11, 11) == null);
+}
+
+test "main window snap bails out on a degenerate cell size or sub-cell content" {
+    try std.testing.expect(helpers.snapMainWindowOuterSize(1000, 1000, 500, 500, 0, 0, 0, 11) == null);
+    try std.testing.expect(helpers.snapMainWindowOuterSize(1000, 1000, 500, 500, 0, 0, 11, 0) == null);
+    try std.testing.expect(helpers.snapMainWindowOuterSize(1000, 1000, 5, 500, 0, 0, 11, 11) == null);
+}
+
 // The row scissor must end where d3d11_renderer.drawEx's viewport ends:
 // viewport_x = content_x_offset, viewport_w = base - x_offset - sidebar_right,
 // base = content_width orelse the renderer (client) width.
