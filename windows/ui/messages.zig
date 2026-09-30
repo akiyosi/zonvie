@@ -183,9 +183,6 @@ pub fn onMsgShow(
         if (!appendChunkText(msg_text, &msg_len, chunk)) break;
     }
 
-    // Convert timeout from milliseconds to seconds
-    const timeout_sec: f32 = @as(f32, @floatFromInt(timeout_ms)) / 1000.0;
-
     if (applog.isEnabled()) applog.appLog("[win] on_msg_show: kind={s} chunks={d} replace_last={d} history={d} append={d} msg_id={d} text=\"{s}\" view={d} timeout_ms={d}\n", .{
         kind_str, chunk_count, replace_last, history, append, msg_id, msg_text[0..msg_len], @intFromEnum(view), timeout_ms,
     });
@@ -207,7 +204,7 @@ pub fn onMsgShow(
     req.replace_last = @intCast(@as(u32, if (replace_last != 0) 1 else 0));
     req.append = @intCast(@as(u32, if (append != 0) 1 else 0));
     req.view_type = view;
-    req.timeout = timeout_sec;
+    req.timeout_ms = timeout_ms;
 
     enqueuePendingMessage(app, req, "message");
 }
@@ -291,6 +288,7 @@ pub fn handleMsgMiniOrExtFloat(
             req.append = 0;
             // No timeout: the status arm keeps the text until it is emptied.
             req.view_type = view;
+            req.status = mini_id;
 
             enqueuePendingMessage(app, req, "message");
         },
@@ -321,15 +319,6 @@ pub const isConfirmKind = core.config.isInteractivePrompt;
 pub fn messageWindowIsConfirm(app: *const App) bool {
     const mw = app.message_window orelse return false;
     return isConfirmKind(mw.kind[0..mw.kind_len]);
-}
-
-/// The channel (App.status_messages index) of a kind handleMsgMiniOrExtFloat
-/// queues for showmode/showcmd/ruler, or null for any other kind.
-pub fn statusChannel(kind: []const u8) ?usize {
-    if (std.mem.eql(u8, kind, "showmode")) return 0;
-    if (std.mem.eql(u8, kind, "showcmd")) return 1;
-    if (std.mem.eql(u8, kind, "ruler")) return 2;
-    return null;
 }
 
 /// Bytes the message window keeps; one UTF-16 unit per byte decodes all of it.
@@ -1119,8 +1108,6 @@ test "message kinds: interactive prompts are dialogs, status kinds are not" {
     try std.testing.expect(isConfirmKind("confirm"));
     try std.testing.expect(isConfirmKind("number_prompt"));
     try std.testing.expect(!isConfirmKind("emsg"));
-    try std.testing.expectEqual(@as(?usize, 1), statusChannel("showcmd"));
-    try std.testing.expectEqual(@as(?usize, null), statusChannel("echo"));
     try std.testing.expect(isConfirmKind("confirm_sub"));
     try std.testing.expect(!isConfirmKind("return_prompt"));
 }

@@ -1186,9 +1186,11 @@ pub const Renderer = struct {
         // Use content_x_offset if specified (for left sidebar)
         const viewport_x_offset = opts.content_x_offset orelse 0;
         const viewport_y_offset = opts.content_y_offset orelse 0;
-        const sidebar_right_w = opts.sidebar_right_width orelse 0;
-        const base_width = opts.content_width orelse self.width;
-        const viewport_width = if (base_width > viewport_x_offset + sidebar_right_w) base_width - viewport_x_offset - sidebar_right_w else 1;
+        const viewport_width = render_pipeline_helpers.contentViewportWidthPx(
+            opts.content_width orelse self.width,
+            viewport_x_offset,
+            opts.sidebar_right_width orelse 0,
+        );
         const viewport_height = opts.content_height orelse
             (if (self.height > viewport_y_offset) self.height - viewport_y_offset else 1);
         const effective_dirty: ?c.RECT = if (!self.has_presented_once) null else dirty_rect;

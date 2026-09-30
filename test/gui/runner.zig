@@ -343,6 +343,11 @@ test "gui:extwin_blink_without_cursor_skips" {
     try gated(is_macos, @import("scenarios/macos/extwin_blink_without_cursor_skips.zig"));
 }
 
+test "gui:cmdline_does_not_stall_extwin" {
+    // macOS only: the occlusion gate is macOS frontend code.
+    try gated(is_macos, @import("scenarios/macos/cmdline_does_not_stall_extwin.zig"));
+}
+
 test "gui:visual_extwin_split_with_float_background" {
     // macOS only: it enumerates the app's OS windows to capture the external
     // one.

@@ -1308,6 +1308,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// animation on a focus change.
     func markOcclusionSuspect() {
         occlusionSuspectUntil = CFAbsoluteTimeGetCurrent() + 0.1
+        ZonvieCore.appLog("[occlusion_suspect] \(drawLoopTraceName)")
         // The frames skipped are frames the animation still owes.
         requestRedraw()
     }
