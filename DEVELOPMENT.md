@@ -328,11 +328,10 @@ frontend-owned physical storage:
   session outcome, not retryable backpressure.
 - macOS row storage has a 256 MiB per-surface peak and a 512 MiB process-wide
   peak shared by the main renderer and all external windows. Both limits count
-  unique live MTLBuffer objects plus replacement reservations. **They are
-  charged only by the provisioning planner, which since b83ff29 runs on the
-  allocation-failure recovery path.** Ordinary row submission on both the main
-  grid and external grids allocates directly and consults neither, so these are
-  recovery-path bounds, not a cap on live traffic. With three
+  unique live MTLBuffer objects plus replacement reservations. Ordinary row
+  submission charges each fresh buffer to the process-wide ledger; a refusal
+  is an allocation failure, whose recovery path runs the provisioning planner.
+  The per-surface limit is checked only by that planner. With three
   sets and two private slots per set, a fresh 42 MiB row fits the per-surface
   byte limit while a 44 MiB row is rejected even though it remains below the
   core's logical 256 MiB callback limit; the boundary is covered by the Metal
@@ -343,7 +342,9 @@ frontend-owned physical storage:
   buffer while the old buffer is still live, commits accounting only after
   `CreateBuffer` succeeds, and releases ownership on row shrink, surface
   destruction, or device loss. Exceeding either fixed limit terminates the UI
-  session through `zonvie_core_fail_render_budget`.
+  session through `zonvie_core_fail_render_budget`. Rows of grids drawn as
+  layers belong to no surface, so all of them together are charged as one
+  surface; a layer that shrinks releases the rows past its height.
 - Windows scrollbar underlay capture and restore are part of the paint
   transaction. A missing D3D resource or function stops Present, clears the
   saved-underlay state, and requests a full retry; unchanged track geometry

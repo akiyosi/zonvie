@@ -1313,7 +1313,7 @@ fn releaseSurfaceRecoveryBuffers(app: *App, ws: *app_mod.WindowSurface, grid_id:
 fn releaseLayerGridRecoveryBuffers(app: *App) void {
     while (true) {
         app.mu.lockUncancelable(core.clock.io());
-        const vb = app_mod.detachOneLayerGridVB(&app.layer_grids);
+        const vb = app_mod.detachOneLayerGridVB(&app.layer_grids, &app.layer_row_vb_released_bytes);
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
