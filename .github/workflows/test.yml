@@ -125,3 +125,96 @@ jobs:
         env:
           ZONVIE_REQUIRE_TEST_FONTS: "1"
         timeout-minutes: 30
+
+  # The GUI driver launches the real Windows app against a headless nvim and
+  # observes its windows (EnumWindows, synthesized input, DIB capture).
+  # Goldens are gitignored, so the visual scenarios create them and pass;
+  # those that compare captures within one run, and the behavioural ones,
+  # assert. ZONVIE_GUI_REQUIRE turns a missing nvim or app into a failure
+  # instead of a skip.
+  gui-tests-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "nvim-win64.zip"
+          Invoke-WebRequest "https://github.com/neovim/neovim/releases/latest/download/nvim-win64.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $nvim = Join-Path $env:RUNNER_TEMP "nvim-win64\bin\nvim.exe"
+          & $nvim --version
+          Add-Content $env:GITHUB_ENV "ZONVIE_TEST_NVIM=$nvim"
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build Windows app
+        run: zig build windows -Dtarget=x86_64-windows-gnu --summary all
+        timeout-minutes: 30
+      - name: GUI Tests
+        run: zig build gui-test --summary all
+        env:
+          ZONVIE_GUI_REQUIRE: "1"
+        timeout-minutes: 40
+      - name: Upload GUI test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-test-windows
+          path: |
+            tmp/
+            test/gui/golden/windows/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The same driver on macOS: CGWindowList, CGEvent input, window capture.
+  # Goldens are gitignored, so as on Windows the visual scenarios create them
+  # and pass; those that compare captures within one run still assert.
+  # Scenarios that need Accessibility skip themselves when the runner does
+  # not grant it.
+  gui-tests-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - name: Install dependencies (Homebrew)
+        run: brew install freetype harfbuzz pkgconf
+      - name: Install Neovim
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" https://github.com/neovim/neovim/releases/latest/download/nvim-macos-arm64.tar.gz
+          tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" --version
+          echo "ZONVIE_TEST_NVIM=$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" >> "$GITHUB_ENV"
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build macOS app
+        run: |
+          zig build
+          xcodebuild -project macos/zonvie.xcodeproj \
+            -scheme zonvie \
+            -configuration Debug \
+            -derivedDataPath macos/.derived \
+            -destination "platform=macOS,arch=arm64" \
+            build
+        timeout-minutes: 30
+      - name: GUI Tests
+        run: zig build gui-test --summary all
+        env:
+          ZONVIE_GUI_REQUIRE: "1"
+        timeout-minutes: 40
+      - name: Upload GUI test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-test-macos
+          path: |
+            tmp/
+            test/gui/golden/macos/
+          if-no-files-found: ignore
+          retention-days: 7
