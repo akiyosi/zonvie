@@ -124,7 +124,11 @@ pub fn countVerticalRules(
     );
     var found: u32 = 0;
     // Cell by cell, so a rule spread over several subpixel columns is
-    // reported once, at the length of its longest one.
+    // reported once, at the length of its longest one. Adjacent rule cells
+    // are one rule: cell_w_px is an estimate (the capture's width over the
+    // columns), and on Windows the client area is not a whole number of
+    // cells, so a single rule can straddle two estimated cells.
+    var prev_had_rule = false;
     var cell: u32 = @intFromFloat(@as(f64, @floatFromInt(x0_px)) / cell_w_px);
     const last_cell: u32 = @intFromFloat(@as(f64, @floatFromInt(x1_px - 1)) / cell_w_px);
     while (cell <= last_cell) : (cell += 1) {
@@ -133,8 +137,12 @@ pub fn countVerticalRules(
         var longest: u32 = 0;
         var x = cx0;
         while (x < cx1) : (x += 1) longest = @max(longest, longestRun(img, x, y0, bg, seam_gap_px));
-        if (longest < min_run_px) continue;
-        found += 1;
+        if (longest < min_run_px) {
+            prev_had_rule = false;
+            continue;
+        }
+        if (!prev_had_rule) found += 1;
+        prev_had_rule = true;
         std.debug.print(" col{d}(run={d}px)", .{ cell, longest });
     }
     if (found == 0) std.debug.print(" none", .{});

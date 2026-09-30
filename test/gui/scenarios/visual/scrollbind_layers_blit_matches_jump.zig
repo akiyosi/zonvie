@@ -148,8 +148,24 @@ pub fn run(alloc: std.mem.Allocator) !void {
         \\setline(1, map(range(1, 400), {_, i -> printf('%3d %s', i, repeat(nr2char(65 + i % 26), 60))}))
     );
 
-    const total_cols = try g.evalInt("&columns");
+    var total_cols = try g.evalInt("&columns");
     const need_cols = split_width_cols * 2 + 12;
+    // A small screen (the Windows CI runner opens at 55 columns) grows the
+    // window instead; the two captures compared are both taken after it.
+    if (total_cols < need_cols) {
+        var cols_buf: [48]u8 = undefined;
+        try g.exec(try std.fmt.bufPrint(&cols_buf, "execute('set columns={d}')", .{need_cols}));
+        var waited_ms: u32 = 0;
+        while (waited_ms < 10_000) : (waited_ms += 100) {
+            total_cols = try g.evalInt("&columns");
+            if (total_cols >= need_cols) break;
+            gui_io.sleepNs(100 * std.time.ns_per_ms);
+        }
+        // Let the frontend's resize round trip settle: a window that could
+        // not grow sends the old size back.
+        gui_io.sleepNs(1500 * std.time.ns_per_ms);
+        total_cols = try g.evalInt("&columns");
+    }
     if (total_cols < need_cols) {
         std.debug.print(
             "[gui] scrollbind_layers: window is {d} cols, need at least {d} for three splits\n",
