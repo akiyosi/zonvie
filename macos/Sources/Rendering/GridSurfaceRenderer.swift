@@ -413,6 +413,23 @@ func provisionSurfaceRowCapacity(
     return ledger.requiredRows == 0 ? .ready : .retry
 }
 
+/// What one on_vertices_row callback updates, decoded once for every surface
+/// (zonvie_core.h): MAIN replaces the rows, CURSOR without MAIN is
+/// cursor-only, and neither leaves both layers as they were.
+enum VertexRowUpdate {
+    case main, cursorOnly, none
+
+    init(flags: UInt32) {
+        if flags & UInt32(ZONVIE_VERT_UPDATE_MAIN) != 0 {
+            self = .main
+        } else if flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) != 0 {
+            self = .cursorOnly
+        } else {
+            self = .none
+        }
+    }
+}
+
 /// Encode the user's custom post-process chain, sampling `input` and writing
 /// the last pass into `output`.
 ///
@@ -2193,9 +2210,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
     }
 
-    /// Allocate the two ping-pong textures used by multi-pass custom
-    /// shader chains. Size/format must match the drawable so the final
-    /// pass can write the same pixel format the drawable expects.
     init?(view: MTKView, collectsGpuPerfSamples: Bool = true) {
         self.collectsGpuPerfSamples = collectsGpuPerfSamples
         guard let dev = view.device else {
@@ -2268,8 +2282,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
         if collectsGpuPerfSamples { gpuSampler.setUp(device: shared.device) }
     }
-
-    // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
 
     // MARK: - Triple Buffer Flush Bracket
 
@@ -2805,9 +2817,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         var debtAnchorGridId: Int64 = 0
     }
 
+    /// draw()'s cell-snapped viewport height: the committed extent, else the
+    /// live drawable height.
+    func committedViewportHeightPx(liveHeight: UInt32, cellHi: UInt32) -> UInt32 {
+        lock.lock()
+        let height = committedExtent.resolved(liveWidth: 1, liveHeight: liveHeight).height
+        lock.unlock()
+        return (height / cellHi) * cellHi
+    }
+
     /// - Parameters:
     ///   - offsets: Array of ScrollOffsetInfo with margin data
-    ///   - drawableHeight: Current drawable height for NDC conversion
+    ///   - drawableHeight: Viewport height for NDC conversion (committedViewportHeightPx)
     ///   - cellHeightPx: Cell height in pixels
     func updateScrollOffsets(_ offsets: [ScrollOffsetInfo], drawableHeight: Float, cellHeightPx: Float) {
         // Convert pixel offsets to NDC
@@ -5008,13 +5029,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
         }
-        let updateMain = (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
-        let updateCursor = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
-        if updateCursor && !updateMain {
+        switch VertexRowUpdate(flags: flags) {
+        case .main: break
+        case .cursorOnly:
             submitLayerCursor(gridId: 1, ptr: ptr, count: count, rootRow: rowStart)
             return
+        case .none: return
         }
-        guard updateMain else { return }
         if rowCount == 0 {
             guard count == 0,
                   prepareMainWriteState(),

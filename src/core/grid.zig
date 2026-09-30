@@ -3560,6 +3560,7 @@ pub const Grid = struct {
                     if (msg.kind.len > 0) self.alloc.free(msg.kind);
                     msg.kind = k;
                 }
+                msg.replace_last = replace_last;
                 msg.history = history;
                 msg.append = append;
                 self.message_state.msg_dirty = true;

@@ -434,16 +434,18 @@ fn wrappedTextHeightPx(hwnd: c.HWND, font_px: c_int, text: []const u8, width_px:
 }
 
 /// Append `line` to the toast text at `len`, after a '\n' when it is not the
-/// first, clamped to the buffer. Returns the new length.
-fn appendToastLine(buf: []u8, len: usize, line: []const u8) usize {
-    var n = len;
-    if (n > 0 and n < buf.len) {
-        buf[n] = '\n';
-        n += 1;
+/// first, cut at a UTF-8 boundary to what is left. False once the line did not
+/// fit: later lines must not follow the gap.
+fn appendToastLine(buf: []u8, len: *usize, line: []const u8) bool {
+    if (len.* > 0) {
+        if (len.* == buf.len) return false;
+        buf[len.*] = '\n';
+        len.* += 1;
     }
-    const copy_len = @min(line.len, buf.len - n);
-    @memcpy(buf[n..][0..copy_len], line[0..copy_len]);
-    return n + copy_len;
+    const copy_len = render_helpers.utf8TruncLen(line, buf.len - len.*);
+    @memcpy(buf[len.*..][0..copy_len], line[0..copy_len]);
+    len.* += copy_len;
+    return copy_len == line.len;
 }
 
 /// Re-show the toast from the stack and the statuses, or hide it when both
@@ -470,18 +472,20 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
 
     // The toast is the stack's lines followed by the non-empty status lines,
     // macOS's rule. A confirm dialog shows only its own text.
-    var combined_text: [16384]u8 = undefined;
+    // Sized to what the window stores, so the line count covers only that.
+    var combined_text: [message_text_capacity]u8 = undefined;
     var combined_len: usize = 0;
+    var fits = true;
     const stack: []const app_mod.DisplayMessage = if (is_confirm) &.{} else app.display_messages.items;
-    for (stack) |*dm| combined_len = appendToastLine(&combined_text, combined_len, dm.text[0..dm.text_len]);
+    for (stack) |*dm| fits = fits and appendToastLine(&combined_text, &combined_len, dm.text[0..dm.text_len]);
     // Allocation failure while extending display_messages must not make the
     // current message disappear. The caller requests this fixed-buffer
     // fallback when the append failed (and for confirm messages, which are
     // not stored in the display stack at all).
-    if (include_msg) combined_len = appendToastLine(&combined_text, combined_len, msg.text[0..msg.text_len]);
+    if (include_msg) fits = fits and appendToastLine(&combined_text, &combined_len, msg.text[0..msg.text_len]);
     if (!is_confirm) {
         for (&app.status_messages) |*entry| {
-            if (entry.*) |*m| combined_len = appendToastLine(&combined_text, combined_len, m.text[0..m.text_len]);
+            if (entry.*) |*m| fits = fits and appendToastLine(&combined_text, &combined_len, m.text[0..m.text_len]);
         }
     }
 
@@ -511,7 +515,7 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     var window_height: c_int = undefined;
     const line_height: c_int = @as(c_int, @intCast(cell_h)) + app.scalePx(4);
     const text_pad = app.scalePx(message_text_pad_px);
-    const stored = combined_text[0..@min(combined_len, message_text_capacity)];
+    const stored = combined_text[0..combined_len];
 
     if (is_confirm) {
         // For confirm dialogs (like E325), use larger fixed width and calculate height

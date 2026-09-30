@@ -1168,6 +1168,28 @@ fn recoverMainPaintFailure(hwnd: c.HWND, app: *App) void {
     failSurfacePaintAndWake(app, &app.surf, hwnd, app.window_wake_cookie, device_lost, hwnd, null);
 }
 
+/// Under app.mu, pin every external window not closing (paint_ref_count + 1)
+/// and record its grid and renderer; release each with
+/// finishExternalWindowPaint. False on OOM, with nothing pinned.
+fn pinLiveExternalWindows(app: *App, grids: *std.ArrayListUnmanaged(i64), renderers: *std.ArrayListUnmanaged(*d3d11.Renderer)) bool {
+    grids.clearRetainingCapacity();
+    renderers.clearRetainingCapacity();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const ext_capacity = app.external_windows.count();
+    grids.ensureTotalCapacity(app.alloc, ext_capacity) catch return false;
+    renderers.ensureTotalCapacity(app.alloc, ext_capacity) catch return false;
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        const ext_win = entry.value_ptr.*;
+        if (ext_win.is_pending_close) continue;
+        ext_win.paint_ref_count += 1;
+        grids.appendAssumeCapacity(entry.key_ptr.*);
+        renderers.appendAssumeCapacity(&ext_win.renderer);
+    }
+    return true;
+}
+
 fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
     const corep = app.corep orelse {
         app.glow_prepare_posted.store(false, .release);
@@ -1205,24 +1227,7 @@ fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
     defer external_grids.deinit(app.alloc);
     var external_renderers: std.ArrayListUnmanaged(*d3d11.Renderer) = .empty;
     defer external_renderers.deinit(app.alloc);
-    app.mu.lockUncancelable(core.clock.io());
-    const ext_capacity = app.external_windows.count();
-    const snapshot_ready = snapshot: {
-        external_grids.ensureTotalCapacity(app.alloc, ext_capacity) catch break :snapshot false;
-        external_renderers.ensureTotalCapacity(app.alloc, ext_capacity) catch break :snapshot false;
-        var it = app.external_windows.iterator();
-        while (it.next()) |entry| {
-            const ext_win = entry.value_ptr.*;
-            if (ext_win.is_pending_close) continue;
-            ext_win.paint_ref_count += 1;
-            external_grids.appendAssumeCapacity(entry.key_ptr.*);
-            external_renderers.appendAssumeCapacity(&ext_win.renderer);
-        }
-        break :snapshot true;
-    };
-    app.mu.unlock(core.clock.io());
-
-    if (!snapshot_ready) {
+    if (!pinLiveExternalWindows(app, &external_grids, &external_renderers)) {
         app.glow_prepare_posted.store(false, .release);
         return;
     }
@@ -1538,24 +1543,36 @@ fn showCoreStartFailed(hwnd: c.HWND, rc: c_int) void {
 // =========================================================================
 // Helper: build native-mode nvim command string
 // =========================================================================
-fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
-    const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
-    // The core splits the command on spaces, so a path with one is quoted
-    // even with no extra args (`C:\Program Files\Neovim\bin\nvim.exe`).
-    const needs_quote = std.mem.indexOfScalar(u8, effective_nvim, ' ') != null;
-    if (app.nvim_extra_args.items.len == 0 and !needs_quote) return effective_nvim;
+fn writeSpawnArg(writer: *std.Io.Writer, arg: []const u8) void {
+    // An argument no quote can carry keeps the old double quotes.
+    const q = core.frontend_rules.spawnArgQuote(arg) orelse '"';
+    if (q != 0) writer.writeByte(q) catch {};
+    writer.writeAll(arg) catch {};
+    if (q != 0) writer.writeByte(q) catch {};
+}
+
+/// The nvim path, one surrounding quote pair dropped: a config value written
+/// `"C:\nvim\nvim.exe"` went to the tokenizer as is, which removed them.
+fn nvimPathArg(app: *App) []const u8 {
+    const p = app.cli_nvim_path orelse app.config.neovim.path;
+    if (p.len >= 2 and (p[0] == '"' or p[0] == '\'') and p[p.len - 1] == p[0]) return p[1 .. p.len - 1];
+    return p;
+}
+
+/// The nvim path alone, quoted for the core's tokenizer
+/// (`C:\Program Files\Neovim\bin\nvim.exe`).
+fn quotedNvimPath(app: *App, buf: []u8) []const u8 {
     var w = std.Io.Writer.fixed(buf);
-    const writer = &w;
-    if (needs_quote) writer.writeByte('\'') catch {};
-    writer.writeAll(effective_nvim) catch {};
-    if (needs_quote) writer.writeByte('\'') catch {};
+    writeSpawnArg(&w, nvimPathArg(app));
+    return buf[0..w.end];
+}
+
+fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    writeSpawnArg(&w, nvimPathArg(app));
     for (app.nvim_extra_args.items) |arg| {
-        writer.writeByte(' ') catch {};
-        // An argument no quote can carry keeps the old double quotes.
-        const q = core.frontend_rules.spawnArgQuote(arg) orelse '"';
-        if (q != 0) writer.writeByte(q) catch {};
-        writer.writeAll(arg) catch {};
-        if (q != 0) writer.writeByte(q) catch {};
+        w.writeByte(' ') catch {};
+        writeSpawnArg(&w, arg);
     }
     return buf[0..w.end];
 }
@@ -3078,8 +3095,7 @@ pub export fn WndProc(
                                     if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
                                     break :present_frame;
                                 };
-                                // Same rule as the scroll rect: an empty list
-                                // already presents it.
+                                // An empty list already presents it.
                                 if (present_rects.items.len != 0) present.addOpt(captured_scrollbar_rect);
 
                                 // When seed_clear is true, the back buffer was just cleared.
@@ -4330,28 +4346,8 @@ pub export fn WndProc(
                         // close handlers wait, then drop the lock for the
                         // actual presents. finishExternalWindowPaint
                         // releases the ref + drives any deferred close.
-                        app.shader_anim_external_grids.clearRetainingCapacity();
-                        app.shader_anim_external_renderers.clearRetainingCapacity();
-                        app.mu.lockUncancelable(core.clock.io());
-                        const ext_capacity = app.external_windows.count();
-                        const snapshot_ready = snapshot: {
-                            app.shader_anim_external_grids.ensureTotalCapacity(app.alloc, ext_capacity) catch break :snapshot false;
-                            app.shader_anim_external_renderers.ensureTotalCapacity(app.alloc, ext_capacity) catch break :snapshot false;
-                            var it = app.external_windows.iterator();
-                            while (it.next()) |entry| {
-                                const ew = entry.value_ptr.*;
-                                if (ew.is_pending_close) continue;
-                                ew.paint_ref_count += 1;
-                                app.shader_anim_external_grids.appendAssumeCapacity(entry.key_ptr.*);
-                                app.shader_anim_external_renderers.appendAssumeCapacity(&ew.renderer);
-                            }
-                            break :snapshot true;
-                        };
-                        if (!snapshot_ready) {
-                            app.shader_anim_external_grids.clearRetainingCapacity();
-                            app.shader_anim_external_renderers.clearRetainingCapacity();
-                        }
-                        app.mu.unlock(core.clock.io());
+                        // On OOM nothing is pinned and the lists stay empty.
+                        _ = pinLiveExternalWindows(app, &app.shader_anim_external_grids, &app.shader_anim_external_renderers);
 
                         var anim_dev_lost = false;
                         var i: usize = 0;
@@ -4616,9 +4612,9 @@ pub export fn WndProc(
                     return 0;
                 }
                 // device_lost_recovering was rejected above.
-                if (app.paintReentrancyBlocked()) {
-                    // An outer paint, shader-animation Present, or glow
-                    // warm-up is currently using the renderer/device state
+                if (d3dOperationBlocked(app)) {
+                    // An outer paint, shader-animation Present, glow warm-up
+                    // or external-window creation is currently using the renderer/device state
                     // this recovery is about to tear down and release. If a
                     // queued WM_APP_DEVICE_LOST_RECOVER is dispatched through
                     // that operation's message-pump reentrancy, proceeding now
@@ -5128,20 +5124,6 @@ pub export fn WndProc(
                     var nvim_cmd_buf: [1024]u8 = undefined;
                     var nvim_cmd_slice: []const u8 = undefined;
 
-                    const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
-                    const quoted_nvim: []const u8 = blk: {
-                        if (std.mem.indexOfScalar(u8, effective_nvim, ' ') != null) {
-                            const buf = app.alloc.alloc(u8, effective_nvim.len + 2) catch
-                                break :blk effective_nvim;
-                            buf[0] = '\'';
-                            @memcpy(buf[1 .. 1 + effective_nvim.len], effective_nvim);
-                            buf[1 + effective_nvim.len] = '\'';
-                            break :blk buf;
-                        }
-                        break :blk effective_nvim;
-                    };
-                    defer if (quoted_nvim.ptr != effective_nvim.ptr) app.alloc.free(@constCast(quoted_nvim));
-
                     if (app.wsl_mode) {
                         var w = std.Io.Writer.fixed(&nvim_cmd_buf);
                         const writer = &w;
@@ -5171,13 +5153,12 @@ pub export fn WndProc(
 
                             if (app.ssh_password) |pwd| {
                                 var pwd_utf16: [256]u16 = undefined;
-                                var pwd_idx: usize = 0;
-                                for (pwd) |ch| {
-                                    if (pwd_idx < 255) {
-                                        pwd_utf16[pwd_idx] = ch;
-                                        pwd_idx += 1;
-                                    }
-                                }
+                                defer std.crypto.secureZero(u16, &pwd_utf16);
+                                // N UTF-8 bytes never need more than N UTF-16 units.
+                                const pwd_idx = if (pwd.len < pwd_utf16.len)
+                                    std.unicode.utf8ToUtf16Le(pwd_utf16[0 .. pwd_utf16.len - 1], pwd) catch 0
+                                else
+                                    0;
                                 pwd_utf16[pwd_idx] = 0;
                                 _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_SSH_PASSWORD"), &pwd_utf16);
                             }
@@ -5191,7 +5172,7 @@ pub export fn WndProc(
                             _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS_REQUIRE"), std.unicode.utf8ToUtf16LeStringLiteral("force"));
                             _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("DISPLAY"), std.unicode.utf8ToUtf16LeStringLiteral("dummy:0"));
                         } else {
-                            nvim_cmd_slice = quoted_nvim;
+                            nvim_cmd_slice = quotedNvimPath(app, &nvim_cmd_buf);
                         }
                     } else if (app.devcontainer_mode) devcontainer_block: {
                         if (app.devcontainer_workspace) |workspace| {
@@ -5202,7 +5183,7 @@ pub export fn WndProc(
                                 const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
                                     if (deferred_log_enabled) applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
                                     dialogs.hideDevcontainerProgressDialog();
-                                    nvim_cmd_slice = quoted_nvim;
+                                    nvim_cmd_slice = quotedNvimPath(app, &nvim_cmd_buf);
                                     break :devcontainer_block;
                                 };
                                 thread.detach();
@@ -5214,7 +5195,7 @@ pub export fn WndProc(
                                 nvim_cmd_slice = core.frontend_rules.devcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                             }
                         } else {
-                            nvim_cmd_slice = quoted_nvim;
+                            nvim_cmd_slice = quotedNvimPath(app, &nvim_cmd_buf);
                         }
                     } else {
                         // Local (also a --dialog Local choice): the file and

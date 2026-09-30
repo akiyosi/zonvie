@@ -656,10 +656,11 @@ final class MetalTerminalView: GridInputView {
 
         renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
 
+        let update = VertexRowUpdate(flags: flags)
         let isZeroCellLayout =
             rowCount == 0
             && count == 0
-            && (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
+            && update == .main
             && (totalRows == 0 || totalCols == 0)
         if isZeroCellLayout {
             let fullDrawableRectPx = NSRect(
@@ -709,9 +710,7 @@ final class MetalTerminalView: GridInputView {
         // ExternalGridView does. A row marked here would instead band that row,
         // redraw it, and pull every layer crossing it into the frame. The
         // redraw request below still schedules the frame.
-        let cursorOnly = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
-            && (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) == 0
-        if !cursorOnly {
+        if update != .cursorOnly {
             renderer.markDirtyRows(rowStart: rowStart, rowCount: rowCount)
         }
     
@@ -755,17 +754,6 @@ final class MetalTerminalView: GridInputView {
         let cellHeightPx = Float(renderer.cellHeightPx)
         guard cellHeightPx > 0 else { return }
 
-        // Use the same cell-snapped viewport height the vertex data and
-        // fragment shader already use (see draw()'s vpHeight / MetalTypes.swift
-        // fragmentHeight), not the raw drawable height — otherwise this
-        // scroll-offset math disagrees with the shader's NDC reconstruction
-        // whenever drawableHeight is not an exact multiple of cellHeightPx
-        // (fullscreen / zoomed / tiled window states).
-        let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
-        let drawableHi = max(1, UInt32(drawableSize.height))
-        let drawableHeight = Float((drawableHi / cellHi) * cellHi)
-        guard drawableHeight > 0 else { return }
-
         // Idle fast path: nothing to do once the model has held no offset
         // for more than one call. appendFloatScrollOffsets() itself no-ops
         // when offsets is empty, so "no floats need servicing" is already
@@ -778,6 +766,13 @@ final class MetalTerminalView: GridInputView {
         if isEmptyNow && !hadScrollOffsetsLastCall {
             return
         }
+
+        // draw()'s vpHeight: the committed extent the vertices were baked
+        // with, not the live drawable, which runs ahead of it after a resize.
+        let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
+        let drawableHeight = Float(renderer.committedViewportHeightPx(
+            liveHeight: max(1, UInt32(drawableSize.height)), cellHi: cellHi))
+        guard drawableHeight > 0 else { return }
         hadScrollOffsetsLastCall = !isEmptyNow
 
         // Get grid info to look up margins and positions (non-blocking).
@@ -1318,9 +1313,11 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     }
 
     /// Only a window covering all of this one can hide it; holding the frames
-    /// on every activation stalled the surface at each `:`.
+    /// on every activation stalled the surface at each `:`. A higher-level
+    /// window (a .floating panel) or a child of `front` stays above it.
     func markOcclusionSuspect(ifCoveredBy front: NSWindow) {
-        if let frame = window?.frame, front.frame.contains(frame) { markOcclusionSuspect() }
+        guard let win = window, win.parent !== front, front.level >= win.level else { return }
+        if front.frame.contains(win.frame) { markOcclusionSuspect() }
     }
 
     enum VisibilityGate { case draw, unsettled, hidden }

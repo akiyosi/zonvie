@@ -992,7 +992,13 @@ else "") ++
     \\
     \\    [tabline]
     \\        external            Enable external tabline UI
+    \\
+    ++ (if (is_windows)
+    \\        style               "titlebar" or "sidebar" (default: "titlebar")
+else
     \\        style               "titlebar", "menu" or "sidebar" (default: "titlebar")
+) ++
+    \\
     \\        sidebar_position    "left" or "right" (default: "left")
     \\        sidebar_width       Sidebar width in pixels (100-500, default: 200)
     \\        agent_indicator     AI-agent status icon on terminal tabs (default: true)

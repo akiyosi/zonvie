@@ -931,7 +931,6 @@ pub inline fn simdExtractCp(cells: [*]const grid_mod.Cell, out: [*]u32, count: u
 pub const MsgCachedLine = struct {
     data: [256]u8 = undefined,
     len: u16 = 0,
-    display_width: u16 = 0,
 };
 
 // ---------------------------------------------------------------
@@ -4913,14 +4912,14 @@ const CmdlineRowWriter = struct {
         return true;
     }
 
-    /// `caret` writes control characters as ^X and ^?; the prompt and
-    /// special_char are written as they are.
-    fn text(w: *CmdlineRowWriter, s: []const u8, hl_id: u32, caret: bool) !bool {
+    /// Control characters go out as ^X and ^?, the two cells
+    /// countDisplayWidth measures them as.
+    fn text(w: *CmdlineRowWriter, s: []const u8, hl_id: u32) !bool {
         var byte_i: usize = 0;
         while (byte_i < s.len) {
             const c = scanEmojiCluster(s, byte_i);
             if (c.codepoint_count == 0) break;
-            if (caret and (c.first_cp < 0x20 or c.first_cp == 0x7F)) {
+            if (c.first_cp < 0x20 or c.first_cp == 0x7F) {
                 if (!w.cell('^', hl_id)) return false;
                 if (!w.cell(if (c.first_cp == 0x7F) '?' else '@' + c.first_cp, hl_id)) return false;
             } else {
@@ -4934,15 +4933,15 @@ const CmdlineRowWriter = struct {
 
     fn line(w: *CmdlineRowWriter, state: *const grid_mod.CmdlineState, has_control_chars: bool) !void {
         if (state.firstc != 0 and !w.cell(state.firstc, 0)) return;
-        if (!try w.text(state.prompt, state.prompt_hl_id, false)) return;
+        if (!try w.text(state.prompt, state.prompt_hl_id)) return;
         var i: u32 = 0;
         while (i < state.indent) : (i += 1) {
             if (!w.cell(' ', 0)) return;
         }
         for (state.content.items) |chunk| {
-            if (!try w.text(chunk.text, chunk.hl_id, true)) return;
+            if (!try w.text(chunk.text, chunk.hl_id)) return;
         }
-        if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0, false);
+        if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0);
     }
 };
 
@@ -5143,7 +5142,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     for (block_lines, 0..) |line, row_idx| {
         var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = @intCast(row_idx), .scroll_offset = scroll_offset, .width = max_width };
         for (line.items) |chunk| {
-            const more = writer.text(chunk.text, chunk.hl_id, true) catch |e| {
+            const more = writer.text(chunk.text, chunk.hl_id) catch |e| {
                 abortClusterUpdate(self, "cmdline_block", e);
                 return false;
             };
@@ -5370,9 +5369,9 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     var max_kind_w: u32 = 0;
     var max_menu_w: u32 = 0;
     for (items) |item| {
-        const ww = countDisplayWidth(item.word);
-        const kw = countDisplayWidth(item.kind);
-        const mw = countDisplayWidth(item.menu);
+        const ww = textCells(item.word);
+        const kw = textCells(item.kind);
+        const mw = textCells(item.menu);
         if (ww > max_word_w) max_word_w = ww;
         if (kw > max_kind_w) max_kind_w = kw;
         if (mw > max_menu_w) max_menu_w = mw;
@@ -5474,14 +5473,31 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 /// combining characters like U+306F U+3099 = ば) as single display units.
 /// NFD combining kana voicing marks are composed to NFC so the rasterizer
 /// receives a single precomposed codepoint (e.g., U+3070 ば, not U+306F は).
-/// Returns the column after the last written cell.
-fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) !u32 {
+/// Cells as textCells measures them: a TAB as spaces to the next multiple of
+/// 8 from `start_col`, as Neovim shows it in messages, other control
+/// characters as ^X and ^?. Returns the column after the last written cell.
+fn writeUtf8ToGrid(self: *Core, grid_id: i64, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) !u32 {
     if (text.len == 0) return start_col;
     var col = start_col;
     var byte_i: usize = 0;
     while (byte_i < text.len) {
         const cluster = scanEmojiCluster(text, byte_i);
         if (cluster.codepoint_count == 0) break;
+        if (cluster.first_cp == '\t') {
+            const next = start_col + ((col - start_col) / 8 + 1) * 8;
+            if (next > col_limit) break;
+            while (col < next) : (col += 1) self.grid.putCellGrid(grid_id, row, col, ' ', hl_id);
+            byte_i = cluster.end_byte;
+            continue;
+        }
+        if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
+            if (col + 2 > col_limit) break;
+            self.grid.putCellGrid(grid_id, row, col, '^', hl_id);
+            self.grid.putCellGrid(grid_id, row, col + 1, if (cluster.first_cp == 0x7F) '?' else '@' + cluster.first_cp, hl_id);
+            col += 2;
+            byte_i = cluster.end_byte;
+            continue;
+        }
         const dw = cluster.display_width;
         // Ensure room for the full cluster width (body + placeholders)
         if (col + dw > col_limit) break;
@@ -6150,7 +6166,7 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                         self.flush_aborted = true;
                         return false;
                     }
-                    self.msg_scroll_offset = 0;
+                    resetMsgScroll(self);
                     if (!renderMsgGridFromCache(self, 0)) {
                         self.flush_aborted = true;
                         return false;
@@ -6352,8 +6368,7 @@ pub fn buildMsgLineCache(self: *Core) bool {
 
                     // Finish current line (skip leading empty lines)
                     if (current_line.len > 0 or build.items.len > 0) {
-                        current_line.display_width = @intCast(countDisplayWidth(current_line.data[0..current_line.len]));
-                        if (current_line.display_width > max_width) max_width = current_line.display_width;
+                        max_width = @max(max_width, textCells(current_line.data[0..current_line.len]));
                         build.append(self.alloc, current_line) catch return false;
                     }
                     current_line = .{};
@@ -6372,8 +6387,7 @@ pub fn buildMsgLineCache(self: *Core) bool {
 
         // Finish last line of this message
         if (current_line.len > 0 or build.items.len == 0) {
-            current_line.display_width = @intCast(countDisplayWidth(current_line.data[0..current_line.len]));
-            if (current_line.display_width > max_width) max_width = current_line.display_width;
+            max_width = @max(max_width, textCells(current_line.data[0..current_line.len]));
             build.append(self.alloc, current_line) catch return false;
         }
     }
@@ -6393,7 +6407,6 @@ pub fn buildMsgLineCache(self: *Core) bool {
 /// The line cache holds a fixed number of bytes, and a cut in the middle of a
 /// character left a truncated sequence for the width scan.
 const utf8PrefixLen = grid_mod.utf8PrefixLen;
-
 
 /// Widest a message panel may grow, in cells.
 const msg_panel_max_width: u32 = 80;
@@ -6420,23 +6433,10 @@ fn beginMsgPanelGrid(self: *Core, grid_id: i64, height: u32, width: u32) !void {
 }
 
 /// Write one line of a message panel, starting after the left padding column
-/// and stopping before the right one. A wide codepoint takes two cells, the
-/// second written as cp 0; when only one cell is left the body is still
-/// written and the placeholder is dropped, so the glyph overhangs the right
-/// padding column.
-fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) void {
-    var col: u32 = 1; // Start with 1 cell padding
-    var iter: ScalarCursor = .{ .bytes = line };
-    while (iter.nextCodepoint()) |cp| {
-        if (col >= width - 1) break;
-        self.grid.putCellGrid(grid_id, row, col, cp, 0);
-        col += 1;
-        if (isWideChar(cp)) {
-            if (col >= width - 1) break;
-            self.grid.putCellGrid(grid_id, row, col, 0, 0);
-            col += 1;
-        }
-    }
+/// and stopping before the right one, by the rule the panel was measured
+/// with (textCells).
+fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) !void {
+    _ = try writeUtf8ToGrid(self, grid_id, row, 1, line, width - 1, 0);
 }
 
 /// Register a message panel as an external grid at the top-right sentinel
@@ -6490,7 +6490,10 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
         if (source_line_idx >= lines.len) break;
 
         const cached_line = lines[source_line_idx];
-        writeMsgPanelRow(self, msg_grid_id, @intCast(row_idx), cached_line.data[0..cached_line.len], width);
+        writeMsgPanelRow(self, msg_grid_id, @intCast(row_idx), cached_line.data[0..cached_line.len], width) catch |e| {
+            abortClusterUpdate(self, "msg", e);
+            return false;
+        };
     }
 
     // Register as external grid
@@ -6689,6 +6692,15 @@ pub fn processPendingMsgScroll(self: *Core) void {
     }
 }
 
+/// New content, or none, starts at the top with no scroll owed. An abort
+/// backoff dates last_send into the future, so it goes too.
+fn resetMsgScroll(self: *Core) void {
+    self.msg_scroll_offset = 0;
+    self.msg_scroll_pending = false;
+    self.msg_scroll_last_send = 0;
+    self.msg_scroll_retry_delay_ns = msg_scroll_throttle_ns;
+}
+
 /// Hide msg_show external grid.
 pub fn hideMsgShow(self: *Core) void {
     const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
@@ -6697,13 +6709,9 @@ pub fn hideMsgShow(self: *Core) void {
         return;
     };
     // Reset scroll state and invalidate cache
-    self.msg_scroll_offset = 0;
+    resetMsgScroll(self);
     self.msg_total_lines = 0;
     self.msg_cached_max_width = 0;
-    self.msg_scroll_pending = false;
-    // An abort backoff dates last_send into the future; the next float starts clean.
-    self.msg_scroll_last_send = 0;
-    self.msg_scroll_retry_delay_ns = msg_scroll_throttle_ns;
     self.msg_show_retry_at = null;
     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
     self.msg_line_cache.clearRetainingCapacity();
@@ -6743,7 +6751,6 @@ fn sendConfirmCallback(self: *Core) void {
     );
 }
 
-/// Send msg_show callback to frontend (helper for short messages or fallback).
 fn messageTimeoutMs(timeout_sec: f32) u32 {
     if (!std.math.isFinite(timeout_sec) or timeout_sec <= 0) return 0;
 
@@ -7005,7 +7012,7 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
                 if (copy_len < seg.len) line_full = true;
                 const p = nl orelse break;
                 line_lens[line_count % ring_len] = line_len;
-                max_width = @max(max_width, countDisplayWidth(line[0..line_len]));
+                max_width = @max(max_width, textCells(line[0..line_len]));
                 line_count += 1;
                 line_len = 0;
                 line_full = false;
@@ -7016,7 +7023,7 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
         prev_line_open = line_len > 0 or line_count == first_line;
         if (prev_line_open) {
             line_lens[line_count % ring_len] = line_len;
-            max_width = @max(max_width, countDisplayWidth(lines[line_count % ring_len][0..line_len]));
+            max_width = @max(max_width, textCells(lines[line_count % ring_len][0..line_len]));
             line_count += 1;
         }
     }
@@ -7045,7 +7052,10 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
     // Write lines to grid
     for (0..height) |row_idx| {
         const i = (oldest_kept + first + row_idx) % ring_len;
-        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[i][0..line_lens[i]], width);
+        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[i][0..line_lens[i]], width) catch |e| {
+            abortClusterUpdate(self, "msg_history", e);
+            return false;
+        };
     }
 
     // Register as external grid, positioned like msg_show.
@@ -7463,6 +7473,19 @@ fn initCmdlineTestCore() !Core {
     return core;
 }
 
+test "a control character in the cmdline prompt is written in the cells the cursor counts" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "x" }}, 1, 0, "a\nb", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,5 off=0
+        \\61 5e 4a 62 78
+        \\
+    );
+}
+
 test "cmdline single-line output: caret notation, wide chars, prompt, indent, special_char, scroll" {
     var core = try initCmdlineTestCore();
     defer core.deinitForTest();
@@ -7650,7 +7673,11 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
         .extras = undefined,
         .extras_len = 0,
     };
-    const first_cp = std.unicode.utf8Decode(first_slice) catch return .{
+    // utf8Decode passes a lone byte through unchecked.
+    const first_cp = (if (first_slice.len == 1 and first_slice[0] >= 0x80)
+        error.Utf8InvalidStartByte
+    else
+        std.unicode.utf8Decode(first_slice)) catch return .{
         .first_cp = 0xFFFD,
         .codepoint_count = 1,
         .display_width = 1,
@@ -7754,8 +7781,11 @@ pub fn isWideChar(cp: u32) bool {
     if (cp >= 0x2E80 and cp <= 0x4DBF) return true;
     // CJK Unified Ideographs
     if (cp >= 0x4E00 and cp <= 0x9FFF) return true;
-    // Yi Syllables, Yi Radicals, Lisu, Vai, Hangul Syllables
-    if (cp >= 0xA000 and cp <= 0xD7FF) return true;
+    // Yi Syllables and Radicals, Hangul Jamo Extended-A, Hangul Syllables
+    // (the scripts between them, Lisu, Vai, Latin Extended-D, Cherokee..., are narrow)
+    if (cp >= 0xA000 and cp <= 0xA4CF) return true;
+    if (cp >= 0xA960 and cp <= 0xA97F) return true;
+    if (cp >= 0xAC00 and cp <= 0xD7A3) return true;
     // CJK Compatibility Ideographs
     if (cp >= 0xF900 and cp <= 0xFAFF) return true;
     // Vertical Forms, CJK Compatibility Forms
@@ -7768,9 +7798,22 @@ pub fn isWideChar(cp: u32) bool {
     return false;
 }
 
-/// Count display width accounting for control characters (^X notation) and wide characters.
-/// Control characters (0x00-0x1F) and DEL (0x7F) take 2 columns.
-/// Wide characters (CJK, etc.) take 2 columns.
+/// The cells writeUtf8ToGrid writes `s` in: countDisplayWidth, except a TAB
+/// runs to the next multiple of 8 from the start of `s`.
+fn textCells(s: []const u8) u32 {
+    var count: u32 = 0;
+    var byte_i: usize = 0;
+    while (byte_i < s.len) {
+        const cluster = scanEmojiCluster(s, byte_i);
+        if (cluster.codepoint_count == 0) break;
+        count = if (cluster.first_cp == '\t')
+            (count / 8 + 1) * 8
+        else if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) count + 2 else count + cluster.display_width;
+        byte_i = cluster.end_byte;
+    }
+    return count;
+}
+
 /// Count display width of a UTF-8 string, recognizing emoji clusters.
 /// Control characters (^X) take 2 columns. Emoji clusters take 2 columns.
 /// Wide CJK characters take 2 columns. Everything else takes 1 column.
@@ -11880,6 +11923,36 @@ test "a repeatedly aborted msg float scroll backs off from one throttle window" 
     try std.testing.expect(nextMsgTimeoutNs(&core).? > after_second_ns + msg_scroll_throttle_ns);
 }
 
+test "new msg_show content in a visible float drops the old scroll backoff" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    try appendTestMessage(&core, 1, "echo", "first");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+    AbortProbe.target = &core;
+    defer AbortProbe.target = null;
+    core.cb.on_flush_begin = AbortProbe.onBegin;
+
+    core.msg_scroll_pending = true;
+    core.msg_scroll_last_send = 0;
+    processPendingMsgScroll(&core);
+    core.msg_scroll_last_send -= std.time.ns_per_s;
+    processPendingMsgScroll(&core);
+    try std.testing.expect(core.msg_scroll_last_send > clock.nowNs());
+
+    // Replaced in place, without a hide.
+    core.cb.on_flush_begin = null;
+    core.flush_aborted = false;
+    try appendTestMessage(&core, 2, "echo", "second");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+
+    core.msg_scroll_pending = true;
+    processPendingMsgScroll(&core);
+    try std.testing.expect(!core.msg_scroll_pending);
+}
+
 test "a hidden msg float does not hand its scroll backoff to the next one" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -13396,7 +13469,6 @@ fn seedMsgCacheLine(core: *Core, text: []const u8) !void {
     var cached: MsgCachedLine = .{};
     @memcpy(cached.data[0..text.len], text);
     cached.len = @intCast(text.len);
-    cached.display_width = @intCast(countDisplayWidth(text));
     try core.msg_line_cache.append(core.alloc, cached);
 }
 
@@ -13458,6 +13530,39 @@ test "both message panels lay out text with one padding column and double-cell w
     try std.testing.expectEqual(@as(u32, 'b'), core.grid.getCellGrid(hgid, 0, 4).cp);
     try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 2).hl);
     try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 3).hl);
+}
+
+test "a message panel writes clusters and control characters in the cells it measured" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    // A ZWJ family is one 2-cell cluster, ^A is 2 cells, and a TAB (as in a
+    // Lua traceback) runs to column 8 of the text, as Neovim shows it.
+    const line = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\x01\tx";
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, line);
+    core.msg_cached_max_width = textCells(line);
+    try std.testing.expectEqual(@as(u32, 9), core.msg_cached_max_width);
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 0x1F468), core.grid.getCellGrid(mgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 2).cp);
+    try std.testing.expectEqual(@as(u32, '^'), core.grid.getCellGrid(mgid, 0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCellGrid(mgid, 0, 4).cp);
+    for (5..9) |col| try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, @intCast(col)).cp);
+    try std.testing.expectEqual(@as(u32, 'x'), core.grid.getCellGrid(mgid, 0, 9).cp);
+}
+
+test "only the East Asian Wide blocks between U+A000 and U+D7FF take two cells" {
+    try std.testing.expect(isWideChar(0xA000)); // Yi
+    try std.testing.expect(isWideChar(0xA960)); // Hangul Jamo Extended-A
+    try std.testing.expect(isWideChar(0xAC00)); // Hangul
+    try std.testing.expect(isWideChar(0xD7A3));
+    try std.testing.expect(!isWideChar(0xA4D0)); // Lisu
+    try std.testing.expect(!isWideChar(0xA78C)); // Latin Extended-D
+    try std.testing.expect(!isWideChar(0xAB70)); // Cherokee Supplement
+    try std.testing.expect(!isWideChar(0xD7B0)); // Hangul Jamo Extended-B
 }
 
 test "both message panels write each line to its own row" {
@@ -13668,10 +13773,10 @@ test "only the history panel aborts the flush when registration fails" {
     try std.testing.expect(core.grid.external_grids.get(grid_mod.MSG_HISTORY_GRID_ID) == null);
 }
 
-test "a wide char on the last usable column writes its body without the placeholder" {
-    // The inner guard breaks after the body cell, so the wide glyph overhangs
-    // the right padding column with no cell reserved for its second half, and
-    // everything after it is dropped.
+test "a wide char that does not fit the last usable column is dropped, not overhung" {
+    // Both panels write through writeUtf8ToGrid, as the popupmenu does: a
+    // cluster whose cells do not fit is not written, so no glyph overhangs
+    // the right padding column, and nothing after it is written either.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try core.grid.resize(24, 80);
@@ -13682,18 +13787,13 @@ test "a wide char on the last usable column writes its body without the placehol
     try std.testing.expect(renderMsgGridFromCache(&core, 0));
 
     try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
-    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(mgid, 0, 4).cp);
-    // Still the cleared space: no placeholder was written for the second half.
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 4).cp);
     try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
-    // 'z' never fits, on any column.
     for (0..6) |col| {
         try std.testing.expect(core.grid.getCellGrid(mgid, 0, @intCast(col)).cp != 'z');
     }
 
-    // Same edge on the history panel, reachable only at the 80-column cap:
-    // 77 narrow columns, then a wide char whose body lands on the last usable
-    // column. This is the guard that distinguishes the current loop from
-    // writeUtf8ToGrid, which would drop the whole cluster instead.
+    // Same edge on the history panel, reachable only at the 80-column cap.
     const hgid = grid_mod.MSG_HISTORY_GRID_ID;
     var long_line: [81]u8 = undefined;
     @memset(long_line[0..77], 'a');
@@ -13704,7 +13804,8 @@ test "a wide char on the last usable column writes its body without the placehol
     try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
 
     try std.testing.expectEqual(@as(u32, 80), panelCols(&core, hgid));
-    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(hgid, 0, 78).cp);
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 77).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 78).cp);
     try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 79).cp);
     for (0..80) |col| {
         try std.testing.expect(core.grid.getCellGrid(hgid, 0, @intCast(col)).cp != 'z');
