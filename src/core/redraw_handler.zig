@@ -1808,6 +1808,7 @@ pub fn handleRedraw(
                     // window's own cells.
                     const placing_surface = grid.surfaceForGrid(anchor_grid);
                     const on_external_surface = placing_surface != null and placing_surface.? != 1;
+                    var float_anchor: ?grid_mod.FloatAnchor = null;
 
                     if (screen_row_i >= 0 and screen_col_i >= 0 and !on_external_surface) {
                         // Let nvim take care of positioning.
@@ -1842,61 +1843,16 @@ pub fn handleRedraw(
                             continue;
                         }
 
-                        var base_row: i64 = 0;
-                        var base_col: i64 = 0;
-
-                        // The anchor's position in the surface that places it;
-                        // an external root is that surface's origin.
-                        if (anchor_grid != 1) {
-                            if (grid.win_pos.get(anchor_grid)) |p| {
-                                base_row = @as(i64, p.row);
-                                base_col = @as(i64, p.col);
-                            }
-                        }
-
-                        // Adjust by anchor using goneovim-like metrics conversion.
-                        // We compute float window size in "global grid cell units" using per-grid pixel metrics.
-                        const main_m = grid.getGridMetricsPx(1);
-                        const anchor_m = grid.getGridMetricsPx(anchor_grid);
-                        const float_m = grid.getGridMetricsPx(grid_id);
-
-                        // Convert anchor point from anchor_grid units -> global grid units.
-                        // base_row/base_col are already in global grid units (win_pos is relative to grid=1).
-                        const anchor_row_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_row_i)) * @as(f64, @floatFromInt(anchor_m.cell_h_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_h_px))) orelse continue;
-                        const anchor_col_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_col_i)) * @as(f64, @floatFromInt(anchor_m.cell_w_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
-
-                        row_i64 = std.math.add(i64, base_row, anchor_row_main) catch continue;
-                        col_i64 = std.math.add(i64, base_col, anchor_col_main) catch continue;
-
-                        // Compute float window size in global grid units (approx; future-proof for per-grid fonts).
-                        if (grid.sub_grids.get(grid_id)) |sg| {
-                            const float_rows: i64 = @as(i64, sg.rows);
-                            const float_cols: i64 = @as(i64, sg.cols);
-
-                            const wincols_main = checkedFloatToI64(@as(f64, @floatFromInt(float_cols)) * @as(f64, @floatFromInt(float_m.cell_w_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
-
-                            const winrows_main = checkedFloatToI64(@ceil(@as(f64, @floatFromInt(float_rows)) * @as(f64, @floatFromInt(float_m.cell_h_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_h_px)))) orelse continue;
-
-                            // Anchor string: "NW", "NE", "SW", "SE"
-                            if (std.mem.indexOfScalar(u8, anchor, 'S') != null) {
-                                row_i64 = std.math.sub(i64, row_i64, winrows_main) catch std.math.minInt(i64);
-                            }
-                            if (std.mem.indexOfScalar(u8, anchor, 'E') != null) {
-                                col_i64 = std.math.sub(i64, col_i64, wincols_main) catch std.math.minInt(i64);
-                            }
-                            // Neovim's own clamp, against the surface that
-                            // shows the float rather than the main grid.
-                            if (on_external_surface) {
-                                if (grid.sub_grids.get(placing_surface.?)) |root| {
-                                    row_i64 = @min(row_i64, @as(i64, root.rows) - winrows_main);
-                                    col_i64 = @min(col_i64, @as(i64, root.cols) - wincols_main);
-                                }
-                            }
-                        }
+                        const parsed_anchor: grid_mod.FloatAnchor = .{
+                            .south = std.mem.indexOfScalar(u8, anchor, 'S') != null,
+                            .east = std.mem.indexOfScalar(u8, anchor, 'E') != null,
+                            .row = anchor_row_i,
+                            .col = anchor_col_i,
+                        };
+                        const at = grid.resolveAnchoredFloat(grid_id, anchor_grid, parsed_anchor) orelse continue;
+                        row_i64 = at.row;
+                        col_i64 = at.col;
+                        float_anchor = parsed_anchor;
                     }
 
                     if (row_i64 < 0) row_i64 = 0;
@@ -1923,6 +1879,9 @@ pub fn handleRedraw(
                         },
                         else => return err,
                     };
+                    if (on_external_surface) {
+                        if (float_anchor) |fa| grid.setWinFloatAnchor(grid_id, fa);
+                    }
                 }
             },
             .win_external_pos => {

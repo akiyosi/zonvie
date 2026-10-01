@@ -1304,21 +1304,8 @@ fn releaseSurfaceRecoveryBuffers(app: *App, ws: *app_mod.WindowSurface, grid_id:
         const d = detached orelse return true;
         _ = d.buffer.lpVtbl.*.Release.?(d.buffer);
         if (d.row_bytes != 0) {
-            app.row_vb_budget.release(&ws.paint.row_vb_retained_bytes, d.row_bytes);
-        }
-    }
-}
-
-/// Layer-grid row buffers belong to no surface; see detachOneLayerGridVB.
-fn releaseLayerGridRecoveryBuffers(app: *App) void {
-    while (true) {
-        app.mu.lockUncancelable(core.clock.io());
-        const vb = app_mod.detachOneLayerGridVB(&app.layer_grids, &app.layer_row_vb_released_bytes);
-        app.mu.unlock(core.clock.io());
-        if (vb) |buffer| {
-            _ = buffer.lpVtbl.*.Release.?(buffer);
-        } else {
-            return;
+            const retained = if (d.layer) &ws.paint.layer_row_vb_retained_bytes else &ws.paint.row_vb_retained_bytes;
+            app.row_vb_budget.release(retained, d.row_bytes);
         }
     }
 }
@@ -2529,22 +2516,11 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
                 // offset once the core emits multi-layer layouts.
                 .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
                 .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
-                // Under ext_multigrid the root grid carries only
-                // chrome, so the glow pass has to extract the
-                // layers as well or the buffer text never lights.
-                .bloom_layers = if (tbs_snapshot.layers.len > 1)
-                    app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
-                else
-                    null,
             };
 
             // Shared with the external driver: row VBs, the scroll
-            // pixel shift, the layer plan under app.mu (after the
-            // renderer context, the order the layer draw uses), then
-            // the row frame. Layer present rects are added in the
-            // plan's own app.mu hold: added in a hold of their own
-            // before it, a layer the core dirtied in between was
-            // drawn but not presented until the next paint.
+            // pixel shift, the layer plan and its present rects, then
+            // the row frame.
             const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.surf), .{
                 .snapshot = tbs_snapshot,
                 .rows_to_draw = rows_to_draw,
@@ -2553,7 +2529,7 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
                 .preserve_back = preserve_back,
                 .cell_w_px = @intCast(@max(1, app.cell_w_px)),
                 .layer_present = .{
-                    .rects = present_rects,
+                    .present = &present,
                     .right = client.right,
                     .bottom = client.bottom,
                     .cursor_grid = cursor_grid,
@@ -2571,8 +2547,6 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
                     .cursor_layer_origin = cursor_layer_origin,
                     .blink_visible = app.cursor_blink.visible,
                     .force_full_rows = force_full_rows,
-                    .layer_layout_stale = false,
-                    .layer_commit_stale = false,
                     .glow = if (glow_enabled) app_mod.RowFrameGlow{
                         .intensity = glow_intensity,
                         .radius_scale = glow_radius_scale,
@@ -2585,19 +2559,6 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
                 recoverMainPaintFailure(hwnd, app);
                 return;
             };
-            if (pass.stale) {
-                // Nothing reached back_tex but the scrollbar underlay restore:
-                // hand the damage back and repaint now. Not a failure, so no
-                // backoff and no full repaint.
-                app.surf.tbs.returnUndrawnDamage(dirty_row_keys.items, force_full_rows);
-                app.mu.lockUncancelable(core.clock.io());
-                if (seed_clear) app.seed_clear_pending = true;
-                app.paint_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch app_mod.requestMainFullPaintLocked(app);
-                if (restored_scrollbar_rect) |r| app.paint_rects.append(app.alloc, r) catch app_mod.requestMainFullPaintLocked(app);
-                app.mu.unlock(core.clock.io());
-                _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                return;
-            }
             // Add bottom gutter rect if client area extends beyond the grid area.
             // This ensures the gutter is properly cleared in all swapchain buffers
             // during partial present, preventing ghost artifacts from stale content.
@@ -2693,7 +2654,7 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
 
             const row_frame = pass.frame;
             if (row_frame.row_vb_budget_exceeded) {
-                app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
+                app_mod.failRowVbBudget(app, &app.surf.tbs, tbs_snapshot.layers.slice());
                 return;
             }
 
@@ -4771,7 +4732,6 @@ pub export fn WndProc(
                     app.d3d_device = null;
                 }
                 _ = releaseSurfaceRecoveryBuffers(app, &app.surf, null);
-                releaseLayerGridRecoveryBuffers(app);
                 // releaseD2DDeviceObjects drops its own mutex before COM;
                 // call it with no outer app.mu held as well.
                 if (app.atlas) |*a| a.releaseD2DDeviceObjects();

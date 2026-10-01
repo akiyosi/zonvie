@@ -74,6 +74,15 @@ fn ensureMainSurfaceFlush(app: *App) bool {
     return false;
 }
 
+/// ensureMainSurfaceFlush for an external window's write set. External
+/// surfaces join only inside the core's flush bracket. Caller holds app.mu.
+fn ensureExternalSurfaceFlush(app: *App, ext_win: *app_mod.ExternalWindow) bool {
+    if (ext_win.surf.tbs.is_in_flush) return true;
+    if (app.core_flush_active.load(.acquire) and ext_win.surf.tbs.beginFlush(app.alloc)) return true;
+    failFlush(app);
+    return false;
+}
+
 /// Fetch the inline atlas pointer without nesting app.mu -> atlas.mu.
 /// Recovery never replaces App.atlas, and App.deinit joins the core thread
 /// before destroying it, so the pointer remains valid for the callback.
@@ -1124,8 +1133,24 @@ pub fn onGridRowScroll(
         .main_root, .main_layer, .external_layer => false,
     };
     if (!is_external_root) {
-        if (app.layer_grids.get(grid_id)) |state| {
-            if (!state.stageShift(app.alloc, row_start, row_end, rows_delta, total_rows, total_cols)) {
+        // The shift lands in the write set of the surface that places the
+        // grid. A grid that surface holds no rows for cannot carry survivors,
+        // and the vacated-rows-only follow-up would land on rows that were
+        // never sent: ask for the full resend instead.
+        const host_tbs: ?*app_mod.TripleBufferedSurface = switch (row_route) {
+            .main_layer => if (ensureMainSurfaceFlush(app)) &app.surf.tbs else null,
+            .external_layer => |host| if (ensureExternalSurfaceFlush(app, host)) &host.surf.tbs else null,
+            .main_root, .external_root, .unplaced => null,
+        };
+        if (host_tbs) |tbs| {
+            const shifted = tbs.hasLayerRows(grid_id) and tbs.shiftLayerRows(app.alloc, grid_id, .{
+                .row_start = row_start,
+                .row_end = row_end,
+                .rows_delta = rows_delta,
+                .total_rows = total_rows,
+                .total_cols = total_cols,
+            });
+            if (!shifted) {
                 core.zonvie_core_force_resend_locked(app.corep);
                 failFlush(app);
             } else {
@@ -1364,7 +1389,6 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     // the main O(rows) TBS bracket has already been opened.
     app.mu.lockUncancelable(core.clock.io());
     app.log_flush_row_callbacks = 0;
-    app.pending_grid_destroys.clearRetainingCapacity();
     app.log_flush_vertex_count = 0;
     app.core_flush_active.store(true, .release);
     app.mu.unlock(core.clock.io());
@@ -1388,17 +1412,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const core_aborted = if (app.corep) |corep| app_mod.zonvie_core_flush_was_aborted(corep) else false;
     const retryable = if (app.corep) |corep| app_mod.zonvie_core_flush_is_retryable(corep) else false;
     app.mu.lockUncancelable(core.clock.io());
-    var failed = app.flush_failed or atlas_corrupted or core_aborted;
-    if (!failed) {
-        var prepare_it = app.layer_grids.valueIterator();
-        while (prepare_it.next()) |state| {
-            if (!state.*.prepareCommit(app.alloc)) {
-                failFlush(app);
-                failed = true;
-                break;
-            }
-        }
-    }
+    const failed = app.flush_failed or atlas_corrupted or core_aborted;
     app.flush_failed = false;
     if (failed) {
         app.surf.flush_needs_invalidate = false;
@@ -1408,12 +1422,6 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             traceRender(app, "event=surface_abort surface={d}\n", .{entry.key_ptr.*});
             entry.value_ptr.*.surf.tbs.cancelFlush();
             entry.value_ptr.*.surf.flush_needs_invalidate = false;
-        }
-        // Layers publish nothing until applyStaged, so dropping their staged
-        // ops leaves WM_PAINT on the previous committed frame.
-        var layer_cancel_it = app.layer_grids.iterator();
-        while (layer_cancel_it.next()) |entry| {
-            entry.value_ptr.*.discardStaged();
         }
         // Pending captures are CPU-only and can outlive their originating
         // flush while window creation is queued. Drop exactly the captures
@@ -1438,22 +1446,10 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // otherwise clean.
         if (retryable) core.zonvie_core_force_resend_locked(app.corep);
     } else {
-        // Publish staged rows and placements under the same app.mu hold.
-        var layer_commit_it = app.layer_grids.iterator();
-        var layer_rows_published = false;
-        while (layer_commit_it.next()) |entry| {
-            if (entry.value_ptr.*.staged_len != 0) layer_rows_published = true;
-            const applied = entry.value_ptr.*.applyStaged(app.alloc, &app.layer_row_vb_released_bytes);
-            std.debug.assert(applied);
-        }
-        // Not keyed to the hosting surface: a surface told of another's layer
-        // rows only refuses a frame it would have kept.
-        if (layer_rows_published) app.surf.tbs.noteLayerRowsPublished();
-        invalidateMovedLayersLocked(app, &app.surf.tbs);
+        // Each surface publishes its root rows, layer rows, placement and
+        // cursor in one commit.
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
-            if (layer_rows_published) entry.value_ptr.*.surf.tbs.noteLayerRowsPublished();
-            invalidateMovedLayersLocked(app, &entry.value_ptr.*.surf.tbs);
             entry.value_ptr.*.surf.tbs.commitFlush(app.alloc);
             traceRender(app, "event=surface_commit surface={d} layers={d}\n", .{ entry.key_ptr.*, entry.value_ptr.*.surf.tbs.committed_layers.len });
         }
@@ -1474,18 +1470,9 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 if (mini.hwnd) |h| _ = c.InvalidateRect(h, null, c.FALSE);
             }
         }
-        for (app.pending_grid_destroys.items) |grid_id| {
-            traceRender(app, "event=destroy_release grid={d} storage_present={}\n", .{ grid_id, app.layer_grids.contains(grid_id) });
-            if (app.layer_grids.fetchRemove(grid_id)) |kv| {
-                _ = app.layer_row_vb_released_bytes.fetchAdd(kv.value.releaseRowsFrom(app.alloc, 0), .acq_rel);
-                kv.value.deinit(app.alloc);
-                app.alloc.destroy(kv.value);
-            }
-        }
     }
     if (failed) app.surf.tbs.cancelFlush();
-    traceRender(app, "event=end outcome={s} retryable={} destroyed_pending={d} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (failed) "abort" else "commit", retryable, app.pending_grid_destroys.items.len, app.layout_budget.live_bytes.load(.monotonic), core.render_layout.Budget.limit_bytes });
-    app.pending_grid_destroys.clearRetainingCapacity();
+    traceRender(app, "event=end outcome={s} retryable={} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (failed) "abort" else "commit", retryable, app.layout_budget.live_bytes.load(.monotonic), core.render_layout.Budget.limit_bytes });
     const log_row_callbacks = app.log_flush_row_callbacks;
     const log_vertex_count = app.log_flush_vertex_count;
     app.core_flush_active.store(false, .release);
@@ -2561,50 +2548,12 @@ pub fn onSurfaceLayout(
     surf.flush_needs_invalidate = true;
 }
 
-/// Run after row publication and before placement publication, under app.mu.
-/// Moving a layer preserves its rows, but invalidates cached surface pixels.
-fn invalidateMovedLayersLocked(app: *App, tbs: *app_mod.TripleBufferedSurface) void {
-    const staged = tbs.flush_layers orelse return;
-    for (staged.slice(), 0..) |layer, index| {
-        if (index == 0) continue;
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        var unchanged = false;
-        for (tbs.committed_layers.slice()) |prev| {
-            if (prev.grid_id != layer.grid_id) continue;
-            unchanged = prev.x_px == layer.x_px and prev.y_px == layer.y_px and
-                prev.rows == layer.rows and prev.cols == layer.cols and
-                prev.z == layer.z and prev.follows_scroll == layer.follows_scroll;
-            break;
-        }
-        if (unchanged) continue;
-        state.needs_full_redraw = true;
-        state.pending_scroll = null;
-        state.dirty = true;
-    }
-}
-
-/// Stage destruction until the layout that removes this grid commits.
+/// A destroyed grid's rows go with the commit whose layout no longer places
+/// it (TripleBufferedSurface.pruneLayerRows), so there is nothing to release
+/// here.
 pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
-    app.mu.lockUncancelable(core.clock.io());
-    defer app.mu.unlock(core.clock.io());
-    // Outside a flush bracket there is no on_flush_end to publish against, and
-    // onFlushBegin clears this list -- a staged destroy would simply be thrown
-    // away. The core uses that form on session reset, where the grids are
-    // already gone and the storage has to be released now or never.
-    if (!app.core_flush_active.load(.acquire)) {
-        traceRender(app, "event=destroy_now grid={d}\n", .{grid_id});
-        if (app.layer_grids.fetchRemove(grid_id)) |kv| {
-            _ = app.layer_row_vb_released_bytes.fetchAdd(kv.value.releaseRowsFrom(app.alloc, 0), .acq_rel);
-            kv.value.deinit(app.alloc);
-            app.alloc.destroy(kv.value);
-        }
-        return;
-    }
-    traceRender(app, "event=destroy_stage grid={d}\n", .{grid_id});
-    app.pending_grid_destroys.append(app.alloc, grid_id) catch {
-        failFlush(app);
-    };
+    traceRender(app, "event=destroy grid={d}\n", .{grid_id});
 }
 
 /// True when the main surface places `grid_id` as one of its layers. The
@@ -2717,29 +2666,19 @@ fn storeMainSurfaceLayerRowLocked(
         host.surf.flush_needs_invalidate = true;
     }
 
-    // The row belongs to this path, so an allocation failure must not fall
-    // through to the external-window path. Abort the flush and have the core
-    // re-send instead, and still report the row consumed.
-    const gop = app.layer_grids.getOrPut(app.alloc, grid_id) catch {
-        core.zonvie_core_force_resend_locked(app.corep);
-        failFlush(app);
-        return true;
-    };
-    if (!gop.found_existing) {
-        const created = app.alloc.create(app_mod.LayerGridState) catch {
-            _ = app.layer_grids.remove(grid_id);
-            core.zonvie_core_force_resend_locked(app.corep);
-            failFlush(app);
-            return true;
-        };
-        created.* = .{};
-        gop.value_ptr.* = created;
-    }
-    const accepted = gop.value_ptr.*.stageRow(app.alloc, row, verts, total_rows, total_cols);
+    // The row belongs to this path, so a failure must not fall through to the
+    // external-window path. Abort the flush and have the core re-send
+    // instead, and still report the row consumed. The rows go to the write
+    // set of the surface that places the grid, so they publish with that
+    // surface's commit.
+    const opened = if (ext) |host| ensureExternalSurfaceFlush(app, host) else ensureMainSurfaceFlush(app);
+    if (!opened) return true;
+    const tbs = if (ext) |host| &host.surf.tbs else &app.surf.tbs;
+    const accepted = tbs.writeLayerRow(app.alloc, grid_id, row, verts, total_rows);
     traceRender(app, "event=row_staged grid={d} row={d} accepted={}\n", .{ grid_id, row, accepted });
     if (!accepted) {
-        // Nothing was published, so the layer keeps its previous frame until
-        // the core re-sends this one.
+        // The write set is cancelled with the flush, so the layer keeps its
+        // previous frame until the core re-sends this one.
         core.zonvie_core_force_resend_locked(app.corep);
         failFlush(app);
     }
