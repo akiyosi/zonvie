@@ -689,6 +689,16 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
+    if (self.float_config_requests.fetchRemove(id)) |kv| {
+        // An error is a window closed before the answer; nothing to apply.
+        if (has_err) return;
+        const follows = floatConfigFollowsScroll(top[3]);
+        self.grid_mu.lockUncancelable(clock.io());
+        self.grid.setFloatFollows(kv.value, follows);
+        self.grid_mu.unlock(clock.io());
+        return;
+    }
+
     if (takeTrackedRequest(&self.glow_request_msgid, id)) {
         if (has_err) {
             // The next redraw re-requests it.
@@ -698,6 +708,25 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
         applyGlowConfig(self, top[3]);
     }
+}
+
+/// Whether an nvim_win_get_config result describes a float that tracks the
+/// buffer: relative to a window, at a buffer position. Neovim moves exactly
+/// those with their window's scroll (win_float_pos follows it in the same
+/// batch); every other float stays put while the window scrolls under it.
+pub fn floatConfigFollowsScroll(result: mp.Value) bool {
+    if (result != .map) return false;
+    var relative_win = false;
+    var has_bufpos = false;
+    for (result.map) |entry| {
+        if (entry.key != .str) continue;
+        if (std.mem.eql(u8, entry.key.str, "relative")) {
+            relative_win = entry.val == .str and std.mem.eql(u8, entry.val.str, "win");
+        } else if (std.mem.eql(u8, entry.key.str, "bufpos")) {
+            has_bufpos = entry.val == .arr and entry.val.arr.len == 2;
+        }
+    }
+    return relative_win and has_bufpos;
 }
 
 /// Whether `id` answers the request tracked in `slot`, clearing the slot if so.
@@ -1830,7 +1859,9 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
+        self.takeFloatConfigQueriesLocked();
         self.unlockGridAsRedrawOwner();
+        self.sendFloatConfigQueries();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -4006,4 +4037,25 @@ test "yank and put round-trip a register larger than the staging buffers" {
     try std.testing.expectEqual(want.len, board.bytes.items.len);
     try std.testing.expectEqual(want.len, pasted.len);
     try std.testing.expectEqualSlices(u8, want, pasted);
+}
+
+test "only a window-relative float at a buffer position follows the scroll" {
+    const Entry = mp.Pair;
+    var pos = [_]mp.Value{ .{ .int = 10 }, .{ .int = 2 } };
+    var win_bufpos = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "win" } },
+        .{ .key = .{ .str = "bufpos" }, .val = .{ .arr = &pos } },
+    };
+    var win_rowcol = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "win" } },
+        .{ .key = .{ .str = "row" }, .val = .{ .int = 3 } },
+    };
+    var editor = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "editor" } },
+        .{ .key = .{ .str = "bufpos" }, .val = .{ .arr = &pos } },
+    };
+    try std.testing.expect(floatConfigFollowsScroll(.{ .map = &win_bufpos }));
+    try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &win_rowcol }));
+    try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &editor }));
+    try std.testing.expect(!floatConfigFollowsScroll(.nil));
 }

@@ -250,14 +250,6 @@ pub const Callbacks = struct {
         chunk_count: usize,
     ) callconv(.c) void = null,
 
-    /// Called when message history should be shown.
-    on_msg_history_show: ?*const fn (
-        ctx: ?*anyopaque,
-        entries: [*]const c_api.MsgHistoryEntry,
-        entry_count: usize,
-        prev_cmd: c_int,
-    ) callconv(.c) void = null,
-
     // Clipboard callbacks
     /// Called to get clipboard content.
     /// Returns 1 on success, 0 on failure.
@@ -479,10 +471,9 @@ pub const RedrawRecoveryState = enum {
     await_attach,
 };
 
-/// One surface's vertex row ledger as it stood when a flush attempt began.
-/// `live` is cleared at the start of every snapshot, so an entry left stale
-/// belongs to a grid destroyed since and is not restored onto a replacement
-/// that reuses the id.
+/// One surface's vertex row ledger as it stood before a flush attempt first
+/// wrote it. `live` is cleared at the start of every attempt, so only grids
+/// this attempt touched are restored.
 pub const SavedLedger = struct {
     counts: std.ArrayListUnmanaged(usize) = .empty,
     surface_vertex_count: usize = 0,
@@ -722,20 +713,16 @@ pub const Core = struct {
     /// When true, the flush pipeline skips vertex generation and atlas operations.
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
-    /// Main-grid dirty state as it stood when the current flush started.
-    /// A frontend that refuses to publish (atlas back-sync still in flight,
-    /// no free buffer set) leaves the previously committed frame on screen,
-    /// so the retry only owes the rows this attempt consumed — restoring
-    /// this is what keeps a rejection from costing a whole-viewport resend.
-    flush_dirty_snapshot: grid_mod.DirtySnapshot = .{},
-    /// Row ledgers as they stood when the current flush started, paired with
-    /// flush_dirty_snapshot. Restoring both makes the core's accounting match
-    /// the frame the frontend still has on screen after it declined to commit.
-    /// `live` on the main entry says the whole snapshot was taken. Entries and
-    /// their buffers are reused across flushes; a steady-state flush allocates
-    /// nothing here.
+    /// Row ledgers as they stood before the current flush first wrote them,
+    /// saved per grid on that first write (saveLedgerOnFirstWrite). Restoring
+    /// them makes the core's accounting match the frame the frontend still has
+    /// on screen after it declined to commit. Entries and their buffers are
+    /// reused across flushes; a steady-state flush allocates nothing here.
     flush_main_ledger: SavedLedger = .{},
     flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SavedLedger) = .empty,
+    /// A ledger could not be saved this attempt; a refusal then falls back to
+    /// invalidating every ledger.
+    flush_ledger_journal_failed: bool = false,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -1082,6 +1069,13 @@ pub const Core = struct {
     // 0 means no pending request
     quit_request_msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
+    // In-flight nvim_win_get_config requests for float follows-scroll, msgid
+    // -> window handle, and the windows the last redraw batch queued for one.
+    // RPC thread only: sent after a redraw batch, answered in
+    // handleRpcResponse.
+    float_config_requests: std.AutoHashMapUnmanaged(i64, i64) = .{},
+    float_config_outbox: std.ArrayListUnmanaged(i64) = .empty,
+
     clipboard_setup_done: bool = false,
 
     // Neon glow configuration (read from vim.g.zonvie_glow)
@@ -1233,11 +1227,12 @@ pub const Core = struct {
         // Scratch buffers.
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
-        self.flush_dirty_snapshot.deinit(self.alloc);
         self.flush_main_ledger.counts.deinit(self.alloc);
         var subgrid_ledger_it = self.flush_subgrid_ledgers.valueIterator();
         while (subgrid_ledger_it.next()) |entry| entry.counts.deinit(self.alloc);
         self.flush_subgrid_ledgers.deinit(self.alloc);
+        self.float_config_requests.deinit(self.alloc);
+        self.float_config_outbox.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
@@ -1451,6 +1446,7 @@ pub const Core = struct {
             // stale response from the new server cannot match.
             self.quit_request_msgid.store(0, .release);
             self.glow_request_msgid.store(0, .release);
+            self.float_config_requests.clearRetainingCapacity();
 
             self.glow_startup_retries = 30;
             self.ssh_auth_pending.store(false, .seq_cst);
@@ -3572,15 +3568,13 @@ pub const Core = struct {
             .is_external = @intFromBool(is_external),
             .mouse_enabled = 1,
             .placed_by_surface = gid,
-            .compindex = 0,
-            .draw_order = 0,
+            .layer_z = 0,
         };
         const p = pos orelse return info;
         // In the space of the surface that places it, as the header promises:
         // a float an external window hosts is stored in global units.
         const placed = self.grid.surfacePlacement(p);
-        const layer = self.grid.win_layer.get(gid) orelse grid_mod.WinLayer{ .zindex = 0, .compindex = 0, .order = 0 };
-        info.zindex = layer.zindex;
+        info.zindex = if (self.grid.win_layer.get(gid)) |layer| layer.zindex else 0;
         info.start_row = if (placed) |sp| std.math.lossyCast(i32, sp.row) else grid_mod.saturatingI32FromU32(p.row);
         info.start_col = if (placed) |sp| std.math.lossyCast(i32, sp.col) else grid_mod.saturatingI32FromU32(p.col);
         info.anchor_grid = p.anchor_grid;
@@ -3590,8 +3584,7 @@ pub const Core = struct {
         // whose layer list this grid belongs in; 0 when no surface draws it
         // (broken or cyclic anchor chain, or a surface with no buffer yet).
         info.placed_by_surface = flush.placedSurfaceForGrid(&self.grid, gid) orelse 0;
-        info.compindex = layer.compindex;
-        info.draw_order = layer.order;
+        info.layer_z = flush.publishedLayerZ(self, info.placed_by_surface, gid);
         return info;
     }
 
@@ -5007,6 +5000,36 @@ pub const Core = struct {
             return;
         };
         self.log.write("rpc send: requestGlowConfig (id={d})\n", .{id});
+    }
+
+    /// Take the windows the redraw batch queued for a follows-scroll query.
+    /// Caller holds grid_mu; the requests go out after it is released.
+    pub fn takeFloatConfigQueriesLocked(self: *Core) void {
+        self.float_config_outbox.clearRetainingCapacity();
+        self.float_config_outbox.appendSlice(self.alloc, self.grid.float_config_wanted.items) catch return;
+        self.grid.float_config_wanted.clearRetainingCapacity();
+    }
+
+    /// Ask Neovim for each queued window's config. A window already asked is
+    /// not asked again; a failed send leaves it to the next win_float_pos.
+    pub fn sendFloatConfigQueries(self: *Core) void {
+        outer: for (self.float_config_outbox.items) |win_id| {
+            var it = self.float_config_requests.valueIterator();
+            while (it.next()) |w| if (w.* == win_id) continue :outer;
+            const id = self.nextMsgId();
+            self.float_config_requests.put(self.alloc, id, win_id) catch continue;
+            var buf: rpc.Buf = .empty;
+            defer buf.deinit(self.alloc);
+            const ok = blk: {
+                self.sendRequestHeader(&buf, id, "nvim_win_get_config") catch break :blk false;
+                rpc.packArray(&buf, self.alloc, 1) catch break :blk false;
+                rpc.packInt(&buf, self.alloc, win_id) catch break :blk false;
+                self.sendRaw(buf.items) catch break :blk false;
+                break :blk true;
+            };
+            if (!ok) _ = self.float_config_requests.remove(id);
+        }
+        self.float_config_outbox.clearRetainingCapacity();
     }
 
     /// Set a global option value in Neovim via nvim_set_option_value.
@@ -7391,10 +7414,9 @@ test "a float an external window hosts is reported in that window's cells" {
     // A detached split: external window 3 kept its main-grid origin (5, 7).
     try core.grid.resizeGrid(3, 10, 30);
     _ = try core.grid.setWinExternalPosAt(3, 43, 5, 7);
-    // Float 4 at (2, 1) inside it, stored the way redraw_handler stores it:
-    // with the window's origin added.
+    // Float 4 at (2, 1) inside it, in the window's own cells.
     try core.grid.resizeGrid(4, 3, 10);
-    try core.grid.setWinFloatPos(4, 44, 5 + 2, 7 + 1, 50, 0, 3, true);
+    try core.grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
 
     var out: [4]c_api.GridInfo = undefined;
     const count = core.getVisibleGrids(&out);

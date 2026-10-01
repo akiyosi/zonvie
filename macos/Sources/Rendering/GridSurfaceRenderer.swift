@@ -1388,6 +1388,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             flushFailed = true
             return
         }
+        // The core only shifts on full grid-local width
+        // (gridScrollFastPathRegion in src/core/flush.zig). A narrower shift
+        // cannot be carried by whole-row slot remaps, so fail the flush and
+        // let the retry resend every row.
+        guard colStart == 0, colEnd == totalCols else {
+            flushFailed = true
+            return
+        }
         // Must run before the remap: it reuses the outgoing row's slot for the
         // incoming row within this same flush.
         captureLayerScrollStep(
@@ -1427,7 +1435,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // above: the prepareLayerGridsForWrite() inside it resets the
         // destination's pendingScroll.
         let ws = sets[writeSetIndex]
-        if colStart == 0, colEnd == totalCols, regionRows > 0 {
+        if regionRows > 0 {
             stageSurfaceRowScroll(
                 on: ws,
                 rowStart: rowStart, rowEnd: rowEnd,
@@ -1444,11 +1452,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let shiftRows = min(abs(rowsDelta), regionRows)
             let vacatedStart = rowsDelta > 0 ? rowEnd - shiftRows : rowStart
             markLayerRowsDirty(gridId: gridId, rowStart: vacatedStart, rowCount: shiftRows)
-        } else {
-            // The core only shifts on full grid-local width
-            // (gridScrollFastPathRegion in src/core/flush.zig), so redraw the
-            // region rather than stage a shift the blit would apply too wide.
-            markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: regionRows)
         }
         // Once per hint, not per row: the scroll scenarios assert the fast
         // path actually ran, since regenerating everything looks identical on
@@ -1646,10 +1649,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     static let commitGuardBandNs: UInt64 = {
         guard let s = ProcessInfo.processInfo.environment["ZONVIE_COMMIT_GUARD_US"],
               let us = UInt64(s) else { return 2_000_000 }
-        // Clamped: this is a main-thread wait, so an unbounded override stalls
-        // input for as long as it names.
-        return min(us, 8_000) * 1_000
+        // Clamped: this is a main-thread wait, and the budget is shared by
+        // every surface drawing on the same vsync.
+        return min(us, 2_000) * 1_000
     }()
+    static let commitGuardBandSpacingNs: UInt64 = 4_000_000
 
     /// Continuous-scroll guard band, shared by both surfaces' draws.
     ///
@@ -1660,26 +1664,33 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// stutter. A draw spends ~0.3ms of the 16.67ms budget, so the slack to
     /// absorb this is already there.
     ///
-    /// Only a frame that would otherwise be dropped can wait, and only while a
-    /// scroll is actually in progress, so a genuinely idle screen still bails
-    /// immediately. The wait ends the moment the commit lands; the bound only
-    /// caps a genuinely late producer. `lock` is held only for each revision
-    /// read, never across the sleep.
+    /// Only a frame that would otherwise be dropped can wait, and only on a
+    /// surface that is smooth scrolling, so any other screen bails
+    /// immediately. At most one surface waits per vsync: a wait that ended
+    /// within `commitGuardBandSpacingNs` blocks the rest, which keeps the total
+    /// main-thread cost per vsync under `commitGuardBandNs`. The wait ends the
+    /// moment the commit lands; the bound only caps a genuinely late producer.
+    /// `lock` is held only for each revision read, never across the sleep.
+    /// Main thread only.
     static func waitCommitGuardBand(
+        shared: SharedRenderResources,
         lock: NSLock,
         commitRevision: () -> UInt64,
         lastDrawnRevision: UInt64,
-        hadRecentCommit: (UInt64) -> Bool,
+        isSmoothScrolling: Bool,
         timedOutRevision: inout UInt64,
         seq: UInt32 = 0
     ) {
-        guard commitGuardBandNs > 0 else { return }
+        guard commitGuardBandNs > 0, isSmoothScrolling else { return }
         lock.lock()
         var revision = commitRevision()
         lock.unlock()
-        guard revision == lastDrawnRevision, revision != timedOutRevision,
-              hadRecentCommit(50_000_000) else { return }
+        guard revision == lastDrawnRevision, revision != timedOutRevision else { return }
         let start = FrameTracer.nowNs()
+        // Surfaces on one vsync draw back to back, well inside this; the next
+        // vsync's draws start >= 6ms after a band ends even at 120Hz.
+        guard start >= shared.commitGuardBandLastEndNs + commitGuardBandSpacingNs else { return }
+        defer { shared.commitGuardBandLastEndNs = FrameTracer.nowNs() }
         let deadline = start + commitGuardBandNs
         while FrameTracer.nowNs() < deadline {
             // Short enough to catch a ~200us miss, long enough not to spin
@@ -1692,10 +1703,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         if revision == lastDrawnRevision {
             // The band ran out with no commit, so the producer is not merely
-            // a few hundred microseconds late. hadRecentCommit is a trailing
-            // window, so without this every frame for the rest of it would
-            // burn the full band for nothing — ~3 frames after each scroll
-            // stop at 60Hz.
+            // a few hundred microseconds late; without this every frame of
+            // the scroll's settle would burn the full band for nothing.
             timedOutRevision = revision
         }
         if FrameTracer.enabled {
@@ -3078,11 +3087,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
+            lock.lock()
+            let guardBandSmoothScrolling = scrollOffsetLatch.isSmoothScrolling
+            lock.unlock()
             Self.waitCommitGuardBand(
+                shared: shared,
                 lock: lock,
                 commitRevision: { self.commitRevision },
                 lastDrawnRevision: lastDrawnRevision,
-                hadRecentCommit: { self.hadRecentCommit(withinNs: $0) },
+                isSmoothScrolling: guardBandSmoothScrolling,
                 timedOutRevision: &guardBandTimedOutRevision
             )
 
@@ -3166,6 +3179,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 if !terminal {
                     host?.requestRedraw()
                 }
+                return
+            }
+            // Before the first row lands there is only the cursor to draw, and
+            // with no cursor either there is nothing. Checked before the
+            // snapshot below, which consumes pending dirty state.
+            if !bufferSets[committedSetIndex].rowState.usingRowBuffers,
+               cursorSlots[committedCursorSetIndex].vertexCount <= 0 {
+                lock.unlock()
+                inflightSemaphore.signal()
+                notifyCellMetricsIfChanged()
+                FrameTracer.trace(.drawSkipNoChange, a: 1)
+                host?.didDrawFrame()
                 return
             }
             csi = committedSetIndex
@@ -3355,13 +3380,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let ch = shared.cellHeightPx
 
             let currentCursorCount = committedCursorCount
-
-            // Before the first row lands there is only the cursor to draw.
-            if !rowMode && currentCursorCount <= 0 {
-                FrameTracer.trace(.drawSkipNoChange, a: 1)
-                host?.didDrawFrame()
-                return
-            }
 
             let blinkStateChanged = cursorBlinkStateSnapshot != blink.lastRendered
 

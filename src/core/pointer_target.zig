@@ -27,13 +27,11 @@ const std = @import("std");
 /// region shaped like the grid, wherever the numbers happen to land.
 pub const Candidate = struct {
     grid_id: i64,
+    /// Only says whether this is a float, for `require_scrollable`.
     zindex: i64,
-    /// Neovim's composition index, and the core's own tie-breaker after it.
-    /// Together with zindex and grid_id these are the order the core sorts a
-    /// surface's layers by, back to front — the one answer to "which of these
-    /// is drawn on top".
-    compindex: i64,
-    draw_order: u64,
+    /// The grid's z in its surface's published layer list: the one answer to
+    /// "which of these is drawn on top".
+    layer_z: i64,
     start_row: i32,
     start_col: i32,
     rows: i32,
@@ -115,11 +113,9 @@ pub fn resolve(
         if (row < g.start_row or row >= g.start_row + g.rows) continue;
         if (col < g.start_col or col >= g.start_col + g.cols) continue;
         if (require_scrollable and g.zindex > 0 and !capturesScroll(g)) continue;
-        // Front-most wins, by the key the core sorts a surface's layers with.
-        // A plain split carries zeros for all three of zindex, compindex and
-        // draw_order, so grid_id decides between it and the container grid — which
-        // is the special case one frontend had written out as `grid_id > 1`,
-        // and the other did not have at all.
+        // Front-most wins, by the order the surface published. A grid not
+        // published yet carries 0, the root's z, so grid_id decides between it
+        // and the container grid.
         const dominated = if (best) |b| drawnInFrontOf(g, b) else true;
         if (dominated) best = g;
     }
@@ -129,12 +125,9 @@ pub fn resolve(
 
 // ── tests ────────────────────────────────────────────────────────────────
 
-/// Whether `a` is drawn in front of `b`, by the core's layer sort key
-/// (flush.collectSurfaceLayerEntries).
+/// Whether `a` is drawn in front of `b`, by the published layer order.
 fn drawnInFrontOf(a: anytype, b: anytype) bool {
-    if (a.zindex != b.zindex) return a.zindex > b.zindex;
-    if (a.compindex != b.compindex) return a.compindex > b.compindex;
-    if (a.draw_order != b.draw_order) return a.draw_order > b.draw_order;
+    if (a.layer_z != b.layer_z) return a.layer_z > b.layer_z;
     return a.grid_id > b.grid_id;
 }
 
@@ -144,8 +137,7 @@ fn win(grid_id: i64, start_row: i32, start_col: i32, rows: i32, cols: i32) Candi
     return .{
         .grid_id = grid_id,
         .zindex = 0,
-        .compindex = 0,
-        .draw_order = 0,
+        .layer_z = 0,
         .start_row = start_row,
         .start_col = start_col,
         .rows = rows,
@@ -162,6 +154,7 @@ fn win(grid_id: i64, start_row: i32, start_col: i32, rows: i32, cols: i32) Candi
 fn float(grid_id: i64, start_row: i32, start_col: i32, rows: i32, cols: i32, lines: i64) Candidate {
     var c = win(grid_id, start_row, start_col, rows, cols);
     c.zindex = 50;
+    c.layer_z = grid_id;
     c.line_count = lines;
     return c;
 }
@@ -220,8 +213,8 @@ test "a float showing all of its content lets a wheel event through" {
 }
 
 test "a scrollable float under a non-scrollable one still takes the wheel" {
-    var over = float(6, 10, 20, 10, 30, 10);
-    over.draw_order = 1; // drawn after 5, so in front of it
+    const over = float(6, 10, 20, 10, 30, 10);
+    // Published over 5 (float() takes the grid id as its z).
     const grids = [_]Candidate{
         win(1, 0, 0, 40, 100),
         float(5, 10, 20, 10, 30, 400),

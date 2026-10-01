@@ -1440,13 +1440,19 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     } else {
         // Publish staged rows and placements under the same app.mu hold.
         var layer_commit_it = app.layer_grids.iterator();
+        var layer_rows_published = false;
         while (layer_commit_it.next()) |entry| {
+            if (entry.value_ptr.*.staged_len != 0) layer_rows_published = true;
             const applied = entry.value_ptr.*.applyStaged(app.alloc, &app.layer_row_vb_released_bytes);
             std.debug.assert(applied);
         }
+        // Not keyed to the hosting surface: a surface told of another's layer
+        // rows only refuses a frame it would have kept.
+        if (layer_rows_published) app.surf.tbs.noteLayerRowsPublished();
         invalidateMovedLayersLocked(app, &app.surf.tbs);
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
+            if (layer_rows_published) entry.value_ptr.*.surf.tbs.noteLayerRowsPublished();
             invalidateMovedLayersLocked(app, &entry.value_ptr.*.surf.tbs);
             entry.value_ptr.*.surf.tbs.commitFlush(app.alloc);
             traceRender(app, "event=surface_commit surface={d} layers={d}\n", .{ entry.key_ptr.*, entry.value_ptr.*.surf.tbs.committed_layers.len });
