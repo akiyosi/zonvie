@@ -329,8 +329,27 @@ final class MetalTerminalView: GridInputView {
         commonInit()
     }
 
+    /// Test only: with ZONVIE_TEST_FULL_REDRAW=1, SIGUSR2 forces the next frame
+    /// to redraw everything, so a gui-test can compare it with the partial
+    /// frame before it.
+    private var testFullRedrawSource: DispatchSourceSignal?
+
+    private func installTestFullRedrawHandler() {
+        guard ProcessInfo.processInfo.environment["ZONVIE_TEST_FULL_REDRAW"] == "1" else { return }
+        signal(SIGUSR2, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self, let renderer = self.renderer else { return }
+            renderer.forceFullRedrawForTest()
+            self.requestRedraw()
+        }
+        src.resume()
+        testFullRedrawSource = src
+    }
+
     private func commonInit() {
         FrameTracer.installDumpHandler()
+        installTestFullRedrawHandler()
         guard self.device != nil else {
             ZonvieCore.appLog("[View] Failed to create MTLDevice - Metal not available")
             return

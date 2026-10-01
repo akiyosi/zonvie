@@ -120,6 +120,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
+    const setup_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("execute('set laststatus=0 noruler noshowcmd nowrap')");
     try g.exec(
         \\setline(1, map(range(1, 200), {_, i -> printf('%3d %s', i, repeat(nr2char(65 + i % 26), 40))}))
@@ -127,7 +128,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('vsplit')");
     try g.exec("execute('wincmd =')");
     try g.exec("execute('wincmd h')");
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, setup_mark, 10_000);
 
     var left_img = try g.captureStable(crop, 8000);
     defer left_img.deinit(alloc);

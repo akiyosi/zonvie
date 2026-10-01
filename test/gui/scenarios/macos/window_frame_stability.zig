@@ -1,5 +1,5 @@
-// window_frame_stability — regression test for 44705f8: with ext_tabline
-// enabled the main window shrank a few rows of height on EVERY launch
+// window_frame_stability — with ext_tabline enabled the main window once
+// shrank a few rows of height on EVERY launch
 // (default-guifont snap chained into user-guifont snap, compounded through
 // the autosaved frame) until it hit the minimum size.
 //

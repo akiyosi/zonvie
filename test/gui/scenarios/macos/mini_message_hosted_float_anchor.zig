@@ -71,7 +71,7 @@ fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !vo
     });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
 
     const before_snap = driver.snapshotWindows(g.app_pid);
     const before = before_snap.slice();
@@ -79,16 +79,20 @@ fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !vo
 
     // An external window, and a float anchored inside it with searchable
     // content. The cursor ends in the float.
+    const ext_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, true, {"host"}) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[external_window] open gridId=", ext_mark, 10_000);
+    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
+    try app_log.waitFramesAfter(alloc, log_path, ext_grid, 1, ext_mark, 10_000);
 
+    const float_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, true, {"alpha zonvie beta", "gamma zonvie delta"}) _G.z_float = vim.api.nvim_open_win(b, true, {relative="win", win=_G.z_anchor, row=2, col=2, width=30, height=5}) return 1 end)()')
     );
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, ext_grid, 1, float_mark, 10_000);
 
     // Gates. Each names a way this could pass while proving nothing.
     if (try g.evalInt("luaeval('(vim.api.nvim_get_current_win() == _G.z_float) and 1 or 0')") != 1) {

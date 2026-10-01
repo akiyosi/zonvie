@@ -133,6 +133,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // The external window, with a buffer whose every line differs across the
     // full width: a screen made of similar lines would survive a bad shift
     // unchanged and make this blind to the very artifact it exists to catch.
+    const before_float = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 400 do l[i] = string.format("%3d %s", i, string.rep(string.char(65 + i % 26), 56)) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_ext = vim.api.nvim_open_win(b, true, {relative="editor", row=1, col=1, width=60, height=20}) return 1 end)()')
     );
@@ -144,7 +145,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // origin of 0 instead. Both routes draw; only this one places the float at
     // `float_pos.row - start_row`. extfloat_over_born_external_anchor covers
     // the other.
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_float, 10_000);
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
@@ -157,10 +158,11 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // A float anchored to the EXTERNAL window. style="minimal" keeps the
     // oracle about the float's content rather than border geometry, and
     // enter=false leaves the anchor current so the scroll below lands on it.
+    const before_hosted = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 6 do l[i] = "FLOAT" .. i .. " " .. string.rep(string.char(64 + i), 17) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, false, {relative="win", win=_G.z_ext, row=6, col=4, width=24, height=6, style="minimal"}) return 1 end)()')
     );
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_hosted, 10_000);
 
     // The premise: this float is composited into the anchor's rows, not given
     // an OS window of its own. If the frontend ever draws it separately there

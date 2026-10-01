@@ -73,11 +73,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // cmdline view is the one publishing the shader cursor rect.
     const t0 = try app_log.nowMs(alloc, log_path);
     try g.remoteSend(":");
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    const cmdline_win = driver.waitNewWindow(g.app_pid, main_wins, 0) catch return error.CmdlineWindowNotFound;
+    // The rect read below has to be the one published after "echo" moved the
+    // cursor, not the one ":" left.
+    const echo_mark = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("echo");
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
-
-    const cmdline_win = driver.newWindow(g.app_pid, main_wins, 0) orelse return error.CmdlineWindowNotFound;
+    try app_log.waitAfter(alloc, log_path, marker, echo_mark, 10_000);
     const rect = try waitCursorRect(alloc, t0, 10_000);
 
     // Scale comes off the rect's own line: it is the scale of the space the

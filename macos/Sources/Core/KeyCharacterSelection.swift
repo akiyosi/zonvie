@@ -15,8 +15,8 @@ enum KeyCharacterSelection {
     ///
     /// Both the main grid view and the external grid views call this. The rule
     /// used to be written out at each keyDown, and the two copies drifted:
-    /// `2e91d87` added it to one of them while its own message claimed to
-    /// "apply optionIsMeta logic consistently in both".
+    /// a change that set out to apply the optionIsMeta logic consistently in
+    /// both added it to only one of them.
     static func primaryCharacters(
         optionIsMeta: Bool,
         characters: String?,

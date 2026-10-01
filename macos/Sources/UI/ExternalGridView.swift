@@ -423,9 +423,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     // and publishes eased offsets outside the bracket (`lock`), and a
     // core-thread bracket may block neither. Everything else — retention
     // included — is under the same lock as the vertex publish on both
-    // surfaces. Touching the provisioning path itself: b83ff29 and 4b1ad75 are
-    // the same mistake twice, a capacity gate that deferred allocation and
-    // raced the per-flush row remap. Audit 2026-08-25, finding 037.
+    // surfaces. Touching the provisioning path itself: it has twice been broken the
+    // same way, by a capacity gate that deferred allocation and raced the
+    // per-flush row remap. Audit 2026-08-25, finding 037.
     // Fixed-size capacity ledger. The core callback only raises entries;
     // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
     // bracket closes, before retrying the core flush.
@@ -1012,13 +1012,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// Refuses the bracket while the capacity ledger is armed, which is the
     /// gate `GridSurfaceRenderer.beginFlush` has carried all along. Only that
     /// one: the row SET is still acquired lazily by `prepareRowWriteState`, so
-    /// a cursor-only flush is never dropped for a set it does not want (56f3b4a
-    /// moved it there for exactly that reason, and this must not undo it).
+    /// a cursor-only flush is never dropped for a set it does not want (that is
+    /// why the acquisition lives there, and this must not undo it).
     ///
     /// Refusing here rather than at the first row submit does not change the
     /// blast radius — both end in `zonvie_core_abort_flush` plus a retry — but
     /// it spends no vertex generation first. The ledger only arms on a real
-    /// allocation failure (b83ff29, 4b1ad75), so this is a rare, transient
+    /// allocation failure, so this is a rare, transient
     /// state, not a per-flush cost.
     ///
     /// The stage-by-stage table against `GridSurfaceRenderer.beginFlush` is
@@ -3353,6 +3353,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // `sem` and `tbLock` are the ones captured for `releaseFrameState`
             // above, for the same reason: the signal has to fire even if the
             // view is deallocated before the GPU finishes.
+            let traceSurfaceId = gridId
             cmd.addCompletedHandler { [weak self] completed in
                 let failed = completed.status != .completed
                 tbLock.lock()
@@ -3368,6 +3369,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     DispatchQueue.main.async { [weak self] in
                         self?.requestRedraw()
                     }
+                } else if ZonvieCore.appLogEnabled {
+                    // What a test waits on instead of sleeping for a frame.
+                    ZonvieCore.appLog("[trace] event=frame_done surface=\(traceSurfaceId)")
                 }
             }
             cmd.commit()

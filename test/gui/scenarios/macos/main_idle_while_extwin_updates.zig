@@ -131,8 +131,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (ext_draws == 0) return error.ExternalWindowDidNotDraw;
     if (empty != 0) return error.MainDrewForExternalOnlyFlush;
 
+    const main_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("setline(1, 'ab')");
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, main_mark, 10_000);
     const t1 = try app_log.nowMs(alloc, log_path);
     i = 0;
     while (i < updates) : (i += 1) {

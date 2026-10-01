@@ -364,7 +364,7 @@ test "a region below row 0 never expands above its own start" {
 }
 
 test "a reported row count past the drawable clamps copy, band and dirty rows alike" {
-    // The regression 8a9cba0 fixed: 45 rows reported, 44 fit. Everything must
+    // A regression once lived here: 45 rows reported, 44 fit. Everything must
     // stop at the same clamped row, or part of the band the blit cleared is
     // never redrawn and stays blank until the next full redraw.
     const p = plan44(0, 45, 2).?;

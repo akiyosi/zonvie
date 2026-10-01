@@ -6,7 +6,7 @@
 // so neither `dirtyRows` nor `anyLayerWork` says anything about it. The commit
 // revision is what keeps the frame alive: the main surface's row-mode skip gate
 // carries `!hasNewCommit`, so a commit this draw has not seen is not skipped
-// (it did not always; see ad3d17a).
+// (it did not always: without it the cursor froze inside the float).
 //
 // WHAT THIS SCENARIO DOES AND DOES NOT COVER. It asserts the OUTCOME: the
 // cursor visibly moves inside a float the main window hosts. It does NOT
@@ -29,6 +29,7 @@ const std = @import("std");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 /// The float sits in the upper-left quadrant. Cropping to it keeps the main
 /// grid's own cursor and any chrome out of the measurement.
@@ -45,11 +46,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('set nocursorline nonumber')");
     // A float with enough rows that the cursor can move without scrolling it,
     // and plain identical-width content so only the cursor varies the pixels.
+    const before_float = try app_log.lineMark(alloc, fixture.default_log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 12 do l[i] = "float line" end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, true, {relative="editor", row=3, col=4, width=20, height=10, style="minimal", border="single"}) vim.api.nvim_win_set_cursor(_G.z_float, {1, 0}) return 1 end)()')
     );
     // Let the float's own first frames land before measuring.
-    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, fixture.default_log_path, 1, 2, before_float, 10_000);
 
     var before = try g.captureStable(.{ .w_pt = 600, .h_pt = 300 }, 8000);
     defer before.deinit(alloc);
@@ -57,8 +59,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Move the cursor several rows down INSIDE the float. No content changes:
     // every line is identical, cursorline is off, and the float does not
     // scroll.
+    const before_move = try app_log.lineMark(alloc, fixture.default_log_path);
     try g.exec("luaeval('(function() vim.api.nvim_win_set_cursor(_G.z_float, {6, 0}) return 1 end)()')");
-    gui_io.sleepNs(900 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, fixture.default_log_path, 1, 1, before_move, 10_000);
 
     var after = try g.captureStable(.{ .w_pt = 600, .h_pt = 300 }, 8000);
     defer after.deinit(alloc);

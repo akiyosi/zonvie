@@ -2,7 +2,7 @@
 // the mouse must let the scroll through to the window under it.
 //
 // The twin of extwin_float_trackpad_scroll's second phase, which has asserted
-// this on the EXTERNAL surface since 5e7e9cb. The main window had no such rule:
+// this on the EXTERNAL surface from the start. The main window had no such rule:
 // `MetalTerminalView.resolveScrollTarget` resolves against `zonvie_grid_info`,
 // which carries no mouse field, so it named the float and the gesture died.
 //
@@ -38,6 +38,7 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_main_float_mouse_disabled_scroll.log";
 
@@ -77,12 +78,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
+    const before_setup = try app_log.lineMark(alloc, log_path);
     try g.exec("execute('set laststatus=0 noruler noshowcmd showtabline=0 scrolloff=0 nowrap noswapfile')");
     try g.exec(
         \\setline(1, map(range(1, 400), {_, i -> printf('%3d host line', i)}))
     );
     try g.exec("execute('normal! gg')");
-    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_setup, 10_000);
 
     const win = platform.mainWindowForPid(g.app_pid) orelse {
         std.debug.print("[gui] no main window for the app\n", .{});
@@ -116,8 +118,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "row={d}, col={d}, width={d}, height={d}, style=\"minimal\", mouse=false}}) return 1 end)()')",
         .{ float_row, float_col, float_cols, float_rows },
     );
+    const before_float = try app_log.lineMark(alloc, log_path);
     try g.exec(open_float);
-    gui_io.sleepNs(900 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_float, 10_000);
 
     const float_top0 = try g.evalInt("luaeval('vim.fn.getwininfo(_G.z_float)[1].topline')");
     const host_top2 = try g.evalInt("line('w0')");

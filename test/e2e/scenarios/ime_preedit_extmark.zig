@@ -1,13 +1,12 @@
-// ime_preedit_extmark — regression test for 629615d: extmark-based inline
-// preedit display. Core.setPreedit must place the composition text as an
+// ime_preedit_extmark — extmark-based inline preedit display. Core.setPreedit must place the composition text as an
 // inline virt_text extmark at the cursor in insert/replace mode (returns
 // true → frontend hides its overlay), render it in the grid, remove it on
 // clearPreedit, and fall back to frontend-overlay mode (returns false)
 // outside insert/replace.
 //
-// The setPreedit return value is also the core-side contract behind
-// 60e3081 (Windows: hide the preedit overlay while the inline extmark is
-// active): true tells the frontend to suppress its own overlay window so
+// The setPreedit return value is also the core-side contract behind the
+// Windows frontend hiding its preedit overlay while the inline extmark is
+// active: true tells the frontend to suppress its own overlay window so
 // the two don't both draw. We assert that contract here; the frontend's
 // actual overlay-window hiding is a pixel/z-order effect that needs the
 // not-yet-built screenshot layer to observe directly.

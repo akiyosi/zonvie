@@ -104,6 +104,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const before = driver.snapshotWindows(g.app_pid);
 
+    const before_ext = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "local lines = {} for i = 1, 400 do lines[i] = string.rep(\"line \" .. i .. \" \", 6) end " ++
@@ -115,7 +116,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "return 1 end)()')",
     );
     const extwin = try driver.waitNewWindow(g.app_pid, before.slice(),150);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_ext, 10_000);
 
     const t0 = try app_log.nowMs(alloc, log_path);
     const topline_before = try g.evalInt("line('w0')");

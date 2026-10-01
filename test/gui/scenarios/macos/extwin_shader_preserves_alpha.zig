@@ -102,7 +102,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
         \\luaeval('(function() _G.z_ext = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, {external=true, width=50, height=14}) return 1 end)()')
     );
     const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     const ext_grid = @as(f64, @floatFromInt(
         try g.evalInt("luaeval('vim.api.nvim_win_get_config(_G.z_ext).external and 1 or 0')"),
@@ -120,7 +119,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // two live surfaces rather than against a constant.
     const t0 = try app_log.nowMs(alloc, log_path);
     try g.remoteSend(":");
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
     const cmdline_variant = (try waitSelection(alloc, t0, 10_000, isCmdlineSurface)).opaque_chain;
     std.debug.print("[gui] ext-cmdline took the opaque chain: {d:.0}\n", .{cmdline_variant});
     try g.remoteSend("<Esc>");

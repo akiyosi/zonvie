@@ -3,7 +3,7 @@
 // An internal float (nvim_open_win, relative='editor', with a border) is
 // composited over the main grid. This anchors float compositing in the
 // client area — the area where the Windows "float double-cursor"/recompose
-// class of drawing bug (73fb272) lives. enter=false keeps the cursor in
+// class of drawing bug lives. enter=false keeps the cursor in
 // the main grid (steady), so only the float's content/border varies the
 // pixels from the baseline.
 

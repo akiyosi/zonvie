@@ -25,6 +25,8 @@ const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_blink_popupmenu.log";
+/// Any surface's completed frame.
+const frame_marker = "[trace] event=frame_done";
 const toggle_marker = "[blink] blink toggled to ";
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -42,18 +44,19 @@ pub fn run(alloc: std.mem.Allocator) !void {
     });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(500 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
     const main_b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
     const base_windows = g.windowCount();
 
     try g.exec("execute('set nocursorline noshowmode guicursor=n:block-blinkwait200-blinkon250-blinkoff250,i:ver25-blinkwait200-blinkon300-blinkoff300')");
+    const ext_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, false, {\"alpha alphabet alpine\", \"\"}) " ++
             "vim.api.nvim_open_win(b, true, {external=true, width=60, height=10}) return 1 end)()')",
     );
     try g.waitWindowCount(base_windows + 1, 10_000);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, ext_mark, 10_000);
 
     if (!platform.setWindowMinimizedBySize(g.app_pid, main_b.w, main_b.h, true)) {
         return error.MinimizeFailed;
@@ -70,12 +73,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Insert-mode completion opens the external popupmenu; the cursor stays
     // on the float's grid throughout.
     try g.exec("setline(2, '')");
+    const menu_mark = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("2Gial<C-n>");
     try g.waitWindowCount(ext_windows + 1, 10_000);
-    gui_io.sleepNs(500 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, menu_mark, 10_000);
+    const close_mark = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("<C-e><Esc>");
     try g.waitWindowCount(ext_windows, 10_000);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, close_mark, 10_000);
 
     const t_after = try app_log.nowMs(alloc, log_path);
     gui_io.sleepNs(2000 * std.time.ns_per_ms);
