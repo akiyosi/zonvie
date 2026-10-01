@@ -44,14 +44,15 @@ pub const capture = switch (builtin.os.tag) {
 };
 
 pub const default_app_rel_path = switch (builtin.os.tag) {
-    .windows => "windows/zig-out/bin/zonvie.exe",
+    // build.zig installs the Windows exe directly into windows/zig-out, with
+    // no bin/ subdirectory.
+    .windows => "windows/zig-out/zonvie.exe",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
 };
 
 extern "kernel32" fn GetProcessId(h: std.os.windows.HANDLE) callconv(.winapi) u32;
 // std.os.windows.WaitForSingleObject was removed in 0.16; declare the raw call.
 extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
-const WAIT_TIMEOUT: u32 = 0x00000102;
 // std.posix.W.NOHANG went with std.posix.waitpid in 0.16 (see appAlive).
 const W_NOHANG: c_int = 1;
 
@@ -105,6 +106,10 @@ pub const Options = struct {
     /// empty shared fixtures dir; scenarios that need a config.toml ship
     /// their own fixture dir (<dir>/zonvie/config.toml layout).
     config_dir: []const u8 = "test/gui/fixtures/config",
+    /// Extra environment for the app, as {name, value} pairs. For settings the
+    /// app reads from the environment rather than from config.toml, which a
+    /// fixture cannot reach.
+    app_env: []const [2][]const u8 = &.{},
 };
 
 pub const Gui = struct {
@@ -159,8 +164,15 @@ pub const Gui = struct {
         errdefer alloc.free(g.listen_addr);
 
         // 1. Shared nvim server (headless, clean).
+        //
+        // `-n` disables swap files ('noswapfile'), for the same reason
+        // test/e2e/harness.zig passes it: every scenario spawns an nvim and
+        // kills it, so each one leaves a swap file behind in the user's real
+        // state directory. They accumulate across runs until nvim answers
+        // E325 "swap file exists" with a |hit-enter| prompt — in the user's
+        // own editor, not just in the tests. A harness never needs swap.
         g.nvim_child = try std.process.spawn(gui_io.io(), .{
-            .argv = &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
+            .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
@@ -180,6 +192,12 @@ pub const Gui = struct {
         try argv.append(alloc, try alloc.dupe(u8, app_path));
         try argv.append(alloc, try std.fmt.allocPrint(alloc, "--connect-nvim={s}", .{g.listen_addr}));
         for (opts.app_args) |a| try argv.append(alloc, try alloc.dupe(u8, a));
+        // AppKit window restoration lives in the real user's Saved
+        // Application State, like the frame autosave below: never read it.
+        if (builtin.os.tag == .macos) {
+            try argv.append(alloc, try alloc.dupe(u8, "-ApplePersistenceIgnoreState"));
+            try argv.append(alloc, try alloc.dupe(u8, "YES"));
+        }
         g.app_argv = try argv.toOwnedSlice(alloc);
 
         // Isolate from the user's real config: point the platform config
@@ -191,12 +209,46 @@ pub const Gui = struct {
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
 
-        // Optional home isolation (persisted app state, frame autosave).
-        if (opts.home_dir) |home| {
+        for (opts.app_env) |pair| {
+            try g.app_env.put(pair[0], pair[1]);
+        }
+
+        // Home isolation (persisted app state, frame autosave). A scenario
+        // may name the dir, for relaunch comparisons; otherwise every Gui
+        // gets a fresh one of its own. On macOS the app restores its window
+        // frame from NSUserDefaults, which do NOT follow HOME (or
+        // CFFIXED_USER_HOME): cfprefs keeps them in the real user's domain.
+        // So every scenario ran at whatever frame the user's own zonvie last
+        // saved, and wrote its own back over it. ZONVIE_FRAME_AUTOSAVE_NAME
+        // keeps the app off the user's key: none for a fresh home, and one
+        // of its own for a named home, whose relaunches compare frames. Two
+        // scenarios that assumed a geometry (a float under the window's
+        // centre, a margin band with no sub-cell remainder) failed or flaked
+        // on that alone. Windows keeps the opt-in: its persisted state under
+        // USERPROFILE has not been shown to matter, and the change has not
+        // had a hardware run.
+        const isolate_home = opts.home_dir != null or builtin.os.tag != .windows;
+        if (isolate_home) {
+            var home_buf: [128]u8 = undefined;
+            const home: []const u8 = opts.home_dir orelse blk: {
+                const fresh = try std.fmt.bufPrint(&home_buf, "tmp/gui_home/{d}_{d}", .{ currentPid(), seq });
+                std.Io.Dir.cwd().deleteTree(gui_io.io(), fresh) catch {};
+                break :blk fresh;
+            };
             std.Io.Dir.cwd().createDirPath(gui_io.io(), home) catch {};
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
             try g.app_env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", home_abs);
+            if (builtin.os.tag == .macos) {
+                var name_buf: [160]u8 = undefined;
+                // Per run too: the key outlives the home dir the scenario
+                // deletes, and a first launch must start from no frame.
+                const name = if (opts.home_dir) |h|
+                    try std.fmt.bufPrint(&name_buf, "zonvie.gui_test.{s}.{d}", .{ std.fs.path.basename(h), currentPid() })
+                else
+                    "";
+                try g.app_env.put("ZONVIE_FRAME_AUTOSAVE_NAME", name);
+            }
         }
 
         try g.launchApp();
@@ -395,31 +447,14 @@ pub const Gui = struct {
     /// Cursor blink etc. must be disabled by the scenario first, or the
     /// frames will never settle.
     pub fn captureStable(g: *Gui, crop: ?capture.Crop, timeout_ms: u64) !capture.Image {
-        var timer = gui_io.Timer.start();
-        var prev: ?capture.Image = null;
-        defer if (prev) |*p| p.deinit(g.alloc);
-        while (true) {
-            gui_io.sleepNs(150 * std.time.ns_per_ms);
-            const cur = capture.captureMainWindow(g.alloc, g.app_pid, crop) catch |e| {
-                if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-                continue;
-            };
-            if (prev) |*p| {
-                if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                    p.deinit(g.alloc);
-                    prev = null;
-                    return cur;
-                }
-                p.deinit(g.alloc);
-                prev = null;
+        const MainGrab = struct {
+            pid: i32,
+            crop: ?capture.Crop,
+            fn grab(s: @This(), alloc: std.mem.Allocator) !capture.Image {
+                return capture.captureMainWindow(alloc, s.pid, s.crop);
             }
-            prev = cur;
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-                const out = prev.?;
-                prev = null;
-                return out; // last capture even if not fully settled
-            }
-        }
+        };
+        return captureUntilStable(g.alloc, timeout_ms, MainGrab{ .pid = g.app_pid, .crop = crop });
     }
 
     /// True while the app process is still running. Reaps/observes at most
@@ -463,3 +498,105 @@ pub const Gui = struct {
         }
     }
 };
+
+// ── External windows (macOS only: built on platform.windowsForPid) ─────
+
+pub const max_windows = 16;
+
+/// Every on-screen window of a pid at one moment, front to back.
+pub const WindowSnapshot = struct {
+    buf: [max_windows]platform.MainWindow = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const WindowSnapshot) []const platform.MainWindow {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn snapshotWindows(pid: i32) WindowSnapshot {
+    var s: WindowSnapshot = .{};
+    s.len = platform.windowsForPid(pid, &s.buf);
+    return s;
+}
+
+/// The first window of `pid` absent from `before` whose sides are both at
+/// least `min_side` points. The size floor skips transient helper windows
+/// that would otherwise be taken for the one being waited on.
+pub fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
+    const now = snapshotWindows(pid);
+    outer: for (now.slice()) |w| {
+        for (before) |b| {
+            if (b.number == w.number) continue :outer;
+        }
+        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
+        return w;
+    }
+    return null;
+}
+
+/// Poll newWindow until it finds one; dumps the window list on timeout.
+pub fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
+    var timer = gui_io.Timer.start();
+    while (true) {
+        if (newWindow(pid, before, min_side)) |w| return w;
+        if (timer.read() / std.time.ns_per_ms >= 15_000) {
+            platform.dumpWindowsForPid(pid);
+            return error.ExternalWindowNotFound;
+        }
+        gui_io.sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
+/// The frontmost window of `pid` covering the point, which is the one a posted
+/// event will land on. windowsForPid returns the on-screen list front to back.
+pub fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
+    const now = snapshotWindows(pid);
+    for (now.slice()) |w| {
+        if (x >= w.bounds.x and x < w.bounds.x + w.bounds.w and
+            y >= w.bounds.y and y < w.bounds.y + w.bounds.h) return w;
+    }
+    return null;
+}
+
+/// Gui.captureStable for a window that is not the app's main one: retry until
+/// two consecutive captures are pixel-identical, so a frame caught mid-present
+/// is never what a comparison sees.
+pub fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
+    const WindowGrab = struct {
+        number: u32,
+        fn grab(s: @This(), a: std.mem.Allocator) !capture.Image {
+            return capture.captureWindow(a, s.number);
+        }
+    };
+    return captureUntilStable(alloc, timeout_ms, WindowGrab{ .number = window_number });
+}
+
+/// Call `grabber.grab(alloc)` until two consecutive captures are
+/// pixel-identical, or return the last capture at timeout.
+fn captureUntilStable(alloc: std.mem.Allocator, timeout_ms: u64, grabber: anytype) !capture.Image {
+    var timer = gui_io.Timer.start();
+    var prev: ?capture.Image = null;
+    defer if (prev) |*p| p.deinit(alloc);
+    while (true) {
+        gui_io.sleepNs(150 * std.time.ns_per_ms);
+        const cur = grabber.grab(alloc) catch |e| {
+            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
+            continue;
+        };
+        if (prev) |*p| {
+            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
+                p.deinit(alloc);
+                prev = null;
+                return cur;
+            }
+            p.deinit(alloc);
+            prev = null;
+        }
+        prev = cur;
+        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
+            const out = prev.?;
+            prev = null;
+            return out; // last capture even if not fully settled
+        }
+    }
+}

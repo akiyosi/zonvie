@@ -17,8 +17,10 @@ const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
+const app_log = @import("../../app_log.zig");
 
-const max_windows = 16;
+const log_path = "tmp/gui_app.log";
+
 const settle_polls = 4; // bounds unchanged for 4 * 250 ms = startup settled
 const tol_px = 150.0; // float-anchored placement is off by several hundred px
 
@@ -48,8 +50,34 @@ fn contains(set: []const platform.MainWindow, number: u32) bool {
     return false;
 }
 
+/// The OS window numbers the app says are minis, from `[mini_window]`.
+///
+/// "Any window that was not there before" is not the same thing. A search
+/// also puts a message float on screen, at the TOP-right of the main window
+/// rather than the bottom-right — a different anchor, correctly — and this
+/// scenario used to measure whichever of the two the poll happened to catch.
+/// When it caught the float alone it reported `mini_bottom=73` and failed,
+/// always with that same number, which read like a deterministic defect in
+/// the anchoring. The anchoring was right every time: instrumented over
+/// twelve runs it resolved to grid 1 at the same anchorY in all of them,
+/// including the two that failed.
+fn miniWindowNumbers(alloc: std.mem.Allocator, since_ms: f64, out: *std.AutoHashMap(u32, void)) !void {
+    const lines = try app_log.linesSince(alloc, log_path, "[mini_window]", since_ms);
+    defer alloc.free(lines);
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        const number = app_log.field(line, "number") orelse continue;
+        if (number <= 0) continue;
+        try out.put(@intFromFloat(number), {});
+    }
+}
+
 pub fn run(alloc: std.mem.Allocator) !void {
-    var g = try Gui.init(alloc, .{ .app_args = &.{ "--extmessages", "--log", "tmp/gui_app.log" } });
+    // Or a previous scenario's minis are still named in it.
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+    std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
+
+    var g = try Gui.init(alloc, .{ .app_args = &.{ "--extmessages", "--log", log_path } });
     defer g.deinit();
 
     const main_b = try waitStableMainBounds(g);
@@ -66,8 +94,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const in_float = try g.evalInt("luaeval('(vim.api.nvim_get_current_win() == _G.e2e_float) and 1 or 0')");
     if (in_float != 1) return error.CursorNotInFloat;
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
+
+    const t_search = try app_log.nowMs(alloc, log_path);
+    var minis = std.AutoHashMap(u32, void).init(alloc);
+    defer minis.deinit();
 
     // Search inside the float: search_count routes to the mini view.
     try g.remoteSend("/zonvie<CR>");
@@ -80,13 +112,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 10_000) return error.Timeout;
 
-        var now_buf: [max_windows]platform.MainWindow = undefined;
-        const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+        const now_snap = driver.snapshotWindows(g.app_pid);
+        const now = now_snap.slice();
+        try miniWindowNumbers(alloc, t_search, &minis);
 
         var fresh: usize = 0;
         var max_bottom: f64 = -1;
         for (now) |w| {
             if (contains(before, w.number)) continue;
+            // Only the app's own minis. Everything else a search puts on
+            // screen answers to a different anchor.
+            if (!minis.contains(w.number)) continue;
             fresh += 1;
             const d_right = (main_b.x + main_b.w) - (w.bounds.x + w.bounds.w);
             if (@abs(d_right) > tol_px) {
@@ -101,6 +137,18 @@ pub fn run(alloc: std.mem.Allocator) !void {
         }
 
         if (fresh > 0) {
+            // Every fresh window, named: the assertion below is about the
+            // bottom-most of them, and a failure that reports only that number
+            // cannot say WHICH window was measured — nor whether it was a mini
+            // at all.
+            for (now) |w| {
+                if (contains(before, w.number)) continue;
+                if (!minis.contains(w.number)) continue;
+                std.debug.print(
+                    "[gui] fresh window #{d}: ({d:.0},{d:.0},{d:.0},{d:.0}) bottom={d:.0} right={d:.0}\n",
+                    .{ w.number, w.bounds.x, w.bounds.y, w.bounds.w, w.bounds.h, w.bounds.y + w.bounds.h, w.bounds.x + w.bounds.w },
+                );
+            }
             const d_bottom = (main_b.y + main_b.h) - max_bottom;
             if (@abs(d_bottom) > tol_px) {
                 std.debug.print(

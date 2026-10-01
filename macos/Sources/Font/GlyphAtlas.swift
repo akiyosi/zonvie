@@ -521,7 +521,7 @@ final class GlyphAtlas {
     // the sole writer increments it while beginAtlasWrite() holds that gate.
     private var blitGeneration: UInt64 = 0
 
-    /// Called by the writer (MetalTerminalRenderer.beginFlush's blit path)
+    /// Called by the writer (GridSurfaceRenderer.beginFlush's blit path)
     /// on the SAME command buffer as encodeBackTextureBlit, right before
     /// cmd.commit(). Must be called while still holding the write critical
     /// section (i.e. before endAtlasWrite()). Returns the generation encoded,
@@ -640,40 +640,17 @@ final class GlyphAtlas {
     }
 
     /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
+    /// The core's reading of a feature list (zonvie_core_parse_font_features),
+    /// shared with Windows.
     private static func parseFontFeatures(_ s: String) -> [zonvie_font_feature] {
         guard !s.isEmpty else { return [] }
-        return s.split(separator: ",").compactMap { token in
-            let t = token.trimmingCharacters(in: .whitespaces)
-            var tag: String
-            var value: Int32
-
-            if t.contains("=") {
-                let kv = t.split(separator: "=", maxSplits: 1)
-                guard kv.count == 2, kv[0].count == 4, let val = Int32(kv[1]) else { return nil }
-                tag = String(kv[0])
-                value = val
-            } else if t.hasPrefix("+") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 1
-            } else if t.hasPrefix("-") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 0
-            } else {
-                guard t.count == 4 else { return nil }
-                tag = t
-                value = 1
+        var out = [zonvie_font_feature](repeating: zonvie_font_feature(), count: Int(ZONVIE_MAX_FONT_FEATURES))
+        let n = s.withCString { cs in
+            out.withUnsafeMutableBufferPointer { buf in
+                zonvie_core_parse_font_features(cs, s.utf8.count, buf.baseAddress, buf.count)
             }
-
-            let bytes = Array(tag.utf8)
-            guard bytes.count == 4 else { return nil }
-            var feature = zonvie_font_feature()
-            feature.tag = (Int8(bitPattern: bytes[0]), Int8(bitPattern: bytes[1]),
-                           Int8(bitPattern: bytes[2]), Int8(bitPattern: bytes[3]))
-            feature.value = value
-            return feature
         }
+        return Array(out.prefix(n))
     }
     
     func setBackingScale(_ s: CGFloat) {
@@ -846,6 +823,17 @@ final class GlyphAtlas {
         }
     }
 
+    /// Pack an axis for zonvie_ft_hb_font_set_variation_axes, which keeps a
+    /// fractional design coordinate (Skia's wght runs 0.48-3.2).
+    private static func fontAxis(_ axis: FontInstanceAxes.Axis) -> zonvie_font_axis {
+        let t = axis.tag
+        return zonvie_font_axis(
+            tag: (CChar(bitPattern: UInt8(t >> 24 & 0xFF)), CChar(bitPattern: UInt8(t >> 16 & 0xFF)),
+                  CChar(bitPattern: UInt8(t >> 8 & 0xFF)), CChar(bitPattern: UInt8(t & 0xFF))),
+            value: Float(axis.value)
+        )
+    }
+
     /// Use kCTFontVariationAttribute to nudge CoreText into selecting the variable
     /// font file.  Always returns the varied CTFont — for static fonts the
     /// variation dictionary is silently ignored and createHbFtFont_locked will
@@ -929,9 +917,11 @@ final class GlyphAtlas {
         // the generation-checked publication below.
         os_unfair_lock_unlock(&mu)
         var newBase: LoadedHbFtFont?
+        var baseSource = baseFont
         if let hint {
             let baseFaceIdx = ctFontFaceIndex(hint) & 0xFFFF
             newBase = createHbFtFontBorrowed(for: hint, px: px, faceIndex: baseFaceIdx)
+            if newBase != nil { baseSource = hint }
         }
         if newBase == nil {
             newBase = createHbFtFontBorrowed(for: baseFont, px: px)
@@ -940,11 +930,26 @@ final class GlyphAtlas {
         let newItalic = italic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
         let newBoldItalic = boldItalic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
 
-        for loaded in [newBase, newBold, newItalic, newBoldItalic] {
-            guard let loaded, !features.isEmpty else { continue }
-            features.withUnsafeBufferPointer { buf in
-                zonvie_ft_hb_font_set_variations(loaded.handle, buf.baseAddress, buf.count)
-                zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+        let userAxes = Self.extractVariationAxes(from: features).map {
+            FontInstanceAxes.Axis(tag: $0.tag, value: Double($0.value))
+        }
+        let faces: [(LoadedHbFtFont?, CTFont?)] = [
+            (newBase, baseSource), (newBold, bold), (newItalic, italic), (newBoldItalic, boldItalic),
+        ]
+        for case let (loaded?, ctFont?) in faces {
+            // A trait face of a variable font is an instance of the same
+            // file; FreeType needs its coordinates (see FontInstanceAxes).
+            let axes = FontInstanceAxes.merged(instance: FontInstanceAxes.coordinates(of: ctFont), user: userAxes)
+            if !axes.isEmpty {
+                let variations = axes.map(Self.fontAxis)
+                variations.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_variation_axes(loaded.handle, buf.baseAddress, buf.count)
+                }
+            }
+            if !features.isEmpty {
+                features.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+                }
             }
         }
         os_unfair_lock_lock(&mu)
@@ -1030,7 +1035,11 @@ final class GlyphAtlas {
         }
 
         let faceIndex = ctFontFaceIndex(ctFont)
-        let urlKey = "\(url.absoluteString)#\(faceIndex)"
+        // A variable file's instances (SFNS regular and bold) share the URL;
+        // each needs its own handle loaded at its coordinates.
+        let instanceAxes = FontInstanceAxes.coordinates(of: ctFont)
+        var urlKey = "\(url.absoluteString)#\(faceIndex)"
+        for axis in instanceAxes { urlKey += "#\(axis.tag)=\(axis.value)" }
 
         if var cached = fallbackFacesByURL[urlKey] {
             // LRU: update access order on hit
@@ -1091,6 +1100,12 @@ final class GlyphAtlas {
         }
         let createEnd = CFAbsoluteTimeGetCurrent()
 
+        if let hbft = created, !instanceAxes.isEmpty {
+            let variations = instanceAxes.map(Self.fontAxis)
+            variations.withUnsafeBufferPointer { buf in
+                zonvie_ft_hb_font_set_variation_axes(hbft, buf.baseAddress, buf.count)
+            }
+        }
         if let hbft = created, !features.isEmpty {
             features.withUnsafeBufferPointer { buf in
                 zonvie_ft_hb_font_set_features(hbft, buf.baseAddress, buf.count)
@@ -1336,25 +1351,7 @@ final class GlyphAtlas {
             return nil
         }
 
-        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
-        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
-
-        let (selectedFont, selectedHbft): (CTFont?, OpaquePointer?) = {
-            if styleFlags == 0 {
-                return (font, hbftFont)
-            } else if isBold && isItalic {
-                return (boldItalicFont ?? boldFont ?? italicFont, hbftBoldItalic ?? hbftBold ?? hbftItalic)
-            } else if isBold {
-                return (boldFont, hbftBold)
-            } else if isItalic {
-                return (italicFont, hbftItalic)
-            } else {
-                return (font, hbftFont)
-            }
-        }()
-
-        let fontToUse = selectedFont ?? font
-        let hbftToUse = selectedHbft ?? hbftFont
+        let (fontToUse, hbftToUse) = selectFace_locked(styleFlags: styleFlags)
 
         guard let hbft = hbftToUse else {
             insertFailedScalar_locked(failKey)
@@ -1478,6 +1475,9 @@ final class GlyphAtlas {
             var position = CGPoint(x: originX, y: originY)
             var g = glyph
 
+            // White, so a monochrome glyph compacts to coverage below
+            // (a colour font ignores the fill).
+            ctx.setFillColor(CGColor.white)
             CTFontDrawGlyphs(ctFont, &g, &position, 1, ctx)
             return true
         }
@@ -1499,8 +1499,34 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = 4
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
+        if !CTFontGetSymbolicTraits(ctFont).contains(.traitColorGlyphs) {
+            compactWhiteRgbaToCoverage_locked(width: bitmapW, height: bitmapH, outBitmap: outBitmap)
+        }
 
         return true
+    }
+
+    /// Rewrite the white-on-transparent premultiplied RGBA glyph in
+    /// rasterizeScratch as 1-bpp coverage (its alpha), in place. The core tags
+    /// every 4-bpp glyph colour emoji and draws it as-is, so a monochrome CG
+    /// fallback would ignore the highlight fg; as coverage it takes it, like
+    /// a FreeType glyph (Windows compacts its D2D fallback the same way).
+    /// Must be called with mu locked.
+    private func compactWhiteRgbaToCoverage_locked(
+        width: Int, height: Int, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+    ) {
+        rasterizeScratch.withUnsafeMutableBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            // Forward in place: pixel i reads byte 4i+3 >= i.
+            for i in 0..<(width * height) {
+                base[i] = base[i * 4 + 3]
+            }
+        }
+        rasterizeScratch.withUnsafeBufferPointer { buf in
+            outBitmap.pointee.pixels = buf.baseAddress
+        }
+        outBitmap.pointee.pitch = Int32(width)
+        outBitmap.pointee.bytes_per_pixel = 1
     }
 
     /// Render a multi-codepoint emoji cluster using CoreText line layout.
@@ -1527,6 +1553,9 @@ final class GlyphAtlas {
         CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), str as CFString)
         let fullRange = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
         CFAttributedStringSetAttribute(attrStr, fullRange, kCTFontAttributeName, ef)
+        // White, so a run CoreText sets in a monochrome fallback font
+        // compacts to coverage below (the default is black).
+        CFAttributedStringSetAttribute(attrStr, fullRange, kCTForegroundColorAttributeName, CGColor.white)
 
         // Create a CTLine and measure its bounds
         let line = CTLineCreateWithAttributedString(attrStr)
@@ -1597,6 +1626,14 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = 4
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
+        let runs = CTLineGetGlyphRuns(line) as! [CTRun]
+        let monochrome = runs.allSatisfy { run in
+            guard let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName] else { return false }
+            return !CTFontGetSymbolicTraits(runFont as! CTFont).contains(.traitColorGlyphs)
+        }
+        if monochrome {
+            compactWhiteRgbaToCoverage_locked(width: bitmapW, height: bitmapH, outBitmap: outBitmap)
+        }
 
         return true
     }
@@ -1761,38 +1798,18 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
     }
 
-    /// Select the appropriate HBFT font handle for the given style flags.
+    /// Select the style face for the given style flags as one (CTFont, hbft)
+    /// pair: a style whose FreeType handle failed to load is skipped whole, so
+    /// glyph IDs from one face are never rasterized from another.
     /// Must be called with mu locked.
-    private func selectHbft_locked(styleFlags: UInt32) -> OpaquePointer? {
+    private func selectFace_locked(styleFlags: UInt32) -> (ctFont: CTFont, hbft: OpaquePointer?) {
         let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
         let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
 
-        if isBold && isItalic {
-            return hbftBoldItalic ?? hbftBold ?? hbftItalic ?? hbftFont
-        } else if isBold {
-            return hbftBold ?? hbftFont
-        } else if isItalic {
-            return hbftItalic ?? hbftFont
-        } else {
-            return hbftFont
-        }
-    }
-
-    /// Select the appropriate CTFont for the given style flags.
-    /// Must be called with mu locked.
-    private func selectCtFont_locked(styleFlags: UInt32) -> CTFont {
-        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
-        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
-
-        if isBold && isItalic {
-            return boldItalicFont ?? boldFont ?? italicFont ?? font
-        } else if isBold {
-            return boldFont ?? font
-        } else if isItalic {
-            return italicFont ?? font
-        } else {
-            return font
-        }
+        if isBold && isItalic, let f = boldItalicFont, let h = hbftBoldItalic { return (f, h) }
+        if isBold, let f = boldFont, let h = hbftBold { return (f, h) }
+        if isItalic, let f = italicFont, let h = hbftItalic { return (f, h) }
+        return (font, hbftFont)
     }
 
     /// Phase B: Shape a text run using HarfBuzz.
@@ -1810,7 +1827,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return 0 }
 
         // zonvie_hb_shape_utf32 outputs y_advance too, but our callback doesn't need it.
         // Use persistent buffer to avoid per-call heap allocation.
@@ -1842,7 +1859,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return 0 }
 
         let ok1 = zonvie_ft_hb_get_ascii_glyph_ids(hbft, outGlyphIDs)
         let ok2 = zonvie_ft_hb_get_ascii_x_advances(hbft, outXAdvances)
@@ -1856,7 +1873,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return false }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return false }
 
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
@@ -1876,7 +1893,7 @@ final class GlyphAtlas {
 
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
             // FreeType color failed — try CoreGraphics fallback
-            let ctFontToUse = selectCtFont_locked(styleFlags: styleFlags)
+            let ctFontToUse = selectFace_locked(styleFlags: styleFlags).ctFont
             if renderGlyphWithCoreGraphics_locked(
                 ctFont: ctFontToUse, glyphID: glyphID, outBitmap: outBitmap
             ) {
@@ -2260,7 +2277,7 @@ final class GlyphAtlas {
         // blocks the core thread. That automatic
         // ordering is scoped to the main renderer's OWN MTLCommandQueue --
         // it does not cover ExternalGridView's reads, each of which runs on
-        // its own separate MTLCommandQueue. The caller (MetalTerminalRenderer's
+        // its own separate MTLCommandQueue. The caller (GridSurfaceRenderer's
         // beginFlush, right before committing this blit's command buffer)
         // calls beginAtlasWrite()/endAtlasWrite() to close that gap explicitly instead
         // of relying solely on the append-only/byte-identical/fresh-texture

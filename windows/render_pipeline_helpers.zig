@@ -1,4 +1,5 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 
 pub fn nextBackoffDelayMs(current_ms: u32, max_ms: u32) u32 {
     return @min(current_ms *| 2, max_ms);
@@ -155,6 +156,29 @@ pub fn retryEpochWasCovered(armed_failure_epoch: u64, success_epoch: u64) bool {
 pub fn retryEpochNeedsArm(failure_epoch: u64, success_epoch: u64, consumed_failure_epoch: u64) bool {
     return failure_epoch > success_epoch and failure_epoch > consumed_failure_epoch;
 }
+
+/// Copy-button grid-text reads per click while the core's try-lock is busy
+/// (macOS copyDecoratedGridContent: attemptsLeft 5, 20 ms apart).
+pub const copy_text_max_attempts: u8 = 5;
+pub const copy_text_retry_interval_ms: u32 = 20;
+
+/// Consume the attempt that just hit a busy lock. True: arm another read
+/// copy_text_retry_interval_ms later. False: give up (the click is dropped).
+pub fn copyTextRetryAfterBusy(attempts_left: *u8) bool {
+    if (attempts_left.* <= 1) {
+        attempts_left.* = 0;
+        return false;
+    }
+    attempts_left.* -= 1;
+    return true;
+}
+
+/// OpenClipboard attempts for a `\"+y`/`\"+p` or the copy button: the OS
+/// clipboard is briefly held open by another process (clipboard managers,
+/// rdpclip) far more often than our own internal locks contend. Retried
+/// synchronously on the UI thread via Sleep, off any render path.
+pub const clipboard_open_max_attempts: u8 = 5;
+pub const clipboard_open_retry_interval_ms: u32 = 10;
 
 /// Lifetime pins for Win32 operations whose underlying API may pump messages.
 /// Keeping the predicate platform-independent makes it testable without a
@@ -646,6 +670,61 @@ pub fn insertSortedRow(
     return true;
 }
 
+/// Which atlas generation a surface's texture last received in full. The
+/// atlas bumps its generation (under its own `mu`) on every reset and on every
+/// upload it could not queue, so a surface owes a full upload exactly when the
+/// generation moved since its last one. The main driver kept a flag set from
+/// three threads instead and the external driver compared with `<`, which
+/// wraps: `!=` is the answer both give now. `null` owes a full upload
+/// unconditionally — a surface that has never uploaded, a failed upload, a
+/// fresh device.
+pub const AtlasUploadLedger = struct {
+    uploaded_generation: ?u64 = null,
+
+    pub fn needsFull(self: AtlasUploadLedger, current_generation: u64) bool {
+        return self.uploaded_generation != current_generation;
+    }
+
+    pub fn fullUploaded(self: *AtlasUploadLedger, generation: u64) void {
+        self.uploaded_generation = generation;
+    }
+
+    pub fn forceFull(self: *AtlasUploadLedger) void {
+        self.uploaded_generation = null;
+    }
+};
+
+/// A paint that uploaded glyphs but redrew no root row leaves those glyphs
+/// invisible until an unrelated repaint: rows drawn before the upload sampled
+/// an atlas region that was still empty. Such a paint asks for a full one.
+/// The two drivers asked this differently — main of its root rows, the
+/// external driver of whether anything at all was presented, which missed a
+/// frame whose only damage was a layer.
+pub fn atlasUploadOwesFullPaint(atlas_uploaded: bool, drew_root_rows: bool) bool {
+    return atlas_uploaded and !drew_root_rows;
+}
+
+/// Claim the two root rows a cursor move touches — where the previous cursor
+/// was baked into the back texture and where this one lands — so they are
+/// repainted from the root's own vertices, which is what removes the previous
+/// cursor. Only for a cursor on the root: a layer's cursor rows are that
+/// grid's, and its layer repaints whole. Rows past `row_limit` are skipped.
+/// Both drivers collected the same pair.
+pub fn insertCursorEraseRows(
+    alloc: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(u32),
+    erase_rows: [2]?u32,
+    row_limit: u32,
+    cursor_on_root: bool,
+) void {
+    if (!cursor_on_root) return;
+    for (erase_rows) |maybe_row| {
+        const r = maybe_row orelse continue;
+        if (r >= row_limit) continue;
+        _ = insertSortedRow(alloc, rows, r);
+    }
+}
+
 /// Return the in-bounds logical rows that must be redrawn when replacing a
 /// cursor overlay. The old row erases the previously presented cursor; the
 /// new row restores content before the replacement overlay is drawn.
@@ -688,9 +767,424 @@ pub fn shouldRetireSlotBacking(capacity: usize, layout_peak_verts: usize) bool {
     return capacity > layout_peak_verts * 2;
 }
 
-/// Sort rectangles in place, then merge overlapping or edge-adjacent entries.
-/// The merge may enlarge damage to a bounding rectangle, but never drops
-/// damaged pixels. This keeps the paint path allocation-free and O(n log n).
+/// Where a window's SURFACE begins inside its client area -- grid 1's cell
+/// (0,0). Only the main window draws chrome inside its own client rect, so the
+/// offset is zero for every other window, which is why an external window can
+/// hand client pixels to a layer test unchanged and the main window cannot.
+///
+/// Pure and host-testable because getting it wrong is silent: a hit test that
+/// applies it twice, or not at all, moves every click by a fixed number of
+/// cells and nothing fails until someone notices the cursor landing in the
+/// wrong place. Both callers in `input.zig` fill this from `App`.
+pub const SurfaceOriginInputs = struct {
+    is_main_window: bool,
+    ext_tabline_enabled: bool = false,
+    style_is_sidebar: bool = false,
+    style_is_titlebar: bool = false,
+    sidebar_on_right: bool = false,
+    /// Already DPI-scaled.
+    sidebar_width_px: i32 = 0,
+    /// Already DPI-scaled.
+    tab_bar_height_px: i32 = 0,
+};
+
+pub const SurfaceOrigin = struct { x: i32 = 0, y: i32 = 0 };
+
+pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
+    if (!in.is_main_window) return .{};
+    return .{
+        // A sidebar on the RIGHT takes no leading columns, so it shifts
+        // nothing: the surface still starts at the client origin.
+        .x = if (in.ext_tabline_enabled and in.style_is_sidebar and !in.sidebar_on_right)
+            in.sidebar_width_px
+        else
+            0,
+        .y = if (in.ext_tabline_enabled and in.style_is_titlebar)
+            in.tab_bar_height_px
+        else
+            0,
+    };
+}
+
+/// Width of the content viewport drawEx binds at x_offset. `base_w` is a right
+/// edge measured from x=0 (the client width, less an "always" scrollbar).
+pub fn contentViewportWidthPx(base_w: u32, x_offset: u32, sidebar_right_w: u32) u32 {
+    return if (base_w > x_offset + sidebar_right_w) base_w - x_offset - sidebar_right_w else 1;
+}
+
+/// Right edge of the main paint's row scissors: the viewport's right edge.
+pub fn mainContentRightPx(content_width: ?u32, client_w: u32, x_offset: u32, sidebar_right_w: u32) i32 {
+    return @intCast(x_offset + contentViewportWidthPx(content_width orelse client_w, x_offset, sidebar_right_w));
+}
+
+pub const MainWindowSnap = struct {
+    outer_w: i32,
+    outer_h: i32,
+    snapped_content_w: u32,
+    snapped_content_h: u32,
+};
+
+/// The main window's new outer size for WM_APP_SNAP_MAIN_WINDOW: snap the
+/// *desired* content size (0 falls back to the live `content_w`/`content_h`,
+/// i.e. before the first WM_SIZE) to a cell multiple, then apply the chrome
+/// delta already present between `outer_w`/`outer_h` and the live content.
+/// Snapping the desired size rather than the live content is what lets the
+/// window grow back after it shrank on a font-size change (see the caller in
+/// windows/window.zig). Returns null when there is nothing to do: a
+/// degenerate cell size, a content area smaller than one cell, or the window
+/// already holding the snapped size.
+pub fn snapMainWindowOuterSize(
+    outer_w: i32,
+    outer_h: i32,
+    content_w: u32,
+    content_h: u32,
+    desired_content_w: u32,
+    desired_content_h: u32,
+    cell_w: u32,
+    cell_h: u32,
+) ?MainWindowSnap {
+    if (cell_w == 0 or cell_h == 0) return null;
+    if (content_w < cell_w or content_h < cell_h) return null;
+
+    const base_w: u32 = if (desired_content_w != 0) desired_content_w else content_w;
+    const base_h: u32 = if (desired_content_h != 0) desired_content_h else content_h;
+
+    const snapped_w = core.zonvie_core_snap_terminal_px(base_w, cell_w);
+    const snapped_h = core.zonvie_core_snap_terminal_px(base_h, cell_h);
+    if (snapped_w == 0 or snapped_h == 0) return null;
+    if (snapped_w == content_w and snapped_h == content_h) return null;
+
+    const delta_w: i32 = @as(i32, @intCast(content_w)) - @as(i32, @intCast(snapped_w));
+    const delta_h: i32 = @as(i32, @intCast(content_h)) - @as(i32, @intCast(snapped_h));
+    return .{
+        .outer_w = outer_w - delta_w,
+        .outer_h = outer_h - delta_h,
+        .snapped_content_w = snapped_w,
+        .snapped_content_h = snapped_h,
+    };
+}
+
+pub const PaintPolicyInputs = struct {
+    /// The surface's own "repaint everything" request.
+    force_full: bool,
+    cursor_grid_changed: bool,
+    glow_enabled: bool,
+    opacity: f32,
+    /// Whether `back_tex` still holds a usable previous frame. The main driver
+    /// tracks this per app; an external window has no equivalent yet and
+    /// passes true, which is what its previous `!force_full_rows` meant.
+    back_tex_valid: bool,
+};
+
+pub const PaintPolicy = struct {
+    force_full_rows: bool,
+    preserve_back: bool,
+};
+
+/// The cursor vertices a frame draws: all of them while the blink phase shows
+/// the cursor, none while it hides it. The main driver's flat path answered
+/// this inline and the decorated external path did not ask, so an ext-cmdline
+/// cursor never blinked.
+pub fn cursorVertsForFrame(comptime V: type, cursor: []const V, blink_visible: bool) []const V {
+    return if (blink_visible) cursor else &.{};
+}
+
+pub fn paintPolicy(in: PaintPolicyInputs) PaintPolicy {
+    const force_full_rows =
+        in.force_full or
+        in.cursor_grid_changed or
+        in.glow_enabled or
+        (in.opacity < 1.0);
+    return .{
+        .force_full_rows = force_full_rows,
+        // Keeping the previous frame is only safe when nothing forces a full
+        // redraw AND that frame is still there. A frame this returns false for
+        // redraws every row anyway, so clearing costs nothing it needs.
+        .preserve_back = !force_full_rows and in.back_tex_valid,
+    };
+}
+
+/// The main driver's seed state. Only the main surface has one (the core seeds
+/// grid 1 alone), so an external window passes none.
+pub const SeedPresentFacts = struct {
+    pending: bool,
+    clear: bool,
+    back_tex_valid: bool,
+    rows_mismatch: bool,
+    row_valid_count: usize,
+};
+
+pub const PresentGateInputs = struct {
+    /// The row layout this paint snapshotted is still current.
+    layout_ok: bool = true,
+    /// The committed set's metrics generation is still current.
+    metrics_ok: bool = true,
+    /// Rows, layers or the cursor overlay never reached back_tex.
+    frame_incomplete: bool = false,
+    force_full_rows: bool,
+    preserve_back: bool,
+    rows: usize,
+    rows_to_draw: usize,
+    skipped_empty: u32,
+    custom_shader: bool = false,
+    present_rects: usize,
+    present_rects_overflowed: bool = false,
+    seed: ?SeedPresentFacts = null,
+    /// Main's chrome is redrawn from hover state that yields no damage rect,
+    /// so an empty damage list there still presents the whole surface.
+    empty_damage_presents_all: bool = false,
+};
+
+pub const PresentVerdict = enum {
+    /// Must not present; the caller's failure path requeues a full paint.
+    refuse,
+    /// Nothing changed on screen; not a failure.
+    skip,
+    present,
+};
+
+pub const PresentGate = struct {
+    verdict: PresentVerdict,
+    /// Mark every rotating swapchain buffer damaged.
+    full: bool,
+    /// back_tex after a successful present.
+    back_tex_valid: bool,
+};
+
+/// Whether and how a paint presents, for both paint drivers. The seed and
+/// row-count rules are the main surface's; with no seed this is the external
+/// driver's gate.
+pub fn presentGate(in: PresentGateInputs) PresentGate {
+    const full = in.force_full_rows or
+        in.present_rects_overflowed or
+        in.custom_shader or
+        if (in.seed) |s| s.clear or (s.pending and !s.back_tex_valid and !s.rows_mismatch) else false;
+    const rendered_complete_frame = in.rows != 0 and
+        in.skipped_empty == 0 and
+        in.rows_to_draw == in.rows;
+    const back_tex_valid = if (in.seed) |s|
+        (s.back_tex_valid and in.preserve_back) or rendered_complete_frame
+    else
+        true;
+    const verdict: PresentVerdict = if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete)
+        .refuse
+    else if (in.seed) |s|
+        (if (seedAllowsPresent(in, s)) .present else .refuse)
+    else if (!full and in.present_rects == 0 and !in.empty_damage_presents_all)
+        .skip
+    else
+        .present;
+    return .{ .verdict = verdict, .full = full, .back_tex_valid = back_tex_valid };
+}
+
+fn seedAllowsPresent(in: PresentGateInputs, s: SeedPresentFacts) bool {
+    // A cleared back buffer must reach every swapchain buffer, or the gutter
+    // keeps stale pixels.
+    if (s.clear) return true;
+    if (s.pending and !in.preserve_back) return true;
+    // Never present until the core has provided a stable row count.
+    if (in.rows == 0) return false;
+    const drew_every_row = in.skipped_empty == 0 and in.rows_to_draw == in.rows;
+    if (s.pending) {
+        if (s.rows_mismatch) return in.rows_to_draw != 0 and in.skipped_empty == 0;
+        // A valid back_tex sources the rows not yet re-validated.
+        if (s.back_tex_valid) return true;
+        // No back_tex yet: the first present must cover every row.
+        return s.row_valid_count == in.rows and drew_every_row;
+    }
+    return !in.force_full_rows or drew_every_row;
+}
+
+/// Where `grid_id`'s layer sits in its surface, in surface pixels: zero for
+/// the surface's root, the layer's origin for a grid it hosts, zero when the
+/// grid is not placed there. The cursor overlay, its damage rect and the IME
+/// all place against this; they carried five copies of the loop with two
+/// different keys.
+pub fn layerOriginPx(comptime Layer: type, layers: []const Layer, grid_id: i64, root_grid_id: i64) [2]i32 {
+    if (grid_id == root_grid_id) return .{ 0, 0 };
+    for (layers) |l| {
+        if (l.grid_id == grid_id) return .{ l.x_px, l.y_px };
+    }
+    return .{ 0, 0 };
+}
+
+/// Where one non-root layer sits for its present damage, in client pixels.
+pub const LayerPresentGeom = struct {
+    left_px: i32,
+    top_px: i32,
+    width_px: i32,
+    row_h_px: i32,
+    /// The layout's row count: the extent of a whole-layer rect.
+    rows: u32,
+    /// Rows the layer draw visits (stored rows within the layout).
+    row_limit: usize,
+    clip_right: i32,
+    clip_bottom: i32,
+};
+
+/// Append the present damage of the rows a layer's plan draws: the whole
+/// layer for `draw_all`, else one rect per run of `draw_rows` and
+/// `cursor_rows`, plus the GPU copy's rect. Every rect is clipped to the
+/// client; empty ones are dropped.
+pub fn appendLayerDrawRects(
+    comptime Rect: type,
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(Rect),
+    geom: LayerPresentGeom,
+    draw_all: bool,
+    draw_rows: *const std.DynamicBitSetUnmanaged,
+    cursor_rows: [2]?u32,
+    blit: ?BlitRectPx,
+) error{OutOfMemory}!void {
+    const l: i32 = @max(0, geom.left_px);
+    const right: i32 = @min(geom.clip_right, l + geom.width_px);
+    if (draw_all) {
+        const t: i32 = @max(0, geom.top_px);
+        const b: i32 = @min(geom.clip_bottom, t + @as(i32, @intCast(geom.rows)) * geom.row_h_px);
+        try appendClipped(Rect, alloc, out, .{ .left = l, .top = t, .right = right, .bottom = b });
+        return;
+    }
+    var run_start: ?usize = null;
+    var r: usize = 0;
+    while (r <= geom.row_limit) : (r += 1) {
+        const marked = r < geom.row_limit and
+            ((r < draw_rows.bit_length and draw_rows.isSet(r)) or
+                std.mem.indexOfScalar(?u32, &cursor_rows, @intCast(r)) != null);
+        if (marked) {
+            if (run_start == null) run_start = r;
+            continue;
+        }
+        const s = run_start orelse continue;
+        run_start = null;
+        const band_top = geom.top_px + @as(i32, @intCast(s)) * geom.row_h_px;
+        const band_bottom = geom.top_px + @as(i32, @intCast(r)) * geom.row_h_px;
+        try appendClipped(Rect, alloc, out, .{
+            .left = l,
+            .top = @max(0, band_top),
+            .right = right,
+            .bottom = @min(geom.clip_bottom, band_bottom),
+        });
+    }
+    if (blit) |br| try appendClipped(Rect, alloc, out, .{
+        .left = @max(0, br.left),
+        .top = @max(0, br.top),
+        .right = @min(geom.clip_right, br.right),
+        .bottom = @min(geom.clip_bottom, br.bottom),
+    });
+}
+
+fn appendClipped(comptime Rect: type, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(Rect), rc: Rect) error{OutOfMemory}!void {
+    if (rc.right <= rc.left or rc.bottom <= rc.top) return;
+    try out.append(alloc, rc);
+}
+
+/// The scissor of the cursor overlay's row: the cursor's row across its own
+/// layer, or across the content when the cursor is on the root
+/// (`layer_w_px` null). The blink-off erase clears the whole scissor, so a
+/// wider one wipes a vertical-split neighbour's row.
+pub fn cursorRowScissor(
+    comptime Rect: type,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    layer_x_px: i32,
+    layer_y_px: i32,
+    layer_w_px: ?i32,
+    row: u32,
+    row_h_px: i32,
+) Rect {
+    const top = y_offset + layer_y_px + @as(i32, @intCast(row)) * row_h_px;
+    const w = layer_w_px orelse return .{ .left = x_offset, .top = top, .right = content_right, .bottom = top + row_h_px };
+    return .{
+        .left = @max(x_offset, x_offset + layer_x_px),
+        .top = top,
+        .right = @min(content_right, x_offset + layer_x_px + w),
+        .bottom = top + row_h_px,
+    };
+}
+
+/// The grid whose Neovim window a move INTO the main window lands on: the
+/// top-left split the main window still shows. Grid 2 is only that window
+/// until it is externalized. Same rule as macOS `mainWindowTargetWinId`.
+pub fn mainMoveTargetGrid(comptime Grid: type, grids: []const Grid) i64 {
+    var best: ?Grid = null;
+    for (grids) |g| {
+        if (g.grid_id <= 1 or g.zindex > 0 or g.placed_by_surface != 1) continue;
+        if (best) |b| {
+            if (g.start_row > b.start_row or (g.start_row == b.start_row and g.start_col >= b.start_col)) continue;
+        }
+        best = g;
+    }
+    return if (best) |b| b.grid_id else 2;
+}
+
+/// One full-width rect per run of adjacent dirty rows, written into `out` and
+/// counted. `rows` is sorted and deduplicated, so there are never more runs
+/// than rows: a caller that reserved `rows.len` slots cannot run short, which
+/// is what lets both paint drivers share this without a fallible append.
+pub fn rowSpanRects(
+    comptime Rect: type,
+    rows: []const u32,
+    y_offset: i32,
+    right: i32,
+    row_h: i32,
+    out: []Rect,
+) usize {
+    if (rows.len == 0) return 0;
+    std.debug.assert(out.len >= rows.len);
+    var n: usize = 0;
+    var start = rows[0];
+    var end = start + 1;
+    for (rows[1..]) |r| {
+        if (r == end) {
+            end += 1;
+            continue;
+        }
+        out[n] = spanRect(Rect, start, end, y_offset, right, row_h);
+        n += 1;
+        start = r;
+        end = r + 1;
+    }
+    out[n] = spanRect(Rect, start, end, y_offset, right, row_h);
+    return n + 1;
+}
+
+fn spanRect(comptime Rect: type, start: u32, end: u32, y_offset: i32, right: i32, row_h: i32) Rect {
+    return .{
+        .left = 0,
+        .top = y_offset + @as(i32, @intCast(start)) * row_h,
+        .right = right,
+        .bottom = y_offset + @as(i32, @intCast(end)) * row_h,
+    };
+}
+
+/// Clamp present rectangles to the render target and drop the ones that clamp
+/// away to nothing, returning the surviving length.
+///
+/// Both paint drivers build their present list from grid rows, cursor damage
+/// and chrome bands, any of which can extend past the target after a resize
+/// the other side has not seen yet. Order is not preserved: an emptied slot is
+/// filled from the end, which is what keeps this a single pass.
+pub fn clampPresentRects(comptime Rect: type, rects: []Rect, max_right: i32, max_bottom: i32) usize {
+    var len = rects.len;
+    var i: usize = 0;
+    while (i < len) {
+        var r = rects[i];
+        if (r.left < 0) r.left = 0;
+        if (r.top < 0) r.top = 0;
+        if (r.right > max_right) r.right = max_right;
+        if (r.bottom > max_bottom) r.bottom = max_bottom;
+        if (r.right <= r.left or r.bottom <= r.top) {
+            rects[i] = rects[len - 1];
+            len -= 1;
+            continue;
+        }
+        rects[i] = r;
+        i += 1;
+    }
+    return len;
+}
+
 pub fn compactDamageRects(comptime Rect: type, rects: []Rect) usize {
     if (rects.len < 2) return rects.len;
 
@@ -755,4 +1249,250 @@ pub fn invertClusterMap(
         while (first > 0 and cluster_map[first - 1] == cluster_map[char_ptr]) first -= 1;
         out_clusters[gi] = utf16_to_scalar_idx[first];
     }
+}
+
+/// Length of the next shaping chunk of `scalars`, at most `max_len`. A run
+/// that does not fit is cut just after its last space inside the limit, so
+/// no ligature or cluster spans the cut; with no space it is cut at the limit.
+pub fn shapeChunkLen(scalars: []const u32, max_len: usize) usize {
+    if (scalars.len <= max_len) return scalars.len;
+    var i = max_len;
+    while (i > 0) : (i -= 1) {
+        if (scalars[i - 1] == ' ') return i;
+    }
+    return max_len;
+}
+
+/// The row-scroll blit arithmetic lives in the core now
+/// (`src/core/row_scroll.zig`), so both frontends get the same answer to the
+/// same geometry. Aliased under the name the paint code already uses.
+pub const RowScrollBlitPlan = core.row_scroll.Plan;
+
+/// Every pixel the blit rewrites: the copy plus the band it vacated. The
+/// z-aware float scroll mask compares against it; the core computes it inside
+/// `overBlitRows` for the same reason.
+pub const BlitRectPx = core.row_scroll.Rect;
+
+/// Half-open on all four edges, so rectangles that only touch do not
+/// intersect: a layer abutting an accepted blit shares none of its pixels.
+pub fn blitRectsIntersect(a: BlitRectPx, b: BlitRectPx) bool {
+    return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom;
+}
+
+/// The ROOT rows a layer's pixels can occupy after the root's own scroll copy
+/// moved them, as a half-open [from, to) clamped to `surface_rows`.
+///
+/// The copy shifts every pixel of its region, the layer composited into it
+/// included, but the root only redraws the band the scroll vacated — so the
+/// rows the layer was dragged onto keep a strip of it that nothing else owns.
+/// Those rows have to be repainted from the root.
+///
+/// The span reaches `shift_rows` in BOTH directions instead of following the
+/// sign of the shift. It costs one extra band height, and a sign taken the
+/// wrong way would leave exactly the ghost this exists to remove.
+///
+/// Null when the layer has no rows or nothing of the span is on the surface.
+pub fn rootRowsLayerScrollReached(
+    origin_y_px: i32,
+    layer_rows: u32,
+    shift_rows: u32,
+    row_h_px: i32,
+    surface_rows: u32,
+) ?[2]u32 {
+    if (row_h_px <= 0 or layer_rows == 0 or surface_rows == 0) return null;
+    const h: i64 = row_h_px;
+    const band_top: i64 = @divFloor(@as(i64, origin_y_px), h);
+    const band_bottom: i64 = band_top + @as(i64, layer_rows);
+    const reach: i64 = @as(i64, shift_rows);
+    const from: i64 = @max(0, band_top - reach);
+    const to: i64 = @min(@as(i64, surface_rows), band_bottom + reach);
+    if (to <= from) return null;
+    return .{ @intCast(from), @intCast(to) };
+}
+
+/// One layer grid's pending row scroll, accumulated across a flush.
+pub const LayerScroll = struct {
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    total_rows: u32,
+    total_cols: u32,
+
+    /// This driver does not track the columns a shift covers, so the whole
+    /// grid width is what the core is told. `mergeStaged` compares rows only,
+    /// which is what every caller of it decides on.
+    fn toStaged(self: LayerScroll) core.row_scroll.Staged {
+        return .{
+            .row_start = @intCast(self.row_start),
+            .row_end = @intCast(self.row_end),
+            .col_start = 0,
+            .col_end = @intCast(self.total_cols),
+            .rows_delta = self.rows_delta,
+            .total_rows = @intCast(self.total_rows),
+            .total_cols = @intCast(self.total_cols),
+        };
+    }
+
+    fn fromStaged(s: core.row_scroll.Staged) LayerScroll {
+        return .{
+            .row_start = @intCast(@max(0, s.row_start)),
+            .row_end = @intCast(@max(0, s.row_end)),
+            .rows_delta = s.rows_delta,
+            .total_rows = @intCast(@max(0, s.total_rows)),
+            .total_cols = @intCast(@max(0, s.total_cols)),
+        };
+    }
+};
+
+pub const LayerScrollMerge = union(enum) {
+    accumulate: LayerScroll,
+    /// Two different regions in one flush. This driver blits neither and hands
+    /// both back for the caller to dirty.
+    ///
+    /// The core's rule keeps the incoming one as a valid blit and returns only
+    /// the displaced region — see `row_scroll.mergeStaged`, which names all
+    /// three answers that were found asking this. The arithmetic below is the
+    /// core's; only this policy is the driver's, and it stays until hardware
+    /// can say whether the cheaper answer holds here.
+    conflict: struct { old: LayerScroll, new: LayerScroll },
+};
+
+pub fn mergeLayerScroll(existing: ?LayerScroll, incoming: LayerScroll) LayerScrollMerge {
+    const staged_existing: ?core.row_scroll.Staged =
+        if (existing) |e| e.toStaged() else null;
+    const merged = core.row_scroll.mergeStaged(staged_existing, incoming.toStaged());
+    if (merged.superseded) |old| {
+        return .{ .conflict = .{ .old = LayerScroll.fromStaged(old), .new = incoming } };
+    }
+    // `superseded` is also null for a displaced region that was empty, which
+    // moved nothing and so owes no repaint — the core drops it and this driver
+    // has nothing to dirty either.
+    return .{ .accumulate = LayerScroll.fromStaged(merged.staged) };
+}
+
+/// Bound a scroll-delta accumulator well below the integer extremes, which
+/// later abs() calls would trap on. The core's, so the two frontends clamp
+/// identically.
+pub const clampRowsDelta = core.row_scroll.clampRowsDelta;
+
+fn swapRowBits(bits: *std.DynamicBitSetUnmanaged, a: usize, b: usize) void {
+    const av = bits.isSet(a);
+    const bv = bits.isSet(b);
+    if (av == bv) return;
+    bits.setValue(a, bv);
+    bits.setValue(b, av);
+}
+
+/// Carry a row bitset through a scroll region's shift, so a bit recorded
+/// before the shift still names the row its vertices ended up on. The swap
+/// chain mirrors the one that moves the row storage: `rows_delta > 0` means
+/// content moves up, so what was bit `r + shift` becomes bit `r`.
+///
+/// The vacated band is set, not cleared: those rows lost their vertices and
+/// have to be repainted whatever the caller does next. A caller that also
+/// marks the band (Windows `mergeShift`) then only repeats itself.
+pub fn shiftRowBits(
+    bits: *std.DynamicBitSetUnmanaged,
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+) void {
+    if (checkShift(row_start, row_end, rows_delta, bits.bit_length) != .fits) return;
+    const shift: u32 = @intCast(@abs(rows_delta));
+
+    if (rows_delta > 0) {
+        var r: u32 = row_start;
+        while (r + shift < row_end) : (r += 1) swapRowBits(bits, r, r + shift);
+        bits.setRangeValue(.{ .start = row_end - shift, .end = row_end }, true);
+    } else {
+        var r: u32 = row_end;
+        while (r > row_start + shift) {
+            r -= 1;
+            swapRowBits(bits, r, r - shift);
+        }
+        bits.setRangeValue(.{ .start = row_start, .end = row_start + shift }, true);
+    }
+}
+
+pub const RowBand = struct { start: usize, end: usize };
+
+pub const ShiftCheck = enum { noop, fits, invalid };
+
+/// Classify a row shift of `[row_start, row_end)` by `rows_delta` over storage
+/// of `len` rows: nothing to move, a shift that leaves surviving rows, or one
+/// that overruns the storage or covers the whole region.
+pub fn checkShift(row_start: u32, row_end: u32, rows_delta: i32, len: usize) ShiftCheck {
+    if (rows_delta == 0 or row_end <= row_start) return .noop;
+    if (row_end > len or @abs(rows_delta) >= row_end - row_start) return .invalid;
+    return .fits;
+}
+
+/// Move the surviving entries of a scroll region `items[row_start..row_end]`
+/// by `rows_delta` (`> 0`: content moves up, as on_grid_row_scroll) and
+/// return the vacated band, which now holds the entries scrolled off: a
+/// rotation never drops or duplicates one, so each caller resets the band its
+/// own way and keeps whatever it owns. A shift covering the region vacates
+/// all of it and moves nothing.
+pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usize, rows_delta: i32) RowBand {
+    std.debug.assert(row_start <= row_end and row_end <= items.len);
+    const region = items[row_start..row_end];
+    const shift: usize = @abs(rows_delta);
+    if (shift >= region.len) return .{ .start = row_start, .end = row_end };
+    if (rows_delta > 0) {
+        std.mem.rotate(T, region, shift);
+        return .{ .start = row_end - shift, .end = row_end };
+    }
+    std.mem.rotate(T, region, region.len - shift);
+    return .{ .start = row_start, .end = row_start + shift };
+}
+
+pub const copyUtf8Truncated = core.frontend_rules.copyUtf8Truncated;
+pub const mini_max_lines = core.frontend_rules.mini_max_lines;
+pub const clampMiniContent = core.frontend_rules.clampMiniContent;
+
+pub const utf8TruncLen = core.frontend_rules.utf8PrefixLen;
+
+/// The longest valid UTF-8 prefix of `s` that converts to at most
+/// `max_utf16` UTF-16 units. utf8ToUtf16Le rejects invalid input and does not
+/// bound its destination.
+pub fn utf8ValidPrefix(s: []const u8, max_utf16: usize) []const u8 {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
+        if (n > s.len - i) break;
+        _ = std.unicode.utf8Decode(s[i..][0..n]) catch break;
+        const w: usize = if (n == 4) 2 else 1;
+        if (units + w > max_utf16) break;
+        units += w;
+        i += n;
+    }
+    return s[0..i];
+}
+
+/// Where one KEY=VALUE line of wide text starts its key and its value. Both
+/// are NUL-terminated in the buffer by the call.
+pub const EnvAssignment = struct { key: usize, value: usize };
+
+/// The next KEY=VALUE line of `buf[0..len]` at or after `pos.*`, cut in place:
+/// the line is trimmed of spaces, tabs and CRs, its first '=' and the unit
+/// after the value become NULs, so neither side has a length limit. A line
+/// with no '=' or an empty key is skipped. `buf` needs one unit past `len`.
+pub fn nextEnvAssignment(buf: []u16, len: usize, pos: *usize) ?EnvAssignment {
+    std.debug.assert(len < buf.len);
+    const blank = [_]u16{ ' ', '\t', '\r' };
+    while (pos.* < len) {
+        const end = std.mem.indexOfScalarPos(u16, buf[0..len], pos.*, '\n') orelse len;
+        var start = pos.*;
+        var stop = end;
+        pos.* = end + 1;
+        while (start < stop and std.mem.indexOfScalar(u16, &blank, buf[start]) != null) start += 1;
+        while (stop > start and std.mem.indexOfScalar(u16, &blank, buf[stop - 1]) != null) stop -= 1;
+        const eq = std.mem.indexOfScalarPos(u16, buf[0..stop], start, '=') orelse continue;
+        if (eq == start) continue;
+        buf[eq] = 0;
+        buf[stop] = 0;
+        return .{ .key = start, .value = eq + 1 };
+    }
+    return null;
 }

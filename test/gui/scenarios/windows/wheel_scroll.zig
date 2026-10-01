@@ -1,5 +1,4 @@
-// wheel_scroll — regression test for 7b37537 (Windows): one physical wheel
-// notch must map to exactly one Neovim wheel event. Before the fix the
+// wheel_scroll — Windows: one physical wheel notch must map to exactly one Neovim wheel event. Before the fix the
 // accumulator fired at WHEEL_DELTA/3, so a single notch sent 3 events and
 // 'mousescroll' (3) scrolled 9 lines per notch instead of 3.
 //

@@ -5,7 +5,7 @@
 // margin row: a main-grid window's winbar makes only a top margin, but a
 // float with border="single" carries border rows on both edges
 // (marginTop = 2 with a winbar, marginBottom = 1). Scrolling inside the
-// float exercises MetalTerminalRenderer's grid_scroll retention capture
+// float exercises GridSurfaceRenderer's grid_scroll retention capture
 // (captureOneRetainedRow) — the composited-float path, distinct from both
 // the external-window path and the main fast path.
 //
@@ -26,6 +26,7 @@ const capture = driver.capture;
 const Gui = driver.Gui;
 const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
+const margin_scroll = @import("margin_scroll.zig");
 
 const log_path = "tmp/gui_main_float_margin_flicker.log";
 const scroll_marker = "[renderer] scroll offset:";
@@ -33,9 +34,7 @@ const scroll_marker = "[renderer] scroll offset:";
 const settle_cycles = 240;
 const step_px: f64 = -2;
 const nudge_steps: u32 = 1;
-const scrollbar_exclude_px: u32 = 48;
 const margin_hit_threshold: usize = 3;
-const max_windows = 16;
 
 const float_rows = 18;
 const float_cols = 56;
@@ -43,9 +42,7 @@ const float_cols = 56;
 /// Capture rows of the float's margin bands, from the app's own log line.
 /// grid bottom NDC = bot - marginBottom*cellNDC (bot is the CONTENT bottom,
 /// marginBottom rows of border sit below it).
-const MarginBand = struct { start: usize, end: usize, bottom_start: usize, bottom_end: usize };
-
-fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !MarginBand {
+fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !margin_scroll.Bands {
     const line = (try app_log.lastLineSince(alloc, log_path, scroll_marker, since_ms)) orelse
         return error.NoScrollOffsetLogged;
     defer alloc.free(line);
@@ -75,38 +72,11 @@ fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !Margin
     // (-0.59999996 for -0.6), and truncation pulls a boundary one pixel
     // into the content side.
     return .{
-        .start = @intFromFloat(@round(chrome + (1.0 - grid_top) / 2.0 * vp_h)),
-        .end = @intFromFloat(@round(chrome + (1.0 - top) / 2.0 * vp_h)),
-        .bottom_start = @intFromFloat(@round(chrome + (1.0 - bot) / 2.0 * vp_h)),
-        .bottom_end = @intFromFloat(@round(chrome + (1.0 - grid_bottom) / 2.0 * vp_h)),
+        .top_start = @intFromFloat(@round(chrome + (1.0 - grid_top) / 2.0 * vp_h)),
+        .top_end = @intFromFloat(@round(chrome + (1.0 - top) / 2.0 * vp_h)),
+        .bot_start = @intFromFloat(@round(chrome + (1.0 - bot) / 2.0 * vp_h)),
+        .bot_end = @intFromFloat(@round(chrome + (1.0 - grid_bottom) / 2.0 * vp_h)),
     };
-}
-
-fn bandIsUniform(img: capture.Image, start: usize, end: usize, width: u32) bool {
-    if (end <= start or end > img.h or width == 0) return false;
-    const stride = @as(usize, img.w) * 4;
-    const first = img.rgba[start * stride ..][0..4].*;
-    var row = start;
-    while (row < end) : (row += 1) {
-        const off = row * stride;
-        var x: usize = 0;
-        while (x < width) : (x += 1) {
-            if (!std.mem.eql(u8, img.rgba[off + x * 4 .. off + x * 4 + 4], &first)) return false;
-        }
-    }
-    return true;
-}
-
-fn bandsEqual(a: capture.Image, b: capture.Image, start: usize, end: usize, width: u32) bool {
-    if (end <= start or end > a.h or end > b.h or a.w != b.w or width == 0) return true;
-    const stride = @as(usize, a.w) * 4;
-    const bytes = @as(usize, width) * 4;
-    var row = start;
-    while (row < end) : (row += 1) {
-        const off = row * stride;
-        if (!std.mem.eql(u8, a.rgba[off .. off + bytes], b.rgba[off .. off + bytes])) return false;
-    }
-    return true;
 }
 
 const Phase = struct {
@@ -126,59 +96,22 @@ fn runPhase(
     g: *Gui,
     window: platform.MainWindow,
     base: capture.Image,
-    band: MarginBand,
+    band: margin_scroll.Bands,
     phase: Phase,
 ) !void {
-    var top_hits: usize = 0;
-    var bottom_hits: usize = 0;
-    var body_diffs: usize = 0;
-    var shots: usize = 0;
-
-    if (!platform.scrollBegin(g.app_pid, window)) return error.ScrollRefused;
-    var n: u32 = 0;
-    while (n < nudge_steps) : (n += 1) {
-        platform.scrollStep(phase.nudge_px);
-        gui_io.sleepNs(16 * std.time.ns_per_ms);
-    }
-    platform.scrollEnd();
-
-    var c: u32 = 0;
-    while (c < settle_cycles) : (c += 1) {
-        var shot = capture.captureWindow(alloc, window.number) catch continue;
-        shots += 1;
-        defer shot.deinit(alloc);
-        if (shot.w != base.w or shot.h != base.h) continue;
-        const cw = if (shot.w > scrollbar_exclude_px) shot.w - scrollbar_exclude_px else shot.w;
-        if (!bandsEqual(shot, base, band.start, band.end, cw)) top_hits += 1;
-        if (!bandsEqual(shot, base, band.bottom_start, band.bottom_end, cw)) bottom_hits += 1;
-        const stride = @as(usize, shot.w) * 4;
-        const mid = (shot.h / 2) * stride;
-        const cmp = @as(usize, cw) * 4;
-        if (!std.mem.eql(u8, shot.rgba[mid .. mid + cmp], base.rgba[mid .. mid + cmp])) body_diffs += 1;
-
-        if (c % 20 == 19) {
-            gui_io.sleepNs(400 * std.time.ns_per_ms);
-            if (platform.scrollBegin(g.app_pid, window)) {
-                var n2: u32 = 0;
-                while (n2 < nudge_steps) : (n2 += 1) {
-                    platform.scrollStep(phase.nudge_px);
-                    gui_io.sleepNs(16 * std.time.ns_per_ms);
-                }
-                platform.scrollEnd();
-            }
-        }
-    }
+    var known: ?margin_scroll.Bands = band;
+    const s = try margin_scroll.sampleSettle(alloc, g.app_pid, window, base, phase.nudge_px, nudge_steps, settle_cycles, &known, margin_scroll.known_bands);
 
     std.debug.print(
         "[gui] {s} glide margin bands changed: top={d} bottom={d} of {d}; body {d}/{d}\n",
-        .{ phase.label, top_hits, bottom_hits, shots, body_diffs, shots },
+        .{ phase.label, s.top, s.bottom, s.shots, s.body, s.shots },
     );
-    if (shots < 20) return error.TooFewCaptures;
-    if (body_diffs == 0) {
+    if (s.shots < 20) return error.TooFewCaptures;
+    if (s.body == 0) {
         std.debug.print("[gui] scrolling content never changed — captures were not live\n", .{});
         return error.CaptureNotLive;
     }
-    if (top_hits > 0 or bottom_hits > 0) {
+    if (s.top > 0 or s.bottom > 0) {
         std.debug.print(
             "[gui] a margin row changed during the {s} glide — margin rows do not scroll and must hold still\n",
             .{phase.label},
@@ -188,59 +121,22 @@ fn runPhase(
 
     // Hard scroll and release: the shrink-gated coverage check on the
     // settle, plus a uniformity probe of the band region the offset opens.
-    var blank_band: usize = 0;
-    var band_shots: usize = 0;
     const t0 = try app_log.nowMs(alloc, log_path);
-    if (platform.scrollBegin(g.app_pid, window)) {
-        var k: u32 = 0;
-        while (k < 12) : (k += 1) {
-            platform.scrollStep(phase.hard_px);
-            gui_io.sleepNs(16 * std.time.ns_per_ms);
-        }
-        platform.scrollEnd();
-        while (k < 40) : (k += 1) {
-            var shot = capture.captureWindow(alloc, window.number) catch continue;
-            defer shot.deinit(alloc);
-            band_shots += 1;
-            const cw = if (shot.w > scrollbar_exclude_px) shot.w - scrollbar_exclude_px else shot.w;
-            if (bandIsUniform(shot, phase.blank_start, phase.blank_end, cw)) blank_band += 1;
-            gui_io.sleepNs(16 * std.time.ns_per_ms);
-        }
-    }
+    const probe = margin_scroll.hardScrollBlankBand(alloc, g.app_pid, window, phase.hard_px, phase.blank_start, phase.blank_end);
     std.debug.print(
         "[gui] {s} frames with a blank scroll band: {d}/{d}\n",
-        .{ phase.label, blank_band, band_shots },
+        .{ phase.label, probe.blank, probe.shots },
     );
-    if (band_shots < 10) return error.TooFewCaptures;
-    if (blank_band > 0) return error.ScrollBandBlank;
+    if (probe.shots < 10) return error.TooFewCaptures;
+    if (probe.blank > 0) return error.ScrollBandBlank;
 
-    const lines = try app_log.linesSince(alloc, log_path, scroll_marker, t0);
-    defer alloc.free(lines);
-    var uncovered: usize = 0;
-    var offset_frames: usize = 0;
-    var prev_ndc: ?f64 = null;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const ndc = app_log.field(line, "ndc") orelse continue;
-        const cell_ndc = app_log.field(line, "cellNDC") orelse continue;
-        const retained = app_log.field(line, "retained") orelse continue;
-        defer prev_ndc = ndc;
-        if (cell_ndc <= 0) continue;
-        const shrinking = if (prev_ndc) |p| @abs(ndc) < @abs(p) else false;
-        if (!shrinking) continue;
-        // Same rounding as ScrollRetention.coversBand.
-        const band_rows = std.math.ceil(@abs(ndc) / cell_ndc - 0.001);
-        if (band_rows < 1) continue;
-        offset_frames += 1;
-        if (retained < band_rows) uncovered += 1;
-    }
+    const cov = try margin_scroll.shrinkCoverageSince(alloc, log_path, scroll_marker, t0);
     std.debug.print(
         "[gui] {s} shrinking-offset frames with an uncovered scroll band: {d}/{d}\n",
-        .{ phase.label, uncovered, offset_frames },
+        .{ phase.label, cov.uncovered, cov.frames },
     );
-    if (offset_frames < 3) return error.TooFewSettleFrames;
-    if (uncovered >= margin_hit_threshold) return error.ScrollBandUncovered;
+    if (cov.frames < 3) return error.TooFewSettleFrames;
+    if (cov.uncovered >= margin_hit_threshold) return error.ScrollBandUncovered;
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -265,13 +161,21 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // A bordered, winbar-carrying float composited into the MAIN window
     // (relative='editor', NOT external). Focused, so the wheel over the
     // window center scrolls it. Cursor deep enough to scroll both ways.
+    //
+    // Centred on the editor rather than placed at a fixed cell: the gesture
+    // lands on the window's centre, and the window is whatever frame the
+    // app restored from the last session — on a 192x46-cell frame a float
+    // at row 1 ended 30 rows above the pointer, so the nudge scrolled the
+    // base grid (no margin rows) and the scenario failed before measuring.
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "local lines = {} for i = 1, 400 do lines[i] = string.rep(\"line \" .. i .. \" \", 6) end " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, lines) " ++
+            "local w = " ++ std.fmt.comptimePrint("{d}", .{float_cols}) ++
+            " local h = " ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++ " " ++
             "_G.e2e_float = vim.api.nvim_open_win(b, true, " ++
-            "{relative=\"editor\", row=1, col=2, width=" ++ std.fmt.comptimePrint("{d}", .{float_cols}) ++
-            ", height=" ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++ ", border=\"single\", " ++
+            "{relative=\"editor\", row=math.max(1, math.floor((vim.o.lines - h) / 2)), " ++
+            "col=math.max(2, math.floor((vim.o.columns - w) / 2)), width=w, height=h, border=\"single\", " ++
             // A footer bakes text into the BOTTOM border row (nvim 0.10+),
             // giving the bottom margin row glyphs the way the winbar gives
             // the top one — a corruption there moves many more pixels than
@@ -283,10 +187,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
-    var win_buf: [max_windows]platform.MainWindow = undefined;
-    const wins = win_buf[0..platform.windowsForPid(g.app_pid, &win_buf)];
+    const wins = driver.snapshotWindows(g.app_pid);
     var main_win: ?platform.MainWindow = null;
-    for (wins) |w| {
+    for (wins.slice()) |w| {
         if (w.bounds.w >= 150 and w.bounds.h >= 150) {
             main_win = w;
             break;
@@ -308,7 +211,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     platform.scrollStep(step_px);
     gui_io.sleepNs(16 * std.time.ns_per_ms);
     platform.scrollEnd();
-    var band: ?MarginBand = null;
+    var band: ?margin_scroll.Bands = null;
     var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {
         if (marginBand(alloc, capture_h, t0)) |b| {
@@ -320,7 +223,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const b = band orelse return error.NoScrollOffsetLogged;
     std.debug.print(
         "[gui] float margin bands {d}..{d} and {d}..{d}\n",
-        .{ b.start, b.end, b.bottom_start, b.bottom_end },
+        .{ b.top_start, b.top_end, b.bot_start, b.bot_end },
     );
     // Wait out the arming nudge's settle, then re-take the rest reference:
     // the nudge scrolled the float, so the original capture's CONTENT is
@@ -330,7 +233,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     base.deinit(alloc);
     base = try capture.captureWindow(alloc, window.number);
 
-    const cell = if (b.end > b.start) (b.end - b.start) / 2 else 0;
+    const cell = if (b.top_end > b.top_start) (b.top_end - b.top_start) / 2 else 0;
     if (cell == 0) return error.ScrollOffsetUnparsable;
 
     // Downward: rows leave the TOP, the band opens under the top margin.
@@ -338,8 +241,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .label = "down",
         .nudge_px = step_px,
         .hard_px = -12,
-        .blank_start = b.end,
-        .blank_end = b.end + cell * 2,
+        .blank_start = b.top_end,
+        .blank_end = b.top_end + cell * 2,
     });
     gui_io.sleepNs(500 * std.time.ns_per_ms);
     // Upward: rows leave the BOTTOM, the band presses on the bottom border.
@@ -347,8 +250,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .label = "up",
         .nudge_px = -step_px,
         .hard_px = 12,
-        .blank_start = b.bottom_start - cell * 2,
-        .blank_end = b.bottom_start,
+        .blank_start = b.bot_start - cell * 2,
+        .blank_end = b.bot_start,
     });
 
     const topline_after = try g.evalInt("luaeval('vim.api.nvim_win_call(_G.e2e_float, function() return vim.fn.line(\"w0\") end)')");

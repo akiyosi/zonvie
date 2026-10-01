@@ -18,7 +18,7 @@
 //!      (`layout(location=0) in vec2 vUV`).
 //!
 //! The shared uniform layout (160 bytes, std140) matches
-//! `include/zonvie_core.h`'s `zonvie_shader_uniforms`, which both
+//! `include/zonvie_frontend.h`'s `zonvie_shader_uniforms`, which both
 //! frontends populate and upload per frame as a UBO at binding=1.
 
 const std = @import("std");
@@ -65,7 +65,7 @@ fn ensureGlslangInit() void {
 
 /// Shadertoy-compatible wrapper prepended to Shadertoy-style user sources.
 /// Member order and sizes match `zonvie_shader_uniforms` in
-/// `include/zonvie_core.h` (160 bytes, std140).
+/// `include/zonvie_frontend.h` (160 bytes, std140).
 ///
 /// Screen-space unification: `iResolution` is the main window's drawable
 /// size for every view, and `iWindowOffset` / `iWindowSize` describe the

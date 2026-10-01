@@ -18,6 +18,7 @@ pub const c = @cImport({
     @cInclude("d2d1.h");
     @cInclude("d2d1_1.h"); // ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
     @cInclude("dwrite.h");
+    @cInclude("dwrite_3.h"); // IDWriteFontFace5 / IDWriteFontResource (variation axes)
 
     // D3D11 + DXGI
     @cInclude("d3d11.h");

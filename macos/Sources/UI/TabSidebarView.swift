@@ -188,7 +188,6 @@ final class TabSidebarView: NSView {
             self.layer?.backgroundColor = NSColor.clear.cgColor
         }
         setupTrackingArea()
-        observeColorschemeChanges()
     }
 
     override func viewDidMoveToWindow() {
@@ -208,10 +207,15 @@ final class TabSidebarView: NSView {
         agentIndicator.stop()
     }
 
-    private func observeColorschemeChanges() {
+    /// Follow `core`'s colorscheme only: every session posts the same name,
+    /// and observing them all recoloured this sidebar from another session.
+    func observeColorschemeChanges(of core: ZonvieCore) {
+        if let observer = colorschemeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         colorschemeObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.colorschemeDidChangeNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
             guard let self = self else { return }
@@ -302,7 +306,9 @@ final class TabSidebarView: NSView {
             floatPath.lineWidth = 1.0
             floatPath.stroke()
 
-            // Draw tab name in floating row
+            // Draw tab name in floating row. A tabline_update can shrink
+            // `tabs` mid-drag (the tracking loop drains the main queue).
+            guard dragIdx < tabs.count else { return }
             let tab = tabs[dragIdx]
             let font = NSFont.systemFont(ofSize: 12, weight: .medium)
             let paragraphStyle = NSMutableParagraphStyle()
@@ -485,7 +491,9 @@ final class TabSidebarView: NSView {
         let location = convert(event.locationInWindow, from: nil)
 
         if let index = tabIndex(at: location) {
-            if isCloseButton(at: location, tabIndex: index) {
+            // Only where the row shows the X: a selected or hovered tab.
+            let closeShown = tabs[index].handle == currentTab || hoveredTabIndex == index
+            if closeShown && isCloseButton(at: location, tabIndex: index) {
                 trackCloseButtonClick(initialEvent: event, tabIndex: index)
             } else {
                 trackTabDrag(initialEvent: event, tabIndex: index)
@@ -509,9 +517,12 @@ final class TabSidebarView: NSView {
         dropTargetIndex = nil
         var isDragging = true
         var hasMoved = false
+        // The loop drains the main queue, so a tabline_update can replace
+        // `tabs` mid-drag: the dragged tab is followed by its handle.
+        let draggedTab = tabs[tabIndex]
 
         // Select the dragged tab immediately (`:tabmove` moves the current tab)
-        onTabSelected?(tabs[tabIndex].handle)
+        onTabSelected?(draggedTab.handle)
 
         while isDragging {
             guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
@@ -533,7 +544,7 @@ final class TabSidebarView: NSView {
                 if hasMoved && isOutsideSidebar && !isExternalDrag {
                     isExternalDrag = true
                     dropTargetIndex = nil
-                    dragPreviewHelper.create(tabName: tabs[tabIndex].name, at: screenLocation)
+                    dragPreviewHelper.create(tabName: draggedTab.name, at: screenLocation)
                 } else if hasMoved && !isOutsideSidebar && isExternalDrag {
                     isExternalDrag = false
                     dragPreviewHelper.destroy()
@@ -545,31 +556,26 @@ final class TabSidebarView: NSView {
                     // Internal reorder drag
                     dragCurrentY = location.y
 
-                    // Calculate drop target from Y position
-                    var targetIdx = 0
-                    for i in 0..<tabs.count {
-                        let rowCenterY = CGFloat(i) * tabRowHeight + tabRowHeight / 2
-                        if location.y < rowCenterY {
-                            targetIdx = i
-                            break
-                        }
-                        targetIdx = i + 1
-                    }
-                    dropTargetIndex = min(targetIdx, tabs.count)
+                    dropTargetIndex = Int(zonvie_core_tab_drop_index(
+                        Double(location.y), UInt32(tabs.count), 0,
+                        Double(tabRowHeight), Double(tabRowHeight)))
                 }
                 needsDisplay = true
 
             case .leftMouseUp:
                 isDragging = false
 
+                let currentIndex = tabs.firstIndex { $0.handle == draggedTab.handle }
                 if isExternalDrag {
                     dragPreviewHelper.destroy()
-                    onTabExternalized?(tabs[tabIndex].handle, screenLocation)
+                    if currentIndex != nil {
+                        onTabExternalized?(draggedTab.handle, screenLocation)
+                    }
                 } else if !hasMoved {
                     // Click without drag — tab was already selected above
-                } else if let targetIdx = dropTargetIndex {
-                    if targetIdx != tabIndex && targetIdx != tabIndex + 1 {
-                        onTabMoved?(tabIndex, targetIdx)
+                } else if let currentIndex, let targetIdx = dropTargetIndex.map({ min($0, tabs.count) }) {
+                    if targetIdx != currentIndex && targetIdx != currentIndex + 1 {
+                        onTabMoved?(currentIndex, targetIdx)
                     }
                 }
 

@@ -22,15 +22,29 @@ const IID_IDWriteFactory_ZONVIE: GUID = .{
     .Data4 = .{ 0xA2, 0xE8, 0x1A, 0xDC, 0x7D, 0x93, 0xDB, 0x48 },
 };
 
-// DWrite font feature struct for IDWriteTextAnalyzer::GetGlyphs.
-const DWriteFontFeature = extern struct { nameTag: u32, parameter: u32 };
-const MAX_FONT_FEATURES = 32;
+// IDWriteFontFace5 IID: {98EFF3A5-B667-479A-B145-E2FA5B9FDC29}
+const IID_IDWriteFontFace5_ZONVIE: GUID = .{
+    .Data1 = 0x98EFF3A5,
+    .Data2 = 0xB667,
+    .Data3 = 0x479A,
+    .Data4 = .{ 0xB1, 0x45, 0xE2, 0xFA, 0x5B, 0x9F, 0xDC, 0x29 },
+};
 
-// Styled glyph logging stats (global)
-var g_log_styled_hits: u64 = 0;
-var g_log_styled_misses: u64 = 0;
-var g_log_styled_fallbacks: u64 = 0;
-var g_log_styled_last_report_ns: i128 = 0;
+// A [font] family entry holds at most this many features (the core parser's
+// cap); the defaults below take slots of their own on top.
+const MAX_USER_FONT_FEATURES = 32;
+const MAX_FONT_FEATURES = default_font_features.len + MAX_USER_FONT_FEATURES;
+
+// GetGlyphs applies DirectWrite's default features only when it gets no
+// feature list; given one, it applies that list alone. Seeding the list with
+// HarfBuzz's horizontal defaults (what macOS shapes with) makes a [font]
+// family feature add to them, so `+liga` keeps the `calt` ligatures.
+const default_font_features = [_]u32{
+    packTag("abvm"), packTag("blwm"), packTag("ccmp"), packTag("locl"),
+    packTag("mark"), packTag("mkmk"), packTag("rlig"), packTag("calt"),
+    packTag("clig"), packTag("curs"), packTag("dist"), packTag("kern"),
+    packTag("liga"), packTag("rclt"),
+};
 
 // GSUB ligature trigger cache entry, keyed by IDWriteFontFace pointer.
 const GsubCacheEntry = struct {
@@ -48,6 +62,89 @@ const GsubCacheEntry = struct {
 /// the size every other Neovim GUI shows for the same `guifont`.
 fn emSizePxForPointSize(dpi: u32, point_size: f32) f32 {
     return point_size * @as(f32, @floatFromInt(dpi)) / 72.0;
+}
+
+const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+
+/// en-us IDWriteTextFormat for `name_w` at `size_px`; null on failure.
+fn createTextFormat(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bool, italic: bool, size_px: f32) ?*c.IDWriteTextFormat {
+    const create_fn = factory.lpVtbl.*.CreateTextFormat orelse return null;
+    var fmt: ?*c.IDWriteTextFormat = null;
+    const hr = create_fn(
+        factory,
+        name_w,
+        null,
+        if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
+        if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
+        c.DWRITE_FONT_STRETCH_NORMAL,
+        size_px,
+        std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
+        &fmt,
+    );
+    if (hr != 0) {
+        safeRelease(fmt);
+        return null;
+    }
+    return fmt;
+}
+
+/// Design advances of `gids` at `em_size_px`, as 26.6 pixels. False when the
+/// face has no usable metrics; the caller then uses the cell width.
+fn designAdvances26_6(face: *c.IDWriteFontFace, em_size_px: f32, gids: []const c.UINT16, out_adv: []i32) bool {
+    std.debug.assert(gids.len <= 128 and out_adv.len >= gids.len);
+    const fvtbl = face.lpVtbl.*;
+    const get_fm_fn = fvtbl.GetMetrics orelse return false;
+    const get_gm_fn = fvtbl.GetDesignGlyphMetrics orelse return false;
+    var fm: c.DWRITE_FONT_METRICS = undefined;
+    get_fm_fn(face, &fm);
+    if (fm.designUnitsPerEm == 0) return false;
+    var gm: [128]c.DWRITE_GLYPH_METRICS = undefined;
+    if (c.FAILED(get_gm_fn(face, gids.ptr, @intCast(gids.len), &gm, c.FALSE))) return false;
+    const scale: f32 = em_size_px / @as(f32, @floatFromInt(fm.designUnitsPerEm)) * 64.0;
+    for (gm[0..gids.len], out_adv[0..gids.len]) |m, *adv| {
+        adv.* = @intFromFloat(@as(f32, @floatFromInt(m.advanceWidth)) * scale);
+    }
+    return true;
+}
+
+/// First system-collection face of family `name_w` matching the weight and
+/// slant; null when the family or a matching face is missing.
+fn matchFontFace(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bool, italic: bool) ?*c.IDWriteFontFace {
+    var sys_fc: ?*c.IDWriteFontCollection = null;
+    const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse return null;
+    if (c.FAILED(get_fc_fn(factory, &sys_fc, c.FALSE)) or sys_fc == null) return null;
+    defer safeRelease(sys_fc);
+    const fc = sys_fc.?;
+
+    var index: u32 = 0;
+    var exists: c.BOOL = c.FALSE;
+    const find_fn = fc.lpVtbl.*.FindFamilyName orelse return null;
+    if (c.FAILED(find_fn(fc, name_w, &index, &exists)) or exists == c.FALSE) return null;
+
+    var family: ?*c.IDWriteFontFamily = null;
+    const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return null;
+    if (c.FAILED(get_family_fn(fc, index, &family)) or family == null) return null;
+    defer safeRelease(family);
+
+    var font: ?*c.IDWriteFont = null;
+    const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse return null;
+    const hr_font = get_first_fn(
+        family.?,
+        if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
+        c.DWRITE_FONT_STRETCH_NORMAL,
+        if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
+        &font,
+    );
+    if (c.FAILED(hr_font) or font == null) return null;
+    defer safeRelease(font);
+
+    var face: ?*c.IDWriteFontFace = null;
+    const create_face_fn = font.?.lpVtbl.*.CreateFontFace orelse return null;
+    if (c.FAILED(create_face_fn(font.?, &face))) {
+        safeRelease(face);
+        return null;
+    }
+    return face;
 }
 
 pub const Renderer = struct {
@@ -78,6 +175,9 @@ pub const Renderer = struct {
     has_color_tables: ?bool = null,
     font_em_size: f32 = 14.0,
     emoji_font_size: f32 = 0, // scaled em size for Segoe UI Emoji (0 = not yet computed)
+    // Regular Segoe UI Emoji format at emoji_font_size; released with every
+    // emoji_font_size reset.
+    emoji_text_format: ?*c.IDWriteTextFormat = null,
     base_point_size: f32 = 14.0, // original point size before DPI scaling
     // Base font weight/slant chosen via the font picker (`:set guifont=*`).
     // Normally regular; a picked Bold/Italic face sets these so the base font
@@ -93,18 +193,12 @@ pub const Renderer = struct {
     cell_w_px: u32 = 9,
     cell_h_px: u32 = 18,
 
-    // atlas
-    atlas_bitmap: ?*c.ID2D1Bitmap = null,
-
     // Pipeline
     vs: ?*c.ID3D11VertexShader = null,
     ps: ?*c.ID3D11PixelShader = null,
     il: ?*c.ID3D11InputLayout = null,
     sampler: ?*c.ID3D11SamplerState = null,
     blend: ?*c.ID3D11BlendState = null,
-
-    // VS constants (viewport transform)
-    vs_cb: ?*c.ID3D11Buffer = null,
 
     // Glyph cache: scalar -> entry (aligned with core types)
     // Styled glyph cache: (scalar | (style_flags << 21)) -> entry
@@ -121,23 +215,13 @@ pub const Renderer = struct {
     glyph_tmp: std.ArrayListUnmanaged(u8) = .empty,
 
     // Append-only queue of atlas dirty rects. Entries are appended when glyphs
-    // are rasterized and consumed independently by the D2D bitmap path (renderVertices)
-    // and each D3D window via per-consumer cursors. Only cleared on atlas reset.
+    // are rasterized and consumed independently by each D3D window via
+    // per-consumer cursors. Only cleared on atlas reset.
     pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .empty,
     // Monotonic sequence number of the first entry in pending_uploads.
     // Advances only on atlas reset (when all entries become invalid).
     // head_seq = pending_upload_base_seq + pending_uploads.items.len.
     pending_upload_base_seq: u64 = 0,
-    // D2D bitmap consumer cursor (used by renderVertices / flushPendingAtlasUploadsLocked).
-    d2d_upload_cursor: u64 = 0,
-
-    // reusable brushes
-    solid_brush: ?*c.ID2D1SolidColorBrush = null,
-
-    // Off-screen render target for high-quality glyph rendering (created lazily)
-    glyph_rt: ?*c.ID2D1BitmapRenderTarget = null,
-    glyph_rt_size: u32 = 0, // current size (square)
-    glyph_rt_brush: ?*c.ID2D1SolidColorBrush = null,
 
     // Atlas version - incremented when new glyphs are added (for multi-context sync)
     atlas_version: u64 = 0,
@@ -150,9 +234,6 @@ pub const Renderer = struct {
     // of atlas_version (which bumps too often for that purpose — see
     // tmp/fixplan/06-windows-atlas.md finding 3).
     atlas_reset_generation: u64 = 0,
-    // Bumped for every atlas_cpu mutation. Resource rebuilds validate it
-    // after running D2D Create/Copy calls outside mu.
-    atlas_content_generation: u64 = 0,
 
     // Font change detection: track name + generation to skip redundant setFont calls
     font_name_utf8: [128]u8 = [_]u8{0} ** 128,
@@ -160,8 +241,15 @@ pub const Renderer = struct {
     font_generation: u32 = 0,
 
     // OpenType font features for DWrite shaping.
-    font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
+    font_features: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = std.mem.zeroes([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE),
     font_feature_count: u32 = 0,
+    // Every [font] family entry as a variation axis value (wght=700,
+    // slnt=-12); withUserAxes applies the ones the face has an axis for.
+    font_axis_values: [MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = undefined,
+    font_axis_count: u32 = 0,
+    // The regular face was recreated at those axis values, so the TextFormat
+    // (family name only) no longer measures it; see recomputeCellMetrics.
+    base_face_varied: bool = false,
     text_analyzer: ?*c.IDWriteTextAnalyzer = null,
 
     // GSUB ligature trigger cache (see GsubCacheEntry above).
@@ -255,17 +343,19 @@ pub const Renderer = struct {
 
         var loaded = false;
         if (family_raw.len > 0) {
-            const cands = core.config.splitFontFamilyList(aa, family_raw) catch &.{};
-            for (cands) |cand_str| {
-                const resolved = core.redraw_handler.parseGuiFontCandidate(aa, cand_str) catch continue;
-                if (resolved.name.len == 0) continue;
-                const parsed_pt: f32 = @floatCast(resolved.point_size);
-                const cand_pt: f32 = if (size_explicit or parsed_pt <= 0) default_pt else parsed_pt;
-                self.setFontUtf8WithFeatures(resolved.name, cand_pt, "") catch |e| {
-                    if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ resolved.name, cand_pt, e });
+            // The core's "name\tsize\tfeatures" lines, as onGuiFont reads
+            // them: a bare entry inherits `default_pt` and features are kept.
+            const lines = core.config.formatFontFamilyAsCandidateList(aa, family_raw, default_pt, "") catch "";
+            var line_it = std.mem.splitScalar(u8, lines, '\n');
+            while (line_it.next()) |entry| {
+                const cand = core.config.parseFontCandidateLine(entry, default_pt, size_explicit) orelse continue;
+                const cand_name = cand.name;
+                const cand_pt = cand.point_size;
+                self.setFontUtf8WithFeatures(cand_name, cand_pt, cand.features) catch |e| {
+                    if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ cand_name, cand_pt, e });
                     continue;
                 };
-                if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: selected '{s}' pt={d}\n", .{ resolved.name, cand_pt });
+                if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: selected '{s}' pt={d}\n", .{ cand_name, cand_pt });
                 loaded = true;
                 break;
             }
@@ -327,102 +417,6 @@ pub const Renderer = struct {
         return .{ .device = d2d_device.?, .ctx = d2d_ctx.? };
     }
 
-    const AtlasBitmapAndBrush = struct {
-        bitmap: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-    };
-
-    const AtlasPixelSnapshot = struct {
-        pixels: []u8,
-        width: u32,
-        height: u32,
-        generation: u64,
-    };
-
-    fn snapshotAtlasPixels(self: *Renderer) !AtlasPixelSnapshot {
-        self.mu.lockUncancelable(core.clock.io());
-        defer self.mu.unlock(core.clock.io());
-
-        const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
-        if (self.atlas_cpu.items.len != total) {
-            try self.atlas_cpu.resize(self.alloc, total);
-            @memset(self.atlas_cpu.items, 0);
-            self.pending_upload_base_seq += self.pending_uploads.items.len;
-            self.pending_uploads.clearRetainingCapacity();
-            self.atlas_content_generation +%= 1;
-        }
-
-        const pixels = try self.alloc.alloc(u8, total);
-        @memcpy(pixels, self.atlas_cpu.items);
-        return .{
-            .pixels = pixels,
-            .width = self.atlas_w,
-            .height = self.atlas_h,
-            .generation = self.atlas_content_generation,
-        };
-    }
-
-    fn copyAtlasSnapshotUnlocked(bitmap: *c.ID2D1Bitmap, snapshot: AtlasPixelSnapshot) !void {
-        const copy_fn = bitmap.lpVtbl.*.CopyFromMemory orelse return error.BitmapMissingCopyFromMemory;
-        const rect = c.D2D1_RECT_U{
-            .left = 0,
-            .top = 0,
-            .right = snapshot.width,
-            .bottom = snapshot.height,
-        };
-        const hr = copy_fn(bitmap, &rect, snapshot.pixels.ptr, snapshot.width * 4);
-        if (c.FAILED(hr)) return error.ClearAtlasFailed;
-    }
-
-    /// Creates the atlas bitmap + solid brush on the given (not-yet-shared)
-    /// render target. Pure: touches no self fields, holds no lock — safe to
-    /// call on a freshly-created device context BEFORE it is published to
-    /// self.d2d_device_ctx, since nothing else can have a reference to it
-    /// yet. CreateBitmap/CreateSolidColorBrush are D2D resource-creation
-    /// calls that, per repeated review, can also pump window messages;
-    /// running them under self.mu risks the exact app.mu<->self.mu
-    /// lock-order inversion those reviews found (core-thread atlas
-    /// callbacks take app.mu then self.mu; a UI-thread caller holding
-    /// self.mu here that gets reentered into a handler needing app.mu would
-    /// deadlock against it).
-    fn createAtlasBitmapAndBrushUnlocked(rt_base: *c.ID2D1RenderTarget, atlas_w: u32, atlas_h: u32) !AtlasBitmapAndBrush {
-        const props = c.D2D1_BITMAP_PROPERTIES{
-            .pixelFormat = c.D2D1_PIXEL_FORMAT{
-                .format = c.DXGI_FORMAT_R8G8B8A8_UNORM,
-                .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            .dpiX = 96.0,
-            .dpiY = 96.0,
-        };
-        var bmp: ?*c.ID2D1Bitmap = null;
-        const sz = c.D2D1_SIZE_U{ .width = atlas_w, .height = atlas_h };
-        const vtbl = rt_base.lpVtbl.*;
-
-        const hr = if (vtbl.CreateBitmap) |create_bitmap_fn| blk: {
-            break :blk create_bitmap_fn(rt_base, sz, null, 0, &props, &bmp);
-        } else {
-            if (applog.isEnabled()) applog.appLog("[d2d] CreateBitmap missing on vtbl\n", .{});
-            return error.CreateAtlasFailed;
-        };
-        if (c.FAILED(hr) or bmp == null) {
-            if (applog.isEnabled()) {
-                const hr_u: u32 = @bitCast(hr);
-                applog.appLog("[d2d] CreateBitmap(A8) FAILED hr=0x{x} bmp={*}\n", .{ hr_u, bmp });
-            }
-            return error.CreateAtlasFailed;
-        }
-        errdefer safeRelease(bmp);
-
-        var br: ?*c.ID2D1SolidColorBrush = null;
-        const c0 = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
-        const hr2 = if (vtbl.CreateSolidColorBrush) |create_brush_fn| blk: {
-            break :blk create_brush_fn(rt_base, &c0, null, &br);
-        } else return error.CreateBrushFailed;
-        if (c.FAILED(hr2) or br == null) return error.CreateBrushFailed;
-
-        return .{ .bitmap = bmp.?, .brush = br.? };
-    }
-
     /// Phase 2: Create D2D device context from a D3D11 device via DXGI.
     /// Falls back to legacy HwndRenderTarget if Factory1 is not available.
     pub fn initD2DDeviceContext(self: *Renderer, d3d_device: *c.ID3D11Device) !void {
@@ -449,77 +443,27 @@ pub const Renderer = struct {
 
         if (applog.isEnabled()) applog.appLog("[d2d] D2D device context created from D3D11 device\n", .{});
 
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(built.ctx);
-        var attempt: u8 = 0;
-        while (attempt < 3) : (attempt += 1) {
-            const snapshot = self.snapshotAtlasPixels() catch |err| {
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-            const atlas_res = createAtlasBitmapAndBrushUnlocked(rt_base, snapshot.width, snapshot.height) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-            copyAtlasSnapshotUnlocked(atlas_res.bitmap, snapshot) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                safeRelease(@as(?*c.ID2D1Bitmap, atlas_res.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas_res.brush));
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-
-            var old_bitmap: ?*c.ID2D1Bitmap = null;
-            var old_brush: ?*c.ID2D1SolidColorBrush = null;
-            var old_ctx: ?*c.ID2D1DeviceContext = null;
-            var old_device: ?*c.ID2D1Device = null;
+        var old_ctx: ?*c.ID2D1DeviceContext = null;
+        var old_device: ?*c.ID2D1Device = null;
+        {
             self.mu.lockUncancelable(core.clock.io());
-            const snapshot_still_current = self.atlas_w == snapshot.width and
-                self.atlas_h == snapshot.height and
-                self.atlas_content_generation == snapshot.generation;
-            if (snapshot_still_current) {
-                old_bitmap = self.atlas_bitmap;
-                old_brush = self.solid_brush;
-                old_ctx = self.d2d_device_ctx;
-                old_device = self.d2d_device;
-                self.atlas_bitmap = atlas_res.bitmap;
-                self.solid_brush = atlas_res.brush;
-                self.d2d_device_ctx = built.ctx;
-                self.d2d_device = built.device;
-                self.d2d_upload_cursor = self.pending_upload_base_seq + self.pending_uploads.items.len;
-            }
-            self.mu.unlock(core.clock.io());
-            self.alloc.free(snapshot.pixels);
-
-            if (!snapshot_still_current) {
-                safeRelease(@as(?*c.ID2D1Bitmap, atlas_res.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas_res.brush));
-                continue;
-            }
-
-            safeRelease(old_bitmap);
-            safeRelease(old_brush);
-            safeRelease(old_ctx);
-            safeRelease(old_device);
-            if (applog.isEnabled()) {
-                _ = c.QueryPerformanceCounter(&t1);
-                applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
-            }
-            return;
+            defer self.mu.unlock(core.clock.io());
+            old_ctx = self.d2d_device_ctx;
+            old_device = self.d2d_device;
+            self.d2d_device_ctx = built.ctx;
+            self.d2d_device = built.device;
         }
-
-        safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-        safeRelease(@as(?*c.ID2D1Device, built.device));
-        return error.AtlasChangedDuringRebuild;
+        safeRelease(old_ctx);
+        safeRelease(old_device);
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
     }
 
     /// Release device-bound D2D objects so initD2DDeviceContext can rebind to
     /// a fresh D3D device after device loss. CPU atlas pixels and glyph maps
-    /// are preserved (createAtlasResources keeps them when atlas_cpu is
-    /// already sized), so recovery is a full GPU re-upload, not a re-raster.
+    /// are preserved, so recovery is a full GPU re-upload, not a re-raster.
     ///
     /// Acquires self.mu only to detach the pointers (swap to null) — the
     /// actual COM Release() calls run AFTER unlocking. Even Release() is
@@ -529,29 +473,22 @@ pub const Renderer = struct {
     /// that under self.mu risks the same reentrant deadlock CreateDevice/
     /// CreateBitmap did before this file's other self.mu-scope fixes.
     pub fn releaseD2DDeviceObjects(self: *Renderer) void {
-        var old_bitmap: ?*c.ID2D1Bitmap = null;
-        var old_brush: ?*c.ID2D1SolidColorBrush = null;
         var old_ctx: ?*c.ID2D1DeviceContext = null;
         var old_device: ?*c.ID2D1Device = null;
         {
             self.mu.lockUncancelable(core.clock.io());
             defer self.mu.unlock(core.clock.io());
-            old_bitmap = self.atlas_bitmap;
-            self.atlas_bitmap = null;
-            old_brush = self.solid_brush;
-            self.solid_brush = null;
             old_ctx = self.d2d_device_ctx;
             self.d2d_device_ctx = null;
             old_device = self.d2d_device;
             self.d2d_device = null;
         }
-        safeRelease(old_bitmap);
-        safeRelease(old_brush);
         safeRelease(old_ctx);
         safeRelease(old_device);
     }
 
-    /// Legacy phase 2: creates the D2D HwndRenderTarget and atlas resources.
+    /// Legacy phase 2: creates the D2D HwndRenderTarget (nothing draws through
+    /// it; window.zig checks it as the "render path ready" gate).
     pub fn initRenderTarget(self: *Renderer) !void {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
@@ -578,17 +515,12 @@ pub const Renderer = struct {
         self.glyph_tmp.deinit(self.alloc);
         self.pending_uploads.deinit(self.alloc);
 
-        safeRelease(self.vs_cb);
         safeRelease(self.blend);
         safeRelease(self.sampler);
 
-        safeRelease(self.solid_brush);
-        safeRelease(self.glyph_rt_brush);
-        safeRelease(self.glyph_rt);
-        safeRelease(self.atlas_bitmap);
-
         safeRelease(self.text_analyzer);
         safeRelease(self.text_format);
+        safeRelease(self.emoji_text_format);
         safeRelease(self.font_face);
         safeRelease(self.bold_font_face);
         safeRelease(self.italic_font_face);
@@ -612,13 +544,7 @@ pub const Renderer = struct {
         bgRGB: u32,
     };
 
-    const LegacyRenderTargetResources = struct {
-        rt: *c.ID2D1HwndRenderTarget,
-        bitmap: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-    };
-
-    fn buildLegacyRenderTargetUnlocked(self: *Renderer, snapshot: AtlasPixelSnapshot) !LegacyRenderTargetResources {
+    fn buildLegacyRenderTargetUnlocked(self: *Renderer) !*c.ID2D1HwndRenderTarget {
         var rc: c.RECT = undefined;
         _ = c.GetClientRect(self.hwnd, &rc);
 
@@ -658,59 +584,20 @@ pub const Renderer = struct {
             &rt,
         );
         if (hr != 0 or rt == null) return error.D2DCreateHwndRenderTargetFailed;
-        errdefer safeRelease(rt);
-
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(rt.?);
-        const atlas = try createAtlasBitmapAndBrushUnlocked(rt_base, snapshot.width, snapshot.height);
-        errdefer {
-            safeRelease(@as(?*c.ID2D1Bitmap, atlas.bitmap));
-            safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas.brush));
-        }
-        try copyAtlasSnapshotUnlocked(atlas.bitmap, snapshot);
-        return .{ .rt = rt.?, .bitmap = atlas.bitmap, .brush = atlas.brush };
+        return rt.?;
     }
 
     fn recreateRenderTarget(self: *Renderer) !void {
-        var attempt: u8 = 0;
-        while (attempt < 3) : (attempt += 1) {
-            const snapshot = try self.snapshotAtlasPixels();
-            const built = self.buildLegacyRenderTargetUnlocked(snapshot) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                return err;
-            };
-
-            var old_rt: ?*c.ID2D1HwndRenderTarget = null;
-            var old_bitmap: ?*c.ID2D1Bitmap = null;
-            var old_brush: ?*c.ID2D1SolidColorBrush = null;
+        const built = try self.buildLegacyRenderTargetUnlocked();
+        var old_rt: ?*c.ID2D1HwndRenderTarget = null;
+        {
             self.mu.lockUncancelable(core.clock.io());
-            const snapshot_still_current = self.atlas_w == snapshot.width and
-                self.atlas_h == snapshot.height and
-                self.atlas_content_generation == snapshot.generation;
-            if (snapshot_still_current) {
-                old_rt = self.rt;
-                old_bitmap = self.atlas_bitmap;
-                old_brush = self.solid_brush;
-                self.rt = built.rt;
-                self.atlas_bitmap = built.bitmap;
-                self.solid_brush = built.brush;
-                self.d2d_upload_cursor = self.pending_upload_base_seq + self.pending_uploads.items.len;
-                self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
-            }
-            self.mu.unlock(core.clock.io());
-            self.alloc.free(snapshot.pixels);
-
-            if (!snapshot_still_current) {
-                safeRelease(@as(?*c.ID2D1Bitmap, built.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, built.brush));
-                safeRelease(@as(?*c.ID2D1HwndRenderTarget, built.rt));
-                continue;
-            }
-            safeRelease(old_bitmap);
-            safeRelease(old_brush);
-            safeRelease(old_rt);
-            return;
+            defer self.mu.unlock(core.clock.io());
+            old_rt = self.rt;
+            self.rt = built;
+            self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
         }
-        return error.AtlasChangedDuringRebuild;
+        safeRelease(old_rt);
     }
 
     // Style flags constants (match ZONVIE_STYLE_* in zonvie_core.h)
@@ -770,18 +657,10 @@ pub const Renderer = struct {
     /// Uses DWrite TextLayout to measure the actual line height, then scales down
     /// if the emoji font's metrics exceed the cell height.
     fn computeEmojiFontSize(self: *Renderer, dwrite_factory: *c.IDWriteFactory, cell_h_f: f32) f32 {
-        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
-        const locale: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
-
         // Create a temporary text format at font_em_size to measure
-        var tmp_fmt: ?*c.IDWriteTextFormat = null;
-        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return self.font_em_size;
-        const hr_tf = create_tf(dwrite_factory, emoji_font_name, null, c.DWRITE_FONT_WEIGHT_NORMAL, c.DWRITE_FONT_STYLE_NORMAL, c.DWRITE_FONT_STRETCH_NORMAL, self.font_em_size, locale, &tmp_fmt);
-        if (hr_tf != 0 or tmp_fmt == null) return self.font_em_size;
-        defer {
-            const base: *c.IUnknown = @ptrCast(tmp_fmt.?);
-            _ = base.lpVtbl.*.Release.?(base);
-        }
+        const tmp_fmt = createTextFormat(dwrite_factory, emoji_font_name, false, false, self.font_em_size);
+        if (tmp_fmt == null) return self.font_em_size;
+        defer safeRelease(tmp_fmt);
 
         // Measure a sample emoji character
         const sample: [2]c.WCHAR = .{ 0xD83D, 0xDE01 }; // U+1F601 😁
@@ -809,7 +688,7 @@ pub const Renderer = struct {
     /// D2D color emoji rendering: render a Unicode scalar (or cluster) via D2D
     /// DrawTextW into a 32-bit BGRA DIB section, then copy to glyph_tmp as RGBA.
     /// Returns true if color emoji was successfully rendered.
-    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
+    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, fallback_style: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
         // Use oversized buffer so emoji glyphs are not clipped.
         // Emoji fonts often render taller than the cell height (ascent + descent
         // can exceed em size). The actual glyph bounds are scanned afterwards and
@@ -849,8 +728,10 @@ pub const Renderer = struct {
                 .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
                 .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
             },
-            .dpiX = 0,
-            .dpiY = 0,
+            // 96 so DIPs are device pixels: emoji_font_size and the layout
+            // rect below are already in pixels.
+            .dpiX = 96,
+            .dpiY = 96,
             .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
             .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
         };
@@ -877,25 +758,22 @@ pub const Renderer = struct {
             self.emoji_font_size = self.computeEmojiFontSize(dwrite_factory, cell_h_f);
         }
 
-        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
-        var text_format: ?*c.IDWriteTextFormat = null;
-        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return false;
-        const hr_tf = create_tf(
-            dwrite_factory,
-            emoji_font_name,
-            null, // font collection (system default)
-            c.DWRITE_FONT_WEIGHT_NORMAL,
-            c.DWRITE_FONT_STYLE_NORMAL,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            self.emoji_font_size,
-            std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
-            &text_format,
-        );
-        if (hr_tf != 0 or text_format == null) return false;
-        defer {
-            const base: *c.IUnknown = @ptrCast(text_format.?);
-            _ = base.lpVtbl.*.Release.?(base);
-        }
+        // A styled notdef fallback keeps its run's weight and slant; everything
+        // else shares the cached regular format.
+        const fb_bold = (fallback_style & STYLE_BOLD) != 0;
+        const fb_italic = (fallback_style & STYLE_ITALIC) != 0;
+        var styled_format: ?*c.IDWriteTextFormat = null;
+        defer safeRelease(styled_format);
+        const text_format: ?*c.IDWriteTextFormat = if (fb_bold or fb_italic) blk: {
+            styled_format = createTextFormat(dwrite_factory, emoji_font_name, fb_bold, fb_italic, self.emoji_font_size);
+            break :blk styled_format;
+        } else blk: {
+            if (self.emoji_text_format == null) {
+                self.emoji_text_format = createTextFormat(dwrite_factory, emoji_font_name, false, false, self.emoji_font_size);
+            }
+            break :blk self.emoji_text_format;
+        };
+        if (text_format == null) return false;
 
         // Convert cluster scalars to UTF-16.
         // If flush set a multi-scalar cluster context, use the full cluster;
@@ -904,32 +782,10 @@ pub const Renderer = struct {
         const gdi_cl_ptr = core.zonvie_core_get_emoji_cluster(corep, &gdi_cl_len);
         var text_buf: [32]c.WCHAR = undefined; // max 16 scalars * 2 UTF-16 units
         var text_len: u32 = 0;
-        if (gdi_cl_len > 1 and gdi_cl_ptr != null) {
-            for (gdi_cl_ptr.?[0..gdi_cl_len]) |sc| {
-                if (sc <= 0xFFFF) {
-                    if (text_len < text_buf.len) {
-                        text_buf[text_len] = @intCast(sc);
-                        text_len += 1;
-                    }
-                } else {
-                    const v = sc - 0x10000;
-                    if (text_len + 1 < text_buf.len) {
-                        text_buf[text_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                        text_buf[text_len + 1] = @intCast(0xDC00 + (v & 0x3FF));
-                        text_len += 2;
-                    }
-                }
-            }
-        } else {
-            if (scalar <= 0xFFFF) {
-                text_buf[0] = @intCast(scalar);
-                text_len = 1;
-            } else {
-                const v = scalar - 0x10000;
-                text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
-                text_len = 2;
-            }
+        const text_scalars: []const u32 = if (gdi_cl_len > 1 and gdi_cl_ptr != null) gdi_cl_ptr.?[0..gdi_cl_len] else (&scalar)[0..1];
+        for (text_scalars) |sc| {
+            if (text_len + 2 > text_buf.len) break;
+            text_len += @intCast(encodeUtf16Scalar(sc, text_buf[text_len..][0..2]));
         }
 
         // Draw emoji using D2D DrawText (supports color emoji natively)
@@ -1199,32 +1055,33 @@ pub const Renderer = struct {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
 
-        const face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
+        var face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
 
         // scalar -> glyph_index (feature-aware via IDWriteTextAnalyzer when features set)
-        const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
+        var glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
             if (applog.isEnabled()) applog.appLog("[dwrite] getGlyphIndexForScalar failed in rasterizeGlyphOnly: {any}\n", .{err});
             return err;
         };
+        // A style face missing the glyph uses the regular face's before any
+        // system fallback, as macOS does.
+        if (glyph_index == 0) if (self.font_face) |base| if (base != face) {
+            const base_index = self.getGlyphIndexForScalar(base, scalar) catch 0;
+            if (base_index != 0) {
+                face = base;
+                glyph_index = base_index;
+            }
+        };
 
-        // Emoji codepoints: always prefer system color emoji (D2D + Segoe UI Emoji).
-        // Also check the cluster context: flush sets emoji_cluster_len > 0 for
-        // VS16-qualified and multi-scalar emoji clusters (e.g., ☀️ = U+2600 + FE0F).
+        // System color emoji (D2D + Segoe UI Emoji) first for emoji, for
+        // clusters flush marked as emoji (emoji_cluster_len > 0, e.g. ☀️ =
+        // U+2600 + FE0F) and for non-ASCII the font lacks (.notdef).
         var emoji_cl_len: u8 = 0;
         _ = core.zonvie_core_get_emoji_cluster(corep, &emoji_cl_len);
-        if (isEmojiPresentation(scalar) or emoji_cl_len > 0) {
-            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
-                return;
-            }
-        }
-
-        // .notdef (glyph_index==0): font doesn't have this glyph.
-        // Try GDI color emoji fallback for non-emoji non-ASCII scalars.
-        if (glyph_index == 0 and scalar > 0xFF) {
-            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
-                return;
-            }
-        }
+        const non_ascii = scalar > 0x7F;
+        const is_emoji = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0;
+        const gdi_first = is_emoji or (glyph_index == 0 and non_ascii);
+        const fallback_style: u32 = if (is_emoji) 0 else style_flags;
+        if (gdi_first and self.rasterizeColorEmojiGDI(scalar, fallback_style, corep, out_bitmap)) return;
 
         // The by-scalar path always retries an empty ClearType bound as
         // aliased, then falls back to GDI colour emoji before giving up.
@@ -1232,8 +1089,8 @@ pub const Renderer = struct {
         if (outcome == .empty) {
             // DWrite produced an empty bitmap. For non-ASCII scalars this may
             // be a colour emoji that DWrite ClearType/aliased cannot render.
-            if (scalar > 0xFF) {
-                if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
+            if (!gdi_first and non_ascii) {
+                if (self.rasterizeColorEmojiGDI(scalar, 0, corep, out_bitmap)) return;
             }
             // Empty glyph (space etc.)
             out_bitmap.pixels = null;
@@ -1331,8 +1188,6 @@ pub const Renderer = struct {
             }
         }
 
-        self.atlas_content_generation +%= 1;
-
         // Mark dirty rect for GPU upload
         try self.pending_uploads.append(self.alloc, c.D2D1_RECT_U{
             .left = dest_x,
@@ -1371,343 +1226,10 @@ pub const Renderer = struct {
         if (self.atlas_cpu.items.len > 0) {
             @memset(self.atlas_cpu.items, 0);
         }
-        self.atlas_content_generation +%= 1;
 
-        const rebuild_legacy = self.rt != null and self.d2d_device_ctx == null;
         self.atlas_reset_pending = true;
         self.atlas_reset_generation +%= 1;
         self.mu.unlock(core.clock.io());
-
-        if (rebuild_legacy) {
-            try self.recreateRenderTarget();
-        }
-    }
-
-    pub fn renderVertices(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex) !void {
-        self.mu.lockUncancelable(core.clock.io());
-        const needs_target = self.rt == null;
-        self.mu.unlock(core.clock.io());
-        if (needs_target) {
-            try self.recreateRenderTarget();
-        }
-
-        self.mu.lockUncancelable(core.clock.io());
-        errdefer self.mu.unlock(core.clock.io());
-
-        // IMPORTANT: Upload pending atlas dirty rects BEFORE BeginDraw.
-        // NOTE: renderVertices already holds self.mu, so call the _Locked variant.
-        self.flushPendingAtlasUploadsLocked();
-
-        const rt_hwnd = self.rt orelse return error.NoRenderTarget;
-        const atlas = self.atlas_bitmap orelse return error.NoAtlas;
-        const brush = self.solid_brush orelse return error.NoBrush;
-
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(rt_hwnd);
-        const vtbl = rt_base.lpVtbl.*;
-
-        // BeginDraw
-        if (vtbl.BeginDraw) |begin_fn| begin_fn(rt_base);
-
-        // ★ FillOpacityMask requirement: AntialiasMode must be ALIASED
-        // Failure causes deferred draw command failure and EndDraw returns 0x88990001
-        if (vtbl.SetAntialiasMode) |set_aa_fn| {
-            set_aa_fn(rt_base, c.D2D1_ANTIALIAS_MODE_ALIASED);
-        }
-
-        // Client size
-        var rc: c.RECT = undefined;
-        _ = c.GetClientRect(self.hwnd, &rc);
-
-        const client_w: f32 = @floatFromInt(@max(1, rc.right - rc.left));
-        const client_h: f32 = @floatFromInt(@max(1, rc.bottom - rc.top));
-
-        // Optional clear
-        if (vtbl.Clear) |clear_fn| {
-            const c0 = c.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 };
-            clear_fn(rt_base, &c0);
-        }
-
-        // Draw
-        try self.drawVertexList(rt_base, atlas, brush, client_w, client_h, main);
-        try self.drawVertexList(rt_base, atlas, brush, client_w, client_h, cursor);
-
-        // EndDraw
-        var tag1: u64 = 0;
-        var tag2: u64 = 0;
-        const hr = if (vtbl.EndDraw) |end_fn| end_fn(rt_base, &tag1, &tag2) else 0;
-
-        if (c.FAILED(hr)) {
-            const hr_u: u32 = @bitCast(hr);
-            if (applog.isEnabled()) applog.appLog("[d2d] EndDraw FAILED hr=0x{x} tags=({d},{d})\n", .{ hr_u, tag1, tag2 });
-
-            // D2DERR_RECREATE_TARGET (0x8899000C or 0x88990001)
-            if (hr_u == 0x8899000C or hr_u == 0x88990001) {
-                self.mu.unlock(core.clock.io());
-                _ = self.recreateRenderTarget() catch {};
-                return;
-            }
-            return error.D2DEndDrawFailed;
-        }
-
-        self.mu.unlock(core.clock.io());
-    }
-
-    fn drawVertexList(
-        self: *Renderer,
-        rt: *c.ID2D1RenderTarget,
-        atlas: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-        client_w: f32,
-        client_h: f32,
-        verts: []const core.Vertex,
-    ) !void {
-        if (verts.len < 6) return;
-
-        const log_active = applog.isEnabled();
-
-        const rtv = rt.lpVtbl.*;
-
-        // Avoid GetSize (it can crash in some states); use caller-provided client size.
-        const w: f32 = client_w;
-        const h: f32 = client_h;
-
-        // IMPORTANT: Do NOT call atlas->GetPixelSize().
-        // Use instance atlas size fields to avoid COM/VTBL mismatch crashes.
-        const atlas_w: f32 = @floatFromInt(self.atlas_w);
-        const atlas_h: f32 = @floatFromInt(self.atlas_h);
-
-        var i: usize = 0;
-        while (i + 5 < verts.len) : (i += 6) {
-            const quad = verts[i .. i + 6];
-
-            // Compute bounds from all 6 vertices (do NOT assume ordering).
-            var min_x: f32 = quad[0].position[0];
-            var max_x: f32 = quad[0].position[0];
-            var min_y: f32 = quad[0].position[1];
-            var max_y: f32 = quad[0].position[1];
-
-            var min_u: f32 = quad[0].texCoord[0];
-            var max_u: f32 = quad[0].texCoord[0];
-            var min_v: f32 = quad[0].texCoord[1];
-            var max_v: f32 = quad[0].texCoord[1];
-
-            // BG marker: ONLY U < 0 means BG.
-            // V may legitimately be negative depending on UV conventions.
-            var any_bg_marker: bool = (min_u < 0.0);
-
-            for (quad[1..]) |vtx| {
-                min_x = @min(min_x, vtx.position[0]);
-                max_x = @max(max_x, vtx.position[0]);
-                min_y = @min(min_y, vtx.position[1]);
-                max_y = @max(max_y, vtx.position[1]);
-
-                min_u = @min(min_u, vtx.texCoord[0]);
-                max_u = @max(max_u, vtx.texCoord[0]);
-                min_v = @min(min_v, vtx.texCoord[1]);
-                max_v = @max(max_v, vtx.texCoord[1]);
-
-                if (vtx.texCoord[0] < 0.0) any_bg_marker = true;
-            }
-
-            // Reject NaNs/Infs early (D2D can crash on them).
-            if (!std.math.isFinite(min_x) or !std.math.isFinite(max_x) or
-                !std.math.isFinite(min_y) or !std.math.isFinite(max_y) or
-                !std.math.isFinite(min_u) or !std.math.isFinite(max_u) or
-                !std.math.isFinite(min_v) or !std.math.isFinite(max_v))
-            {
-                continue;
-            }
-
-            // NDC(-1..1) -> px; flip Y for top-left origin.
-            const x_left = (min_x * 0.5 + 0.5) * w;
-            const x_right = (max_x * 0.5 + 0.5) * w;
-            const y_top = (1.0 - (max_y * 0.5 + 0.5)) * h;
-            const y_bottom = (1.0 - (min_y * 0.5 + 0.5)) * h;
-
-            const left = @min(x_left, x_right);
-            const right = @max(x_left, x_right);
-            const top = @min(y_top, y_bottom);
-            const bottom = @max(y_top, y_bottom);
-
-            if (right <= left or bottom <= top) continue;
-
-            const dst = c.D2D1_RECT_F{ .left = left, .top = top, .right = right, .bottom = bottom };
-
-            // Color: use first vertex
-            const col = quad[0].color;
-            const a: f32 = std.math.clamp(col[3], 0.0, 1.0);
-            const r: f32 = std.math.clamp(col[0], 0.0, 1.0);
-            const g: f32 = std.math.clamp(col[1], 0.0, 1.0);
-            const b: f32 = std.math.clamp(col[2], 0.0, 1.0);
-
-            if (brush.lpVtbl.*.SetColor) |set_color_fn| {
-                set_color_fn(brush, &c.D2D1_COLOR_F{ .r = r, .g = g, .b = b, .a = a });
-            }
-
-            // ---- Debug for root-cause: first 4 quads ----
-            if (i < 24 and log_active) {
-                applog.appLog(
-                    "[d2d] quad{d} any_bg={any} uv(min/max)=({d},{d})..({d},{d})\n",
-                    .{ i / 6, any_bg_marker, min_u, min_v, max_u, max_v },
-                );
-            }
-
-            // BG quad: FillRectangle
-            if (any_bg_marker) {
-                if (i == 0 and log_active) {
-                    applog.appLog("[d2d] quad0 BG FillRectangle dst=({d},{d},{d},{d})\n", .{
-                        dst.left, dst.top, dst.right, dst.bottom,
-                    });
-                }
-                if (rtv.FillRectangle) |fill_rect_fn| {
-                    fill_rect_fn(rt, &dst, @as(*c.ID2D1Brush, @ptrCast(brush)));
-                }
-                continue;
-            }
-
-            // Glyph quad
-            const u_min = std.math.clamp(min_u, 0.0, 1.0);
-            const u_max = std.math.clamp(max_u, 0.0, 1.0);
-            const v_min = std.math.clamp(min_v, 0.0, 1.0);
-            const v_max = std.math.clamp(max_v, 0.0, 1.0);
-
-            if (u_max <= u_min or v_max <= v_min) {
-                if (i < 24 and log_active) {
-                    applog.appLog(
-                        "[d2d] quad{d} UV degenerate (clamped) u={d}..{d} v={d}..{d}\n",
-                        .{ i / 6, u_min, u_max, v_min, v_max },
-                    );
-                }
-                continue;
-            }
-
-            const src = c.D2D1_RECT_F{
-                .left = u_min * atlas_w,
-                .top = v_min * atlas_h,
-                .right = u_max * atlas_w,
-                .bottom = v_max * atlas_h,
-            };
-
-            const is_color_emoji = (quad[0].deco_flags & core.DECO_COLOR_EMOJI) != 0;
-
-            if (is_color_emoji) {
-                // Color emoji: use DrawBitmap to render RGBA directly from atlas
-                if (rtv.DrawBitmap) |draw_bmp_fn| {
-                    if (i < 24 and log_active) {
-                        applog.appLog(
-                            "[d2d] quad{d} COLOR_EMOJI DrawBitmap dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
-                            .{
-                                i / 6,
-                                dst.left,
-                                dst.top,
-                                dst.right,
-                                dst.bottom,
-                                src.left,
-                                src.top,
-                                src.right,
-                                src.bottom,
-                            },
-                        );
-                    }
-
-                    draw_bmp_fn(
-                        rt,
-                        atlas,
-                        &dst,
-                        1.0, // opacity
-                        c.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                        &src,
-                    );
-                }
-            } else if (rtv.FillOpacityMask) |fill_mask_fn| {
-                // Regular glyph: FillOpacityMask (alpha-only rendering with brush color)
-                if (i < 24 and log_active) {
-                    applog.appLog(
-                        "[d2d] quad{d} GLYPH FillOpacityMask dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
-                        .{
-                            i / 6,
-                            dst.left,
-                            dst.top,
-                            dst.right,
-                            dst.bottom,
-                            src.left,
-                            src.top,
-                            src.right,
-                            src.bottom,
-                        },
-                    );
-                }
-
-                fill_mask_fn(
-                    rt,
-                    atlas,
-                    @as(*c.ID2D1Brush, @ptrCast(brush)),
-                    c.D2D1_OPACITY_MASK_CONTENT_TEXT_GDI_COMPATIBLE,
-                    &dst,
-                    &src,
-                );
-
-                if (i < 24 and log_active) {
-                    applog.appLog("[d2d] quad{d} FillOpacityMask returned\n", .{i / 6});
-                }
-            }
-        }
-
-        if (log_active) {
-            // DEBUG: count glyph vertices inside THIS vertex list (texCoord >= 0)
-            var glyph_vtx: usize = 0;
-            for (verts) |v| {
-                if (v.texCoord[0] >= 0.0 and v.texCoord[1] >= 0.0) {
-                    glyph_vtx += 1;
-                }
-            }
-            applog.appLog("[d2d] drawVertexList: total_vtx={d} glyph_vtx={d}\n", .{ verts.len, glyph_vtx });
-        }
-    }
-
-    // Upload pending atlas rects to the D2D bitmap since the last D2D cursor.
-    // Does NOT drain the queue — other consumers (D3D windows) read independently.
-    fn flushPendingAtlasUploadsLocked(self: *Renderer) void {
-        const bmp = self.atlas_bitmap orelse return;
-        const head_seq = self.pending_upload_base_seq + self.pending_uploads.items.len;
-        if (self.d2d_upload_cursor >= head_seq) return;
-
-        const bvtbl = bmp.lpVtbl.*;
-        const copy_fn = bvtbl.CopyFromMemory orelse return;
-
-        // If cursor fell behind base (atlas reset), upload the full bitmap.
-        if (self.d2d_upload_cursor < self.pending_upload_base_seq) {
-            if (self.atlas_cpu.items.len > 0) {
-                const full_rect = c.D2D1_RECT_U{
-                    .left = 0,
-                    .top = 0,
-                    .right = self.atlas_w,
-                    .bottom = self.atlas_h,
-                };
-                const hr = copy_fn(
-                    bmp,
-                    &full_rect,
-                    self.atlas_cpu.items.ptr,
-                    self.atlas_w * 4,
-                );
-                if (hr != 0) return;
-            }
-            self.d2d_upload_cursor = head_seq;
-            return;
-        }
-
-        const start_idx = self.d2d_upload_cursor - self.pending_upload_base_seq;
-        for (self.pending_uploads.items[start_idx..]) |r| {
-            const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
-            const hr = copy_fn(
-                bmp,
-                &r,
-                self.atlas_cpu.items.ptr + src_off,
-                self.atlas_w * 4,
-            );
-            if (hr != 0) return;
-            self.d2d_upload_cursor += 1;
-        }
     }
 
     /// Upload atlas dirty rects added since `since_seq` to the given D3D context.
@@ -1794,7 +1316,14 @@ pub const Renderer = struct {
     }
 
     fn uploadFullAtlasToD3DLocked(self: *Renderer, d3d: anytype) D3DUploadResult {
-        if (self.atlas_cpu.items.len == 0) return .{ .cursor = 0, .success = false };
+        // Before the core's first on_atlas_create nothing has sized the CPU
+        // atlas (the legacy D2D init used to), and a paint that could not
+        // upload drew nothing at all: upload the blank atlas instead, once.
+        if (self.atlas_cpu.items.len == 0) {
+            const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
+            self.atlas_cpu.resize(self.alloc, total) catch return .{ .cursor = 0, .success = false };
+            @memset(self.atlas_cpu.items, 0);
+        }
 
         if (applog.isEnabled()) applog.appLog(
             "[atlas] uploadFullAtlasToD3D: uploading full atlas {d}x{d}\n",
@@ -1816,34 +1345,6 @@ pub const Renderer = struct {
         return self.descent_px;
     }
 
-    pub fn onResize(self: *Renderer) void {
-        self.mu.lockUncancelable(core.clock.io());
-        const rt = self.rt orelse {
-            self.mu.unlock(core.clock.io());
-            return;
-        };
-        self.mu.unlock(core.clock.io());
-
-        const hwnd: c.HWND = self.hwnd;
-        var rc: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &rc);
-
-        const size = c.D2D1_SIZE_U{
-            .width = @intCast(@max(1, rc.right - rc.left)),
-            .height = @intCast(@max(1, rc.bottom - rc.top)),
-        };
-        const vtbl = rt.lpVtbl.*;
-        if (vtbl.Resize) |resize_fn| {
-            const hr = resize_fn(rt, &size);
-
-            // D2DERR_RECREATE_TARGET (0x8899000C)
-            const hr_u: u32 = @bitCast(hr);
-            if (hr_u == 0x8899000C) {
-                _ = self.recreateRenderTarget() catch {};
-            }
-        }
-    }
-
     pub fn setFontUtf8(self: *Renderer, name_utf8: []const u8, point_size: f32) !void {
         return self.setFontUtf8WithFeatures(name_utf8, point_size, "");
     }
@@ -1860,9 +1361,6 @@ pub const Renderer = struct {
         defer self.mu.unlock(core.clock.io());
 
         if (self.dwrite_factory == null) return error.NotInitialized;
-
-        const dw_weight: c.DWRITE_FONT_WEIGHT = if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL;
-        const dw_style: c.DWRITE_FONT_STYLE = if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL;
 
         // DPI scaling: scale point size to physical pixels
         const scaled_size: f32 = emSizePxForPointSize(self.dpi, point_size);
@@ -1893,64 +1391,12 @@ pub const Renderer = struct {
         errdefer safeRelease(new_face);
 
         // CreateTextFormat (scaled for DPI)
-        const vtbl = factory.lpVtbl.*;
-        const create_fn = vtbl.CreateTextFormat orelse return error.DWriteFactoryMissingCreateTextFormat;
-
-        const hr = create_fn(
-            factory,
-            @ptrCast(name_w.ptr),
-            null,
-            dw_weight,
-            dw_style,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            scaled_size,
-            @ptrCast(L("en-us")),
-            &new_fmt,
-        );
-        if (hr != 0 or new_fmt == null) return error.DWriteCreateTextFormatFailed;
+        new_fmt = createTextFormat(factory, @ptrCast(name_w.ptr), bold, italic, scaled_size) orelse
+            return error.DWriteCreateTextFormatFailed;
 
         // Build font_face from system font collection using the same family name.
-        var sys_fc: ?*c.IDWriteFontCollection = null;
-        const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse
-            return error.DWriteFactoryMissingGetSystemFontCollection;
-
-        const hr_fc = get_fc_fn(factory, &sys_fc, c.FALSE);
-        if (c.FAILED(hr_fc) or sys_fc == null) return error.DWriteGetSystemFontCollectionFailed;
-        defer safeRelease(sys_fc);
-
-        const fc = sys_fc.?;
-
-        var index: u32 = 0;
-        var exists: c.BOOL = c.FALSE;
-        const find_fn = fc.lpVtbl.*.FindFamilyName orelse return error.DWriteFontCollectionMissingFindFamilyName;
-
-        const hr_find = find_fn(fc, @ptrCast(name_w.ptr), &index, &exists);
-        if (c.FAILED(hr_find) or exists == c.FALSE) return error.DWriteFamilyNotFound;
-
-        var family: ?*c.IDWriteFontFamily = null;
-        const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return error.DWriteFontCollectionMissingGetFontFamily;
-
-        const hr_fam = get_family_fn(fc, index, &family);
-        if (c.FAILED(hr_fam) or family == null) return error.DWriteGetFontFamilyFailed;
-        defer safeRelease(family);
-
-        var font: ?*c.IDWriteFont = null;
-        const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse
-            return error.DWriteFontFamilyMissingGetFirstMatchingFont;
-
-        const hr_font = get_first_fn(
-            family.?,
-            dw_weight,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            dw_style,
-            &font,
-        );
-        if (c.FAILED(hr_font) or font == null) return error.DWriteGetFontFailed;
-        defer safeRelease(font);
-
-        const create_face_fn = font.?.lpVtbl.*.CreateFontFace orelse return error.DWriteFontMissingCreateFontFace;
-        const hr_face = create_face_fn(font.?, &new_face);
-        if (c.FAILED(hr_face) or new_face == null) return error.DWriteCreateFontFaceFailed;
+        new_face = matchFontFace(factory, @ptrCast(name_w.ptr), bold, italic) orelse
+            return error.DWriteFontFaceNotFound;
 
         // NOTE: Bold/Italic/Bold+Italic font variants are created eagerly
         // via ensureStyledFontFaces() at the end of this function.
@@ -1989,6 +1435,8 @@ pub const Renderer = struct {
 
         self.font_em_size = scaled_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
+        safeRelease(self.emoji_text_format);
+        self.emoji_text_format = null;
         self.base_point_size = point_size;
         self.base_bold = bold;
         self.base_italic = italic;
@@ -2009,20 +1457,15 @@ pub const Renderer = struct {
 
         // Parse and store OpenType features
         self.font_feature_count = 0;
+        self.font_axis_count = 0;
         if (features_str.len > 0) {
             self.parseFontFeatures(features_str);
         }
-        // Ensure text analyzer is available when features are set
-        if (self.font_feature_count > 0 and self.text_analyzer == null) {
-            const dw_factory = self.dwrite_factory orelse return error.NotInitialized;
-            var analyzer: ?*c.IDWriteTextAnalyzer = null;
-            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return error.DWriteFactoryMissingCreateTextAnalyzer;
-            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
-            if (!c.FAILED(hr_ta) and analyzer != null) {
-                self.text_analyzer = analyzer;
-            }
+        self.base_face_varied = false;
+        if (self.font_face) |face| {
+            self.font_face = self.withUserAxes(face);
+            self.base_face_varied = self.font_face != face;
         }
-
         try self.recomputeCellMetrics();
 
         // Invalidate GSUB lig trigger cache (font faces changed).
@@ -2035,58 +1478,57 @@ pub const Renderer = struct {
 
     /// Parse comma-separated features string into font_features array.
     /// Format: "+liga,-dlig,ss01=2"
+    /// The list starts from default_font_features, and a user feature with
+    /// the same tag replaces its default in place.
     fn parseFontFeatures(self: *Renderer, features_str: []const u8) void {
-        var i: usize = 0;
-        while (i < features_str.len and self.font_feature_count < MAX_FONT_FEATURES) {
-            // Find next comma
-            var j = i;
-            while (j < features_str.len and features_str[j] != ',') : (j += 1) {}
-            const tok = features_str[i..j];
-
-            if (self.parseOneFeature(tok)) |feat| {
-                self.font_features[self.font_feature_count] = feat;
-                self.font_feature_count += 1;
+        for (default_font_features) |tag| {
+            self.font_features[self.font_feature_count] = .{ .nameTag = @bitCast(tag), .parameter = 1 };
+            self.font_feature_count += 1;
+        }
+        var parsed: [MAX_USER_FONT_FEATURES]core.redraw_handler.FontFeature = undefined;
+        const n = core.redraw_handler.parseFontFeatureList(features_str, &parsed);
+        for (parsed[0..n]) |f| {
+            self.font_axis_values[self.font_axis_count] = .{
+                .axisTag = @bitCast(packTag(&f.tag)),
+                .value = @floatFromInt(f.value),
+            };
+            self.font_axis_count += 1;
+        }
+        next: for (parsed[0..n]) |f| {
+            const feat = dwriteFontFeature(f) orelse continue;
+            for (self.font_features[0..self.font_feature_count]) |*have| {
+                if (have.nameTag == feat.nameTag) {
+                    have.* = feat;
+                    continue :next;
+                }
             }
-
-            i = if (j < features_str.len) j + 1 else j;
+            self.font_features[self.font_feature_count] = feat;
+            self.font_feature_count += 1;
         }
     }
 
-    fn parseOneFeature(_: *Renderer, tok: []const u8) ?DWriteFontFeature {
-        if (tok.len == 0) return null;
-
-        var tag_str: []const u8 = undefined;
-        var value: u32 = 1;
-
-        if (tok[0] == '+' or tok[0] == '-') {
-            tag_str = tok[1..];
-            value = if (tok[0] == '+') 1 else 0;
-        } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
-            tag_str = tok[0..eq];
-            value = std.fmt.parseInt(u32, tok[eq + 1 ..], 10) catch return null;
-        } else {
-            tag_str = tok;
+    /// The shared IDWriteTextAnalyzer, created on first use. Caller holds mu.
+    fn ensureTextAnalyzerLocked(self: *Renderer) ?*c.IDWriteTextAnalyzer {
+        if (self.text_analyzer) |a| return a;
+        const dw_factory = self.dwrite_factory orelse return null;
+        const create_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return null;
+        var analyzer: ?*c.IDWriteTextAnalyzer = null;
+        if (c.FAILED(create_fn(dw_factory, &analyzer))) {
+            safeRelease(analyzer);
+            return null;
         }
-
-        if (tag_str.len != 4) return null;
-
-        // Pack 4-char tag into u32 (big-endian, matching DWRITE_FONT_FEATURE_TAG)
-        const nameTag: u32 = @as(u32, tag_str[0]) |
-            (@as(u32, tag_str[1]) << 8) |
-            (@as(u32, tag_str[2]) << 16) |
-            (@as(u32, tag_str[3]) << 24);
-
-        return DWriteFontFeature{ .nameTag = nameTag, .parameter = value };
+        self.text_analyzer = analyzer;
+        return analyzer;
     }
 
     /// Get glyph index for a scalar, applying OpenType features if set.
     /// Falls back to GetGlyphIndicesW when no features or analyzer unavailable.
     fn getGlyphIndexForScalar(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
-        if (self.font_feature_count > 0 and self.text_analyzer != null) {
-            if (self.getGlyphIndexViaAnalyzer(face, scalar)) |gid| {
+        if (self.font_feature_count > 0) if (self.ensureTextAnalyzerLocked()) |analyzer| {
+            if (self.getGlyphIndexViaAnalyzer(analyzer, face, scalar)) |gid| {
                 return gid;
             } else |_| {}
-        }
+        };
 
         // Default path: direct cmap lookup (no features)
         const fvtbl = face.lpVtbl.*;
@@ -2099,37 +1541,18 @@ pub const Renderer = struct {
     }
 
     /// Use IDWriteTextAnalyzer::GetGlyphs to get feature-aware glyph index.
-    fn getGlyphIndexViaAnalyzer(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
-        const analyzer = self.text_analyzer orelse return error.NoTextAnalyzer;
+    fn getGlyphIndexViaAnalyzer(self: *Renderer, analyzer: *c.IDWriteTextAnalyzer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
         const atbl = analyzer.lpVtbl.*;
 
-        // Convert scalar to UTF-16
         var text_buf: [2]c.WCHAR = undefined;
-        var text_len: u32 = 1;
-        if (scalar <= 0xFFFF) {
-            text_buf[0] = @intCast(scalar);
-        } else {
-            // Surrogate pair
-            const v = scalar - 0x10000;
-            text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-            text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
-            text_len = 2;
-        }
+        const text_len: u32 = @intCast(encodeUtf16Scalar(scalar, &text_buf));
 
         var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
         script_analysis.script = 0; // Default (Latin)
         script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
 
-        // Build DWRITE_TYPOGRAPHIC_FEATURES from stored features
-        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
-        for (0..self.font_feature_count) |fi| {
-            dw_features_arr[fi] = .{
-                .nameTag = @bitCast(self.font_features[fi].nameTag),
-                .parameter = self.font_features[fi].parameter,
-            };
-        }
         var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
-            .features = &dw_features_arr,
+            .features = &self.font_features,
             .featureCount = self.font_feature_count,
         };
         var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
@@ -2171,6 +1594,53 @@ pub const Renderer = struct {
         return glyph_indices[0];
     }
 
+    /// `face` at the [font] family entry's variation axis values, clamped to
+    /// each axis's range, or `face` itself when no entry names one of its
+    /// axes. Axes the entry leaves out keep the face's own values, so a Bold
+    /// named instance stays bold under `slnt=-12`. Takes over the reference
+    /// to `face`.
+    fn withUserAxes(self: *Renderer, face: *c.IDWriteFontFace) *c.IDWriteFontFace {
+        if (self.font_axis_count == 0) return face;
+        var face5: ?*c.IDWriteFontFace5 = null;
+        const qi = face.lpVtbl.*.QueryInterface orelse return face;
+        if (c.FAILED(qi(face, @ptrCast(&IID_IDWriteFontFace5_ZONVIE), @ptrCast(&face5))) or face5 == null) return face;
+        defer safeRelease(face5);
+        const f5 = face5.?;
+        const vt = f5.lpVtbl.*;
+        if ((vt.HasVariations orelse return face)(f5) == c.FALSE) return face;
+
+        var values: [16]c.DWRITE_FONT_AXIS_VALUE = undefined;
+        const n: u32 = @min((vt.GetFontAxisValueCount orelse return face)(f5), values.len);
+        if (c.FAILED((vt.GetFontAxisValues orelse return face)(f5, &values, n))) return face;
+
+        var resource: ?*c.IDWriteFontResource = null;
+        if (c.FAILED((vt.GetFontResource orelse return face)(f5, &resource)) or resource == null) return face;
+        defer safeRelease(resource);
+        const rvt = resource.?.lpVtbl.*;
+        var ranges: [16]c.DWRITE_FONT_AXIS_RANGE = undefined;
+        const range_count: u32 = @min((rvt.GetFontAxisCount orelse return face)(resource.?), ranges.len);
+        if (c.FAILED((rvt.GetFontAxisRanges orelse return face)(resource.?, &ranges, range_count))) return face;
+
+        var changed = false;
+        for (values[0..n]) |*v| {
+            for (self.font_axis_values[0..self.font_axis_count]) |u| {
+                if (u.axisTag != v.axisTag) continue;
+                v.value = u.value;
+                for (ranges[0..range_count]) |r| {
+                    if (r.axisTag == v.axisTag) v.value = std.math.clamp(v.value, r.minValue, r.maxValue);
+                }
+                changed = true;
+            }
+        }
+        if (!changed) return face;
+
+        const simulations = (face.lpVtbl.*.GetSimulations orelse return face)(face);
+        var varied: ?*c.IDWriteFontFace5 = null;
+        if (c.FAILED((rvt.CreateFontFace orelse return face)(resource.?, simulations, &values, n, &varied)) or varied == null) return face;
+        safeRelease(@as(?*c.IDWriteFontFace, face));
+        return @ptrCast(varied.?);
+    }
+
     // Lazy-load Bold/Italic/Bold+Italic font faces on first use.
     // This improves startup time by ~10ms since styled fonts are rarely used at launch.
     // Must be called with mu locked.
@@ -2179,101 +1649,15 @@ pub const Renderer = struct {
         self.styled_fonts_initialized = true;
 
         const factory = self.dwrite_factory orelse return;
-
-        // Get system font collection
-        var sys_fc: ?*c.IDWriteFontCollection = null;
-        const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse return;
-        const hr_fc = get_fc_fn(factory, &sys_fc, c.FALSE);
-        if (c.FAILED(hr_fc) or sys_fc == null) return;
-        defer safeRelease(sys_fc);
-
-        const fc = sys_fc.?;
-
-        // Find font family by name
-        var index: u32 = 0;
-        var exists: c.BOOL = c.FALSE;
-        const find_fn = fc.lpVtbl.*.FindFamilyName orelse return;
-        const hr_find = find_fn(fc, @ptrCast(&self.font_name), &index, &exists);
-        if (c.FAILED(hr_find) or exists == c.FALSE) return;
-
-        var family: ?*c.IDWriteFontFamily = null;
-        const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return;
-        const hr_fam = get_family_fn(fc, index, &family);
-        if (c.FAILED(hr_fam) or family == null) return;
-        defer safeRelease(family);
-
-        const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse return;
-
-        // Bold variant
-        {
-            var bold_font: ?*c.IDWriteFont = null;
-            const hr_bold = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_BOLD,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_NORMAL,
-                &bold_font,
-            );
-            if (!c.FAILED(hr_bold) and bold_font != null) {
-                const cf = bold_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_bold_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(bold_font.?, &new_bold_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.bold_font_face = new_bold_face;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(bold_font);
-            }
-        }
-
-        // Italic variant
-        {
-            var italic_font: ?*c.IDWriteFont = null;
-            const hr_italic = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_NORMAL,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_ITALIC,
-                &italic_font,
-            );
-            if (!c.FAILED(hr_italic) and italic_font != null) {
-                const cf = italic_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_italic_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(italic_font.?, &new_italic_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.italic_font_face = new_italic_face;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Italic font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(italic_font);
-            }
-        }
-
-        // Bold+Italic variant
-        {
-            var bold_italic_font: ?*c.IDWriteFont = null;
-            const hr_bi = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_BOLD,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_ITALIC,
-                &bold_italic_font,
-            );
-            if (!c.FAILED(hr_bi) and bold_italic_font != null) {
-                const cf = bold_italic_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_bold_italic_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(bold_italic_font.?, &new_bold_italic_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.bold_italic_font_face = new_bold_italic_face;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold+Italic font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(bold_italic_font);
-            }
+        const Variant = struct { bold: bool, italic: bool, slot: *?*c.IDWriteFontFace };
+        const variants = [_]Variant{
+            .{ .bold = true, .italic = false, .slot = &self.bold_font_face },
+            .{ .bold = false, .italic = true, .slot = &self.italic_font_face },
+            .{ .bold = true, .italic = true, .slot = &self.bold_italic_font_face },
+        };
+        for (variants) |v| {
+            const face = matchFontFace(factory, @ptrCast(&self.font_name), v.bold, v.italic) orelse continue;
+            v.slot.* = self.withUserAxes(face);
         }
     }
 
@@ -2309,8 +1693,32 @@ pub const Renderer = struct {
         if (hrm != 0) return error.DWriteGetMetricsFailed;
 
         // Round up for cell size
-        const cw: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.widthIncludingTrailingWhitespace)))));
+        var cw: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.widthIncludingTrailingWhitespace)))));
         const ch: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.height)))));
+
+        // An axis-varied face (wdth, MONO) is wider or narrower than the
+        // TextFormat's default instance: take the cell width and the
+        // ascent/descent from the face the glyphs are drawn with.
+        if (self.base_face_varied) if (self.font_face) |face| {
+            const fvtbl = face.lpVtbl.*;
+            var fm: c.DWRITE_FONT_METRICS = undefined;
+            (fvtbl.GetMetrics orelse return error.DWriteFontFaceMissingGetMetrics)(face, &fm);
+            const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
+            if (du_per_em > 0.0) {
+                const px_per_du = self.font_em_size / du_per_em;
+                self.ascent_px = px_per_du * @as(f32, @floatFromInt(fm.ascent));
+                self.descent_px = px_per_du * @as(f32, @floatFromInt(fm.descent));
+                var codepoint = [1]c.UINT32{'M'};
+                var gid: [1]c.UINT16 = undefined;
+                var gm: [1]c.DWRITE_GLYPH_METRICS = undefined;
+                const get_gid = fvtbl.GetGlyphIndicesW orelse return error.DWriteFontFaceMissingGetGlyphIndicesW;
+                const get_gm = fvtbl.GetDesignGlyphMetrics orelse return error.DWriteGetMetricsFailed;
+                if (!c.FAILED(get_gid(face, &codepoint, 1, &gid)) and !c.FAILED(get_gm(face, &gid, 1, &gm, c.FALSE))) {
+                    const advance_px = px_per_du * @as(f32, @floatFromInt(gm[0].advanceWidth));
+                    cw = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(advance_px)))));
+                }
+            }
+        };
 
         self.cell_w_px = cw;
         self.cell_h_px = ch;
@@ -2335,10 +1743,14 @@ pub const Renderer = struct {
         self.dpi = new_dpi;
         if (applog.isEnabled()) applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
 
-        // Re-scale font_em_size and metrics proportionally
-        const scale: f32 = @as(f32, @floatFromInt(new_dpi)) / @as(f32, @floatFromInt(old_dpi));
-        self.font_em_size *= scale;
+        // Assign the em size exactly as setFontUtf8WithStyle computes it, so its
+        // unchanged-font early return still matches after a DPI round trip.
+        const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
+        const scale: f32 = if (self.font_em_size > 0) new_font_size / self.font_em_size else 1.0;
+        self.font_em_size = new_font_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
+        safeRelease(self.emoji_text_format);
+        self.emoji_text_format = null;
         self.ascent_px *= scale;
         self.descent_px *= scale;
 
@@ -2347,26 +1759,8 @@ pub const Renderer = struct {
             safeRelease(self.text_format);
             self.text_format = null;
 
-            const factory = self.dwrite_factory.?;
-            const vtbl = factory.lpVtbl.*;
-            if (vtbl.CreateTextFormat) |create_fn| {
-                const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
-                var new_fmt: ?*c.IDWriteTextFormat = null;
-                const hr = create_fn(
-                    factory,
-                    @ptrCast(&self.font_name),
-                    null,
-                    c.DWRITE_FONT_WEIGHT_NORMAL,
-                    c.DWRITE_FONT_STYLE_NORMAL,
-                    c.DWRITE_FONT_STRETCH_NORMAL,
-                    new_font_size,
-                    @ptrCast(L("en-us")),
-                    &new_fmt,
-                );
-                if (hr == 0 and new_fmt != null) {
-                    self.text_format = new_fmt;
-                }
-            }
+            // The picked base style, as setFontUtf8WithStyle measures it.
+            self.text_format = createTextFormat(self.dwrite_factory.?, @ptrCast(&self.font_name), self.base_bold, self.base_italic, new_font_size);
         }
 
         // Re-compute cell metrics with new TextFormat
@@ -2451,70 +1845,67 @@ pub const Renderer = struct {
 
         const face = self.selectFontFace(style_flags) orelse return 0;
 
-        // For very long runs that exceed the stack-allocated shaping buffers,
-        // fall back to per-codepoint glyph lookup (correct rendering, no ligatures/kerning).
-        // This avoids returning 0 which would trigger the slower per-cell path in the core.
-        if (scalar_count > SHAPE_MAX_SCALARS) {
-            return self.shapeFallbackPerCodepoint(face, scalars, scalar_count, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+        // Runs longer than the stack shaping buffers are shaped in chunks cut
+        // after a space, so features and ligatures still apply. A failed
+        // chunk of a long run falls back to per-codepoint lookup rather than
+        // returning 0 (the core's slower per-cell path).
+        var total: usize = 0;
+        var start: usize = 0;
+        while (start < scalar_count) {
+            const len = render_pipeline_helpers.shapeChunkLen(scalars[start..scalar_count], SHAPE_MAX_SCALARS);
+            const cap = out_cap -| total;
+            const n = self.shapeChunkLocked(face, scalars + start, len, out_glyph_ids + @min(total, out_cap), out_clusters + @min(total, out_cap), out_x_advance + @min(total, out_cap), out_x_offset + @min(total, out_cap), out_y_offset + @min(total, out_cap), cap);
+            if (n == 0) {
+                if (scalar_count <= SHAPE_MAX_SCALARS) return 0;
+                return self.shapeFallbackPerCodepoint(face, scalars, scalar_count, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+            }
+            // The chunk's clusters are chunk-relative; a count over `cap`
+            // left the buffers unfilled and only adds to the total.
+            if (n <= cap) {
+                for (out_clusters[total..][0..n]) |*cl| cl.* += @intCast(start);
+            }
+            total += n;
+            start += len;
         }
+        return total;
+    }
 
-        // Ensure text analyzer exists (create lazily if needed)
-        if (self.text_analyzer == null) {
-            const dw_factory = self.dwrite_factory orelse return 0;
-            var analyzer: ?*c.IDWriteTextAnalyzer = null;
-            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return 0;
-            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
-            if (c.FAILED(hr_ta) or analyzer == null) return 0;
-            self.text_analyzer = analyzer;
-        }
-        const analyzer = self.text_analyzer orelse return 0;
+    /// shapeTextRunDWrite for one run of at most SHAPE_MAX_SCALARS scalars,
+    /// with clusters relative to `scalars`. Caller holds mu.
+    fn shapeChunkLocked(
+        self: *Renderer,
+        face: *c.IDWriteFontFace,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        std.debug.assert(scalar_count > 0 and scalar_count <= SHAPE_MAX_SCALARS);
+        const analyzer = self.ensureTextAnalyzerLocked() orelse return 0;
 
         // --- 1) Convert UTF-32 scalars → UTF-16 ---
         var utf16_buf: [SHAPE_MAX_UTF16]c.WCHAR = undefined;
         var utf16_to_scalar_idx: [SHAPE_MAX_UTF16]u32 = undefined;
         var utf16_len: u32 = 0;
 
+        // scalar_count <= SHAPE_MAX_SCALARS, so two units per scalar always fit.
         for (0..scalar_count) |si| {
-            const s = scalars[si];
-            if (utf16_len >= SHAPE_MAX_UTF16) return 0;
-            if (s <= 0xFFFF) {
-                utf16_buf[utf16_len] = @intCast(if (s >= 0xD800 and s <= 0xDFFF) @as(u32, 0xFFFD) else s);
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            } else if (s <= 0x10FFFF) {
-                if (utf16_len + 1 >= SHAPE_MAX_UTF16) return 0;
-                const v = s - 0x10000;
-                utf16_buf[utf16_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-                utf16_buf[utf16_len] = @intCast(0xDC00 + (v & 0x3FF));
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            } else {
-                // Invalid scalar → U+FFFD
-                utf16_buf[utf16_len] = 0xFFFD;
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            }
+            const n = encodeUtf16Scalar(scalars[si], utf16_buf[utf16_len..][0..2]);
+            @memset(utf16_to_scalar_idx[utf16_len..][0..n], @intCast(si));
+            utf16_len += @intCast(n);
         }
-
-        if (utf16_len == 0) return 0;
 
         // --- 2) Call GetGlyphs ---
         var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
         script_analysis.script = 0; // Default (Latin)
         script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
 
-        // Build features array
-        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
-        for (0..self.font_feature_count) |fi| {
-            dw_features_arr[fi] = .{
-                .nameTag = @bitCast(self.font_features[fi].nameTag),
-                .parameter = self.font_features[fi].parameter,
-            };
-        }
         var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
-            .features = &dw_features_arr,
+            .features = &self.font_features,
             .featureCount = self.font_feature_count,
         };
         var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
@@ -2629,7 +2020,7 @@ pub const Renderer = struct {
         return gcount;
     }
 
-    /// Per-codepoint glyph fallback for runs exceeding SHAPE_MAX_SCALARS.
+    /// Per-codepoint glyph fallback for a run whose shaping failed.
     /// Returns 1:1 glyph mapping with correct advances but no multi-glyph shaping.
     /// Must be called with self.mu locked.
     fn shapeFallbackPerCodepoint(
@@ -2646,62 +2037,26 @@ pub const Renderer = struct {
     ) usize {
         if (scalar_count > out_cap) return scalar_count;
 
-        const fvtbl = face.lpVtbl.*;
-        const get_glyph_fn = fvtbl.GetGlyphIndicesW orelse return 0;
-        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
-            // No metrics available — use cell_w_px for advances
-            for (0..scalar_count) |i| {
-                out_glyph_ids[i] = 0;
-                out_clusters[i] = @intCast(i);
-                out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-                out_x_offset[i] = 0;
-                out_y_offset[i] = 0;
-            }
-            return scalar_count;
-        };
-
-        // Compute advance scale factor
-        var fm: c.DWRITE_FONT_METRICS = undefined;
-        const get_fm_fn = fvtbl.GetMetrics orelse return 0;
-        get_fm_fn(face, &fm);
-        const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
-        if (du_per_em <= 0.0) return 0;
-        const scale: f32 = self.font_em_size / du_per_em * 64.0;
+        const get_glyph_fn = face.lpVtbl.*.GetGlyphIndicesW orelse return 0;
+        const cell_adv: i32 = @as(i32, @intCast(self.cell_w_px)) * 64;
 
         // Process in small batches to keep stack usage minimal
         const BATCH = 128;
         var batch_cp: [BATCH]c.UINT32 = undefined;
         var batch_gids: [BATCH]c.UINT16 = undefined;
-        var batch_metrics: [BATCH]c.DWRITE_GLYPH_METRICS = undefined;
 
         var si: usize = 0;
         while (si < scalar_count) {
             const n = @min(BATCH, scalar_count - si);
             for (0..n) |i| batch_cp[i] = scalars[si + i];
-
-            const hr_gi = get_glyph_fn(face, &batch_cp, @intCast(n), &batch_gids);
-            if (c.FAILED(hr_gi)) {
-                // Fill remaining with cell_w_px fallback
-                for (si..scalar_count) |i| {
-                    out_glyph_ids[i] = 0;
-                    out_clusters[i] = @intCast(i);
-                    out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-                    out_x_offset[i] = 0;
-                    out_y_offset[i] = 0;
-                }
-                return scalar_count;
+            const have_gids = !c.FAILED(get_glyph_fn(face, &batch_cp, @intCast(n), &batch_gids));
+            if (!have_gids) @memset(batch_gids[0..n], 0);
+            if (!have_gids or !designAdvances26_6(face, self.font_em_size, batch_gids[0..n], out_x_advance[si..][0..n])) {
+                @memset(out_x_advance[si..][0..n], cell_adv);
             }
-
-            const hr_gm = get_metrics_fn(face, &batch_gids, @intCast(n), &batch_metrics, c.FALSE);
-            const has_metrics = !c.FAILED(hr_gm);
-
             for (0..n) |i| {
                 out_glyph_ids[si + i] = batch_gids[i];
                 out_clusters[si + i] = @intCast(si + i);
-                out_x_advance[si + i] = if (has_metrics)
-                    @intFromFloat(@as(f32, @floatFromInt(batch_metrics[i].advanceWidth)) * scale)
-                else
-                    @as(i32, @intCast(self.cell_w_px)) * 64;
                 out_x_offset[si + i] = 0;
                 out_y_offset[si + i] = 0;
             }
@@ -2780,35 +2135,8 @@ pub const Renderer = struct {
         if (applog.isEnabled()) applog.appLog("[ascii_table] GetGlyphIndicesW done style={d}\n", .{style_flags});
 
         // --- 2) X Advances: design units → 26.6 fixed-point pixels ---
-        var glyph_metrics: [128]c.DWRITE_GLYPH_METRICS = undefined;
-        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
-            // Fallback: use cell_w_px for all advances
-            for (0..128) |i| {
-                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-            }
-            @memset(out_lig_triggers[0..128], 0);
-            return true;
-        };
-
-        const hr_gm = get_metrics_fn(face, &glyph_ids_u16, 128, &glyph_metrics, c.FALSE);
-        if (c.FAILED(hr_gm)) {
-            // Fallback to cell_w_px
-            for (0..128) |i| {
-                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-            }
-        } else {
-            // Get designUnitsPerEm for conversion
-            var fm: c.DWRITE_FONT_METRICS = undefined;
-            const get_fm_fn = fvtbl.GetMetrics orelse return false;
-            get_fm_fn(face, &fm);
-            const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
-            if (du_per_em <= 0.0) return false;
-
-            const scale: f32 = self.font_em_size / du_per_em * 64.0;
-            for (0..128) |i| {
-                const adv_du: f32 = @floatFromInt(glyph_metrics[i].advanceWidth);
-                out_x_advances[i] = @intFromFloat(adv_du * scale);
-            }
+        if (!designAdvances26_6(face, self.font_em_size, &glyph_ids_u16, out_x_advances[0..128])) {
+            @memset(out_x_advances[0..128], @as(i32, @intCast(self.cell_w_px)) * 64);
         }
         if (applog.isEnabled()) applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
 
@@ -2862,106 +2190,16 @@ fn safeRelease(p: anytype) void {
     }
 }
 
-/// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
-/// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
-/// renderers display as color emoji without an explicit VS16 selector.
-fn isEmojiPresentation(scalar: u32) bool {
-    return switch (scalar) {
-        // BMP: Emoji_Presentation=Yes (Unicode 15.1)
-        0x231A...0x231B,
-        0x23E9...0x23F3,
-        0x23F8...0x23FA,
-        0x25FD...0x25FE,
-        0x2614...0x2615,
-        0x2648...0x2653,
-        0x267F,
-        0x2693,
-        0x26A1,
-        0x26AA...0x26AB,
-        0x26BD...0x26BE,
-        0x26C4...0x26C5,
-        0x26CE,
-        0x26D4,
-        0x26EA,
-        0x26F2...0x26F3,
-        0x26F5,
-        0x26FA,
-        0x26FD,
-        0x2705,
-        0x270A...0x270B,
-        0x2728,
-        0x274C,
-        0x274E,
-        0x2753...0x2755,
-        0x2757,
-        0x2795...0x2797,
-        0x27A1,
-        0x27B0,
-        0x27BF,
-        0x2934...0x2935,
-        0x2B05...0x2B07,
-        0x2B1B...0x2B1C,
-        0x2B50,
-        0x2B55,
-        0x3030,
-        0x303D,
-        0x3297,
-        0x3299,
-        // SMP: Emoji_Presentation=Yes (Unicode 15.1)
-        0x1F004,
-        0x1F0CF,
-        0x1F18E,
-        0x1F191...0x1F19A,
-        0x1F1E6...0x1F1FF,
-        0x1F201,
-        0x1F21A,
-        0x1F22F,
-        0x1F232...0x1F236,
-        0x1F238...0x1F23A,
-        0x1F250...0x1F251,
-        0x1F300...0x1F320,
-        0x1F32D...0x1F335,
-        0x1F337...0x1F37C,
-        0x1F37E...0x1F393,
-        0x1F3A0...0x1F3CA,
-        0x1F3CF...0x1F3D3,
-        0x1F3E0...0x1F3F0,
-        0x1F3F4,
-        0x1F3F8...0x1F43E,
-        0x1F440,
-        0x1F442...0x1F4FC,
-        0x1F4FF...0x1F53D,
-        0x1F54B...0x1F54E,
-        0x1F550...0x1F567,
-        0x1F57A,
-        0x1F595...0x1F596,
-        0x1F5A4,
-        0x1F5FB...0x1F64F,
-        0x1F680...0x1F6C5,
-        0x1F6CC,
-        0x1F6D0...0x1F6D2,
-        0x1F6D5...0x1F6D7,
-        0x1F6DC...0x1F6DF,
-        0x1F6EB...0x1F6EC,
-        0x1F6F4...0x1F6FC,
-        0x1F7E0...0x1F7EB,
-        0x1F7F0,
-        0x1F90C...0x1F93A,
-        0x1F93C...0x1F945,
-        0x1F947...0x1F9FF,
-        0x1FA70...0x1FA7C,
-        0x1FA80...0x1FA89,
-        0x1FA8F...0x1FAC6,
-        0x1FACE...0x1FADC,
-        0x1FADF...0x1FAE9,
-        0x1FAF0...0x1FAF8,
-        => true,
-        else => false,
-    };
+/// A core feature as DirectWrite takes it: the tag packed little-endian
+/// (DWRITE_MAKE_OPENTYPE_TAG). A negative value (a variation axis such as
+/// slnt) has no DirectWrite feature parameter and is dropped.
+fn dwriteFontFeature(f: core.redraw_handler.FontFeature) ?c.DWRITE_FONT_FEATURE {
+    if (f.value < 0) return null;
+    return .{ .nameTag = @bitCast(packTag(&f.tag)), .parameter = @intCast(f.value) };
 }
 
 /// Pack a 4-char OpenType tag into u32 (little-endian, matching DWRITE_FONT_FEATURE_TAG).
-fn packTag(comptime s: *const [4]u8) u32 {
+fn packTag(s: *const [4]u8) u32 {
     return @as(u32, s[0]) | (@as(u32, s[1]) << 8) | (@as(u32, s[2]) << 16) | (@as(u32, s[3]) << 24);
 }
 
@@ -3091,6 +2329,21 @@ fn processSubtable(
     collectCoverageGlyphs(tbl, cov_abs, ascii_gids, out_triggers);
 }
 
+// Lookup-index bitset capacity (fonts typically have < 500 lookups).
+const GSUB_MAX_LOOKUPS = 4096;
+
+/// Mark the lookups a Feature table lists: featureParams(2) + lookupCount(2)
+/// + lookupListIndices[lookupCount].
+fn markGsubFeatureLookups(tbl: []const u8, feat_abs: usize, lookup_active: *[GSUB_MAX_LOOKUPS / 8]u8) void {
+    const lk_count = readU16BE(tbl, feat_abs + 2) orelse return;
+    for (0..lk_count) |li| {
+        const lk_idx = readU16BE(tbl, feat_abs + 4 + li * 2) orelse continue;
+        if (lk_idx < GSUB_MAX_LOOKUPS) {
+            lookup_active[lk_idx / 8] |= @as(u8, 1) << @intCast(lk_idx % 8);
+        }
+    }
+}
+
 /// Detect ligature trigger characters by introspecting the font's GSUB table.
 /// Matches macOS behavior (HarfBuzz `hb_ot_layout_collect_lookups` + `hb_ot_layout_lookup_collect_glyphs`).
 ///
@@ -3101,7 +2354,7 @@ fn processSubtable(
 fn detectLigTriggersFromGSUB(
     face: *c.IDWriteFontFace,
     ascii_gids: []const c.UINT16,
-    user_features: []const DWriteFontFeature,
+    user_features: []const c.DWRITE_FONT_FEATURE,
     user_feature_count: u32,
     out_triggers: [*]u8,
 ) void {
@@ -3146,23 +2399,22 @@ fn detectLigTriggersFromGSUB(
     const feature_count = readU16BE(tbl, fl_abs) orelse return;
 
     // Determine which features are active.
-    // Default-on features: liga, calt, rlig, locl, ccmp (mirrors HarfBuzz defaults
-    // and macOS HBFTBridge.c). locl and ccmp can substitute ASCII glyphs in some
-    // fonts (e.g. locale-specific bracket forms) so we must mark their input
-    // glyphs as triggers to avoid divergent rendering between the ASCII fast
-    // path and HarfBuzz output.
-    // Default-off features: clig, dlig, ss01-ss20, cv01-cv99, etc.
+    // Default-on features: default_font_features (what shapeTextRunDWrite
+    // hands GetGlyphs, HarfBuzz's defaults as on macOS), plus rvrn, which
+    // DirectWrite applies to a variable font whatever list it gets (Cascadia
+    // Code's bold `$`). Any of them can substitute an ASCII glyph, so their
+    // input glyphs must be triggers or the ASCII fast path draws the glyph
+    // the shaper would have replaced.
+    // Default-off features: dlig, ss01-ss20, cv01-cv99, etc.
     // User features can override defaults (enable or disable).
-    const ot_liga: u32 = 0x6C696761; // 'liga' big-endian
-    const ot_calt: u32 = 0x63616C74; // 'calt' big-endian
-    const ot_rlig: u32 = 0x726C6967; // 'rlig' big-endian
-    const ot_locl: u32 = 0x6C6F636C; // 'locl' big-endian
-    const ot_ccmp: u32 = 0x63636D70; // 'ccmp' big-endian
+    const ot_rvrn: u32 = 0x7276726E; // 'rvrn' big-endian
     // Collect lookup indices from active features
     // We use a bitset for lookup indices (max 65536 lookups, but typically <500)
     // Use a fixed-size array as a simple bitset (supports up to 4096 lookups)
-    const MAX_LOOKUPS = 4096;
-    var lookup_active = std.mem.zeroes([MAX_LOOKUPS / 8]u8);
+    var lookup_active = std.mem.zeroes([GSUB_MAX_LOOKUPS / 8]u8);
+    // Active features by FeatureList index, for FeatureVariations below.
+    const MAX_FEATURES = 1024;
+    var feature_active = std.mem.zeroes([MAX_FEATURES / 8]u8);
 
     for (0..feature_count) |fi| {
         const rec_off = fl_abs + 2 + fi * 6;
@@ -3172,16 +2424,15 @@ fn detectLigTriggersFromGSUB(
         // Determine if this feature is active
         var active = false;
 
-        // Check default-on features
-        if (tag_be == ot_liga or tag_be == ot_calt or tag_be == ot_rlig or
-            tag_be == ot_locl or tag_be == ot_ccmp)
-        {
-            active = true; // default on
+        // Check default-on features (default_font_features are little-endian)
+        if (tag_be == ot_rvrn) active = true;
+        for (default_font_features) |tag_le| {
+            if (@byteSwap(tag_le) == tag_be) active = true;
         }
 
         // Check user overrides: DWrite tags are little-endian, GSUB tags are big-endian
         for (0..user_feature_count) |ui| {
-            const user_tag_le = user_features[ui].nameTag;
+            const user_tag_le: u32 = @bitCast(user_features[ui].nameTag);
             // Convert LE→BE for comparison: swap bytes
             const user_tag_be = @byteSwap(user_tag_le);
             if (user_tag_be == tag_be) {
@@ -3191,16 +2442,34 @@ fn detectLigTriggersFromGSUB(
         }
 
         if (!active) continue;
+        if (fi < MAX_FEATURES) feature_active[fi / 8] |= @as(u8, 1) << @intCast(fi % 8);
+        markGsubFeatureLookups(tbl, fl_abs + @as(usize, feat_off_rel), &lookup_active);
+    }
 
-        // Read Feature table: featureParams(2) + lookupCount(2) + lookupListIndices[lookupCount]
-        const feat_abs = fl_abs + @as(usize, feat_off_rel);
-        // Skip featureParams (2 bytes)
-        const lk_count = readU16BE(tbl, feat_abs + 2) orelse continue;
-
-        for (0..lk_count) |li| {
-            const lk_idx = readU16BE(tbl, feat_abs + 4 + li * 2) orelse continue;
-            if (lk_idx < MAX_LOOKUPS) {
-                lookup_active[lk_idx / 8] |= @as(u8, 1) << @intCast(lk_idx % 8);
+    // GSUB 1.1 FeatureVariations swap an active feature for an alternate
+    // table under axis conditions (Cascadia Code's rvrn replaces `$` at heavy
+    // weights). Conditions are not evaluated: every alternate of an active
+    // feature counts, so no instance of a variable font misses a trigger.
+    if ((readU16BE(tbl, 2) orelse 0) >= 1) {
+        const fv_off = readU32BE(tbl, 10) orelse 0;
+        if (fv_off != 0) {
+            const fv_abs = @as(usize, fv_off);
+            // The count comes from the font: never walk past the table (a
+            // malformed u32 would otherwise loop billions of times under mu).
+            const rec_count = @min(readU32BE(tbl, fv_abs + 4) orelse 0, (tbl.len -| (fv_abs + 8)) / 8);
+            for (0..rec_count) |ri| {
+                const fts_off = readU32BE(tbl, fv_abs + 8 + ri * 8 + 4) orelse continue;
+                if (fts_off == 0) continue;
+                const fts_abs = fv_abs + @as(usize, fts_off);
+                const sub_count = readU16BE(tbl, fts_abs + 4) orelse continue;
+                for (0..sub_count) |si| {
+                    const rec = fts_abs + 6 + si * 6;
+                    const feat_idx = readU16BE(tbl, rec) orelse continue;
+                    if (feat_idx >= MAX_FEATURES) continue;
+                    if ((feature_active[feat_idx / 8] & (@as(u8, 1) << @intCast(feat_idx % 8))) == 0) continue;
+                    const alt_off = readU32BE(tbl, rec + 2) orelse continue;
+                    markGsubFeatureLookups(tbl, fts_abs + @as(usize, alt_off), &lookup_active);
+                }
             }
         }
     }
@@ -3211,13 +2480,13 @@ fn detectLigTriggersFromGSUB(
 
     // Count active lookups for logging
     var active_count: u32 = 0;
-    for (0..@min(lookup_count, MAX_LOOKUPS)) |li| {
+    for (0..@min(lookup_count, GSUB_MAX_LOOKUPS)) |li| {
         if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) != 0) active_count += 1;
     }
     if (applog.isEnabled()) applog.appLog("[gsub] feature_count={d} lookup_count={d} active_lookups={d} tbl_size={d}\n", .{ feature_count, lookup_count, active_count, table_size });
 
     for (0..lookup_count) |li| {
-        if (li >= MAX_LOOKUPS) break;
+        if (li >= GSUB_MAX_LOOKUPS) break;
         // Check if this lookup is in our active set
         if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) == 0) continue;
 
@@ -3275,4 +2544,608 @@ fn utf8ToUtf16Alloc(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
 
 fn L(comptime s: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(s);
+}
+
+fn shapeForTest(r: *Renderer, text: []const u8, out: *[16]u32) []const u32 {
+    return shapeStyledForTest(r, text, 0, out);
+}
+
+fn shapeStyledForTest(r: *Renderer, text: []const u8, style_flags: u32, out: *[16]u32) []const u32 {
+    var scalars: [16]u32 = undefined;
+    for (text, 0..) |ch, i| scalars[i] = ch;
+    var clusters: [16]u32 = undefined;
+    var xa: [16]i32 = undefined;
+    var xo: [16]i32 = undefined;
+    var yo: [16]i32 = undefined;
+    const n = r.shapeTextRunDWrite(&scalars, text.len, style_flags, out, &clusters, &xa, &xo, &yo, out.len);
+    return out[0..@min(n, out.len)];
+}
+
+/// Printable ASCII the core may send down the fast path, and the operator
+/// characters programming ligatures are built from.
+const fast_path_operator_chars = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~0xw";
+
+/// The core draws a run with no lig-trigger scalar straight from the ASCII
+/// table (flush.zig, ASCII fast path), so every such run must shape to exactly
+/// the table's glyphs. Checks every printable pair and every operator triple.
+fn expectFastPathMatchesShaping(r: *Renderer, style_flags: u32, label: []const u8) !void {
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(r.getAsciiTableDWrite(style_flags, &gids, &advances, &triggers));
+    // A table that marks everything a trigger would pass vacuously.
+    var fast_path_chars: usize = 0;
+    for (0x20..0x7F) |t| {
+        if (triggers[t] == 0) fast_path_chars += 1;
+    }
+    try std.testing.expect(fast_path_chars >= 26);
+
+    var buf: [3]u8 = undefined;
+    var a: u8 = 0x20;
+    while (a <= 0x7E) : (a += 1) {
+        var b: u8 = 0x20;
+        while (b <= 0x7E) : (b += 1) {
+            buf = .{ a, b, 0 };
+            try expectRunMatchesTable(r, style_flags, label, buf[0..2], &gids, &triggers);
+        }
+    }
+    // Operator triples reach the contextual (calt) rules pairs cannot; the
+    // style faces share those rules, so the regular face carries them.
+    if (style_flags != 0) return;
+    for (fast_path_operator_chars) |x| for (fast_path_operator_chars) |y| for (fast_path_operator_chars) |z| {
+        buf = .{ x, y, z };
+        try expectRunMatchesTable(r, style_flags, label, &buf, &gids, &triggers);
+    };
+}
+
+fn expectRunMatchesTable(
+    r: *Renderer,
+    style_flags: u32,
+    label: []const u8,
+    text: []const u8,
+    gids: *const [128]u32,
+    triggers: *const [128]u8,
+) !void {
+    for (text) |ch| if (triggers[ch] != 0) return;
+    var out: [16]u32 = undefined;
+    const shaped = shapeStyledForTest(r, text, style_flags, &out);
+    var expected: [16]u32 = undefined;
+    for (text, 0..) |ch, i| expected[i] = gids[ch];
+    if (!std.mem.eql(u32, shaped, expected[0..text.len])) {
+        std.debug.print("{s} style={d}: \"{s}\" takes the ASCII fast path as {any} but shapes to {any}\n", .{ label, style_flags, text, expected[0..text.len], shaped });
+        return error.TestExpectedEqual;
+    }
+}
+
+// A [font] family entry's features reach DirectWrite: the config string goes
+// through initMetrics (the core's candidate list and feature parser) into
+// GetGlyphs. Cascadia Code ships with Windows 11 and draws `->`, `==`, `!=`,
+// `<=`, `=>` as contextual alternates; skipped where it is not installed.
+test "[font] family features change what DirectWrite shapes" {
+    const alloc = std.testing.allocator;
+    const hwnd = c.GetDesktopWindow() orelse return error.SkipZigTest;
+    const family = "Cascadia Code";
+
+    var plain = Renderer.initMetrics(alloc, hwnd, family ++ ":h14", 14, false) catch return error.SkipZigTest;
+    defer plain.deinit();
+    if (!std.mem.eql(u8, plain.font_name_utf8[0..plain.font_name_utf8_len], family)) return error.SkipZigTest;
+
+    var off = try Renderer.initMetrics(alloc, hwnd, family ++ ":h14:-liga:-calt", 14, false);
+    defer off.deinit();
+    try std.testing.expectEqualStrings(family, off.font_name_utf8[0..off.font_name_utf8_len]);
+    try std.testing.expectEqual(@as(u32, default_font_features.len), off.font_feature_count);
+
+    var changed: usize = 0;
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>" }) |s| {
+        var a: [16]u32 = undefined;
+        var b: [16]u32 = undefined;
+        if (!std.mem.eql(u32, shapeForTest(&plain, s, &a), shapeForTest(&off, s, &b))) changed += 1;
+    }
+    try std.testing.expect(changed > 0);
+}
+
+// A [font] family feature adds to DirectWrite's default features, the way
+// HarfBuzz treats it on macOS. Passing only the user's list to GetGlyphs
+// dropped the defaults, so `+liga` turned off the `calt` ligatures that
+// Cascadia Code and Fira Code draw.
+test "a [font] family feature keeps DirectWrite's default ligatures" {
+    const alloc = std.testing.allocator;
+    const hwnd = c.GetDesktopWindow() orelse return error.SkipZigTest;
+    const family = "Cascadia Code";
+
+    var plain = Renderer.initMetrics(alloc, hwnd, family ++ ":h14", 14, false) catch return error.SkipZigTest;
+    defer plain.deinit();
+    if (!std.mem.eql(u8, plain.font_name_utf8[0..plain.font_name_utf8_len], family)) return error.SkipZigTest;
+
+    var liga = try Renderer.initMetrics(alloc, hwnd, family ++ ":h14:+liga", 14, false);
+    defer liga.deinit();
+
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>" }) |s| {
+        var a: [16]u32 = undefined;
+        var b: [16]u32 = undefined;
+        try std.testing.expectEqualSlices(u32, shapeForTest(&plain, s, &a), shapeForTest(&liga, s, &b));
+    }
+}
+
+// The seeded defaults take slots of their own: an entry with as many features
+// as the core parser keeps passes every one to GetGlyphs, as macOS does.
+test "every [font] family feature is kept beside the default features" {
+    var r: Renderer = .{ .alloc = std.testing.allocator, .hwnd = null };
+    var spec_buf: [MAX_USER_FONT_FEATURES * 6]u8 = undefined;
+    var spec_len: usize = 0;
+    for (1..MAX_USER_FONT_FEATURES + 1) |i| {
+        spec_len += (try std.fmt.bufPrint(spec_buf[spec_len..], "+cv{d:0>2},", .{i})).len;
+    }
+    r.parseFontFeatures(spec_buf[0 .. spec_len - 1]);
+    try std.testing.expectEqual(@as(u32, default_font_features.len + MAX_USER_FONT_FEATURES), r.font_feature_count);
+    const last = r.font_features[r.font_feature_count - 1];
+    try std.testing.expectEqual(packTag("cv32"), @as(u32, @bitCast(last.nameTag)));
+    try std.testing.expectEqual(@as(u32, 1), last.parameter);
+}
+
+/// Loads `spec` and returns null (the caller skips) when DirectWrite picked a
+/// different family, i.e. the font is not installed.
+fn initInstalledFontForTest(alloc: std.mem.Allocator, family: []const u8, spec: []const u8) !?Renderer {
+    const hwnd = c.GetDesktopWindow() orelse return null;
+    refreshSystemFontsForTest();
+    var r = Renderer.initMetrics(alloc, hwnd, spec, 14, false) catch return missingTestFont(family);
+    if (!std.mem.eql(u8, r.font_name_utf8[0..r.font_name_utf8_len], family)) {
+        r.deinit();
+        return missingTestFont(family);
+    }
+    return r;
+}
+
+/// CI registers its fonts per user without a WM_FONTCHANGE, so the shared
+/// factory's cached system collection may predate them; an update check
+/// refreshes the collection every later lookup on that factory sees.
+fn refreshSystemFontsForTest() void {
+    var factory: ?*c.IDWriteFactory = null;
+    if (c.DWriteCreateFactory(
+        c.DWRITE_FACTORY_TYPE_SHARED,
+        @as(*const c.GUID, @ptrCast(&IID_IDWriteFactory_ZONVIE)),
+        @ptrCast(&factory),
+    ) != 0 or factory == null) return;
+    defer safeRelease(factory);
+    const get_fc_fn = factory.?.lpVtbl.*.GetSystemFontCollection orelse return;
+    var fc: ?*c.IDWriteFontCollection = null;
+    if (c.SUCCEEDED(get_fc_fn(factory.?, &fc, c.TRUE))) safeRelease(fc);
+}
+
+/// Families CI installs at a pinned version (.github/workflows/test.yml).
+/// Their feature sets are known, so tests may require every feature to act.
+const pinned_test_families = [_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono" };
+
+fn isPinnedTestFamily(family: []const u8) bool {
+    for (pinned_test_families) |f| {
+        if (std.mem.eql(u8, f, family)) return true;
+    }
+    return false;
+}
+
+/// Null (the test skips), unless ZONVIE_REQUIRE_TEST_FONTS is set and the
+/// family is one CI installs: then a missing font is a broken CI setup,
+/// not a reason to pass without testing anything.
+fn missingTestFont(family: []const u8) !?Renderer {
+    const required = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "ZONVIE_REQUIRE_TEST_FONTS") catch return null;
+    std.testing.allocator.free(required);
+    if (!isPinnedTestFamily(family)) return null;
+    std.debug.print("{s} is not installed but ZONVIE_REQUIRE_TEST_FONTS is set\n", .{family});
+    return error.TestFontMissing;
+}
+
+// The lig-trigger table read from GSUB must name every ASCII character a
+// shaper would substitute, for every feature setting and every style face;
+// a missed one draws the unsubstituted glyph through the fast path.
+test "the ASCII fast path agrees with DirectWrite for every feature setting and style" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { family: []const u8, features: []const []const u8 }{
+        // Variable: wght=700 is where rvrn swaps `$` (GSUB FeatureVariations).
+        .{ .family = "Cascadia Code", .features = &.{ "", ":+liga", ":-calt", ":-liga:-calt", ":+zero", ":+ss02", ":+ss19", ":+ss20", ":+case", ":-rclt", ":wght=200", ":wght=700", ":wght=700:-calt" } },
+        .{ .family = "Fira Code", .features = &.{ "", ":+liga", ":-calt", ":+zero", ":+ss01", ":+ss05", ":+cv01", ":+cv14", ":+onum" } },
+        .{ .family = "JetBrains Mono", .features = &.{ "", ":-calt", ":+zero", ":+ss01", ":+cv01", ":+cv99" } },
+        .{ .family = "Consolas", .features = &.{ "", ":+dlig", ":+ss01", ":+onum", ":+salt" } },
+        .{ .family = "Bahnschrift", .features = &.{ "", ":wdth=75", ":wght=700" } },
+    };
+    var ran: usize = 0;
+    for (cases) |case| {
+        for (case.features) |feat| {
+            var spec_buf: [96]u8 = undefined;
+            const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14{s}", .{ case.family, feat });
+            var r = (try initInstalledFontForTest(alloc, case.family, spec)) orelse continue;
+            defer r.deinit();
+            // Every style face for the default and the ligature-off specs
+            // (Cascadia's bold `$` showed only under -calt); a feature spec
+            // exercises the same trigger code, so the regular face suffices.
+            const all_styles = [_]u32{ 0, Renderer.STYLE_BOLD, Renderer.STYLE_ITALIC, Renderer.STYLE_BOLD | Renderer.STYLE_ITALIC };
+            const styles: []const u32 = if (feat.len == 0 or std.mem.endsWith(u8, feat, "-calt")) &all_styles else all_styles[0..1];
+            for (styles) |style| {
+                try expectFastPathMatchesShaping(&r, style, spec);
+            }
+            ran += 1;
+        }
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+fn asciiGlyphIdsForTest(r: *Renderer, style_flags: u32) ![128]u32 {
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(r.getAsciiTableDWrite(style_flags, &gids, &advances, &triggers));
+    return gids;
+}
+
+/// What a glyph looks like on screen: its coverage (heavier outlines cover
+/// more) and a hash of the bitmap (a slanted or reshaped outline changes it).
+const GlyphLook = struct { ink: u64, hash: u64 };
+
+fn glyphLookForTest(r: *Renderer, ch: u8, style_flags: u32) !GlyphLook {
+    const gids = try asciiGlyphIdsForTest(r, style_flags);
+    var bmp = std.mem.zeroes(core.GlyphBitmap);
+    try r.rasterizeGlyphByIdDWrite(gids[ch], style_flags, &bmp);
+    const px = bmp.pixels orelse return .{ .ink = 0, .hash = 0 };
+    const stride: usize = @intCast(@abs(bmp.pitch));
+    const row_bytes: usize = @as(usize, bmp.width) * @max(bmp.bytes_per_pixel, 1);
+    var ink: u64 = 0;
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&bmp.width));
+    hasher.update(std.mem.asBytes(&bmp.height));
+    for (0..bmp.height) |y| {
+        const row = px[y * stride ..][0..row_bytes];
+        for (row) |b| ink += b;
+        hasher.update(row);
+    }
+    return .{ .ink = ink, .hash = hasher.final() };
+}
+
+fn shapedAdvanceForTest(r: *Renderer, ch: u8) i32 {
+    var scalars = [1]u32{ch};
+    var gid: [4]u32 = undefined;
+    var clusters: [4]u32 = undefined;
+    var xa: [4]i32 = undefined;
+    var xo: [4]i32 = undefined;
+    var yo: [4]i32 = undefined;
+    _ = r.shapeTextRunDWrite(&scalars, 1, 0, &gid, &clusters, &xa, &xo, &yo, gid.len);
+    return xa[0];
+}
+
+// `wght=N` in a [font] family entry moves a variable font's outline: values
+// past the axis clamp to its limit, and a tag the font has no axis for (or a
+// plain feature) leaves the default instance alone.
+test "a wght axis value moves the DirectWrite outline and clamps to the axis range" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    const Look = struct {
+        fn of(spec: []const u8) !GlyphLook {
+            var r = (try initInstalledFontForTest(std.testing.allocator, family, spec)) orelse return error.SkipZigTest;
+            defer r.deinit();
+            return glyphLookForTest(&r, 'H', 0);
+        }
+    };
+    _ = alloc;
+    const default_look = try Look.of(family ++ ":h14");
+    const light = try Look.of(family ++ ":h14:wght=200");
+    const heavy = try Look.of(family ++ ":h14:wght=700");
+    try std.testing.expect(heavy.ink > default_look.ink);
+    try std.testing.expect(default_look.ink > light.ink);
+    try std.testing.expectEqual(heavy, try Look.of(family ++ ":h14:wght=100000"));
+    try std.testing.expectEqual(light, try Look.of(family ++ ":h14:wght=1"));
+    try std.testing.expectEqual(default_look, try Look.of(family ++ ":h14:ZZZZ=5:+liga"));
+}
+
+// The ASCII fast path draws with the advances in the ASCII table, so they
+// must be the varied instance's: Bahnschrift's wdth axis narrows its glyphs.
+test "the ASCII table's advances follow the variation instance" {
+    const alloc = std.testing.allocator;
+    const family = "Bahnschrift";
+    var wide = (try initInstalledFontForTest(alloc, family, family ++ ":h14")) orelse return error.SkipZigTest;
+    defer wide.deinit();
+    var narrow = (try initInstalledFontForTest(alloc, family, family ++ ":h14:wdth=75")) orelse return error.SkipZigTest;
+    defer narrow.deinit();
+
+    const narrow_shaped = shapedAdvanceForTest(&narrow, 'a');
+    try std.testing.expect(narrow_shaped < shapedAdvanceForTest(&wide, 'a'));
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(narrow.getAsciiTableDWrite(0, &gids, &advances, &triggers));
+    // The table and GetGlyphPlacements scale design units along different
+    // float paths; each truncates to 26.6, so allow one unit.
+    try std.testing.expect(@abs(narrow_shaped - advances['a']) <= 1);
+
+    // The grid cell is measured from the varied face too, or glyphs would
+    // overflow (wider instance) or leave gaps (narrower) in their cells.
+    try std.testing.expect(narrow.cellW() < wide.cellW());
+    const narrow_m: f32 = @as(f32, @floatFromInt(shapedAdvanceForTest(&narrow, 'M'))) / 64.0;
+    try std.testing.expectEqual(@as(u32, @intFromFloat(@ceil(narrow_m))), narrow.cellW());
+}
+
+// Bold, Italic and BoldItalic are distinct faces: a real file (Consolas,
+// JetBrains Mono), a named instance of a variable font (Cascadia Code) or a
+// DirectWrite simulation. A plain feature in the entry must not reset a
+// named instance to the default weight.
+test "bold, italic and bold-italic faces draw differently from the regular face" {
+    const alloc = std.testing.allocator;
+    const specs = [_]struct { family: []const u8, spec: []const u8 }{
+        .{ .family = "Cascadia Code", .spec = "Cascadia Code:h14" },
+        .{ .family = "Cascadia Code", .spec = "Cascadia Code:h14:+liga" },
+        .{ .family = "Consolas", .spec = "Consolas:h14" },
+        .{ .family = "JetBrains Mono", .spec = "JetBrains Mono:h14" },
+    };
+    var ran: usize = 0;
+    for (specs) |s| {
+        var r = (try initInstalledFontForTest(alloc, s.family, s.spec)) orelse continue;
+        defer r.deinit();
+        const regular = try glyphLookForTest(&r, 'H', 0);
+        const bold = try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD);
+        const italic = try glyphLookForTest(&r, 'H', Renderer.STYLE_ITALIC);
+        const bold_italic = try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD | Renderer.STYLE_ITALIC);
+        if (bold.ink <= regular.ink or italic.hash == regular.hash or bold_italic.hash == bold.hash or bold_italic.hash == italic.hash) {
+            std.debug.print("{s}: regular={any} bold={any} italic={any} bold_italic={any}\n", .{ s.spec, regular, bold, italic, bold_italic });
+            return error.TestExpectedEqual;
+        }
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+// An axis in the entry applies to every face, as macOS applies it: under
+// `wght=300` the Bold face is the same 300 instance as the regular one.
+test "a wght entry sets the weight of every style face" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    var r = (try initInstalledFontForTest(alloc, family, family ++ ":h14:wght=300")) orelse return error.SkipZigTest;
+    defer r.deinit();
+    try std.testing.expectEqual(try glyphLookForTest(&r, 'H', 0), try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD));
+}
+
+// With every ligature feature off, a run shapes to one cmap glyph per
+// character, the same glyphs the ASCII table holds.
+test "-liga:-calt shapes the ASCII table's glyphs one per character" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    var r = (try initInstalledFontForTest(alloc, family, family ++ ":h14:-liga:-calt")) orelse return error.SkipZigTest;
+    defer r.deinit();
+    const gids = try asciiGlyphIdsForTest(&r, 0);
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>", "===", "www" }) |s| {
+        var buf: [16]u32 = undefined;
+        const shaped = shapeForTest(&r, s, &buf);
+        try std.testing.expectEqual(s.len, shaped.len);
+        for (s, shaped) |ch, g| try std.testing.expectEqual(gids[ch], g);
+    }
+}
+
+// A feature's value is honored: `zero` swaps the digit zero for its
+// alternate, `zero=0` and `-zero` keep the default.
+test "zero picks the alternate zero and zero=0 keeps the default" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    const Zero = struct {
+        fn of(spec: []const u8) !u32 {
+            var r = (try initInstalledFontForTest(std.testing.allocator, family, spec)) orelse return error.SkipZigTest;
+            defer r.deinit();
+            var buf: [16]u32 = undefined;
+            return shapeForTest(&r, "0", &buf)[0];
+        }
+    };
+    _ = alloc;
+    const default_zero = try Zero.of(family ++ ":h14");
+    try std.testing.expect(try Zero.of(family ++ ":h14:+zero") != default_zero);
+    try std.testing.expectEqual(default_zero, try Zero.of(family ++ ":h14:zero=0"));
+    try std.testing.expectEqual(default_zero, try Zero.of(family ++ ":h14:-zero"));
+}
+
+/// Programming ligatures in monospace fonts: calt sequences and liga pairs.
+const ligature_samples = [_][]const u8{ "->", "==", "!=", "<=", "=>", "===", "!==", "<=>", "->>", "&&", "||", "::", "//", "/*", "www", "0xF" };
+
+// flush.zig maps each shaped glyph to a grid column through its cluster and
+// suppresses calt placeholders by position; both assume a monospace ligature
+// font keeps one glyph per character, in order, each one cell wide.
+test "a monospace ligature keeps one glyph per cell in cluster order" {
+    const alloc = std.testing.allocator;
+    var ran: usize = 0;
+    for ([_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono" }) |family| {
+        var spec_buf: [64]u8 = undefined;
+        const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14", .{family});
+        var r = (try initInstalledFontForTest(alloc, family, spec)) orelse continue;
+        defer r.deinit();
+        const cell_advance = shapedAdvanceForTest(&r, 'a');
+        const gids = try asciiGlyphIdsForTest(&r, 0);
+        var ligated: usize = 0;
+        for (ligature_samples) |s| {
+            var scalars: [16]u32 = undefined;
+            for (s, 0..) |ch, i| scalars[i] = ch;
+            var out: [16]u32 = undefined;
+            var clusters: [16]u32 = undefined;
+            var xa: [16]i32 = undefined;
+            var xo: [16]i32 = undefined;
+            var yo: [16]i32 = undefined;
+            const n = r.shapeTextRunDWrite(&scalars, s.len, 0, &out, &clusters, &xa, &xo, &yo, out.len);
+            try std.testing.expectEqual(s.len, n);
+            for (0..n) |i| {
+                try std.testing.expectEqual(@as(u32, @intCast(i)), clusters[i]);
+                try std.testing.expectEqual(cell_advance, xa[i]);
+                if (out[i] != gids[s[i]]) ligated += 1;
+            }
+        }
+        // The samples must actually ligate, or this proves nothing.
+        try std.testing.expect(ligated > 0);
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+/// Whether a GSUB feature tag is one a user picks in a [font] family entry to
+/// change how characters look: stylistic sets, character variants and the
+/// common alternates.
+fn isCharacterFeatureForTest(tag: [4]u8) bool {
+    const digits = std.ascii.isDigit(tag[2]) and std.ascii.isDigit(tag[3]);
+    if (digits and std.mem.eql(u8, tag[0..2], "ss")) return true;
+    if (digits and std.mem.eql(u8, tag[0..2], "cv")) return true;
+    for ([_]*const [4]u8{ "zero", "onum", "case", "salt", "dlig" }) |t| {
+        if (std.mem.eql(u8, &tag, t)) return true;
+    }
+    return false;
+}
+
+/// The distinct character-feature tags in the regular face's GSUB FeatureList.
+fn characterFeaturesForTest(r: *Renderer, out: *[160][4]u8) !usize {
+    const face = r.font_face orelse return error.NoFont;
+    const fvtbl = face.lpVtbl.*;
+    var data: ?*const anyopaque = null;
+    var size: c.UINT32 = 0;
+    var ctx: ?*anyopaque = null;
+    var exists: c.BOOL = c.FALSE;
+    const hr = (fvtbl.TryGetFontTable orelse return error.NoGsub)(face, packTag("GSUB"), &data, &size, &ctx, &exists);
+    defer if (ctx != null) (fvtbl.ReleaseFontTable orelse unreachable)(face, ctx);
+    if (c.FAILED(hr) or exists == c.FALSE or data == null) return 0;
+    const tbl = @as([*]const u8, @ptrCast(data.?))[0..size];
+    const fl = @as(usize, readU16BE(tbl, 6) orelse return 0);
+    const count = readU16BE(tbl, fl) orelse return 0;
+    var n: usize = 0;
+    for (0..count) |i| {
+        const at = fl + 2 + i * 6;
+        if (at + 4 > tbl.len) break;
+        const tag = tbl[at..][0..4].*;
+        if (!isCharacterFeatureForTest(tag)) continue;
+        const seen = for (out[0..n]) |t| {
+            if (std.mem.eql(u8, &t, &tag)) break true;
+        } else false;
+        if (seen or n == out.len) continue;
+        out[n] = tag;
+        n += 1;
+    }
+    return n;
+}
+
+fn shapeScalarsForTest(r: *Renderer, scalars: []const u32, out: *[16]u32) []const u32 {
+    var clusters: [16]u32 = undefined;
+    var xa: [16]i32 = undefined;
+    var xo: [16]i32 = undefined;
+    var yo: [16]i32 = undefined;
+    const n = r.shapeTextRunDWrite(scalars.ptr, scalars.len, 0, out, &clusters, &xa, &xo, &yo, out.len);
+    return out[0..@min(n, out.len)];
+}
+
+/// Text a character feature may act on beyond ASCII pairs: ligatures,
+/// fractions, Latin-1 and Latin Extended-A (Consolas's ss01 Eng), combining
+/// accents (Cascadia's `case`), Greek and Cyrillic (JetBrains Mono's cv99)
+/// and the control pictures (Cascadia's ss20).
+fn characterFeatureCorpusForTest(buf: *[1024][4]u32) [][4]u32 {
+    var n: usize = 0;
+    for (ligature_samples ++ [_][]const u8{ "1/2", "10/31", "0x0", "#{", "{|", "[|", ".=", "..", "...", "~>", "<~", "%%" }) |s| {
+        buf[n] = .{ 0, 0, 0, 0 };
+        for (s[0..@min(s.len, 4)], 0..) |ch, i| buf[n][i] = ch;
+        n += 1;
+    }
+    var cp: u32 = 0xA1;
+    while (cp <= 0x17F) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x2400;
+    while (cp <= 0x2426) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x0300;
+    while (cp <= 0x030C) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x0391;
+    while (cp <= 0x045F) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// A shaped run kept for comparison: up to 16 glyph ids.
+const ShapedForTest = struct {
+    glyphs: [16]u32,
+    len: u8,
+
+    fn init(shaped: []const u32) ShapedForTest {
+        var s: ShapedForTest = .{ .glyphs = undefined, .len = @intCast(shaped.len) };
+        @memcpy(s.glyphs[0..shaped.len], shaped);
+        return s;
+    }
+
+    fn eql(self: *const ShapedForTest, shaped: []const u32) bool {
+        return std.mem.eql(u32, self.glyphs[0..self.len], shaped);
+    }
+};
+
+fn scalarsOf(entry: *const [4]u32) []const u32 {
+    const len = std.mem.indexOfScalar(u32, entry, 0) orelse 4;
+    return entry[0..len];
+}
+
+// Every stylistic set, character variant and alternate the font carries
+// (read from its GSUB, so none is left out) must reach DirectWrite, changing
+// how something shapes, and must keep the ASCII fast path in agreement: a
+// feature that substitutes a character the trigger table misses would draw
+// the default glyph through the fast path.
+test "every stylistic set and character variant changes shaping and keeps the fast path correct" {
+    const alloc = std.testing.allocator;
+    var ran: usize = 0;
+    for ([_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas" }) |family| {
+        var spec_buf: [96]u8 = undefined;
+        // `+liga` is a no-op feature that still makes GetGlyphs take the
+        // explicit default list, so base and feature differ in the tag alone.
+        var base = (try initInstalledFontForTest(alloc, family, try std.fmt.bufPrint(&spec_buf, "{s}:h14:+liga", .{family}))) orelse continue;
+        defer base.deinit();
+        var tags: [160][4]u8 = undefined;
+        const tag_count = try characterFeaturesForTest(&base, &tags);
+
+        var corpus_buf: [1024][4]u32 = undefined;
+        const corpus = characterFeatureCorpusForTest(&corpus_buf);
+
+        // The baseline never changes across tags: shape it once per family.
+        const pair_count = 95 * 95;
+        const base_shapes = try alloc.alloc(ShapedForTest, pair_count + corpus.len);
+        defer alloc.free(base_shapes);
+        for (0..pair_count) |i| {
+            const pair = [2]u8{ @intCast(0x20 + i / 95), @intCast(0x20 + i % 95) };
+            var out: [16]u32 = undefined;
+            base_shapes[i] = .init(shapeForTest(&base, &pair, &out));
+        }
+        for (corpus, 0..) |*entry, i| {
+            var out: [16]u32 = undefined;
+            base_shapes[pair_count + i] = .init(shapeScalarsForTest(&base, scalarsOf(entry), &out));
+        }
+
+        for (tags[0..tag_count]) |tag| {
+            const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14:+{s}", .{ family, &tag });
+            var r = (try initInstalledFontForTest(alloc, family, spec)) orelse return error.TestUnexpectedResult;
+            defer r.deinit();
+
+            var gids: [128]u32 = undefined;
+            var advances: [128]i32 = undefined;
+            var triggers: [128]u8 = undefined;
+            try std.testing.expect(r.getAsciiTableDWrite(0, &gids, &advances, &triggers));
+
+            var changed: usize = 0;
+            for (0..pair_count) |i| {
+                const pair = [2]u8{ @intCast(0x20 + i / 95), @intCast(0x20 + i % 95) };
+                var with: [16]u32 = undefined;
+                if (!base_shapes[i].eql(shapeForTest(&r, &pair, &with))) changed += 1;
+                try expectRunMatchesTable(&r, 0, spec, &pair, &gids, &triggers);
+            }
+            for (corpus, 0..) |*entry, i| {
+                var with: [16]u32 = undefined;
+                if (!base_shapes[pair_count + i].eql(shapeScalarsForTest(&r, scalarsOf(entry), &with))) changed += 1;
+            }
+            if (changed == 0) {
+                std.debug.print("{s}: enabling the feature changed nothing it shapes\n", .{spec});
+                // An OS font's version is not pinned; a feature acting only
+                // outside the corpus there is not a regression.
+                if (isPinnedTestFamily(family)) return error.TestExpectedEqual;
+            }
+            ran += 1;
+        }
+    }
+    if (ran == 0) return error.SkipZigTest;
 }

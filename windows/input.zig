@@ -5,6 +5,38 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const core = @import("zonvie_core");
 const dwrite_d2d = app_mod.dwrite_d2d;
+const render_helpers = @import("render_pipeline_helpers.zig");
+const callbacks = @import("callbacks.zig");
+const external_windows = @import("ui/external_windows.zig");
+
+/// The external window that shows the cursor's grid, and where that grid
+/// sits inside it: zero for the window's own root, the layer's origin for a
+/// float it hosts. Null when the main window shows the grid. The IME
+/// candidate and the preedit overlay both place against this; they looked the
+/// grid up by exact id, so a hosted float fell through to main-window
+/// coordinates. Caller holds `app.mu`.
+const ImeExternalSurface = struct { hwnd: c.HWND, root_grid_id: i64, x_px: c.LONG, y_px: c.LONG };
+
+/// Where core content starts inside a decorated external surface: the
+/// cmdline's icon strip and padding, a message window's padding. The IME wrote
+/// the cmdline's out by hand, twice, and gave a message window none.
+fn imeDecoratedOrigin(app: *App, surface: ?ImeExternalSurface) [2]c.LONG {
+    const s = surface orelse return .{ 0, 0 };
+    const o = external_windows.decoratedContentOriginPx(app, external_windows.classifyExternalSurface(s.root_grid_id));
+    return .{ @intFromFloat(o.x), @intFromFloat(o.y) };
+}
+
+fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
+    const shown = callbacks.externalWindowShowingGridLocked(app, grid_id) orelse return null;
+    const hwnd = shown.win.hwnd orelse return null;
+    const origin = render_helpers.layerOriginPx(
+        app_mod.SurfaceLayer,
+        shown.win.surf.tbs.committed_layers.slice(),
+        grid_id,
+        shown.root_grid_id,
+    );
+    return .{ .hwnd = hwnd, .root_grid_id = shown.root_grid_id, .x_px = origin[0], .y_px = origin[1] };
+}
 
 // =========================================================================
 // Keyboard constants and input helpers
@@ -13,6 +45,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 pub const MOD_CTRL = 1 << 0; // same bit layout as header comment
 pub const MOD_ALT = 1 << 1;
 pub const MOD_SHIFT = 1 << 2;
+pub const MOD_SUPER = 1 << 3;
 // Windows has no "Command", leave it unused.
 
 /// Non-blocking cursor position query with cache fallback (mirrors macOS's
@@ -76,6 +109,168 @@ pub fn sendKeyEventToCore(
     app_mod.zonvie_core_send_key_event(app.corep, keycode, mods, cptr, clen, iptr, ilen);
 }
 
+/// The `:` <-> `;` swap (config input.swap_colon_semicolon) for one typed
+/// character. Paste arrives through the clipboard path and is unaffected.
+pub fn swapColonSemicolon(ch: u16, enabled: bool) u16 {
+    if (!enabled) return ch;
+    return switch (ch) {
+        0x3A => 0x3B,
+        0x3B => 0x3A,
+        else => ch,
+    };
+}
+
+test "AltGr composing a printable character is text, other Ctrl+Alt combos are keys" {
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, "@", false));
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT | MOD_SHIFT, "{", false));
+    // Nothing composed (US layout Ctrl+Alt+q) or a control character: a key.
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, null, false));
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, "\x11", false));
+    // Ctrl or Alt alone is never AltGr.
+    try std.testing.expect(!isAltGrText(MOD_CTRL, "q", false));
+    try std.testing.expect(!isAltGrText(MOD_ALT, "q", false));
+}
+
+test "an AltGr dead key is left to WM_DEADCHAR, not sent as <C-M-x>" {
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, null, true));
+    // Alt alone with a dead key is still a key.
+    try std.testing.expect(!isAltGrText(MOD_ALT, null, true));
+}
+
+test "colon and semicolon swap only when enabled" {
+    try std.testing.expectEqual(@as(u16, ';'), swapColonSemicolon(':', true));
+    try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(';', true));
+    try std.testing.expectEqual(@as(u16, 'a'), swapColonSemicolon('a', true));
+    try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(':', false));
+}
+
+/// WM_KEYDOWN / WM_SYSKEYDOWN for any surface, main or external. True when
+/// the key was consumed; false leaves it to WM_CHAR (plain text, Shift-only,
+/// IME). The two WndProcs carried copies of this body.
+pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool {
+    const vk: u32 = @intCast(wParam);
+    const mods = queryMods();
+    // Passed as 0x10000|VK so the core can tell a Windows keycode apart.
+    const keycode: u32 = KEYCODE_WINVK_FLAG | vk;
+    const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
+
+    app.mu.lockUncancelable(core.clock.io());
+    const ime_composing = app.ime_composing;
+    app.mu.unlock(core.clock.io());
+
+    // Special keys always go through send_key_event, except Enter and
+    // Backspace while IME composes: the committed text comes via WM_IME_CHAR
+    // and the key via WM_CHAR after WM_IME_ENDCOMPOSITION, so sending it here
+    // too would input it twice.
+    if (isSpecialVk(vk)) {
+        if (!(ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK))) {
+            sendKeyEventToCore(app, keycode, mods, null, null);
+        }
+        return true;
+    }
+
+    if (isAltNumpadDigit(mods, vk)) return false;
+
+    // Ctrl/Alt combos go through send_key_event with the characters the core
+    // needs to decide <C-x> and the like.
+    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
+        var tmp_chars: [16]u16 = undefined;
+        var tmp_ign: [16]u16 = undefined;
+        var out_chars: [8]u8 = undefined;
+        var out_ign: [8]u8 = undefined;
+        const pair = toUnicodePairUtf8(vk, scancode, &tmp_chars, &tmp_ign, &out_chars, &out_ign);
+        // AltGr arrives as Left Ctrl + Right Alt, and Windows composes text
+        // for Ctrl+Alt the same way. A key that composes a printable
+        // character under it (German AltGr+Q is `@`) is typed text, left to
+        // WM_CHAR; it used to be sent as <C-M-q>, and `@ { [ ] } \ | ~` could
+        // not be typed on those layouts.
+        if (isAltGrText(mods, pair.chars, pair.dead)) return false;
+        sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
+        return true;
+    }
+    return false;
+}
+
+/// Alt+numpad digits type an Alt code: the system delivers the character as
+/// WM_CHAR when Alt is released, so the digits are not <M-0>..<M-9>.
+fn isAltNumpadDigit(mods: u32, vk: u32) bool {
+    return mods == MOD_ALT and vk >= c.VK_NUMPAD0 and vk <= c.VK_NUMPAD9;
+}
+
+test "isAltNumpadDigit leaves Alt codes to the system" {
+    try std.testing.expect(isAltNumpadDigit(MOD_ALT, c.VK_NUMPAD0));
+    try std.testing.expect(isAltNumpadDigit(MOD_ALT, c.VK_NUMPAD9));
+    try std.testing.expect(!isAltNumpadDigit(MOD_ALT | MOD_CTRL, c.VK_NUMPAD1));
+    try std.testing.expect(!isAltNumpadDigit(0, c.VK_NUMPAD1));
+    try std.testing.expect(!isAltNumpadDigit(MOD_ALT, '1'));
+}
+
+/// Ctrl and Alt both held (AltGr) and the key composed a printable character,
+/// or is a dead key (Czech AltGr+2, a caron) whose accent WM_DEADCHAR/WM_CHAR
+/// composes with the next key.
+fn isAltGrText(mods: u32, chars: ?[]const u8, dead: bool) bool {
+    if ((mods & MOD_CTRL) == 0 or (mods & MOD_ALT) == 0) return false;
+    if (dead) return true;
+    const text = chars orelse return false;
+    return text.len != 0 and text[0] >= 0x20 and text[0] != 0x7F;
+}
+
+/// The modifiers a WM_CHAR is sent with, or null when WM_KEYDOWN already sent
+/// the combo: with Ctrl or Alt down WM_CHAR is usually a control character.
+/// AltGr text (Ctrl+Alt, printable; see isAltGrText) is sent without Ctrl and
+/// Alt, which composed it: with them the core built `<C-M-@>` from AltGr+Q.
+fn charMessageMods(mods: u32, ch: usize) ?u32 {
+    if ((mods & (MOD_CTRL | MOD_ALT)) == 0) return mods;
+    const both = (mods & MOD_CTRL) != 0 and (mods & MOD_ALT) != 0;
+    if (!both or ch < 0x20 or ch == 0x7F) return null;
+    return mods & ~@as(u32, MOD_CTRL | MOD_ALT);
+}
+
+test "AltGr text reaches the core without the Ctrl and Alt that composed it" {
+    try std.testing.expectEqual(@as(?u32, 0), charMessageMods(MOD_CTRL | MOD_ALT, '@'));
+    try std.testing.expectEqual(@as(?u32, MOD_SHIFT), charMessageMods(MOD_CTRL | MOD_ALT | MOD_SHIFT, '{'));
+    try std.testing.expectEqual(@as(?u32, MOD_SHIFT), charMessageMods(MOD_SHIFT, 'A'));
+    // Ctrl or Alt alone, or a control character: WM_KEYDOWN sent it.
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_CTRL, 'q'));
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_ALT, 'q'));
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_CTRL | MOD_ALT, 0x11));
+}
+
+/// WM_CHAR / WM_SYSCHAR for any surface, main or external. The two WndProcs
+/// carried copies of this body and one had lost the colon/semicolon swap.
+pub fn handleCharMessage(app: *App, wParam: c.WPARAM) void {
+    const mods = charMessageMods(queryMods(), wParam) orelse return;
+
+    const ch0 = swapColonSemicolon(@as(u16, @intCast(wParam)), app.config.input.swap_colon_semicolon);
+
+    // Enter, Backspace, Tab and Escape are sent by WM_KEYDOWN as special keys.
+    if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
+        app.pending_high_surrogate_char = 0;
+        return;
+    }
+
+    // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high surrogate
+    // first, then low. Buffer the high one and combine it with the next.
+    var out: [8]u8 = undefined;
+    var s: ?[]const u8 = null;
+    if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
+        app.pending_high_surrogate_char = ch0;
+        return;
+    } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
+        const hi = app.pending_high_surrogate_char;
+        app.pending_high_surrogate_char = 0;
+        if (hi == 0) return; // stray low surrogate
+        s = utf16UnitsToUtf8(&out, hi, ch0);
+    } else {
+        app.pending_high_surrogate_char = 0;
+        s = utf16UnitsToUtf8(&out, ch0, null);
+    }
+
+    const text = s orelse return;
+    // keycode=0 means "text input" (the core takes the chars path).
+    sendKeyEventToCore(app, 0, mods, text, text);
+}
+
 /// Convert a UTF-16 (1 or 2 units) sequence to UTF-8 in a small stack buffer.
 pub fn utf16UnitsToUtf8(tmp: *[8]u8, unit0: u16, unit1_opt: ?u16) ?[]const u8 {
     // Handle surrogate pair if present.
@@ -101,6 +296,7 @@ pub fn utf16UnitsToUtf8(tmp: *[8]u8, unit0: u16, unit1_opt: ?u16) ?[]const u8 {
 /// Best-effort: use ToUnicodeEx to get chars and charsIgnoringModifiers for a VK.
 /// - chars: using current keyboard state
 /// - ign:   using state with Ctrl/Alt/Shift cleared (base letter for <C-x> etc)
+/// - dead:  the key is a dead key under the current state
 pub fn toUnicodePairUtf8(
     vk: u32,
     scancode: u32,
@@ -108,9 +304,14 @@ pub fn toUnicodePairUtf8(
     tmp_ign: *[16]u16,
     out_chars_utf8: *[8]u8,
     out_ign_utf8: *[8]u8,
-) struct { chars: ?[]const u8, ign: ?[]const u8 } {
+) struct { chars: ?[]const u8, ign: ?[]const u8, dead: bool } {
     var state: [256]u8 = undefined;
     _ = c.GetKeyboardState(&state);
+
+    // Flag bit 2 (Windows 10 1607+) leaves the kernel's dead-key buffer
+    // alone: these are lookups, and consuming a pending accent here broke
+    // the composition TranslateMessage had set up.
+    const no_state_change: c.UINT = 0x4;
 
     // Current chars
     const hkl = c.GetKeyboardLayout(0);
@@ -120,7 +321,7 @@ pub fn toUnicodePairUtf8(
         &state,
         @ptrCast(tmp_chars.ptr),
         @intCast(tmp_chars.len),
-        0,
+        no_state_change,
         hkl,
     );
 
@@ -146,7 +347,7 @@ pub fn toUnicodePairUtf8(
         &ign_state,
         @ptrCast(tmp_ign.ptr),
         @intCast(tmp_ign.len),
-        0,
+        no_state_change,
         hkl,
     );
 
@@ -159,40 +360,13 @@ pub fn toUnicodePairUtf8(
         ign = null;
     }
 
-    return .{ .chars = chars, .ign = ign };
+    return .{ .chars = chars, .ign = ign, .dead = n1 < 0 };
 }
 
+/// A key the core names (<Left>, <CR>, <F1>, ...): sent to the core as a key
+/// rather than left to WM_CHAR. The core's table, shared with macOS.
 pub fn isSpecialVk(vk: u32) bool {
-    return switch (vk) {
-        c.VK_LEFT,
-        c.VK_RIGHT,
-        c.VK_UP,
-        c.VK_DOWN,
-        c.VK_HOME,
-        c.VK_END,
-        c.VK_PRIOR,
-        c.VK_NEXT,
-        c.VK_INSERT,
-        c.VK_DELETE,
-        c.VK_BACK,
-        c.VK_TAB,
-        c.VK_RETURN,
-        c.VK_ESCAPE,
-        c.VK_F1,
-        c.VK_F2,
-        c.VK_F3,
-        c.VK_F4,
-        c.VK_F5,
-        c.VK_F6,
-        c.VK_F7,
-        c.VK_F8,
-        c.VK_F9,
-        c.VK_F10,
-        c.VK_F11,
-        c.VK_F12,
-        => true,
-        else => false,
-    };
+    return core.zonvie_core_key_is_special(KEYCODE_WINVK_FLAG | vk);
 }
 
 // =========================================================================
@@ -218,6 +392,11 @@ pub fn isSpecialVk(vk: u32) bool {
 /// already has them in hand from the same locked read as the other metrics.
 pub const CellPos = struct { row: i32, col: i32 };
 
+/// `allow_negative` keeps a position above or left of the grid as a negative
+/// cell instead of clamping it to 0. A drag needs that: Neovim scrolls the
+/// window while the pointer is held past its edge, and row 0 reads as "at the
+/// first line", which stops the scroll. Everything else clamps, because a
+/// press cannot land outside the grid it was captured in.
 pub fn clientPxToCell(
     app: *App,
     is_main_window: bool,
@@ -225,29 +404,105 @@ pub fn clientPxToCell(
     y: i32,
     cell_w: u32,
     row_h: u32,
+    allow_negative: bool,
 ) CellPos {
     // Single early return rather than an is_main_window term inside each
     // offset: this way removing the guard makes the parameter unused, which
     // Zig rejects. An external window silently taking the main window's
     // chrome offsets is otherwise invisible until someone clicks.
-    if (!is_main_window) return cellAt(x, y, cell_w, row_h);
-
-    const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-        x - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-    else
-        x;
-    const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        y - @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-    else
-        y;
-    return cellAt(content_x, content_y, cell_w, row_h);
+    if (!is_main_window) return cellAt(x, y, cell_w, row_h, allow_negative);
+    const origin = surfaceOriginPx(app, true);
+    return cellAt(x - origin.x, y - origin.y, cell_w, row_h, allow_negative);
 }
 
-fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32) CellPos {
+/// Offset from a window's client origin to its SURFACE origin -- grid 1's cell
+/// (0,0). Only the main window draws chrome inside its own client area, so it
+/// is zero everywhere else, which is why an external window can pass client
+/// pixels to a layer test unchanged and the main window cannot.
+///
+/// Split out of clientPxToCell because a hit test has to reach surface space
+/// BEFORE comparing against `zonvie_layer.x_px`, which is surface-local
+/// (include/zonvie_core.h), and must not then pay the offset a second time on
+/// the way to the core.
+pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOrigin {
+    return render_helpers.surfaceOriginPx(.{
+        .is_main_window = is_main_window,
+        .ext_tabline_enabled = app.ext_tabline_enabled,
+        .style_is_sidebar = app.tabline_style == .sidebar,
+        .style_is_titlebar = app.tabline_style == .titlebar,
+        .sidebar_on_right = app.sidebar_position_right,
+        .sidebar_width_px = @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))),
+        .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
+    });
+}
+
+/// Whether a MAIN-window client point is on the chrome -- a titlebar tabline or
+/// a sidebar -- rather than the grid. The origin rule is `surfaceOriginPx`'s; a
+/// sidebar on the right takes no leading columns, so it is tested at the edge.
+pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
+    if (!app.ext_tabline_enabled) return false;
+    const origin = surfaceOriginPx(app, true);
+    if (px < origin.x or py < origin.y) return true;
+    if (app.tabline_style == .sidebar and app.sidebar_position_right) {
+        var client: c.RECT = undefined;
+        if (c.GetClientRect(hwnd, &client) == 0) return false;
+        const sidebar_w: i32 = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+        return px >= client.right - sidebar_w;
+    }
+    return false;
+}
+
+/// Resolve a MAIN-window client point to the grid the pointer is actually over,
+/// the way ExternalWndProc resolves its own. Takes app.mu,
+/// which is what the committed layer list is protected by.
+pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
+    return resolveSurfaceTarget(app, &app.surf.tbs, 1, true, x, y);
+}
+
+/// resolveMainWindowTarget for any surface: `tbs` and `root_grid_id` name the
+/// surface, and `is_main_window` picks its origin (an external window's is 0).
+pub fn resolveSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root_grid_id: i64, is_main_window: bool, x: i32, y: i32) MouseTarget {
+    const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const origin = surfaceOriginPx(app, is_main_window);
+    return resolveMouseTarget(
+        tbs.committed_layers.slice(),
+        grids,
+        root_grid_id,
+        x - origin.x,
+        y - origin.y,
+        app.cell_w_px,
+        app.rowHeightPx(),
+    );
+}
+
+/// The drag/release counterpart: pin to the grid the press chose rather than
+/// hit-testing again, so a selection dragged out of a float does not retarget
+/// the moment the pointer leaves it.
+pub fn rebaseMainWindowTarget(app: *App, grid_id: i64, x: i32, y: i32) MouseTarget {
+    return rebaseSurfaceTarget(app, &app.surf.tbs, 1, true, grid_id, x, y);
+}
+
+pub fn rebaseSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root_grid_id: i64, is_main_window: bool, grid_id: i64, x: i32, y: i32) MouseTarget {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const origin = surfaceOriginPx(app, is_main_window);
+    return rebaseToGrid(tbs.committed_layers.slice(), root_grid_id, grid_id, x - origin.x, y - origin.y);
+}
+
+fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32, allow_negative: bool) CellPos {
     return .{
-        .col = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0,
-        .row = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0,
+        .col = axisCell(content_x, cell_w, allow_negative),
+        .row = axisCell(content_y, row_h, allow_negative),
     };
+}
+
+fn axisCell(px: i32, size_px: u32, allow_negative: bool) i32 {
+    if (size_px == 0) return 0;
+    const size: i32 = @intCast(size_px);
+    // Floor, not trunc: -1px is the row above, not row 0.
+    return if (allow_negative) @divFloor(px, size) else @divTrunc(@max(0, px), size);
 }
 
 /// Clear the shared IME composition state. `end` additionally lowers
@@ -266,9 +521,9 @@ pub fn resetImeComposition(app: *App, end: bool) void {
     app.mu.unlock(core.clock.io());
 }
 
-/// Whether the shared WM_IME_COMPOSITION body ran to completion. On
-/// `.alloc_failed` the caller must bail out of the message; the two window
-/// procedures return different values there, so the helper does not.
+/// Whether the shared WM_IME_COMPOSITION body ran to completion. Both window
+/// procedures pass the message on to DefWindowProc either way, so a
+/// GCS_RESULTSTR it carries is still committed after an allocation failure.
 pub const ImeCompositionOutcome = enum { done, alloc_failed };
 
 /// The whole WM_IME_COMPOSITION body: read the composition string, clause
@@ -434,29 +689,348 @@ pub fn handleImeChar(app: *App, ch: u16) void {
 }
 
 pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
-    var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-    var mod_len: usize = 0;
-    if ((wParam & c.MK_SHIFT) != 0) {
-        mod_buf[mod_len] = 'S';
-        mod_len += 1;
-    }
-    if ((wParam & c.MK_CONTROL) != 0) {
-        mod_buf[mod_len] = 'C';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_MENU) < 0) {
-        mod_buf[mod_len] = 'A';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-        mod_buf[mod_len] = 'D';
-        mod_len += 1;
-    }
+    var mods: u32 = 0;
+    if ((wParam & c.MK_SHIFT) != 0) mods |= MOD_SHIFT;
+    if ((wParam & c.MK_CONTROL) != 0) mods |= MOD_CTRL;
+    if (keyIsDown(c.VK_MENU)) mods |= MOD_ALT;
+    if (keyIsDown(c.VK_LWIN) or keyIsDown(c.VK_RWIN)) mods |= MOD_SUPER;
+    var mod_buf: [5]u8 = undefined;
+    _ = core.frontend_rules.mouseModifierString(&mod_buf, mods);
     return mod_buf;
 }
 
+/// Client-area mouse position out of an lParam. The two halves are SIGNED:
+/// a drag that leaves the window reports negative coordinates, and reading
+/// them as unsigned turns a few pixels above the top edge into ~65500.
+pub fn mousePosFromLParam(lParam: c.LPARAM) struct { x: i32, y: i32 } {
+    const packed_bits: usize = @bitCast(lParam);
+    const x: i16 = @bitCast(@as(u16, @truncate(packed_bits)));
+    const y: i16 = @bitCast(@as(u16, @truncate(packed_bits >> 16)));
+    return .{ .x = @intCast(x), .y = @intCast(y) };
+}
+
+/// The name Neovim knows a held button by, from the code stored in
+/// `App.press_claim.owner`. Null for "no button held", which is what tells a
+/// move it is not a drag.
+pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
+    return switch (held) {
+        1 => "left",
+        2 => "right",
+        3 => "middle",
+        4 => "x1",
+        5 => "x2",
+        else => null,
+    };
+}
+
+/// Shared press/release/drag delivery for the main window and external
+/// windows. Both resolve the cell the same way handleMouseWheel does: the
+/// content offsets (titlebar tabline, left sidebar) belong to the main window
+/// only, and an external window passes its own grid_id with window-local
+/// coordinates, so the caller never has to know which convention it is in.
+/// Which grid a surface-local point belongs to, and the point rebased into it.
+pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
+
+pub fn loadSystemCursor(id: usize) c.HCURSOR {
+    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
+    const load_fn: RawLoadCursorFn = @ptrCast(&c.LoadCursorW);
+    return @ptrCast(@alignCast(load_fn(null, id)));
+}
+
+/// The composition edges and the committed character, for both window
+/// procedures. `invalidate_on_edge` repaints `hwnd` when composition starts
+/// and ends: an external cmdline hides its cursor while composing, and the
+/// main window must not pay a full repaint for it. Null for any other message.
+pub fn imeEdgeMessage(app_opt: ?*App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, invalidate_on_edge: bool) ?c.LRESULT {
+    switch (msg) {
+        c.WM_IME_STARTCOMPOSITION => {
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION hwnd={*}\n", .{hwnd});
+            if (app_opt) |app| {
+                resetImeComposition(app, false);
+                // Position the IME candidate window at the cursor.
+                positionImeCandidateWindow(hwnd, app);
+                if (invalidate_on_edge) _ = c.InvalidateRect(hwnd, null, 0);
+            }
+            return 0;
+        },
+        c.WM_IME_ENDCOMPOSITION => {
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_ENDCOMPOSITION hwnd={*}\n", .{hwnd});
+            if (app_opt) |app| {
+                resetImeComposition(app, true);
+                // Clear any inline preedit extmark and hide the overlay.
+                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
+                hideImePreeditOverlay(app);
+                if (invalidate_on_edge) _ = c.InvalidateRect(hwnd, null, 0);
+            }
+            return 0;
+        },
+        c.WM_IME_CHAR => {
+            // IME committed character - send to Neovim.
+            const app = app_opt orelse return null;
+            handleImeChar(app, @intCast(wParam));
+            return 0;
+        },
+        else => return null,
+    }
+}
+
+/// Ask for WM_MOUSELEAVE on `hwnd`; every window proc tracked it with the
+/// same literal.
+pub fn trackMouseLeave(hwnd: c.HWND) void {
+    var tme: c.TRACKMOUSEEVENT = .{
+        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+        .dwFlags = c.TME_LEAVE,
+        .hwndTrack = hwnd,
+        .dwHoverTime = 0,
+    };
+    _ = c.TrackMouseEvent(&tme);
+}
+
+/// Keep the caption drawn active under blur (DWM repaints an inactive frame
+/// over the backdrop). Both window procedures answer WM_NCACTIVATE with it.
+pub fn ncActivate(app: ?*App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) c.LRESULT {
+    if (app) |a| {
+        if (a.config.window.blur) return c.DefWindowProcW(hwnd, msg, 1, lParam);
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/// The pointer's position in `hwnd`'s client space.
+pub fn cursorClientPos(hwnd: c.HWND) struct { x: i32, y: i32 } {
+    var pt: c.POINT = undefined;
+    _ = c.GetCursorPos(&pt);
+    _ = c.ScreenToClient(hwnd, &pt);
+    return .{ .x = pt.x, .y = pt.y };
+}
+
+/// Show the hand when the cell a click at `target` would name holds a URL;
+/// true when it did (the caller returns TRUE from WM_SETCURSOR). Both window
+/// procedures ask it: only the main window had it. `null` is a point no click
+/// reaches the editor from. A busy core answers from the last cell asked.
+pub fn showUrlCursor(app: *App, target: ?MouseTarget) bool {
+    const t = target orelse {
+        app.cursor_is_hand = false;
+        return false;
+    };
+    if (app.corep) |corep| {
+        app.mu.lockUncancelable(core.clock.io());
+        const cell_w = app.cell_w_px;
+        const row_h = app.rowHeightPx();
+        app.mu.unlock(core.clock.io());
+        const col: i32 = if (cell_w > 0) @divFloor(t.x, @as(i32, @intCast(cell_w))) else 0;
+        const row: i32 = if (row_h > 0) @divFloor(t.y, @as(i32, @intCast(row_h))) else 0;
+        const result = core.zonvie_core_try_cell_has_url(corep, t.grid_id, row, col);
+        if (result >= 0) {
+            app.cursor_is_hand = (result == 1);
+            app.url_cache_grid = t.grid_id;
+            app.url_cache_row = row;
+            app.url_cache_col = col;
+        } else if (app.url_cache_grid != t.grid_id or app.url_cache_row != row or app.url_cache_col != col) {
+            // Lock unavailable: the cached answer holds only for the same cell.
+            app.cursor_is_hand = false;
+        }
+    }
+    if (!app.cursor_is_hand) return false;
+    _ = c.SetCursor(loadSystemCursor(32649)); // IDC_HAND
+    return true;
+}
+
+/// The button a mouse message names, and its held-button code (the one
+/// heldMouseButtonName reads back): 1 left, 2 right, 3 middle, 4/5 X1/X2.
+pub fn mouseButton(msg: c.UINT, wParam: c.WPARAM) struct { name: [*:0]const u8, code: u8 } {
+    return switch (msg) {
+        c.WM_RBUTTONDOWN, c.WM_RBUTTONUP => .{ .name = "right", .code = 2 },
+        c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => .{ .name = "middle", .code = 3 },
+        // HIWORD(wParam) is XBUTTON1 (1) or XBUTTON2 (2).
+        c.WM_XBUTTONDOWN, c.WM_XBUTTONUP => if (@as(u16, @truncate(wParam >> 16)) == 1)
+            .{ .name = "x1", .code = 4 }
+        else
+            .{ .name = "x2", .code = 5 },
+        else => .{ .name = "left", .code = 1 },
+    };
+}
+
+/// What a button message returns: WM_XBUTTON* want TRUE.
+pub fn mouseButtonResult(msg: c.UINT) c.LRESULT {
+    return if (msg == c.WM_XBUTTONDOWN or msg == c.WM_XBUTTONUP) 1 else 0;
+}
+
+/// A press the editor takes, at `target`, for either window procedure.
+/// Another button pressed mid left-drag leaves the drag -- its held state,
+/// press grid and capture -- to the left button: taking over the held state
+/// lost the left release once this button was let go. Capture so a drag that
+/// leaves the window keeps arriving; not again mid-drag, since whether
+/// re-capturing notifies WM_CAPTURECHANGED is not worth depending on.
+/// Capture held with no editor button down belongs to a scrollbar or tab
+/// drag: another button then stays out of the editor, as it would its release.
+pub fn pressEditorButton(app: *App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, target: MouseTarget) void {
+    if (uiOwnsCapture(app.press_claim.owner, msg, c.GetCapture() == hwnd)) return;
+    const b = mouseButton(msg, wParam);
+    if (app.press_claim.press(b.code)) app.mouse_press_grid_id = target.grid_id;
+    if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
+    sendMouseButton(app, target.grid_id, b.name, .press, target.x, target.y, wParam);
+}
+
+pub const ButtonRelease = struct {
+    /// The grid the press chose; 0 when the press never reached the editor
+    /// (chrome, scrollbar, copy button), which then gets no release either.
+    press_grid: i64,
+    /// Another button is still held (frontend_rules.PressClaim): the claim
+    /// and its capture go on. Also true for a non-left release the editor
+    /// never saw: any capture is a scrollbar or tab drag's, and releasing it
+    /// would cancel that drag.
+    left_drag_continues: bool,
+};
+
+/// A non-left press while this window holds capture and no editor button is
+/// down: the capture is a scrollbar or tab drag's.
+pub fn uiOwnsCapture(mouse_button_held: u8, msg: c.UINT, window_has_capture: bool) bool {
+    return mouse_button_held == 0 and msg != c.WM_LBUTTONDOWN and window_has_capture;
+}
+
+/// Read and clear the press state before anything can return early: a
+/// branch that returned first left a button held, and every later
+/// WM_MOUSEMOVE then dragged with no button down.
+pub fn takeButtonRelease(app: *App, msg: c.UINT, wParam: c.WPARAM) ButtonRelease {
+    const r = app.press_claim.release(mouseButton(msg, wParam).code);
+    const rel: ButtonRelease = .{
+        .press_grid = if (r.send) app.mouse_press_grid_id else 0,
+        // An unsent release keeps the capture while an editor press still holds it.
+        .left_drag_continues = if (r.send) !r.ends else (!r.ends or msg != c.WM_LBUTTONUP),
+    };
+    if (r.ends) app.mouse_press_grid_id = 0;
+    return rel;
+}
+
+/// Release to the editor at `target` -- pinned by the caller to the grid the
+/// press chose -- if the press reached it.
+pub fn releaseEditorButton(app: *App, msg: c.UINT, wParam: c.WPARAM, rel: ButtonRelease, target: MouseTarget) void {
+    if (rel.press_grid == 0) return;
+    sendMouseButton(app, target.grid_id, mouseButton(msg, wParam).name, .release, target.x, target.y, wParam);
+}
+
+/// Capture was taken away: no button-up will arrive, and it is the only
+/// place the held state ends.
+pub fn cancelMouseButtons(app: *App) void {
+    app.press_claim = .{};
+    app.mouse_press_grid_id = 0;
+}
+
+/// Resolve a surface-local pixel against the layers that surface composites,
+/// back to front, so a click on a float reaches the float.
+///
+/// Neovim does no z-order test of its own once the UI names a grid: for a
+/// grid > 1 it looks the window up by handle and CLAMPS the position into it
+/// (nvim mouse.c, mouse_find_grid_win). Only grid 0 is hit-tested by the
+/// compositor. So a surface that composites layers has to answer the question
+/// itself or every click lands in the window behind the one under the pointer.
+///
+/// Which grid is chosen is the core's rule (`zonvie_core_resolve_pointer_grid`),
+/// the one the wheel path and macOS use: it skips a grid that refuses the
+/// mouse — Neovim rejects an event addressed to it without re-resolving —
+/// and takes the front-most by the order the core sorts layers in. This used
+/// to be a pixel loop here where the last layer in list order won, a third
+/// rule beside the wheel's and macOS's. The pixel rebase into the chosen
+/// layer stays local: `layers` is what this surface drew, and a grid the
+/// cached snapshot names but the drawn list does not falls back to the root.
+/// Caller holds app.mu, which is what the layer list is protected by;
+/// `grids` is the non-blocking cached snapshot.
+pub fn resolveMouseTarget(
+    layers: []const app_mod.SurfaceLayer,
+    grids: []const app_mod.GridInfo,
+    root_grid_id: i64,
+    x: i32,
+    y: i32,
+    cell_w: u32,
+    row_h: u32,
+) MouseTarget {
+    const target = MouseTarget{ .grid_id = root_grid_id, .x = x, .y = y };
+    if (cell_w == 0 or row_h == 0 or layers.len <= 1 or grids.len == 0) return target;
+    var hit: app_mod.zonvie_pointer_hit = undefined;
+    if (app_mod.zonvie_core_resolve_pointer_grid(
+        grids.ptr,
+        grids.len,
+        root_grid_id,
+        @divFloor(y, @as(i32, @intCast(row_h))),
+        @divFloor(x, @as(i32, @intCast(cell_w))),
+        0, // a click
+        &hit,
+    ) == 0) return target;
+    return rebaseToGrid(layers, root_grid_id, hit.grid_id, x, y);
+}
+
+/// Rebase a surface-local point into the layer a press already chose, for the
+/// drag and release that follow it. The layer's CURRENT origin is used, so a
+/// float that moves mid-drag keeps receiving the right cells. A layer that has
+/// gone falls back to the surface's own grid.
+pub fn rebaseToGrid(
+    layers: []const app_mod.SurfaceLayer,
+    root_grid_id: i64,
+    grid_id: i64,
+    x: i32,
+    y: i32,
+) MouseTarget {
+    if (grid_id == root_grid_id or grid_id == 0 or layers.len <= 1) {
+        return .{ .grid_id = root_grid_id, .x = x, .y = y };
+    }
+    for (layers[1..]) |layer| {
+        if (layer.grid_id != grid_id) continue;
+        return .{ .grid_id = grid_id, .x = x - layer.x_px, .y = y - layer.y_px };
+    }
+    return .{ .grid_id = root_grid_id, .x = x, .y = y };
+}
+
+pub const MouseAction = enum {
+    press,
+    release,
+    drag,
+
+    fn name(self: MouseAction) [*:0]const u8 {
+        return switch (self) {
+            .press => "press",
+            .release => "release",
+            .drag => "drag",
+        };
+    }
+};
+
+/// `x`/`y` are SURFACE-local pixels -- layer-local when a hit test chose a
+/// float, otherwise the surface origin already subtracted. The window handle is
+/// no longer a parameter: it existed only to re-derive the chrome offset here,
+/// which now happens once in the caller, before the layer rects are tested.
+pub fn sendMouseButton(
+    app: *App,
+    grid_id: i64,
+    button: [*:0]const u8,
+    action: MouseAction,
+    x: i32,
+    y: i32,
+    wParam: c.WPARAM,
+) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const cell_w = app.cell_w_px;
+    const row_h = app.rowHeightPx();
+    app.mu.unlock(core.clock.io());
+
+    const drag = action == .drag;
+    const cell = clientPxToCell(app, false, x, y, cell_w, row_h, drag);
+    const mod_buf = buildMouseModifiers(wParam);
+
+    core.zonvie_core_send_mouse_input(
+        app.corep,
+        button,
+        action.name(),
+        @as([*:0]const u8, @ptrCast(&mod_buf)),
+        grid_id,
+        if (drag) cell.row else @max(0, cell.row),
+        if (drag) cell.col else @max(0, cell.col),
+    );
+}
+
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
-/// external windows.
+/// external windows. `grid_id` is the surface this hwnd draws — 1 for the main
+/// window — and is all the core needs to resolve the target against, so this
+/// no longer reaches for the surface's layer list or takes `app.mu`.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -489,34 +1063,46 @@ pub fn handleMouseWheel(
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h);
+    const px: i32 = @intCast(pt.x);
+    const py: i32 = @intCast(pt.y);
+    // Clicks there are the chrome's; a wheel clamped its negative cell to 0
+    // and scrolled whatever window sat at row 0 or column 0.
+    if (is_main_window and pointInMainChrome(app, hwnd, px, py)) return;
+    const cell = clientPxToCell(app, is_main_window, px, py, cell_w, row_h, false);
     const col = cell.col;
     const row = cell.row;
 
     // Resolve the scroll target on the main window: hit-test visible grids so
     // a wheel event over a composited grid (float/split) targets that grid
     // with grid-local coordinates, matching the URL-hover hit-test and macOS
-    // resolveScrollTarget. External windows already receive their own grid_id
-    // and window-local coordinates. Uses the non-blocking cached query, so no
-    // lock contention is added to the input path.
+    // resolveScrollTarget. Uses the non-blocking cached query, so no lock
+    // contention is added to the input path.
     var target_grid_id: i64 = grid_id;
     var target_row: i32 = row;
     var target_col: i32 = col;
-    if (is_main_window) {
-        if (corep) |cp| {
-            const vg = app.getVisibleGridsCached(cp);
-            var best_zindex: i64 = -1;
-            for (vg) |g| {
-                if (row >= g.start_row and row < g.start_row + g.rows and
-                    col >= g.start_col and col < g.start_col + g.cols and
-                    g.zindex > best_zindex)
-                {
-                    best_zindex = g.zindex;
-                    target_grid_id = g.grid_id;
-                    target_row = row - g.start_row;
-                    target_col = col - g.start_col;
-                }
-            }
+    {
+        // The rule is the core's, for both surfaces and both frontends. It
+        // used to be a loop here and another in macOS's MetalTerminalView, and
+        // between them they held different parts of it: this one applied
+        // neither the mouse flag nor the scrollability rule on the main
+        // window, and that one hit-tested floats an external surface hosts.
+        const grids: []const app_mod.GridInfo = if (corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+        var hit: app_mod.zonvie_pointer_hit = undefined;
+        if (grids.len > 0 and app_mod.zonvie_core_resolve_pointer_grid(
+            grids.ptr,
+            grids.len,
+            grid_id,
+            row,
+            col,
+            // Vertical wheel only: a float showing all its lines lets it
+            // through. "Can scroll" is a line-count test, so a sideways wheel
+            // over a nowrap float must still reach the float (as on macOS).
+            if (horizontal) 0 else 1,
+            &hit,
+        ) != 0) {
+            target_grid_id = hit.grid_id;
+            target_row = hit.row;
+            target_col = hit.col;
         }
     }
 
@@ -538,10 +1124,10 @@ pub fn handleMouseWheel(
     // scrolls proportionally faster.
     app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
 
+    // A throttled msg float scroll is a core deadline (nextMsgTimeoutNs) with
+    // no flush to re-arm the message timer after it.
     if (target_grid_id == app_mod.MESSAGE_GRID_ID) {
-        if (app.hwnd) |main_hwnd| {
-            _ = c.SetTimer(main_hwnd, app_mod.TIMER_MSG_SCROLL_RETRY, app_mod.MSG_SCROLL_RETRY_INTERVAL_MS, null);
-        }
+        callbacks.postCoalesced(app, &app.msg_throttle_arm_posted, app_mod.WM_APP_MSG_THROTTLE_ARM);
     }
 }
 
@@ -599,121 +1185,89 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
     return n;
 }
 
+/// The cursor cell as client points of `coord_hwnd`: the window that shows
+/// the cursor's grid. On an external host that is its client area, the grid's
+/// layer origin plus the decorated content origin; in the main window the
+/// grid's layer origin plus the surface origin (below a titlebar tab bar,
+/// right of a left sidebar). `pt_below` is one cell down, for the candidate
+/// list. The candidate window and the preedit overlay both place against
+/// this. Null when no cursor position is known yet (a cold cache under lock
+/// contention yields (-1,-1)).
+const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT };
+
+fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, cell_w: u32, cell_h: u32, row_h_px: u32) ?ImeCursorPoint {
+    var row: i32 = 0;
+    var col: i32 = 0;
+    const grid_id = getCursorPositionNonBlocking(app, corep, &row, &col, null);
+    if (row < 0 or col < 0) return null;
+
+    var main_layer: [2]i32 = .{ 0, 0 };
+    const ext_surface = blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        const es = imeExternalSurfaceLocked(app, grid_id);
+        if (es == null) main_layer = render_helpers.layerOriginPx(app_mod.SurfaceLayer, app.surf.tbs.committed_layers.slice(), grid_id, 1);
+        break :blk es;
+    };
+    const decorated = imeDecoratedOrigin(app, ext_surface);
+    var coord_hwnd: c.HWND = main_hwnd;
+    var origin_x: c.LONG = decorated[0];
+    var origin_y: c.LONG = decorated[1];
+    if (ext_surface) |es| {
+        coord_hwnd = es.hwnd;
+        origin_x += es.x_px;
+        origin_y += es.y_px;
+    } else {
+        const origin = surfaceOriginPx(app, true);
+        origin_x += origin.x + main_layer[0];
+        origin_y += origin.y + main_layer[1];
+    }
+    const x = origin_x + col * @as(c.LONG, @intCast(cell_w));
+    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px));
+    return .{
+        .coord_hwnd = coord_hwnd,
+        .pt_cursor = .{ .x = x, .y = y },
+        .pt_below = .{ .x = x, .y = y + @as(c.LONG, @intCast(cell_h)) },
+    };
+}
+
 /// Position IME candidate window at cursor location.
 pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const himc = c.ImmGetContext(hwnd);
     if (himc == null) return;
     defer _ = c.ImmReleaseContext(hwnd, himc);
 
-    // Get cursor position and cell metrics from core
     app.mu.lockUncancelable(core.clock.io());
     const corep = app.corep;
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
     const row_h_px = app.rowHeightPx();
-    const ext_tabline_enabled = app.ext_tabline_enabled;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
-    if (corep == null) return;
-
-    // Row height includes linespace (for row positioning)
-    const row_h: i32 = @intCast(row_h_px);
-
-    var row: i32 = 0;
-    var col: i32 = 0;
-    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
-
-    // A cold cache under lock contention yields (-1,-1); skip positioning
-    // rather than placing the candidate window at negative coordinates
-    // (macOS counterpart checks cursor.row >= 0 the same way).
-    if (row < 0 or col < 0) return;
-
-    // Check if cursor is on an external window's grid (e.g. ext-cmdline).
-    // If so, we need to calculate screen coordinates via that window, then convert
-    // back to the IME hwnd's client coordinates. Otherwise the candidate window
-    // appears behind the topmost external window and is invisible.
-    var ext_hwnd: ?c.HWND = null;
-    {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        if (app.external_windows.get(grid_id)) |ew| {
-            ext_hwnd = ew.hwnd;
-        }
-    }
-
-    if (ext_hwnd) |ehwnd| {
-        // Cursor is on an external grid — position via that window's client area.
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const cmdline_x_offset: c.LONG = if (is_cmdline)
-            @intCast(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT)
-        else
-            0;
-        const cmdline_y_offset: c.LONG = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING) else 0;
-
-        // Grid-local pixel position within the external window's client area
-        const local_x: c.LONG = col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset;
-        const local_cursor_y: c.LONG = row * row_h + cmdline_y_offset;
-        const local_below_y: c.LONG = local_cursor_y + @as(c.LONG, @intCast(cell_h));
-
-        // Convert external window client coords → screen → IME hwnd client coords
-        var pt_cursor: c.POINT = .{ .x = local_x, .y = local_cursor_y };
-        var pt_below: c.POINT = .{ .x = local_x, .y = local_below_y };
-        _ = c.ClientToScreen(ehwnd, &pt_cursor);
-        _ = c.ClientToScreen(ehwnd, &pt_below);
+    const cp = imeCursorClientPoint(app, corep orelse return, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
+    var pt_cursor = cp.pt_cursor;
+    var pt_below = cp.pt_below;
+    // Into the client area of the window the IME is attached to, which is
+    // another window when the cursor's grid is shown elsewhere; placed in
+    // the external host's coordinates the candidate list sat behind it.
+    if (cp.coord_hwnd != hwnd) {
+        _ = c.ClientToScreen(cp.coord_hwnd, &pt_cursor);
+        _ = c.ClientToScreen(cp.coord_hwnd, &pt_below);
         _ = c.ScreenToClient(hwnd, &pt_cursor);
         _ = c.ScreenToClient(hwnd, &pt_below);
-
-        var cf: c.COMPOSITIONFORM = undefined;
-        cf.dwStyle = c.CFS_POINT;
-        cf.ptCurrentPos = .{ .x = pt_cursor.x, .y = pt_cursor.y };
-        _ = c.ImmSetCompositionWindow(himc, &cf);
-
-        var candidate_form: c.CANDIDATEFORM = undefined;
-        candidate_form.dwIndex = 0;
-        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-        candidate_form.ptCurrentPos = .{ .x = pt_below.x, .y = pt_below.y };
-        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
-    } else {
-        // Cursor is on a main-window grid — use startRow/startCol offset.
-        const cached = app.getVisibleGridsCached(corep.?);
-
-        var screen_row: i32 = row;
-        var screen_col: i32 = col;
-
-        for (cached) |grid| {
-            if (grid.grid_id == grid_id) {
-                screen_row = grid.start_row + row;
-                screen_col = grid.start_col + col;
-                break;
-            }
-        }
-
-        const x: c.LONG = @intCast(screen_col * @as(i32, @intCast(cell_w)));
-        const cursor_y: c.LONG = @intCast(screen_row * row_h);
-        const below_overlay_y: c.LONG = cursor_y + @as(c.LONG, @intCast(cell_h));
-
-        // When ext_tabline is enabled on main window, content is rendered below the tabbar.
-        var adjusted_cursor_y = cursor_y;
-        var adjusted_below_overlay_y = below_overlay_y;
-        const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
-        if (ext_tabline_enabled and is_main_window) {
-            const tab_h = app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-            adjusted_cursor_y += tab_h;
-            adjusted_below_overlay_y += tab_h;
-        }
-
-        var cf: c.COMPOSITIONFORM = undefined;
-        cf.dwStyle = c.CFS_POINT;
-        cf.ptCurrentPos = .{ .x = x, .y = adjusted_cursor_y };
-        _ = c.ImmSetCompositionWindow(himc, &cf);
-
-        var candidate_form: c.CANDIDATEFORM = undefined;
-        candidate_form.dwIndex = 0;
-        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-        candidate_form.ptCurrentPos = .{ .x = x, .y = adjusted_below_overlay_y };
-        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
     }
+
+    var cf: c.COMPOSITIONFORM = undefined;
+    cf.dwStyle = c.CFS_POINT;
+    cf.ptCurrentPos = pt_cursor;
+    _ = c.ImmSetCompositionWindow(himc, &cf);
+
+    var candidate_form: c.CANDIDATEFORM = undefined;
+    candidate_form.dwIndex = 0;
+    candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
+    candidate_form.ptCurrentPos = pt_below;
+    _ = c.ImmSetCandidateWindow(himc, &candidate_form);
 }
 
 /// Disable IME input (switch to direct input mode).
@@ -777,8 +1331,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     atlas_ptr = if (app.atlas) |*a| a else null;
     atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
-    const ext_tabline_enabled = app.ext_tabline_enabled;
-    const content_hwnd = app.content_hwnd;
+    const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
     // Access atlas without holding app.mu to avoid nested locking
@@ -802,56 +1355,9 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         return;
     }
 
-    // Row height includes linespace
-    const row_h: u32 = row_h_px;
-
-    var row: i32 = 0;
-    var col: i32 = 0;
-    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
-
-    // Check if hwnd is an external window (use grid-local coords) or main window (use screen coords)
-    var is_external_window = false;
-    {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        var ext_it = app.external_windows.iterator();
-        while (ext_it.next()) |entry| {
-            if (entry.value_ptr.*.hwnd == hwnd) {
-                is_external_window = true;
-                break;
-            }
-        }
-    }
-
-    var screen_row: i32 = row;
-    var screen_col: i32 = col;
-
-    // For external windows, use grid-local coordinates directly
-    // For main window, add start_row/start_col to get screen position
-    if (!is_external_window) {
-        // Get grid info to calculate screen position (non-blocking)
-        const cached = app.getVisibleGridsCached(corep.?);
-
-        for (cached) |grid| {
-            if (grid.grid_id == grid_id) {
-                screen_row = grid.start_row + row;
-                screen_col = grid.start_col + col;
-                break;
-            }
-        }
-    }
-
-    // Hide overlay if no composition text
-    if (comp_str.len == 0) {
-        if (app.ime_overlay_hwnd) |overlay| {
-            _ = c.ShowWindow(overlay, c.SW_HIDE);
-        }
-        return;
-    }
-
-    // A cold cursor-position cache under lock contention yields (-1,-1);
-    // keep the overlay's previous position rather than drawing off-window.
-    if (row < 0 or col < 0) return;
+    // No cursor position yet: keep the overlay's previous position rather
+    // than drawing off-window.
+    const cp = imeCursorClientPoint(app, corep.?, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
 
     // Create a memory DC and font first to measure actual text width
     const screen_dc = c.GetDC(null);
@@ -902,33 +1408,10 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const overlay_width: i32 = text_size.cx + 4; // Add small padding
     const overlay_height: i32 = @intCast(atlas_cell_h);
 
-    // Convert client position to screen position (use row_h for Y position)
-    // For ext-cmdline, add offset for icon area and padding
-    const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-    const cmdline_x_offset: c.LONG = if (is_external_window and is_cmdline)
-        @intCast(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT)
-    else
-        0;
-    const cmdline_y_offset: c.LONG = if (is_external_window and is_cmdline)
-        @intCast(app_mod.CMDLINE_PADDING)
-    else
-        0;
+    var pt = cp.pt_cursor;
+    _ = c.ClientToScreen(cp.coord_hwnd, &pt);
 
-    var pt: c.POINT = .{
-        .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
-        .y = screen_row * @as(c.LONG, @intCast(row_h)) + cmdline_y_offset,
-    };
-    // For external windows, always use their own hwnd for coordinate conversion
-    // (grid-local coords are relative to the external window's client area).
-    // For main window, use content_hwnd when it exists (positioned below tabline),
-    // or add tabline height manually if content_hwnd is null.
-    const coord_hwnd = if (is_external_window) hwnd else if (content_hwnd) |ch| ch else hwnd;
-    if (!is_external_window and content_hwnd == null and ext_tabline_enabled) {
-        pt.y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-    }
-    _ = c.ClientToScreen(coord_hwnd, &pt);
-
-    if (log_active) applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h });
+    if (log_active) applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h_px });
 
     // Create overlay window if it doesn't exist (use layered window)
     if (app.ime_overlay_hwnd == null) {
@@ -1085,97 +1568,94 @@ pub fn hideImePreeditOverlay(app: *App) void {
 // Cursor blink functions
 // =========================================================================
 
+// The cadence is the core's (frontend_rules.Blink, shared with macOS); this
+// file keeps the timer, the gate and the repaints.
+
+fn armBlinkTimer(hwnd: c.HWND, app: *App, delay_ms: u32) void {
+    if (delay_ms == 0) return;
+    app.cursor_blink_timer = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, delay_ms, null);
+}
+
+fn killBlinkTimer(hwnd: c.HWND, app: *App) void {
+    if (app.cursor_blink_timer != 0) {
+        _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
+        app.cursor_blink_timer = 0;
+    }
+}
+
+/// Repaint the main window's cursor, when it holds one: the same question the
+/// external windows ask. With no rect nothing is invalidated; a whole-window
+/// invalidate would present the full frame.
+fn invalidateMainCursor(hwnd: c.HWND, app: *App) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const cursor_rect = if (app.surf.has_committed_cursor) app.last_cursor_rect_px else null;
+    app.mu.unlock(core.clock.io());
+    if (cursor_rect) |rect| _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
+}
+
 pub fn startCursorBlinking(hwnd: c.HWND, app: *App, wait_ms: u32, on_ms: u32, off_ms: u32) void {
-    // Stop any existing timer
-    stopCursorBlinking(hwnd, app);
-
-    // Don't blink if on_ms is 0
-    if (on_ms == 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] on_ms=0, not blinking\n", .{});
-        return;
+    killBlinkTimer(hwnd, app);
+    const was_visible = app.cursor_blink.visible;
+    const delay_ms = app.cursor_blink.start(wait_ms, on_ms, off_ms);
+    if (applog.isEnabled()) applog.appLog("[blink] start wait={d} on={d} off={d} first_tick_ms={d}\n", .{ wait_ms, on_ms, off_ms, delay_ms });
+    armBlinkTimer(hwnd, app, delay_ms);
+    if (!was_visible) {
+        updateExternalWindowsBlinkState(app);
+        invalidateMainCursor(hwnd, app);
     }
-
-    app.cursor_blink_wait_ms = wait_ms;
-    app.cursor_blink_on_ms = on_ms;
-    app.cursor_blink_off_ms = off_ms;
-
-    // Start with wait phase if wait_ms > 0
-    if (wait_ms > 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] starting with wait_ms={d}\n", .{wait_ms});
-        app.cursor_blink_phase = 0;
-        app.cursor_blink_state = true;
-        const timer_result = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, wait_ms, null);
-        if (applog.isEnabled()) applog.appLog("[blink] SetTimer result={d}\n", .{timer_result});
-        app.cursor_blink_timer = timer_result;
-    } else {
-        // No wait, start blinking immediately
-        enterBlinkCycle(hwnd, app);
-    }
-}
-
-/// Enter the on/off blink cycle
-pub fn enterBlinkCycle(hwnd: c.HWND, app: *App) void {
-    if (applog.isEnabled()) applog.appLog("[blink] enterBlinkCycle\n", .{});
-    app.cursor_blink_phase = 1;
-    app.cursor_blink_state = true;
-    scheduleNextBlink(hwnd, app, true);
-    // Request repaint
-    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-}
-
-/// Schedule the next blink state change
-pub fn scheduleNextBlink(hwnd: c.HWND, app: *App, is_currently_on: bool) void {
-    const interval = if (is_currently_on) app.cursor_blink_on_ms else app.cursor_blink_off_ms;
-
-    if (interval == 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] interval=0, stopping\n", .{});
-        return;
-    }
-
-    if (applog.isEnabled()) applog.appLog("[blink] scheduleNextBlink: is_on={} interval={d}ms\n", .{ is_currently_on, interval });
-    app.cursor_blink_timer = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, interval, null);
 }
 
 /// Handle cursor blink timer event
 pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
     _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
     app.cursor_blink_timer = 0;
-
-    if (app.cursor_blink_phase == 0) {
-        // Wait phase complete, enter blink cycle
-        enterBlinkCycle(hwnd, app);
-    } else {
-        // Toggle blink state
-        app.cursor_blink_state = !app.cursor_blink_state;
-        if (applog.isEnabled()) applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink_state});
-
-        // Update external windows blink state
-        updateExternalWindowsBlinkState(app);
-
-        // Request repaint for cursor area
-        app.mu.lockUncancelable(core.clock.io());
-        const cursor_rect_snapshot = app.last_cursor_rect_px;
-        app.mu.unlock(core.clock.io());
-        if (cursor_rect_snapshot) |rect| {
-            _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
-        } else {
-            _ = c.InvalidateRect(hwnd, null, c.FALSE);
-        }
-
-        // Schedule next blink
-        scheduleNextBlink(hwnd, app, app.cursor_blink_state);
+    // Minimized or covered since the last tick: stop here, within one
+    // interval, rather than hooking every way a window can stop showing.
+    if (!cursorBlinkAllowed(app)) {
+        pauseCursorBlinking(hwnd, app);
+        return;
     }
+    const was_visible = app.cursor_blink.visible;
+    const delay_ms = app.cursor_blink.tick();
+    if (app.cursor_blink.visible != was_visible) {
+        if (applog.isEnabled()) applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink.visible});
+        updateExternalWindowsBlinkState(app);
+        invalidateMainCursor(hwnd, app);
+    }
+    armBlinkTimer(hwnd, app, delay_ms);
+}
+
+/// Whether the blink timer may run: this process is in front and the window
+/// showing the cursor is visible and not minimized -- macOS's
+/// `cursorBlinkAllowed`. The timer used to run regardless, repainting a
+/// window in the background or in the taskbar twice a second.
+fn cursorBlinkAllowed(app: *App) bool {
+    const foreground = c.GetForegroundWindow() orelse return false;
+    var foreground_pid: c.DWORD = 0;
+    _ = c.GetWindowThreadProcessId(foreground, &foreground_pid);
+    if (foreground_pid != c.GetCurrentProcessId()) return false;
+    app.mu.lockUncancelable(core.clock.io());
+    const holder: ?c.HWND = if (callbacks.externalWindowShowingGridLocked(app, app.last_cursor_grid)) |shown|
+        shown.win.hwnd
+    else
+        app.hwnd;
+    app.mu.unlock(core.clock.io());
+    const h = holder orelse return false;
+    return c.IsWindowVisible(h) != 0 and c.IsIconic(h) == 0;
+}
+
+/// Stop the timer and leave the cursor drawn. Stopping in the off phase left
+/// the main window's cursor hidden until something else repainted it.
+pub fn pauseCursorBlinking(hwnd: c.HWND, app: *App) void {
+    const was_off = !app.cursor_blink.visible;
+    stopCursorBlinking(hwnd, app);
+    if (was_off) invalidateMainCursor(hwnd, app);
 }
 
 /// Stop cursor blinking
 pub fn stopCursorBlinking(hwnd: c.HWND, app: *App) void {
-    if (app.cursor_blink_timer != 0) {
-        _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
-        app.cursor_blink_timer = 0;
-    }
-    app.cursor_blink_phase = 0;
-    app.cursor_blink_state = true;
-
+    killBlinkTimer(hwnd, app);
+    app.cursor_blink.stop();
     // Update external windows blink state (cursor visible)
     updateExternalWindowsBlinkState(app);
 }
@@ -1185,9 +1665,9 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
     // Pre-seed with the last-known values: try_get_cursor_blink leaves its
     // out params untouched on lock contention, so a busy lock here
     // naturally reads back as "unchanged since last time" below.
-    var wait_ms: u32 = app.cursor_blink_wait_ms;
-    var on_ms: u32 = app.cursor_blink_on_ms;
-    var off_ms: u32 = app.cursor_blink_off_ms;
+    var wait_ms: u32 = app.cursor_blink.wait_ms;
+    var on_ms: u32 = app.cursor_blink.on_ms;
+    var off_ms: u32 = app.cursor_blink.off_ms;
 
     if (app.corep) |core_ptr| {
         if (!app_mod.zonvie_core_try_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms)) {
@@ -1204,40 +1684,45 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
         }
     }
 
-    if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink_wait_ms, app.cursor_blink_on_ms, app.cursor_blink_off_ms });
+    if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink.wait_ms, app.cursor_blink.on_ms, app.cursor_blink.off_ms });
 
-    // Check if blink settings changed
-    const settings_changed = wait_ms != app.cursor_blink_wait_ms or
-        on_ms != app.cursor_blink_on_ms or
-        off_ms != app.cursor_blink_off_ms;
+    const settings_changed = !app.cursor_blink.sameSettings(wait_ms, on_ms, off_ms);
 
     // Check if timer is currently stopped
     const timer_stopped = app.cursor_blink_timer == 0;
 
     if (applog.isEnabled()) applog.appLog("[blink] settings_changed={}, on_ms>0={}, off_ms>0={}, timer_stopped={}\n", .{ settings_changed, on_ms > 0, off_ms > 0, timer_stopped });
 
-    if (on_ms > 0 and off_ms > 0) {
-        // Blink should be enabled
+    if (core.frontend_rules.Blink.blinks(on_ms, off_ms)) {
+        // Blink should be enabled -- where it can be seen. Gated here as well
+        // as in the tick: a stopped timer reads as "restart" below, and every
+        // cursor callback lands here.
+        if (!cursorBlinkAllowed(app)) {
+            if (!timer_stopped) pauseCursorBlinking(hwnd, app);
+            return;
+        }
         if (settings_changed or timer_stopped) {
             // Start/restart if settings changed OR timer was stopped (e.g., after mode change to non-blinking mode)
             if (applog.isEnabled()) applog.appLog("[blink] calling startCursorBlinking\n", .{});
             startCursorBlinking(hwnd, app, wait_ms, on_ms, off_ms);
         }
     } else {
-        // Blink should be disabled
-        if (settings_changed) {
-            if (applog.isEnabled()) applog.appLog("[blink] calling stopCursorBlinking\n", .{});
-            stopCursorBlinking(hwnd, app);
-        }
+        // Blink should be disabled; start() records the settings and leaves
+        // the cursor shown with no timer.
+        if (settings_changed) startCursorBlinking(hwnd, app, wait_ms, on_ms, off_ms);
     }
 }
 
-/// Update blink state for all external windows
+/// Repaint the external windows that hold a cursor after a blink phase change
 pub fn updateExternalWindowsBlinkState(app: *App) void {
     var it = app.external_windows.iterator();
     while (it.next()) |entry| {
         const ext_win = entry.value_ptr.*;
-        ext_win.cursor_blink_state = app.cursor_blink_state;
+        // Paint reads app.cursor_blink.visible directly. Only the surface that actually holds a cursor repaints. A toggle
+        // changes no pixel on the others, and the whole-window invalidate cost
+        // each of them a no-op WM_PAINT — app.mu, a layer scan and a snapshot
+        // acquire/release — twice a second, scaling with the window count.
+        if (!ext_win.surf.has_committed_cursor) continue;
         if (ext_win.hwnd) |ext_hwnd| {
             _ = c.InvalidateRect(ext_hwnd, null, c.FALSE);
         }

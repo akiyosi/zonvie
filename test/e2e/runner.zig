@@ -2,7 +2,8 @@
 //
 // Each scenario spawns its own `nvim --embed --clean` for isolation.
 // When no usable nvim binary is found, every test skips with a clear
-// message instead of failing (CI machines without nvim stay green).
+// message instead of failing, unless ZONVIE_REQUIRE_NVIM is set: CI sets it
+// so a runner without nvim fails instead of passing with nothing tested.
 
 const std = @import("std");
 const harness = @import("harness.zig");
@@ -11,6 +12,11 @@ const testing = std.testing;
 fn requireNvim() !void {
     const path = harness.resolveNvim(testing.allocator) catch |e| switch (e) {
         error.NvimNotFound => {
+            if (std.process.Environ.getAlloc(testing.environ, testing.allocator, "ZONVIE_REQUIRE_NVIM")) |required| {
+                testing.allocator.free(required);
+                std.debug.print("[e2e] nvim not found but ZONVIE_REQUIRE_NVIM is set\n", .{});
+                return error.NvimNotFound;
+            } else |_| {}
             std.debug.print("[e2e] skipped: nvim not found (set ZONVIE_TEST_NVIM)\n", .{});
             return error.SkipZigTest;
         },
@@ -87,6 +93,11 @@ test "e2e:external_window_cursor" {
 test "e2e:float_move_recompose" {
     try requireNvim();
     try @import("scenarios/float_move_recompose.zig").run(testing.allocator);
+}
+
+test "e2e:float_fixed_after_move" {
+    try requireNvim();
+    try @import("scenarios/float_fixed_after_move.zig").run(testing.allocator);
 }
 
 test "e2e:ime_preedit_extmark" {
@@ -249,6 +260,16 @@ test "e2e:message_state_corruption" {
     try @import("scenarios/message_state_corruption.zig").run(testing.allocator);
 }
 
+test "e2e:scrollbind_layers_fast_path" {
+    try requireNvim();
+    try @import("scenarios/scrollbind_layers_fast_path.zig").run(testing.allocator);
+}
+
+test "e2e:ext_anchor_scroll_under_float" {
+    try requireNvim();
+    try @import("scenarios/ext_anchor_scroll_under_float.zig").run(testing.allocator);
+}
+
 test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);
@@ -350,4 +371,9 @@ test "e2e:msg_backoff_delivery" {
 test "e2e:msg_split_payload_ceiling" {
     try requireNvim();
     try @import("scenarios/msg_split_payload_ceiling.zig").run(testing.allocator);
+}
+
+test "e2e:born_external_anchor_float" {
+    try requireNvim();
+    try @import("scenarios/born_external_anchor_float.zig").run(testing.allocator);
 }

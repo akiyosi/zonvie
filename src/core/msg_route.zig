@@ -99,6 +99,33 @@ pub fn isInteractivePrompt(kind: []const u8) bool {
         std.mem.eql(u8, kind, "number_prompt");
 }
 
+/// The colour family a message panel draws a `kind` in; each frontend maps it
+/// to its RGB, `normal` being Normal's foreground. Values are ABI
+/// (ZONVIE_MSG_TONE_*).
+pub const MsgTone = enum(u8) { normal = 0, err = 1, warn = 2, prompt = 3, search = 4 };
+
+pub fn toneForKind(kind: []const u8) MsgTone {
+    return switch (levelForKind(kind)) {
+        .err => .err,
+        .warn => .warn,
+        .info => if (isInteractivePrompt(kind) or isReturnPrompt(kind))
+            .prompt
+        else if (std.mem.eql(u8, kind, "search_count"))
+            .search
+        else
+            .normal,
+    };
+}
+
+test "toneForKind" {
+    try std.testing.expectEqual(MsgTone.err, toneForKind("rpc_error"));
+    try std.testing.expectEqual(MsgTone.warn, toneForKind("wmsg"));
+    try std.testing.expectEqual(MsgTone.prompt, toneForKind("number_prompt"));
+    try std.testing.expectEqual(MsgTone.prompt, toneForKind("return_prompt"));
+    try std.testing.expectEqual(MsgTone.search, toneForKind("search_count"));
+    try std.testing.expectEqual(MsgTone.normal, toneForKind("echo"));
+}
+
 /// A route predicate. All present fields must match (logical AND); absent
 /// fields match anything.
 pub const MsgFilter = struct {
