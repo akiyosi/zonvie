@@ -10,8 +10,8 @@
 //
 // One scroll, two floats, measured against real Neovim. The `relative='win'`
 // float is pinned to a window row and is NOT repositioned; the `bufpos` float
-// is pinned to a buffer line and IS. settleFloatScrollFollowing reads that
-// batch as the measurement it is, and each float gets the answer it earned.
+// is pinned to a buffer line and IS. The flag comes from each float's
+// nvim_win_get_config (relative='win' with a bufpos), not from how it moved.
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -91,7 +91,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // One reposition. This alone used to be enough to set the flag for good.
     try h.command("lua vim.api.nvim_win_set_config(_G.e2e_fixed, {relative='win', win=0, row=7, col=2})");
     try waitAtRow(h, fixed_grid, fixed_moved_row);
-    try std.testing.expect((h.gridPos(fixed_grid) orelse unreachable).follows_scroll);
+    try std.testing.expect(!(h.gridPos(fixed_grid) orelse unreachable).follows_scroll);
 
     // bufpos pins the float to a BUFFER line, so Neovim recomputes its screen
     // row on every scroll. This is a float that really does track the buffer.

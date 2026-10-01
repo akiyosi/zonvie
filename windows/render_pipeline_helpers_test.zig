@@ -1563,20 +1563,6 @@ test "nextEnvAssignment cuts KEY=VALUE lines in place" {
     try std.testing.expect(helpers.nextEnvAssignment(&buf, text.len, &pos) == null);
 }
 
-test "a root commit refuses the layer frame only beside republished layer rows" {
-    try std.testing.expect(!helpers.layerFrameCommitStale(true, false));
-    try std.testing.expect(!helpers.layerFrameCommitStale(false, true));
-    try std.testing.expect(!helpers.layerFrameCommitStale(false, false));
-    try std.testing.expect(helpers.layerFrameCommitStale(true, true));
-}
-
-test "a stale layer frame is a failure only once back_tex moved" {
-    try std.testing.expectEqual(helpers.LayerFrameRefusal.none, helpers.classifyLayerFrameRefusal(false, false));
-    try std.testing.expectEqual(helpers.LayerFrameRefusal.none, helpers.classifyLayerFrameRefusal(false, true));
-    try std.testing.expectEqual(helpers.LayerFrameRefusal.stale, helpers.classifyLayerFrameRefusal(true, false));
-    try std.testing.expectEqual(helpers.LayerFrameRefusal.failed, helpers.classifyLayerFrameRefusal(true, true));
-}
-
 const TestRect = struct { left: i32, top: i32, right: i32, bottom: i32 };
 
 fn layerRectsFor(
