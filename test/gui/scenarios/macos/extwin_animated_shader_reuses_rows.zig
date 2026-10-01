@@ -55,13 +55,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     try g.exec("execute('set nocursorline noruler noshowcmd laststatus=0 guicursor+=a:blinkon0')");
     const before = driver.snapshotWindows(g.app_pid);
+    const open_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, {\"one\", \"two\", \"three\"}) " ++
             "vim.api.nvim_open_win(b, false, {external=true, width=40, height=12}) return 1 end)()')",
     );
     _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 1, open_mark, 10_000);
 
     const t0 = try app_log.nowMs(alloc, log_path);
     gui_io.sleepNs(idle_ms * std.time.ns_per_ms);

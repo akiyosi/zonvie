@@ -143,13 +143,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // A vertical split always fails the core's full-width row-scroll fast
     // path, so its window grid is drawn as a layer and its outgoing rows can
     // only be kept by the retention this scenario measures.
+    const setup_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("execute('set laststatus=0 noruler noshowcmd scrolloff=0 nowrap noswapfile cursorline')");
     try g.exec(
         \\setline(1, map(range(1, 400), {_, i -> printf('%3d %s', i, repeat(nr2char(65 + i % 26), 60))}))
     );
     try g.exec("execute('vsplit')");
     try g.exec("execute('normal! ggM0')");
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, setup_mark, 10_000);
 
     // Phase 1: cursor motion on a grid that has never scrolled. This is the
     // reference the defect did not touch, and it proves the oracle can read a
@@ -205,8 +206,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
 
     // Phase 2: the same cursor motion on the grid that has now scrolled.
+    const m0_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("execute('normal! M0')");
-    gui_io.sleepNs(1000 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", m0_mark, 10_000);
     const t_after = try app_log.nowMs(alloc, log_path);
     try nudgeCursor(g);
     var after_buf: [max_grids]Layer = undefined;

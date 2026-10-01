@@ -2727,10 +2727,10 @@ func ensureSurfaceRowBuffer(
         //   comparing against src alone misses it (torn row mid-scroll).
         //
         // Reuse deliberately accepts storage larger than this row needs. The
-        // oversize rejection belonged to 91bb4ad's async provisioning, which
+        // oversize rejection belonged to an earlier async provisioning, which
         // reached here with allowAllocation: false so the provisioner refilled
-        // the slot off the redraw callback; b83ff29 restored synchronous
-        // allocation at the hot sites, so the same rejection would now land as
+        // the slot off the redraw callback; synchronous allocation is back
+        // at the hot sites now, so the same rejection would now land as
         // device.makeBuffer() inside the callback (the provisioner survives as
         // the allocation-failure fallback). Whether it fires depends on how the
         // row widths a slot sees line up with the pool-and-ring cycle, not on

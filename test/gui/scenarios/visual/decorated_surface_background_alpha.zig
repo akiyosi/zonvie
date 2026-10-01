@@ -26,6 +26,7 @@ const platform = driver.platform;
 const capture = driver.capture;
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_decorated_alpha.log";
 const home_dir = "tmp/gui_home_decorated_alpha";
@@ -215,7 +216,10 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
     );
     defer alloc.free(size);
     try g.exec(size);
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
+    var size_timer = gui_io.Timer.start();
+    while (try g.evalInt("&columns") != grid_cols and size_timer.read() / std.time.ns_per_ms < 5000) {
+        gui_io.sleepNs(50 * std.time.ns_per_ms);
+    }
     if (try g.evalInt("&columns") != grid_cols) return error.GridSizeNotApplied;
 
     const hl = try std.fmt.allocPrint(
@@ -224,16 +228,18 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
         .{ guibg, guifg, guibg, guifg, guibg, guifg },
     );
     defer alloc.free(hl);
+    const before_hl = try app_log.lineMark(alloc, log_path);
     try g.exec(hl);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_hl, 10_000);
 
     const before = driver.snapshotWindows(g.app_pid);
     if (before.len == 0) return error.MainWindowNotFound;
 
     try g.remoteSend(":");
     gui_io.sleepNs(700 * std.time.ns_per_ms);
+    const before_typed = try app_log.lineMark(alloc, log_path);
     try g.remoteSend(stems);
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_typed, 10_000);
 
     const cmd_win = driver.newWindow(g.app_pid, before.slice(), 0) orelse return error.CmdlineWindowNotFound;
     if (cmd_win.bounds.w < @as(f64, @floatFromInt(x_lo + x_trailing_inset)) or cmd_win.bounds.h < 10) {

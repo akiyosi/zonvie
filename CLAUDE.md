@@ -76,6 +76,7 @@ When changing redraw or layout handling, verify the affected events against the 
 ## Conventions
 
 - Comments must be in English.
+- Comments state invariants and reasons; history (commit hashes, "previously", "this branch") belongs in commit messages.
 - Use explicit unit suffixes in names where relevant: `_px`, `_pt`, `_rows`, `_cols`, `26_6`.
 
 ## Build / Test

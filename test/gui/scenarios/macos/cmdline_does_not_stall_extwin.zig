@@ -38,6 +38,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     g.activateApp();
 
     const base_windows = g.windowCount();
+    const ext_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, false, {\"external\"}) " ++
@@ -45,7 +46,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
     try g.waitWindowCount(base_windows + 1, 10_000);
     const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
-    gui_io.sleepNs(1000 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, ext_grid, 1, ext_mark, 10_000);
 
     const t0 = try app_log.nowMs(alloc, log_path);
     var i: usize = 0;

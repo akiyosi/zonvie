@@ -641,6 +641,12 @@ pub fn pinWindow(pid: i32, x: i32, y: i32) void {
     _ = y;
 }
 
+/// Ask an app launched with ZONVIE_TEST_FULL_REDRAW=1 to clear and redraw its
+/// main window whole on the next frame (MetalTerminalView's SIGUSR2 handler).
+pub fn forceFullRedraw(pid: i32) void {
+    std.posix.kill(pid, std.posix.SIG.USR2) catch {};
+}
+
 /// Debug helper: print layer and bounds of every on-screen window owned by
 /// `pid`. Used by waitWindowCount on failure to identify stray windows.
 pub fn dumpWindowsForPid(pid: i32) void {

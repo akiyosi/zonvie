@@ -38,7 +38,7 @@
 // attribute id against ids from `hl_group_set`, two different id spaces, so
 // `glow_hl_ids` stayed empty while the log still said "glow config: enabled"
 // and the screen did not change. This scenario measured exactly that, 0.0000 in
-// both bands, until 28492df taught the core to resolve names through
+// both bands, until the core learned to resolve names through
 // `ext_hlstate`.
 //
 // Relational — the same screen with glow off and glow on — so it needs no
@@ -115,10 +115,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // the placement has reached the core, so the float below is composited at
     // the host's own origin (see extfloat_over_scrolled_anchor for why the
     // `{external=true}`-from-birth route places it differently).
+    const before_float = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 200 do l[i] = string.rep(".", 56) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_ext = vim.api.nvim_open_win(b, true, {relative="editor", row=1, col=1, width=60, height=20}) return 1 end)()')
     );
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_float, 10_000);
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
@@ -126,10 +127,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // The hosted layer: a float inside the external window whose first four
     // rows carry the glow group, then four blank rows, then four plain ones.
+    const before_hosted = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 12 do if i <= 4 then l[i] = string.rep("W", 40) else l[i] = "" end end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, false, {relative="win", win=_G.z_ext, row=3, col=2, width=44, height=12, style="minimal"}) local ns = vim.api.nvim_create_namespace("zglow") for i = 0, 3 do vim.api.nvim_buf_add_highlight(b, ns, "Search", i, 0, -1) end return 1 end)()')
     );
-    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_hosted, 10_000);
 
     var glow_off = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer glow_off.deinit(alloc);

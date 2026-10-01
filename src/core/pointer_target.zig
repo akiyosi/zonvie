@@ -3,10 +3,10 @@
 //! Both frontends were deciding this themselves, and the two answers drifted.
 //! macOS walked the grid list and had to be told separately which grids an
 //! external surface hosts — without that it hit-tested a float drawn in
-//! another window, and a wheel event on the main window scrolled it
-//! (`b7708e0`). Windows walked its layer list, which excluded those for free,
+//! another window, and a wheel event on the main window scrolled it.
+//! Windows walked its layer list, which excluded those for free,
 //! but in exchange its main-window branch applied neither the mouse flag nor
-//! the scrollability rule (`ef287bf`). Each frontend had part of the rule.
+//! the scrollability rule. Each frontend had part of the rule.
 //!
 //! The rule is here, once. The enumeration is NOT: "which grids are visible"
 //! already has one answer in `nvim_core.getVisibleGridsSnapshotLocked`, and a

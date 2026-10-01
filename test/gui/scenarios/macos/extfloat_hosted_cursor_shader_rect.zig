@@ -105,7 +105,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 200 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(), 100);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFor(alloc, log_path, "[resizeExternalWindows]", 10_000);
 
     // Cell metrics in the same drawable pixels the rect is expressed in
     // (resizeExternalWindows divides these by the backing scale to get points).
@@ -158,10 +158,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // sends a cursor for the new placement rather than leaving the old rect
     // standing.
     const t1 = try app_log.nowMs(alloc, log_path);
+    const close_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("luaeval('(function() vim.api.nvim_win_close(_G.z_float, true) return 1 end)()')");
-    gui_io.sleepNs(300 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 1, close_mark, 10_000);
+    const reopen_mark = try app_log.lineMark(alloc, log_path);
     try openFloatAt(g, row_b, col_b);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 1, reopen_mark, 10_000);
 
     const at_b = try waitCursorRect(alloc, t1, 10_000);
     std.debug.print("[gui] hosted-float cursor rect at col {d}: ({d:.0},{d:.0})\n", .{ col_b, at_b.x, at_b.y });

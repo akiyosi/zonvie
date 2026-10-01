@@ -112,9 +112,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
         "luaeval('(function() _G.z_ext = vim.api.nvim_open_win(0, true, {{external=true, width={d}, height={d}}}) return 1 end)()')",
         .{ ext_cols, ext_rows },
     );
+    const open_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(open_cmd);
     const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", open_mark, 10_000);
 
     // Start with the cursor on the last visible row, so every `j` scrolls.
     try g.exec("execute('normal! 100GztL')");

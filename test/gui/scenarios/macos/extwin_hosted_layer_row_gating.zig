@@ -106,7 +106,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
             std.fmt.comptimePrint("{d}", .{ext_rows}) ++ "}) return 1 end)()')",
     );
     try g.waitWindowCount(base_windows + 1, 10_000);
+    try app_log.waitFor(alloc, log_path, "[external_window] open gridId=", 10_000);
+    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
 
+    const float_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() _G.z_fbuf = vim.api.nvim_create_buf(false, true) " ++
             "local l = {} for i = 1, " ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++
@@ -117,9 +120,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             ", height=" ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++ ", style=\"minimal\"}) return 1 end)()')",
     );
     // Let the float seed itself. Its first frames legitimately draw every row.
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
-
-    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
+    try app_log.waitFramesAfter(alloc, log_path, ext_grid, 1, float_mark, 10_000);
 
     const t0 = try app_log.nowMs(alloc, log_path);
 
@@ -133,8 +134,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "luaeval('(function() vim.api.nvim_buf_set_lines(_G.z_fbuf, {d}, {d}, false, {{string.rep(\"{c}\", {d})}}) return 1 end)()')",
             .{ dirty_row, dirty_row + 1, @as(u8, 'a' + @as(u8, @intCast(i))), float_cols },
         );
+        const mark = try app_log.lineMark(alloc, log_path);
         try g.exec(expr);
-        gui_io.sleepNs(250 * std.time.ns_per_ms);
+        try app_log.waitFramesAfter(alloc, log_path, ext_grid, 1, mark, 10_000);
     }
 
     const t = try tally(alloc, ext_grid, t0);

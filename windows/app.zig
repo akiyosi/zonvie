@@ -246,6 +246,9 @@ pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
 /// which runs while the core's grid lock is held — taking that lock from the
 /// handler directly would self-deadlock.
 pub const WM_APP_MSG_HOVER: c.UINT = c.WM_APP + 42;
+/// Test only (ZONVIE_TEST_FULL_REDRAW=1): repaint the main window whole, so a
+/// gui-test can compare it with the partial frame before it.
+pub const WM_APP_TEST_FULL_REDRAW: c.UINT = c.WM_APP + 43;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -5249,6 +5252,9 @@ pub const App = struct {
     // Shared by every surface's row buffers.
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
+    /// WM_APP_TEST_FULL_REDRAW asked for a full repaint; the next successful
+    /// main paint is it and logs `[trace] event=full_frame_done`. UI thread.
+    test_full_redraw_armed: bool = false,
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).

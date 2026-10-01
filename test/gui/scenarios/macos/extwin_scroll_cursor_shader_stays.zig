@@ -102,6 +102,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     g.activateApp();
 
     const before = driver.snapshotWindows(g.app_pid);
+    const ext_mark = try app_log.lineMark(alloc, log_path);
 
     // The cursor sits mid-buffer, so <C-e> scrolls the view while the cursor
     // keeps its line: the rect moves one row per key and the ease holds it.
@@ -116,7 +117,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "return 1 end)()')",
     );
     _ = try driver.waitNewWindow(g.app_pid, before.slice(),150);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", ext_mark, 10_000);
 
     const t0 = try app_log.nowMs(alloc, log_path);
     const topline_before = try g.evalInt("line('w0')");

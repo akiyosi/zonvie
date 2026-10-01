@@ -96,6 +96,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // A long buffer in the main window, then a stack of bufpos-anchored
     // floats over it. They are unfocused so the wheel scrolls the buffer
     // underneath rather than a float's own contents.
+    const floats_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         "luaeval('(function() " ++
             "local lines = {} for i = 1, 800 do lines[i] = string.rep(\"line \" .. i .. \" \", 8) end " ++
@@ -113,7 +114,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             ", focusable=false, zindex=50, style=\"minimal\"}) end " ++
             "return 1 end)()')",
     );
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, floats_mark, 10_000);
 
     const open_floats = try g.evalInt("luaeval('#_G.e2e_floats')");
     if (open_floats != float_count) {
