@@ -2406,6 +2406,10 @@ pub const SurfacePaintState = struct {
     /// free entry has `grid_id == 0` and keeps its storage for the next grid.
     layers: std.ArrayListUnmanaged(LayerPaintState) = .empty,
     layer_row_vb_retained_bytes: usize = 0,
+    /// The damage spans and redraw bands of the paint being drawn
+    /// (planLayerFrame), reused so a paint does not allocate.
+    damage_spans: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
+    bands: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
 
     pub fn layerState(self: *SurfacePaintState, grid_id: i64) ?*LayerPaintState {
         for (self.layers.items) |*s| {
@@ -2450,6 +2454,8 @@ pub const SurfacePaintState = struct {
             s.draw_rows.deinit(alloc);
         }
         self.layers.deinit(alloc);
+        self.damage_spans.deinit(alloc);
+        self.bands.deinit(alloc);
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
         self.scroll_rows_merge_scratch.deinit(alloc);
@@ -3635,9 +3641,15 @@ pub const LayerFramePlanParams = struct {
     preserve_back: bool,
     cursor_grid: i64,
     last_cursor_row: ?u32,
-    /// The root grid's rows this paint redraws. Each paints its own band over
-    /// whatever sits under it.
-    rows_to_draw: []const u32,
+    /// Rows of the cursor's grid the overlay would otherwise erase: where the
+    /// previous cursor was baked into back_tex, and where this one lands.
+    cursor_erase_rows: [2]?u32 = .{ null, null },
+    /// The root grid's rows this paint redraws. The plan adds the root rows
+    /// its bands reach, so it is sorted and unique on return as on entry.
+    rows_to_draw: *std.ArrayListUnmanaged(u32),
+    scroll_rows_merge_scratch: *std.ArrayListUnmanaged(u32),
+    /// The root grid's row count.
+    root_rows: u32,
     /// The rectangle the root's GPU scroll copied, in back_tex pixels, or null
     /// when the root did not shift. Every pixel inside it moved, including the
     /// layers drawn there, while the root only redraws the band it vacated.
@@ -3652,37 +3664,6 @@ fn markDrawRows(state: *LayerPaintState, row_start: usize, row_end: usize) void 
     const start = @min(row_start, end);
     if (start == end) return;
     state.draw_rows.setRangeValue(.{ .start = start, .end = end }, true);
-}
-
-/// Add the cursor's row to its layer's redraw set, after planLayerFrame
-/// settled it and before drawSurfaceLayers consumes it. False means this frame
-/// will not draw that row, so the caller cannot promise the overlay it was
-/// repainted.
-///
-/// The row arrives too late for planLayerFrame's own propagation, so it
-/// carries its own: drawing it rewrites the whole row rectangle, so a layer
-/// over it loses those pixels and has to be marked as well -- and so does a
-/// layer over THAT one, which is why this replays the same back-to-front walk
-/// rather than marking the overlapping layers once.
-pub fn markLayerCursorRow(
-    src: LayerFrameSource,
-    layers: []const SurfaceLayer,
-    cursor_grid: i64,
-    row: u32,
-    cell_w_px: i32,
-    row_h_px: i32,
-) bool {
-    if (layers.len <= 1 or row_h_px <= 0) return false;
-    const li = for (layers[1..], 1..) |layer, i| {
-        if (layer.grid_id == cursor_grid) break i;
-    } else return false;
-    const state = src.paint.layerState(cursor_grid) orelse return false;
-    // A layer redrawing whole already propagated in planLayerFrame.
-    if (state.draw_all) return true;
-    if (row >= src.rows(layers[li]).len or row >= state.draw_rows.bit_length) return false;
-    state.draw_rows.set(row);
-    propagateLayerRedraw(src, layers, li, cell_w_px, row_h_px);
-    return true;
 }
 
 /// No copy ran, so the whole scroll region still holds pre-scroll pixels: the
@@ -3711,54 +3692,40 @@ fn refuseLayerBlit(
     markDrawRows(state, rows[0], rows[1]);
 }
 
-/// Mark the rows of every layer above `li` that `band` covers. Only a layer
-/// whose columns overlap the one at `li` can lose pixels to it.
-fn markLayersOverBand(
-    paint: *SurfacePaintState,
-    layers: []const SurfaceLayer,
-    li: usize,
-    band_top_px: i32,
-    band_bottom_px: i32,
-    cell_w_px: i32,
-    row_h_px: i32,
-) void {
-    const src = layers[li];
-    const left = src.x_px;
-    const right = left + @as(i32, @intCast(src.cols)) * cell_w_px;
-    for (layers[li + 1 ..]) |above| {
-        const above_state = paint.layerState(above.grid_id) orelse continue;
-        if (above_state.draw_all) continue;
-        const a_left = above.x_px;
-        const a_right = a_left + @as(i32, @intCast(above.cols)) * cell_w_px;
-        if (a_right <= left or a_left >= right) continue;
-        const rows = core.row_scroll.bandLayerRows(
-            band_top_px,
-            band_bottom_px,
-            above.y_px,
-            above.rows,
-            row_h_px,
-        ) orelse continue;
-        markDrawRows(above_state, rows[0], @as(usize, rows[1]) + 1);
-    }
+/// Whether this frame redraws `row` of layer `grid_id`, after planLayerFrame.
+pub fn layerRowDrawn(paint: *SurfacePaintState, grid_id: i64, row: u32) bool {
+    const state = paint.layerState(grid_id) orelse return false;
+    if (state.draw_all) return true;
+    return row < state.draw_rows.bit_length and state.draw_rows.isSet(row);
 }
 
-/// Decide which rows of each non-root layer this paint has to draw, and shift
-/// on the GPU the ones whose scroll a copy of their own rectangle can serve.
-/// Runs before the root rows for the same reason applyScrollShift does: the
-/// copy has to land before anything paints over the band it moves.
-/// `src.paint` must already hold a state for every layer (syncLayers).
+/// Decide which rows of every layer this paint draws, and shift on the GPU
+/// the ones whose scroll a copy of their own rectangle can serve. Runs before
+/// the root rows for the same reason applyScrollShift does: the copy has to
+/// land before anything paints over the band it moves.
+///
+/// What the layers owe, the root's dirty rows and the cursor's rows become
+/// the core's damage bands (damage_bands.zig), and every layer, the root
+/// included, redraws the rows those bands reach. A band spans the whole
+/// surface, so a lower layer's repaint reaches the layers over it without a
+/// propagation of its own. The bands are left in `src.paint.bands` for the
+/// present damage. `src.paint` must already hold a state for every layer
+/// (syncLayers).
 pub fn planLayerFrame(
     g: *d3d11.Renderer,
     src: LayerFrameSource,
     layers: []const SurfaceLayer,
     p: LayerFramePlanParams,
-) void {
+) error{OutOfMemory}!void {
+    const paint = src.paint;
+    paint.bands.clearRetainingCapacity();
     if (layers.len <= 1 or p.row_h_px <= 0) return;
     const n = layers.len;
+    const h = p.row_h_px;
 
     // 1. Take the damage this paint consumed and settle the redraw decision.
     for (layers[1..n]) |layer| {
-        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const state = paint.layerState(layer.grid_id) orelse continue;
         const row_limit = src.rows(layer).len;
         var grow_failed = false;
         if (state.draw_rows.bit_length < row_limit) {
@@ -3766,7 +3733,7 @@ pub fn planLayerFrame(
                 grow_failed = true;
             };
         }
-        if (!resizeRowVBsForPaint(src.alloc, &state.row_vbs, src.budget, &src.paint.layer_row_vb_retained_bytes, row_limit))
+        if (!resizeRowVBsForPaint(src.alloc, &state.row_vbs, src.budget, &paint.layer_row_vb_retained_bytes, row_limit))
             grow_failed = true;
         if (state.draw_rows.bit_length > 0) state.draw_rows.unsetAll();
         const dmg = src.damageFor(layer.grid_id);
@@ -3790,50 +3757,12 @@ pub fn planLayerFrame(
         if (state.draw_scroll) |s| shiftRowVBs(state.row_vbs.items, s.rows_delta, s.row_start, s.row_end);
     }
 
-    // 2. Rows a root dirty band overpaints. A root row that resolves to
-    //    nothing counts: cursor damage reaches the root's dirty set as a rect
-    //    and has to propagate to the layer under it.
-    for (layers[1..n]) |layer| {
-        const state = src.paint.layerState(layer.grid_id) orelse continue;
-        if (state.draw_all) continue;
-        for (p.rows_to_draw) |row| {
-            const band_top: i32 = @as(i32, @intCast(row)) * p.row_h_px;
-            const rows = core.row_scroll.bandLayerRows(
-                band_top,
-                band_top + p.row_h_px,
-                layer.y_px,
-                layer.rows,
-                p.row_h_px,
-            ) orelse continue;
-            markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
-        }
-    }
-
-    // 2b. Rows the root's own GPU scroll displaced. The copy moved every pixel
-    //     of its rectangle, a layer sitting inside it included, but the root
-    //     redraws only the band it vacated -- so the rest of that layer keeps
-    //     the pixels the copy dragged it to. The region is always full width.
-    if (p.root_scroll_rect) |sr| {
-        for (layers[1..n]) |layer| {
-            const state = src.paint.layerState(layer.grid_id) orelse continue;
-            if (state.draw_all) continue;
-            const rows = core.row_scroll.bandLayerRows(
-                sr.top - p.y_offset,
-                sr.bottom - p.y_offset,
-                layer.y_px,
-                layer.rows,
-                p.row_h_px,
-            ) orelse continue;
-            markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
-        }
-    }
-
-    // 3. The refusal ladder, back-to-front. Order matters twice: a rung only
+    // 2. The refusal ladder, back-to-front. Order matters twice: a rung only
     //    runs once the cheaper ones passed, and an accepted copy is always the
     //    lowest in the stack, so the marking below it stays one-directional.
     const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
     for (layers[1..n], 1..) |layer, li| {
-        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const state = paint.layerState(layer.grid_id) orelse continue;
         const scroll = state.draw_scroll orelse continue;
         const origin_x: i32 = p.x_offset + layer.x_px;
         const origin_y: i32 = p.y_offset + layer.y_px;
@@ -3856,7 +3785,7 @@ pub fn planLayerFrame(
                 @as(i32, @intCast(layer.cols)) * p.cell_w_px,
                 p.content_right,
                 tex_h,
-                p.row_h_px,
+                h,
             ) orelse break :ladder "plan";
             plan = made;
 
@@ -3866,10 +3795,10 @@ pub fn planLayerFrame(
                 .left = origin_x,
                 .top = origin_y,
                 .right = origin_x + @as(i32, @intCast(layer.cols)) * p.cell_w_px,
-                .bottom = origin_y + @as(i32, @intCast(layer.rows)) * p.row_h_px,
+                .bottom = origin_y + @as(i32, @intCast(layer.rows)) * h,
             };
             for (layers[1..li]) |below| {
-                const below_state = src.paint.layerState(below.grid_id) orelse continue;
+                const below_state = paint.layerState(below.grid_id) orelse continue;
                 const r = below_state.draw_blit_rect orelse continue;
                 if (render_pipeline_helpers.blitRectsIntersect(layer_rect, r))
                     break :ladder "overlap";
@@ -3882,10 +3811,10 @@ pub fn planLayerFrame(
             // core's rows_delta, which counts rows the content moved up.
             const ok = g.scrollBackTex(.{
                 .left = origin_x,
-                .top = origin_y + @as(i32, @intCast(scroll.row_start)) * p.row_h_px,
+                .top = origin_y + @as(i32, @intCast(scroll.row_start)) * h,
                 .right = origin_x + made.copy_w_px,
-                .bottom = origin_y + @as(i32, @intCast(made.clamped_row_end)) * p.row_h_px,
-            }, -scroll.rows_delta * p.row_h_px);
+                .bottom = origin_y + @as(i32, @intCast(made.clamped_row_end)) * h,
+            }, -scroll.rows_delta * h);
             if (!ok) break :ladder "plan";
             if (p.log_enabled) {
                 const us = @as(f64, @floatFromInt(core.clock.nowNs() - t0)) / 1000.0;
@@ -3898,7 +3827,7 @@ pub fn planLayerFrame(
         };
 
         if (refusal) |reason| {
-            refuseLayerBlit(state, layer.grid_id, scroll, origin_y, tex_h, p.row_h_px, reason, p.log_enabled);
+            refuseLayerBlit(state, layer.grid_id, scroll, origin_y, tex_h, h, reason, p.log_enabled);
             continue;
         }
 
@@ -3918,10 +3847,10 @@ pub fn planLayerFrame(
                 above.rows,
                 above.cols,
                 p.cell_w_px,
-                p.row_h_px,
+                h,
             ) orelse continue;
             if (over.above) |a| {
-                if (src.paint.layerState(above.grid_id)) |above_state| {
+                if (paint.layerState(above.grid_id)) |above_state| {
                     markDrawRows(above_state, a[0], @as(usize, a[1]) + 1);
                 }
             }
@@ -3948,90 +3877,74 @@ pub fn planLayerFrame(
         state.draw_blit_rect = core.row_scroll.blitRect(pl);
     }
 
-    // 4. Rows every layer repaints over the layers above it. A layer owns the
-    //    whole rectangle of each row it draws, so drawing one erases what a
-    //    layer over it had there, and that layer draws nothing this paint
-    //    unless it is marked too.
-    propagateLayerRedraw(src, layers, 1, p.cell_w_px, p.row_h_px);
-}
-
-/// Carry each layer's redraw rows into the layers above it, from `start_li` up.
-/// Back to front, because a layer marked by a lower one has to be the source of
-/// the next step: a layer that overlaps none of the marked rows' columns can
-/// still sit over one that does, and it loses its pixels to that one's row.
-/// Idempotent -- the sets are bitsets, so a second run over the same layers
-/// only adds what the first could not see.
-fn propagateLayerRedraw(
-    src: LayerFrameSource,
-    layers: []const SurfaceLayer,
-    start_li: usize,
-    cell_w_px: i32,
-    row_h_px: i32,
-) void {
-    if (start_li >= layers.len) return;
-    for (layers[start_li..], start_li..) |layer, li| {
-        const state = src.paint.layerState(layer.grid_id) orelse continue;
+    // 3. Everything owed, as surface pixel spans.
+    const spans = &paint.damage_spans;
+    spans.clearRetainingCapacity();
+    const root = layers[0];
+    try spans.ensureUnusedCapacity(src.alloc, p.rows_to_draw.items.len + 3);
+    for (p.rows_to_draw.items) |row| {
+        const top = root.y_px + @as(i32, @intCast(row)) * h;
+        spans.appendAssumeCapacity(.{ .top_px = top, .bottom_px = top + h });
+    }
+    if (p.root_scroll_rect) |sr| spans.appendAssumeCapacity(.{ .top_px = sr.top - p.y_offset, .bottom_px = sr.bottom - p.y_offset });
+    for (layers[1..n]) |layer| {
+        const state = paint.layerState(layer.grid_id) orelse continue;
         const row_limit = src.rows(layer).len;
         if (row_limit == 0) continue;
         if (state.draw_all) {
-            markLayersOverBand(
-                src.paint,
-                layers,
-                li,
-                layer.y_px,
-                layer.y_px + @as(i32, @intCast(row_limit)) * row_h_px,
-                cell_w_px,
-                row_h_px,
-            );
+            try spans.append(src.alloc, .{ .top_px = layer.y_px, .bottom_px = layer.y_px + @as(i32, @intCast(row_limit)) * h });
             continue;
         }
         var it = state.draw_rows.iterator(.{});
         while (it.next()) |ri| {
             if (ri >= row_limit) break;
-            const top = layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
-            markLayersOverBand(src.paint, layers, li, top, top + row_h_px, cell_w_px, row_h_px);
+            const top = layer.y_px + @as(i32, @intCast(ri)) * h;
+            try spans.append(src.alloc, .{ .top_px = top, .bottom_px = top + h });
         }
+        if (layer.grid_id == p.cursor_grid) {
+            for (p.cursor_erase_rows) |maybe_row| {
+                const r = maybe_row orelse continue;
+                if (r >= row_limit) continue;
+                const top = layer.y_px + @as(i32, @intCast(r)) * h;
+                try spans.append(src.alloc, .{ .top_px = top, .bottom_px = top + h });
+            }
+        }
+    }
+
+    // 4. The bands, and every row they reach.
+    try paint.bands.ensureTotalCapacity(src.alloc, @max(1, spans.items.len));
+    paint.bands.items.len = core.damage_bands.bands(spans.items, h, p.content_height, paint.bands.allocatedSlice());
+    for (paint.bands.items) |band| {
+        for (layers[1..n]) |layer| {
+            const state = paint.layerState(layer.grid_id) orelse continue;
+            if (state.draw_all) continue;
+            const rows = core.damage_bands.layerRowsForBand(band, layer.y_px, @intCast(src.rows(layer).len), h) orelse continue;
+            markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
+        }
+        const root_rows = core.damage_bands.layerRowsForBand(band, root.y_px, p.root_rows, h) orelse continue;
+        if (!render_pipeline_helpers.mergeSortedRowsWithRange(src.alloc, p.rows_to_draw, p.scroll_rows_merge_scratch, root_rows[0], root_rows[1] + 1))
+            return error.OutOfMemory;
     }
 }
 
-/// Queue the present damage of each layer this frame redraws: the rows its
-/// plan draws (plus the GPU copy and the cursor's rows), or the whole layer
-/// when it redraws whole. Their rows are not in rows_to_draw, which only
-/// covers the root grid's own dirty rows. `x_offset`/`y_offset` is where the
-/// surface's content sits in its client area; `client_right`/`client_bottom`
-/// bound the rects. A rect that cannot be queued makes the present full.
-pub fn appendLayerPresentRects(
-    src: LayerFrameSource,
-    layers: []const SurfaceLayer,
+/// Queue the bands this frame redraws as present damage, full content width.
+/// `x_offset`/`y_offset` is where the surface's content sits in its client
+/// area; `client_right`/`client_bottom` bound the rects. A rect that cannot be
+/// queued makes the present full.
+pub fn appendBandPresentRects(
+    bands: []const core.damage_bands.Band,
     x_offset: i32,
     y_offset: i32,
     client_right: i32,
     client_bottom: i32,
-    row_h_px: i32,
-    cell_w_px: i32,
-    cursor_grid: i64,
-    cursor_rows: [2]?u32,
     present: *PresentRectBuilder,
 ) void {
-    if (layers.len <= 1) return;
-    for (layers[1..]) |layer| {
-        if (present.full) return;
-        const state = src.paint.layerState(layer.grid_id) orelse continue;
-        const layer_cursor_rows: [2]?u32 = if (layer.grid_id == cursor_grid) cursor_rows else .{ null, null };
-        if (!state.drawsAnything() and layer_cursor_rows[0] == null and layer_cursor_rows[1] == null) continue;
-        render_pipeline_helpers.appendLayerDrawRects(c.RECT, present.alloc, present.list, .{
-            .left_px = x_offset + layer.x_px,
-            .top_px = y_offset + layer.y_px,
-            .width_px = @as(i32, @intCast(layer.cols)) * cell_w_px,
-            .row_h_px = row_h_px,
-            .rows = layer.rows,
-            .row_limit = src.rows(layer).len,
-            .clip_right = client_right,
-            .clip_bottom = client_bottom,
-        }, state.draw_all, &state.draw_rows, layer_cursor_rows, state.draw_blit_rect) catch {
-            present.full = true;
-        };
-    }
+    for (bands) |band| present.add(.{
+        .left = x_offset,
+        .top = y_offset + band.top_px,
+        .right = client_right,
+        .bottom = @min(client_bottom, y_offset + band.bottom_px),
+    });
 }
 
 /// A row frame refused for its vertex-buffer budget: the layer damage this
@@ -4813,10 +4726,9 @@ pub fn drawSurfaceRowFrame(
 
     // What row_already_redrawn promises drawCursorOverlay: this frame
     // repainted the cursor's OWN grid's row, so blink-on needs only the
-    // cursor quad and blink-off needs nothing. A layer's rows have to be
-    // claimed here, after planLayerFrame settled the redraw set and before
-    // drawSurfaceLayers' defer clears it; the root's went into rows_to_draw
-    // before the frame, so membership decides there.
+    // cursor quad and blink-off needs nothing. planLayerFrame put a layer
+    // cursor's rows into its bands; the root's went into rows_to_draw before
+    // the frame. Read before drawSurfaceLayers' defer clears the plan.
     var cursor_row_redrawn = in.force_full_rows;
     if (!cursor_row_redrawn) {
         var claimed = true;
@@ -4825,7 +4737,7 @@ pub fn drawSurfaceRowFrame(
             if (cursor_on_root) {
                 if (std.mem.indexOfScalar(u32, in.rows_to_draw, r) == null) claimed = false;
             } else if (in.layer_src) |src| {
-                if (!markLayerCursorRow(src, in.layers, in.cursor_grid, r, cell_w_px, row_h_px)) claimed = false;
+                if (!layerRowDrawn(src.paint, in.cursor_grid, r)) claimed = false;
             } else claimed = false;
         }
         cursor_row_redrawn = claimed;
@@ -5063,7 +4975,7 @@ pub fn drawSurfaceRowPass(
             .budget = &app.row_vb_budget,
         };
         layer_src = src;
-        planLayerFrame(g, src, layers, .{
+        try planLayerFrame(g, src, layers, .{
             .x_offset = p.x_offset,
             .y_offset = p.y_offset,
             .content_right = p.content_right,
@@ -5073,21 +4985,19 @@ pub fn drawSurfaceRowPass(
             .preserve_back = in.preserve_back,
             .cursor_grid = in.snapshot.cursor_layer_grid_id,
             .last_cursor_row = paint.last_painted_cursor_row,
-            .rows_to_draw = rows_to_draw.items,
+            .cursor_erase_rows = in.frame.cursor_erase_rows,
+            .rows_to_draw = rows_to_draw,
+            .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
+            .root_rows = in.total_rows,
             .root_scroll_rect = scroll_damage,
             .log_enabled = in.frame.log_enabled,
         });
-        if (in.layer_present) |lp| appendLayerPresentRects(
-            src,
-            layers,
+        if (in.layer_present) |lp| appendBandPresentRects(
+            paint.bands.items,
             p.x_offset,
             p.y_offset,
             lp.right,
             lp.bottom,
-            p.row_h_px,
-            in.cell_w_px,
-            lp.cursor_grid,
-            lp.cursor_rows,
             lp.present,
         );
     }
@@ -6748,65 +6658,72 @@ const LayerPlanFixture = struct {
     }
 };
 
+/// Run planLayerFrame over `fx` the way drawSurfaceRowPass does, with a root
+/// that owes nothing of its own.
+fn planForTest(
+    fx: *LayerPlanFixture,
+    a: std.mem.Allocator,
+    layers: []const SurfaceLayer,
+    row_h_px: i32,
+    cell_w_px: i32,
+    cursor_grid: i64,
+    cursor_erase_rows: [2]?u32,
+    rows_to_draw: *std.ArrayListUnmanaged(u32),
+    scratch: *std.ArrayListUnmanaged(u32),
+) !void {
+    var g: d3d11.Renderer = undefined;
+    g.height = 1000;
+    try planLayerFrame(&g, fx.src(a), layers, .{
+        .x_offset = 0,
+        .y_offset = 0,
+        .content_right = 400,
+        .content_height = @intCast(layers[0].rows * @as(u32, @intCast(row_h_px))),
+        .row_h_px = row_h_px,
+        .cell_w_px = cell_w_px,
+        .preserve_back = true,
+        .cursor_grid = cursor_grid,
+        .last_cursor_row = null,
+        .cursor_erase_rows = cursor_erase_rows,
+        .rows_to_draw = rows_to_draw,
+        .scroll_rows_merge_scratch = scratch,
+        .root_rows = layers[0].rows,
+        .log_enabled = false,
+    });
+}
+
 test "a layer's cursor row is repainted over the layers above it" {
     // A float sits over the rows the cursor's own grid owns. Repainting the
     // cursor's row rewrites the whole row rectangle, float pixels included, so
-    // the float has to be marked for those rows or it keeps the hole until
-    // something else redraws it. The cursor row is claimed after
-    // planLayerFrame settles the redraw set, which is where the mark has to
-    // reach the layers above.
+    // the float has to redraw those rows too, or it keeps the hole until
+    // something else redraws it.
     const alloc = std.testing.allocator;
     const row_h_px: i32 = 10;
     const cell_w_px: i32 = 8;
 
     const layers = [_]SurfaceLayer{
-        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 0, .follows_scroll = false },
-        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 1, .follows_scroll = false },
-        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 0, .y_px = 2 * row_h_px, .rows = 2, .cols = 10, .z = 2, .follows_scroll = false },
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 10, .cols = 20, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 10, .cols = 20, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 0, .y_px = 6 * row_h_px, .rows = 2, .cols = 10, .z = 2, .follows_scroll = false },
     };
     var fx = LayerPlanFixture{};
     defer fx.deinit(alloc);
-    try fx.init(alloc, &.{ 2, 3 }, &.{ 5, 2 }, &layers);
+    try fx.init(alloc, &.{ 2, 3 }, &.{ 10, 2 }, &layers);
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows_to_draw.deinit(alloc);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(alloc);
 
-    // Row 0 of the lower layer is dirty; the float covers rows 2 and 3, so
-    // nothing propagates to it from the core's own dirty set.
-    (fx.damage.getOrAdd(alloc, 2, 5) orelse return error.OutOfMemory).rows.set(0);
+    // Control: with the cursor far from the float, the float owes nothing.
+    try planForTest(&fx, alloc, &layers, row_h_px, cell_w_px, 2, .{ 1, null }, &rows_to_draw, &scratch);
+    try std.testing.expect(layerRowDrawn(&fx.paint, 2, 1));
+    try std.testing.expect(!layerRowDrawn(&fx.paint, 3, 0));
+    try std.testing.expect(!fx.paint.layerState(3).?.draw_all);
 
-    var g: d3d11.Renderer = undefined;
-    g.height = 1000;
-
-    planLayerFrame(&g, fx.src(alloc), &layers, .{
-        .x_offset = 0,
-        .y_offset = 0,
-        .content_right = 20 * cell_w_px,
-        .content_height = 5 * row_h_px,
-        .row_h_px = row_h_px,
-        .cell_w_px = cell_w_px,
-        .preserve_back = true,
-        .cursor_grid = 2,
-        .last_cursor_row = 2,
-        .rows_to_draw = &.{},
-        .log_enabled = false,
-    });
-
-    const under = fx.paint.layerState(2).?;
-    const over = fx.paint.layerState(3).?;
-    // Control: the plan really ran -- step 1 moves the damage into draw_rows,
-    // so a failure below cannot be an early return going unnoticed.
-    try std.testing.expect(under.draw_rows.isSet(0));
-    try std.testing.expect(!under.draw_all);
-
-    // Precondition: the float owes nothing yet.
-    try std.testing.expect(!over.draw_all);
-    try std.testing.expect(!over.draw_rows.isSet(0));
-
-    // The stationary cursor's row is claimed after the plan, e.g. so a blink
-    // can erase the previous cursor from that row.
-    try std.testing.expect(markLayerCursorRow(fx.src(alloc), &layers, 2, 2, cell_w_px, row_h_px));
-    try std.testing.expect(under.draw_rows.isSet(2));
-
-    // Lower-layer row 2 starts at y=20, which is the float's own row 0.
-    try std.testing.expect(over.draw_rows.isSet(0));
+    // The cursor on row 6 of the lower layer, which is the float's row 0.
+    rows_to_draw.clearRetainingCapacity();
+    try planForTest(&fx, alloc, &layers, row_h_px, cell_w_px, 2, .{ 6, null }, &rows_to_draw, &scratch);
+    try std.testing.expect(layerRowDrawn(&fx.paint, 2, 6));
+    try std.testing.expect(layerRowDrawn(&fx.paint, 3, 0));
 }
 
 test "a layer's cursor row reaches a float that only overlaps the float above it" {
@@ -6815,51 +6732,68 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
     //   B          40..120   overlaps A
     //   C          90..110   over B, overlapping B only
     // B repaints its whole row rectangle, so C loses its pixels to B even
-    // though C never touches A. The mark has to walk the stack, not just the
-    // layers that overlap the row's own grid.
+    // though C never touches A. A band spans the whole surface, so C is in it.
     const alloc = std.testing.allocator;
     const row_h_px: i32 = 10;
     const cell_w_px: i32 = 10;
 
     const layers = [_]SurfaceLayer{
-        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 0, .follows_scroll = false },
-        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 1, .follows_scroll = false },
-        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 40, .y_px = 2 * row_h_px, .rows = 2, .cols = 8, .z = 2, .follows_scroll = false },
-        .{ .grid_id = 4, .anchor_grid = 1, .x_px = 90, .y_px = 2 * row_h_px, .rows = 2, .cols = 2, .z = 3, .follows_scroll = false },
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 10, .cols = 12, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 10, .cols = 8, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 40, .y_px = 6 * row_h_px, .rows = 2, .cols = 8, .z = 2, .follows_scroll = false },
+        .{ .grid_id = 4, .anchor_grid = 1, .x_px = 90, .y_px = 6 * row_h_px, .rows = 2, .cols = 2, .z = 3, .follows_scroll = false },
     };
     var fx = LayerPlanFixture{};
     defer fx.deinit(alloc);
-    try fx.init(alloc, &.{ 2, 3, 4 }, &.{ 5, 2, 2 }, &layers);
-
-    var g: d3d11.Renderer = undefined;
-    g.height = 1000;
-
-    planLayerFrame(&g, fx.src(alloc), &layers, .{
-        .x_offset = 0,
-        .y_offset = 0,
-        .content_right = 200,
-        .content_height = 5 * row_h_px,
-        .row_h_px = row_h_px,
-        .cell_w_px = cell_w_px,
-        .preserve_back = true,
-        .cursor_grid = 2,
-        .last_cursor_row = 2,
-        .rows_to_draw = &.{},
-        .log_enabled = false,
-    });
+    try fx.init(alloc, &.{ 2, 3, 4 }, &.{ 10, 2, 2 }, &layers);
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows_to_draw.deinit(alloc);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(alloc);
 
     // Control: nothing owes a row before the cursor claims one.
+    try planForTest(&fx, alloc, &layers, row_h_px, cell_w_px, 2, .{ null, null }, &rows_to_draw, &scratch);
     for ([_]i64{ 2, 3, 4 }) |grid| {
         const st = fx.paint.layerState(grid).?;
         try std.testing.expect(!st.draw_all);
         try std.testing.expect(st.draw_rows.count() == 0);
     }
 
-    try std.testing.expect(markLayerCursorRow(fx.src(alloc), &layers, 2, 2, cell_w_px, row_h_px));
-
+    try planForTest(&fx, alloc, &layers, row_h_px, cell_w_px, 2, .{ 6, null }, &rows_to_draw, &scratch);
     // B is directly over the cursor's row; C is only over B.
-    try std.testing.expect(fx.paint.layerState(3).?.draw_rows.isSet(0));
-    try std.testing.expect(fx.paint.layerState(4).?.draw_rows.isSet(0));
+    try std.testing.expect(layerRowDrawn(&fx.paint, 3, 0));
+    try std.testing.expect(layerRowDrawn(&fx.paint, 4, 0));
+}
+
+test "a band redraws the root rows and layer rows one row past its edges" {
+    // The bands are the damage widened by a row each way, and each layer
+    // draws the rows meeting the band widened by one more: ink a row outside
+    // spills in is drawn too.
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 20, .cols = 20, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 20, .cols = 20, .z = 1, .follows_scroll = false },
+    };
+    var fx = LayerPlanFixture{};
+    defer fx.deinit(alloc);
+    try fx.init(alloc, &.{2}, &.{20}, &layers);
+    (fx.damage.getOrAdd(alloc, 2, 20) orelse return error.OutOfMemory).rows.set(10);
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows_to_draw.deinit(alloc);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(alloc);
+
+    try planForTest(&fx, alloc, &layers, row_h_px, 8, 1, .{ null, null }, &rows_to_draw, &scratch);
+    // One band: row 10 widened to rows 9..11.
+    try std.testing.expectEqual(@as(usize, 1), fx.paint.bands.items.len);
+    try std.testing.expectEqual(core.damage_bands.Band{ .top_px = 90, .bottom_px = 120 }, fx.paint.bands.items[0]);
+    // Each draws rows 8..12.
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11, 12 }, rows_to_draw.items);
+    for (0..20) |r| {
+        try std.testing.expectEqual(r >= 8 and r <= 12, layerRowDrawn(&fx.paint, 2, @intCast(r)));
+    }
 }
 
 test {

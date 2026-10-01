@@ -20,6 +20,7 @@ pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
+pub const damage_bands = @import("damage_bands.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
 const msg_stack = @import("msg_stack.zig");
@@ -33,6 +34,7 @@ pub const log_mod = @import("log.zig");
 
 test {
     _ = @import("abi_header_test.zig");
+    _ = damage_bands;
 }
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -1004,9 +1006,23 @@ pub export fn zonvie_core_row_scroll_dirty_rows_without_blit(
     return true;
 }
 
-pub export fn zonvie_core_band_layer_rows(
-    band_top_px: i32,
-    band_bottom_px: i32,
+/// See `damage_bands.bands`. The Windows frontend calls it directly as Zig.
+pub export fn zonvie_core_damage_bands(
+    spans: ?[*]const damage_bands.Band,
+    span_count: usize,
+    row_height_px: i32,
+    surface_height_px: i32,
+    out: ?[*]damage_bands.Band,
+    out_capacity: usize,
+) callconv(.c) usize {
+    const dst = out orelse return 0;
+    const src: []const damage_bands.Band = if (spans) |s| s[0..span_count] else &.{};
+    return damage_bands.bands(src, row_height_px, surface_height_px, dst[0..out_capacity]);
+}
+
+/// See `damage_bands.layerRowsForBand`.
+pub export fn zonvie_core_damage_band_layer_rows(
+    band: damage_bands.Band,
     origin_y_px: i32,
     layer_rows: u32,
     row_height_px: i32,
@@ -1015,19 +1031,28 @@ pub export fn zonvie_core_band_layer_rows(
 ) callconv(.c) bool {
     const f = out_first_row orelse return false;
     const l = out_last_row orelse return false;
-    const rows = row_scroll.bandLayerRows(
-        band_top_px,
-        band_bottom_px,
-        origin_y_px,
-        layer_rows,
-        row_height_px,
-    ) orelse return false;
+    const rows = damage_bands.layerRowsForBand(band, origin_y_px, layer_rows, row_height_px) orelse return false;
     f.* = rows[0];
     l.* = rows[1];
     return true;
 }
 
-/// Layout must match `zonvie_row_scroll_merge` in include/zonvie_core.h.
+/// See `damage_bands.bandForLayerRow`.
+pub export fn zonvie_core_damage_band_for_layer_row(
+    bands: ?[*]const damage_bands.Band,
+    band_count: usize,
+    origin_y_px: i32,
+    row: u32,
+    row_height_px: i32,
+    out_band: ?*damage_bands.Band,
+) callconv(.c) bool {
+    const dst = out_band orelse return false;
+    const list: []const damage_bands.Band = if (bands) |b| b[0..band_count] else &.{};
+    dst.* = damage_bands.bandForLayerRow(list, origin_y_px, row, row_height_px) orelse return false;
+    return true;
+}
+
+/// Layout must match `zonvie_row_scroll_merge` in include/zonvie_frontend.h.
 pub const RowScrollMergeC = extern struct {
     staged: row_scroll.Staged,
     superseded: row_scroll.Staged,
@@ -1074,7 +1099,7 @@ pub export fn zonvie_core_row_scroll_merge(
     return true;
 }
 
-/// Layout must match `zonvie_over_blit_rows` in include/zonvie_core.h. The
+/// Layout must match `zonvie_over_blit_rows` in include/zonvie_frontend.h. The
 /// core answers in Zig optionals; C gets a flag beside each range.
 pub const OverBlitRowsC = extern struct {
     above_first: u32,

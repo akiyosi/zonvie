@@ -153,6 +153,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// This surface's own grid is not a layer here; the main renderer's entry 0
     /// is its root.
     private var layerSnapshot: [SurfaceLayerFrame] = []
+    /// This frame's damage bands. Draw thread only.
+    private let damageBands = SurfaceDamageBands()
     /// Rows each hosted layer's committed placement has travelled upwards
     /// since this surface began, in the same units and direction as
     /// on_grid_scroll's rowsDelta. The float ledger's other half; the main
@@ -326,9 +328,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         defer { lock.unlock() }
         guard let layer = (pendingSurfaceLayers ?? committedSurfaceLayers).first(where: { $0.gridId == id }) else { return }
         let height = max(1, Float(shared.cellHeightPx).rounded(.up))
-        // Include the adjacent rows for glyph ink crossing a cell boundary.
-        let first = max(0, Int(floor(layer.originPx.y / height)) + rowStart - 1)
-        let end = min(Int(gridRows), Int(ceil(layer.originPx.y / height)) + rowEnd + 1)
+        // The host rows the layer rows cover; the draw's damage bands add the
+        // neighbours glyph ink can cross into.
+        let first = max(0, Int(floor(layer.originPx.y / height)) + rowStart)
+        let end = min(Int(gridRows), Int(ceil(layer.originPx.y / height)) + rowEnd)
         if first < end { flushDirtyRows.insert(integersIn: first..<end) }
     }
 
@@ -2771,6 +2774,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // compaction only shortens the array in place, so this adds no
             // heap work to the frame.
             surfaceSortAndDeduplicateRows(&dirtyRows)
+            // The core's damage bands (SurfaceDamageBands): the root and every
+            // hosted layer repaint the rows the bands reach, clipped to the
+            // band, so a partial frame equals a full one inside each band.
+            damageBands.reset()
+            if rowMode && !dirtyRows.isEmpty && Int(cellHi) > 0 {
+                damageBands.addRows(dirtyRows, originYPx: 0, rowHeightPx: Int(cellHi))
+                damageBands.resolve(rowHeightPx: Int(cellHi), surfaceHeightPx: backTex.height)
+                damageBands.layerRows(originYPx: 0, rowCount: safeRowCount, rowHeightPx: Int(cellHi), into: &dirtyRows)
+            }
             if let scroll = pendingScroll {
                 ZonvieCore.appLog("[ext_scroll_draw] gridId=\(gridId) delta=\(scroll.rowsDelta) rows=\(scroll.rowStart)..<\(scroll.rowEnd) may=\(mayGpuScrollCopy) used=\(useGpuScrollCopy) newCommit=\(hasNewCommit) layout=\(layoutDamageSnapshot) font=\(committedFontIsCurrent) presented=\(hasPresentedOnce) smooth=\(smoothScrolling) size=\(drawableSizeChanged) submitted=\(submittedDirtyRows.count) dirty=\(dirtyRows.count) rev=\(currentCommitRevision)")
             }
@@ -2947,38 +2959,21 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                         )
                     }
                     if partialHostedContents && !glow {
-                        // Recompose each dirty surface band back-to-front.
-                        // Every layer is clipped to the band the root erased,
-                        // so unchanged pixels are neither cleared nor blended.
+                        // Recompose each damage band back-to-front. Every
+                        // layer is clipped to the band the root erased, so
+                        // unchanged pixels are neither cleared nor blended.
                         var encodedRows = 0
-                        // One band per RUN of contiguous dirty rows, not per
-                        // row. A run's scissor is exactly the union of its
-                        // rows' scissors, so the clipping is unchanged — but
-                        // the layer row range each band expands to carries a
-                        // row of padding at both ends for ink crossing a cell
-                        // boundary, and per-row bands make neighbouring ranges
-                        // overlap. Measured on an 8-row float over an external
-                        // window with 8 dirty rows: 22 row draws per frame,
-                        // 2.75x what drawing every row once would cost.
-                        var runStart = 0
-                        while runStart < dirtyRows.count {
-                            var runEnd = runStart
-                            while runEnd + 1 < dirtyRows.count,
-                                  dirtyRows[runEnd + 1] == dirtyRows[runEnd] + 1 {
-                                runEnd += 1
-                            }
-                            let firstRow = dirtyRows[runStart]
-                            let lastRow = dirtyRows[runEnd]
-                            runStart = runEnd + 1
-                            let top = max(scissor.y, firstRow * Int(cellHi))
-                            let bottom = min(scissor.y + scissor.height, (lastRow + 1) * Int(cellHi))
+                        for band in damageBands.bands {
+                            let top = max(scissor.y, Int(band.top_px))
+                            let bottom = min(scissor.y + scissor.height, Int(band.bottom_px))
                             guard top < bottom else { continue }
                             encoder.setScissorRect(MTLScissorRect(x: scissor.x, y: top,
                                 width: scissor.width, height: bottom - top))
-                            let first = max(0, Int(floor((Float(top) - origin.y) / Float(cellHi))) - 1)
-                            let end = min(rows, Int(ceil((Float(bottom) - origin.y) / Float(cellHi))) + 1)
-                            guard first < end else { continue }
-                            encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: first..<end,
+                            guard let bandRows = SurfaceDamageBands.rows(
+                                in: band, originYPx: Int(origin.y.rounded(.down)),
+                                rowCount: rows, rowHeightPx: Int(cellHi)
+                            ) else { continue }
+                            encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: bandRows,
                                 resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
                                 pipeline: pipeline, backgroundPipeline: shared.backgroundPipeline,
                                 glyphPipeline: shared.glyphPipeline, useTwoPass: use2Pass,
@@ -3114,7 +3109,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                         pipeline: pipeline,
                         shared: shared,
                         bgRGB: surfaceBgRGB,
-                        gridId: gridId
+                        gridId: gridId,
+                        damageBands: damageBands.bands
                     )
                 }
 

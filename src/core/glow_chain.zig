@@ -44,7 +44,7 @@ pub const Pass = extern struct {
     dst_h_px: u32,
 };
 
-/// Layout must match `zonvie_glow_chain` in include/zonvie_core.h.
+/// Layout must match `zonvie_glow_chain` in include/zonvie_frontend.h.
 pub const Chain = extern struct {
     half_w_px: u32,
     half_h_px: u32,

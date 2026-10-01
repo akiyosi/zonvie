@@ -1,5 +1,5 @@
 // born_external_anchor_float — a float anchored to an external window must be
-// composited into that window's rows, whichever way the window became external.
+// composited into that window, whichever way the window became external.
 //
 // An external grid can reach `external_grids` two ways, and only one of them
 // leaves a position behind. Split-then-detach sends `win_pos` first, so
@@ -8,33 +8,26 @@
 // gets a `win_pos`, and `win_external_pos` carries no coordinates, so
 // start_row keeps its -1 initialiser.
 //
-// A float anchored to an external window is not a main-surface layer
-// (`collectMainLayerEntries` skips it); it is composited into the anchor's own
-// rows instead. Both halves of that compositing read the float's stored
-// win_pos against the anchor's origin — `Grid.dirtyCompositedRow` and
-// `buildExternalFloatRowIndexWithLimits` — and that origin is 0 for an anchor
-// with no position of its own, which is exactly the base redraw_handler used
-// when it stored the float's coordinates. Reading a negative start_row as "no
-// compositing" instead would leave the born-external route drawn by nobody.
+// A float anchored to an external window is not a main-surface layer; it is
+// placed in the anchor's own surface instead. The float's stored win_pos is
+// read against the anchor's origin, which is 0 for an anchor with no position
+// of its own — exactly the base redraw_handler used when it stored the float's
+// coordinates. Reading a negative start_row as "no compositing" instead would
+// leave the born-external route drawn by nobody.
 //
-// This is a dirty-row oracle only. Marking the rows is necessary but not
-// sufficient: a fix that repaired `dirtyCompositedRow` alone, leaving the row
-// index unbuilt, would still turn this green while the float stayed invisible.
-// The pixel side is gui/scenarios/visual/extfloat_over_born_external_anchor.
-//
-// The dirty set is what a frontend would be asked to repaint, and this harness
-// leaves `on_vertices_row` null so it only accumulates — clearing it right
-// before the float opens makes the rows that opening dirtied readable.
+// The oracle is the layout the core publishes for the anchor's surface: where
+// it places the float is what the frontend draws it at. The pixel side is
+// gui/scenarios/visual/extfloat_over_born_external_anchor.
 //
 // The oracle is differential: the split-then-detach route is the control that
-// says what compositing looks like. If the control dirties nothing the harness
+// says what compositing looks like. If the control places nothing the harness
 // is broken, not the product, and this reports that instead.
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
 
 /// Where the float sits inside the anchor, and how tall. Strictly inside the
-/// anchor's 20 rows, so every covered row has an anchor row to land on.
+/// anchor's 20 rows.
 const float_row: u32 = 8;
 const float_height: u32 = 6;
 
@@ -44,10 +37,9 @@ const Observation = struct {
     ext_grid: i64,
     start_row: i32,
     float_grid: i64,
-    /// Rows of the anchor under the float that the open marked for repaint.
-    covered_dirty: u32,
-    /// Rows anywhere in the anchor that the open marked for repaint.
-    total_dirty: u32,
+    /// Where the anchor's surface layout placed the float, or null when it
+    /// placed it nowhere.
+    placed_y_px: ?i32,
 };
 
 fn contains(ids: []const i64, id: i64) bool {
@@ -102,26 +94,6 @@ fn observe(alloc: std.mem.Allocator, route: Route) !Observation {
     const before_pos = try h.positionedGridsAlloc(alloc);
     defer alloc.free(before_pos);
 
-    // The anchor's own content must have dirtied something before the clear.
-    // Without that, a zero below could just mean this grid has no readable
-    // dirty set rather than that nothing composited into it.
-    var setup_dirty: u32 = 0;
-    var sr: u32 = 0;
-    while (sr < ext_size.rows) : (sr += 1) {
-        if (h.isRowDirty(ext_grid, sr)) setup_dirty += 1;
-    }
-    if (setup_dirty == 0) {
-        std.debug.print(
-            "[e2e] anchor grid {d} reported no dirty rows even for its own content; its dirty set is not readable\n",
-            .{ext_grid},
-        );
-        return error.AnchorDirtySetUnreadable;
-    }
-
-    // Everything the anchor's own content dirtied belongs to the setup, not to
-    // the float; only what follows this line is the measurement.
-    h.clearDirtyRows(ext_grid);
-
     try h.command(
         "lua _G.e2e_float = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, " ++
             "{relative='win', win=_G.e2e_anchor, row=8, col=2, width=20, height=6, style='minimal'})",
@@ -151,20 +123,21 @@ fn observe(alloc: std.mem.Allocator, route: Route) !Observation {
     }
     if (float_grid == 0) return error.FloatNotAnchoredToExternal;
 
-    var out: Observation = .{
+    // The layout reaches the frontend with the flush that follows the float's
+    // placement; give it that flush.
+    const CtxPlaced = struct { ext: i64, float: i64 };
+    h.waitUntil(CtxPlaced{ .ext = ext_grid, .float = float_grid }, struct {
+        fn check(c: CtxPlaced, hh: *Harness) bool {
+            return hh.layoutPlacement(c.ext, c.float) != null;
+        }
+    }.check, h.opts.timeout_ms) catch {};
+
+    return .{
         .ext_grid = ext_grid,
         .start_row = h.externalGridStartRow(ext_grid),
         .float_grid = float_grid,
-        .covered_dirty = 0,
-        .total_dirty = 0,
+        .placed_y_px = if (h.layoutPlacement(ext_grid, float_grid)) |p| p.y_px else null,
     };
-    var r: u32 = 0;
-    while (r < ext_size.rows) : (r += 1) {
-        if (!h.isRowDirty(ext_grid, r)) continue;
-        out.total_dirty += 1;
-        if (r >= float_row and r < float_row + float_height) out.covered_dirty += 1;
-    }
-    return out;
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -172,33 +145,29 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const suspect = try observe(alloc, .born_external);
 
     std.debug.print(
-        "[e2e] born_external_anchor_float: split-then-detach start_row={d} covered_dirty={d}/{d} total_dirty={d}\n" ++
-            "[e2e] born_external_anchor_float: born-external     start_row={d} covered_dirty={d}/{d} total_dirty={d}\n",
-        .{
-            control.start_row, control.covered_dirty, float_height, control.total_dirty,
-            suspect.start_row, suspect.covered_dirty, float_height, suspect.total_dirty,
-        },
+        "[e2e] born_external_anchor_float: split-then-detach start_row={d} placed_y_px={?d}\n" ++
+            "[e2e] born_external_anchor_float: born-external     start_row={d} placed_y_px={?d}\n",
+        .{ control.start_row, control.placed_y_px, suspect.start_row, suspect.placed_y_px },
     );
 
     // Vacuity gate: without a control that composites, any number on the
     // suspect route says nothing about the product.
-    if (control.covered_dirty != float_height) {
+    const control_y = control.placed_y_px orelse {
         std.debug.print(
-            "[e2e] the CONTROL route marked {d} of the {d} rows its float covers (start_row={d}); " ++
+            "[e2e] the CONTROL route's layout placed no float in its anchor (start_row={d}); " ++
                 "this measurement proves nothing\n",
-            .{ control.covered_dirty, float_height, control.start_row },
+            .{control.start_row},
         );
         return error.ControlDidNotComposite;
-    }
+    };
 
-    // The two routes must be indistinguishable from the anchor's dirty set.
-    if (suspect.covered_dirty != float_height) {
+    // The two routes must place the float identically in the anchor.
+    if (suspect.placed_y_px == null or suspect.placed_y_px.? != control_y) {
         std.debug.print(
-            "[e2e] a float over an anchor born external (start_row={d}) marked {d} of the {d} rows it covers " ++
-                "for repaint, while the same float over a detached-split anchor (start_row={d}) marked {d}. " ++
-                "The float's win_pos was stored against an origin of 0, so every consumer must read it back " ++
-                "against 0 too\n",
-            .{ suspect.start_row, suspect.covered_dirty, float_height, control.start_row, control.covered_dirty },
+            "[e2e] a float over an anchor born external (start_row={d}) was placed at y={?d}, while the same " ++
+                "float over a detached-split anchor (start_row={d}) was placed at y={d}. The float's win_pos " ++
+                "was stored against an origin of 0, so every consumer must read it back against 0 too\n",
+            .{ suspect.start_row, suspect.placed_y_px, control.start_row, control_y },
         );
         return error.BornExternalAnchorNeverComposites;
     }

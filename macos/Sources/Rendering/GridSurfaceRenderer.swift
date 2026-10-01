@@ -122,27 +122,111 @@ extension RowScrollBlitPlan {
     }
 }
 
-/// Which of a layer's own rows a full-width damage band overpaints, inclusive.
-/// The arithmetic is `src/core/row_scroll.zig`, which the Windows driver calls
-/// as Zig; this is the same answer through the C ABI.
-func layerRowsUnderBand(
-    bandTopPx: Int,
-    bandBottomPx: Int,
-    layer: SurfaceLayer,
-    rowHeightPx: Int
-) -> ClosedRange<Int>? {
-    var firstRow: UInt32 = 0
-    var lastRow: UInt32 = 0
-    guard zonvie_core_band_layer_rows(
-        Int32(clamping: bandTopPx),
-        Int32(clamping: bandBottomPx),
-        Int32(clamping: Int(layer.originPx.y.rounded(.down))),
-        UInt32(clamping: layer.rows),
-        Int32(clamping: rowHeightPx),
-        &firstRow,
-        &lastRow
-    ) else { return nil }
-    return Int(firstRow)...Int(lastRow)
+/// The bands a partial frame repaints (`src/core/damage_bands.zig`, which the
+/// Windows driver calls as Zig; this is the same answer through the C ABI),
+/// and the rows of each layer it draws there. The arrays are reused, so a
+/// frame allocates nothing once they have grown.
+final class SurfaceDamageBands {
+    private(set) var bands: [zonvie_damage_band] = []
+    private var spans: [zonvie_damage_band] = []
+    /// Each layer's placement as the last frame drew it, in paint order.
+    private var drawnPlacements: [(gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int)] = []
+
+    func reset() {
+        spans.removeAll(keepingCapacity: true)
+        bands.removeAll(keepingCapacity: true)
+    }
+
+    var hasSpans: Bool { !spans.isEmpty }
+
+    /// Damage what moving, resizing, restacking, adding or removing a layer
+    /// exposed: its old extent and its new one. The core no longer dirties
+    /// the root rows under a layer for that; the pixels are this surface's.
+    /// Records `frames` as drawn, so call it once per frame.
+    func addPlacementChanges(_ frames: [SurfaceLayerFrame], rowHeightPx: Int) {
+        func placement(_ layer: SurfaceLayer) -> (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int) {
+            let top = Int(layer.originPx.y.rounded(.down))
+            return (layer.gridId, top, top + layer.rows * rowHeightPx, Int(layer.originPx.x.rounded(.down)), layer.cols)
+        }
+        func same(_ a: (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int),
+                  _ b: (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int)) -> Bool {
+            a.gridId == b.gridId && a.topPx == b.topPx && a.bottomPx == b.bottomPx && a.leftPx == b.leftPx && a.cols == b.cols
+        }
+        // Paint order matters too: a restack changes which layer wins the
+        // pixels they share, so a layer at a different index is damaged.
+        for (i, old) in drawnPlacements.enumerated() {
+            if i < frames.count, same(old, placement(frames[i].layer)) { continue }
+            addSpan(topPx: old.topPx, bottomPx: old.bottomPx)
+        }
+        for (i, frame) in frames.enumerated() {
+            let now = placement(frame.layer)
+            if i < drawnPlacements.count, same(drawnPlacements[i], now) { continue }
+            addSpan(topPx: now.topPx, bottomPx: now.bottomPx)
+        }
+        drawnPlacements.removeAll(keepingCapacity: true)
+        for frame in frames { drawnPlacements.append(placement(frame.layer)) }
+    }
+
+    func addSpan(topPx: Int, bottomPx: Int) {
+        spans.append(zonvie_damage_band(top_px: Int32(clamping: topPx), bottom_px: Int32(clamping: bottomPx)))
+    }
+
+    func addRows<S: Sequence>(_ rows: S, originYPx: Int, rowHeightPx: Int) where S.Element == Int {
+        for row in rows where row >= 0 {
+            let top = originYPx + row * rowHeightPx
+            addSpan(topPx: top, bottomPx: top + rowHeightPx)
+        }
+    }
+
+    /// Fold the spans added since reset() into bands.
+    func resolve(rowHeightPx: Int, surfaceHeightPx: Int) {
+        let capacity = max(1, spans.count)
+        bands.removeAll(keepingCapacity: true)
+        bands.append(contentsOf: repeatElement(zonvie_damage_band(), count: capacity))
+        let count = spans.withUnsafeBufferPointer { src in
+            bands.withUnsafeMutableBufferPointer { dst in
+                zonvie_core_damage_bands(
+                    src.baseAddress, src.count,
+                    Int32(clamping: rowHeightPx), Int32(clamping: surfaceHeightPx),
+                    dst.baseAddress, dst.count
+                )
+            }
+        }
+        bands.removeLast(capacity - count)
+    }
+
+    /// The rows of a layer at `originYPx` the bands reach, in order and each
+    /// once (the bands are three rows apart), replacing `rows`.
+    func layerRows(originYPx: Int, rowCount: Int, rowHeightPx: Int, into rows: inout [Int]) {
+        rows.removeAll(keepingCapacity: true)
+        for band in bands {
+            guard let r = Self.rows(in: band, originYPx: originYPx, rowCount: rowCount, rowHeightPx: rowHeightPx) else { continue }
+            rows.append(contentsOf: r)
+        }
+    }
+
+    /// The rows of a layer at `originYPx` one band repaints.
+    static func rows(in band: zonvie_damage_band, originYPx: Int, rowCount: Int, rowHeightPx: Int) -> ClosedRange<Int>? {
+        var first: UInt32 = 0
+        var last: UInt32 = 0
+        guard zonvie_core_damage_band_layer_rows(
+            band, Int32(clamping: originYPx), UInt32(clamping: rowCount),
+            Int32(clamping: rowHeightPx), &first, &last
+        ) else { return nil }
+        return Int(first)...Int(last)
+    }
+
+    /// The band `row` of a layer at `originYPx` is drawn in.
+    func band(forRow row: Int, originYPx: Int, rowHeightPx: Int) -> zonvie_damage_band? {
+        var out = zonvie_damage_band()
+        let found = bands.withUnsafeBufferPointer { b in
+            zonvie_core_damage_band_for_layer_row(
+                b.baseAddress, b.count, Int32(clamping: originYPx), UInt32(clamping: row),
+                Int32(clamping: rowHeightPx), &out
+            )
+        }
+        return found ? out : nil
+    }
 }
 
 /// What a scroll blit under `plan` did to `layer`, drawn over the blitted
@@ -864,9 +948,53 @@ func encodeSurfaceRootRowPass(
     pipeline: MTLRenderPipelineState,
     shared: SharedRenderResources,
     bgRGB: UInt32,
-    gridId: Int64
+    gridId: Int64,
+    /// The frame's damage bands, when the surface draws its dirty rows by
+    /// band (SurfaceDamageBands); empty for one scissor per row.
+    damageBands: [zonvie_damage_band] = []
 ) {
+    /// The dirty rows one band at a time, under the band's clip: the
+    /// background bands are cut to it, so a row it reaches only through its
+    /// extra row clears nothing outside the band.
+    func drawDirtyRowsByBand(twoPass: Bool) {
+        let cellHeightPx = geometry.cellHeightPx
+        for band in damageBands {
+            guard let rows = SurfaceDamageBands.rows(
+                in: band, originYPx: 0, rowCount: rowCount, rowHeightPx: cellHeightPx
+            ) else { continue }
+            guard let sr = clampScissor(
+                x: 0, y: Int(band.top_px), width: geometry.drawableWidthPx,
+                height: Int(band.bottom_px - band.top_px),
+                targetWidth: geometry.renderTargetWidthPx, targetHeight: geometry.renderTargetHeightPx
+            ) else { continue }
+            enc.setScissorRect(sr)
+            encodeSurfaceDirtyRowBands(
+                encoder: enc,
+                rows: rows,
+                pipeline: twoPass ? (shared.backgroundPipeline ?? pipeline) : pipeline,
+                cellHeightPx: cellHeightPx,
+                widthPx: geometry.bandWidthPx,
+                heightPx: geometry.bandHeightPx,
+                bgRGB: bgRGB,
+                gridId: gridId
+            )
+            _ = encodeSurfaceRowDraws(
+                encoder: enc,
+                rows: rows,
+                resolve: resolveRow,
+                pipeline: pipeline,
+                backgroundPipeline: twoPass ? shared.backgroundPipeline : nil,
+                glyphPipeline: twoPass ? shared.glyphPipeline : nil,
+                useTwoPass: twoPass,
+                unifiedBlurPipeline: twoPass ? shared.unifiedBlurPipeline : nil
+            )
+        }
+    }
     func drawScissoredDirtyRows() {
+        if !damageBands.isEmpty {
+            drawDirtyRowsByBand(twoPass: false)
+            return
+        }
         encodeSurfaceScissoredDirtyRows(
             encoder: enc,
             rows: dirtyRows,
@@ -878,6 +1006,10 @@ func encodeSurfaceRootRowPass(
         )
     }
     func drawScissoredDirtyRowsTwoPass() {
+        if !damageBands.isEmpty {
+            drawDirtyRowsByBand(twoPass: true)
+            return
+        }
         if let backgroundPipeline = shared.backgroundPipeline {
             encodeSurfaceDirtyRowBands(
                 encoder: enc,
@@ -1543,6 +1675,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var committedSurfaceLayers: [SurfaceLayer] = [
         SurfaceLayer(gridId: 1, anchorGrid: 1, originPx: simd_float2(0, 0), rows: 0, cols: 0, z: 0, followsScroll: false)
     ]                                                    // Protected by lock
+    /// A commit changed the placement; the next frame owes what it exposed.
+    private var layoutDamagePending = false              // Protected by lock
     private var writeSetIndex: Int = 0       // Core thread only
     private var mainWritePrepared = false    // Core thread only
     /// Whether this bracket dirtied any layer grid's rows. The root grid's own
@@ -2011,6 +2145,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Per-frame snapshot taken under `lock`, reused across frames. Entry 0 is
     /// this surface's root grid, which every draw loop below skips.
     private var layerSnapshot: [SurfaceLayerFrame] = []
+    /// This frame's damage bands. Draw thread only.
+    private let damageBands = SurfaceDamageBands()
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
     /// Protected by `lock`; an entry is created when a grid first submits a row
     /// or a scroll and released when the grid is destroyed.
@@ -2603,6 +2739,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 cellHeightPx: ledgerCellHeightPx,
                 into: &layerPlacementRowsUp
             )
+            // The pixels a move, resize, restack or removal exposes are this
+            // surface's to repaint (SurfaceDamageBands.addPlacementChanges),
+            // so a placement change alone is work for the next frame.
+            if staged.count != committedSurfaceLayers.count
+                || zip(staged, committedSurfaceLayers).contains(where: {
+                    $0.gridId != $1.gridId || $0.originPx != $1.originPx
+                        || $0.rows != $1.rows || $0.cols != $1.cols
+                }) {
+                layoutDamagePending = true
+            }
             for layer in staged where layer.gridId != 1 {
                 let previous = committedSurfaceLayers.first { $0.gridId == layer.gridId }
                 guard let state = layerDrawStates[layer.gridId] else { continue }
@@ -3255,6 +3401,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             layerSnapshot.removeAll(keepingCapacity: true)
+            if layoutDamagePending {
+                layoutDamagePending = false
+                anyLayerWork = true
+            }
             for layer in committedSurfaceLayers {
                 // Only a grid the committed layout places is consumed. Work
                 // staged for one not on screen yet waits for the layout that
@@ -3892,95 +4042,58 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
             scrollBlitEncoder?.endEncoding()
 
-            // Every root dirty row is overpainted below with a background band
-            // spanning the whole drawable width, which .load makes mandatory:
-            // the core drops default-background runs from the root's rows while
-            // the surface has layers (flush.zig `skip_default_bg`), so a root
-            // row would otherwise keep the pixels it lost or re-blend the ones
-            // it kept. The band also erases layer pixels, so mark the grid-local
-            // rows it lands on here, where the damage is produced; the layer
-            // then repaints those rows instead of all of them.
+            // What this frame owes, as the core's damage bands: the root's
+            // dirty rows and each layer's own rows, or the whole layer when it
+            // redraws whole. Every root row is overpainted with a background
+            // band spanning the drawable, which .load makes mandatory (the core
+            // drops default-background runs from the root's rows while the
+            // surface has layers, flush.zig `skip_default_bg`), and that band
+            // erases the layers' pixels. Every layer therefore redraws the rows
+            // the bands reach, clipped to the band each belongs to: inside a
+            // band the frame equals a full redraw, ink that crosses a row
+            // boundary included, and a lower layer's repaint reaches the layers
+            // over it with no propagation of its own.
             let bandRowHeightPx = Int(cellHi)
-            if layerSnapshot.count > 1 && bandRowHeightPx > 0 {
-                for row in dirtyRows {
-                    let bandTopPx = row * bandRowHeightPx
-                    for entry in layerSnapshot.dropFirst() {
-                        let layer = entry.layer
-                        guard let state = entry.state else { continue }
-                        guard let rows = layerRowsUnderBand(
-                            bandTopPx: bandTopPx,
-                            bandBottomPx: bandTopPx + bandRowHeightPx,
-                            layer: layer,
-                            rowHeightPx: bandRowHeightPx
-                        ) else { continue }
-                        state.drawRows.append(contentsOf: rows)
+            let drawsBands = layerSnapshot.count > 1 && bandRowHeightPx > 0
+            damageBands.reset()
+            if drawsBands {
+                let rootOriginYPx = Int(rootLayerOrigin.y.rounded(.down))
+                damageBands.addPlacementChanges(layerSnapshot, rowHeightPx: bandRowHeightPx)
+                damageBands.addRows(dirtyRows, originYPx: rootOriginYPx, rowHeightPx: bandRowHeightPx)
+                for (li, entry) in layerSnapshot.enumerated().dropFirst() {
+                    let layer = entry.layer
+                    let rowCount = layerResolvableRowCount(li, layer)
+                    guard rowCount > 0 else { continue }
+                    let topPx = Int(layer.originPx.y.rounded(.down))
+                    // `loadActionIsClear: false` for the same reason the blit
+                    // ladder passes it: a frame that does clear redraws every
+                    // layer whole anyway, so the disagreement cannot lose a row.
+                    if let state = entry.state, !layerNeedsAllRows(
+                        state: state,
+                        rowCount: rowCount,
+                        retainedRowCount: collectLayerRetainedRows(layer.gridId),
+                        loadActionIsClear: false
+                    ) {
+                        damageBands.addRows(state.drawRows, originYPx: topPx, rowHeightPx: bandRowHeightPx)
+                    } else {
+                        damageBands.addSpan(topPx: topPx, bottomPx: topPx + rowCount * bandRowHeightPx)
                     }
+                }
+                damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: backTex.height)
+                if rowMode {
+                    damageBands.layerRows(
+                        originYPx: rootOriginYPx, rowCount: safeRowCount,
+                        rowHeightPx: bandRowHeightPx, into: &dirtyRows)
+                }
+                for (li, entry) in layerSnapshot.enumerated().dropFirst() {
+                    guard let state = entry.state else { continue }
+                    damageBands.layerRows(
+                        originYPx: Int(entry.layer.originPx.y.rounded(.down)),
+                        rowCount: layerResolvableRowCount(li, entry.layer),
+                        rowHeightPx: bandRowHeightPx, into: &state.drawRows)
                 }
             }
 
-            // Rows every layer repaints over the layers above it. A layer owns
-            // the whole rectangle of each row it draws, so drawing one erases
-            // what a layer over it had there, and that layer draws nothing this
-            // frame unless it is marked too. An accepted blit is already handled
-            // above; this covers the rest — a refused one, and any ordinary
-            // dirty-row or whole-layer repaint. Back to front, so a mark lands
-            // before the layer carrying it becomes the source of the next one.
-            func markLayersOverBand(
-                _ li: Int,
-                _ leftPx: Int,
-                _ rightPx: Int,
-                _ bandTopPx: Int,
-                _ bandBottomPx: Int
-            ) {
-                let rowHeightPx = Int(cellHi)
-                guard rowHeightPx > 0 else { return }
-                for mi in (li + 1)..<layerSnapshot.count {
-                    let above = layerSnapshot[mi].layer
-                    guard let aboveState = layerSnapshot[mi].state, above.cols > 0 else { continue }
-                    let aLeftPx = Int(above.originPx.x.rounded(.down))
-                    let aRightPx = aLeftPx + above.cols * Int(cellWi)
-                    guard aLeftPx < rightPx, aRightPx > leftPx else { continue }
-                    guard let rows = layerRowsUnderBand(
-                        bandTopPx: bandTopPx,
-                        bandBottomPx: bandBottomPx,
-                        layer: above,
-                        rowHeightPx: rowHeightPx
-                    ) else { continue }
-                    aboveState.drawRows.append(contentsOf: rows)
-                }
-            }
-            // Back to front, and each layer is normalized before it becomes a
-            // source: only lower layers write to a higher one, so a layer's
-            // list is final by the time its turn comes. Propagating it with
-            // duplicates still in it would copy every duplicate into every
-            // layer above, doubling the count per overlapping layer. The
-            // frontmost layer marks nothing but is normalized here too, so no
-            // separate pass follows.
-            for (li, entry) in layerSnapshot.enumerated().dropFirst() {
-                let layer = entry.layer
-                guard let state = entry.state else { continue }
-                surfaceSortAndDeduplicateRows(&state.drawRows)
-                guard layer.rows > 0, layer.cols > 0, bandRowHeightPx > 0 else { continue }
-                let leftPx = Int(layer.originPx.x.rounded(.down))
-                let rightPx = leftPx + layer.cols * Int(cellWi)
-                let topPx = Int(layer.originPx.y.rounded(.down))
-                // `loadActionIsClear: false` for the same reason the blit
-                // ladder passes it: a frame that does clear redraws every
-                // layer whole anyway, so the disagreement cannot lose a row.
-                if layerNeedsAllRows(
-                    state: state,
-                    rowCount: layerResolvableRowCount(li, layer),
-                    retainedRowCount: collectLayerRetainedRows(layer.gridId),
-                    loadActionIsClear: false
-                ) {
-                    markLayersOverBand(li, leftPx, rightPx, topPx, topPx + layer.rows * bandRowHeightPx)
-                    continue
-                }
-                for row in state.drawRows where row >= 0 && row < layer.rows {
-                    let bandTopPx = topPx + row * bandRowHeightPx
-                    markLayersOverBand(li, leftPx, rightPx, bandTopPx, bandTopPx + bandRowHeightPx)
-                }
-            }
 
             // --- 1) Render into back buffer (partial redraw is valid here) ---
             let rpd = MTLRenderPassDescriptor()
@@ -4155,7 +4268,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     pipeline: shared.pipeline!,
                     shared: shared,
                     bgRGB: snappedBgRGB,
-                    gridId: 1
+                    gridId: 1,
+                    damageBands: drawsBands ? damageBands.bands : []
                 )
             }
 
@@ -4277,7 +4391,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     } else {
-                        let dirtyLayerRows = st!.drawRows
                         // The band this layer's GPU scroll copy vacated, in the
                         // layer's own pixel space. Drawn before the rows: the
                         // plan's dirty rows cover the band and must land on top.
@@ -4292,32 +4405,36 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 gridId: layer.gridId
                             )
                         }
-                        if !dirtyLayerRows.isEmpty {
-                            encodedRows += clearEmptyLayerRows(dirtyLayerRows)
+                        // One damage band at a time, clipped to the band and to
+                        // the layer the way a full redraw clips it, so a row's
+                        // ink reaches its neighbours here exactly as it does
+                        // there. A row the band only reaches through its extra
+                        // row is cleared and drawn under the same clip: outside
+                        // the band nothing of it lands.
+                        let layerBottomPx = originY + rowCount * Int(cellHi) + scissorPadY
+                        for band in damageBands.bands {
+                            guard let rows = SurfaceDamageBands.rows(
+                                in: band, originYPx: originY, rowCount: rowCount, rowHeightPx: Int(cellHi)
+                            ) else { continue }
+                            let top = max(Int(band.top_px), originY)
+                            let bottom = min(Int(band.bottom_px), layerBottomPx)
+                            guard let sr = clampScissor(
+                                x: originX, y: top, width: widthPx, height: bottom - top,
+                                targetWidth: backTex.width, targetHeight: backTex.height
+                            ) else { continue }
+                            enc.setScissorRect(sr)
+                            encodedRows += clearEmptyLayerRows(rows)
+                            encodedRows += encodeSurfaceRowDraws(
+                                encoder: enc,
+                                rows: rows,
+                                resolve: resolveLayerRow,
+                                pipeline: shared.pipeline!,
+                                backgroundPipeline: shared.backgroundPipeline,
+                                glyphPipeline: shared.glyphPipeline,
+                                useTwoPass: use2Pass,
+                                unifiedBlurPipeline: shared.unifiedBlurPipeline
+                            )
                         }
-                        // One scissor per dirty row, the root's precedent for a
-                        // dirty-only draw. makeRowScissorRect cannot serve here:
-                        // it pins x to 0, and a layer starts at its own origin.
-                        encodedRows += encodeSurfaceRowDraws(
-                            encoder: enc,
-                            rows: dirtyLayerRows,
-                            resolve: resolveLayerRow,
-                            scissor: { row in
-                                clampScissor(
-                                    x: originX,
-                                    y: originY + row * Int(cellHi),
-                                    width: widthPx,
-                                    height: Int(cellHi) + scissorPadY,
-                                    targetWidth: backTex.width,
-                                    targetHeight: backTex.height
-                                )
-                            },
-                            pipeline: shared.pipeline!,
-                            backgroundPipeline: shared.backgroundPipeline,
-                            glyphPipeline: shared.glyphPipeline,
-                            useTwoPass: use2Pass,
-                            unifiedBlurPipeline: shared.unifiedBlurPipeline
-                        )
                     }
                     st?.lastDrawnRowCount = rowCount
                     // rows= counts the row draws encoded (drawn rows plus

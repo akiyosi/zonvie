@@ -1,12 +1,17 @@
 //! Checks every extern struct the core shares with frontends against its
-//! declaration in include/zonvie_core.h, as the C compiler lays it out.
-//! Fields are matched by position, since several Zig names differ from C.
+//! declaration in include/zonvie_core.h or include/zonvie_frontend.h, as the
+//! C compiler lays it out. Fields are matched by position, since several Zig
+//! names differ from C.
 
 const std = @import("std");
-const c = @cImport(@cInclude("zonvie_core.h"));
+const c = @cImport({
+    @cInclude("zonvie_core.h");
+    @cInclude("zonvie_frontend.h");
+});
 
 const c_api = @import("c_api.zig");
 const row_scroll = @import("row_scroll.zig");
+const damage_bands = @import("damage_bands.zig");
 const cursor_rect = @import("cursor_rect.zig");
 const win_layout = @import("win_layout.zig");
 const pointer_target = @import("pointer_target.zig");
@@ -27,6 +32,7 @@ const pairs = .{
     .{ c.zonvie_tab_entry, c_api.TabEntry },
     .{ c.zonvie_buffer_entry, c_api.BufferEntry },
     .{ c.zonvie_row_scroll_plan, row_scroll.Plan },
+    .{ c.zonvie_damage_band, damage_bands.Band },
     .{ c.zonvie_over_blit_rows, c_api.OverBlitRowsC },
     .{ c.zonvie_row_scroll, row_scroll.Staged },
     .{ c.zonvie_row_scroll_merge, c_api.RowScrollMergeC },
