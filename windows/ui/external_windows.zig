@@ -763,16 +763,7 @@ fn drawNormalExternalSurfaceRowMode(
     // A layer's own rows can be the only thing that changed: the host was
     // invalidated for exactly that, and grid 1 holds no cells under
     // ext_multigrid, so rows_to_draw is empty and the layer would never draw.
-    const any_layer_dirty = blk_dirty: {
-        if (!has_layers) break :blk_dirty false;
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        for (tbs_snap.layers.slice()[1..]) |layer| {
-            const state = app.layer_grids.get(layer.grid_id) orelse continue;
-            if (state.dirty) break :blk_dirty true;
-        }
-        break :blk_dirty false;
-    };
+    const any_layer_dirty = has_layers and tbs_snap.layer_damage.len != 0;
     // A committed scroll is work too: acquireForPaint has already consumed
     // it, so returning here would lose the back_tex and row-VB shift for good.
     const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
@@ -793,7 +784,6 @@ fn drawNormalExternalSurfaceRowMode(
         // The root layer drives the pixel space core vertices arrive in.
         .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
         .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
-        .bloom_layers = if (has_layers) .{ .app = app, .layers = tbs_snap.layers.slice() } else null,
     };
 
     // Damage for this frame: every row span plus one rectangle per layer. The
@@ -816,7 +806,7 @@ fn drawNormalExternalSurfaceRowMode(
         .preserve_back = paint_policy.preserve_back,
         .cell_w_px = @intCast(@max(1, app.cell_w_px)),
         .layer_present = .{
-            .rects = present.list,
+            .present = &present,
             .right = @intCast(g.width),
             .bottom = @intCast(draw_params.content_height),
             .cursor_grid = tbs_snap.cursor_layer_grid_id,
@@ -834,8 +824,6 @@ fn drawNormalExternalSurfaceRowMode(
             .cursor_layer_origin = .{ @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px) },
             .blink_visible = cursor_blink_visible,
             .force_full_rows = force_full_rows,
-            .layer_layout_stale = false,
-            .layer_commit_stale = false,
             .glow = if (glow.enabled) app_mod.RowFrameGlow{
                 .intensity = glow.intensity,
                 .radius_scale = glow.radius_scale,
@@ -845,12 +833,6 @@ fn drawNormalExternalSurfaceRowMode(
             .log_enabled = log_enabled,
         },
     });
-    if (pass.stale) {
-        // Nothing reached back_tex but the scrollbar underlay restore, whose
-        // strip spans every row: hand the damage back for a repaint now.
-        ext_win.surf.tbs.returnUndrawnDamage(dirty_row_keys, force_full_rows or restored_scrollbar_rect != null);
-        return error.LayerFrameStale;
-    }
     const row_frame = pass.frame;
     const scroll_damage = pass.scroll_damage;
 
@@ -2975,8 +2957,7 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
 }
 
 /// An external window's renderer, at creation and at device-loss rebuild. It
-/// shares the App device (app.layer_grids row buffers are drawn by whichever
-/// surface places the grid), so until that is published there is none, and
+/// shares the App device, so until that is published there is none, and
 /// it loads the main window's custom post-process shaders so overlays get the
 /// same effect through their own back_tex.
 pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
@@ -3473,14 +3454,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             tbs_snapshot,
             row_h_px_snapshot,
         ) catch |e| {
-            if (e == error.LayerFrameStale) {
-                // Not a failure: no backoff, no full repaint.
-                _ = c.InvalidateRect(hwnd, null, 0);
-                return;
-            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
-                app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
+                app_mod.failRowVbBudget(app, &ext_win.surf.tbs, tbs_snapshot.layers.slice());
                 return;
             }
             requeueExternalFullPaint(app, grid_id, hwnd);

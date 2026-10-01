@@ -541,6 +541,36 @@ pub const VertexSet = struct {
     // Shared font/cell/linespace generation used to build row NDC. Main
     // drawable-only resizes deliberately do not affect this value.
     metrics_gen: u64 = 0,
+    /// Rows of the non-root grids this surface places as layers. They rotate
+    /// with the root rows, so a paint reads every grid from one commit. The
+    /// list never shrinks: a free entry has `grid_id == 0` and keeps its map's
+    /// capacity for the next grid.
+    layer_rows: std.ArrayListUnmanaged(LayerRows) = .empty,
+
+    pub fn layerRows(self: *const VertexSet, grid_id: i64) ?*const LayerRows {
+        for (self.layer_rows.items) |*lr| {
+            if (lr.grid_id == grid_id) return lr;
+        }
+        return null;
+    }
+
+    fn layerRowsMut(self: *VertexSet, grid_id: i64) ?*LayerRows {
+        for (self.layer_rows.items) |*lr| {
+            if (lr.grid_id == grid_id) return lr;
+        }
+        return null;
+    }
+
+    fn freeLayerEntry(alloc: std.mem.Allocator, pool: *SlotPool, lr: *LayerRows) void {
+        for (lr.row_map.items) |m| pool.release(alloc, m.slot);
+        lr.row_map.items.len = 0;
+        lr.grid_id = 0;
+    }
+
+    /// Release every layer row slot; entries keep their map capacity.
+    pub fn releaseLayerSlots(self: *VertexSet, alloc: std.mem.Allocator, pool: *SlotPool) void {
+        for (self.layer_rows.items) |*lr| freeLayerEntry(alloc, pool, lr);
+    }
 
     pub fn ensureRowStorage(self: *VertexSet, alloc: std.mem.Allocator, row: u32) bool {
         const need: usize = @intCast(row + 1);
@@ -576,9 +606,102 @@ pub const VertexSet = struct {
     }
 
     /// Free VertexSet-owned arrays. Slot memory is owned by SlotPool.
-    /// Caller must releaseAllSlots before calling this.
+    /// Caller must releaseAllSlots and releaseLayerSlots before calling this.
     pub fn deinitCpu(self: *VertexSet, alloc: std.mem.Allocator) void {
         self.row_map.deinit(alloc);
+        for (self.layer_rows.items) |*lr| lr.row_map.deinit(alloc);
+        self.layer_rows.deinit(alloc);
+    }
+};
+
+/// One non-root grid's rows inside a VertexSet, slots from the surface's pool.
+pub const LayerRows = struct {
+    grid_id: i64 = 0,
+    row_map: std.ArrayListUnmanaged(RowMapping) = .empty,
+};
+
+/// What the core changed in one layer grid since the last paint, for the
+/// paint to turn into redraw rows and a GPU copy.
+pub const LayerDamage = struct {
+    grid_id: i64 = 0,
+    rows: std.DynamicBitSetUnmanaged = .{},
+    full: bool = false,
+    scroll: ?LayerScroll = null,
+
+    fn markRows(self: *LayerDamage, row_start: usize, row_end: usize) void {
+        const end = @min(row_end, self.rows.bit_length);
+        const start = @min(row_start, end);
+        if (start == end) return;
+        self.rows.setRangeValue(.{ .start = start, .end = end }, true);
+    }
+
+    /// Fold a shift into this damage: the bits travel with the rows, the band
+    /// it vacated is owed, and the rest of the region is a GPU copy the paint
+    /// still owes. Two shifts of different regions cannot be one copy, so
+    /// neither runs and both regions are redrawn.
+    fn addShift(self: *LayerDamage, s: LayerScroll) void {
+        render_pipeline_helpers.shiftRowBits(&self.rows, s.row_start, s.row_end, s.rows_delta);
+        const shift: u32 = @intCast(@abs(s.rows_delta));
+        if (s.rows_delta > 0) {
+            self.markRows(s.row_end - shift, s.row_end);
+        } else {
+            self.markRows(s.row_start, s.row_start + shift);
+        }
+        switch (render_pipeline_helpers.mergeLayerScroll(self.scroll, s)) {
+            .accumulate => |merged| self.scroll = merged,
+            .conflict => |both| {
+                self.markRows(both.old.row_start, both.old.row_end);
+                self.markRows(both.new.row_start, both.new.row_end);
+                self.scroll = null;
+            },
+        }
+    }
+};
+
+/// Per-grid damage, kept in a list that never shrinks so its bitsets are
+/// reused; entries past `len` are free.
+pub const LayerDamageList = struct {
+    items: std.ArrayListUnmanaged(LayerDamage) = .empty,
+    len: usize = 0,
+
+    pub fn slice(self: *const LayerDamageList) []const LayerDamage {
+        return self.items.items[0..self.len];
+    }
+
+    pub fn find(self: *const LayerDamageList, grid_id: i64) ?*const LayerDamage {
+        for (self.items.items[0..self.len]) |*d| {
+            if (d.grid_id == grid_id) return d;
+        }
+        return null;
+    }
+
+    /// The entry for `grid_id`, sized to `rows`, added clear when missing.
+    /// Null on allocation failure, in which case the caller owes a full paint.
+    fn getOrAdd(self: *LayerDamageList, alloc: std.mem.Allocator, grid_id: i64, rows: usize) ?*LayerDamage {
+        const d = for (self.items.items[0..self.len]) |*d| {
+            if (d.grid_id == grid_id) break d;
+        } else blk: {
+            if (self.len == self.items.items.len) self.items.append(alloc, .{}) catch return null;
+            const d = &self.items.items[self.len];
+            self.len += 1;
+            d.grid_id = grid_id;
+            d.full = false;
+            d.scroll = null;
+            if (d.rows.bit_length > 0) d.rows.unsetAll();
+            break :blk d;
+        };
+        if (d.rows.bit_length < rows) d.rows.resize(alloc, rows, false) catch return null;
+        return d;
+    }
+
+    pub fn clear(self: *LayerDamageList) void {
+        self.len = 0;
+    }
+
+    fn deinit(self: *LayerDamageList, alloc: std.mem.Allocator) void {
+        for (self.items.items) |*d| d.rows.deinit(alloc);
+        self.items.deinit(alloc);
+        self.len = 0;
     }
 };
 
@@ -612,16 +735,9 @@ pub const PaintSnapshot = struct {
     /// Which grid owns the cursor in this committed set, from the same
     /// transaction as the cursor vertices themselves.
     cursor_layer_grid_id: i64 = 1,
-    /// The placement generation the two fields above were taken from, so the
-    /// paint can tell that the core has published a newer one since.
-    layout_gen: u64 = 0,
-    /// The commit this snapshot pinned `committed_index` from. A later commit
-    /// rotates that index away while the layer rows this paint draws beside it
-    /// advance in place, so the paint has to tell that the two halves it holds
-    /// are no longer from one flush.
-    commit_rev: u64 = 0,
-    /// `layer_rows_rev` as it stood at the same moment.
-    layer_rows_rev: u64 = 0,
+    /// Layer damage taken with this snapshot. Owned by the outermost paint
+    /// until the next one; empty for a re-entrant paint.
+    layer_damage: []const LayerDamage = &.{},
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -646,12 +762,6 @@ pub const TripleBufferedSurface = struct {
     write_index: u8 = 0,
     committed_index: u8 = 1,
     is_in_flush: bool = false,
-    commit_rev: u64 = 0,
-    /// Bumped by every commit whose flush republished layer rows in place.
-    /// Moved together with commit_rev under this lock, so a paint can tell a
-    /// root commit that left the layers alone from one that did not.
-    layer_rows_rev: u64 = 0,
-    flush_layer_rows: bool = false,
 
     // Per-set UI read refcount (rotation_mu protected).
     // Re-entrant WM_PAINT: DXGIs Present/ResizeBuffers can pump messages,
@@ -701,11 +811,12 @@ pub const TripleBufferedSurface = struct {
     /// callback and promoted with the cursor set.
     flush_cursor_layer_grid_id: ?i64 = null,
     committed_cursor_layer_grid_id: i64 = 1,
-    /// Bumped by every commit that promotes either of the two fields above.
-    /// A paint pins them at acquireForPaint but reads the rows they place
-    /// later, under app.mu, so this is what tells it the two came from
-    /// different flushes.
-    layout_publish_gen: u64 = 0,
+
+    /// Layer damage of the open flush (core thread), accumulated since the
+    /// last paint (rotation_mu), and taken by the outermost paint (UI thread).
+    flush_layer_damage: LayerDamageList = .{},
+    pending_layer_damage: LayerDamageList = .{},
+    paint_layer_damage: LayerDamageList = .{},
 
     // Pending scroll state (rotation_mu protected).
     // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
@@ -769,6 +880,7 @@ pub const TripleBufferedSurface = struct {
         // to the committed snapshot. Dimension/layout barriers use the old
         // full clone path, but steady one-row updates touch one mapping.
         if (!self.syncVertexSetForWrite(alloc, wi, ci)) return false;
+        if (!self.copyLayerRows(alloc, wi, ci)) return false;
 
         if (perf_enabled) {
             var sync_end: c.LARGE_INTEGER = undefined;
@@ -786,6 +898,7 @@ pub const TripleBufferedSurface = struct {
         // Clear flush-local dirty state.
         self.sparse_sync.clearFlushDirty();
         self.sparse_sync.clearFlushMapping();
+        self.flush_layer_damage.clear();
         self.flush_paint_full = false;
         self.flush_requires_full_sync = false;
 
@@ -921,17 +1034,12 @@ pub const TripleBufferedSurface = struct {
         if (self.flush_layers) |*staged| staged.deinit();
         self.flush_layers = null;
         self.flush_cursor_layer_grid_id = null;
+        self.flush_layer_damage.clear();
         self.is_in_flush = false;
         self.main_cursor_in_flush = false;
         self.main_cursor_flush_paint_full = false;
         self.main_cursor_flush_old_row = null;
         self.main_cursor_flush_new_row = null;
-    }
-
-    /// Record that this flush republished layer rows, for commitFlush to
-    /// publish with the root's commit. Core thread, under app.mu.
-    pub fn noteLayerRowsPublished(self: *TripleBufferedSurface) void {
-        self.flush_layer_rows = true;
     }
 
     /// Stage this surface's layer list. Core thread, inside the flush bracket.
@@ -962,15 +1070,16 @@ pub const TripleBufferedSurface = struct {
 
     /// Commit the write set as the new committed set.
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
-        if (!self.is_in_flush and !self.main_cursor_in_flush and self.flush_layers == null and !self.flush_layer_rows) return;
+        if (!self.is_in_flush and !self.main_cursor_in_flush and self.flush_layers == null) return;
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
 
-        if (self.flush_layer_rows) {
-            self.layer_rows_rev +%= 1;
-            self.flush_layer_rows = false;
-        }
+        // Before the placement is promoted: a moved layer is found by
+        // comparing the staged placement with the committed one.
+        self.mergeLayerDamageLocked(alloc, self.flush_layers);
+        self.flush_layer_damage.clear();
+        if (self.is_in_flush) self.pruneLayerRows(alloc, self.flush_layers orelse self.committed_layers);
 
         // Layers and the vertices they place become visible together.
         if (self.flush_layers) |staged| {
@@ -979,12 +1088,8 @@ pub const TripleBufferedSurface = struct {
             self.committed_layers = staged;
             self.flush_layers = null;
             self.pending_paint_full = true;
-            self.layout_publish_gen +%= 1;
         }
         if (self.flush_cursor_layer_grid_id) |staged_grid| {
-            // Every cursor callback stages its owner; only a change of owner
-            // moves what a pinned paint places.
-            if (staged_grid != self.committed_cursor_layer_grid_id) self.layout_publish_gen +%= 1;
             self.committed_cursor_layer_grid_id = staged_grid;
             self.flush_cursor_layer_grid_id = null;
         }
@@ -1152,7 +1257,6 @@ pub const TripleBufferedSurface = struct {
         }
 
         self.committed_index = new_committed;
-        self.commit_rev +%= 1;
         self.is_in_flush = false;
     }
 
@@ -1238,6 +1342,10 @@ pub const TripleBufferedSurface = struct {
             }
             paint_full = self.pending_paint_full;
             self.pending_paint_full = false;
+            // A swap, not a copy: the previous paint's list becomes the next
+            // commits' storage, bitsets and all.
+            std.mem.swap(LayerDamageList, &self.paint_layer_damage, &self.pending_layer_damage);
+            self.pending_layer_damage.clear();
         }
         // Re-entrant paint: do not overwrite snapshot. paint_full=false → inner paint is no-op.
 
@@ -1260,6 +1368,7 @@ pub const TripleBufferedSurface = struct {
             self.pending_scroll_row_end = 0;
         }
 
+        const layer_damage: []const LayerDamage = if (self.paint_nesting == 0) self.paint_layer_damage.slice() else &.{};
         self.paint_nesting += 1;
         return .{
             .committed_index = ci,
@@ -1267,9 +1376,7 @@ pub const TripleBufferedSurface = struct {
             .paint_full = paint_full,
             .layers = self.committed_layers.retain(),
             .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
-            .layout_gen = self.layout_publish_gen,
-            .commit_rev = self.commit_rev,
-            .layer_rows_rev = self.layer_rows_rev,
+            .layer_damage = layer_damage,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -1288,7 +1395,7 @@ pub const TripleBufferedSurface = struct {
         self.paint_nesting -= 1;
         // When nesting returns to 0, check if new dirty state accumulated.
         const needs_reinvalidate = (self.paint_nesting == 0) and
-            (self.pending_dirty.count() > 0 or self.pending_paint_full);
+            (self.pending_dirty.count() > 0 or self.pending_paint_full or self.pending_layer_damage.len != 0);
         return needs_reinvalidate;
     }
 
@@ -1355,6 +1462,166 @@ pub const TripleBufferedSurface = struct {
         return true;
     }
 
+    /// Make dst's layer rows a shallow copy of src's. Layers are small, so
+    /// every flush copies them whole instead of tracking sparse changes.
+    /// Every allocation comes first: a failure leaves dst untouched.
+    fn copyLayerRows(self: *TripleBufferedSurface, alloc: std.mem.Allocator, dst_idx: u8, src_idx: u8) bool {
+        const dst = &self.sets[dst_idx];
+        const src = &self.sets[src_idx];
+        const n = src.layer_rows.items.len;
+        while (dst.layer_rows.items.len < n) dst.layer_rows.append(alloc, .{}) catch return false;
+        for (src.layer_rows.items, 0..) |s, i| {
+            dst.layer_rows.items[i].row_map.ensureTotalCapacity(alloc, s.row_map.items.len) catch return false;
+        }
+
+        dst.releaseLayerSlots(alloc, &self.pool);
+        for (src.layer_rows.items, 0..) |s, i| {
+            const d = &dst.layer_rows.items[i];
+            d.grid_id = s.grid_id;
+            d.row_map.appendSliceAssumeCapacity(s.row_map.items);
+            for (s.row_map.items) |m| self.pool.retain(m.slot);
+        }
+        return true;
+    }
+
+    /// Store one layer row in the open flush's write set: detach its slot,
+    /// write, and record the damage. `total_rows` is authoritative, so rows
+    /// past it are released. False means the caller must abort the flush.
+    pub fn writeLayerRow(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        grid_id: i64,
+        row: u32,
+        verts: []const Vertex,
+        total_rows: u32,
+    ) bool {
+        std.debug.assert(self.is_in_flush);
+        if (row >= total_rows) return true;
+        const ws = self.writeSet();
+        const lr = ws.layerRowsMut(grid_id) orelse blk: {
+            const free = ws.layerRowsMut(0) orelse free_blk: {
+                ws.layer_rows.append(alloc, .{}) catch return false;
+                break :free_blk &ws.layer_rows.items[ws.layer_rows.items.len - 1];
+            };
+            free.grid_id = grid_id;
+            break :blk free;
+        };
+        const rows: usize = total_rows;
+        if (lr.row_map.items.len > rows) {
+            for (lr.row_map.items[rows..]) |m| self.pool.release(alloc, m.slot);
+            lr.row_map.items.len = rows;
+        } else if (lr.row_map.items.len < rows) {
+            lr.row_map.appendNTimes(alloc, .{}, rows - lr.row_map.items.len) catch return false;
+        }
+        const dmg = self.flush_layer_damage.getOrAdd(alloc, grid_id, rows) orelse return false;
+
+        const mapping = &lr.row_map.items[row];
+        const slot = self.detachSlot(alloc, mapping) orelse return false;
+        slot.verts.clearRetainingCapacity();
+        slot.verts.appendSlice(alloc, verts) catch return false;
+        // Under ext_multigrid the text is all in layers, so their rows set the
+        // pool's retirement floor too.
+        self.pool.noteRowVerts(verts.len);
+        slot.origin_row = row;
+        slot.ver +%= 1;
+        dmg.markRows(row, @as(usize, row) + 1);
+        return true;
+    }
+
+    /// Move a layer's surviving rows for a row shift; the vacated band is
+    /// emptied for the core to refill. False when the region does not fit the
+    /// grid's rows, in which case the caller asks for a full resend.
+    pub fn shiftLayerRows(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        grid_id: i64,
+        scroll: LayerScroll,
+    ) bool {
+        std.debug.assert(self.is_in_flush);
+        const lr = self.writeSet().layerRowsMut(grid_id) orelse return false;
+        switch (render_pipeline_helpers.checkShift(scroll.row_start, scroll.row_end, scroll.rows_delta, lr.row_map.items.len)) {
+            .noop => return true,
+            .invalid => return false,
+            .fits => {},
+        }
+        const dmg = self.flush_layer_damage.getOrAdd(alloc, grid_id, lr.row_map.items.len) orelse return false;
+        const band = render_pipeline_helpers.rotateRegion(RowMapping, lr.row_map.items, scroll.row_start, scroll.row_end, scroll.rows_delta);
+        for (lr.row_map.items[band.start..band.end]) |*m| {
+            self.pool.release(alloc, m.slot);
+            m.slot = SLOT_NONE;
+        }
+        dmg.addShift(scroll);
+        return true;
+    }
+
+    /// Whether the open flush's write set holds rows for `grid_id`.
+    pub fn hasLayerRows(self: *TripleBufferedSurface, grid_id: i64) bool {
+        return self.writeSet().layerRowsMut(grid_id) != null;
+    }
+
+    /// Fold this flush's layer damage into the pending damage, and mark every
+    /// layer whose placement changed for a whole redraw. Caller holds
+    /// rotation_mu. An allocation failure degrades to a full paint, which
+    /// redraws every layer.
+    fn mergeLayerDamageLocked(self: *TripleBufferedSurface, alloc: std.mem.Allocator, staged_layers: ?SurfaceLayers) void {
+        for (self.flush_layer_damage.slice()) |*f| {
+            const p = self.pending_layer_damage.getOrAdd(alloc, f.grid_id, f.rows.bit_length) orelse {
+                self.pending_paint_full = true;
+                continue;
+            };
+            // The rows already pending moved with this flush's shift.
+            if (f.scroll) |s| p.addShift(s);
+            if (f.full) p.full = true;
+            p.rows.setUnion(f.rows);
+        }
+        const staged = staged_layers orelse return;
+        for (staged.slice(), 0..) |layer, index| {
+            if (index == 0) continue;
+            const unchanged = for (self.committed_layers.slice()) |prev| {
+                if (prev.grid_id != layer.grid_id) continue;
+                break prev.x_px == layer.x_px and prev.y_px == layer.y_px and
+                    prev.rows == layer.rows and prev.cols == layer.cols and
+                    prev.z == layer.z and prev.follows_scroll == layer.follows_scroll;
+            } else false;
+            if (unchanged) continue;
+            const p = self.pending_layer_damage.getOrAdd(alloc, layer.grid_id, layer.rows) orelse {
+                self.pending_paint_full = true;
+                continue;
+            };
+            p.full = true;
+            p.scroll = null;
+        }
+    }
+
+    /// Hand a whole redraw of `layers` back to the next paint, for a frame
+    /// that took their damage and never reached the screen.
+    pub fn returnLayerDamageFull(self: *TripleBufferedSurface, alloc: std.mem.Allocator, layers: []const SurfaceLayer) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        if (layers.len <= 1) return;
+        for (layers[1..]) |layer| {
+            const p = self.pending_layer_damage.getOrAdd(alloc, layer.grid_id, layer.rows) orelse {
+                self.pending_paint_full = true;
+                continue;
+            };
+            p.full = true;
+            p.scroll = null;
+        }
+    }
+
+    /// Drop the write set's rows of grids the surface no longer places. Core
+    /// thread, at commit, before the set is published.
+    fn pruneLayerRows(self: *TripleBufferedSurface, alloc: std.mem.Allocator, layers: SurfaceLayers) void {
+        const ws = &self.sets[self.write_index];
+        for (ws.layer_rows.items) |*lr| {
+            if (lr.grid_id == 0) continue;
+            const placed = for (layers.slice()) |layer| {
+                if (layer.grid_id == lr.grid_id) break true;
+            } else false;
+            if (!placed) VertexSet.freeLayerEntry(alloc, &self.pool, lr);
+        }
+    }
+
     /// Shallow-copy slot mappings from src set to dst set (COW).
     /// Only copies the u16 row_map array + retains slots. ~130 bytes for 65 rows.
     /// Returns false on alloc failure.
@@ -1419,7 +1686,11 @@ pub const TripleBufferedSurface = struct {
     pub fn cowDetachRow(self: *TripleBufferedSurface, alloc: std.mem.Allocator, row: u32) ?*RowSlot {
         const vs = self.writeSet();
         if (row >= vs.row_map.items.len) return null;
-        const mapping = &vs.row_map.items[row];
+        return self.detachSlot(alloc, &vs.row_map.items[row]);
+    }
+
+    /// cowDetachRow for any mapping of the write set, root or layer.
+    fn detachSlot(self: *TripleBufferedSurface, alloc: std.mem.Allocator, mapping: *RowMapping) ?*RowSlot {
         const old_slot = mapping.slot;
 
         if (old_slot == SLOT_NONE) {
@@ -1469,8 +1740,12 @@ pub const TripleBufferedSurface = struct {
         // Release all slot references from each set.
         for (&self.sets) |*set| {
             set.releaseAllSlots(alloc, &self.pool);
+            set.releaseLayerSlots(alloc, &self.pool);
             set.deinitCpu(alloc);
         }
+        self.flush_layer_damage.deinit(alloc);
+        self.pending_layer_damage.deinit(alloc);
+        self.paint_layer_damage.deinit(alloc);
         for (&self.main_cursor_sets) |*set| set.deinit(alloc);
         // Free slot pool (vertex memory lives in slots).
         self.pool.deinit(alloc);
@@ -2043,340 +2318,38 @@ pub const SlotPool = struct {
 
 pub const LayerScroll = render_pipeline_helpers.LayerScroll;
 
-/// Vertex storage for one grid a surface places as a non-root layer. Layers
-/// other than the root are small and the core regenerates them wholesale, so
-/// they use plain per-row buffers rather than the root grid's slot pool.
-///
-/// Written on the core thread inside the flush bracket and read by WM_PAINT,
-/// both under `App.mu`. That lock alone only makes a single row store atomic,
-/// so a flush's row stores and scroll shifts are recorded in `staged` and
-/// reach `rows_buf`/`origin_rows` only in applyStaged(), called once at
-/// on_flush_end. A paint landing between two row callbacks therefore draws the
-/// whole previous frame, and an aborted flush (discardStaged) leaves that
-/// frame untouched for the core's resend to replace.
-pub const LayerGridState = struct {
-    rows_buf: std.ArrayListUnmanaged(RowVerts) = .empty,
-    /// The row each stored array's vertices were built for. A row-shift hint
-    /// moves arrays between rows without rewriting their pixels, so the draw
-    /// has to offset them by the difference.
-    origin_rows: std.ArrayListUnmanaged(u32) = .empty,
-    /// The origins the layer draw actually placed this frame's pixels at.
-    ///
-    /// The bloom extract runs in a third `App.mu` hold, after the draw's and
-    /// the cursor overlay's, and `content_gen` exists because a flush can
-    /// commit in between -- rewriting `origin_rows` under a frame already
-    /// drawn. Re-reading them there put the light at rows the glyphs are not
-    /// on. The draw records what it used; the extract spends that.
-    drawn_origin_rows: std.ArrayListUnmanaged(u32) = .empty,
-    /// Set when rows changed since the last paint; the paint presents this
-    /// layer's rect and clears it.
-    dirty: bool = false,
-
-    /// Row scroll accumulated over the open flush and installed by
-    /// applyStaged, for the paint to turn into one GPU copy.
-    pending_scroll: ?LayerScroll = null,
-    draw_scroll: ?LayerScroll = null,
-    draw_blit_rect: ?render_pipeline_helpers.BlitRectPx = null,
-    paint_has_present_rect: bool = false,
-    /// Rows the core changed since the last paint. Sized by applyStaged.
-    dirty_rows: std.DynamicBitSetUnmanaged = .{},
-    needs_full_redraw: bool = false,
-    /// Bumped by every applyStaged that publishes anything, so the paint can
-    /// tell that `rows_buf`/`origin_rows` are no longer the frame it planned
-    /// against. The paint plans and draws under two separate `App.mu` holds --
-    /// the GPU row copy has to land before the root rows paint over the band it
-    /// moves, and the layers themselves have to draw after those rows -- so a
-    /// flush committing in between is a normal event, not a bug. Drawing
-    /// through it is: the newer rows would go on top of the older frame's copy,
-    /// and the next plan would copy the rows already advanced, leaving a row
-    /// drawn twice.
-    content_gen: u64 = 0,
-    /// The five fields below belong to the paint thread for the duration of
-    /// one frame, taken from the three above under `App.mu`.
+/// What one surface's paint keeps for a layer it draws: its GPU row buffers
+/// and the plan of the frame being drawn. UI thread only; the rows themselves
+/// are read from the committed set the paint pinned.
+pub const LayerPaintState = struct {
+    grid_id: i64 = 0,
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
+    /// The plan of one frame, settled by planLayerFrame and spent by
+    /// drawSurfaceLayers.
     draw_rows: std.DynamicBitSetUnmanaged = .{},
     draw_all: bool = false,
+    draw_scroll: ?LayerScroll = null,
+    draw_blit_rect: ?render_pipeline_helpers.BlitRectPx = null,
     /// Layer-local, like everything the layer transform draws.
     blit_clear_band: ?struct { top_px: i32, bottom_px: i32 } = null,
     last_drawn_rows: usize = 0,
-    /// `content_gen` as it stood when planLayerFrame settled this frame.
-    plan_content_gen: u64 = 0,
 
-    /// Ops of the open flush. `staged.items` never shrinks, so entries and
-    /// their vertex capacity survive across flushes; `staged_len` is the live
-    /// prefix.
-    staged: std.ArrayListUnmanaged(StagedOp) = .empty,
-    staged_len: usize = 0,
-    /// Row count the staged ops need. stageShift validates against it so a
-    /// shift can never see a shorter array at replay than it was checked
-    /// against, whatever order rows and shifts arrived in.
-    staged_rows_len: usize = 0,
-
-    /// One recorded mutation of the open flush, replayed in arrival order.
-    pub const StagedOp = struct {
-        kind: enum { row, shift } = .row,
-        row: u32 = 0,
-        total_rows: u32 = 0,
-        total_cols: u32 = 0,
-        row_start: u32 = 0,
-        row_end: u32 = 0,
-        rows_delta: i32 = 0,
-        /// Payload of a `.row` op. applyStaged swaps it with the live row, so
-        /// afterwards it holds the replaced buffer and its capacity is reused
-        /// by whatever stages through this slot next.
-        verts: std.ArrayListUnmanaged(Vertex) = .empty,
-    };
-
-    pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator) void {
-        for (self.rows_buf.items) |*rv| {
-            rv.verts.deinit(alloc);
-            if (rv.vb) |vb| {
-                _ = vb.*.lpVtbl.*.Release.?(@ptrCast(vb));
-                rv.vb = null;
-                rv.vb_bytes = 0;
-            }
-        }
-        self.rows_buf.deinit(alloc);
-        self.rows_buf = .empty;
-        self.origin_rows.deinit(alloc);
-        self.origin_rows = .empty;
-        self.drawn_origin_rows.deinit(alloc);
-        self.drawn_origin_rows = .empty;
-        self.dirty_rows.deinit(alloc);
-        self.dirty_rows = .{};
-        self.draw_rows.deinit(alloc);
-        self.draw_rows = .{};
-        for (self.staged.items) |*op| op.verts.deinit(alloc);
-        self.staged.deinit(alloc);
-        self.staged = .empty;
-        self.staged_len = 0;
-        self.staged_rows_len = 0;
+    /// Release this state's buffers and free the entry for another grid.
+    fn release(self: *LayerPaintState, budget: *RowVBPhysicalBudget, retained_bytes: *usize) void {
+        releaseRowVBs(self.row_vbs.items, budget, retained_bytes);
+        self.row_vbs.items.len = 0;
+        if (self.draw_rows.bit_length > 0) self.draw_rows.unsetAll();
+        self.grid_id = 0;
+        self.draw_all = false;
+        self.draw_scroll = null;
+        self.draw_blit_rect = null;
+        self.blit_clear_band = null;
+        self.last_drawn_rows = 0;
     }
 
-    /// Free rows `start..` and drop them from the arrays, keeping capacity.
-    /// Returns the GPU bytes released, which the caller owes the row budget.
-    pub fn releaseRowsFrom(self: *LayerGridState, alloc: std.mem.Allocator, start: usize) usize {
-        if (start >= self.rows_buf.items.len) return 0;
-        var bytes: usize = 0;
-        for (self.rows_buf.items[start..]) |*rv| {
-            rv.verts.deinit(alloc);
-            if (rv.vb) |vb| {
-                _ = vb.*.lpVtbl.*.Release.?(@ptrCast(vb));
-                bytes += rv.vb_bytes;
-            }
-            rv.* = .{};
-        }
-        self.rows_buf.items.len = start;
-        self.origin_rows.items.len = @min(self.origin_rows.items.len, start);
-        self.drawn_origin_rows.items.len = @min(self.drawn_origin_rows.items.len, start);
-        return bytes;
-    }
-
-    /// Rows the arrays will hold once this flush is applied.
-    fn plannedRows(self: *const LayerGridState) usize {
-        return @max(self.rows_buf.items.len, self.staged_rows_len);
-    }
-
-    /// Next free op slot, reusing a previous flush's entry when there is one.
-    fn nextOp(self: *LayerGridState, alloc: std.mem.Allocator) ?*StagedOp {
-        if (self.staged_len == self.staged.items.len) {
-            self.staged.append(alloc, .{}) catch return null;
-        }
-        const op = &self.staged.items[self.staged_len];
-        self.staged_len += 1;
-        return op;
-    }
-
-    /// Record a scroll region's row shift. Returns false when the region does
-    /// not fit the storage applyStaged will produce, in which case the caller
-    /// must force a full regeneration rather than publish a half-shifted grid.
-    pub fn stageShift(
-        self: *LayerGridState,
-        alloc: std.mem.Allocator,
-        row_start: u32,
-        row_end: u32,
-        rows_delta: i32,
-        total_rows: u32,
-        total_cols: u32,
-    ) bool {
-        switch (render_pipeline_helpers.checkShift(row_start, row_end, rows_delta, self.plannedRows())) {
-            .noop => return true,
-            .invalid => return false,
-            .fits => {},
-        }
-        const op = self.nextOp(alloc) orelse return false;
-        // Field-wise, because op.verts owns a buffer this slot keeps.
-        op.kind = .shift;
-        op.row_start = row_start;
-        op.row_end = row_end;
-        op.rows_delta = rows_delta;
-        op.total_rows = total_rows;
-        op.total_cols = total_cols;
-        return true;
-    }
-
-    /// Record one row's vertices. Reserves the painted arrays' capacity here so
-    /// applyStaged cannot fail to grow them after the flush was accepted.
-    /// Returns false when staging could not be grown; every failure path leaves
-    /// the painted rows untouched, so the caller only has to abort the flush.
-    pub fn stageRow(
-        self: *LayerGridState,
-        alloc: std.mem.Allocator,
-        row: u32,
-        verts: []const Vertex,
-        total_rows: u32,
-        total_cols: u32,
-    ) bool {
-        const need: usize = @max(@as(usize, row) + 1, self.plannedRows());
-        self.rows_buf.ensureTotalCapacity(alloc, need) catch return false;
-        self.origin_rows.ensureTotalCapacity(alloc, need) catch return false;
-        const op = self.nextOp(alloc) orelse return false;
-        op.kind = .row;
-        op.row = row;
-        op.total_rows = total_rows;
-        op.total_cols = total_cols;
-        op.verts.clearRetainingCapacity();
-        op.verts.appendSlice(alloc, verts) catch return false;
-        self.staged_rows_len = need;
-        return true;
-    }
-
-    /// Drop the open flush's ops. The painted rows keep the previous committed
-    /// frame and the core's resend rebuilds this one.
-    pub fn discardStaged(self: *LayerGridState) void {
-        self.staged_len = 0;
-        self.staged_rows_len = 0;
-    }
-
-    /// Reserve every fallible part before ANY grid publishes its staged rows.
-    pub fn prepareCommit(self: *LayerGridState, alloc: std.mem.Allocator) bool {
-        if (self.staged_len == 0) return true;
-        const need = self.plannedRows();
-        self.rows_buf.ensureTotalCapacity(alloc, need) catch return false;
-        self.origin_rows.ensureTotalCapacity(alloc, need) catch return false;
-        self.drawn_origin_rows.ensureTotalCapacity(alloc, need) catch return false;
-        if (self.dirty_rows.bit_length < need) {
-            self.dirty_rows.resize(alloc, need, false) catch return false;
-        }
-        for (self.staged.items[0..self.staged_len]) |op| {
-            if (op.kind == .shift and render_pipeline_helpers.checkShift(op.row_start, op.row_end, op.rows_delta, need) != .fits) return false;
-        }
-        return true;
-    }
-
-    /// Publish after prepareCommit succeeded for every grid. Caller holds
-    /// App.mu throughout preparation and publication. GPU bytes freed by a
-    /// shrink are added to `released_vb_bytes`.
-    pub fn applyStaged(self: *LayerGridState, alloc: std.mem.Allocator, released_vb_bytes: *std.atomic.Value(usize)) bool {
-        defer self.discardStaged();
-        if (self.staged_len == 0) return true;
-        const need = self.plannedRows();
-        if (self.rows_buf.items.len < need) {
-            const old_len = self.rows_buf.items.len;
-            self.rows_buf.resize(alloc, need) catch return false;
-            for (self.rows_buf.items[old_len..]) |*rv| rv.* = .{};
-        }
-        if (self.origin_rows.items.len < need) {
-            const old_len = self.origin_rows.items.len;
-            self.origin_rows.resize(alloc, need) catch return false;
-            for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
-        }
-        if (self.drawn_origin_rows.items.len < need) {
-            const old_len = self.drawn_origin_rows.items.len;
-            self.drawn_origin_rows.resize(alloc, need) catch return false;
-            for (self.drawn_origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
-        }
-        if (self.dirty_rows.bit_length < need) {
-            self.dirty_rows.resize(alloc, need, false) catch return false;
-        }
-        for (self.staged.items[0..self.staged_len]) |*op| {
-            switch (op.kind) {
-                .shift => {
-                    if (!self.shiftRows(op.row_start, op.row_end, op.rows_delta)) return false;
-                    self.mergeShift(op);
-                },
-                .row => {
-                    const rv = &self.rows_buf.items[@intCast(op.row)];
-                    std.mem.swap(std.ArrayListUnmanaged(Vertex), &rv.verts, &op.verts);
-                    rv.gen +%= 1;
-                    // Freshly generated vertices are built for the row they
-                    // arrived at.
-                    self.origin_rows.items[@intCast(op.row)] = op.row;
-                    self.markDirtyRows(op.row, @as(usize, op.row) + 1);
-                    self.dirty = true;
-                },
-            }
-        }
-        // total_rows is authoritative: rows past it left the grid and are
-        // never drawn, so their storage goes now rather than at destroy.
-        _ = released_vb_bytes.fetchAdd(self.releaseRowsFrom(alloc, self.staged.items[self.staged_len - 1].total_rows), .acq_rel);
-        // Rows and origins both moved; any plan taken before this point was
-        // made against a frame that no longer exists.
-        self.content_gen +%= 1;
-        return true;
-    }
-
-    fn markDirtyRows(self: *LayerGridState, row_start: usize, row_end: usize) void {
-        const end = @min(row_end, self.dirty_rows.bit_length);
-        const start = @min(row_start, end);
-        if (start == end) return;
-        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
-    }
-
-    /// Record a replayed shift: the band it vacated has to be redrawn, and the
-    /// rest of the region is a GPU copy the paint still owes.
-    fn mergeShift(self: *LayerGridState, op: *const StagedOp) void {
-        const shift: u32 = @intCast(@abs(op.rows_delta));
-        if (op.rows_delta > 0) {
-            self.markDirtyRows(op.row_end - shift, op.row_end);
-        } else {
-            self.markDirtyRows(op.row_start, op.row_start + shift);
-        }
-        const incoming: LayerScroll = .{
-            .row_start = op.row_start,
-            .row_end = op.row_end,
-            .rows_delta = op.rows_delta,
-            .total_rows = op.total_rows,
-            .total_cols = op.total_cols,
-        };
-        switch (render_pipeline_helpers.mergeLayerScroll(self.pending_scroll, incoming)) {
-            .accumulate => |merged| self.pending_scroll = merged,
-            .conflict => |both| {
-                // A copy of the newer region would smear the pixels the older
-                // one already moved outside it, so neither runs and both are
-                // redrawn from vertices.
-                self.markDirtyRows(both.old.row_start, both.old.row_end);
-                self.markDirtyRows(both.new.row_start, both.new.row_end);
-                self.pending_scroll = null;
-            },
-        }
-    }
-
-    /// Move the surviving rows of a scroll region, leaving the vacated ones
-    /// empty for the core to refill. Replay only: stageShift already checked
-    /// the region against the length applyStaged resized to.
-    fn shiftRows(self: *LayerGridState, row_start: u32, row_end: u32, rows_delta: i32) bool {
-        const len = @min(self.rows_buf.items.len, self.origin_rows.items.len);
-        switch (render_pipeline_helpers.checkShift(row_start, row_end, rows_delta, len)) {
-            .noop => return true,
-            .invalid => return false,
-            .fits => {},
-        }
-
-        const rows_buf = self.rows_buf.items;
-        const origins = self.origin_rows.items;
-        const band = render_pipeline_helpers.rotateRegion(RowVerts, rows_buf, row_start, row_end, rows_delta);
-        _ = render_pipeline_helpers.rotateRegion(u32, origins, row_start, row_end, rows_delta);
-        for (band.start..band.end) |v| {
-            rows_buf[v].verts.clearRetainingCapacity();
-            rows_buf[v].gen +%= 1;
-            origins[v] = @intCast(v);
-        }
-        // The bits have to travel with the rows they describe, or a row marked
-        // earlier in this flush keeps its bit at the pre-shift index while its
-        // vertices moved.
-        render_pipeline_helpers.shiftRowBits(&self.dirty_rows, row_start, row_end, rows_delta);
-        self.dirty = true;
-        return true;
+    /// Something of this layer is redrawn this frame.
+    fn drawsAnything(self: *const LayerPaintState) bool {
+        return self.draw_all or self.draw_blit_rect != null or self.draw_rows.findFirstSet() != null;
     }
 };
 
@@ -2429,10 +2402,54 @@ pub const SurfacePaintState = struct {
     /// row is that grid's OWN row -- so a row remembered from the last paint
     /// cannot be placed with the grid holding the cursor now.
     last_painted_cursor_grid: i64 = 0,
-    /// Layer frames this surface refused for staleness, for `[layer_frame]`.
-    layer_frame_refusals: u64 = 0,
+    /// Paint state of each non-root layer this surface drew. Never shrinks: a
+    /// free entry has `grid_id == 0` and keeps its storage for the next grid.
+    layers: std.ArrayListUnmanaged(LayerPaintState) = .empty,
+    layer_row_vb_retained_bytes: usize = 0,
+
+    pub fn layerState(self: *SurfacePaintState, grid_id: i64) ?*LayerPaintState {
+        for (self.layers.items) |*s| {
+            if (s.grid_id == grid_id) return s;
+        }
+        return null;
+    }
+
+    /// Give every non-root layer of `layers` a paint state and free the states
+    /// of grids no longer placed, returning their buffers to the budget. A
+    /// layer new to this surface is drawn whole. Fails only to allocate a
+    /// state, which the caller treats as a failed paint.
+    pub fn syncLayers(
+        self: *SurfacePaintState,
+        alloc: std.mem.Allocator,
+        budget: *RowVBPhysicalBudget,
+        layers: []const SurfaceLayer,
+    ) error{OutOfMemory}!void {
+        for (self.layers.items) |*s| {
+            if (s.grid_id == 0) continue;
+            const placed = for (layers) |layer| {
+                if (layer.grid_id == s.grid_id) break true;
+            } else false;
+            if (!placed) s.release(budget, &self.layer_row_vb_retained_bytes);
+        }
+        if (layers.len <= 1) return;
+        for (layers[1..]) |layer| {
+            if (self.layerState(layer.grid_id) != null) continue;
+            const s = self.layerState(0) orelse blk: {
+                try self.layers.append(alloc, .{});
+                break :blk &self.layers.items[self.layers.items.len - 1];
+            };
+            s.grid_id = layer.grid_id;
+            s.last_drawn_rows = std.math.maxInt(usize);
+        }
+    }
 
     pub fn deinit(self: *SurfacePaintState, alloc: std.mem.Allocator, row_vb_budget: *RowVBPhysicalBudget) void {
+        for (self.layers.items) |*s| {
+            s.release(row_vb_budget, &self.layer_row_vb_retained_bytes);
+            s.row_vbs.deinit(alloc);
+            s.draw_rows.deinit(alloc);
+        }
+        self.layers.deinit(alloc);
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
         self.scroll_rows_merge_scratch.deinit(alloc);
@@ -2523,7 +2540,13 @@ pub const WindowSurface = struct {
         _ = resizeRowVBsForPaint(app.alloc, &self.paint.row_vbs, &app.row_vb_budget, &self.paint.row_vb_retained_bytes, 0);
     }
 
-    pub const RecoveryVB = struct { buffer: *c.ID3D11Buffer, row_bytes: usize };
+    pub const RecoveryVB = struct {
+        buffer: *c.ID3D11Buffer,
+        row_bytes: usize,
+        /// The bytes are owed to `paint.layer_row_vb_retained_bytes`, not to
+        /// the root's.
+        layer: bool = false,
+    };
 
     /// Detach one of this surface's device-bound buffers without calling COM,
     /// for device-loss teardown; the caller releases it after dropping app.mu.
@@ -2531,6 +2554,9 @@ pub const WindowSurface = struct {
     /// holds app.mu.
     pub fn detachOneRecoveryVB(self: *WindowSurface) ?RecoveryVB {
         if (detachOneRowVB(self.paint.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes };
+        for (self.paint.layers.items) |*s| {
+            if (detachOneRowVB(s.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes, .layer = true };
+        }
         if (self.paint.cursor_vb) |vb| {
             self.paint.cursor_vb = null;
             self.paint.cursor_vb_bytes = 0;
@@ -3270,25 +3296,6 @@ pub fn drawRowModeSetupAndRowsFromSlots(
 /// live outside every SurfaceState because the grid can be drawn by whichever
 /// surface places it, so device-loss recovery has to walk them separately or
 /// the next paint maps a buffer created on the dead device.
-pub fn detachOneLayerGridVB(
-    layer_grids: *std.AutoHashMapUnmanaged(i64, *LayerGridState),
-    released_vb_bytes: *std.atomic.Value(usize),
-) ?*c.ID3D11Buffer {
-    var it = layer_grids.valueIterator();
-    while (it.next()) |state| {
-        for (state.*.rows_buf.items) |*rv| {
-            if (rv.vb) |vb| {
-                _ = released_vb_bytes.fetchAdd(rv.vb_bytes, .acq_rel);
-                rv.vb = null;
-                rv.vb_bytes = 0;
-                rv.uploaded_gen = 0;
-                return vb;
-            }
-        }
-    }
-    return null;
-}
-
 /// Device-loss recovery: release row-slot GPU buffers and reset their upload
 /// bookkeeping (slot mappings stay valid — they index the CPU-side pool).
 pub fn releaseRowVBs(
@@ -3496,16 +3503,6 @@ pub fn snappedContentHeight(client_h: u32, cell_total_h_px: u32, y_offset: u32) 
     return @max(snapped, safe_cell_h);
 }
 
-/// The non-root layers a surface places, plus the App that owns their row
-/// storage. The bloom extract pass needs both to light layer rows; under
-/// ext_multigrid the root grid holds only chrome, so a root-only extract
-/// leaves the buffer text unlit.
-pub const BloomLayerSource = struct {
-    app: *App,
-    /// Full layer list, root first; only the non-root entries are extracted.
-    layers: []const SurfaceLayer,
-};
-
 /// Parameters for shared row-mode draw sequence (drawEx setup + drawSurfaceRowsVBFromSlots + bloom collect).
 /// Used by both main window WM_PAINT and external window paint path.
 pub const RowModeDrawParams = struct {
@@ -3531,11 +3528,6 @@ pub const RowModeDrawParams = struct {
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
     tabbar_bg_color: ?[4]f32 = null,
-    /// Layers to include in the bloom extract pass. Null for a surface that
-    /// places none. The extract reads live layer row storage, so when this is
-    /// set drawBloomRowsOverlay takes `app.mu` itself — the caller must NOT
-    /// hold it across the bloom call.
-    bloom_layers: ?BloomLayerSource = null,
 
     /// Compute bloom viewport from these params.
     pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
@@ -3598,17 +3590,37 @@ pub fn rowModeViewportWidth(g: *d3d11.Renderer, params: RowModeDrawParams) u32 {
     );
 }
 
-/// How far a row-shift hint moved this layer row's vertices from where they
-/// were built. The layer draw and the bloom extract apply the same offset.
-fn layerRowShiftPx(origins: []const u32, row_index: usize, row_h_px: i32) f32 {
-    const origin_row: u32 = if (row_index < origins.len)
-        origins[row_index]
-    else
-        @intCast(row_index);
+/// How far a row-shift hint moved this slot's vertices from where they were
+/// built. The layer draw, the cursor overlay and the bloom extract apply the
+/// same offset.
+fn slotRowShiftPx(slot: *const RowSlot, row_index: usize, row_h_px: i32) f32 {
     return @floatFromInt(
-        (@as(i32, @intCast(row_index)) - @as(i32, @intCast(origin_row))) * row_h_px,
+        (@as(i32, @intCast(row_index)) - @as(i32, @intCast(slot.origin_row))) * row_h_px,
     );
 }
+
+/// What a paint needs to read its layers: the rows of the committed set it
+/// pinned, the damage it took with it, and its own paint state.
+pub const LayerFrameSource = struct {
+    set: *const VertexSet,
+    pool: *const SlotPool,
+    damage: []const LayerDamage,
+    paint: *SurfacePaintState,
+    alloc: std.mem.Allocator,
+    budget: *RowVBPhysicalBudget,
+
+    fn rows(self: LayerFrameSource, layer: SurfaceLayer) []const RowMapping {
+        const lr = self.set.layerRows(layer.grid_id) orelse return &.{};
+        return lr.row_map.items[0..@min(lr.row_map.items.len, @as(usize, layer.rows))];
+    }
+
+    fn damageFor(self: LayerFrameSource, grid_id: i64) ?*const LayerDamage {
+        for (self.damage) |*d| {
+            if (d.grid_id == grid_id) return d;
+        }
+        return null;
+    }
+};
 
 /// What one paint's layer plan needs that does not live on `App`.
 pub const LayerFramePlanParams = struct {
@@ -3633,9 +3645,9 @@ pub const LayerFramePlanParams = struct {
     log_enabled: bool,
 };
 
-/// Half-open, clamped to the set's length like `markDirtyRows`, so a caller
-/// working in layout rows never has to know the bitset's size.
-fn markDrawRows(state: *LayerGridState, row_start: usize, row_end: usize) void {
+/// Half-open, clamped to the set's length, so a caller working in layout rows
+/// never has to know the bitset's size.
+fn markDrawRows(state: *LayerPaintState, row_start: usize, row_end: usize) void {
     const end = @min(row_end, state.draw_rows.bit_length);
     const start = @min(row_start, end);
     if (start == end) return;
@@ -3645,7 +3657,7 @@ fn markDrawRows(state: *LayerGridState, row_start: usize, row_end: usize) void {
 /// Add the cursor's row to its layer's redraw set, after planLayerFrame
 /// settled it and before drawSurfaceLayers consumes it. False means this frame
 /// will not draw that row, so the caller cannot promise the overlay it was
-/// repainted. Caller must hold `app.mu`.
+/// repainted.
 ///
 /// The row arrives too late for planLayerFrame's own propagation, so it
 /// carries its own: drawing it rewrites the whole row rectangle, so a layer
@@ -3653,7 +3665,7 @@ fn markDrawRows(state: *LayerGridState, row_start: usize, row_end: usize) void {
 /// layer over THAT one, which is why this replays the same back-to-front walk
 /// rather than marking the overlapping layers once.
 pub fn markLayerCursorRow(
-    app: *App,
+    src: LayerFrameSource,
     layers: []const SurfaceLayer,
     cursor_grid: i64,
     row: u32,
@@ -3664,20 +3676,19 @@ pub fn markLayerCursorRow(
     const li = for (layers[1..], 1..) |layer, i| {
         if (layer.grid_id == cursor_grid) break i;
     } else return false;
-    const state = app.layer_grids.get(cursor_grid) orelse return false;
+    const state = src.paint.layerState(cursor_grid) orelse return false;
     // A layer redrawing whole already propagated in planLayerFrame.
     if (state.draw_all) return true;
-    const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layers[li].rows));
-    if (row >= row_limit or row >= state.draw_rows.bit_length) return false;
+    if (row >= src.rows(layers[li]).len or row >= state.draw_rows.bit_length) return false;
     state.draw_rows.set(row);
-    propagateLayerRedraw(app, layers, li, cell_w_px, row_h_px);
+    propagateLayerRedraw(src, layers, li, cell_w_px, row_h_px);
     return true;
 }
 
 /// No copy ran, so the whole scroll region still holds pre-scroll pixels: the
 /// core vacated only the band, leaving the rest to a shift that did not happen.
 fn refuseLayerBlit(
-    state: *LayerGridState,
+    state: *LayerPaintState,
     grid_id: i64,
     scroll: LayerScroll,
     origin_y_px: i32,
@@ -3703,7 +3714,7 @@ fn refuseLayerBlit(
 /// Mark the rows of every layer above `li` that `band` covers. Only a layer
 /// whose columns overlap the one at `li` can lose pixels to it.
 fn markLayersOverBand(
-    app: *App,
+    paint: *SurfacePaintState,
     layers: []const SurfaceLayer,
     li: usize,
     band_top_px: i32,
@@ -3715,7 +3726,7 @@ fn markLayersOverBand(
     const left = src.x_px;
     const right = left + @as(i32, @intCast(src.cols)) * cell_w_px;
     for (layers[li + 1 ..]) |above| {
-        const above_state = app.layer_grids.get(above.grid_id) orelse continue;
+        const above_state = paint.layerState(above.grid_id) orelse continue;
         if (above_state.draw_all) continue;
         const a_left = above.x_px;
         const a_right = a_left + @as(i32, @intCast(above.cols)) * cell_w_px;
@@ -3735,48 +3746,55 @@ fn markLayersOverBand(
 /// on the GPU the ones whose scroll a copy of their own rectangle can serve.
 /// Runs before the root rows for the same reason applyScrollShift does: the
 /// copy has to land before anything paints over the band it moves.
-/// Caller must hold `app.mu`, which is what protects the state consumed here.
+/// `src.paint` must already hold a state for every layer (syncLayers).
 pub fn planLayerFrame(
     g: *d3d11.Renderer,
-    app: *App,
+    src: LayerFrameSource,
     layers: []const SurfaceLayer,
     p: LayerFramePlanParams,
 ) void {
     if (layers.len <= 1 or p.row_h_px <= 0) return;
     const n = layers.len;
 
-    // 1. Take the core's dirty set and settle the frame's redraw decision.
+    // 1. Take the damage this paint consumed and settle the redraw decision.
     for (layers[1..n]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const row_limit = src.rows(layer).len;
         var grow_failed = false;
-        if (state.draw_rows.bit_length < state.dirty_rows.bit_length) {
-            state.draw_rows.resize(app.alloc, state.dirty_rows.bit_length, false) catch {
+        if (state.draw_rows.bit_length < row_limit) {
+            state.draw_rows.resize(src.alloc, row_limit, false) catch {
                 grow_failed = true;
             };
         }
-        std.mem.swap(std.DynamicBitSetUnmanaged, &state.draw_rows, &state.dirty_rows);
-        if (state.dirty_rows.bit_length > 0) state.dirty_rows.unsetAll();
+        if (!resizeRowVBsForPaint(src.alloc, &state.row_vbs, src.budget, &src.paint.layer_row_vb_retained_bytes, row_limit))
+            grow_failed = true;
+        if (state.draw_rows.bit_length > 0) state.draw_rows.unsetAll();
+        const dmg = src.damageFor(layer.grid_id);
+        if (dmg) |d| {
+            var it = d.rows.iterator(.{});
+            while (it.next()) |r| {
+                if (r >= state.draw_rows.bit_length) break;
+                state.draw_rows.set(r);
+            }
+        }
         // A row count that moved invalidates last_drawn_rows' bookkeeping and
         // the blit's geometry alike, so it belongs with the other full-redraw
         // reasons rather than only in the refusal ladder.
-        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
         state.draw_all = grow_failed or !p.preserve_back or
-            state.needs_full_redraw or row_limit != state.last_drawn_rows;
-        state.needs_full_redraw = false;
+            (dmg != null and dmg.?.full) or row_limit != state.last_drawn_rows;
         state.blit_clear_band = null;
-        state.draw_scroll = state.pending_scroll;
+        state.draw_scroll = if (dmg) |d| d.scroll else null;
         state.draw_blit_rect = null;
-        state.pending_scroll = null;
-        // The row data this whole plan -- redraw set, GPU copy, clear band --
-        // is built for. drawSurfaceLayers refuses the frame if it moved.
-        state.plan_content_gen = state.content_gen;
+        // The row buffers follow the slots through the shift, so the rows
+        // that only moved are not uploaded again.
+        if (state.draw_scroll) |s| shiftRowVBs(state.row_vbs.items, s.rows_delta, s.row_start, s.row_end);
     }
 
     // 2. Rows a root dirty band overpaints. A root row that resolves to
     //    nothing counts: cursor damage reaches the root's dirty set as a rect
     //    and has to propagate to the layer under it.
     for (layers[1..n]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
         if (state.draw_all) continue;
         for (p.rows_to_draw) |row| {
             const band_top: i32 = @as(i32, @intCast(row)) * p.row_h_px;
@@ -3797,7 +3815,7 @@ pub fn planLayerFrame(
     //     the pixels the copy dragged it to. The region is always full width.
     if (p.root_scroll_rect) |sr| {
         for (layers[1..n]) |layer| {
-            const state = app.layer_grids.get(layer.grid_id) orelse continue;
+            const state = src.paint.layerState(layer.grid_id) orelse continue;
             if (state.draw_all) continue;
             const rows = core.row_scroll.bandLayerRows(
                 sr.top - p.y_offset,
@@ -3815,7 +3833,7 @@ pub fn planLayerFrame(
     //    lowest in the stack, so the marking below it stays one-directional.
     const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
     for (layers[1..n], 1..) |layer, li| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
         const scroll = state.draw_scroll orelse continue;
         const origin_x: i32 = p.x_offset + layer.x_px;
         const origin_y: i32 = p.y_offset + layer.y_px;
@@ -3851,7 +3869,7 @@ pub fn planLayerFrame(
                 .bottom = origin_y + @as(i32, @intCast(layer.rows)) * p.row_h_px,
             };
             for (layers[1..li]) |below| {
-                const below_state = app.layer_grids.get(below.grid_id) orelse continue;
+                const below_state = src.paint.layerState(below.grid_id) orelse continue;
                 const r = below_state.draw_blit_rect orelse continue;
                 if (render_pipeline_helpers.blitRectsIntersect(layer_rect, r))
                     break :ladder "overlap";
@@ -3903,7 +3921,7 @@ pub fn planLayerFrame(
                 p.row_h_px,
             ) orelse continue;
             if (over.above) |a| {
-                if (app.layer_grids.get(above.grid_id)) |above_state| {
+                if (src.paint.layerState(above.grid_id)) |above_state| {
                     markDrawRows(above_state, a[0], @as(usize, a[1]) + 1);
                 }
             }
@@ -3934,7 +3952,7 @@ pub fn planLayerFrame(
     //    whole rectangle of each row it draws, so drawing one erases what a
     //    layer over it had there, and that layer draws nothing this paint
     //    unless it is marked too.
-    propagateLayerRedraw(app, layers, 1, p.cell_w_px, p.row_h_px);
+    propagateLayerRedraw(src, layers, 1, p.cell_w_px, p.row_h_px);
 }
 
 /// Carry each layer's redraw rows into the layers above it, from `start_li` up.
@@ -3942,9 +3960,9 @@ pub fn planLayerFrame(
 /// the next step: a layer that overlaps none of the marked rows' columns can
 /// still sit over one that does, and it loses its pixels to that one's row.
 /// Idempotent -- the sets are bitsets, so a second run over the same layers
-/// only adds what the first could not see. Caller must hold `app.mu`.
+/// only adds what the first could not see.
 fn propagateLayerRedraw(
-    app: *App,
+    src: LayerFrameSource,
     layers: []const SurfaceLayer,
     start_li: usize,
     cell_w_px: i32,
@@ -3952,12 +3970,12 @@ fn propagateLayerRedraw(
 ) void {
     if (start_li >= layers.len) return;
     for (layers[start_li..], start_li..) |layer, li| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const row_limit = src.rows(layer).len;
         if (row_limit == 0) continue;
         if (state.draw_all) {
             markLayersOverBand(
-                app,
+                src.paint,
                 layers,
                 li,
                 layer.y_px,
@@ -3971,90 +3989,57 @@ fn propagateLayerRedraw(
         while (it.next()) |ri| {
             if (ri >= row_limit) break;
             const top = layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
-            markLayersOverBand(app, layers, li, top, top + row_h_px, cell_w_px, row_h_px);
+            markLayersOverBand(src.paint, layers, li, top, top + row_h_px, cell_w_px, row_h_px);
         }
     }
 }
 
-/// Layers whose row data was republished after planLayerFrame settled this
-/// frame. Re-arms every layer, because the plan's redraw set is consumed
-/// either way: step 1 of the next plan swaps `draw_rows` out and clears it, so
-/// an unconsumed set is lost rather than carried. Caller must hold `app.mu`.
-fn staleLayerPlans(app: *App, layers: []const SurfaceLayer) u32 {
-    if (layers.len <= 1) return 0;
-    var stale: u32 = 0;
-    for (layers[1..]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        if (state.content_gen != state.plan_content_gen) stale += 1;
-    }
-    if (stale != 0) rearmLayerDraw(app, layers);
-    return stale;
-}
-
-/// Put back what planLayerFrame consumed when the frame that consumed it never
-/// reached the screen. A full redraw is a correct superset either way: the
-/// committed vertices are already post-shift. Caller must hold `app.mu`.
-pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
-    if (layers.len <= 1) return;
-    for (layers[1..]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        state.needs_full_redraw = true;
-        state.dirty = true;
-    }
-}
-
-/// Queue the present damage of each changed layer: the rows its plan draws
-/// (plus the GPU copy and the cursor's rows), or the whole layer when it
-/// redraws whole. Their rows are not in rows_to_draw, which only covers the
-/// root grid's own dirty rows. Caller holds `mu`, in the same hold as the plan,
-/// so a store landing between them cannot have its flag dropped.
-/// `x_offset`/`y_offset` is where the surface's content sits in its client
-/// area; `client_right`/`client_bottom` bound the rects. A layer whose rects
-/// cannot all be queued keeps its flag clear, so its dirt is kept for the next
-/// paint.
+/// Queue the present damage of each layer this frame redraws: the rows its
+/// plan draws (plus the GPU copy and the cursor's rows), or the whole layer
+/// when it redraws whole. Their rows are not in rows_to_draw, which only
+/// covers the root grid's own dirty rows. `x_offset`/`y_offset` is where the
+/// surface's content sits in its client area; `client_right`/`client_bottom`
+/// bound the rects. A rect that cannot be queued makes the present full.
 pub fn appendLayerPresentRects(
-    app: *App,
+    src: LayerFrameSource,
     layers: []const SurfaceLayer,
     x_offset: i32,
     y_offset: i32,
     client_right: i32,
     client_bottom: i32,
     row_h_px: i32,
+    cell_w_px: i32,
     cursor_grid: i64,
     cursor_rows: [2]?u32,
-    present_rects: *std.ArrayListUnmanaged(c.RECT),
+    present: *PresentRectBuilder,
 ) void {
     if (layers.len <= 1) return;
-    const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
     for (layers[1..]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        state.paint_has_present_rect = false;
-        if (!state.dirty) continue;
-        render_pipeline_helpers.appendLayerDrawRects(c.RECT, app.alloc, present_rects, .{
+        if (present.full) return;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const layer_cursor_rows: [2]?u32 = if (layer.grid_id == cursor_grid) cursor_rows else .{ null, null };
+        if (!state.drawsAnything() and layer_cursor_rows[0] == null and layer_cursor_rows[1] == null) continue;
+        render_pipeline_helpers.appendLayerDrawRects(c.RECT, present.alloc, present.list, .{
             .left_px = x_offset + layer.x_px,
             .top_px = y_offset + layer.y_px,
-            .width_px = @as(i32, @intCast(layer.cols)) * cell_w_i32,
+            .width_px = @as(i32, @intCast(layer.cols)) * cell_w_px,
             .row_h_px = row_h_px,
             .rows = layer.rows,
-            .row_limit = @min(state.rows_buf.items.len, @as(usize, layer.rows)),
+            .row_limit = src.rows(layer).len,
             .clip_right = client_right,
             .clip_bottom = client_bottom,
-        }, state.draw_all, &state.draw_rows, if (layer.grid_id == cursor_grid) cursor_rows else .{ null, null }, state.draw_blit_rect) catch continue;
-        state.paint_has_present_rect = true;
+        }, state.draw_all, &state.draw_rows, layer_cursor_rows, state.draw_blit_rect) catch {
+            present.full = true;
+        };
     }
 }
 
-/// A row frame refused for its vertex-buffer budget: nothing reaches
-/// drawSurfaceLayers on this path, so the plan taken for the layers is never
-/// paid for and has to be re-armed, and the core is told the budget failed.
+/// A row frame refused for its vertex-buffer budget: the layer damage this
+/// paint took is handed back whole, and the core is told the budget failed.
 /// Unlike every other failure, this one does not requeue a full paint.
-pub fn failRowVbBudget(app: *App, layers: []const SurfaceLayer) void {
+pub fn failRowVbBudget(app: *App, tbs: *TripleBufferedSurface, layers: []const SurfaceLayer) void {
     app.row_vb_budget_failed = true;
-    if (layers.len > 1) {
-        app.mu.lockUncancelable(core.clock.io());
-        rearmLayerDraw(app, layers);
-        app.mu.unlock(core.clock.io());
-    }
+    tbs.returnLayerDamageFull(app.alloc, layers);
     if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
 }
 
@@ -4068,80 +4053,27 @@ const LayerRowOutcome = struct {
     budget_exceeded: bool = false,
 };
 
-/// What a surface's whole layer draw produced. A frame is incomplete when rows
-/// are missing from back_tex, when the plan and the row data it drew came from
-/// different flushes, when the placement it would have drawn at is older than
-/// those rows, or when the root rows it drew beside them are; none of the four
-/// may be presented.
+/// What a surface's whole layer draw produced. A frame with rows missing from
+/// back_tex may not be presented.
 pub const LayerDrawOutcome = struct {
     failed_rows: u32 = 0,
     /// Some of the failed rows were refused by the row VB budget.
     budget_exceeded: bool = false,
-    stale_layers: u32 = 0,
-    stale_layout: bool = false,
-    stale_commit: bool = false,
 
     pub fn incomplete(self: LayerDrawOutcome) bool {
-        return self.failed_rows != 0 or self.stale_layers != 0 or
-            self.stale_layout or self.stale_commit;
+        return self.failed_rows != 0;
     }
 };
-
-/// Both reasons a paint may no longer draw the layer frame it pinned.
-///
-/// A paint takes layers, cursor ownership and the root's committed index from
-/// the TBS snapshot under rotation_mu, but reads the rows they place later,
-/// under app.mu. The core publishes all of it inside one app.mu hold, so a
-/// commit landing in that gap hands the paint one flush's rows at another
-/// flush's origins -- or beside another flush's root rows.
-///
-/// plan_content_gen cannot see either: it is stamped after such a commit, so
-/// the rows and the plan agree even though the frame no longer does.
-///
-/// Answered together on purpose. A driver that knew only half the list drew
-/// the other half's stale frame, and a reason added here reaches every surface
-/// without a second edit.
-///
-/// Caller holds app.mu, which is what makes the plain reads sound: commitFlush
-/// bumps both counters inside an app.mu hold of its own.
-pub const LayerFrameStaleness = struct {
-    /// The placement or cursor owner was republished (layout_publish_gen).
-    layout: bool = false,
-    /// The root's committed set rotated away from the index the snapshot froze
-    /// (commit_rev) AND layer rows were republished in place (layer_rows_rev)
-    /// -- the case that moves neither the placement nor the cursor owner, so
-    /// `layout` stays clear. The frame would pair one flush's chrome with
-    /// another flush's window text; under ext_multigrid the root carries the
-    /// statusline, tabline and separators, which describe what the layers show.
-    ///
-    /// The root rows come from the pinned set, so a root-only commit (every
-    /// statusline update) leaves the pair consistent, and a layers-only one
-    /// leaves committed_index alone; neither is refused.
-    commit: bool = false,
-
-    pub fn any(self: LayerFrameStaleness) bool {
-        return self.layout or self.commit;
-    }
-};
-
-pub fn layerFrameStaleness(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) LayerFrameStaleness {
-    return .{
-        .layout = tbs.layout_publish_gen != snapshot.layout_gen,
-        .commit = render_pipeline_helpers.layerFrameCommitStale(
-            tbs.commit_rev != snapshot.commit_rev,
-            tbs.layer_rows_rev != snapshot.layer_rows_rev,
-        ),
-    };
-}
 
 /// One layer row: scissor, background overwrite, upload, draw.
 fn drawLayerRow(
     g: *d3d11.Renderer,
-    state: *LayerGridState,
+    src: LayerFrameSource,
+    state: *LayerPaintState,
+    rows: []const RowMapping,
     ri: usize,
     d: LayerRowDrawCtx,
 ) LayerRowOutcome {
-    const rv = &state.rows_buf.items[ri];
     if (d.rs_set_sc_fn) |f| {
         const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(ri)) * d.row_h_px;
         var sc: c.D3D11_RECT = .{
@@ -4154,6 +4086,9 @@ fn drawLayerRow(
         f(d.ctx_ptr, 1, &sc);
     }
 
+    const mapping = rows[ri];
+    const verts_len: usize = if (mapping.slot != SLOT_NONE) src.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
+
     // Reset this row's band to exactly (bg * opacity, opacity) before
     // drawing it. A translucent background blended over its own previous
     // output compounds toward opaque; the overwrite also erases whatever a
@@ -4163,35 +4098,22 @@ fn drawLayerRow(
     // default-bg run (flush.zig, skip_default_bg), so no other pass
     // repaints the columns this layer's row no longer covers.
     var encoded = false;
-    if (g.opacity < 1.0 or g.blur_enabled or rv.verts.items.len == 0) {
+    if (g.opacity < 1.0 or g.blur_enabled or verts_len == 0) {
         g.drawClearRowOverwrite() catch return .{ .encoded = encoded, .failed = true };
         encoded = true;
     }
-    if (rv.verts.items.len == 0) return .{ .encoded = encoded };
+    if (verts_len == 0) return .{ .encoded = encoded };
 
-    const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
-    ensureBudgetedRowVertexBuffer(g, d.row_vb_budget, d.layer_row_vb_retained_bytes, &rv.vb, &rv.vb_bytes, need_bytes) catch |e|
+    const rvb = &state.row_vbs.items[ri];
+    _ = ensureRowVBReadyFromSlot(g, src.budget, &src.paint.layer_row_vb_retained_bytes, rvb, mapping, src.pool) catch |e|
         return .{ .encoded = encoded, .failed = true, .budget_exceeded = e == error.RowVBPhysicalBudgetExceeded };
-    const vb = rv.vb orelse return .{ .encoded = encoded, .failed = true };
-    if (rv.uploaded_gen != rv.gen) {
-        g.uploadVertsToVB(vb, rv.verts.items) catch
-            return .{ .encoded = encoded, .failed = true };
-        rv.uploaded_gen = rv.gen;
-    }
-    // A row-shift hint moves an array between rows without rewriting its
-    // pixels, so offset it by the distance it moved. Record the origin this
-    // used: the bloom extract reads it in a later lock hold, by which time the
-    // core may have shifted the rows again.
-    const row_dy: f32 = layerRowShiftPx(state.origin_rows.items, ri, d.row_h_px);
-    if (ri < state.drawn_origin_rows.items.len) {
-        state.drawn_origin_rows.items[ri] = if (ri < state.origin_rows.items.len)
-            state.origin_rows.items[ri]
-        else
-            @intCast(ri);
-    }
+    const vb = rvb.vb orelse return .{ .encoded = encoded, .failed = true };
+    // A row-shift hint moves a slot between rows without rewriting its
+    // pixels, so offset it by the distance it moved.
+    const row_dy = slotRowShiftPx(src.pool.slotPtrConst(mapping.slot), ri, d.row_h_px);
     g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h) catch
         return .{ .encoded = encoded, .failed = true };
-    g.drawVB(vb, rv.verts.items.len) catch
+    g.drawVB(vb, verts_len) catch
         return .{ .encoded = encoded, .failed = true };
     return .{ .encoded = true };
 }
@@ -4209,46 +4131,39 @@ const LayerRowDrawCtx = struct {
     row_h_px: i32,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
-    row_vb_budget: *RowVBPhysicalBudget,
-    layer_row_vb_retained_bytes: *usize,
 };
 
 /// Draw the surface's non-root layers, back-to-front, on top of the root grid.
 /// Each layer gets its own pixel space and is clipped to its own rect. A layer
 /// whose grid has no rows yet draws nothing, which is what the core's layout
-/// contract requires. Caller must hold `app.mu`.
+/// contract requires. Reads only the pinned set and the UI thread's state, so
+/// no lock is held.
 ///
 /// The caller must refuse to present a frame the outcome calls incomplete.
 pub fn drawSurfaceLayers(
     g: *d3d11.Renderer,
-    app: *App,
+    src: LayerFrameSource,
     layers: []const SurfaceLayer,
     base_vp: BaseViewport,
     x_offset: i32,
     y_offset: i32,
     content_right: i32,
     row_h_px: i32,
+    cell_w_px: i32,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     log_enabled: bool,
 ) LayerDrawOutcome {
     if (layers.len <= 1 or row_h_px <= 0) return .{};
-    // Before any GPU work: a plan made against row data the core has since
-    // republished cannot produce this frame, and a partly drawn one would be
-    // discarded anyway.
-    const stale = staleLayerPlans(app, layers);
-    if (stale != 0) {
-        if (log_enabled) applog.appLog("[layer_draw] stale_plans={d}\n", .{stale});
-        return .{ .stale_layers = stale };
-    }
     var failed_rows: u32 = 0;
     var budget_exceeded = false;
     for (layers[1..]) |layer| {
-        const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const rows = src.rows(layer);
+        const row_limit = @min(rows.len, state.row_vbs.items.len);
         // The plan is spent whether or not this layer drew anything.
         defer {
-            state.last_drawn_rows = row_limit;
+            state.last_drawn_rows = rows.len;
             state.draw_all = false;
             if (state.draw_rows.bit_length > 0) state.draw_rows.unsetAll();
             state.blit_clear_band = null;
@@ -4257,7 +4172,7 @@ pub fn drawSurfaceLayers(
 
         const d = LayerRowDrawCtx{
             .layer = layer,
-            .layer_w_px = @intCast(layer.cols * @as(u32, @intCast(@max(1, app.cell_w_px)))),
+            .layer_w_px = @as(i32, @intCast(layer.cols)) * cell_w_px,
             .origin_x = @floatFromInt(layer.x_px),
             .origin_y = @floatFromInt(layer.y_px),
             .base_vp = base_vp,
@@ -4267,15 +4182,13 @@ pub fn drawSurfaceLayers(
             .row_h_px = row_h_px,
             .ctx_ptr = ctx_ptr,
             .rs_set_sc_fn = rs_set_sc_fn,
-            .row_vb_budget = &app.row_vb_budget,
-            .layer_row_vb_retained_bytes = &app.layer_row_vb_retained_bytes,
         };
 
         var encoded: u32 = 0;
         var band_drawn = false;
         if (state.draw_all) {
             for (0..row_limit) |ri| {
-                const out = drawLayerRow(g, state, ri, d);
+                const out = drawLayerRow(g, src, state, rows, ri, d);
                 if (out.encoded) encoded += 1;
                 if (out.failed) failed_rows += 1;
                 if (out.budget_exceeded) budget_exceeded = true;
@@ -4304,7 +4217,7 @@ pub fn drawSurfaceLayers(
             var it = state.draw_rows.iterator(.{});
             while (it.next()) |ri| {
                 if (ri >= row_limit) break;
-                const out = drawLayerRow(g, state, ri, d);
+                const out = drawLayerRow(g, src, state, rows, ri, d);
                 if (out.encoded) encoded += 1;
                 if (out.failed) failed_rows += 1;
                 if (out.budget_exceeded) budget_exceeded = true;
@@ -4321,6 +4234,14 @@ pub fn drawSurfaceLayers(
     };
     return .{ .failed_rows = failed_rows, .budget_exceeded = budget_exceeded };
 }
+
+/// The cursor's row in its layer: the slot the pinned set maps it to, and the
+/// layer's GPU buffer for that row.
+pub const LayerCursorRow = struct {
+    row: usize,
+    mapping: RowMapping,
+    rvb: *RowVB,
+};
 
 pub const CursorOverlayParams = struct {
     cursor_verts: []const Vertex,
@@ -4346,13 +4267,10 @@ pub const CursorOverlayParams = struct {
     cursor_layer_w_px: ?i32 = null,
     /// The cursor's row in its own layer, when the cursor is not on the root
     /// grid. Blink-off redraws this instead of the root's (empty) row.
-    cursor_layer_row: ?*RowVerts = null,
+    cursor_layer_row: ?LayerCursorRow = null,
     /// What `cursor_layer_row`'s buffer is charged to.
     row_vb_budget: *RowVBPhysicalBudget,
     layer_row_vb_retained_bytes: *usize,
-    /// How far a row-shift hint moved that row's vertices from where they
-    /// were built; the layer draw applies the same offset.
-    cursor_layer_row_dy_px: f32 = 0,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     last_painted_cursor_row: *?u32,
@@ -4382,18 +4300,15 @@ fn redrawCursorRowContent(
     layer_h: f32,
 ) !void {
     if (p.cursor_layer_row) |lr| {
-        if (lr.verts.items.len == 0) return;
-        const need_bytes = lr.verts.items.len * @sizeOf(Vertex);
-        try ensureBudgetedRowVertexBuffer(g, p.row_vb_budget, p.layer_row_vb_retained_bytes, &lr.vb, &lr.vb_bytes, need_bytes);
-        const lvb = lr.vb orelse return error.CursorRowVertexBufferMissing;
-        if (lr.uploaded_gen != lr.gen) {
-            try g.uploadVertsToVB(lvb, lr.verts.items);
-            lr.uploaded_gen = lr.gen;
-        }
+        if (lr.mapping.slot == SLOT_NONE) return;
+        const slot = p.pool.slotPtrConst(lr.mapping.slot);
+        if (slot.verts.items.len == 0) return;
+        _ = try ensureRowVBReadyFromSlot(g, p.row_vb_budget, p.layer_row_vb_retained_bytes, lr.rvb, lr.mapping, p.pool);
+        const lvb = lr.rvb.vb orelse return error.CursorRowVertexBufferMissing;
         // Same offset drawSurfaceLayers applies: a shift hint moved these
         // vertices between rows without rewriting them.
-        try g.setLayerTransform(cursor_ox, cursor_oy + p.cursor_layer_row_dy_px, layer_w, layer_h);
-        try g.drawVB(lvb, lr.verts.items.len);
+        try g.setLayerTransform(cursor_ox, cursor_oy + slotRowShiftPx(slot, lr.row, p.row_h_px), layer_w, layer_h);
+        try g.drawVB(lvb, slot.verts.items.len);
         return;
     }
     if (cursor_row >= p.row_vbs.len or cursor_row >= p.row_map.len) return;
@@ -4603,14 +4518,17 @@ const BloomRowsContext = struct {
     pool: *const SlotPool,
     row_vbs: []const RowVB,
     row_h_px: i32,
-    /// Non-root layers extracted after the root rows. Null for a surface
-    /// without layers.
-    bloom_layers: ?BloomLayerSource = null,
+    /// Non-root layers extracted after the root rows: the pinned set the
+    /// frame drew them from, and the full layer list, root first.
+    layers: []const SurfaceLayer = &.{},
+    layer_src: ?LayerFrameSource = null,
     /// Cursor vertices are grid-local; drawBloomPasses draws them right after
     /// this callback with the transform it leaves bound.
     cursor_layer_origin: [2]f32 = .{ 0, 0 },
 };
 
+/// False when a transform could not be bound, so the extract is missing rows
+/// and the frame may not be presented.
 fn drawBloomRowBuffers(
     opaque_ctx: ?*const anyopaque,
     g: *d3d11.Renderer,
@@ -4619,9 +4537,9 @@ fn drawBloomRowBuffers(
     viewport_y: f32,
     viewport_w: f32,
     viewport_h: f32,
-) void {
-    const ctx: *const BloomRowsContext = @ptrCast(@alignCast(opaque_ctx orelse return));
-    const set_viewport = d3d_ctx.*.lpVtbl.*.RSSetViewports orelse return;
+) bool {
+    const ctx: *const BloomRowsContext = @ptrCast(@alignCast(opaque_ctx orelse return true));
+    const set_viewport = d3d_ctx.*.lpVtbl.*.RSSetViewports orelse return true;
 
     // The extract target is half resolution, so the viewport handed in is half
     // the surface's while core vertices stay in full-resolution surface pixels.
@@ -4652,8 +4570,8 @@ fn drawBloomRowBuffers(
         };
         set_viewport(d3d_ctx, 1, &viewport);
         // Core row vertices are grid-local pixels against this viewport.
-        g.setLayerTransform(0, 0, extent_w_px, extent_h_px) catch continue;
-        g.drawVB(vb, slot.verts.items.len) catch {};
+        g.setLayerTransform(0, 0, extent_w_px, extent_h_px) catch return false;
+        g.drawVB(vb, slot.verts.items.len) catch return false;
     }
 
     // drawBloomPasses draws the cursor after this callback using the base
@@ -4672,13 +4590,13 @@ fn drawBloomRowBuffers(
     // chrome, so extracting root rows alone leaves the whole buffer unlit.
     // Same rows, same row-shift offset as drawSurfaceLayers, with each
     // layer's origin carried by the layer transform instead of the viewport.
-    if (ctx.bloom_layers) |src| {
-        if (src.layers.len > 1) {
-            for (src.layers[1..]) |layer| {
-                const state = src.app.layer_grids.get(layer.grid_id) orelse continue;
+    if (ctx.layer_src) |src| {
+        if (ctx.layers.len > 1) {
+            for (ctx.layers[1..]) |layer| {
+                const state = src.paint.layerState(layer.grid_id) orelse continue;
+                const rows = src.rows(layer);
                 const origin_x: f32 = @floatFromInt(layer.x_px);
                 const origin_y: f32 = @floatFromInt(layer.y_px);
-                const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
                 // Pass 0 attenuates what the layers below already extracted by
                 // this layer's background coverage, pass 1 adds this layer's
                 // own light. Back to front over the layer list, which is the
@@ -4686,18 +4604,19 @@ fn drawBloomRowBuffers(
                 var pass: u8 = 0;
                 while (pass < 2) : (pass += 1) {
                     if (!g.setBloomOccludePass(d3d_ctx, pass == 0)) continue;
-                    for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
-                        if (rv.verts.items.len == 0) continue;
+                    for (rows, 0..) |mapping, ri| {
+                        if (ri >= state.row_vbs.items.len or mapping.slot == SLOT_NONE) continue;
+                        const slot = src.pool.slotPtrConst(mapping.slot);
+                        if (slot.verts.items.len == 0) continue;
                         // Only a buffer holding this row's current vertices is
                         // safe to draw: the layer pass skips a row whose upload
-                        // failed and leaves uploaded_gen behind.
-                        if (rv.uploaded_gen != rv.gen) continue;
-                        const vb = rv.vb orelse continue;
-                        // The origins the draw placed these pixels at, not the
-                        // ones the core may have published since.
-                        const row_dy = layerRowShiftPx(state.drawn_origin_rows.items, ri, ctx.row_h_px);
-                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px) catch continue;
-                        g.drawVB(vb, rv.verts.items.len) catch {};
+                        // failed and leaves it behind.
+                        const rvb = state.row_vbs.items[ri];
+                        if (rvb.uploaded_slot != mapping.slot or rvb.uploaded_ver != slot.ver) continue;
+                        const vb = rvb.vb orelse continue;
+                        const row_dy = slotRowShiftPx(slot, ri, ctx.row_h_px);
+                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px) catch return false;
+                        g.drawVB(vb, slot.verts.items.len) catch return false;
                     }
                 }
             }
@@ -4706,7 +4625,8 @@ fn drawBloomRowBuffers(
     // drawBloomPasses draws the cursor after this callback, in its layer's
     // space as the main pass does; it used to be left at the surface origin,
     // so a cursor in a split or float glowed away from where it was drawn.
-    g.setLayerTransform(ctx.cursor_layer_origin[0], ctx.cursor_layer_origin[1], extent_w_px, extent_h_px) catch {};
+    g.setLayerTransform(ctx.cursor_layer_origin[0], ctx.cursor_layer_origin[1], extent_w_px, extent_h_px) catch return false;
+    return true;
 }
 
 /// Release the snapshot a paint took with `acquireForPaint`, once, from the
@@ -4778,6 +4698,7 @@ pub fn requestMainFullPaint(app: *App) void {
 pub const RowFrameSurface = struct {
     row_vbs: []RowVB,
     row_vb_retained_bytes: *usize,
+    layer_row_vb_retained_bytes: *usize,
     pool: *const SlotPool,
     cursor_vb: *?*c.ID3D11Buffer,
     cursor_vb_bytes: *usize,
@@ -4793,13 +4714,16 @@ pub const RowFrameGlow = struct {
 };
 
 /// Everything one row frame needs that the caller settled before it: the
-/// committed set, the redraw set, the cursor, the layer staleness verdict, and
-/// the viewport the rows are drawn into.
+/// committed set, the redraw set, the cursor, and the viewport the rows are
+/// drawn into.
 pub const RowFrameInput = struct {
     /// The grid this surface's root layer draws; a cursor on it is placed by
     /// the root's transform, any other by its layer's.
     root_grid_id: i64,
     layers: []const SurfaceLayer,
+    /// The pinned set's layer rows and their paint state. Null when the
+    /// surface places no layers.
+    layer_src: ?LayerFrameSource = null,
     row_map: []const RowMapping,
     rows_to_draw: []const u32,
     cursor_verts: []const Vertex,
@@ -4814,8 +4738,6 @@ pub const RowFrameInput = struct {
     cursor_layer_origin: [2]f32,
     blink_visible: bool,
     force_full_rows: bool,
-    layer_layout_stale: bool,
-    layer_commit_stale: bool,
     glow: ?RowFrameGlow,
     draw_params: RowModeDrawParams,
     log_enabled: bool,
@@ -4825,15 +4747,19 @@ pub const RowFrameOutcome = struct {
     rows: RowModeDrawResult = .{},
     layers: LayerDrawOutcome = .{},
     cursor_overlay_failed: bool = false,
+    /// The bloom extract could not bind a transform, so the glow it
+    /// composited is missing rows.
+    bloom_failed: bool = false,
     /// The row pass hit the physical VB budget. Nothing after it ran, so the
-    /// layer plan taken before the frame was never paid for; the caller
-    /// re-arms it and reports the budget to the core.
+    /// layer damage taken for the frame was never paid for; the caller hands
+    /// it back and reports the budget to the core.
     row_vb_budget_exceeded: bool = false,
 
     /// A frame that must not be presented: rows missing from back_tex, a
-    /// layer plan spent without its frame, or a cursor that never landed.
+    /// cursor that never landed, or a glow missing rows.
     pub fn incomplete(self: RowFrameOutcome) bool {
-        return self.rows.metrics.failed_rows != 0 or self.layers.incomplete() or self.cursor_overlay_failed;
+        return self.rows.metrics.failed_rows != 0 or self.layers.incomplete() or
+            self.cursor_overlay_failed or self.bloom_failed;
     }
 };
 
@@ -4845,22 +4771,16 @@ pub const RowFrameOutcome = struct {
 /// Rules this frame settles once, where the two drivers used to differ:
 /// - The cursor's row is the one its callback named (`cursor_row`), never
 ///   re-derived from the vertices' pixels.
-/// - The cursor's rows are claimed into the redraw set only when the layer
-///   plan is current: a stale frame is refused below, and a claim made
-///   against it would leak into the next plan.
 /// - A cursor on the root grid counts as redrawn when both of its rows are in
 ///   `rows_to_draw`, layers or not. Both drivers put them there, and the
 ///   overlay's erase branch double-blends a row that was already redrawn.
-/// - `app.mu` is held once, from the claim through the overlay: the layer
-///   rows the overlay redraws are the ones the plan was just spent on.
 /// - Any row-pass failure ends the frame before the layers and the cursor;
 ///   the outcome refuses the present and the caller re-arms.
 /// - `last_painted_cursor_grid` is recorded whether or not the overlay
 ///   succeeded, so a blink-off frame cannot leave the pair naming different
 ///   paints.
 ///
-/// `app.mu` must be free on entry. Bloom takes it itself for the layer
-/// storage it reads.
+/// Every row it draws comes from the set the paint pinned, so no lock is held.
 pub fn drawSurfaceRowFrame(
     g: *d3d11.Renderer,
     app: *App,
@@ -4870,13 +4790,8 @@ pub fn drawSurfaceRowFrame(
     var out = RowFrameOutcome{};
     const log_enabled = in.log_enabled;
     const row_h_px = in.draw_params.row_h_px;
+    const cell_w_px: i32 = @intCast(@max(1, app.cell_w_px));
 
-    // Return what the core thread freed before anything is charged.
-    const freed = app.layer_row_vb_released_bytes.swap(0, .acq_rel);
-    app.row_vb_budget.release(&app.layer_row_vb_retained_bytes, freed);
-
-    // TBS lock-free draw: the committed set is protected by refcount, so no
-    // app.mu is needed during VB upload + draw.
     out.rows = drawRowModeSetupAndRowsFromSlots(
         g,
         &app.row_vb_budget,
@@ -4894,160 +4809,123 @@ pub fn drawSurfaceRowFrame(
     };
     if (out.rows.metrics.failed_rows != 0) return out;
 
-    const has_layers = in.layers.len > 1;
-    const layers_stale = in.layer_layout_stale or in.layer_commit_stale;
     const cursor_on_root = in.cursor_grid == in.root_grid_id;
-    out.layers = .{ .stale_layout = in.layer_layout_stale, .stale_commit = in.layer_commit_stale };
 
-    {
-        // A layer's rows and a cursor inside one both live in layer storage
-        // the core thread can resize; hold app.mu from the claim to the
-        // overlay so the row the overlay redraws is the one the plan drew.
-        const needs_layer_lock = has_layers or !cursor_on_root;
-        if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
-        defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
-
-        // What row_already_redrawn promises drawCursorOverlay: this frame
-        // repainted the cursor's OWN grid's row, so blink-on needs only the
-        // cursor quad and blink-off needs nothing. A layer's rows have to be
-        // claimed here, after planLayerFrame settled the redraw set and
-        // before drawSurfaceLayers' defer clears it; the root's went into
-        // rows_to_draw before the frame, so membership decides there.
-        var cursor_row_redrawn = in.force_full_rows;
-        if (!cursor_row_redrawn and !layers_stale) {
-            var claimed = true;
-            for (in.cursor_erase_rows) |maybe_row| {
-                const r = maybe_row orelse continue;
-                if (cursor_on_root) {
-                    if (std.mem.indexOfScalar(u32, in.rows_to_draw, r) == null) claimed = false;
-                } else if (!markLayerCursorRow(
-                    app,
-                    in.layers,
-                    in.cursor_grid,
-                    r,
-                    @intCast(@max(1, app.cell_w_px)),
-                    row_h_px,
-                )) claimed = false;
-            }
-            cursor_row_redrawn = claimed;
+    // What row_already_redrawn promises drawCursorOverlay: this frame
+    // repainted the cursor's OWN grid's row, so blink-on needs only the
+    // cursor quad and blink-off needs nothing. A layer's rows have to be
+    // claimed here, after planLayerFrame settled the redraw set and before
+    // drawSurfaceLayers' defer clears it; the root's went into rows_to_draw
+    // before the frame, so membership decides there.
+    var cursor_row_redrawn = in.force_full_rows;
+    if (!cursor_row_redrawn) {
+        var claimed = true;
+        for (in.cursor_erase_rows) |maybe_row| {
+            const r = maybe_row orelse continue;
+            if (cursor_on_root) {
+                if (std.mem.indexOfScalar(u32, in.rows_to_draw, r) == null) claimed = false;
+            } else if (in.layer_src) |src| {
+                if (!markLayerCursorRow(src, in.layers, in.cursor_grid, r, cell_w_px, row_h_px)) claimed = false;
+            } else claimed = false;
         }
-
-        // Non-root layers on top of the root grid, before the cursor so the
-        // cursor stays on top of everything.
-        if (has_layers and !layers_stale) {
-            out.layers = drawSurfaceLayers(
-                g,
-                app,
-                in.layers,
-                .{
-                    .x = @floatFromInt(in.draw_params.x_offset),
-                    .y = @floatFromInt(in.draw_params.y_offset),
-                    .w = @floatFromInt(rowModeViewportWidth(g, in.draw_params)),
-                    .h = @floatFromInt(in.draw_params.content_height),
-                },
-                in.draw_params.x_offset,
-                in.draw_params.y_offset,
-                in.draw_params.content_right,
-                row_h_px,
-                out.rows.ctx_ptr,
-                out.rows.rs_set_sc_fn,
-                log_enabled,
-            );
-            if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
-            // Their pixels are in back_tex now; the present rects for this
-            // frame were already built by the caller. Only a layer that got
-            // one of those rects has its dirty flag consumed here: a layer the
-            // core made dirty after the rect loop has no rect covering it, so
-            // it keeps the flag and is presented by the next paint. The clear
-            // stays inside the same lock as the draw so a store landing
-            // between the two cannot be dropped; a present that then fails
-            // requeues a full paint, which redraws and presents every layer.
-            for (in.layers[1..]) |layer| {
-                const state = app.layer_grids.get(layer.grid_id) orelse continue;
-                if (state.paint_has_present_rect) state.dirty = false;
-            }
-        }
-
-        // The cursor's own row in its layer. Blink-off redraws this instead
-        // of the root's row, which is empty under ext_multigrid. Read with
-        // the row itself, so a blink-off redraw uses the shift the layer draw
-        // above applied.
-        var cursor_layer_row: ?*RowVerts = null;
-        var cursor_layer_row_dy_px: f32 = 0;
-        var cursor_layer_w_px: ?i32 = null;
-        if (!cursor_on_root) {
-            for (in.layers) |layer| {
-                if (layer.grid_id != in.cursor_grid) continue;
-                cursor_layer_w_px = @as(i32, @intCast(layer.cols)) * @as(i32, @intCast(@max(1, app.cell_w_px)));
-                break;
-            }
-            if (in.cursor_row) |row| {
-                if (app.layer_grids.get(in.cursor_grid)) |state| {
-                    if (row < state.rows_buf.items.len) {
-                        cursor_layer_row = &state.rows_buf.items[row];
-                        const origin_row: u32 = if (row < state.origin_rows.items.len)
-                            state.origin_rows.items[row]
-                        else
-                            row;
-                        cursor_layer_row_dy_px = @floatFromInt(
-                            (@as(i32, @intCast(row)) - @as(i32, @intCast(origin_row))) * row_h_px,
-                        );
-                    }
-                }
-            }
-        }
-
-        drawCursorOverlay(g, .{
-            .cursor_verts = in.cursor_verts,
-            .cursor_row = in.cursor_row,
-            .cursor_vb = surface.cursor_vb,
-            .cursor_vb_bytes = surface.cursor_vb_bytes,
-            .row_vbs = surface.row_vbs,
-            .row_map = in.row_map,
-            .pool = surface.pool,
-            .blink_visible = in.blink_visible,
-            .x_offset = in.draw_params.x_offset,
-            .y_offset = in.draw_params.y_offset,
-            .content_right = in.draw_params.content_right,
-            .content_width = rowModeViewportWidth(g, in.draw_params),
-            .content_height = in.draw_params.content_height,
-            .row_h_px = row_h_px,
-            .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
-            .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
-            .cursor_layer_w_px = cursor_layer_w_px,
-            .cursor_layer_row = cursor_layer_row,
-            .row_vb_budget = &app.row_vb_budget,
-            .layer_row_vb_retained_bytes = &app.layer_row_vb_retained_bytes,
-            .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
-            .ctx_ptr = out.rows.ctx_ptr,
-            .rs_set_sc_fn = out.rows.rs_set_sc_fn,
-            .last_painted_cursor_row = surface.last_painted_cursor_row,
-            .row_already_redrawn = cursor_row_redrawn,
-        }) catch |e| {
-            out.cursor_overlay_failed = true;
-            if (e == error.RowVBPhysicalBudgetExceeded) out.row_vb_budget_exceeded = true;
-            if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
-        };
-        // Paired with the row drawCursorOverlay just recorded, so the next
-        // paint can tell whether that row is one it can still place.
-        surface.last_painted_cursor_grid.* = in.cursor_grid;
+        cursor_row_redrawn = claimed;
     }
+
+    // Non-root layers on top of the root grid, before the cursor so the
+    // cursor stays on top of everything.
+    if (in.layer_src) |src| {
+        out.layers = drawSurfaceLayers(
+            g,
+            src,
+            in.layers,
+            .{
+                .x = @floatFromInt(in.draw_params.x_offset),
+                .y = @floatFromInt(in.draw_params.y_offset),
+                .w = @floatFromInt(rowModeViewportWidth(g, in.draw_params)),
+                .h = @floatFromInt(in.draw_params.content_height),
+            },
+            in.draw_params.x_offset,
+            in.draw_params.y_offset,
+            in.draw_params.content_right,
+            row_h_px,
+            cell_w_px,
+            out.rows.ctx_ptr,
+            out.rows.rs_set_sc_fn,
+            log_enabled,
+        );
+        if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
+    }
+
+    // The cursor's own row in its layer. Blink-off redraws this instead of
+    // the root's row, which is empty under ext_multigrid.
+    var cursor_layer_row: ?LayerCursorRow = null;
+    var cursor_layer_w_px: ?i32 = null;
+    if (!cursor_on_root) {
+        for (in.layers) |layer| {
+            if (layer.grid_id != in.cursor_grid) continue;
+            cursor_layer_w_px = @as(i32, @intCast(layer.cols)) * cell_w_px;
+            const row = in.cursor_row orelse break;
+            const src = in.layer_src orelse break;
+            const state = src.paint.layerState(layer.grid_id) orelse break;
+            const rows = src.rows(layer);
+            if (row < rows.len and row < state.row_vbs.items.len) {
+                cursor_layer_row = .{ .row = row, .mapping = rows[row], .rvb = &state.row_vbs.items[row] };
+            }
+            break;
+        }
+    }
+
+    drawCursorOverlay(g, .{
+        .cursor_verts = in.cursor_verts,
+        .cursor_row = in.cursor_row,
+        .cursor_vb = surface.cursor_vb,
+        .cursor_vb_bytes = surface.cursor_vb_bytes,
+        .row_vbs = surface.row_vbs,
+        .row_map = in.row_map,
+        .pool = surface.pool,
+        .blink_visible = in.blink_visible,
+        .x_offset = in.draw_params.x_offset,
+        .y_offset = in.draw_params.y_offset,
+        .content_right = in.draw_params.content_right,
+        .content_width = rowModeViewportWidth(g, in.draw_params),
+        .content_height = in.draw_params.content_height,
+        .row_h_px = row_h_px,
+        .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
+        .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
+        .cursor_layer_w_px = cursor_layer_w_px,
+        .cursor_layer_row = cursor_layer_row,
+        .row_vb_budget = &app.row_vb_budget,
+        .layer_row_vb_retained_bytes = surface.layer_row_vb_retained_bytes,
+        .ctx_ptr = out.rows.ctx_ptr,
+        .rs_set_sc_fn = out.rows.rs_set_sc_fn,
+        .last_painted_cursor_row = surface.last_painted_cursor_row,
+        .row_already_redrawn = cursor_row_redrawn,
+    }) catch |e| {
+        out.cursor_overlay_failed = true;
+        if (e == error.RowVBPhysicalBudgetExceeded) out.row_vb_budget_exceeded = true;
+        if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
+    };
+    // Paired with the row drawCursorOverlay just recorded, so the next
+    // paint can tell whether that row is one it can still place.
+    surface.last_painted_cursor_grid.* = in.cursor_grid;
 
     if (in.glow) |glow| {
         const bloom_cursor = if (glow.cursor_visible) in.cursor_verts else &[_]Vertex{};
         // The blur reads this from the renderer rather than the call, so it
         // has to be current before the passes run.
         g.glow_radius_scale = glow.radius_scale;
-        drawBloomRowsOverlay(
+        if (!drawBloomRowsOverlay(
             g,
             in.row_map,
             surface.pool,
             surface.row_vbs,
+            in.layers,
+            in.layer_src,
             bloom_cursor,
             glow.intensity,
             in.cursor_layer_origin,
             in.draw_params,
-        );
+        )) out.bloom_failed = true;
     }
     return out;
 }
@@ -5056,36 +4934,17 @@ pub fn drawSurfaceRowFrame(
 /// plus the growable row VB list and the scratch the scroll shift uses.
 pub const RowPassSurface = struct {
     pub fn of(ws: *WindowSurface) RowPassSurface {
-        const paint = &ws.paint;
-        return .{
-            .tbs = &ws.tbs,
-            .row_vbs = &paint.row_vbs,
-            .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
-            .row_vb_retained_bytes = &paint.row_vb_retained_bytes,
-            .cursor_vb = &paint.cursor_vb,
-            .cursor_vb_bytes = &paint.cursor_vb_bytes,
-            .last_painted_cursor_row = &paint.last_painted_cursor_row,
-            .last_painted_cursor_grid = &paint.last_painted_cursor_grid,
-            .layer_frame_refusals = &paint.layer_frame_refusals,
-        };
+        return .{ .tbs = &ws.tbs, .paint = &ws.paint };
     }
 
     tbs: *TripleBufferedSurface,
-    row_vbs: *std.ArrayListUnmanaged(RowVB),
-    scroll_rows_merge_scratch: *std.ArrayListUnmanaged(u32),
-    row_vb_retained_bytes: *usize,
-    cursor_vb: *?*c.ID3D11Buffer,
-    cursor_vb_bytes: *usize,
-    last_painted_cursor_row: *?u32,
-    last_painted_cursor_grid: *i64,
-    layer_frame_refusals: *u64,
+    paint: *SurfacePaintState,
 };
 
-/// Layer rectangles appended under the lock the layer plan runs in, so a store
-/// landing between plan and draw cannot have its flag dropped. Reserved by the
-/// caller.
+/// Where the layer rectangles of this frame's present damage go, and what
+/// bounds them.
 pub const RowPassLayerPresent = struct {
-    rects: *std.ArrayListUnmanaged(c.RECT),
+    present: *PresentRectBuilder,
     right: i32,
     bottom: i32,
     /// Grid-local rows of the cursor's grid this frame redraws.
@@ -5103,8 +4962,7 @@ pub const RowPassInput = struct {
     preserve_back: bool,
     cell_w_px: i32,
     layer_present: ?RowPassLayerPresent = null,
-    /// The frame, minus what this pass settles: the redraw set, the layers
-    /// and their staleness verdict.
+    /// The frame, minus what this pass settles: the redraw set and the layers.
     frame: RowFrameInput,
 };
 
@@ -5112,17 +4970,13 @@ pub const RowPassOutcome = struct {
     frame: RowFrameOutcome,
     /// The rectangle the root's GPU scroll copied, or null.
     scroll_damage: ?c.RECT,
-    /// The layer frame went stale before anything reached back_tex, so
-    /// nothing was drawn and no layer plan was spent. Not a failure: the
-    /// driver hands its damage back (returnUndrawnDamage) and repaints now.
-    stale: bool = false,
 };
 
 /// The row pass both paint drivers run, in one order: size the row VBs, shift
-/// the root's retained pixels for a committed scroll, plan the layers under
-/// `app.mu`, then draw the row frame. Prologue, redraw set, present rects and
-/// Present stay with the driver. OutOfMemory means nothing may be presented
-/// and the driver requeues a full paint.
+/// the root's retained pixels for a committed scroll, plan the layers, then
+/// draw the row frame. Prologue, redraw set, present rects and Present stay
+/// with the driver. OutOfMemory means nothing may be presented and the driver
+/// requeues a full paint.
 pub fn drawSurfaceRowPass(
     g: *d3d11.Renderer,
     app: *App,
@@ -5134,9 +4988,11 @@ pub fn drawSurfaceRowPass(
     const rows_to_draw = in.rows_to_draw;
     const layers = in.snapshot.layers.slice();
     const has_layers = layers.len > 1;
+    const paint = surface.paint;
 
-    if (!resizeRowVBsForPaint(app.alloc, surface.row_vbs, &app.row_vb_budget, surface.row_vb_retained_bytes, in.row_vb_len))
+    if (!resizeRowVBsForPaint(app.alloc, &paint.row_vbs, &app.row_vb_budget, &paint.row_vb_retained_bytes, in.row_vb_len))
         return error.OutOfMemory;
+    try paint.syncLayers(app.alloc, &app.row_vb_budget, layers);
 
     var scroll_damage: ?c.RECT = null;
     if (in.preserve_back) {
@@ -5144,16 +5000,16 @@ pub fn drawSurfaceRowPass(
             const shift = applyScrollShift(
                 g,
                 app.alloc,
-                surface.row_vbs.items,
+                paint.row_vbs.items,
                 rows_to_draw,
-                surface.scroll_rows_merge_scratch,
+                &paint.scroll_rows_merge_scratch,
                 sr,
                 in.snapshot.scroll_dy_px,
                 in.snapshot.vb_shift,
                 in.snapshot.scroll_row_start,
                 in.snapshot.scroll_row_end,
-                surface.last_painted_cursor_row,
-                surface.last_painted_cursor_grid.* == in.frame.root_grid_id,
+                &paint.last_painted_cursor_row,
+                paint.last_painted_cursor_grid == in.frame.root_grid_id,
                 p.row_h_px,
                 in.total_rows,
                 p.y_offset,
@@ -5181,7 +5037,7 @@ pub fn drawSurfaceRowPass(
                     if (!render_pipeline_helpers.mergeSortedRowsWithRange(
                         app.alloc,
                         rows_to_draw,
-                        surface.scroll_rows_merge_scratch,
+                        &paint.scroll_rows_merge_scratch,
                         span[0],
                         span[1],
                     )) return error.OutOfMemory;
@@ -5191,48 +5047,23 @@ pub fn drawSurfaceRowPass(
     } else {
         // A frame that redraws every row still applies the staged shift, or
         // the stale slot order carries into the next partial frame.
-        shiftRowVBs(surface.row_vbs.items, in.snapshot.vb_shift, in.snapshot.scroll_row_start, in.snapshot.scroll_row_end);
+        shiftRowVBs(paint.row_vbs.items, in.snapshot.vb_shift, in.snapshot.scroll_row_start, in.snapshot.scroll_row_end);
     }
 
     // The copy has to land before the rows below paint over the band it
-    // moves, and the plan before the draw. app.mu after the renderer context,
-    // the order the layer draw takes them in.
-    var layout_stale = false;
-    var commit_stale = false;
+    // moves, and the plan before the draw.
+    var layer_src: ?LayerFrameSource = null;
     if (has_layers) {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        const staleness = layerFrameStaleness(surface.tbs, in.snapshot);
-        layout_stale = staleness.layout;
-        commit_stale = staleness.commit;
-        // The scroll this snapshot consumed is not handed back, so a frame
-        // that took one has already moved back_tex for good.
-        const scroll_consumed = in.snapshot.scroll_rect != null or in.snapshot.vb_shift != 0;
-        const refusal = render_pipeline_helpers.classifyLayerFrameRefusal(staleness.any(), scroll_consumed);
-        if (refusal != .none) {
-            // Nothing is planned at a placement the core already replaced, or
-            // beside root rows it already replaced, and the root rows are not
-            // drawn either: the whole frame is refused.
-            surface.layer_frame_refusals.* +%= 1;
-            if (in.frame.log_enabled) applog.appLog(
-                "[layer_frame] refused={d} reason={s} outcome={s} root={d} gen={d} rev={d}\n",
-                .{
-                    surface.layer_frame_refusals.*,
-                    if (layout_stale and commit_stale) "layout+commit" else if (layout_stale) "layout" else "commit",
-                    @tagName(refusal),
-                    in.frame.root_grid_id,
-                    in.snapshot.layout_gen,
-                    in.snapshot.commit_rev,
-                },
-            );
-            if (refusal == .stale) return .{ .frame = .{}, .scroll_damage = null, .stale = true };
-            rearmLayerDraw(app, layers);
-            return .{
-                .frame = .{ .layers = .{ .stale_layout = layout_stale, .stale_commit = commit_stale } },
-                .scroll_damage = scroll_damage,
-            };
-        }
-        planLayerFrame(g, app, layers, .{
+        const src: LayerFrameSource = .{
+            .set = &surface.tbs.sets[in.snapshot.committed_index],
+            .pool = &surface.tbs.pool,
+            .damage = in.snapshot.layer_damage,
+            .paint = paint,
+            .alloc = app.alloc,
+            .budget = &app.row_vb_budget,
+        };
+        layer_src = src;
+        planLayerFrame(g, src, layers, .{
             .x_offset = p.x_offset,
             .y_offset = p.y_offset,
             .content_right = p.content_right,
@@ -5241,62 +5072,57 @@ pub fn drawSurfaceRowPass(
             .cell_w_px = in.cell_w_px,
             .preserve_back = in.preserve_back,
             .cursor_grid = in.snapshot.cursor_layer_grid_id,
-            .last_cursor_row = surface.last_painted_cursor_row.*,
+            .last_cursor_row = paint.last_painted_cursor_row,
             .rows_to_draw = rows_to_draw.items,
             .root_scroll_rect = scroll_damage,
             .log_enabled = in.frame.log_enabled,
         });
         if (in.layer_present) |lp| appendLayerPresentRects(
-            app,
+            src,
             layers,
             p.x_offset,
             p.y_offset,
             lp.right,
             lp.bottom,
             p.row_h_px,
+            in.cell_w_px,
             lp.cursor_grid,
             lp.cursor_rows,
-            lp.rects,
+            lp.present,
         );
     }
 
     in.frame.layers = layers;
+    in.frame.layer_src = layer_src;
     in.frame.rows_to_draw = rows_to_draw.items;
-    in.frame.layer_layout_stale = layout_stale;
-    in.frame.layer_commit_stale = commit_stale;
     const frame = drawSurfaceRowFrame(g, app, .{
-        .row_vbs = surface.row_vbs.items,
-        .row_vb_retained_bytes = surface.row_vb_retained_bytes,
+        .row_vbs = paint.row_vbs.items,
+        .row_vb_retained_bytes = &paint.row_vb_retained_bytes,
+        .layer_row_vb_retained_bytes = &paint.layer_row_vb_retained_bytes,
         .pool = &surface.tbs.pool,
-        .cursor_vb = surface.cursor_vb,
-        .cursor_vb_bytes = surface.cursor_vb_bytes,
-        .last_painted_cursor_row = surface.last_painted_cursor_row,
-        .last_painted_cursor_grid = surface.last_painted_cursor_grid,
+        .cursor_vb = &paint.cursor_vb,
+        .cursor_vb_bytes = &paint.cursor_vb_bytes,
+        .last_painted_cursor_row = &paint.last_painted_cursor_row,
+        .last_painted_cursor_grid = &paint.last_painted_cursor_grid,
     }, in.frame);
     return .{ .frame = frame, .scroll_damage = scroll_damage };
 }
 
 /// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
 /// glow out of the per-paint heap and avoids copying every grid vertex.
+/// False when the extract could not be drawn whole.
 pub fn drawBloomRowsOverlay(
     g: *d3d11.Renderer,
     row_map: []const RowMapping,
     pool: *const SlotPool,
     row_vbs: []const RowVB,
+    layers: []const SurfaceLayer,
+    layer_src: ?LayerFrameSource,
     cursor_verts: []const Vertex,
     glow_intensity: f32,
     cursor_layer_origin: [2]f32,
     draw_params: RowModeDrawParams,
-) void {
-    // The extract pass reads live layer row storage, which the core thread
-    // resizes in applyStaged and frees outright when a grid is destroyed, both
-    // under app.mu. Taking it here rather than at the call sites is what stops
-    // a surface from forgetting: bloom_layers is the only thing that reaches
-    // that storage, and it carries the App the lock belongs to.
-    // Callers must NOT hold app.mu -- std.Io.Mutex is not reentrant.
-    if (draw_params.bloom_layers) |src| src.app.mu.lockUncancelable(core.clock.io());
-    defer if (draw_params.bloom_layers) |src| src.app.mu.unlock(core.clock.io());
-
+) bool {
     var has_rows = false;
     for (row_map, 0..) |mapping, row_index| {
         if (row_index >= row_vbs.len or mapping.slot == SLOT_NONE or row_vbs[row_index].vb == null) continue;
@@ -5307,11 +5133,10 @@ pub fn drawBloomRowsOverlay(
     }
     // A root grid that only holds chrome has no rows here, but its layers do.
     if (!has_rows) {
-        if (draw_params.bloom_layers) |src| {
-            if (src.layers.len > 1) layer_scan: for (src.layers[1..]) |layer| {
-                const state = src.app.layer_grids.get(layer.grid_id) orelse continue;
-                for (state.rows_buf.items) |*rv| {
-                    if (rv.vb != null and rv.verts.items.len != 0) {
+        if (layer_src) |src| {
+            if (layers.len > 1) layer_scan: for (layers[1..]) |layer| {
+                for (src.rows(layer)) |m| {
+                    if (m.slot != SLOT_NONE and pool.slotPtrConst(m.slot).verts.items.len != 0) {
                         has_rows = true;
                         break :layer_scan;
                     }
@@ -5319,18 +5144,19 @@ pub fn drawBloomRowsOverlay(
             };
         }
     }
-    if (!has_rows) return;
+    if (!has_rows) return true;
 
     const rows_ctx = BloomRowsContext{
         .row_map = row_map,
         .pool = pool,
         .row_vbs = row_vbs,
         .row_h_px = draw_params.row_h_px,
-        .bloom_layers = draw_params.bloom_layers,
+        .layers = layers,
+        .layer_src = layer_src,
         .cursor_layer_origin = cursor_layer_origin,
     };
     const bvp = draw_params.bloomViewport(g.width);
-    g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
+    return g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
 }
 
 /// Scrollbar geometry result type
@@ -5392,11 +5218,7 @@ pub const App = struct {
     // External windows (grid_id -> ExternalWindow)
     external_windows: std.AutoHashMapUnmanaged(i64, *ExternalWindow) = .{},
 
-    /// Vertex storage for grids the main surface places as non-root layers.
-    /// Keyed by grid id; guarded by `mu`. Released on on_grid_destroy.
-    layer_grids: std.AutoHashMapUnmanaged(i64, *LayerGridState) = .{},
     layout_budget: core.render_layout.Budget = .{},
-    pending_grid_destroys: std.ArrayListUnmanaged(i64) = .empty,
 
     // UI-thread custom-shader animation snapshot. Capacity tracks the
     // high-water external-window count so the 60 Hz path allocates only when
@@ -5517,12 +5339,6 @@ pub const App = struct {
     // Shared by every surface's row buffers.
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
-    // Layer-grid row buffers belong to no surface, so together they are
-    // charged as one. The budget is paint-thread state; the core thread frees
-    // layer buffers and leaves their bytes in `released`, which every row
-    // frame returns before its first charge.
-    layer_row_vb_retained_bytes: usize = 0,
-    layer_row_vb_released_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
@@ -6169,15 +5985,6 @@ pub const App = struct {
         }
         self.external_windows.deinit(self.alloc);
 
-        // Layer grid storage
-        var layer_it = self.layer_grids.iterator();
-        while (layer_it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.alloc);
-            self.alloc.destroy(entry.value_ptr.*);
-        }
-        self.layer_grids.deinit(self.alloc);
-        self.pending_grid_destroys.deinit(self.alloc);
-
         self.shader_anim_external_grids.deinit(self.alloc);
         self.shader_anim_external_renderers.deinit(self.alloc);
         self.pending_external_windows.deinit(self.alloc);
@@ -6677,6 +6484,270 @@ test "writeFlushRow ignores a row past the write set and marks the one it writes
     tbs.commitFlush(alloc);
 }
 
+/// Test helpers for layer rows living in a TripleBufferedSurface.
+const LayerTestProbe = struct {
+    fn marker(value: f32) Vertex {
+        return .{
+            .position = .{ value, value },
+            .texCoord = .{ 0, 0 },
+            .color = .{ 0, 0, 0, 1 },
+            .grid_id = 1,
+            .deco_flags = 0,
+            .deco_phase = 0,
+        };
+    }
+
+    /// Stage a root plus one layer per entry of `grids`, each `rows` tall,
+    /// stacked at `y_px`.
+    fn place(t: *TripleBufferedSurface, a: std.mem.Allocator, b: *core.render_layout.Budget, grids: []const i64, rows: u32, y_px: i32) !void {
+        var staged = try t.prepareLayers(a, b, grids.len + 1);
+        staged.items[0] = .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 10, .cols = 8, .z = 0, .follows_scroll = false };
+        for (grids, 1..) |grid, i| {
+            staged.items[i] = .{ .grid_id = grid, .anchor_grid = 1, .x_px = 0, .y_px = y_px, .rows = rows, .cols = 8, .z = @intCast(i), .follows_scroll = false };
+        }
+        t.stageLayers(staged);
+    }
+
+    /// One layer row, written the way onVerticesRow writes it.
+    fn writeLayer(t: *TripleBufferedSurface, a: std.mem.Allocator, grid: i64, row: u32, value: f32, total_rows: u32) !void {
+        if (!t.is_in_flush) try std.testing.expect(t.beginFlush(a));
+        try std.testing.expect(t.writeLayerRow(a, grid, row, &.{marker(value)}, total_rows));
+    }
+
+    /// What a layer draw reads out of one set: that row's first vertex.
+    fn layerMarker(t: *TripleBufferedSurface, set_index: u8, grid: i64, row: usize) ?f32 {
+        const lr = t.sets[set_index].layerRows(grid) orelse return null;
+        if (row >= lr.row_map.items.len or lr.row_map.items[row].slot == SLOT_NONE) return null;
+        const verts = t.pool.slotPtrConst(lr.row_map.items[row].slot).verts.items;
+        if (verts.len == 0) return null;
+        return verts[0].position[0];
+    }
+
+    fn unpin(t: *TripleBufferedSurface, snapshot: *PaintSnapshot) bool {
+        snapshot.layers.deinit();
+        return t.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
+    }
+
+    fn damageFor(snapshot: PaintSnapshot, grid: i64) ?*const LayerDamage {
+        for (snapshot.layer_damage) |*d| {
+            if (d.grid_id == grid) return d;
+        }
+        return null;
+    }
+};
+
+test "a paint reads the layer rows of the commit it pinned" {
+    // I3: the layer rows rotate with the root's sets, so a commit landing
+    // while a paint holds a set cannot change what that paint draws. The old
+    // design republished layer rows in place and refused the frame instead.
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 3);
+    tbs.commitFlush(alloc);
+
+    var pinned = tbs.acquireForPaint(alloc);
+    // Control: the pinned set holds the row this flush wrote.
+    try std.testing.expectEqual(@as(?f32, 1.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 0));
+
+    // The next flush rewrites the same row and commits while the paint holds
+    // its set.
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 2.0, 3);
+    tbs.commitFlush(alloc);
+    try std.testing.expect(tbs.committed_index != pinned.committed_index);
+    try std.testing.expectEqual(@as(?f32, 2.0), LayerTestProbe.layerMarker(&tbs, tbs.committed_index, 2, 0));
+    try std.testing.expectEqual(@as(?f32, 1.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 0));
+
+    // The release asks for the paint that draws the newer commit.
+    try std.testing.expect(LayerTestProbe.unpin(&tbs, &pinned));
+    var fresh = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &fresh);
+    try std.testing.expectEqual(@as(?f32, 2.0), LayerTestProbe.layerMarker(&tbs, fresh.committed_index, 2, 0));
+    try std.testing.expect(LayerTestProbe.damageFor(fresh, 2).?.rows.isSet(0));
+}
+
+test "an aborted flush leaves the committed layer rows and their damage alone" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 3);
+    tbs.commitFlush(alloc);
+    {
+        var drain = tbs.acquireForPaint(alloc);
+        _ = LayerTestProbe.unpin(&tbs, &drain);
+    }
+
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 1, 9.0, 3);
+    tbs.cancelFlush();
+
+    var pinned = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &pinned);
+    try std.testing.expectEqual(@as(?f32, 1.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 0));
+    try std.testing.expectEqual(@as(?f32, null), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 1));
+    try std.testing.expectEqual(@as(usize, 0), pinned.layer_damage.len);
+
+    // A later flush must not publish the cancelled row's damage either.
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 2, 3.0, 3);
+    tbs.commitFlush(alloc);
+    var next = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &next);
+    const d = LayerTestProbe.damageFor(next, 2).?;
+    try std.testing.expect(d.rows.isSet(2));
+    try std.testing.expect(!d.rows.isSet(1));
+}
+
+test "a layer shift carries the pending damage with the rows" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 6, 0);
+    for (0..6) |r| try LayerTestProbe.writeLayer(&tbs, alloc, 2, @intCast(r), @floatFromInt(r), 6);
+    tbs.commitFlush(alloc);
+    {
+        var drain = tbs.acquireForPaint(alloc);
+        _ = LayerTestProbe.unpin(&tbs, &drain);
+    }
+
+    // Row 3 changes and commits, but no paint takes it yet.
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 3, 30.0, 6);
+    tbs.commitFlush(alloc);
+
+    // Then the grid scrolls up one row; the core resends only the vacated row.
+    try std.testing.expect(tbs.beginFlush(alloc));
+    try std.testing.expect(tbs.shiftLayerRows(alloc, 2, .{ .row_start = 0, .row_end = 6, .rows_delta = 1, .total_rows = 6, .total_cols = 8 }));
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 5, 50.0, 6);
+    tbs.commitFlush(alloc);
+
+    var pinned = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &pinned);
+    // The rows moved up one: what was row 3 is row 2 now.
+    try std.testing.expectEqual(@as(?f32, 30.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 2));
+    try std.testing.expectEqual(@as(?f32, 50.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 5));
+    const d = LayerTestProbe.damageFor(pinned, 2).?;
+    // Its damage went with it, the vacated row is owed, and the rest is a copy.
+    try std.testing.expect(d.rows.isSet(2));
+    try std.testing.expect(!d.rows.isSet(3));
+    try std.testing.expect(d.rows.isSet(5));
+    try std.testing.expect(!d.full);
+    try std.testing.expectEqual(@as(i32, 1), d.scroll.?.rows_delta);
+}
+
+test "a layer the layout no longer places releases its rows at commit" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{ 2, 3 }, 2, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 2);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 3, 0, 1.0, 2);
+    tbs.commitFlush(alloc);
+    try std.testing.expect(tbs.sets[tbs.committed_index].layerRows(3) != null);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 2, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 1, 2.0, 2);
+    tbs.commitFlush(alloc);
+    const set = &tbs.sets[tbs.committed_index];
+    try std.testing.expect(set.layerRows(2) != null);
+    try std.testing.expect(set.layerRows(3) == null);
+}
+
+test "a layer that shrinks drops the rows past its height" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 0);
+    for (0..3) |r| try LayerTestProbe.writeLayer(&tbs, alloc, 2, @intCast(r), 1.0, 3);
+    tbs.commitFlush(alloc);
+    try std.testing.expectEqual(@as(usize, 3), tbs.sets[tbs.committed_index].layerRows(2).?.row_map.items.len);
+
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 1);
+    tbs.commitFlush(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tbs.sets[tbs.committed_index].layerRows(2).?.row_map.items.len);
+}
+
+test "a layer that moves is redrawn whole" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 3);
+    tbs.commitFlush(alloc);
+    {
+        var drain = tbs.acquireForPaint(alloc);
+        _ = LayerTestProbe.unpin(&tbs, &drain);
+    }
+
+    // Control: the same placement again owes nothing.
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 0);
+    tbs.commitFlush(alloc);
+    {
+        var same = tbs.acquireForPaint(alloc);
+        defer _ = LayerTestProbe.unpin(&tbs, &same);
+        try std.testing.expect(LayerTestProbe.damageFor(same, 2) == null);
+    }
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{2}, 3, 40);
+    tbs.commitFlush(alloc);
+    var moved = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &moved);
+    try std.testing.expect(LayerTestProbe.damageFor(moved, 2).?.full);
+}
+
+/// A committed set holding `rows_each[i]` empty rows for grid `grids[i]`, and
+/// a paint state that already drew them, for the plan tests below.
+const LayerPlanFixture = struct {
+    tbs: TripleBufferedSurface = .{},
+    paint: SurfacePaintState = .{},
+    budget: RowVBPhysicalBudget = .{},
+    damage: LayerDamageList = .{},
+    layout_budget_unused: core.render_layout.Budget = .{},
+
+    fn init(self: *LayerPlanFixture, a: std.mem.Allocator, grids: []const i64, rows_each: []const u32, layers: []const SurfaceLayer) !void {
+        try std.testing.expect(self.tbs.beginFlush(a));
+        for (grids, rows_each) |grid, n| {
+            for (0..n) |r| try std.testing.expect(self.tbs.writeLayerRow(a, grid, @intCast(r), &.{}, n));
+        }
+        // Commit without a layout: pruning keeps only what the committed
+        // layout places, and these tests hand the layers to the plan directly.
+        var staged = try self.tbs.prepareLayers(a, &self.layout_budget_unused, layers.len);
+        @memcpy(staged.items[0..layers.len], layers);
+        self.tbs.stageLayers(staged);
+        self.tbs.commitFlush(a);
+        try self.paint.syncLayers(a, &self.budget, layers);
+        for (grids, rows_each) |grid, n| self.paint.layerState(grid).?.last_drawn_rows = n;
+    }
+
+    fn src(self: *LayerPlanFixture, a: std.mem.Allocator) LayerFrameSource {
+        return .{
+            .set = &self.tbs.sets[self.tbs.committed_index],
+            .pool = &self.tbs.pool,
+            .damage = self.damage.slice(),
+            .paint = &self.paint,
+            .alloc = a,
+            .budget = &self.budget,
+        };
+    }
+
+    fn deinit(self: *LayerPlanFixture, a: std.mem.Allocator) void {
+        self.paint.deinit(a, &self.budget);
+        self.damage.deinit(a);
+        self.tbs.deinit(a);
+    }
+};
+
 test "a layer's cursor row is repainted over the layers above it" {
     // A float sits over the rows the cursor's own grid owns. Repainting the
     // cursor's row rewrites the whole row rectangle, float pixels included, so
@@ -6688,49 +6759,23 @@ test "a layer's cursor row is repainted over the layers above it" {
     const row_h_px: i32 = 10;
     const cell_w_px: i32 = 8;
 
-    var under = LayerGridState{};
-    defer {
-        under.rows_buf.deinit(alloc);
-        under.dirty_rows.deinit(alloc);
-        under.draw_rows.deinit(alloc);
-    }
-    try under.rows_buf.appendNTimes(alloc, .{}, 5);
-    under.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 5);
-    under.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 5);
-    under.last_drawn_rows = 5;
-
-    var over = LayerGridState{};
-    defer {
-        over.rows_buf.deinit(alloc);
-        over.dirty_rows.deinit(alloc);
-        over.draw_rows.deinit(alloc);
-    }
-    try over.rows_buf.appendNTimes(alloc, .{}, 2);
-    over.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 2);
-    over.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 2);
-    over.last_drawn_rows = 2;
-
-    // Row 0 of the lower layer is dirty; the float covers rows 2 and 3, so
-    // nothing propagates to it from the core's own dirty set.
-    under.dirty_rows.set(0);
-
-    var app: App = undefined;
-    app.alloc = alloc;
-    app.layer_grids = .{};
-    defer app.layer_grids.deinit(alloc);
-    try app.layer_grids.put(alloc, 2, &under);
-    try app.layer_grids.put(alloc, 3, &over);
-
     const layers = [_]SurfaceLayer{
         .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 0, .follows_scroll = false },
         .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 1, .follows_scroll = false },
         .{ .grid_id = 3, .anchor_grid = 1, .x_px = 0, .y_px = 2 * row_h_px, .rows = 2, .cols = 10, .z = 2, .follows_scroll = false },
     };
+    var fx = LayerPlanFixture{};
+    defer fx.deinit(alloc);
+    try fx.init(alloc, &.{ 2, 3 }, &.{ 5, 2 }, &layers);
+
+    // Row 0 of the lower layer is dirty; the float covers rows 2 and 3, so
+    // nothing propagates to it from the core's own dirty set.
+    (fx.damage.getOrAdd(alloc, 2, 5) orelse return error.OutOfMemory).rows.set(0);
 
     var g: d3d11.Renderer = undefined;
     g.height = 1000;
 
-    planLayerFrame(&g, &app, &layers, .{
+    planLayerFrame(&g, fx.src(alloc), &layers, .{
         .x_offset = 0,
         .y_offset = 0,
         .content_right = 20 * cell_w_px,
@@ -6744,10 +6789,12 @@ test "a layer's cursor row is repainted over the layers above it" {
         .log_enabled = false,
     });
 
-    // Control: the plan really ran -- step 1 moves the core's dirty set into
-    // draw_rows, so a failure below cannot be an early return going unnoticed.
+    const under = fx.paint.layerState(2).?;
+    const over = fx.paint.layerState(3).?;
+    // Control: the plan really ran -- step 1 moves the damage into draw_rows,
+    // so a failure below cannot be an early return going unnoticed.
     try std.testing.expect(under.draw_rows.isSet(0));
-    try std.testing.expect(!under.dirty_rows.isSet(0));
+    try std.testing.expect(!under.draw_all);
 
     // Precondition: the float owes nothing yet.
     try std.testing.expect(!over.draw_all);
@@ -6755,7 +6802,7 @@ test "a layer's cursor row is repainted over the layers above it" {
 
     // The stationary cursor's row is claimed after the plan, e.g. so a blink
     // can erase the previous cursor from that row.
-    try std.testing.expect(markLayerCursorRow(&app, &layers, 2, 2, cell_w_px, row_h_px));
+    try std.testing.expect(markLayerCursorRow(fx.src(alloc), &layers, 2, 2, cell_w_px, row_h_px));
     try std.testing.expect(under.draw_rows.isSet(2));
 
     // Lower-layer row 2 starts at y=20, which is the float's own row 0.
@@ -6774,39 +6821,20 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
     const row_h_px: i32 = 10;
     const cell_w_px: i32 = 10;
 
-    var states: [3]LayerGridState = .{ .{}, .{}, .{} };
-    const rows_each = [3]usize{ 5, 2, 2 };
-    defer for (&states) |*st| {
-        st.rows_buf.deinit(alloc);
-        st.dirty_rows.deinit(alloc);
-        st.draw_rows.deinit(alloc);
-    };
-    for (&states, rows_each) |*st, n| {
-        try st.rows_buf.appendNTimes(alloc, .{}, n);
-        st.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
-        st.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
-        st.last_drawn_rows = n;
-    }
-
-    var app: App = undefined;
-    app.alloc = alloc;
-    app.layer_grids = .{};
-    defer app.layer_grids.deinit(alloc);
-    try app.layer_grids.put(alloc, 2, &states[0]);
-    try app.layer_grids.put(alloc, 3, &states[1]);
-    try app.layer_grids.put(alloc, 4, &states[2]);
-
     const layers = [_]SurfaceLayer{
         .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 0, .follows_scroll = false },
         .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 1, .follows_scroll = false },
         .{ .grid_id = 3, .anchor_grid = 1, .x_px = 40, .y_px = 2 * row_h_px, .rows = 2, .cols = 8, .z = 2, .follows_scroll = false },
         .{ .grid_id = 4, .anchor_grid = 1, .x_px = 90, .y_px = 2 * row_h_px, .rows = 2, .cols = 2, .z = 3, .follows_scroll = false },
     };
+    var fx = LayerPlanFixture{};
+    defer fx.deinit(alloc);
+    try fx.init(alloc, &.{ 2, 3, 4 }, &.{ 5, 2, 2 }, &layers);
 
     var g: d3d11.Renderer = undefined;
     g.height = 1000;
 
-    planLayerFrame(&g, &app, &layers, .{
+    planLayerFrame(&g, fx.src(alloc), &layers, .{
         .x_offset = 0,
         .y_offset = 0,
         .content_right = 200,
@@ -6821,424 +6849,17 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
     });
 
     // Control: nothing owes a row before the cursor claims one.
-    for (&states) |*st| {
+    for ([_]i64{ 2, 3, 4 }) |grid| {
+        const st = fx.paint.layerState(grid).?;
         try std.testing.expect(!st.draw_all);
         try std.testing.expect(st.draw_rows.count() == 0);
     }
 
-    try std.testing.expect(markLayerCursorRow(&app, &layers, 2, 2, cell_w_px, row_h_px));
+    try std.testing.expect(markLayerCursorRow(fx.src(alloc), &layers, 2, 2, cell_w_px, row_h_px));
 
     // B is directly over the cursor's row; C is only over B.
-    try std.testing.expect(states[1].draw_rows.isSet(0));
-    try std.testing.expect(states[2].draw_rows.isSet(0));
-}
-
-test "applyStaged allocates nothing once prepareCommit succeeded" {
-    // Publication runs after other grids already published; a failure there
-    // would leave the flush half-applied.
-    const alloc = std.testing.allocator;
-    var state = LayerGridState{};
-    defer state.deinit(alloc);
-    try std.testing.expect(state.stageRow(alloc, 2, &.{}, 3, 4));
-    try std.testing.expect(state.prepareCommit(alloc));
-    var released = std.atomic.Value(usize).init(0);
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    try std.testing.expect(state.applyStaged(failing.allocator(), &released));
-    try std.testing.expectEqual(@as(usize, 3), state.drawn_origin_rows.items.len);
-}
-
-test "a layer that shrinks drops the rows past its height" {
-    const alloc = std.testing.allocator;
-    var state = LayerGridState{};
-    defer state.deinit(alloc);
-    var released = std.atomic.Value(usize).init(0);
-    for (0..3) |r| try std.testing.expect(state.stageRow(alloc, @intCast(r), &.{}, 3, 4));
-    try std.testing.expect(state.prepareCommit(alloc));
-    try std.testing.expect(state.applyStaged(alloc, &released));
-    try std.testing.expectEqual(@as(usize, 3), state.rows_buf.items.len);
-
-    try std.testing.expect(state.stageRow(alloc, 0, &.{}, 1, 4));
-    try std.testing.expect(state.prepareCommit(alloc));
-    try std.testing.expect(state.applyStaged(alloc, &released));
-    try std.testing.expectEqual(@as(usize, 1), state.rows_buf.items.len);
-    try std.testing.expectEqual(@as(usize, 1), state.origin_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 1), state.drawn_origin_rows.items.len);
-}
-
-test "a layer plan is refused once the core republishes the rows under it" {
-    // planLayerFrame and drawSurfaceLayers run under two separate App.mu
-    // holds, so a flush can commit in between. The plan's GPU copy and redraw
-    // set belong to the frame it was made for; the rows it would draw no
-    // longer do.
-    const alloc = std.testing.allocator;
-    const row_h_px: i32 = 10;
-    const cell_w_px: i32 = 8;
-
-    var state = LayerGridState{};
-    defer state.deinit(alloc);
-    try state.rows_buf.appendNTimes(alloc, .{}, 3);
-    try state.origin_rows.appendSlice(alloc, &.{ 0, 1, 2 });
-    state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
-    state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
-    state.last_drawn_rows = 3;
-    state.dirty_rows.set(1);
-
-    var app: App = undefined;
-    app.alloc = alloc;
-    app.layer_grids = .{};
-    defer app.layer_grids.deinit(alloc);
-    try app.layer_grids.put(alloc, 2, &state);
-
-    const layers = [_]SurfaceLayer{
-        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 0, .follows_scroll = false },
-        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 1, .follows_scroll = false },
-    };
-
-    var g: d3d11.Renderer = undefined;
-    g.height = 1000;
-
-    const plan_params = LayerFramePlanParams{
-        .x_offset = 0,
-        .y_offset = 0,
-        .content_right = 4 * cell_w_px,
-        .content_height = 3 * row_h_px,
-        .row_h_px = row_h_px,
-        .cell_w_px = cell_w_px,
-        .preserve_back = true,
-        .cursor_grid = 1,
-        .last_cursor_row = null,
-        .rows_to_draw = &.{},
-        .log_enabled = false,
-    };
-
-    planLayerFrame(&g, &app, &layers, plan_params);
-    // Control: the plan ran and took the core's dirty row.
-    try std.testing.expect(state.draw_rows.isSet(1));
-    // Nothing has republished, so the frame is drawable.
-    try std.testing.expectEqual(@as(u32, 0), staleLayerPlans(&app, &layers));
-
-    // The core commits the next flush in the gap between plan and draw.
-    try std.testing.expect(state.stageRow(alloc, 1, &.{}, 3, 4));
-    try std.testing.expect(state.prepareCommit(alloc));
-    var released = std.atomic.Value(usize).init(0);
-    try std.testing.expect(state.applyStaged(alloc, &released));
-
-    try std.testing.expectEqual(@as(u32, 1), staleLayerPlans(&app, &layers));
-    // And the plan it spent is put back for the next paint.
-    try std.testing.expect(state.needs_full_redraw);
-    try std.testing.expect(state.dirty);
-
-    // What the paint actually gates on: the draw reports the frame incomplete
-    // and reaches no GPU call at all -- `g` here has nothing a draw could use,
-    // so a guard that stopped running would not survive this.
-    const outcome = drawSurfaceLayers(
-        &g,
-        &app,
-        &layers,
-        .{ .x = 0, .y = 0, .w = 4 * @as(f32, @floatFromInt(cell_w_px)), .h = 3 * @as(f32, @floatFromInt(row_h_px)) },
-        0,
-        0,
-        4 * cell_w_px,
-        row_h_px,
-        null,
-        null,
-        false,
-    );
-    try std.testing.expectEqual(@as(u32, 1), outcome.stale_layers);
-    try std.testing.expectEqual(@as(u32, 0), outcome.failed_rows);
-    try std.testing.expect(outcome.incomplete());
-    // Nothing was drawn, so the row bookkeeping is untouched.
-    try std.testing.expectEqual(@as(usize, 3), state.last_drawn_rows);
-
-    // The next plan takes the new generation and is drawable again.
-    planLayerFrame(&g, &app, &layers, plan_params);
-    try std.testing.expectEqual(@as(u32, 0), staleLayerPlans(&app, &layers));
-}
-
-test "a layer frame is refused once the core republishes the placement under it" {
-    // A paint pins layers and cursor ownership at acquireForPaint, under
-    // rotation_mu, but reads the rows they place later, under app.mu. The core
-    // publishes both halves inside one app.mu hold, so a commit landing in that
-    // gap gives the paint one flush's rows at another flush's origins.
-    const alloc = std.testing.allocator;
-
-    var budget = core.render_layout.Budget{};
-    var tbs = TripleBufferedSurface{};
-    defer tbs.deinit(alloc);
-
-    const Probe = struct {
-        fn placeLayerAt(t: *TripleBufferedSurface, a: std.mem.Allocator, b: *core.render_layout.Budget, y_px: i32) !void {
-            var staged = try t.prepareLayers(a, b, 2);
-            staged.items[0] = .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 4, .cols = 8, .z = 0, .follows_scroll = false };
-            staged.items[1] = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = y_px, .rows = 2, .cols = 8, .z = 1, .follows_scroll = false };
-            t.stageLayers(staged);
-        }
-
-        fn unpin(t: *TripleBufferedSurface, snapshot: *PaintSnapshot) void {
-            snapshot.layers.deinit();
-            _ = t.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
-        }
-    };
-
-    try Probe.placeLayerAt(&tbs, alloc, &budget, 0);
-    tbs.commitFlush(alloc);
-
-    {
-        var pinned = tbs.acquireForPaint(alloc);
-        defer Probe.unpin(&tbs, &pinned);
-        // Control: nothing has been published since, so this paint may draw.
-        try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
-
-        // The core moves the layer and commits, in the gap this paint leaves
-        // open between pinning the placement and reading the rows.
-        try Probe.placeLayerAt(&tbs, alloc, &budget, 40);
-        tbs.commitFlush(alloc);
-
-        try std.testing.expect(layerFrameStaleness(&tbs, pinned).layout);
-        // What the paint gates on: the layer draw never runs, and the frame it
-        // would have produced is refused.
-        try std.testing.expect((LayerDrawOutcome{ .stale_layout = true }).incomplete());
-    }
-
-    {
-        var pinned = tbs.acquireForPaint(alloc);
-        defer Probe.unpin(&tbs, &pinned);
-        try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
-
-        // A cursor owner moving is the same divergence, and the one the
-        // layout's own pending_paint_full does not already cover. It reaches
-        // commitFlush the way the cursor callback does: storeMainCursor is
-        // what opens the bracket that promotes it.
-        try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
-        tbs.stageCursorLayerGrid(2);
-        tbs.commitFlush(alloc);
-
-        try std.testing.expect(layerFrameStaleness(&tbs, pinned).layout);
-    }
-
-    // A paint that pins the placement after the commit is drawable again.
-    var fresh = tbs.acquireForPaint(alloc);
-    defer Probe.unpin(&tbs, &fresh);
-    try std.testing.expect(!layerFrameStaleness(&tbs, fresh).layout);
-}
-
-test "a layer frame is refused once the core republishes the root rows beside it" {
-    // The sibling of the test above, for the commit that moves neither the
-    // placement nor the cursor owner. It still rotates committed_index away
-    // from the index this paint pinned (app.zig, commitFlush) while the layer
-    // rows drawn beside it are republished in place by applyStaged, so the
-    // frame would pair one flush's chrome with another flush's window text.
-    // Neither `layout` nor plan_content_gen can see that: the first watches a
-    // counter this commit does not bump, the second is stamped after it.
-    // `commit` is what closes it.
-    const alloc = std.testing.allocator;
-    const row_h_px: i32 = 10;
-    const cell_w_px: i32 = 8;
-
-    var budget = core.render_layout.Budget{};
-    var tbs = TripleBufferedSurface{};
-    defer tbs.deinit(alloc);
-
-    var state = LayerGridState{};
-    defer state.deinit(alloc);
-    try state.rows_buf.appendNTimes(alloc, .{}, 3);
-    try state.origin_rows.appendSlice(alloc, &.{ 0, 1, 2 });
-    state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
-    state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
-    state.last_drawn_rows = 3;
-
-    var app: App = undefined;
-    app.alloc = alloc;
-    app.layer_grids = .{};
-    defer app.layer_grids.deinit(alloc);
-    try app.layer_grids.put(alloc, 2, &state);
-
-    var g: d3d11.Renderer = undefined;
-    g.height = 1000;
-
-    const Probe = struct {
-        fn marker(value: f32) Vertex {
-            return .{
-                .position = .{ value, value },
-                .texCoord = .{ 0, 0 },
-                .color = .{ 0, 0, 0, 1 },
-                .grid_id = 1,
-                .deco_flags = 0,
-                .deco_phase = 0,
-            };
-        }
-
-        /// One root row, written the way onVerticesRow writes it.
-        fn writeRootRow(t: *TripleBufferedSurface, a: std.mem.Allocator, value: f32) !void {
-            try std.testing.expect(t.beginFlush(a));
-            const ws = t.writeSet();
-            ws.row_mode = true;
-            ws.rows = 1;
-            ws.cols = 1;
-            try std.testing.expect(ws.ensureRowStorage(a, 0));
-            try std.testing.expect(t.prepareRowSyncTracking(a, 1));
-            const slot = t.cowDetachRow(a, 0) orelse return error.SlotDetachFailed;
-            slot.verts.clearRetainingCapacity();
-            try slot.verts.append(a, marker(value));
-            slot.origin_row = 0;
-            slot.ver +%= 1;
-            try std.testing.expect(t.markFlushRowChanged(0));
-        }
-
-        /// What the root draw reads out of one set: row 0's first vertex.
-        fn rootMarker(t: *TripleBufferedSurface, set_index: u8) f32 {
-            const set = &t.sets[set_index];
-            return t.pool.slotPtrConst(set.row_map.items[0].slot).verts.items[0].position[0];
-        }
-
-        /// One layer row, staged and published the way onFlushEnd publishes it.
-        fn publishLayerRow(s: *LayerGridState, a: std.mem.Allocator, value: f32) !void {
-            try std.testing.expect(s.stageRow(a, 0, &.{marker(value)}, 3, 4));
-            try std.testing.expect(s.prepareCommit(a));
-            var released = std.atomic.Value(usize).init(0);
-            try std.testing.expect(s.applyStaged(a, &released));
-        }
-
-        fn layerMarker(s: *const LayerGridState) f32 {
-            return s.rows_buf.items[0].verts.items[0].position[0];
-        }
-
-        fn unpin(t: *TripleBufferedSurface, snapshot: *PaintSnapshot) bool {
-            snapshot.layers.deinit();
-            return t.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
-        }
-    };
-
-    // --- Flush A: the placement, plus a first generation of rows. ---
-    try Probe.writeRootRow(&tbs, alloc, 0.0);
-    {
-        var staged = try tbs.prepareLayers(alloc, &budget, 2);
-        staged.items[0] = .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 0, .follows_scroll = false };
-        staged.items[1] = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 1, .follows_scroll = false };
-        tbs.stageLayers(staged);
-    }
-    try Probe.publishLayerRow(&state, alloc, 0.0);
-    tbs.noteLayerRowsPublished();
-    tbs.commitFlush(alloc);
-
-    // Drain the full-paint flag that staging a placement sets, so the frame
-    // under test is an ordinary partial redraw -- which is what makes the
-    // stale root row actually reach the screen.
-    {
-        var warmup = tbs.acquireForPaint(alloc);
-        _ = Probe.unpin(&tbs, &warmup);
-    }
-
-    // --- Flush N: row content only, both grids. No placement, no cursor. ---
-    try Probe.writeRootRow(&tbs, alloc, 1.0);
-    try Probe.publishLayerRow(&state, alloc, 1.0);
-    tbs.noteLayerRowsPublished();
-    tbs.commitFlush(alloc);
-
-    const root_set_n = tbs.committed_index;
-    const layout_gen_n = tbs.layout_publish_gen;
-
-    // --- The paint pins flush N. ---
-    var pinned = tbs.acquireForPaint(alloc);
-    try std.testing.expectEqual(root_set_n, pinned.committed_index);
-    // A partial redraw whose redraw set contains the root's row 0: this frame
-    // would draw that row, from the set it just pinned.
-    try std.testing.expect(!pinned.paint_full);
-    try std.testing.expect(tbs.paint_dirty_snapshot.isSet(0));
-    // Control: nothing published since, so this paint may draw.
-    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
-    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).commit);
-
-    // --- Flush N+1 lands in the gap, ordered the way onFlushEnd orders it:
-    //     the layers' applyStaged first, then the surface commit, one hold.
-    try Probe.writeRootRow(&tbs, alloc, 2.0);
-    try Probe.publishLayerRow(&state, alloc, 2.0);
-    tbs.noteLayerRowsPublished();
-    tbs.commitFlush(alloc);
-
-    // The skew is real: the pinned set still holds flush N's root row while
-    // the layer rows this paint would draw beside it are at N+1.
-    try std.testing.expect(tbs.committed_index != root_set_n);
-    try std.testing.expectEqual(@as(f32, 1.0), Probe.rootMarker(&tbs, pinned.committed_index));
-    try std.testing.expectEqual(@as(f32, 2.0), Probe.rootMarker(&tbs, tbs.committed_index));
-    try std.testing.expectEqual(@as(f32, 2.0), Probe.layerMarker(&state));
-
-    // Neither existing guard sees it.
-    try std.testing.expectEqual(layout_gen_n, tbs.layout_publish_gen);
-    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
-    planLayerFrame(&g, &app, pinned.layers.slice(), .{
-        .x_offset = 0,
-        .y_offset = 0,
-        .content_right = 4 * cell_w_px,
-        .content_height = 3 * row_h_px,
-        .row_h_px = row_h_px,
-        .cell_w_px = cell_w_px,
-        .preserve_back = true,
-        .cursor_grid = pinned.cursor_layer_grid_id,
-        .last_cursor_row = null,
-        .rows_to_draw = &[_]u32{0},
-        .log_enabled = false,
-    });
-    try std.testing.expectEqual(state.content_gen, state.plan_content_gen);
-
-    // What the paint gates on: the frame is refused.
-    try std.testing.expect(layerFrameStaleness(&tbs, pinned).commit);
-    try std.testing.expect((LayerDrawOutcome{ .stale_commit = true }).incomplete());
-
-    // The release asks for the repaint that draws the frame properly.
-    try std.testing.expect(Probe.unpin(&tbs, &pinned));
-
-    // A paint that pins after the commit is drawable again.
-    {
-        var fresh = tbs.acquireForPaint(alloc);
-        defer _ = Probe.unpin(&tbs, &fresh);
-        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
-
-        // And it is not over-broad: a flush that publishes only layer rows
-        // leaves committed_index alone, so the frame this paint pinned is
-        // still whole and must not be refused.
-        try Probe.publishLayerRow(&state, alloc, 3.0);
-        tbs.noteLayerRowsPublished();
-        tbs.commitFlush(alloc);
-        try std.testing.expectEqual(@as(f32, 3.0), Probe.layerMarker(&state));
-        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
-    }
-
-    // Nor is a flush that publishes only root rows -- every statusline
-    // update: the paint draws the root from the set it pinned, beside layer
-    // rows that did not move.
-    {
-        var fresh = tbs.acquireForPaint(alloc);
-        defer _ = Probe.unpin(&tbs, &fresh);
-        try Probe.writeRootRow(&tbs, alloc, 4.0);
-        tbs.commitFlush(alloc);
-        try std.testing.expect(tbs.committed_index != fresh.committed_index);
-        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
-
-        // Layer rows published after it complete the split, even in a commit
-        // of their own.
-        try Probe.publishLayerRow(&state, alloc, 5.0);
-        tbs.noteLayerRowsPublished();
-        tbs.commitFlush(alloc);
-        try std.testing.expect(layerFrameStaleness(&tbs, fresh).commit);
-    }
-}
-
-test "a cursor callback that keeps its owner does not move the layout generation" {
-    const alloc = std.testing.allocator;
-    var tbs = TripleBufferedSurface{};
-    defer tbs.deinit(alloc);
-
-    const gen0 = tbs.layout_publish_gen;
-    try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
-    tbs.stageCursorLayerGrid(tbs.committed_cursor_layer_grid_id);
-    tbs.commitFlush(alloc);
-    try std.testing.expectEqual(gen0, tbs.layout_publish_gen);
-
-    try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
-    tbs.stageCursorLayerGrid(4);
-    tbs.commitFlush(alloc);
-    try std.testing.expectEqual(gen0 +% 1, tbs.layout_publish_gen);
+    try std.testing.expect(fx.paint.layerState(3).?.draw_rows.isSet(0));
+    try std.testing.expect(fx.paint.layerState(4).?.draw_rows.isSet(0));
 }
 
 test {

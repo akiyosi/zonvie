@@ -1218,6 +1218,19 @@ pub const GridPos = struct {
     /// does NOT retry against what is behind it, so picking it swallows the
     /// click instead of passing it through. Splits are always true.
     mouse_enabled: bool = true,
+    /// Set for a float placed from its anchor in an external window's cells
+    /// (resolveAnchoredFloat). Neovim does not resend win_float_pos when the
+    /// window it is anchored in resizes, so the position is resolved again
+    /// from this against the window's new size.
+    anchor: ?FloatAnchor = null,
+};
+
+/// win_float_pos' anchor corner and offset, in the anchor grid's cells.
+pub const FloatAnchor = struct {
+    south: bool,
+    east: bool,
+    row: i64,
+    col: i64,
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -2097,6 +2110,7 @@ pub const Grid = struct {
             // layer, and with it every root row's `skip_default_bg`; the flush
             // regenerates those (regenerateRootsWhoseDefaultBgRuleFlipped).
             if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, @max(old_rows, rows));
+            if (shape_changed and self.external_grids.contains(grid_id)) self.reresolveAnchoredFloats(grid_id);
             return;
         }
 
@@ -2159,6 +2173,76 @@ pub const Grid = struct {
     pub fn surfacePlacement(self: *const Grid, p: GridPos) ?SurfacePlacement {
         const surface = self.surfaceForGrid(p.anchor_grid) orelse return null;
         return .{ .surface = surface, .row = p.row, .col = p.col };
+    }
+
+    /// Place float `grid_id` from its anchor, in the cells of the surface that
+    /// places `anchor_grid`, clamped to that surface the way Neovim clamps to
+    /// the main grid (window.c win_float_pos). Null when a step overflows.
+    pub fn resolveAnchoredFloat(self: *const Grid, grid_id: i64, anchor_grid: i64, a: FloatAnchor) ?struct { row: u32, col: u32 } {
+        // The anchor's position in the surface that places it; an external
+        // root is that surface's origin.
+        var base_row: i64 = 0;
+        var base_col: i64 = 0;
+        if (anchor_grid != 1) {
+            if (self.win_pos.get(anchor_grid)) |p| {
+                base_row = p.row;
+                base_col = p.col;
+            }
+        }
+
+        // Cells of the anchor and of the float, in cells of grid 1.
+        const main_m = self.getGridMetricsPx(1);
+        const anchor_m = self.getGridMetricsPx(anchor_grid);
+        const float_m = self.getGridMetricsPx(grid_id);
+        const scale = struct {
+            fn cells(n: i64, from_px: u32, to_px: u32, round_up: bool) ?i64 {
+                const v = @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(from_px)) / @as(f64, @floatFromInt(to_px));
+                const r = if (round_up) @ceil(v) else v;
+                if (!std.math.isFinite(r) or @abs(r) > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return null;
+                return @intFromFloat(r);
+            }
+        };
+        var row = std.math.add(i64, base_row, scale.cells(a.row, anchor_m.cell_h_px, main_m.cell_h_px, false) orelse return null) catch return null;
+        var col = std.math.add(i64, base_col, scale.cells(a.col, anchor_m.cell_w_px, main_m.cell_w_px, false) orelse return null) catch return null;
+
+        if (self.sub_grids.get(grid_id)) |sg| {
+            const rows_main = scale.cells(sg.rows, float_m.cell_h_px, main_m.cell_h_px, true) orelse return null;
+            const cols_main = scale.cells(sg.cols, float_m.cell_w_px, main_m.cell_w_px, false) orelse return null;
+            if (a.south) row -= rows_main;
+            if (a.east) col -= cols_main;
+            const surface = self.surfaceForGrid(anchor_grid);
+            if (surface != null and surface.? != 1) {
+                if (self.sub_grids.get(surface.?)) |root| {
+                    row = @min(row, @as(i64, root.rows) - rows_main);
+                    col = @min(col, @as(i64, root.cols) - cols_main);
+                }
+            }
+        }
+        return .{ .row = std.math.lossyCast(u32, @max(row, 0)), .col = std.math.lossyCast(u32, @max(col, 0)) };
+    }
+
+    /// Keep the anchor a float on an external window was placed from
+    /// (resolveAnchoredFloat), after setWinFloatPos stored its position.
+    pub fn setWinFloatAnchor(self: *Grid, grid_id: i64, anchor: FloatAnchor) void {
+        if (self.win_pos.getPtr(grid_id)) |p| p.anchor = anchor;
+    }
+
+    /// Resolve again every anchored float an external root places, after
+    /// that root resized: Neovim does not resend their positions for it.
+    fn reresolveAnchoredFloats(self: *Grid, surface_grid: i64) void {
+        var it = self.win_pos.iterator();
+        while (it.next()) |e| {
+            const p = e.value_ptr;
+            const a = p.anchor orelse continue;
+            if (self.surfaceForGrid(p.anchor_grid) != surface_grid) continue;
+            const at = self.resolveAnchoredFloat(e.key_ptr.*, p.anchor_grid, a) orelse continue;
+            if (at.row == p.row and at.col == p.col) continue;
+            const h = self.layerRows(e.key_ptr.*);
+            self.dirtyLayerBand(p.*, h);
+            p.row = at.row;
+            p.col = at.col;
+            self.dirtyLayerBand(p.*, h);
+        }
     }
 
     /// Rows a placed grid covers: its buffer's, or one for a grid with none.
@@ -5109,4 +5193,36 @@ test "floats keep their place inside a window that is detached and brought back"
     try std.testing.expectEqual(@as(i64, 1), back.surface);
     try std.testing.expectEqual(@as(i64, 3), back.row);
     try std.testing.expectEqual(@as(i64, 4), back.col);
+}
+
+test "a float anchored in an external window is clamped again when the window resizes" {
+    // Neovim clamps a float to the main grid, and does not resend its
+    // position when the window it is anchored in resizes: only move.c flags
+    // anchored floats (winfloat.c win_check_anchored_floats). Placed from its
+    // anchor in that window's own cells, the float has to follow the
+    // window's new size here.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 40);
+    // An external window taller than the main grid.
+    try grid.resizeGrid(2, 30, 40);
+    _ = try grid.setWinExternalPos(2, 1002);
+    try grid.resizeGrid(3, 4, 10);
+
+    const anchor: FloatAnchor = .{ .south = false, .east = false, .row = 25, .col = 3 };
+    const first = grid.resolveAnchoredFloat(3, 2, anchor).?;
+    // Control: inside the 30-row window the float is not clamped.
+    try std.testing.expectEqual(@as(u32, 25), first.row);
+    try grid.setWinFloatPos(3, 1003, first.row, first.col, 50, 0, 2, true);
+    grid.setWinFloatAnchor(3, anchor);
+
+    try grid.resizeGrid(2, 20, 40);
+    // Neovim's clamp, against the window: 20 rows less the float's 4.
+    try std.testing.expectEqual(@as(u32, 16), grid.win_pos.get(3).?.row);
+    try std.testing.expectEqual(@as(u32, 3), grid.win_pos.get(3).?.col);
+
+    // A placement without an anchor is Neovim's own and stays where it is.
+    try grid.setWinFloatPos(3, 1003, 25, 3, 50, 0, 2, true);
+    try grid.resizeGrid(2, 18, 40);
+    try std.testing.expectEqual(@as(u32, 25), grid.win_pos.get(3).?.row);
 }

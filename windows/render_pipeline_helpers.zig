@@ -1008,27 +1008,6 @@ pub fn layerOriginPx(comptime Layer: type, layers: []const Layer, grid_id: i64, 
     return .{ 0, 0 };
 }
 
-/// Whether a commit landing after the paint pinned its root set splits the
-/// layer frame. The root rows come from the pinned set either way, so a root
-/// commit alone leaves them paired with layers that did not move; only one
-/// paired with republished layer rows mixes two flushes.
-pub fn layerFrameCommitStale(root_commit_moved: bool, layer_rows_moved: bool) bool {
-    return root_commit_moved and layer_rows_moved;
-}
-
-pub const LayerFrameRefusal = enum {
-    none,
-    /// Nothing reached back_tex: the paint is only owed a fresh one.
-    stale,
-    /// back_tex already moved (the root's scroll copy): repaint whole.
-    failed,
-};
-
-pub fn classifyLayerFrameRefusal(stale: bool, back_tex_touched: bool) LayerFrameRefusal {
-    if (!stale) return .none;
-    return if (back_tex_touched) .failed else .stale;
-}
-
 /// Where one non-root layer sits for its present damage, in client pixels.
 pub const LayerPresentGeom = struct {
     left_px: i32,

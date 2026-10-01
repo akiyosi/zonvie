@@ -3334,7 +3334,7 @@ pub const Renderer = struct {
         f32,
         f32,
         f32,
-    ) void;
+    ) bool;
 
     fn drawBloomPasses(
         self: *Renderer,
@@ -3349,19 +3349,19 @@ pub const Renderer = struct {
         vp_h: u32,
         bloom_rows_ctx: ?*const anyopaque,
         bloom_rows_draw_fn: ?BloomRowsDrawFn,
-    ) void {
-        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return;
-        const ps_set_fn = ctx_vtbl.*.PSSetShader orelse return;
-        const vs_set_fn = ctx_vtbl.*.VSSetShader orelse return;
-        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return;
-        const ps_set_samp = ctx_vtbl.*.PSSetSamplers orelse return;
-        const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return;
-        const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return;
-        const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return;
-        const ia_set_top = ctx_vtbl.*.IASetPrimitiveTopology orelse return;
-        const ia_set_il = ctx_vtbl.*.IASetInputLayout orelse return;
-        const draw_fn = ctx_vtbl.*.Draw orelse return;
-        const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
+    ) bool {
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return true;
+        const ps_set_fn = ctx_vtbl.*.PSSetShader orelse return true;
+        const vs_set_fn = ctx_vtbl.*.VSSetShader orelse return true;
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return true;
+        const ps_set_samp = ctx_vtbl.*.PSSetSamplers orelse return true;
+        const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return true;
+        const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return true;
+        const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return true;
+        const ia_set_top = ctx_vtbl.*.IASetPrimitiveTopology orelse return true;
+        const ia_set_il = ctx_vtbl.*.IASetInputLayout orelse return true;
+        const draw_fn = ctx_vtbl.*.Draw orelse return true;
+        const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return true;
 
         // --- Pass 1: Glow extract → glow_extract_tex (1/2 res) ---
         // Apply content viewport offset (sidebar/tabline) scaled to half resolution.
@@ -3398,11 +3398,12 @@ pub const Renderer = struct {
             ps_set_fn(ctx, self.ps_glow_extract.?, null, 0);
 
             if (bloom_rows_draw_fn) |draw_rows| {
-                draw_rows(bloom_rows_ctx, self, ctx, ex_x, ex_y, ex_w, ex_h);
+                // A partial extract would composite glow at the wrong rows.
+                if (!draw_rows(bloom_rows_ctx, self, ctx, ex_x, ex_y, ex_w, ex_h)) return false;
             } else {
-                self.drawVertices(main) catch return;
+                self.drawVertices(main) catch return true;
             }
-            self.drawVertices(cursor) catch return;
+            self.drawVertices(cursor) catch return true;
 
 
             ps_set_fn(ctx, self.ps.?, null, 0);
@@ -3426,7 +3427,7 @@ pub const Renderer = struct {
         // GlowParams carries the radius the Kawase taps stretch by as well as
         // the composite's intensity, so it is bound for the whole chain rather
         // than just the last pass.
-        const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
+        const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return true;
         if (self.glow_cb) |gcb| {
             const gcb_res: *c.ID3D11Resource = @ptrCast(gcb);
             var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
@@ -3545,13 +3546,14 @@ pub const Renderer = struct {
             };
             rs_set_sc(ctx, 1, &restore_sr);
         }
+        return true;
     }
 
     /// Public entry point for bloom passes (used by row-mode rendering).
     /// Requires vertices to be passed in (collected from row VBs).
     pub fn drawBloomFromVerts(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex, intensity: f32, vp_x: u32, vp_y: u32, vp_w: u32, vp_h: u32) void {
         const ctx = self.bloomCtx() orelse return;
-        self.drawBloomPasses(ctx, ctx.*.lpVtbl, main, cursor, intensity, vp_x, vp_y, vp_w, vp_h, null, null);
+        _ = self.drawBloomPasses(ctx, ctx.*.lpVtbl, main, cursor, intensity, vp_x, vp_y, vp_w, vp_h, null, null);
     }
 
     /// The device context when every bloom resource is ready, else null.
@@ -3588,9 +3590,9 @@ pub const Renderer = struct {
         vp_y: u32,
         vp_w: u32,
         vp_h: u32,
-    ) void {
-        const ctx = self.bloomCtx() orelse return;
-        self.drawBloomPasses(ctx, ctx.*.lpVtbl, &.{}, cursor, intensity, vp_x, vp_y, vp_w, vp_h, rows_ctx, draw_rows_fn);
+    ) bool {
+        const ctx = self.bloomCtx() orelse return true;
+        return self.drawBloomPasses(ctx, ctx.*.lpVtbl, &.{}, cursor, intensity, vp_x, vp_y, vp_w, vp_h, rows_ctx, draw_rows_fn);
     }
 
     const AtlasTextureObjects = struct {
