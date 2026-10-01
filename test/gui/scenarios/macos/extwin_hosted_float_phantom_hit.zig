@@ -29,8 +29,11 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_extwin_phantom_hit.log";
+/// Any surface's completed frame.
+const frame_marker = "[trace] event=frame_done";
 
 /// The phantom's size in cells, centred on the main window's centre cell. Big
 /// enough that a tabline or a rounding difference cannot move the gesture out
@@ -57,7 +60,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
 
     // The main window, with far more lines than it shows: a main window that
     // cannot scroll would let the phantom pass unnoticed.
@@ -78,11 +81,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const before_count = before.len;
 
     // The host window.
+    const host_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 400 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, host_mark, 10_000);
 
     // Placed so that, read as main-window coordinates, it straddles the main
     // window's centre cell — the point the gesture below lands on.
@@ -99,8 +103,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "row={d}, col={d}, width={d}, height={d}, style=\"minimal\"}}) return 1 end)()')",
         .{ phantom_row, phantom_col, phantom_cols, phantom_rows },
     );
+    const float_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(open_float);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, float_mark, 10_000);
 
     // Gates. Each names a way this could pass while proving nothing.
     if (try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_float).win == _G.z_anchor) and 1 or 0')") != 1) {
@@ -128,8 +133,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Focus back to the main window, and move the host out from over its
     // centre so the posted gesture cannot land on the host by accident.
+    const focus_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("luaeval('(function() vim.api.nvim_set_current_win(_G.z_main) return 1 end)()')");
-    gui_io.sleepNs(500 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, focus_mark, 10_000);
 
     const main_b = platform.mainWindowBoundsForPid(g.app_pid) orelse return error.MainWindowNotFound;
     if (!platform.moveWindowBySize(

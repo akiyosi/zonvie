@@ -1,10 +1,11 @@
 // ext_anchor_scroll_under_float — when an external anchor grid scrolls under
 // a float composited into its rows, the core publishes the shift AND resends
-// the rows the float covers. PASSES: the guard 935bdc0 removed is not needed
-// here, and this pins the property that makes its removal survivable.
+// the rows the float covers. PASSES: the float-overlap guard the row-shift
+// fast path once had is not needed here, and this pins the property that
+// makes its removal survivable.
 //
 // Per-grid rendering made every window grid its own layer, which is why
-// 935bdc0 could drop the float-overlap exclusion from the row-shift fast path
+// the float-overlap exclusion could be dropped from the row-shift fast path
 // (`externalFloatAnchorEntries` in dispatchGridRowScroll, plus a
 // generation-side twin `ext_has_float_overlay`). For a float on the MAIN
 // surface that reasoning is airtight: the float is a layer of its own, so
@@ -206,7 +207,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u32, 0), h.rowScrollCalls(float_grid));
 
     // The core DOES publish the shift for an external anchor carrying a
-    // composited float — 935bdc0's guard is gone and stays gone.
+    // composited float — the float-overlap guard is gone and stays gone.
     if (h.rowScrollCalls(ext_grid) == 0) {
         std.debug.print(
             "[e2e] ext_anchor_scroll_under_float: no on_grid_row_scroll for external anchor " ++

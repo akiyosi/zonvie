@@ -53,11 +53,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // The host: an ordinary editor window given a window of its own, with far
     // more lines than it shows so that a scroll applied to IT would be visible
     // in its topline. A host that cannot scroll would let the bug pass.
+    const before_ext = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 400 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_ext, 10_000);
 
     // The float, likewise longer than it shows: a float whose content fits is
     // deliberately transparent to scrolling, so it would fall through to the
@@ -73,8 +74,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ float_row, float_col, float_cols, float_rows },
     );
     const t_float = try app_log.nowMs(alloc, log_path);
+    const before_float = try app_log.lineMark(alloc, log_path);
     try g.exec(open_float);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_float, 10_000);
 
     // Gate: the float has to be composited INTO the external window. A float
     // given a window of its own is drawn by its own surface root, whose scroll

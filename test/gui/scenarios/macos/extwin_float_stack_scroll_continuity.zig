@@ -150,7 +150,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
 
     const before = driver.snapshotWindows(g.app_pid);
     const before_count = before.len;
@@ -166,9 +166,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "{{external=true, width={d}, height={d}}}) return 1 end)()')",
         .{ host_cols, host_rows },
     );
+    const host_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(open_host);
     _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 1, host_mark, 10_000);
 
     // A stack of bufpos-anchored floats over it, unfocused so the wheel
     // scrolls the host underneath rather than a float's own contents.
@@ -185,8 +186,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "style=\"minimal\"}}) end return 1 end)()')",
         .{ float_count - 1, float_first_line, float_stride_lines, float_cols, float_rows },
     );
+    const floats_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(open_floats);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 1, floats_mark, 10_000);
 
     if (try g.evalInt("luaeval('#_G.z_floats')") != float_count) {
         return error.FloatsNotOpen;
@@ -215,7 +217,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // grid_scroll and the same sub-row ease, which is what displaces a
     // following float.
     try g.exec("luaeval('(function() vim.api.nvim_set_current_win(_G.z_anchor) return 1 end)()')");
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);
 

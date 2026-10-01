@@ -63,6 +63,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
 
     const base_windows = g.windowCount();
+    const open_mark = try app_log.lineMark(alloc, log_path);
 
     try g.exec(
         "luaeval('(function() vim.o.cursorline = false vim.o.number = false " ++
@@ -77,7 +78,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.waitWindowCount(base_windows + 1, 10_000);
     // Let the first frames settle, so the moves below are not racing the
     // window's own seeding (which legitimately redraws everything).
-    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, open_mark, 10_000);
 
     const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
 

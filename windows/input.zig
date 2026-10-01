@@ -453,7 +453,7 @@ pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
 }
 
 /// Resolve a MAIN-window client point to the grid the pointer is actually over,
-/// the way ExternalWndProc has resolved its own since 5e7e9cb. Takes app.mu,
+/// the way ExternalWndProc resolves its own. Takes app.mu,
 /// which is what the committed layer list is protected by.
 pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
     return resolveSurfaceTarget(app, &app.surf.tbs, 1, true, x, y);

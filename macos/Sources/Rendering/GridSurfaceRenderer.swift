@@ -4871,6 +4871,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 sem.signal()
 
                 if ZonvieCore.appLogEnabled {
+                    // What a test waits on instead of sleeping for a frame.
+                    if completedOk { ZonvieCore.appLog("[trace] event=frame_done surface=1") }
                     let gpu_wall_us = (CFAbsoluteTimeGetCurrent() - t_gpu_submit) * 1_000_000
                     let gpu_exec_us = (completed.gpuEndTime - completed.gpuStartTime) * 1_000_000
                     ZonvieCore.appLogPerf("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
@@ -4972,6 +4974,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 }
                 if ZonvieCore.appLogEnabled, wasFirstPresent {
                     ZonvieCore.appLog("[startup] first present completed (GPU done)")
+                    // A frame that cleared and drew every row is done: what a
+                    // test waiting on a forced full redraw reads.
+                    ZonvieCore.appLog("[trace] event=full_frame_done surface=1")
                 }
                 if wasFirstPresent {
                     // Now that the first frame is on screen, flush any
@@ -5293,6 +5298,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         // Also clear the rect so full redraw happens
         pendingDirtyRectPx = nil
+    }
+
+    /// Test only (`ZONVIE_TEST_FULL_REDRAW`): make the next frame clear the
+    /// back buffer and draw every row of every layer, as the first frame does.
+    /// A partial frame of the same commit must be pixel-identical to it.
+    func forceFullRedrawForTest() {
+        lock.lock()
+        invalidatePresentedLocked()
+        lock.unlock()
+        markAllRowsDirty()
+        markAllLayersDirty()
     }
 
     /// Mark every layer for a full redraw, the layer counterpart of

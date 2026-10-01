@@ -1311,6 +1311,7 @@ fn releaseSurfaceRecoveryBuffers(app: *App, ws: *app_mod.WindowSurface, grid_id:
 }
 
 const TRAY_INIT_DELAY_MS = app_mod.TRAY_INIT_DELAY_MS;
+const test_full_redraw_env = std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_TEST_FULL_REDRAW");
 const QUIT_TIMEOUT_MS = app_mod.QUIT_TIMEOUT_MS;
 const SCROLLBAR_FADE_INTERVAL = app_mod.SCROLLBAR_FADE_INTERVAL;
 const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
@@ -2959,6 +2960,12 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
         recoverMainPaintFailure(hwnd, app);
     } else {
         app.surf.completePaintRetry();
+        // What a test waits on instead of sleeping for a frame.
+        applog.appLog("[trace] event=frame_done surface=1\n", .{});
+        if (app.test_full_redraw_armed) {
+            app.test_full_redraw_armed = false;
+            applog.appLog("[trace] event=full_frame_done surface=1\n", .{});
+        }
     }
 
     // Update IME preedit overlay (separate popup window)
@@ -4532,6 +4539,18 @@ pub export fn WndProc(
             return 0;
         },
 
+        app_mod.WM_APP_TEST_FULL_REDRAW => {
+            var env_buf: [2]u16 = undefined;
+            if (c.GetEnvironmentVariableW(test_full_redraw_env, &env_buf, env_buf.len) == 0) return 0;
+            if (getApp(hwnd)) |app| {
+                app.test_full_redraw_armed = true;
+                app_mod.requestSurfaceFullPaint(app, &app.surf);
+                app_mod.requestMainFullPaint(app);
+                _ = c.InvalidateRect(hwnd, null, c.FALSE);
+            }
+            return 0;
+        },
+
         app_mod.WM_APP_MSG_HOVER => {
             if (getApp(hwnd)) |app| {
                 if (app.corep) |corep| {
@@ -5550,8 +5569,8 @@ pub export fn WndProc(
                 // not a window of its own, so the press has to say which grid
                 // it landed on: Neovim trusts the id it is given and resolves
                 // grid 1 through the frame tree, which holds splits only. This
-                // is the follow-up 5e7e9cb deferred when it fixed the external
-                // path -- and it measured the cost on 0.12.2, a middle press
+                // is the follow-up deferred when the external path was fixed --
+                // and that fix measured the cost on 0.12.2, a middle press
                 // over a float pasting destructively into the buffer behind it.
                 const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
                 input.pressEditorButton(app, hwnd, msg, wParam, target);
@@ -5992,7 +6011,7 @@ pub export fn WndProc(
                 // WM_LBUTTONUP never arrives once capture is stolen, and it is
                 // the only place the editor drag ends: a held button left set
                 // here turns every later hover into a drag. ExternalWndProc has
-                // cleared both for the same reason since 5e7e9cb.
+                // cleared both for the same reason.
                 input.cancelMouseButtons(app);
                 // The scrollbar's drag and track-repeat end the same way.
                 scrollbar.cancelPointer(scrollbar.mainSurface(hwnd, app));

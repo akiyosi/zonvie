@@ -45,6 +45,7 @@ const capture = driver.capture;
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 /// Fraction of the anchor window's pixels the float must change to count as
 /// having reached the screen. The float covers 24x6 of the anchor's 60x20
@@ -121,10 +122,11 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
             // Opened as an editor float and externalized afterwards, with the
             // placement reaching the core in between: that `win_pos` is what
             // setWinExternalPos copies into start_row.
+            const float_mark = try app_log.lineMark(alloc, log_path);
             try g.exec(
                 \\luaeval('(function() _G.z_anchor = vim.api.nvim_open_win(_G.z_buf, true, {relative="editor", row=1, col=1, width=60, height=20}) return 1 end)()')
             );
-            gui_io.sleepNs(600 * std.time.ns_per_ms);
+            try app_log.waitFramesAfter(alloc, log_path, 1, 1, float_mark, 10_000);
             try g.exec(
                 \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_anchor, {external=true, width=60, height=20}) return 1 end)()')
             );
@@ -140,8 +142,9 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
     // window rather than about the float.
     var pre_scroll = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer pre_scroll.deinit(alloc);
+    const scroll_mark = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("3<C-e>");
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", scroll_mark, 10_000);
     var baseline = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer baseline.deinit(alloc);
     if (baseline.w != pre_scroll.w or baseline.h != pre_scroll.h) return error.ExternalWindowResized;
@@ -150,10 +153,11 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
 
     // The float: a solid bright background over the anchor's text, since this
     // measures whether ANY pixels appear rather than which glyphs.
+    const probe_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() vim.api.nvim_set_hl(0, "ZProbeFloat", {bg="#ff00ff", fg="#00ff00"}) local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 6 do l[i] = string.rep("#", 24) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, false, {relative="win", win=_G.z_anchor, row=6, col=4, width=24, height=6, style="minimal"}) vim.api.nvim_set_option_value("winhighlight", "Normal:ZProbeFloat,NormalFloat:ZProbeFloat,EndOfBuffer:ZProbeFloat", {win=_G.z_float}) return 1 end)()')
     );
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", probe_mark, 10_000);
 
     // Gate two: the float exists in Neovim, anchored to THIS window. A float
     // Neovim never opened, or one relative to the editor, would produce the
@@ -202,8 +206,9 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
 
     // A defect a forced redraw repairs is a different, smaller defect; measure
     // it rather than assume.
+    const redraw_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("execute('redraw!')");
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[perf] flush_total", redraw_mark, 10_000);
     var after_redraw = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer after_redraw.deinit(alloc);
     if (after_redraw.w != baseline.w or after_redraw.h != baseline.h) return error.ExternalWindowResized;
@@ -212,8 +217,9 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
     // Gate five: the window is still live at the end. Everything above was
     // measured from captures of one window number, and a capture that had gone
     // stale would report exactly the same zero as a float nobody drew.
+    const post_mark = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("3<C-e>");
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", post_mark, 10_000);
     var post_scroll = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer post_scroll.deinit(alloc);
     if (post_scroll.w != baseline.w or post_scroll.h != baseline.h) return error.ExternalWindowResized;

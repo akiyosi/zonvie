@@ -23,6 +23,7 @@ const platform = driver.platform;
 const capture = driver.capture;
 const fixture = @import("fixture.zig");
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 /// `Normal`'s background for this run: far from black on every channel.
 const normal_bg = [3]u8{ 0x20, 0x60, 0xa0 };
@@ -67,17 +68,19 @@ fn runWith(alloc: std.mem.Allocator, config_dir: []const u8, log_path: []const u
     try g.exec("execute('highlight NormalFloat guibg=#a02060 guifg=#ffffff')");
 
     // A split holding a short buffer, and a float anchored to it.
+    const before_split = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() vim.cmd("vsplit") _G.z_host = vim.api.nvim_get_current_win() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, false, {"host 1", "host 2", "host 3"}) vim.api.nvim_win_set_buf(_G.z_host, b) local fb = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(fb, 0, -1, false, {"float A", "float B"}) _G.z_float = vim.api.nvim_open_win(fb, false, {relative="win", win=_G.z_host, row=1, col=2, width=12, height=3, style="minimal"}) return 1 end)()')
     );
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_split, 10_000);
 
     const before = driver.snapshotWindows(g.app_pid);
 
     // The user's repro: externalize the split that hosts the float.
+    const before_ext = try app_log.lineMark(alloc, log_path);
     try g.remoteSend("<C-w>ge");
     const ext = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(1500 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_ext, 10_000);
 
     var img = try capture.captureWindow(alloc, ext.number);
     defer img.deinit(alloc);

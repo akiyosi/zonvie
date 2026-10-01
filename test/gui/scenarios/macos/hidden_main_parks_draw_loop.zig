@@ -37,7 +37,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
     const main_b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
 
     if (!platform.setWindowMinimizedBySize(g.app_pid, main_b.w, main_b.h, true)) {

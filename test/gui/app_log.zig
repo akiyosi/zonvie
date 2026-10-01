@@ -215,6 +215,129 @@ pub fn waitFor(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, t
     }
 }
 
+/// How many lines the log holds now: a position to wait from (waitAfter).
+/// Unlike a timestamp it cannot be confused by an earlier run's lines, which
+/// share the file and restart the app clock.
+pub fn lineMark(alloc: std.mem.Allocator, path: []const u8) !usize {
+    const data = std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer alloc.free(data);
+    return std.mem.count(u8, data, "\n");
+}
+
+/// Poll until `marker` appears on a line past `after_line` (lineMark).
+pub fn waitAfter(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, after_line: usize, timeout_ms: u64) !void {
+    var timer = gui_io.Timer.start();
+    while (true) {
+        if (foundAfter(alloc, path, marker, after_line) catch false) return;
+        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
+            std.debug.print("[gui] app log never contained \"{s}\" past line {d}\n", .{ marker, after_line });
+            return error.Timeout;
+        }
+        gui_io.sleepNs(20 * std.time.ns_per_ms);
+    }
+}
+
+fn foundAfter(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, after_line: usize) !bool {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        if (n >= after_line and std.mem.indexOf(u8, line, marker) != null) return true;
+    }
+    return false;
+}
+
+/// Any surface but the main window's, for waitFramesAfter: an external window
+/// whose grid id the scenario does not know yet.
+pub const any_external_surface: i64 = 0;
+
+/// Wait until `count` frames of `surface` (1 for the main window, the grid id
+/// of an external one, or any_external_surface) have completed past
+/// `after_line`: the structured `[trace] event=frame_done` both frontends log.
+/// What a scenario uses instead of sleeping for "a frame or two". Frames
+/// coalesce, so one change may present once: at least one frame followed by a
+/// quiet window also counts as settled.
+pub fn waitFramesAfter(alloc: std.mem.Allocator, path: []const u8, surface: i64, count: usize, after_line: usize, timeout_ms: u64) !void {
+    var marker_buf: [64]u8 = undefined;
+    const marker = if (surface == any_external_surface)
+        "[trace] event=frame_done surface="
+    else
+        try std.fmt.bufPrint(&marker_buf, "[trace] event=frame_done surface={d}", .{surface});
+    const quiet_ms = 150;
+    var timer = gui_io.Timer.start();
+    var last_n: usize = 0;
+    var last_change_ms: u64 = 0;
+    while (true) {
+        const n = if (surface == any_external_surface)
+            countExternalAfter(alloc, path, marker, after_line) catch 0
+        else
+            countAfter(alloc, path, marker, after_line) catch 0;
+        if (n >= count) return;
+        const now_ms = timer.read() / std.time.ns_per_ms;
+        if (n != last_n) {
+            last_n = n;
+            last_change_ms = now_ms;
+        } else if (n > 0 and now_ms - last_change_ms >= quiet_ms) return;
+        if (now_ms >= timeout_ms) {
+            std.debug.print("[gui] fewer than {d} frames of surface {d} completed past line {d}\n", .{ count, surface, after_line });
+            return error.Timeout;
+        }
+        gui_io.sleepNs(20 * std.time.ns_per_ms);
+    }
+}
+
+/// Frames of every surface but the main window's (surface=1) past `after_line`.
+fn countExternalAfter(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, after_line: usize) !usize {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    var hits: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        if (n < after_line) continue;
+        const at = std.mem.indexOf(u8, line, marker) orelse continue;
+        const id = std.mem.trimEnd(u8, line[at + marker.len ..], " \r");
+        if (id.len == 0 or std.mem.eql(u8, id, "1")) continue;
+        hits += 1;
+    }
+    return hits;
+}
+
+fn countAfter(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, after_line: usize) !usize {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    var hits: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        // A marker followed by more digits names another surface.
+        if (n < after_line) continue;
+        const at = std.mem.indexOf(u8, line, marker) orelse continue;
+        const end = at + marker.len;
+        if (end < line.len and std.ascii.isDigit(line[end])) continue;
+        hits += 1;
+    }
+    return hits;
+}
+
+/// waitFor, counting only lines stamped at or after `since_ms` (nowMs): for a
+/// marker the app also logged before the step being waited on.
+pub fn waitForSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, since_ms: f64, timeout_ms: u64) !void {
+    var timer = gui_io.Timer.start();
+    while (true) {
+        if (containsSince(alloc, path, marker, since_ms) catch false) return;
+        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
+            std.debug.print("[gui] app log never contained \"{s}\" after {d:.0}ms\n", .{ marker, since_ms });
+            return error.Timeout;
+        }
+        gui_io.sleepNs(50 * std.time.ns_per_ms);
+    }
+}
+
 test "field parses a named float out of a log line" {
     const line = "[zonvie] [ 123.000ms] [ext_cursor_shader] gridId=4 x=612.0 y=880.0 w=18.0 h=40.0";
     try std.testing.expectEqual(@as(?f64, 612.0), field(line, "x"));

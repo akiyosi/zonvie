@@ -23,6 +23,7 @@ const platform = driver.platform;
 const capture = driver.capture;
 const fixture = @import("fixture.zig");
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 const normal_bg = [3]i32{ 0x20, 0x60, 0xa0 };
 const float_bg = [3]i32{ 0xa0, 0x20, 0x60 };
@@ -71,18 +72,20 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('highlight NormalFloat guibg=#a02060 guifg=#ffffff')");
 
     const before = driver.snapshotWindows(g.app_pid);
+    const open_mark = try app_log.lineMark(alloc, log_path);
     // 60x20 external window, its NormalFloat mapped to Normal.
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, false, {"host"}) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) vim.wo[_G.z_anchor].winhighlight = "NormalFloat:Normal" return 1 end)()')
     );
     const ext = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", open_mark, 10_000);
+    const float_mark = try app_log.lineMark(alloc, log_path);
 
     // A float over the left half of rows 4..15 (cols 6..30 of 60).
     try g.exec(
         \\luaeval('(function() local fb = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(fb, 0, -1, false, {"float"}) _G.z_float = vim.api.nvim_open_win(fb, false, {relative="win", win=_G.z_anchor, row=4, col=6, width=24, height=12, style="minimal"}) vim.wo[_G.z_float].winhighlight = "" return 1 end)()')
     );
-    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, "[trace] event=frame_done", float_mark, 10_000);
 
     var img = try capture.captureWindow(alloc, ext.number);
     defer img.deinit(alloc);

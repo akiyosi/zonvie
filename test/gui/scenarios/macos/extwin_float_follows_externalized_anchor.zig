@@ -106,11 +106,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // The move under test.
     const t0 = try app_log.nowMs(alloc, log_path);
+    const before_ext = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_host, {external=true, width=60, height=20}) return 1 end)()')
     );
     try g.waitWindowCount(base_windows + 1, 10_000);
-    gui_io.sleepNs(1000 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, app_log.any_external_surface, 2, before_ext, 10_000);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 2, before_ext, 10_000);
 
     // What Neovim says about the float now. If it re-anchored the float to the
     // editor, the float is grid 1's by protocol and the GUI has no say.

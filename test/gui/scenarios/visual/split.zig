@@ -3,7 +3,7 @@
 // A :vsplit composites two window grids side by side with a vertical
 // divider. This anchors split-window compositing in the client area —
 // the area where the Windows "stale cursor in split windows" class of
-// drawing bug (15cad19) lives. The cursor is parked steady in the left
+// drawing bug lives. The cursor is parked steady in the left
 // pane so its rendering is deterministic.
 
 const std = @import("std");

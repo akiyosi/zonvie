@@ -47,6 +47,16 @@ pub fn pinWindow(pid: i32, x: i32, y: i32) void {
     _ = SetWindowPos(hwnd, null, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+/// WM_APP_TEST_FULL_REDRAW in windows/app.zig.
+const wm_app_test_full_redraw: W.UINT = 0x8000 + 43;
+
+/// Ask an app launched with ZONVIE_TEST_FULL_REDRAW=1 to repaint its main
+/// window whole on the next paint.
+pub fn forceFullRedraw(pid: i32) void {
+    const hwnd = mainWindowHandleForPid(pid) orelse return;
+    _ = PostMessageW(hwnd, wm_app_test_full_redraw, 0, 0);
+}
+
 const main_class = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieWin");
 const external_class = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieExternalWin");
 

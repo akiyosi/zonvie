@@ -3435,6 +3435,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
+            if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{grid_id});
             ext_win.surf.completePaintRetry();
             return;
         }
@@ -3508,6 +3509,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         }
+        // What a test waits on instead of sleeping for a frame.
+        if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{grid_id});
         ext_win.surf.completePaintRetry();
     }
 }

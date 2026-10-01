@@ -36,6 +36,8 @@ const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_scrollbar_surface.log";
+/// Any surface's completed frame.
+const frame_marker = "[trace] event=frame_done";
 const marker = "[scrollbar]";
 
 const Report = struct { surface: i64, grid: i64, topline: i64 };
@@ -65,23 +67,29 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
     defer g.deinit();
     g.activateApp();
-    gui_io.sleepNs(700 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, 0, 10_000);
 
     // The main window, with far more lines than it shows so its knob has
     // somewhere to be.
+    const lines_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() _G.z_main = vim.api.nvim_get_current_win() local l = {} for i = 1, 800 do l[i] = string.format("%3d main line", i) end vim.api.nvim_buf_set_lines(0, 0, -1, false, l) return 1 end)()')
     );
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    try app_log.waitFramesAfter(alloc, log_path, 1, 1, lines_mark, 10_000);
 
     // Gate: the main window has to have reported a knob position at all, or
     // "it did not move" proves nothing.
     const t0 = try app_log.nowMs(alloc, log_path);
+    const focus_mark = try app_log.lineMark(alloc, log_path);
     try g.exec("luaeval('(function() vim.api.nvim_set_current_win(_G.z_main) return 1 end)()')");
-    gui_io.sleepNs(300 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, focus_mark, 10_000);
     try g.remoteSend("<C-e>");
-    gui_io.sleepNs(500 * std.time.ns_per_ms);
-    const main_seen = (try lastFor(alloc, true, t0)) orelse {
+    const main_seen = blk: {
+        var timer = gui_io.Timer.start();
+        while (timer.read() / std.time.ns_per_ms < 5_000) {
+            if (try lastFor(alloc, true, t0)) |r| break :blk r;
+            gui_io.sleepNs(20 * std.time.ns_per_ms);
+        }
         std.debug.print("[gui] the main window never reported a scrollbar position\n", .{});
         return error.MainScrollbarSilent;
     };
@@ -91,15 +99,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const before = driver.snapshotWindows(g.app_pid);
 
     // An external window, likewise longer than it shows.
+    const ext_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 800 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, ext_mark, 10_000);
 
     // Now scroll the EXTERNAL window, from the keyboard, with the cursor in it.
     try g.exec("luaeval('(function() vim.api.nvim_set_current_win(_G.z_anchor) return 1 end)()')");
-    gui_io.sleepNs(400 * std.time.ns_per_ms);
 
     const t1 = try app_log.nowMs(alloc, log_path);
     var n: u32 = 0;
@@ -147,10 +155,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // content, so that window's knob is the one that has to move — and the
     // main window's still must not. Reported from Windows: the float scrolled
     // and the MAIN window's knob was the one that moved.
+    const float_mark = try app_log.lineMark(alloc, log_path);
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 800 do l[i] = string.format("%3d float line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, true, {relative="win", win=_G.z_anchor, row=2, col=2, width=40, height=10}) return 1 end)()')
     );
-    gui_io.sleepNs(800 * std.time.ns_per_ms);
+    try app_log.waitAfter(alloc, log_path, frame_marker, float_mark, 10_000);
 
     // Gate: it has to be composited INTO the external window. A float given a
     // window of its own is a surface, and this would test nothing.

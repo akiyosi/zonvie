@@ -85,7 +85,7 @@ test "gui:set_columns_lines" {
 
 test "gui:window_frame_stability" {
     // macOS only: the Windows frontend does not persist the main window
-    // frame across launches, so the 44705f8 regression cannot occur there.
+    // frame across launches, so the launch-to-launch shrink cannot occur there.
     try gated(is_macos, @import("scenarios/macos/window_frame_stability.zig"));
 }
 
@@ -158,7 +158,7 @@ test "gui:extfloat_message_position" {
 
 test "gui:wheel_scroll" {
     // Windows only: synthesizes WM_MOUSEWHEEL into the real frontend wheel
-    // handler (7b37537). No macOS equivalent in this driver.
+    // handler. No macOS equivalent in this driver.
     try gated(is_windows, @import("scenarios/windows/wheel_scroll.zig"));
 }
 
@@ -174,6 +174,10 @@ test "gui:visual_agent_status" {
 
 test "gui:visual_split" {
     try gated(can_capture, @import("scenarios/visual/split.zig"));
+}
+
+test "gui:visual_partial_matches_full" {
+    try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
 test "gui:visual_split_divider_survives_layer_redraw" {
