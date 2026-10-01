@@ -620,6 +620,8 @@ pub const PaintSnapshot = struct {
     /// advance in place, so the paint has to tell that the two halves it holds
     /// are no longer from one flush.
     commit_rev: u64 = 0,
+    /// `layer_rows_rev` as it stood at the same moment.
+    layer_rows_rev: u64 = 0,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -645,6 +647,11 @@ pub const TripleBufferedSurface = struct {
     committed_index: u8 = 1,
     is_in_flush: bool = false,
     commit_rev: u64 = 0,
+    /// Bumped by every commit whose flush republished layer rows in place.
+    /// Moved together with commit_rev under this lock, so a paint can tell a
+    /// root commit that left the layers alone from one that did not.
+    layer_rows_rev: u64 = 0,
+    flush_layer_rows: bool = false,
 
     // Per-set UI read refcount (rotation_mu protected).
     // Re-entrant WM_PAINT: DXGIs Present/ResizeBuffers can pump messages,
@@ -921,6 +928,12 @@ pub const TripleBufferedSurface = struct {
         self.main_cursor_flush_new_row = null;
     }
 
+    /// Record that this flush republished layer rows, for commitFlush to
+    /// publish with the root's commit. Core thread, under app.mu.
+    pub fn noteLayerRowsPublished(self: *TripleBufferedSurface) void {
+        self.flush_layer_rows = true;
+    }
+
     /// Stage this surface's layer list. Core thread, inside the flush bracket.
     pub fn stageLayers(self: *TripleBufferedSurface, layers: SurfaceLayers) void {
         if (self.flush_layers) |*staged| staged.deinit();
@@ -949,10 +962,15 @@ pub const TripleBufferedSurface = struct {
 
     /// Commit the write set as the new committed set.
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
-        if (!self.is_in_flush and !self.main_cursor_in_flush and self.flush_layers == null) return;
+        if (!self.is_in_flush and !self.main_cursor_in_flush and self.flush_layers == null and !self.flush_layer_rows) return;
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
+
+        if (self.flush_layer_rows) {
+            self.layer_rows_rev +%= 1;
+            self.flush_layer_rows = false;
+        }
 
         // Layers and the vertices they place become visible together.
         if (self.flush_layers) |staged| {
@@ -964,9 +982,11 @@ pub const TripleBufferedSurface = struct {
             self.layout_publish_gen +%= 1;
         }
         if (self.flush_cursor_layer_grid_id) |staged_grid| {
+            // Every cursor callback stages its owner; only a change of owner
+            // moves what a pinned paint places.
+            if (staged_grid != self.committed_cursor_layer_grid_id) self.layout_publish_gen +%= 1;
             self.committed_cursor_layer_grid_id = staged_grid;
             self.flush_cursor_layer_grid_id = null;
-            self.layout_publish_gen +%= 1;
         }
 
         // Cursor and rows publish while holding the same lock. A paint can
@@ -1168,6 +1188,22 @@ pub const TripleBufferedSurface = struct {
         self.rotation_mu.unlock(core.clock.io());
     }
 
+    /// Hand back the damage a paint took at acquireForPaint and never drew:
+    /// its dirty rows, and a full paint when it was one. Only for a paint
+    /// that consumed no scroll; a scroll is not handed back.
+    pub fn returnUndrawnDamage(self: *TripleBufferedSurface, rows: []const u32, full: bool) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        if (full) self.pending_paint_full = true;
+        for (rows) |row| {
+            if (row < self.pending_dirty.bit_length) {
+                self.pending_dirty.set(row);
+            } else {
+                self.pending_paint_full = true;
+            }
+        }
+    }
+
     pub fn acquireForPaint(self: *TripleBufferedSurface, alloc: std.mem.Allocator) PaintSnapshot {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
@@ -1233,6 +1269,7 @@ pub const TripleBufferedSurface = struct {
             .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
             .layout_gen = self.layout_publish_gen,
             .commit_rev = self.commit_rev,
+            .layer_rows_rev = self.layer_rows_rev,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -2392,6 +2429,8 @@ pub const SurfacePaintState = struct {
     /// row is that grid's OWN row -- so a row remembered from the last paint
     /// cannot be placed with the grid holding the cursor now.
     last_painted_cursor_grid: i64 = 0,
+    /// Layer frames this surface refused for staleness, for `[layer_frame]`.
+    layer_frame_refusals: u64 = 0,
 
     pub fn deinit(self: *SurfacePaintState, alloc: std.mem.Allocator, row_vb_budget: *RowVBPhysicalBudget) void {
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
@@ -3106,7 +3145,11 @@ pub fn drawSurfaceRowsVBFromSlots(
         }
         // Core row vertices are grid-local pixels against this viewport,
         // offset by where the layer sits inside it.
-        g.setLayerTransform(layer_origin_x_px, layer_origin_y_px, base_vp.w, base_vp.h);
+        g.setLayerTransform(layer_origin_x_px, layer_origin_y_px, base_vp.w, base_vp.h) catch {
+            metrics.skipped_empty += 1;
+            metrics.failed_rows += 1;
+            continue;
+        };
         g.drawVB(row_vb, src.len) catch {
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
@@ -3960,13 +4003,15 @@ pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
     }
 }
 
-/// Layers paint whole; queue a present rect for each one that changed. Their
-/// rows are not in rows_to_draw, which only covers the root grid's own dirty
-/// rows. Caller holds `mu`, under the same hold as the plan, so a store
-/// landing between them cannot have its flag dropped. `x_offset`/`y_offset`
-/// is where the surface's content sits in its client area; `client_right`/
-/// `client_bottom` bound the rects. A rect that cannot be queued leaves the
-/// layer's flag clear, so its dirt is kept for the next paint.
+/// Queue the present damage of each changed layer: the rows its plan draws
+/// (plus the GPU copy and the cursor's rows), or the whole layer when it
+/// redraws whole. Their rows are not in rows_to_draw, which only covers the
+/// root grid's own dirty rows. Caller holds `mu`, in the same hold as the plan,
+/// so a store landing between them cannot have its flag dropped.
+/// `x_offset`/`y_offset` is where the surface's content sits in its client
+/// area; `client_right`/`client_bottom` bound the rects. A layer whose rects
+/// cannot all be queued keeps its flag clear, so its dirt is kept for the next
+/// paint.
 pub fn appendLayerPresentRects(
     app: *App,
     layers: []const SurfaceLayer,
@@ -3975,6 +4020,8 @@ pub fn appendLayerPresentRects(
     client_right: i32,
     client_bottom: i32,
     row_h_px: i32,
+    cursor_grid: i64,
+    cursor_rows: [2]?u32,
     present_rects: *std.ArrayListUnmanaged(c.RECT),
 ) void {
     if (layers.len <= 1) return;
@@ -3983,18 +4030,17 @@ pub fn appendLayerPresentRects(
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
         state.paint_has_present_rect = false;
         if (!state.dirty) continue;
-        const l: i32 = @max(0, x_offset + layer.x_px);
-        const t: i32 = @max(0, y_offset + layer.y_px);
-        const rc: c.RECT = .{
-            .left = l,
-            .top = t,
-            .right = @min(client_right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
-            .bottom = @min(client_bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
-        };
-        if (rc.right > rc.left and rc.bottom > rc.top) {
-            present_rects.append(app.alloc, rc) catch continue;
-            state.paint_has_present_rect = true;
-        }
+        render_pipeline_helpers.appendLayerDrawRects(c.RECT, app.alloc, present_rects, .{
+            .left_px = x_offset + layer.x_px,
+            .top_px = y_offset + layer.y_px,
+            .width_px = @as(i32, @intCast(layer.cols)) * cell_w_i32,
+            .row_h_px = row_h_px,
+            .rows = layer.rows,
+            .row_limit = @min(state.rows_buf.items.len, @as(usize, layer.rows)),
+            .clip_right = client_right,
+            .clip_bottom = client_bottom,
+        }, state.draw_all, &state.draw_rows, if (layer.grid_id == cursor_grid) cursor_rows else .{ null, null }, state.draw_blit_rect) catch continue;
+        state.paint_has_present_rect = true;
     }
 }
 
@@ -4062,14 +4108,15 @@ pub const LayerFrameStaleness = struct {
     /// The placement or cursor owner was republished (layout_publish_gen).
     layout: bool = false,
     /// The root's committed set rotated away from the index the snapshot froze
-    /// (commit_rev), while the layer rows drawn beside it were republished in
-    /// place -- the case that moves neither the placement nor the cursor owner,
-    /// so `layout` stays clear. The frame would pair one flush's chrome with
+    /// (commit_rev) AND layer rows were republished in place (layer_rows_rev)
+    /// -- the case that moves neither the placement nor the cursor owner, so
+    /// `layout` stays clear. The frame would pair one flush's chrome with
     /// another flush's window text; under ext_multigrid the root carries the
     /// statusline, tabline and separators, which describe what the layers show.
     ///
-    /// A flush that publishes no root rows leaves committed_index alone and
-    /// does not bump commit_rev, so a layers-only commit is not refused.
+    /// The root rows come from the pinned set, so a root-only commit (every
+    /// statusline update) leaves the pair consistent, and a layers-only one
+    /// leaves committed_index alone; neither is refused.
     commit: bool = false,
 
     pub fn any(self: LayerFrameStaleness) bool {
@@ -4080,7 +4127,10 @@ pub const LayerFrameStaleness = struct {
 pub fn layerFrameStaleness(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) LayerFrameStaleness {
     return .{
         .layout = tbs.layout_publish_gen != snapshot.layout_gen,
-        .commit = tbs.commit_rev != snapshot.commit_rev,
+        .commit = render_pipeline_helpers.layerFrameCommitStale(
+            tbs.commit_rev != snapshot.commit_rev,
+            tbs.layer_rows_rev != snapshot.layer_rows_rev,
+        ),
     };
 }
 
@@ -4139,7 +4189,8 @@ fn drawLayerRow(
         else
             @intCast(ri);
     }
-    g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h);
+    g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h) catch
+        return .{ .encoded = encoded, .failed = true };
     g.drawVB(vb, rv.verts.items.len) catch
         return .{ .encoded = encoded, .failed = true };
     return .{ .encoded = true };
@@ -4265,7 +4316,9 @@ pub fn drawSurfaceLayers(
         );
     }
     // Restore the surface's own pixel space for whatever draws next.
-    g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
+    g.setLayerTransform(0, 0, base_vp.w, base_vp.h) catch {
+        failed_rows += 1;
+    };
     return .{ .failed_rows = failed_rows, .budget_exceeded = budget_exceeded };
 }
 
@@ -4288,6 +4341,9 @@ pub const CursorOverlayParams = struct {
     /// cursor is on the surface's root grid.
     cursor_layer_origin_x_px: f32 = 0,
     cursor_layer_origin_y_px: f32 = 0,
+    /// The width of the cursor's layer, which bounds the row scissor. Null
+    /// when the cursor is on the surface's root grid.
+    cursor_layer_w_px: ?i32 = null,
     /// The cursor's row in its own layer, when the cursor is not on the root
     /// grid. Blink-off redraws this instead of the root's (empty) row.
     cursor_layer_row: ?*RowVerts = null,
@@ -4336,7 +4392,7 @@ fn redrawCursorRowContent(
         }
         // Same offset drawSurfaceLayers applies: a shift hint moved these
         // vertices between rows without rewriting them.
-        g.setLayerTransform(cursor_ox, cursor_oy + p.cursor_layer_row_dy_px, layer_w, layer_h);
+        try g.setLayerTransform(cursor_ox, cursor_oy + p.cursor_layer_row_dy_px, layer_w, layer_h);
         try g.drawVB(lvb, lr.verts.items.len);
         return;
     }
@@ -4356,7 +4412,7 @@ fn redrawCursorRowContent(
             // once something had scrolled.
             const origin_row: i32 = @intCast(p.pool.slotPtrConst(mapping.slot).origin_row);
             const row_dy: f32 = @floatFromInt((@as(i32, @intCast(cursor_row)) - origin_row) * p.row_h_px);
-            g.setLayerTransform(0, row_dy, layer_w, layer_h);
+            try g.setLayerTransform(0, row_dy, layer_w, layer_h);
             try g.drawVB(row_vb, slot_verts_len);
         }
     } else if (slot_verts_len > 0) {
@@ -4397,16 +4453,27 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
 
     // 3. Set scissor to cursor row. cursor_row is grid-local to the cursor's
     // layer, so the layer's own origin places it on the surface.
+    // Bounded by the cursor's own layer: the blink-off erase below clears
+    // the whole scissor, and a full-width one wiped a vertical-split
+    // neighbour's row.
     const layer_top_px: i32 = @intFromFloat(@floor(cursor_oy));
     if (p.rs_set_sc_fn) |f| {
-        const top_px: i32 = p.y_offset + layer_top_px + @as(i32, @intCast(cursor_row)) * p.row_h_px;
-        const bottom_px: i32 = top_px + p.row_h_px;
-        var sc: c.D3D11_RECT = .{
-            .left = p.x_offset,
-            .top = top_px,
-            .right = p.content_right,
-            .bottom = bottom_px,
-        };
+        var sc = render_pipeline_helpers.cursorRowScissor(
+            c.D3D11_RECT,
+            p.x_offset,
+            p.y_offset,
+            p.content_right,
+            @intFromFloat(@floor(cursor_ox)),
+            layer_top_px,
+            p.cursor_layer_w_px,
+            cursor_row,
+            p.row_h_px,
+        );
+        // A layer with no columns on the surface shows no cursor.
+        if (sc.right <= sc.left) {
+            p.last_painted_cursor_row.* = null;
+            return;
+        }
         f(p.ctx_ptr, 1, &sc);
     }
 
@@ -4418,14 +4485,14 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     if (p.row_already_redrawn) {
         if (p.blink_visible) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
-            g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
+            try g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
             try g.drawVB(vb, p.cursor_verts.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
         }
     } else if (p.blink_visible) {
         if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
-        g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
+        try g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
         try g.drawVB(vb, p.cursor_verts.len);
     } else {
         if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
@@ -4527,7 +4594,7 @@ pub fn drawScrollbarOverlay(
     const vb = vb_ptr.* orelse return error.ScrollbarVertexBufferMissing;
     try g.uploadVertsToVB(vb, scrollbar_verts);
     // Scrollbar geometry is built in clip space by this frontend.
-    g.setLayerTransform(0, 0, 0, 0);
+    try g.setLayerTransform(0, 0, 0, 0);
     try g.drawVB(vb, scrollbar_verts.len);
 }
 
@@ -4585,7 +4652,7 @@ fn drawBloomRowBuffers(
         };
         set_viewport(d3d_ctx, 1, &viewport);
         // Core row vertices are grid-local pixels against this viewport.
-        g.setLayerTransform(0, 0, extent_w_px, extent_h_px);
+        g.setLayerTransform(0, 0, extent_w_px, extent_h_px) catch continue;
         g.drawVB(vb, slot.verts.items.len) catch {};
     }
 
@@ -4629,7 +4696,7 @@ fn drawBloomRowBuffers(
                         // The origins the draw placed these pixels at, not the
                         // ones the core may have published since.
                         const row_dy = layerRowShiftPx(state.drawn_origin_rows.items, ri, ctx.row_h_px);
-                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px);
+                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px) catch continue;
                         g.drawVB(vb, rv.verts.items.len) catch {};
                     }
                 }
@@ -4639,7 +4706,7 @@ fn drawBloomRowBuffers(
     // drawBloomPasses draws the cursor after this callback, in its layer's
     // space as the main pass does; it used to be left at the surface origin,
     // so a cursor in a split or float glowed away from where it was drawn.
-    g.setLayerTransform(ctx.cursor_layer_origin[0], ctx.cursor_layer_origin[1], extent_w_px, extent_h_px);
+    g.setLayerTransform(ctx.cursor_layer_origin[0], ctx.cursor_layer_origin[1], extent_w_px, extent_h_px) catch {};
 }
 
 /// Release the snapshot a paint took with `acquireForPaint`, once, from the
@@ -4907,7 +4974,13 @@ pub fn drawSurfaceRowFrame(
         // above applied.
         var cursor_layer_row: ?*RowVerts = null;
         var cursor_layer_row_dy_px: f32 = 0;
+        var cursor_layer_w_px: ?i32 = null;
         if (!cursor_on_root) {
+            for (in.layers) |layer| {
+                if (layer.grid_id != in.cursor_grid) continue;
+                cursor_layer_w_px = @as(i32, @intCast(layer.cols)) * @as(i32, @intCast(@max(1, app.cell_w_px)));
+                break;
+            }
             if (in.cursor_row) |row| {
                 if (app.layer_grids.get(in.cursor_grid)) |state| {
                     if (row < state.rows_buf.items.len) {
@@ -4941,6 +5014,7 @@ pub fn drawSurfaceRowFrame(
             .row_h_px = row_h_px,
             .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
             .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
+            .cursor_layer_w_px = cursor_layer_w_px,
             .cursor_layer_row = cursor_layer_row,
             .row_vb_budget = &app.row_vb_budget,
             .layer_row_vb_retained_bytes = &app.layer_row_vb_retained_bytes,
@@ -4992,6 +5066,7 @@ pub const RowPassSurface = struct {
             .cursor_vb_bytes = &paint.cursor_vb_bytes,
             .last_painted_cursor_row = &paint.last_painted_cursor_row,
             .last_painted_cursor_grid = &paint.last_painted_cursor_grid,
+            .layer_frame_refusals = &paint.layer_frame_refusals,
         };
     }
 
@@ -5003,6 +5078,7 @@ pub const RowPassSurface = struct {
     cursor_vb_bytes: *usize,
     last_painted_cursor_row: *?u32,
     last_painted_cursor_grid: *i64,
+    layer_frame_refusals: *u64,
 };
 
 /// Layer rectangles appended under the lock the layer plan runs in, so a store
@@ -5012,6 +5088,9 @@ pub const RowPassLayerPresent = struct {
     rects: *std.ArrayListUnmanaged(c.RECT),
     right: i32,
     bottom: i32,
+    /// Grid-local rows of the cursor's grid this frame redraws.
+    cursor_grid: i64,
+    cursor_rows: [2]?u32,
 };
 
 pub const RowPassInput = struct {
@@ -5033,6 +5112,10 @@ pub const RowPassOutcome = struct {
     frame: RowFrameOutcome,
     /// The rectangle the root's GPU scroll copied, or null.
     scroll_damage: ?c.RECT,
+    /// The layer frame went stale before anything reached back_tex, so
+    /// nothing was drawn and no layer plan was spent. Not a failure: the
+    /// driver hands its damage back (returnUndrawnDamage) and repaints now.
+    stale: bool = false,
 };
 
 /// The row pass both paint drivers run, in one order: size the row VBs, shift
@@ -5122,16 +5205,34 @@ pub fn drawSurfaceRowPass(
         const staleness = layerFrameStaleness(surface.tbs, in.snapshot);
         layout_stale = staleness.layout;
         commit_stale = staleness.commit;
-        if (staleness.any()) {
+        // The scroll this snapshot consumed is not handed back, so a frame
+        // that took one has already moved back_tex for good.
+        const scroll_consumed = in.snapshot.scroll_rect != null or in.snapshot.vb_shift != 0;
+        const refusal = render_pipeline_helpers.classifyLayerFrameRefusal(staleness.any(), scroll_consumed);
+        if (refusal != .none) {
             // Nothing is planned at a placement the core already replaced, or
-            // beside root rows it already replaced. The frame is refused, and
-            // the commit that replaced them owes the repaint that draws them.
+            // beside root rows it already replaced, and the root rows are not
+            // drawn either: the whole frame is refused.
+            surface.layer_frame_refusals.* +%= 1;
             if (in.frame.log_enabled) applog.appLog(
-                "[layer_draw] stale_layout={d} stale_commit={d} root={d} gen={d} rev={d}\n",
-                .{ @intFromBool(layout_stale), @intFromBool(commit_stale), in.frame.root_grid_id, in.snapshot.layout_gen, in.snapshot.commit_rev },
+                "[layer_frame] refused={d} reason={s} outcome={s} root={d} gen={d} rev={d}\n",
+                .{
+                    surface.layer_frame_refusals.*,
+                    if (layout_stale and commit_stale) "layout+commit" else if (layout_stale) "layout" else "commit",
+                    @tagName(refusal),
+                    in.frame.root_grid_id,
+                    in.snapshot.layout_gen,
+                    in.snapshot.commit_rev,
+                },
             );
+            if (refusal == .stale) return .{ .frame = .{}, .scroll_damage = null, .stale = true };
             rearmLayerDraw(app, layers);
-        } else planLayerFrame(g, app, layers, .{
+            return .{
+                .frame = .{ .layers = .{ .stale_layout = layout_stale, .stale_commit = commit_stale } },
+                .scroll_damage = scroll_damage,
+            };
+        }
+        planLayerFrame(g, app, layers, .{
             .x_offset = p.x_offset,
             .y_offset = p.y_offset,
             .content_right = p.content_right,
@@ -5153,6 +5254,8 @@ pub fn drawSurfaceRowPass(
             lp.right,
             lp.bottom,
             p.row_h_px,
+            lp.cursor_grid,
+            lp.cursor_rows,
             lp.rects,
         );
     }
@@ -7015,6 +7118,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
         tbs.stageLayers(staged);
     }
     try Probe.publishLayerRow(&state, alloc, 0.0);
+    tbs.noteLayerRowsPublished();
     tbs.commitFlush(alloc);
 
     // Drain the full-paint flag that staging a placement sets, so the frame
@@ -7028,6 +7132,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
     // --- Flush N: row content only, both grids. No placement, no cursor. ---
     try Probe.writeRootRow(&tbs, alloc, 1.0);
     try Probe.publishLayerRow(&state, alloc, 1.0);
+    tbs.noteLayerRowsPublished();
     tbs.commitFlush(alloc);
 
     const root_set_n = tbs.committed_index;
@@ -7048,6 +7153,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
     //     the layers' applyStaged first, then the surface commit, one hold.
     try Probe.writeRootRow(&tbs, alloc, 2.0);
     try Probe.publishLayerRow(&state, alloc, 2.0);
+    tbs.noteLayerRowsPublished();
     tbs.commitFlush(alloc);
 
     // The skew is real: the pinned set still holds flush N's root row while
@@ -7092,10 +7198,47 @@ test "a layer frame is refused once the core republishes the root rows beside it
         // leaves committed_index alone, so the frame this paint pinned is
         // still whole and must not be refused.
         try Probe.publishLayerRow(&state, alloc, 3.0);
+        tbs.noteLayerRowsPublished();
         tbs.commitFlush(alloc);
         try std.testing.expectEqual(@as(f32, 3.0), Probe.layerMarker(&state));
         try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
     }
+
+    // Nor is a flush that publishes only root rows -- every statusline
+    // update: the paint draws the root from the set it pinned, beside layer
+    // rows that did not move.
+    {
+        var fresh = tbs.acquireForPaint(alloc);
+        defer _ = Probe.unpin(&tbs, &fresh);
+        try Probe.writeRootRow(&tbs, alloc, 4.0);
+        tbs.commitFlush(alloc);
+        try std.testing.expect(tbs.committed_index != fresh.committed_index);
+        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
+
+        // Layer rows published after it complete the split, even in a commit
+        // of their own.
+        try Probe.publishLayerRow(&state, alloc, 5.0);
+        tbs.noteLayerRowsPublished();
+        tbs.commitFlush(alloc);
+        try std.testing.expect(layerFrameStaleness(&tbs, fresh).commit);
+    }
+}
+
+test "a cursor callback that keeps its owner does not move the layout generation" {
+    const alloc = std.testing.allocator;
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    const gen0 = tbs.layout_publish_gen;
+    try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
+    tbs.stageCursorLayerGrid(tbs.committed_cursor_layer_grid_id);
+    tbs.commitFlush(alloc);
+    try std.testing.expectEqual(gen0, tbs.layout_publish_gen);
+
+    try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
+    tbs.stageCursorLayerGrid(4);
+    tbs.commitFlush(alloc);
+    try std.testing.expectEqual(gen0 +% 1, tbs.layout_publish_gen);
 }
 
 test {

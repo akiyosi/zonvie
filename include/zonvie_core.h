@@ -205,6 +205,9 @@ typedef void (*zonvie_on_vertices_row_fn)(
    The region is always full width; a partial-width scroll, two different
    regions in one batch, or a shift past half the region is refused here and
    the grid is regenerated instead.
+   A grid resized in the same batch gets no shift: its rows are resent. A grid
+   moved to another surface also has all its rows resent, so a shift never
+   refers to rows held for a different surface.
    Fired after abort check, before clearDirty. */
 typedef void (*zonvie_on_grid_row_scroll_fn)(
     void* ctx,
@@ -477,7 +480,7 @@ typedef void (*zonvie_on_cmdline_pos_fn)(void* ctx, uint32_t pos, uint32_t level
 typedef void (*zonvie_on_cmdline_special_char_fn)(
     void* ctx,
     const uint8_t* c, size_t c_len,
-    int shift,
+    bool shift,
     uint32_t level
 );
 
@@ -581,16 +584,6 @@ typedef struct zonvie_msg_history_entry {
     size_t chunk_count;
     int append;                  /* was appended to previous message */
 } zonvie_msg_history_entry;
-
-/* Reserved: the core never invokes this callback (the slot is kept for struct
-   layout). Message history reaches the frontend through the routed view
-   instead: a Neovim split, the ZONVIE_GRID_ID_MSG_HISTORY grid, or
-   on_msg_show with kind "_msg_history" carrying all entries as one chunk. */
-typedef void (*zonvie_on_msg_history_show_fn)(
-    void* ctx,
-    const zonvie_msg_history_entry* entries, size_t entry_count,
-    int prev_cmd
-);
 
 /* --- ext_popupmenu types --- */
 
@@ -729,20 +722,16 @@ typedef int (*zonvie_on_clipboard_set_fn)(
 /* Layout version of zonvie_callbacks. Bump it whenever a field is removed,
    reordered, or has its signature changed. Appending a new callback at the
    end stays backward compatible through callbacks_size and must NOT bump it.
-   Enforced by `callbacks_layout` in src/core/c_api.zig: it pins the name and
-   byte offset of every field, so a layout change fails to compile until this
-   version and that table are updated together. */
-#define ZONVIE_CALLBACKS_ABI_VERSION 1
+   src/core/abi_header_test.zig checks this struct field by field against
+   the core's Zig declaration. */
+#define ZONVIE_CALLBACKS_ABI_VERSION 2
 
 typedef struct zonvie_callbacks {
     /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
-       NULL otherwise. It exists because callbacks_size can only report that
-       the struct's LENGTH changed, never that its LAYOUT did: commit 935bdc0
-       removed two callbacks and appended two, so a consumer built before it
-       passes a callbacks_size equal to the current sizeof while every pointer
-       from on_vertices_row onward sits at the wrong offset. This field is
-       first on purpose -- it is the one offset a stale consumer cannot match
-       by accident, because a stale build has a function pointer there. */
+       NULL otherwise. callbacks_size only sees the struct's length, not a
+       field removed or reordered in the middle. This field sits where a
+       stale build has its first function pointer, so a stale consumer cannot
+       pass a matching value by accident. */
     uint32_t abi_version;
 
     zonvie_on_vertices_row_fn on_vertices_row;
@@ -786,7 +775,6 @@ typedef struct zonvie_callbacks {
     zonvie_on_msg_showmode_fn on_msg_showmode;
     zonvie_on_msg_showcmd_fn on_msg_showcmd;
     zonvie_on_msg_ruler_fn on_msg_ruler;
-    zonvie_on_msg_history_show_fn on_msg_history_show; /* never invoked; see its typedef */
 
     /* Clipboard callbacks */
     zonvie_on_clipboard_get_fn on_clipboard_get;
@@ -849,7 +837,17 @@ typedef struct zonvie_callbacks {
     /* Flush bracketing callbacks (for GPU buffer management).
        on_flush_begin: called before vertex generation starts.
        on_flush_end: called after all vertices (rows + cursor + external grids) are submitted.
-       Frontend can use these to implement triple buffering / atomic commit. */
+       Frontend can use these to implement triple buffering / atomic commit.
+
+       Callbacks fired inside the bracket fall into two classes:
+       - TRANSACTIONAL: on_vertices_row (row and cursor updates),
+         on_grid_row_scroll, on_surface_layout, on_grid_destroy. Apply them on
+         commit. If the frontend refuses the flush (zonvie_core_abort_flush),
+         the core keeps its dirty state and resends all of them.
+       - IMMEDIATE: on_external_window / on_external_window_close,
+         on_grid_scroll, and the cmdline / popupmenu / message show-family
+         callbacks. Apply them on the spot and keep them even when refusing
+         the flush: the core does not resend them. */
     void (*on_flush_begin)(void* ctx);
     void (*on_flush_end)(void* ctx);
 
@@ -904,14 +902,10 @@ typedef struct zonvie_callbacks {
        Appended at the end for ABI compat. */
     void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
 
-    /* Per-surface layer placement, and grid buffer lifetime.
-       Added with per-grid rendering, which also REMOVED on_vertices_partial
-       and on_main_row_scroll from the front and middle of this struct. The
-       two removals and these two additions cancel out in sizeof, so
-       callbacks_size cannot detect the change: this struct is NOT layout
-       compatible with a consumer built before it, even though the size
-       matches. Both in-tree frontends were updated in the same commit, and
-       abi_version above is what lets the core refuse such a consumer. */
+    /* Per-surface layer placement, and grid buffer lifetime. A consumer
+       built before these existed has a function pointer where abi_version
+       now sits, so it cannot pass the current version and the core refuses
+       it rather than read pointers at shifted offsets. */
     zonvie_on_surface_layout_fn on_surface_layout;
     zonvie_on_grid_destroy_fn on_grid_destroy;
 } zonvie_callbacks;
@@ -1423,9 +1417,10 @@ typedef struct zonvie_grid_info {
      * follows only that window, not any window it merely overlaps. */
     int64_t anchor_grid;
     /* 1 if this float tracks the buffer, so it may pixel-shift with the parent's
-     * smooth scroll. Re-derived from every redraw batch that carried a scroll:
-     * a float Neovim repositioned in that batch follows, one it left alone does
-     * not. A fixed float stays 0 and must not pixel-shift. */
+     * smooth scroll: nvim_win_get_config reports relative='win' with a bufpos
+     * (Neovim re-places exactly those floats as their window scrolls). 0 until
+     * the core has that answer, and for every other float, which must not
+     * pixel-shift. */
     int32_t follows_scroll;
     /* 1 if this grid is an external (separate top-level) window. Such grids are
      * reported with start (0,0) and must be excluded from main-window hit-testing. */
@@ -1440,12 +1435,11 @@ typedef struct zonvie_grid_info {
      * by another surface reports start_row/start_col in that surface's space,
      * so a frontend must not hit-test it as its own. */
     int64_t placed_by_surface;
-    /* Neovim's composition index, and the core's tie-breaker after it. With
-     * zindex and grid_id these are the order a surface's layers are drawn in,
-     * back to front, so a frontend can say which of two grids is on top
-     * without inventing an order of its own. */
-    int64_t compindex;
-    uint64_t draw_order;
+    /* This grid's `z` in the layer list its surface last published through
+     * on_surface_layout (0 for a surface root, and for a grid not yet
+     * published). Larger is drawn on top: the one answer to which of two
+     * grids is in front, so no consumer re-derives the draw order. */
+    int64_t layer_z;
 } zonvie_grid_info;
 
 /* Where message boxes (ext-float messages, the toast, the minis) are placed.
@@ -1485,8 +1479,8 @@ typedef struct zonvie_pointer_hit {
    one hit-tested floats another surface hosts, the other ignored the mouse
    flag and the scrollability rule. It skips an external grid, a grid some
    other surface composites, and a grid that refuses the mouse; it takes the
-   front-most of what is left by (zindex, compindex, draw_order, grid_id), the
-   same order the core sorts a surface's layers in.
+   front-most of what is left by (layer_z, grid_id): the order its surface
+   last published.
 
    `require_scrollable` is the wheel's extra rule: a float showing all of its
    content does not capture scroll, and is skipped so a scrollable grid beneath

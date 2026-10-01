@@ -384,11 +384,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         flushHadContent = true
         markHostedDamage(gridId: id, rowStart: rowStart, rowEnd: rowEnd)
     }
-    private var writeSetIndex: Int = -1           // Main thread only (during flush)
+    private var writeSetIndex: Int = -1           // Flush bracket (core) thread only
     /// Whether this bracket has acquired `writeSetIndex`. A bracket that writes
     /// no rows never does, and commits without rotating the row triple.
     private var rowWritePrepared: Bool = false
-    private var flushSourceSetIndex: Int = 0      // Main thread only (during flush)
+    private var flushSourceSetIndex: Int = 0      // Flush bracket (core) thread only
     private var committedSetIndex: Int = 0        // Protected by lock
     private var gpuInFlightCount: [Int] = [0, 0, 0] // Protected by lock
     private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by lock
@@ -2054,11 +2054,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 return
             }
 
+            lock.lock()
+            let guardBandSmoothScrolling = scrollOffsetLatch.isSmoothScrolling
+            lock.unlock()
             GridSurfaceRenderer.waitCommitGuardBand(
+                shared: shared,
                 lock: lock,
                 commitRevision: { self.commitRevision },
                 lastDrawnRevision: lastDrawnRevision,
-                hadRecentCommit: { self.hadRecentCommit(withinNs: $0) },
+                isSmoothScrolling: guardBandSmoothScrolling,
                 timedOutRevision: &guardBandTimedOutRevision,
                 seq: UInt32(truncatingIfNeeded: gridId)
             )

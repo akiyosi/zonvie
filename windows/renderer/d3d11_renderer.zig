@@ -1104,7 +1104,7 @@ pub const Renderer = struct {
         try self.resize();
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
         // Frontend-authored vertices are already in clip space.
-        self.setLayerTransform(0, 0, 0, 0);
+        try self.setLayerTransform(0, 0, 0, 0);
 
         if (applog.isEnabled()) {
             applog.appLog(
@@ -1467,7 +1467,7 @@ pub const Renderer = struct {
     /// then rebind the atlas.
     fn drawStripTexture(self: *Renderer, st: *const StripTexture, ndc_left: f32, ndc_right: f32, ndc_top: f32, ndc_bottom: f32) !void {
         // Frontend-authored vertices are already in clip space.
-        self.setLayerTransform(0, 0, 0, 0);
+        try self.setLayerTransform(0, 0, 0, 0);
         const srv = st.srv orelse return;
         const ctx = self.ctx orelse return error.NoContext;
 
@@ -1731,7 +1731,7 @@ pub const Renderer = struct {
     /// Lazily creates and caches a 6-vertex VB with the default bg color.
     pub fn drawClearRow(self: *Renderer) !void {
         // Frontend-authored vertices are already in clip space.
-        self.setLayerTransform(0, 0, 0, 0);
+        try self.setLayerTransform(0, 0, 0, 0);
         const bg_rgb = self.default_bg_rgb.load(.acquire);
         const need_rebuild = (self.clear_row_vb == null or bg_rgb != self.clear_row_vb_bg);
 
@@ -3981,14 +3981,15 @@ pub const Renderer = struct {
     /// Bind the vertex stage's layer transform. Every draw afterwards uses it
     /// until it is set again. `extent_px` is the pixel space incoming vertices
     /// are expressed in; pass 0 for both to submit clip-space vertices under
-    /// the identity transform.
+    /// the identity transform. A failed map leaves the previous transform
+    /// bound, so the draw that needed this one must not run.
     pub fn setLayerTransform(
         self: *Renderer,
         origin_x_px: f32,
         origin_y_px: f32,
         extent_w_px: f32,
         extent_h_px: f32,
-    ) void {
+    ) error{LayerTransformMapFailed}!void {
         const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
             .{ 1, 1, 0, 0, 0, 0, 0, 0 }
         else .{
@@ -4011,7 +4012,7 @@ pub const Renderer = struct {
             const res: *c.ID3D11Resource = @ptrCast(cb);
             var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
             const hr = mapDiscard(ctx, res, &mapped);
-            if (c.FAILED(hr)) return;
+            if (c.FAILED(hr)) return error.LayerTransformMapFailed;
             const dst: *[8]f32 = @ptrCast(@alignCast(mapped.pData));
             dst.* = value;
             unmap0(ctx, res);

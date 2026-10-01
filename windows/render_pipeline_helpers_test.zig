@@ -1562,3 +1562,121 @@ test "nextEnvAssignment cuts KEY=VALUE lines in place" {
     }
     try std.testing.expect(helpers.nextEnvAssignment(&buf, text.len, &pos) == null);
 }
+
+test "a root commit refuses the layer frame only beside republished layer rows" {
+    try std.testing.expect(!helpers.layerFrameCommitStale(true, false));
+    try std.testing.expect(!helpers.layerFrameCommitStale(false, true));
+    try std.testing.expect(!helpers.layerFrameCommitStale(false, false));
+    try std.testing.expect(helpers.layerFrameCommitStale(true, true));
+}
+
+test "a stale layer frame is a failure only once back_tex moved" {
+    try std.testing.expectEqual(helpers.LayerFrameRefusal.none, helpers.classifyLayerFrameRefusal(false, false));
+    try std.testing.expectEqual(helpers.LayerFrameRefusal.none, helpers.classifyLayerFrameRefusal(false, true));
+    try std.testing.expectEqual(helpers.LayerFrameRefusal.stale, helpers.classifyLayerFrameRefusal(true, false));
+    try std.testing.expectEqual(helpers.LayerFrameRefusal.failed, helpers.classifyLayerFrameRefusal(true, true));
+}
+
+const TestRect = struct { left: i32, top: i32, right: i32, bottom: i32 };
+
+fn layerRectsFor(
+    rows: []const usize,
+    draw_all: bool,
+    cursor_rows: [2]?u32,
+    blit: ?helpers.BlitRectPx,
+    out: *std.ArrayListUnmanaged(TestRect),
+) !void {
+    const alloc = std.testing.allocator;
+    var bits = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 10);
+    defer bits.deinit(alloc);
+    for (rows) |r| bits.set(r);
+    // A 10-row, 80 px wide layer at (100, 20), 16 px rows, in a 400x300 client.
+    try helpers.appendLayerDrawRects(TestRect, alloc, out, .{
+        .left_px = 100,
+        .top_px = 20,
+        .width_px = 80,
+        .row_h_px = 16,
+        .rows = 10,
+        .row_limit = 10,
+        .clip_right = 400,
+        .clip_bottom = 300,
+    }, draw_all, &bits, cursor_rows, blit);
+}
+
+test "layer present damage covers the drawn rows, not the whole layer" {
+    var out: std.ArrayListUnmanaged(TestRect) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    // Rows 2-3 and 7 are two runs; the layer's other rows are not presented.
+    try layerRectsFor(&.{ 2, 3, 7 }, false, .{ null, null }, null, &out);
+    try std.testing.expectEqualSlices(TestRect, &.{
+        .{ .left = 100, .top = 52, .right = 180, .bottom = 84 },
+        .{ .left = 100, .top = 132, .right = 180, .bottom = 148 },
+    }, out.items);
+
+    // The cursor's rows join the runs they touch.
+    out.clearRetainingCapacity();
+    try layerRectsFor(&.{2}, false, .{ 3, 9 }, null, &out);
+    try std.testing.expectEqualSlices(TestRect, &.{
+        .{ .left = 100, .top = 52, .right = 180, .bottom = 84 },
+        .{ .left = 100, .top = 164, .right = 180, .bottom = 180 },
+    }, out.items);
+
+    // The GPU copy's rect is presented as well, clipped to the client.
+    out.clearRetainingCapacity();
+    try layerRectsFor(&.{}, false, .{ null, null }, .{ .left = 100, .top = 36, .right = 500, .bottom = 100 }, &out);
+    try std.testing.expectEqualSlices(TestRect, &.{
+        .{ .left = 100, .top = 36, .right = 400, .bottom = 100 },
+    }, out.items);
+
+    // A whole-layer redraw presents the whole layer.
+    out.clearRetainingCapacity();
+    try layerRectsFor(&.{1}, true, .{ null, null }, null, &out);
+    try std.testing.expectEqualSlices(TestRect, &.{
+        .{ .left = 100, .top = 20, .right = 180, .bottom = 180 },
+    }, out.items);
+
+    // Nothing drawn, nothing presented.
+    out.clearRetainingCapacity();
+    try layerRectsFor(&.{}, false, .{ null, null }, null, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "layer present damage ignores rows past the stored rows" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(TestRect) = .empty;
+    defer out.deinit(alloc);
+    var bits = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 10);
+    defer bits.deinit(alloc);
+    bits.set(8);
+    try helpers.appendLayerDrawRects(TestRect, alloc, &out, .{
+        .left_px = 0,
+        .top_px = 0,
+        .width_px = 80,
+        .row_h_px = 16,
+        .rows = 10,
+        .row_limit = 4,
+        .clip_right = 400,
+        .clip_bottom = 300,
+    }, false, &bits, .{ 6, null }, null);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "the cursor row scissor stays inside the cursor's layer" {
+    // Root cursor: the content's full width.
+    try std.testing.expectEqual(
+        TestRect{ .left = 10, .top = 30 + 3 * 16, .right = 500, .bottom = 30 + 4 * 16 },
+        helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 0, null, 3, 16),
+    );
+    // The right half of a vertical split: its own columns only, so the
+    // blink-off erase cannot reach the left neighbour.
+    try std.testing.expectEqual(
+        TestRect{ .left = 10 + 248, .top = 30 + 32 + 16, .right = 500, .bottom = 30 + 32 + 32 },
+        helpers.cursorRowScissor(TestRect, 10, 30, 500, 248, 32, 400, 1, 16),
+    );
+    // The left half.
+    try std.testing.expectEqual(
+        TestRect{ .left = 10, .top = 30, .right = 10 + 240, .bottom = 46 },
+        helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 0, 240, 0, 16),
+    );
+}

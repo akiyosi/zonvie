@@ -1008,6 +1008,122 @@ pub fn layerOriginPx(comptime Layer: type, layers: []const Layer, grid_id: i64, 
     return .{ 0, 0 };
 }
 
+/// Whether a commit landing after the paint pinned its root set splits the
+/// layer frame. The root rows come from the pinned set either way, so a root
+/// commit alone leaves them paired with layers that did not move; only one
+/// paired with republished layer rows mixes two flushes.
+pub fn layerFrameCommitStale(root_commit_moved: bool, layer_rows_moved: bool) bool {
+    return root_commit_moved and layer_rows_moved;
+}
+
+pub const LayerFrameRefusal = enum {
+    none,
+    /// Nothing reached back_tex: the paint is only owed a fresh one.
+    stale,
+    /// back_tex already moved (the root's scroll copy): repaint whole.
+    failed,
+};
+
+pub fn classifyLayerFrameRefusal(stale: bool, back_tex_touched: bool) LayerFrameRefusal {
+    if (!stale) return .none;
+    return if (back_tex_touched) .failed else .stale;
+}
+
+/// Where one non-root layer sits for its present damage, in client pixels.
+pub const LayerPresentGeom = struct {
+    left_px: i32,
+    top_px: i32,
+    width_px: i32,
+    row_h_px: i32,
+    /// The layout's row count: the extent of a whole-layer rect.
+    rows: u32,
+    /// Rows the layer draw visits (stored rows within the layout).
+    row_limit: usize,
+    clip_right: i32,
+    clip_bottom: i32,
+};
+
+/// Append the present damage of the rows a layer's plan draws: the whole
+/// layer for `draw_all`, else one rect per run of `draw_rows` and
+/// `cursor_rows`, plus the GPU copy's rect. Every rect is clipped to the
+/// client; empty ones are dropped.
+pub fn appendLayerDrawRects(
+    comptime Rect: type,
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(Rect),
+    geom: LayerPresentGeom,
+    draw_all: bool,
+    draw_rows: *const std.DynamicBitSetUnmanaged,
+    cursor_rows: [2]?u32,
+    blit: ?BlitRectPx,
+) error{OutOfMemory}!void {
+    const l: i32 = @max(0, geom.left_px);
+    const right: i32 = @min(geom.clip_right, l + geom.width_px);
+    if (draw_all) {
+        const t: i32 = @max(0, geom.top_px);
+        const b: i32 = @min(geom.clip_bottom, t + @as(i32, @intCast(geom.rows)) * geom.row_h_px);
+        try appendClipped(Rect, alloc, out, .{ .left = l, .top = t, .right = right, .bottom = b });
+        return;
+    }
+    var run_start: ?usize = null;
+    var r: usize = 0;
+    while (r <= geom.row_limit) : (r += 1) {
+        const marked = r < geom.row_limit and
+            ((r < draw_rows.bit_length and draw_rows.isSet(r)) or
+                std.mem.indexOfScalar(?u32, &cursor_rows, @intCast(r)) != null);
+        if (marked) {
+            if (run_start == null) run_start = r;
+            continue;
+        }
+        const s = run_start orelse continue;
+        run_start = null;
+        const band_top = geom.top_px + @as(i32, @intCast(s)) * geom.row_h_px;
+        const band_bottom = geom.top_px + @as(i32, @intCast(r)) * geom.row_h_px;
+        try appendClipped(Rect, alloc, out, .{
+            .left = l,
+            .top = @max(0, band_top),
+            .right = right,
+            .bottom = @min(geom.clip_bottom, band_bottom),
+        });
+    }
+    if (blit) |br| try appendClipped(Rect, alloc, out, .{
+        .left = @max(0, br.left),
+        .top = @max(0, br.top),
+        .right = @min(geom.clip_right, br.right),
+        .bottom = @min(geom.clip_bottom, br.bottom),
+    });
+}
+
+fn appendClipped(comptime Rect: type, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(Rect), rc: Rect) error{OutOfMemory}!void {
+    if (rc.right <= rc.left or rc.bottom <= rc.top) return;
+    try out.append(alloc, rc);
+}
+
+/// The scissor of the cursor overlay's row: the cursor's row across its own
+/// layer, or across the content when the cursor is on the root
+/// (`layer_w_px` null). The blink-off erase clears the whole scissor, so a
+/// wider one wipes a vertical-split neighbour's row.
+pub fn cursorRowScissor(
+    comptime Rect: type,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    layer_x_px: i32,
+    layer_y_px: i32,
+    layer_w_px: ?i32,
+    row: u32,
+    row_h_px: i32,
+) Rect {
+    const top = y_offset + layer_y_px + @as(i32, @intCast(row)) * row_h_px;
+    const w = layer_w_px orelse return .{ .left = x_offset, .top = top, .right = content_right, .bottom = top + row_h_px };
+    return .{
+        .left = @max(x_offset, x_offset + layer_x_px),
+        .top = top,
+        .right = @min(content_right, x_offset + layer_x_px + w),
+        .bottom = top + row_h_px,
+    };
+}
+
 /// The grid whose Neovim window a move INTO the main window lands on: the
 /// top-left split the main window still shows. Grid 2 is only that window
 /// until it is externalized. Same rule as macOS `mainWindowTargetWinId`.

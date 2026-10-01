@@ -57,6 +57,12 @@ final class SharedRenderResources {
     /// call sites carried comments saying so.
     private let metricsLock = NSLock()
 
+    /// End of the last commit guard band any surface ran
+    /// (`GridSurfaceRenderer.waitCommitGuardBand`), so surfaces drawing on the
+    /// same vsync share one wait instead of each spending their own. Main
+    /// thread only (every surface draws there).
+    var commitGuardBandLastEndNs: UInt64 = 0
+
     func setLineSpace(px: Int32) {
         metricsLock.lock()
         linespacePx = px

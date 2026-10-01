@@ -4,6 +4,11 @@ on: [push, pull_request]
 
 env:
   ZIG_VERSION: "0.16.0"
+  # One pinned Neovim release for the e2e and GUI jobs, so an upstream
+  # release cannot change test results between runs. Stock Neovim: the
+  # ext_windows attach option (unmerged upstream PR) is not available, and
+  # no CI scenario enables it; external floats use ext_multigrid.
+  NVIM_VERSION: "v0.12.5"
 
 jobs:
   # The e2e runner skips every scenario when it finds no nvim;
@@ -13,7 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Neovim
-        run: brew install neovim
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-macos-arm64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" --version
+          echo "$RUNNER_TEMP/nvim-macos-arm64/bin" >> "$GITHUB_PATH"
+          echo "ZONVIE_TEST_NVIM=$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" >> "$GITHUB_ENV"
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -128,9 +138,9 @@ jobs:
 
   # The GUI driver launches the real Windows app against a headless nvim and
   # observes its windows (EnumWindows, synthesized input, DIB capture).
-  # Goldens are gitignored, so the visual scenarios create them and pass;
-  # those that compare captures within one run, and the behavioural ones,
-  # assert. ZONVIE_GUI_REQUIRE turns a missing nvim or app into a failure
+  # Goldens are not committed: with CI set, a golden-only visual check
+  # reports SKIP (visual.assertMatch), so green never rests on one. Those
+  # that compare captures within one run, and the behavioural ones, assert. ZONVIE_GUI_REQUIRE turns a missing nvim or app into a failure
   # instead of a skip.
   gui-tests-windows:
     runs-on: windows-latest
@@ -140,7 +150,7 @@ jobs:
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "nvim-win64.zip"
-          Invoke-WebRequest "https://github.com/neovim/neovim/releases/latest/download/nvim-win64.zip" -OutFile $zip
+          Invoke-WebRequest "https://github.com/neovim/neovim/releases/download/$env:NVIM_VERSION/nvim-win64.zip" -OutFile $zip
           Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
           $nvim = Join-Path $env:RUNNER_TEMP "nvim-win64\bin\nvim.exe"
           & $nvim --version
@@ -169,8 +179,8 @@ jobs:
           retention-days: 7
 
   # The same driver on macOS: CGWindowList, CGEvent input, window capture.
-  # Goldens are gitignored, so as on Windows the visual scenarios create them
-  # and pass; those that compare captures within one run still assert.
+  # As on Windows, golden-only visual checks SKIP on CI (no committed
+  # goldens); those that compare captures within one run still assert.
   # Scenarios that need Accessibility skip themselves when the runner does
   # not grant it.
   gui-tests-macos:
@@ -185,7 +195,7 @@ jobs:
         run: brew install freetype harfbuzz pkgconf
       - name: Install Neovim
         run: |
-          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" https://github.com/neovim/neovim/releases/latest/download/nvim-macos-arm64.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-macos-arm64.tar.gz"
           tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
           "$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" --version
           echo "ZONVIE_TEST_NVIM=$RUNNER_TEMP/nvim-macos-arm64/bin/nvim" >> "$GITHUB_ENV"

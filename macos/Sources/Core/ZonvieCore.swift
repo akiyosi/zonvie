@@ -1068,8 +1068,6 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onMsgStatus(.ruler, label: "ruler", view: view, chunks: chunks, chunkCount: chunkCount)
             },
-            // The core never invokes it (see zonvie_core.h).
-            on_msg_history_show: nil,
             // Clipboard callbacks
             on_clipboard_get: { ctx, register, outBuf, outLen, maxLen in
                 guard let ctx, let outBuf, let outLen else { return 0 }

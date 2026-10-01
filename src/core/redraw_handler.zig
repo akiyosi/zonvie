@@ -1706,6 +1706,11 @@ pub fn handleRedraw(
                     if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
                         grid.composited_win_closed = true;
                     }
+                    // Neovim never reuses a window handle; hideWin forgets
+                    // which one this grid showed.
+                    if (is_close) {
+                        if (grid.grid_win_ids.get(grid_id)) |win_id| _ = grid.float_follows.remove(win_id);
+                    }
                     try grid.hideWin(grid_id);
                     // On permanent close, remove from ext_windows tracking.
                     // On hide (tab switch), keep tracking so win_pos can restore.
@@ -1795,7 +1800,16 @@ pub fn handleRedraw(
                     // Extract anchor_grid (always at t[3] when present)
                     const anchor_grid = checkedGridId(if (t[3] == .int) t[3].int else 1) orelse continue;
 
-                    if (screen_row_i >= 0 and screen_col_i >= 0) {
+                    // Neovim's screen_row/col is the anchor grid's comp_row plus
+                    // the offset, clamped to the main grid (window.c
+                    // win_float_pos). An external window is never composited,
+                    // so for a float it hosts that number is stale: such a
+                    // float is placed from its anchor instead, in that
+                    // window's own cells.
+                    const placing_surface = grid.surfaceForGrid(anchor_grid);
+                    const on_external_surface = placing_surface != null and placing_surface.? != 1;
+
+                    if (screen_row_i >= 0 and screen_col_i >= 0 and !on_external_surface) {
                         // Let nvim take care of positioning.
                         row_i64 = screen_row_i;
                         col_i64 = screen_col_i;
@@ -1831,15 +1845,12 @@ pub fn handleRedraw(
                         var base_row: i64 = 0;
                         var base_col: i64 = 0;
 
+                        // The anchor's position in the surface that places it;
+                        // an external root is that surface's origin.
                         if (anchor_grid != 1) {
                             if (grid.win_pos.get(anchor_grid)) |p| {
                                 base_row = @as(i64, p.row);
                                 base_col = @as(i64, p.col);
-                            } else if (grid.external_grids.get(anchor_grid)) |ext| {
-                                // anchor_grid is an external window: its origin,
-                                // the one Grid.surfacePlacement takes back out.
-                                base_row = grid_mod.externalCompositeOriginRow(ext);
-                                base_col = grid_mod.externalCompositeOriginCol(ext);
                             }
                         }
 
@@ -1876,6 +1887,14 @@ pub fn handleRedraw(
                             }
                             if (std.mem.indexOfScalar(u8, anchor, 'E') != null) {
                                 col_i64 = std.math.sub(i64, col_i64, wincols_main) catch std.math.minInt(i64);
+                            }
+                            // Neovim's own clamp, against the surface that
+                            // shows the float rather than the main grid.
+                            if (on_external_surface) {
+                                if (grid.sub_grids.get(placing_surface.?)) |root| {
+                                    row_i64 = @min(row_i64, @as(i64, root.rows) - winrows_main);
+                                    col_i64 = @min(col_i64, @as(i64, root.cols) - wincols_main);
+                                }
                             }
                         }
                     }
@@ -3613,4 +3632,57 @@ test "mode_change keeps a showmode the same batch sent, and clears a stale one o
         try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "normal"));
         try std.testing.expectEqual(@as(usize, 0), slot.items.len);
     }
+}
+
+test "a float anchored in an external window taller than the main grid is placed from its anchor" {
+    // Neovim clamps screen_row against the main grid (window.c
+    // win_float_pos); an external window is not composited, so that number
+    // is wrong for a float it hosts near its bottom edge.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 40);
+    try grid.resizeGrid(2, 30, 40);
+    _ = try grid.setWinExternalPos(2, 1002);
+    try grid.resizeGrid(3, 3, 10);
+
+    const place = struct {
+        fn run(g: *Grid, h: *Highlights, a: std.mem.Allocator, anchor: []const u8, row: i64, col: i64, screen_row: i64) !void {
+            const t = try a.alloc(mp.Value, 11);
+            t[0] = .{ .int = 3 };
+            t[1] = .{ .int = 1003 };
+            t[2] = .{ .str = anchor };
+            t[3] = .{ .int = 2 };
+            t[4] = .{ .int = row };
+            t[5] = .{ .int = col };
+            t[6] = .{ .bool = true };
+            t[7] = .{ .int = 50 };
+            t[8] = .{ .int = 1 };
+            t[9] = .{ .int = screen_row };
+            t[10] = .{ .int = col };
+            try runRedrawEvents(g, h, a, try testEvent(a, "win_float_pos", t));
+        }
+    }.run;
+
+    // Neovim reports screen_row 7: clamped to the 10-row main grid.
+    try place(&grid, &hl, arena, "NW", 25, 5, 7);
+    var p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 2), p.surface);
+    try std.testing.expectEqual(@as(i64, 25), p.row);
+    try std.testing.expectEqual(@as(i64, 5), p.col);
+
+    // Past the window's bottom: clamped to the window, as Neovim clamps to
+    // the main grid.
+    try place(&grid, &hl, arena, "NW", 29, 5, 7);
+    p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 27), p.row);
+
+    // A south anchor hangs above its anchor row.
+    try place(&grid, &hl, arena, "SW", 20, 5, 7);
+    p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 17), p.row);
 }

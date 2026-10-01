@@ -1092,9 +1092,10 @@ func encodeSurfaceRowDraws<C: Collection>(
 // MARK: - SurfaceBufferSet (shared row-buffer state)
 
 /// One grid's triple-buffered vertex storage, looked up by grid id so a
-/// surface can draw several grids as ordered layers. A grid's buffers are
-/// independent of which surface currently draws it, so a grid moving between
-/// the main window and an external window keeps its rows. The core thread
+/// surface can draw several grids as ordered layers. Each surface owns its own
+/// registry, so rows are NOT retained when a grid moves between the main
+/// window and an external window. `carryLayerRows` only shares row references
+/// between this registry's own sets. The core thread
 /// inserts (a new grid's first row) and releases (grid destroy) while the draw
 /// thread reads, so the dictionary carries its own lock: a Swift Dictionary
 /// rehashing under a concurrent read is a crash, not a stale value.
@@ -2720,7 +2721,7 @@ func ensureSurfaceRowBuffer(
         //   in-flight at any moment between this check and the caller's
         //   memcpy (check-then-write race).
         // - inflightRowBuffers covers OLDER sets the GPU is still reading
-        //   (up to two with ExternalGridView's semaphore=2): the COW chain
+        //   (one per surface, whose in-flight semaphore is 1): the COW chain
         //   can leave the same buffer object shared into a set that is
         //   in-flight while src already holds a detached replacement, so
         //   comparing against src alone misses it (torn row mid-scroll).

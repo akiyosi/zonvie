@@ -396,6 +396,8 @@ pub fn build(b: *std.Build) !void {
     // Core inline tests (c_api.zig and its relative imports, including the
     // redraw/flush/atlas transaction tests). Test files that import the core
     // as a separate module do not execute the dependency module's own tests.
+    // For abi_header_test.zig's @cImport; only test builds reference it.
+    core_mod.addIncludePath(b.path("include"));
     const core_tests = b.addTest(.{
         .root_module = core_mod,
         .filters = test_filters,

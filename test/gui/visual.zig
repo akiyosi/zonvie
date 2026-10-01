@@ -7,7 +7,8 @@
 // unusable — see the AI-testing research report):
 //   - Per-OS goldens under test/gui/golden/<os>/ (subpixel-AA vs ClearType
 //     means cross-OS comparison is meaningless).
-//   - Missing golden => write it and PASS (baseline established).
+//   - Missing golden => write it and PASS (baseline established), except
+//     when CI is set: then SKIP (error.SkipZigTest), since nothing compared.
 //   - ZONVIE_GUI_UPDATE_GOLDEN non-empty and not "0" => overwrite the
 //     golden and PASS (see updateRequested).
 //   - Otherwise compare with a small per-channel tolerance and a max
@@ -53,6 +54,16 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
         std.Io.Dir.cwd().access(gui_io.io(), golden, .{}) catch break :blk false;
         break :blk true;
     };
+
+    // Goldens are not committed, so on CI a missing one would be "created"
+    // and pass while comparing nothing. Report it as a skip instead.
+    if (!update and !exists and inCi(alloc)) {
+        std.debug.print(
+            "[gui] SKIP visual {s}: no golden at {s} on CI (goldens are not committed); nothing compared\n",
+            .{ name, golden },
+        );
+        return error.SkipZigTest;
+    }
 
     if (update or !exists) {
         try capture.writeImage(alloc, golden, captured);
@@ -192,6 +203,13 @@ fn pixelDiffers(ref: capture.Image, captured: capture.Image, o: usize, tol: u8) 
 /// to a non-empty, non-"0" value. Checking the VALUE (not mere existence)
 /// avoids a common footgun: an empty/leftover var silently forcing every
 /// run into update mode so comparisons never happen.
+/// GitHub Actions sets CI=true on every runner.
+fn inCi(alloc: std.mem.Allocator) bool {
+    const v = std.process.Environ.getAlloc(std.testing.environ, alloc, "CI") catch return false;
+    defer alloc.free(v);
+    return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+}
+
 fn updateRequested(alloc: std.mem.Allocator) bool {
     const v = std.process.Environ.getAlloc(std.testing.environ, alloc, "ZONVIE_GUI_UPDATE_GOLDEN") catch return false;
     defer alloc.free(v);
