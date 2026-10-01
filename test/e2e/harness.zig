@@ -50,6 +50,16 @@ pub const RowScrollRecord = struct {
 /// the tally lives in a fixed table rather than a growing list.
 const max_row_scroll_grids = 16;
 
+/// One surface's last published layer list. A scenario's layouts hold a few
+/// windows, so the lists are fixed tables too; a longer one keeps its head.
+pub const LayoutRecord = struct {
+    surface_id: i64 = 0,
+    count: usize = 0,
+    layers: [max_layout_layers]zc.Layer = undefined,
+};
+const max_layout_surfaces = 8;
+const max_layout_layers = 32;
+
 /// One recorded on_msg_show callback. `view` is the routed view type; the
 /// core has already decided it, so scenarios assert on routing outcomes
 /// without reimplementing the route table.
@@ -161,6 +171,13 @@ pub const Harness = struct {
     row_scrolls: [max_row_scroll_grids]RowScrollRecord = [_]RowScrollRecord{.{}} ** max_row_scroll_grids,
     row_scroll_count: usize = 0,
 
+    // on_surface_layout recording: the last layer list each surface was told.
+    // Placement is what a frontend repaints a moved layer from, so this is the
+    // oracle for "the move reached the frontend".
+    layout_mu: std.Io.Mutex = .init,
+    layouts: [max_layout_surfaces]LayoutRecord = [_]LayoutRecord{.{}} ** max_layout_surfaces,
+    layout_count: usize = 0,
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -199,6 +216,7 @@ pub const Harness = struct {
             .on_agent_status = onAgentStatus,
             .on_grid_scroll = onGridScroll,
             .on_grid_row_scroll = onGridRowScroll,
+            .on_surface_layout = onSurfaceLayout,
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
@@ -289,6 +307,31 @@ pub const Harness = struct {
     /// flush bracket (flush.zig dispatches it before vertex generation), so it
     /// is observable with no vertex callbacks installed. Guarded by its own
     /// mutex; grid_mu is already held here and must not be taken.
+    fn onSurfaceLayout(
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const zc.Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void {
+        _ = surface_rows;
+        _ = surface_cols;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.layout_mu.lockUncancelable(zc.clock.io());
+        defer h.layout_mu.unlock(zc.clock.io());
+        const rec = for (h.layouts[0..h.layout_count]) |*r| {
+            if (r.surface_id == surface_id) break r;
+        } else blk: {
+            if (h.layout_count == max_layout_surfaces) return;
+            h.layout_count += 1;
+            break :blk &h.layouts[h.layout_count - 1];
+        };
+        rec.surface_id = surface_id;
+        rec.count = @min(count, max_layout_layers);
+        @memcpy(rec.layers[0..rec.count], layers[0..rec.count]);
+    }
+
     fn onGridRowScroll(
         ctx: ?*anyopaque,
         grid_id: i64,
@@ -635,6 +678,22 @@ pub const Harness = struct {
         h.row_scroll_mu.lockUncancelable(zc.clock.io());
         defer h.row_scroll_mu.unlock(zc.clock.io());
         h.row_scroll_count = 0;
+    }
+
+    // ── Layout readback ────────────────────────────────────────────────
+
+    /// Where the last layout published for `surface_id` placed `grid_id`, in
+    /// surface pixels; null when it did not place it.
+    pub fn layoutPlacement(h: *Harness, surface_id: i64, grid_id: i64) ?struct { x_px: i32, y_px: i32 } {
+        h.layout_mu.lockUncancelable(zc.clock.io());
+        defer h.layout_mu.unlock(zc.clock.io());
+        for (h.layouts[0..h.layout_count]) |*rec| {
+            if (rec.surface_id != surface_id) continue;
+            for (rec.layers[0..rec.count]) |l| {
+                if (l.grid_id == grid_id) return .{ .x_px = l.x_px, .y_px = l.y_px };
+            }
+        }
+        return null;
     }
 
     // ── Dirty-row readback ─────────────────────────────────────────────

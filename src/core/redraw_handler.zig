@@ -1384,8 +1384,6 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
-    const redraw_epoch = grid.redraw_epoch_override orelse grid.beginRedrawBatch();
-
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
     // grid_line / flush_start lines already mark dispatch latency; this gives
@@ -2345,7 +2343,7 @@ pub fn handleRedraw(
                     var col = checkedU32(t[2].int) orelse continue;
 
                     // Update order (existing behavior)
-                    grid.noteGridLine(grid_id, redraw_epoch);
+                    grid.noteGridLine(grid_id);
 
                     const cells = t[3].arr;
 

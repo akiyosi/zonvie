@@ -14823,7 +14823,7 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     try core.grid.resizeGrid(3, 4, 8);
     try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 99, true);
     core.grid.main_buf.clearDirty();
-    core.grid.noteGridLine(3, 1);
+    core.grid.noteGridLine(3);
     try std.testing.expect(!core.grid.main_buf.dirty);
 
     // Registration is allowed to precede grid_resize. Child rows must not
@@ -14840,7 +14840,7 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     try core.grid.resizeGrid(4, 2, 4);
     try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3, true);
     core.grid.sub_grids.getPtr(3).?.clearDirty();
-    core.grid.noteGridLine(4, 2);
+    core.grid.noteGridLine(4);
     try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
 }
 
@@ -15099,7 +15099,7 @@ test "a line in a main-surface split does not run grid 1's pass" {
     try flush_ctx.onFlush(10, 40);
     state = .{};
 
-    core.grid.noteGridLine(2, 7);
+    core.grid.noteGridLine(2);
     core.grid.putCellGrid(2, 3, 0, 'x', 0);
     try flush_ctx.onFlush(10, 40);
 
