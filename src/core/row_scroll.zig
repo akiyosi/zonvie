@@ -18,7 +18,7 @@
 
 const std = @import("std");
 
-/// Layout must match `zonvie_row_scroll_plan` in include/zonvie_core.h.
+/// Layout must match `zonvie_row_scroll_plan` in include/zonvie_frontend.h.
 pub const Plan = extern struct {
     /// The scrolled rectangle's left edge, which the encoder copies at.
     origin_x_px: i32,
@@ -235,26 +235,6 @@ pub fn overBlitRows(
     const shifted_last = @min(region_last, under_last - @as(i64, rows_delta));
     if (shifted_last >= shifted_first) out.shifted = .{ @intCast(shifted_first), @intCast(shifted_last) };
     return out;
-}
-
-/// Which of a layer's own rows a full-width damage band overpaints. The band
-/// spans the whole surface width, so there is no X test; a layer need not be
-/// cell-aligned, so one root row can straddle two of its rows. Inclusive.
-pub fn bandLayerRows(
-    band_top_px: i32,
-    band_bottom_px: i32,
-    origin_y_px: i32,
-    layer_rows: u32,
-    row_h_px: i32,
-) ?[2]u32 {
-    if (row_h_px <= 0 or layer_rows == 0) return null;
-    const h: i64 = row_h_px;
-    const oy: i64 = origin_y_px;
-    if (@as(i64, band_bottom_px) <= oy) return null;
-    const first = @max(0, @divTrunc(@as(i64, band_top_px) - oy, h));
-    const last = @min(@as(i64, layer_rows) - 1, @divTrunc(@as(i64, band_bottom_px) - 1 - oy, h));
-    if (last < first) return null;
-    return .{ @intCast(first), @intCast(last) };
 }
 
 /// A row scroll staged for one grid, waiting for the flush that will spend it.
@@ -579,40 +559,6 @@ test "every over-blit range stays inside the layer it names" {
             if (over.shifted) |s| {
                 try testing.expect(s[0] <= s[1]);
                 try testing.expect(s[1] <= region_last);
-            }
-        }
-    }
-}
-
-test "a root dirty band marks the layer rows it overpaints" {
-    // Cell-aligned: one root row lands on exactly one layer row.
-    try testing.expectEqual([2]u32{ 5, 5 }, bandLayerRows(200, 220, 100, 10, 20).?);
-    // Off the cell grid: the same band straddles two.
-    try testing.expectEqual([2]u32{ 4, 5 }, bandLayerRows(200, 220, 110, 10, 20).?);
-    // Overlapping the layer's top edge from above.
-    try testing.expectEqual([2]u32{ 0, 0 }, bandLayerRows(90, 110, 100, 10, 20).?);
-    // Entirely above the layer.
-    try testing.expect(bandLayerRows(0, 20, 100, 10, 20) == null);
-    // Entirely below it.
-    try testing.expect(bandLayerRows(400, 420, 100, 2, 20) == null);
-    // Degenerate geometry.
-    try testing.expect(bandLayerRows(200, 220, 100, 0, 20) == null);
-    try testing.expect(bandLayerRows(200, 220, 100, 10, 0) == null);
-}
-
-test "a band never names a row outside the layer it covers" {
-    var top: i32 = -60;
-    while (top <= 400) : (top += 7) {
-        var height: i32 = 1;
-        while (height <= 90) : (height += 11) {
-            var rows: u32 = 1;
-            while (rows <= 8) : (rows += 1) {
-                const r = bandLayerRows(top, top + height, 100, rows, 20) orelse continue;
-                try testing.expect(r[0] <= r[1]);
-                try testing.expect(r[1] < rows);
-                // The band really does reach the first row it names.
-                const first_row_bottom = 100 + (@as(i32, @intCast(r[0])) + 1) * 20;
-                try testing.expect(top < first_row_bottom);
             }
         }
     }

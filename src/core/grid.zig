@@ -1275,9 +1275,6 @@ pub const WinLayer = struct {
     // Tie-breaker when zindex/compindex are equal.
     // Larger order means "draw later" (= front).
     order: u64 = 0,
-    // Coverage invalidation is needed once per top-level redraw notification,
-    // while order above still advances for every grid_line tuple.
-    coverage_dirty_epoch: u64 = 0,
 };
 
 /// Viewport margins from win_viewport_margins event.
@@ -1323,8 +1320,6 @@ pub const Grid = struct {
     // resize, and row replacement update this incrementally so flush begin
     // never rescans every external grid after a layout change.
     subgrid_surface_vertex_count: usize = 0,
-    redraw_epoch: u64 = 1,
-    redraw_epoch_override: ?u64 = null,
     // Monotonic revision of the visible glyph working set across every
     // surface, external-only grids included. It is
     // used only to retry atlas-capacity negative entries after content or
@@ -1491,16 +1486,6 @@ pub const Grid = struct {
         return .{ .alloc = alloc };
     }
 
-    pub fn beginRedrawBatch(self: *Grid) u64 {
-        self.redraw_epoch +%= 1;
-        if (self.redraw_epoch == 0) {
-            self.redraw_epoch = 1;
-            var layer_it = self.win_layer.valueIterator();
-            while (layer_it.next()) |layer| layer.coverage_dirty_epoch = 0;
-        }
-        return self.redraw_epoch;
-    }
-
     fn invalidateSubgridVertexSurface(self: *Grid, grid_id: i64) void {
         const sg = self.sub_grids.getPtr(grid_id) orelse return;
         self.subgrid_surface_vertex_count -|= sg.surface_vertex_count;
@@ -1644,8 +1629,6 @@ pub const Grid = struct {
         self.clearAllOverflow();
         self.layer_order_counter = 0;
         self.subgrid_surface_vertex_count = 0;
-        self.redraw_epoch = 1;
-        self.redraw_epoch_override = null;
         self.composited_win_closed = false;
 
         // Cursor: a stale `cursor_grid` pointing at a now-deleted sub_grid
@@ -2094,7 +2077,6 @@ pub const Grid = struct {
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
-            const old_rows = sg.rows;
             const shape_changed = sg.rows != rows or sg.cols != cols;
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
@@ -2105,11 +2087,11 @@ pub const Grid = struct {
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
 
-            // The band the layer covered, at its larger extent. A resize to or
-            // from a zero dimension also changes whether the grid counts as a
-            // layer, and with it every root row's `skip_default_bg`; the flush
-            // regenerates those (regenerateRootsWhoseDefaultBgRuleFlipped).
-            if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, @max(old_rows, rows));
+            // The pixels the resize exposes are the frontend's, from the
+            // layout it publishes. A resize to or from a zero dimension also
+            // changes whether the grid counts as a layer, and with it every
+            // root row's `skip_default_bg`; the flush regenerates those
+            // (regenerateRootsWhoseDefaultBgRuleFlipped).
             if (shape_changed and self.external_grids.contains(grid_id)) self.reresolveAnchoredFloats(grid_id);
             return;
         }
@@ -2128,10 +2110,9 @@ pub const Grid = struct {
         self.total_grid_cells = new_total;
         if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
         self.trimOverflowForGrid(grid_id, rows, cols);
-        // The layer's band. A grid appearing as grid 1's FIRST layer also
-        // flips `skip_default_bg` for every root row; the flush regenerates
-        // those (regenerateRootsWhoseDefaultBgRuleFlipped).
-        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, rows);
+        // A grid appearing as grid 1's FIRST layer flips `skip_default_bg`
+        // for every root row; the flush regenerates those
+        // (regenerateRootsWhoseDefaultBgRuleFlipped).
     }
 
     pub fn clearGrid(self: *Grid, grid_id: i64) void {
@@ -2236,12 +2217,8 @@ pub const Grid = struct {
             const a = p.anchor orelse continue;
             if (self.surfaceForGrid(p.anchor_grid) != surface_grid) continue;
             const at = self.resolveAnchoredFloat(e.key_ptr.*, p.anchor_grid, a) orelse continue;
-            if (at.row == p.row and at.col == p.col) continue;
-            const h = self.layerRows(e.key_ptr.*);
-            self.dirtyLayerBand(p.*, h);
             p.row = at.row;
             p.col = at.col;
-            self.dirtyLayerBand(p.*, h);
         }
     }
 
@@ -2576,22 +2553,15 @@ pub const Grid = struct {
         }
     }
 
-    pub fn noteGridLine(self: *Grid, grid_id: i64, redraw_epoch: u64) void {
+    pub fn noteGridLine(self: *Grid, grid_id: i64) void {
         if (grid_id == 1) return;
 
         if (self.win_layer.getPtr(grid_id)) |layer| {
             self.layer_order_counter +%= 1;
             layer.order = self.layer_order_counter;
             self.glyph_working_set_rev +%= 1;
-
-            if (layer.coverage_dirty_epoch == redraw_epoch) return;
-            layer.coverage_dirty_epoch = redraw_epoch;
-
-            // Changing the tie-break order can change overlap results across
-            // the float's entire coverage, not only the grid_line row that
-            // triggered this update. Recompose every covered row in the
-            // actual target surface (main or an external anchor).
-            if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, self.layerRows(grid_id));
+            // A tie-break order that changes the paint order changes the
+            // published layout, and the frontend repaints what that exposes.
         }
     }
 
@@ -2621,10 +2591,6 @@ pub const Grid = struct {
         const was_external = self.external_grids.contains(grid_id);
         const was_visible = self.win_pos.contains(grid_id) or was_external;
 
-        // Capture before removal below: needed to dirty the right target
-        // (main grid vs. an external anchor) once grid_id's own state is gone.
-        const old_pos = self.win_pos.get(grid_id);
-        const old_rows = self.layerRows(grid_id);
         // Neovim never reuses a window handle.
         if (self.grid_win_ids.get(grid_id)) |win_id| _ = self.float_follows.remove(win_id);
 
@@ -2651,14 +2617,10 @@ pub const Grid = struct {
         _ = self.pending_ext_window_grids.remove(grid_id);
         _ = self.ext_windows_grids.remove(grid_id);
 
-        // Repaint only the band this layer covered, on the surface that
-        // composited it. The last layer going away also flips every root
+        // The pixels the layer covered are the frontend's to repaint, from the
+        // layout it publishes. The last layer going away also flips every root
         // row's `skip_default_bg`; the flush regenerates those
-        // (regenerateRootsWhoseDefaultBgRuleFlipped). A grid with no
-        // placement owes nothing: a hidden one had its band dirtied by
-        // hideWin, and an external one is its own surface, whose window's
-        // teardown releases it.
-        if (old_pos) |p| self.dirtyLayerBand(p, old_rows);
+        // (regenerateRootsWhoseDefaultBgRuleFlipped).
 
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
@@ -2719,21 +2681,13 @@ pub const Grid = struct {
             if (old_pos.row == row and old_pos.col == col and !was_float) return;
         }
 
-        // First dirty the old range (position changed, so exposed area needs
-        // recomposition) -- on the surface it was on: a float leaving an
-        // external window left its pixels there, not on grid 1.
-        const h = self.layerRows(grid_id);
-        if (old_pos_opt) |old_pos| self.dirtyLayerBand(old_pos, h);
-
+        // The pixels the move exposes and covers are the frontend's to
+        // repaint, from the layout it publishes.
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
-
-        // Dirty the new range. A win_pos places on grid 1 (anchor_grid
-        // defaults to it) unless anchored elsewhere.
-        self.dirtyLayerBand(new_pos, h);
         self.glyph_working_set_rev +%= 1;
 
         // Only advance cursor_rev if cursor is on this grid
@@ -2861,27 +2815,20 @@ pub const Grid = struct {
         // may pixel-follow smooth scroll. A truly fixed float never changes row
         // and so must not pixel-shift. Only set on an actual reposition (old_pos
         // exists), never on the initial placement.
-        // Dirty the old coverage and the new one, each on the surface that
-        // composites it. A move/hide-then-show with no cell change would
-        // otherwise leave the vacated area stale -- on an external window
-        // forever, since only cell updates dirty the anchor there.
-        const h = self.layerRows(grid_id);
-        if (self.win_pos.get(grid_id)) |old_pos| self.dirtyLayerBand(old_pos, h);
-
+        // The old coverage and the new one are the frontend's to repaint, from
+        // the layout it publishes.
         const new_pos = prospective_pos;
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
-        self.dirtyLayerBand(new_pos, h);
 
         // Preserve existing order if present.
         const new_layer = WinLayer{
             .zindex = zindex,
             .compindex = compindex,
             .order = if (old_layer_before) |old| old.order else 0,
-            .coverage_dirty_epoch = if (old_layer_before) |old| old.coverage_dirty_epoch else 0,
         };
         if (win_layer_is_new) {
             self.win_layer.putAssumeCapacityNoClobber(grid_id, new_layer);
@@ -2902,10 +2849,8 @@ pub const Grid = struct {
         // main cursor until the next grid_cursor_goto.
         if (grid_id == 1) return;
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
-        // Mark the rows this grid was covering as dirty before removal,
-        // so they get recomposed with the underlying grid=1 content
-        // (e.g., window separators that were previously overlaid).
-        if (self.win_pos.get(grid_id)) |pos| self.dirtyLayerBand(pos, self.layerRows(grid_id));
+        // The rows this grid covered are the frontend's to repaint, from the
+        // layout it publishes.
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
@@ -2955,13 +2900,13 @@ pub const Grid = struct {
             win_ptr.* = win;
         }
 
-        // Save position and mark covered rows dirty before removal.
+        // Save position before removal. The rows it covered are the
+        // frontend's to repaint, from the layout it publishes.
         var start_row: i32 = -1;
         var start_col: i32 = -1;
         if (self.win_pos.get(grid_id)) |pos| {
             start_row = saturatingI32FromU32(pos.row);
             start_col = saturatingI32FromU32(pos.col);
-            self.dirtyLayerBand(pos, self.layerRows(grid_id));
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)
@@ -4067,7 +4012,10 @@ test "subgrid clear dirties every covered main row" {
     try std.testing.expect(!grid.main_buf.dirty_rows.isSet(5));
 }
 
-test "grid line coverage is dirtied once per redraw epoch while order advances" {
+test "a grid line advances the float's paint order and leaves the root rows alone" {
+    // A new paint order changes the published layout, and the frontend
+    // repaints what that exposes; regenerating the root rows under the float
+    // would only rebuild vertices that did not change.
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
 
@@ -4076,23 +4024,11 @@ test "grid line coverage is dirtied once per redraw epoch while order advances" 
     try grid.setWinFloatPos(2, 42, 2, 1, 10, 0, 1, true);
     grid.clearDirty();
 
-    const epoch = grid.beginRedrawBatch();
     const order_before = grid.win_layer.get(2).?.order;
-    grid.noteGridLine(2, epoch);
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
-    const first_order = grid.win_layer.get(2).?.order;
-    try std.testing.expect(first_order != order_before);
-
-    grid.clearDirty();
-    grid.noteGridLine(2, epoch);
+    grid.noteGridLine(2);
+    try std.testing.expect(grid.win_layer.get(2).?.order != order_before);
     try std.testing.expect(!grid.main_buf.dirty_rows.isSet(2));
     try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
-    try std.testing.expect(grid.win_layer.get(2).?.order != first_order);
-
-    grid.noteGridLine(2, grid.beginRedrawBatch());
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
 }
 
 test "viewport margin changes invalidate their vertex consumers" {
@@ -4908,17 +4844,19 @@ test "destroying an external grid owes the main viewport no repaint" {
     defer grid.deinit();
     try grid.resize(10, 8);
 
-    // A split the MAIN window places: its pixels were composited into the main
-    // viewport, so its removal still owes a repaint there — its band. (It was
-    // the last layer, which also flips every main row's skip_default_bg; the
-    // flush regenerates those, see regenerateRootsWhoseDefaultBgRuleFlipped.)
+    // A split the MAIN window places: the pixels its removal exposes are the
+    // frontend's, from the layout it publishes, so the root rows stay clean.
+    // (It was the last layer, which also flips every main row's
+    // skip_default_bg; the flush regenerates those, see
+    // regenerateRootsWhoseDefaultBgRuleFlipped.)
     try grid.resizeGrid(2, 4, 8);
     try grid.setWinPos(2, 101, 0, 0);
     grid.main_buf.dirty_all = false;
     if (grid.main_buf.dirty_rows.bit_length != 0) grid.main_buf.dirty_rows.unsetAll();
     try grid.destroyGrid(2);
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(0));
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(0));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
 
     // An external grid is its own surface and was never placed in the main
     // viewport, so closing it owes nothing there.
@@ -4930,7 +4868,7 @@ test "destroying an external grid owes the main viewport no repaint" {
     try std.testing.expect(!grid.main_buf.dirty_all);
 }
 
-test "a float in an external window turned split dirties that window's band, not grid 1" {
+test "a float in an external window turned split owes no root rows anywhere" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
     try grid.resize(20, 40);
@@ -4949,9 +4887,10 @@ test "a float in an external window turned split dirties that window's band, not
     // `:wincmd J` on the float: Neovim sends win_pos for it with no close.
     try grid.setWinPos(4, 44, 12, 0);
 
-    // The pixels it left are on window 3, rows 2..4.
-    try std.testing.expect(ext.isRowDirty(2));
-    try std.testing.expect(ext.isRowDirty(4));
+    // The pixels it left are on window 3, which repaints them from the
+    // layout it publishes; window 3's rows did not change.
+    try std.testing.expect(!ext.isRowDirty(2));
+    try std.testing.expect(!ext.isRowDirty(4));
     // Grid 1's rows 2..4 never held it.
     try std.testing.expect(!grid.main_buf.isRowDirty(2));
 }
@@ -4960,7 +4899,7 @@ test "typing in a main-surface split leaves the root rows alone" {
     // A split is its own layer and repaints its own band on both frontends;
     // grid 1 holds none of its cells. Dirtying the root row under every
     // changed cell regenerated that row, and every layer crossing it, on each
-    // keystroke. Shrink, clear and close still dirty the band themselves.
+    // keystroke. A clear still dirties the band itself.
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
     try grid.resize(20, 40);
@@ -5004,7 +4943,10 @@ test "typing or scrolling in a float an external window hosts leaves its root ro
     try std.testing.expect(grid.sub_grids.get(4).?.isRowDirty(1));
 }
 
-test "closing or resizing a main-surface layer repaints its band, not the viewport" {
+test "closing, resizing or placing a main-surface layer owes no root rows" {
+    // The pixels a layer's placement change exposes are the frontend's: it
+    // compares the layouts it publishes. Regenerating the root rows under the
+    // layer would rebuild vertices that did not change.
     const ROWS: u32 = 20;
     const COLS: u32 = 40;
     var grid = Grid.init(std.testing.allocator);
@@ -5031,36 +4973,26 @@ test "closing or resizing a main-surface layer repaints its band, not the viewpo
     try grid.resizeGrid(3, 5, COLS);
     try grid.setWinPos(3, 103, 10, 0);
 
-    // Resizing one repaints the band it covers at its larger extent, not the
-    // whole viewport.
     owed.settle(&grid);
     try grid.resizeGrid(2, 7, COLS);
-    try std.testing.expect(!grid.main_buf.dirty_all);
-    try std.testing.expectEqual(@as(u32, 7), owed.count(&grid));
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(9));
-    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(10));
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
 
-    // Closing one, with the other still there, repaints only its band.
-    owed.settle(&grid);
+    try grid.setWinPos(2, 102, 4, 0);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+
     try grid.destroyGrid(2);
-    try std.testing.expect(!grid.main_buf.dirty_all);
-    try std.testing.expectEqual(@as(u32, 7), owed.count(&grid));
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
 
     // Closing the LAST layer, and the first layer appearing again, flip every
-    // main row's skip_default_bg. The mutators still owe only their band; the
-    // whole-root regeneration is the flush's, for every surface alike (flush.zig
-    // tests "... regenerates every row when ...").
-    owed.settle(&grid);
+    // main row's skip_default_bg. That whole-root regeneration is the flush's,
+    // for every surface alike (flush.zig tests "... regenerates every row
+    // when ..."); the mutators owe nothing.
     try grid.destroyGrid(3);
-    try std.testing.expect(!grid.main_buf.dirty_all);
-    try std.testing.expectEqual(@as(u32, 5), owed.count(&grid));
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
 
-    owed.settle(&grid);
     try grid.resizeGrid(4, 5, COLS);
     try grid.setWinPos(4, 104, 2, 0);
-    try std.testing.expect(!grid.main_buf.dirty_all);
-    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
 }
 
 test "grid 1 and a sub-grid take the same cell-write path" {

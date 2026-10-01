@@ -4421,16 +4421,16 @@ func encodeSurfaceDrawableCopy(
 /// is why a row that already has content still gets a band. The external
 /// surface used to band only rows with no resolvable content and left its
 /// margin to whatever the previous frame had.
-func encodeSurfaceDirtyRowBands(
+func encodeSurfaceDirtyRowBands<C: Collection>(
     encoder: MTLRenderCommandEncoder,
-    rows: [Int],
+    rows: C,
     pipeline: MTLRenderPipelineState,
     cellHeightPx: Int,
     widthPx: Float,
     heightPx: Float,
     bgRGB: UInt32,
     gridId: Int64
-) {
+) where C.Element == Int {
     encoder.setRenderPipelineState(pipeline)
     for row in rows {
         let topPx = row * cellHeightPx
