@@ -1700,6 +1700,1312 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     if (log_enabled) applog.appLog("[win] WM_CREATE: early core init done, nvim spawn started rows={d} cols={d}\n", .{ app.surf.surface.rows, app.surf.surface.cols });
 }
 
+/// WM_PAINT for the main window.
+fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
+    app.surf.paint_retry_deadline_ms = 0;
+    app.surf.paint_retry.paintStarted();
+    // Reentrant relative to either: another WM_PAINT already
+    // rendering on this thread (g.lockContext() below is a
+    // non-recursive std.Io.Mutex), or the TIMER_CUSTOM_SHADER_ANIM
+    // handler's presentShaderAnimationFrame() mid-Present on the
+    // same D3D immediate context — either one's DXGI Present()
+    // can pump the Win32 message queue and deliver this WM_PAINT
+    // reentrantly on the same thread.
+    if (app.paintReentrancyBlocked()) {
+        app.consumeReentrantPaint(hwnd);
+        return;
+    }
+    // Also completes closes whose PostMessageW failed because the
+    // UI queue was full. Successful posts are harmlessly
+    // idempotent if this paint reaches the pending state first.
+    external_windows.closePendingExternalWindowsOnUIThread(app);
+    app.wm_paint_in_progress = true;
+    defer {
+        app.wm_paint_in_progress = false;
+        _ = app.finishActiveOperation();
+    }
+
+    var ps: c.PAINTSTRUCT = undefined;
+    const begin_hdc = c.BeginPaint(hwnd, &ps);
+    defer _ = c.EndPaint(hwnd, &ps);
+    if (log_enabled) {
+        applog.appLog(
+            "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
+            .{
+                @intFromBool(begin_hdc != null),
+                ps.rcPaint.left,
+                ps.rcPaint.top,
+                ps.rcPaint.right,
+                ps.rcPaint.bottom,
+                @intFromBool(ps.fErase != 0),
+                @intFromBool(app.wm_paint_reinvalidate_all),
+            },
+        );
+    }
+
+    // While minimized, GetClientRect returns the iconic size
+    // (e.g. 160x28); letting drawEx → resize run would shrink
+    // swapchain/back_tex to that size and discard their contents,
+    // so the next restore would Present an empty surface as a
+    // gray rectangle. BeginPaint/EndPaint above still consumes
+    // the paint region so Windows stops re-issuing WM_PAINT.
+    if (c.IsIconic(hwnd) != 0) {
+        return;
+    }
+
+    // Log first paint with content timing (startup performance)
+    if (!app.first_paint_logged and app.renderer != null) {
+        if (log_enabled) {
+            var first_paint_t: c.LARGE_INTEGER = undefined;
+            _ = c.QueryPerformanceCounter(&first_paint_t);
+            const first_paint_ms = @divTrunc((first_paint_t.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+            applog.appLog("[TIMING] First WM_PAINT (renderer ready): {d}ms from main()\n", .{first_paint_ms});
+        }
+        app.first_paint_logged = true;
+    }
+
+    // Renderer not yet initialized (deferred init pending). Fill
+    // the paint rect with the colorscheme bg if Neovim has
+    // already pushed default_colors_set; otherwise fall back to
+    // black to match the legacy behavior. Without the bg path,
+    // the early frames of startup show a black flash even when
+    // the colorscheme is light.
+    if (app.renderer == null) {
+        const hdc = ps.hdc;
+        app.mu.lockUncancelable(core.clock.io());
+        const bg_rgb = app.colorscheme_bg;
+        app.mu.unlock(core.clock.io());
+        if (bg_rgb != 0xFFFFFFFF) {
+            // Win32 COLORREF is 0x00BBGGRR — swap from our 0x00RRGGBB.
+            const r: u32 = (bg_rgb >> 16) & 0xFF;
+            const g: u32 = (bg_rgb >> 8) & 0xFF;
+            const b: u32 = bg_rgb & 0xFF;
+            const colorref: c.COLORREF = @intCast((b << 16) | (g << 8) | r);
+            if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling bg=0x{x:0>6}", .{bg_rgb});
+            const brush = c.CreateSolidBrush(colorref);
+            if (brush != null) {
+                _ = c.FillRect(hdc, &ps.rcPaint, brush);
+                _ = c.DeleteObject(@ptrCast(brush));
+            } else {
+                const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
+                _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
+            }
+        } else {
+            if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling black (bg unset)", .{});
+            const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
+            _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
+        }
+        return;
+    }
+
+    var dirty: ?c.RECT =
+        if (ps.rcPaint.right > ps.rcPaint.left and ps.rcPaint.bottom > ps.rcPaint.top)
+            ps.rcPaint
+        else
+            null;
+
+    // Consume need_full_seed ONCE here.
+    const did_need_seed = app.need_full_seed.swap(false, .seq_cst);
+    if (did_need_seed) {
+        // Keep rows/cols synced to client size before we snapshot row-mode state.
+        app.mu.lockUncancelable(core.clock.io());
+        updateRowsColsFromClientForce(hwnd, app);
+        app.mu.unlock(core.clock.io());
+
+        // IMPORTANT: do not hold app.mu while calling into core.
+        updateLayoutToCore(hwnd, app);
+
+        // Force full redraw request on this paint.
+        dirty = null;
+
+        // Ensure we get a paint covering the whole surface.
+        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+        app_mod.requestMainFullPaint(app);
+    }
+
+    // Note: row_mode/rows/main_verts length are logged after snapshotting under lock.
+    // if (dirty) |r| {
+    //     applog.appLog("[win]   dirty_rect=({d},{d})-({d},{d})\n", .{ r.left, r.top, r.right, r.bottom });
+    // }
+
+    // Phase timing for WM_PAINT
+    var t_snapshot_start_ns: i128 = 0;
+    var t_snapshot_end_ns: i128 = 0;
+    var t_atlas_end_ns: i128 = 0;
+    if (log_enabled) {
+        t_snapshot_start_ns = core.clock.nowNs();
+    }
+
+    const glow = app_mod.glowPaintSettings(app);
+    const glow_enabled = glow.enabled;
+    const glow_intensity = glow.intensity;
+    const glow_radius_scale = glow.radius_scale;
+
+    // The atlas transaction must cover the TBS and atlas snapshots,
+    // not only the eventual draw. Otherwise a reset can commit
+    // between acquireForPaint() and a later admission check, leaving
+    // this paint with old UVs and the newly uploaded atlas.
+    if (!app.beginAtlasPaintOrRequestFull(&app.surf.tbs)) return;
+    defer app.endAtlasPaint();
+
+    // Step 1: TBS acquire (rotation_mu short lock).
+    // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
+    const tbs_snapshot = app.surf.tbs.acquireForPaint(app.alloc);
+    defer if (app_mod.releasePaintSnapshot(
+        &app.surf.tbs,
+        tbs_snapshot,
+        &app.surf.paint_retry,
+        app.atlas_reset_active.load(.seq_cst),
+    )) {
+        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    };
+    const committed = &app.surf.tbs.sets[tbs_snapshot.committed_index];
+    const committed_cursor = &app.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
+
+    // Step 2: UI metadata snapshot (app.mu short lock).
+    app.mu.lockUncancelable(core.clock.io());
+    app.surf.has_committed_cursor = committed_cursor.verts.items.len > 0;
+    if (app.surf.surface.rows == 0) {
+        updateRowsColsFromClient(hwnd, app);
+    }
+
+    // Read vertex-related state from TBS committed set (refcount-protected, lock-free).
+    const row_mode = committed.row_mode;
+    // The generation this committed set's vertices were generated
+    // against. `row_layout_gen` and `shared_metrics_gen` are bumped
+    // together, but the only gate below compares `row_layout_gen`
+    // to THIS paint's snapshot — i.e. the already-new value — so a
+    // paint landing after a guifont/linespace/DPI change and before
+    // the core's re-flush passed it and drew the old set against the
+    // new row height. Rows and columns need not have changed, so the
+    // rows_mismatch test does not catch it either. The external
+    // driver has always refused such a set.
+    const committed_metrics_gen = committed.metrics_gen;
+    const rows_snapshot: u32 = committed.rows;
+    const row_verts_len: u32 = @intCast(committed.row_map.items.len);
+
+    // Read UI metadata under app.mu.
+    const seed_pending_snapshot = app.seed_pending;
+    const seed_clear_pending_snapshot = app.seed_clear_pending;
+    const back_tex_valid_snapshot = app.back_tex_valid;
+    // The surface's own "repaint everything" request, consumed the
+    // way the external driver consumes its copy. Every setter also
+    // raised a seed flag or the TBS one, so this driver never read
+    // it; a setter that raises only this one now reaches a paint.
+    const surface_paint_full_snapshot = app.surf.surface.paint_full;
+    app.surf.surface.paint_full = false;
+    const row_valid_count_snapshot = app.row_valid_count;
+    const row_layout_gen_snapshot: u64 = app.row_layout_gen;
+    const shared_metrics_gen_snapshot: u64 = app.shared_metrics_gen;
+    const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
+    const row_h_px_snapshot: u32 = app.rowHeightPx();
+    const scrollbar_alpha_snapshot = app.surf.scrollbar.alpha;
+
+    // IMPORTANT: do NOT copy renderer/atlas structs here.
+    // Take pointers to the option payloads instead.
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    var gpu_ptr: ?*d3d11.Renderer = null;
+    if (app.atlas) |*a| atlas_ptr = a;
+    if (app.renderer) |*g| gpu_ptr = g;
+    // Pulled every paint, as the external driver does: a push from
+    // default_colors_set missed a renderer created later (deferred
+    // init, device-lost recovery), which then cleared black.
+    if (gpu_ptr) |g| {
+        if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
+    }
+    var atlas_reset_consumed = false;
+    var atlas_generation: u64 = 0;
+
+    // If the glyph atlas was reset, all cached row vertex UVs are stale.
+    // Request a full re-seed so the core regenerates every row.
+    // Guard with renderer mutex (recreateAtlasTexture sets the flag
+    // under a.mu).
+    if (atlas_ptr) |a| {
+        const gen = app_mod.atlasPaintGeneration(a, true);
+        atlas_generation = gen.generation;
+        if (gen.reset) {
+            // The texture itself is resized by syncSharedAtlas
+            // below, after app.mu is released (D3D creation can
+            // pump messages).
+            atlas_reset_consumed = true;
+            app.need_full_seed.store(true, .seq_cst);
+            app_mod.requestMainFullPaintLocked(app);
+            // The full atlas upload a reset owes is asked below of
+            // the generation the reset bumped.
+        }
+    }
+
+    // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
+    // The bitset iterator yields sorted, unique row indices — no dedup needed.
+    const dirty_row_keys = &app.surf.paint.dirty_row_keys;
+    dirty_row_keys.clearRetainingCapacity();
+    var paint_snapshot_ok = true;
+
+    if (row_mode) {
+        paint_snapshot_ok = app.surf.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
+    }
+
+    // Use committed.rows (content rows from core) as the baseline,
+    // not app.surf.surface.rows (global grid rows) which includes
+    // tabline/statusline rows that never receive vertex data.
+    var effective_rows: u32 = committed.rows;
+    var rows_mismatch: bool = false;
+    if (row_mode and row_mode_max_row_end_snapshot != 0 and row_mode_max_row_end_snapshot < effective_rows) {
+        effective_rows = row_mode_max_row_end_snapshot;
+        rows_mismatch = true;
+    }
+    const effective_row_valid_count: u32 =
+        if (effective_rows < row_valid_count_snapshot) effective_rows else row_valid_count_snapshot;
+
+    const paint_rects_snapshot = &app.wm_paint_rects_snapshot;
+    paint_rects_snapshot.clearRetainingCapacity();
+    paint_rects_snapshot.ensureTotalCapacity(app.alloc, app.paint_rects.items.len) catch {
+        paint_snapshot_ok = false;
+    };
+    if (paint_snapshot_ok) {
+        paint_rects_snapshot.appendSliceAssumeCapacity(app.paint_rects.items);
+        app.paint_rects.clearRetainingCapacity();
+    }
+
+    const paint_full_snapshot = tbs_snapshot.paint_full;
+
+    app.mu.unlock(core.clock.io());
+
+    if (!paint_snapshot_ok) {
+        recoverMainPaintFailure(hwnd, app);
+        return;
+    }
+
+    // A set generated against metrics this paint no longer has is
+    // refused before anything is drawn, as the external driver
+    // refuses it: drawn first, its rows reached back_tex at the old
+    // row height and only the present was refused. The present-time
+    // check below stays for a change landing during the draw. After
+    // the atlas recreate above, which this paint has already
+    // consumed the request for (the texture follows the atlas's
+    // size at every sync, so nothing is lost).
+    if (row_mode and committed_metrics_gen != shared_metrics_gen_snapshot) {
+        recoverMainPaintFailure(hwnd, app);
+        return;
+    }
+
+    if (log_enabled) {
+        t_snapshot_end_ns = core.clock.nowNs();
+    }
+
+    if (log_enabled) {
+        applog.appLog(
+            "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d}\n",
+            .{
+                ps.rcPaint.left,                       ps.rcPaint.top,                        ps.rcPaint.right,                 ps.rcPaint.bottom,
+                if (dirty == null) "null" else "rect", @as(u32, @intFromBool(did_need_seed)), @as(u32, @intFromBool(row_mode)), rows_snapshot,
+                row_verts_len,
+            },
+        );
+        if (row_mode and rows_mismatch) {
+            applog.appLog(
+                "[win] WM_PAINT(row) WARN rows_mismatch rows={d} max_row_end={d} row_verts_len={d}\n",
+                .{ rows_snapshot, row_mode_max_row_end_snapshot, row_verts_len },
+            );
+        }
+    }
+
+    // The shared atlas texture: resized, then the uploads it is
+    // owed, whichever window's paint comes first.
+    var atlas_uploaded = false;
+    if (atlas_ptr) |a| {
+        if (gpu_ptr) |g| {
+            g.lockContext();
+            defer g.unlockContext();
+            const sync = app_mod.syncSharedAtlas(app, a, g, atlas_generation, &app.surf.atlas_seen_upload_seq);
+            if (!sync.ok) {
+                // Do not draw against a texture missing pixels
+                // committed UVs reference. A consumed reset stays
+                // owed, for the re-seed it drives.
+                if (atlas_reset_consumed) {
+                    a.mu.lockUncancelable(core.clock.io());
+                    a.atlas_reset_pending = true;
+                    a.mu.unlock(core.clock.io());
+                }
+                recoverMainPaintFailure(hwnd, app);
+                if (log_enabled) applog.appLog("[win] atlas sync failed; requeued full paint\n", .{});
+                return;
+            }
+            atlas_uploaded = sync.uploaded;
+        }
+    }
+    if (log_enabled and atlas_uploaded) {
+        applog.appLog("[win] atlas_uploads flushed (cursor={d})\n", .{app.atlas_upload_cursor});
+    }
+    if (log_enabled) {
+        t_atlas_end_ns = core.clock.nowNs();
+    }
+
+    var render_ok = false;
+    if (gpu_ptr) |g| {
+        // Lock D3D context for thread-safe rendering
+        g.lockContext();
+        defer g.unlockContext();
+
+        // The resize the external driver does before drawing. A
+        // WM_SIZE deferred while an external window was being
+        // created left the swapchain at the old size; drawEx then
+        // recreated back_tex mid-paint and kept only the dirty rows
+        // of the new one while still reporting it valid.
+        // A failed resize fails the paint, as on the external
+        // driver: drawing on would retry it inside drawEx and
+        // report a partial frame over a fresh back_tex valid.
+        const resized_before_draw = app_mod.resizeSurfaceIfNeeded(g, false) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[win] WM_PAINT pre-draw resize failed: {any}\n", .{e});
+            recoverMainPaintFailure(hwnd, app);
+            return;
+        };
+
+        // Calculate content width for "always" scrollbar mode
+        var client_for_content: c.RECT = undefined;
+        _ = c.GetClientRect(hwnd, &client_for_content);
+        const client_width_u32: u32 = @intCast(@max(1, client_for_content.right - client_for_content.left));
+        const content_width: ?u32 = if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+            getEffectiveContentWidth(app, client_width_u32)
+        else
+            null;
+
+        // Where grid 1 starts: the rule the hit tests and the
+        // cursor damage rect use. Both chrome sizes are non-zero,
+        // so a zero offset means no tabbar / left sidebar.
+        const origin = input.surfaceOriginPx(app, true);
+        const content_y_offset: ?u32 = if (origin.y > 0) @intCast(origin.y) else null;
+        const content_x_offset: ?u32 = if (origin.x > 0) @intCast(origin.x) else null;
+
+        // Sidebar right width (reduces content area from right edge)
+        const sidebar_right_width: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+            @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+        else
+            null;
+
+        // Tabbar background color - fallback strip shown if the
+        // tabline texture is not yet generated (initial frame or
+        // update failure). Track the OS light/dark theme cache so
+        // the fallback matches currentTitlebarPalette().bar_bg
+        // (RGB(32,32,32) dark / RGB(240,240,240) light).
+        const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
+            (if (g_os_dark_theme_cached)
+                [4]f32{ 32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0 }
+            else
+                [4]f32{ 240.0 / 255.0, 240.0 / 255.0, 240.0 / 255.0, 1.0 })
+        else
+            null;
+        const content_x_offset_i32: i32 = if (content_x_offset) |off| @intCast(off) else 0;
+        const content_y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
+        const content_right_i32 = render_helpers.mainContentRightPx(
+            content_width,
+            client_width_u32,
+            content_x_offset orelse 0,
+            sidebar_right_width orelse 0,
+        );
+
+        // Snap viewport height to cell boundaries to match core's NDC calculation.
+        // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
+        // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
+        // misalignment between vertex positions and scissor rects (which causes stripes).
+        const content_height: u32 = app_mod.snappedContentHeight(
+            @intCast(@max(1, client_for_content.bottom - client_for_content.top)),
+            row_h_px_snapshot,
+            content_y_offset orelse 0,
+        );
+
+        // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
+        // This avoids DWM composition issues by keeping GDI rendering offscreen
+        if (app.ext_tabline_enabled) {
+            if (app.tabline_style == .titlebar) {
+                const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
+                const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
+                tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
+            } else if (app.tabline_style == .sidebar) {
+                // Called unconditionally: unlike the tabline, the sidebar
+                // has no tab_count gate, and it draws an empty strip rather
+                // than releasing anything when there are no tabs.
+                const sw: u32 = @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))));
+                const sh: u32 = @intCast(@max(1, client_for_content.bottom));
+                tabline_mod.renderSidebarToD3D(app, sw, sh);
+            }
+        }
+
+        if (!row_mode) {
+            app.surf.dropRowVBs(app);
+
+            // A mode transition can leave a row-mode scrollbar in
+            // retained back_tex. Restore it and widen this flat
+            // draw's damage so the clean strip is also presented.
+            const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
+                if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
+                recoverMainPaintFailure(hwnd, app);
+                return;
+            };
+            if (restored_scrollbar_rect) |restored_rect| {
+                dirty = if (dirty) |old| callbacks.unionRect(old, restored_rect) else restored_rect;
+            }
+
+            // Before the first row commit: background and chrome
+            // only. Do NOT hold app.mu here: Present can pump
+            // Win32 messages, and a re-entrant handler taking
+            // app.mu would self-deadlock.
+            non_row: {
+                g.drawEx(&.{}, &.{}, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity }) catch |e| {
+                    if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
+                    break :non_row;
+                };
+                var dirty_rects: [1]c.RECT = undefined;
+                if (dirty) |r| dirty_rects[0] = r;
+                g.presentFromBack(dirty_rects[0..@intFromBool(dirty != null)], dirty == null) catch |e| {
+                    if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
+                    break :non_row;
+                };
+                render_ok = true;
+                // No row is committed yet, so a background-only
+                // frame is the whole content: back_tex is valid if
+                // drawEx kept a valid one (it clears on dirty ==
+                // null or opacity < 1.0) or redrew all of it.
+                const draw_preserved =
+                    back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
+                const rendered_complete =
+                    !seed_pending_snapshot and dirty == null;
+                app.mu.lockUncancelable(core.clock.io());
+                app.back_tex_valid = draw_preserved or rendered_complete;
+                app.mu.unlock(core.clock.io());
+            }
+        } else {
+            // --- Row-mode ---
+            var t_row_start_ns: i128 = 0;
+            var t_present_start_ns: i128 = 0;
+            if (log_enabled) {
+                t_row_start_ns = core.clock.nowNs();
+            }
+
+            // Build sorted, deduplicated list of rows to draw.
+            const rows_to_draw = &app.surf.paint.rows_to_draw;
+
+            // Transparency mode (opacity<1.0) must force full rows too:
+            // preserve_back=false clears back_tex entirely in drawEx, so if only
+            // dirty rows are drawn the unchanged rows disappear.  Matches
+            // drawNormalExtRowMode's force_full_rows logic for external windows.
+            //
+            // seed_pending alone no longer forces a full redraw: when
+            // back_tex_valid_snapshot is true the previous frame is preserved on
+            // back_tex, so incremental dirty/scroll updates suffice. Limiting the
+            // seed_pending reason to !back_tex_valid_snapshot keeps the
+            // fresh-from-scratch seed path (initial attach, real resize) doing
+            // full redraws while restoring partial-redraw / DXGI scroll fast paths
+            // when the seed has stuck for unrelated reasons (e.g. zero validity
+            // bits propagated through swapAndShiftRows after WM_SIZE no-op).
+            //
+            // seed_clear_pending_snapshot is the tight coupling: whenever the
+            // back_tex is going to be cleared this frame (preserve_back=false via
+            // the seed_clear branch), every row must be redrawn. Not every
+            // seed_clear_pending setter co-sets paint_full / need_full_seed (e.g.
+            // the on_vertices_row dimension-change path at callbacks.zig:1067), so
+            // relying on those flags alone leaves a window where back_tex is
+            // cleared but only dirty rows are drawn — non-dirty rows show the
+            // clear color until Neovim re-sends grid_line.
+            //
+            // An empty ps.rcPaint is not a redraw-all request. Every
+            // Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so the
+            // paint DC has no visible region and BeginPaint clips
+            // rcPaint to nothing on every paint. The app's own damage
+            // (tbs.pending_dirty -> dirty_row_keys, plus
+            // paint_full_snapshot) is what computeRowsToDraw reads.
+            // A cursor that moved to another grid forces one too.
+            // cursor_erase_rows below carries the row the LAST paint
+            // drew the cursor on, and that row belongs to whichever
+            // grid held the cursor then; everything that places it
+            // — the rows_to_draw insert, markLayerCursorRow — uses
+            // the grid holding it now. Under ext_multigrid every
+            // window is a layer, so a cursor leaving one would have
+            // its old row repainted in the wrong window and the old
+            // block would stay. A window switch is a user action and
+            // already repaints most of the surface. Same reasoning,
+            // and the same fix, as drawNormalExternalSurfaceRowMode.
+            const cursor_grid_changed =
+                tbs_snapshot.cursor_layer_grid_id != app.surf.paint.last_painted_cursor_grid;
+            // Everything seed-shaped is this driver's own
+            // "repaint everything" request; the terms both drivers
+            // share live in render_helpers.paintPolicy.
+            const paint_policy = render_helpers.paintPolicy(.{
+                .force_full =
+                    resized_before_draw or
+                    did_need_seed or
+                    paint_full_snapshot or
+                    surface_paint_full_snapshot or
+                    seed_clear_pending_snapshot or
+                    (seed_pending_snapshot and !back_tex_valid_snapshot),
+                .cursor_grid_changed = cursor_grid_changed,
+                .glow_enabled = glow_enabled,
+                .opacity = g.opacity,
+                .back_tex_valid = back_tex_valid_snapshot,
+            });
+            const force_full_rows = paint_policy.force_full_rows;
+
+            if (log_enabled) {
+                applog.appLog(
+                    "[win] force_full_rows={d} seed={d} nodirty={d} paintfull={d} seedclear={d} seedpend_notex={d} glow={d} opacity={d}\n",
+                    .{
+                        @intFromBool(force_full_rows),
+                        @intFromBool(did_need_seed),
+                        @intFromBool(dirty == null),
+                        @intFromBool(paint_full_snapshot),
+                        @intFromBool(seed_clear_pending_snapshot),
+                        @intFromBool(seed_pending_snapshot and !back_tex_valid_snapshot),
+                        @intFromBool(glow_enabled),
+                        @intFromBool(g.opacity < 1.0),
+                    },
+                );
+            }
+
+            const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
+            const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
+
+            if (!app_mod.computeRowsToDraw(
+                app.alloc,
+                rows_to_draw,
+                force_full_rows,
+                dirty_row_keys.items,
+                total_rows_for_enum,
+                max_valid_row,
+            )) {
+                recoverMainPaintFailure(hwnd, app);
+                return;
+            }
+
+            // If atlas was uploaded but no rows will be drawn in this frame,
+            // request a full repaint so newly uploaded glyphs become visible.
+            if (render_helpers.atlasUploadOwesFullPaint(atlas_uploaded, rows_to_draw.items.len != 0)) {
+                app_mod.requestMainFullPaint(app);
+                app.surf.tbs.requestFullPaint();
+                _ = c.InvalidateRect(hwnd, null, c.FALSE);
+            }
+
+            if (log_enabled) {
+                applog.appLog(
+                    "[win] WM_PAINT(row) force_full_rows={d} rows_to_draw={d} dirty_keys={d} row_verts_len={d}\n",
+                    .{
+                        @as(u32, @intFromBool(force_full_rows)),
+                        rows_to_draw.items.len,
+                        dirty_row_keys.items.len,
+                        row_verts_len,
+                    },
+                );
+                if (force_full_rows and effective_rows == 0) {
+                    applog.appLog(
+                        "[win] WM_PAINT(row) WARN rows_unknown skip_present rows_to_draw={d} row_verts_len={d}\n",
+                        .{ rows_to_draw.items.len, row_verts_len },
+                    );
+                }
+                if (force_full_rows and effective_rows != 0 and rows_to_draw.items.len != effective_rows) {
+                    applog.appLog(
+                        "[win] WM_PAINT(row) WARN partial_full_rows rows={d} rows_to_draw={d}\n",
+                        .{ effective_rows, rows_to_draw.items.len },
+                    );
+                }
+                if (!force_full_rows and rows_to_draw.items.len == 0 and (dirty_row_keys.items.len != 0 or paint_rects_snapshot.items.len != 0)) {
+                    applog.appLog(
+                        "[win] WM_PAINT(row) WARN empty_rows_to_draw rows={d} row_verts_len={d} dirty_keys={d} paint_rects={d}\n",
+                        .{ rows_snapshot, row_verts_len, dirty_row_keys.items.len, paint_rects_snapshot.items.len },
+                    );
+                }
+            }
+
+            // --- Build present dirty from actual drawn row_rc + cursor_rc (don't use rcPaint) ---
+            // Read cursor verts from TBS committed set (refcount-protected, lock-free).
+            const cursor_verts_snapshot: []const core.Vertex = committed_cursor.verts.items;
+            if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cursor_verts_snapshot.len});
+            var client: c.RECT = undefined;
+            _ = c.GetClientRect(hwnd, &client);
+
+            // Core vertices are grid-local pixels. The root grid's
+            // layer sits at the surface origin, but a cursor in
+            // any other grid the surface draws as a layer needs
+            // that layer's origin added before its position means
+            // anything in screen space.
+            // Keyed on the grid the snapshot says holds the cursor,
+            // the same transaction as the vertices.
+            const cursor_layer_origin_px = render_helpers.layerOriginPx(
+                app_mod.SurfaceLayer,
+                tbs_snapshot.layers.slice(),
+                tbs_snapshot.cursor_layer_grid_id,
+                1,
+            );
+            const cursor_layer_x_px: f32 = @floatFromInt(cursor_layer_origin_px[0]);
+            const cursor_layer_y_px: f32 = @floatFromInt(cursor_layer_origin_px[1]);
+
+            // Where the cursor's grid sits on the surface: its
+            // layer's origin plus the content viewport's, the same
+            // translation the row pass draws it with. One bounds
+            // serves both the damage rectangle and the shader
+            // uniform; they used to be two loops over the same
+            // vertices, one integer and one float.
+            const cursor_origin_x: f32 = @as(f32, @floatFromInt(content_x_offset orelse 0)) + cursor_layer_x_px;
+            const cursor_origin_y: f32 = @as(f32, @floatFromInt(content_y_offset orelse 0)) + cursor_layer_y_px;
+            const cursor_bounds = core.cursor_rect.bounds(
+                core.Vertex,
+                cursor_verts_snapshot,
+                cursor_origin_x,
+                cursor_origin_y,
+            );
+            // The damage consumer needs whole pixels, clipped to
+            // the client; an empty result is dropped rather than
+            // handed on.
+            const cursor_rc_opt: ?c.RECT = if (cursor_bounds) |cb| blk: {
+                const ir = core.cursor_rect.inflateClip(cb, client.right, client.bottom) orelse break :blk null;
+                break :blk .{ .left = ir.left, .top = ir.top, .right = ir.right, .bottom = ir.bottom };
+            } else null;
+
+            // Feed cursor state into the custom shader uniforms
+            // (Ghostty 1.1+ iCurrentCursor / iPreviousCursor /
+            // iTimeCursorChange etc.). No-op when the rect + color
+            // match the last call. Ghostty's cursor shaders read
+            // the y component as the BOTTOM edge of the rect
+            // (center is `y - h/2`, rect spans `y-h..y`).
+            if (cursor_bounds) |cb| {
+                if (app.renderer) |*r_sh| {
+                    r_sh.setCursorShaderState(
+                        .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                        cursor_verts_snapshot[0].color,
+                    );
+                }
+            }
+
+            // cell_h + linespace, as the external driver reads it.
+            const row_h_px_u32: u32 = row_h_px_snapshot;
+            const row_h_px: i32 = @intCast(row_h_px_u32);
+
+            // Where the cursor's own layer sits, so the overlay is
+            // placed with that layer's transform rather than the
+            // root grid's. The grid id comes from the same
+            // transaction as the cursor vertices.
+            const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
+            const cursor_layer_origin: [2]f32 = .{ cursor_layer_x_px, cursor_layer_y_px };
+
+            // The rows the cursor overlay would otherwise erase:
+            // where the previous cursor was baked into back_tex,
+            // and where this one lands. Both are grid-local rows of
+            // the cursor's own grid. Repainting them from that
+            // grid's vertices is what removes the previous cursor,
+            // so the overlay's blink-off clear — a full-content-
+            // width band it can only refill from one grid — never
+            // has to run.
+            const cursor_erase_rows: [2]?u32 = .{
+                app.surf.paint.last_painted_cursor_row,
+                committed_cursor.last_cursor_row,
+            };
+            render_helpers.insertCursorEraseRows(
+                app.alloc,
+                rows_to_draw,
+                cursor_erase_rows,
+                max_valid_row,
+                cursor_grid == 1,
+            );
+
+            // Reserve every rect this paint can add: one span per
+            // dirty row, the copied paint damage, one per layer,
+            // and eight singletons — restored and captured
+            // scrollbar, rcPaint, gutter, cursor, three chrome
+            // strips.
+            var present = app_mod.PresentRectBuilder.begin(
+                &app.surf.paint.present_rects,
+                app.alloc,
+                rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 8,
+            );
+            const present_rects = present.list;
+
+            // The scrollbar is alpha-blended into retained back_tex.
+            // Restore only its narrow saved underlay before applying
+            // this frame's row/cursor updates; the returned strip is
+            // real back_tex damage and must reach every swapchain
+            // buffer through the per-buffer damage queue.
+            const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
+                if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
+                recoverMainPaintFailure(hwnd, app);
+                return;
+            };
+            present.addOpt(restored_scrollbar_rect);
+
+            // Build full-width present_rects initially.
+            // After the row drawing loop, we may replace with cursor rects if no content changed.
+            // Add content_y_offset for ext_tabline (present_rects are in screen coords)
+            const present_y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
+            if (rows_to_draw.items.len != 0) {
+                present.addRowSpans(rows_to_draw.items, present_y_offset, client.right, row_h_px);
+            } else {
+                present.addOpt(dirty);
+            }
+
+            // Always include explicit paint rects (cursor damage) in present set.
+            for (paint_rects_snapshot.items) |r| present.add(r);
+            present.addOpt(cursor_rc_opt);
+
+            // row-setup drawEx is the ONLY drawEx in row-mode WM_PAINT.
+            // When did_need_seed is true, we must NOT preserve old back buffer contents,
+            // so integrate "seed-clear" behavior here (no extra drawEx).
+            // With TBS, committed set is read-only — only clear row_valid under app.mu.
+            app.mu.lockUncancelable(core.clock.io());
+
+            // Use the snapshot rather than a live re-read so seed_clear matches the
+            // value force_full_rows above was computed from. If an RPC callback
+            // (e.g. on_vertices_row dimension change) sets app.seed_clear_pending
+            // between the snapshot and this point, the new request is handled by
+            // the next WM_PAINT — never in a frame where force_full_rows was false.
+            const seed_clear = did_need_seed or seed_clear_pending_snapshot;
+            if (seed_clear) {
+                // Only consume the pending flag when no RPC dimension change has
+                // landed since the snapshot. A bumped row_layout_gen means the new
+                // committed set will need its own clear at the new dimensions;
+                // leaving seed_clear_pending=true defers that to the next paint.
+                if (app.row_layout_gen == row_layout_gen_snapshot) {
+                    app.seed_clear_pending = false;
+                }
+                // Only unset validity for rows beyond current grid
+                const current_rows = committed.rows;
+                var clear_idx: usize = current_rows;
+                while (clear_idx < app.row_valid.bit_length) : (clear_idx += 1) {
+                    if (app.row_valid.isSet(clear_idx)) {
+                        app.row_valid.unset(clear_idx);
+                        if (app.row_valid_count > 0) {
+                            app.row_valid_count -= 1;
+                        }
+                    }
+                }
+            }
+            app.mu.unlock(core.clock.io());
+
+            // Gate preservation on back_tex_valid (mirror of macOS hasPresentedOnce
+            // plus explicit invalidation on font/linespace/DPI changes) rather than
+            // on !seed_pending. seed_pending alone gets stuck in a dead state when
+            // a scroll arrives before Neovim finishes re-sending grid_line for all
+            // rows: swapAndShiftRows propagates zero validity bits through every
+            // shifted slot, row_valid_count never reaches total_rows, and the old
+            // gating cleared back_tex on every frame.
+            // Transparency mode (opacity<1.0) must still force clear: premultiplied
+            // alpha blending accumulates on retained back_tex, producing faint ghost
+            // text on rows that are drawn over without an intervening clear (matches
+            // external window logic in drawNormalExtRowMode).
+            // From the shared policy above. It is stricter than the
+            // terms spelled out here used to be — it also refuses on
+            // paint_full and on a cursor that changed grid — but every
+            // case it newly refuses is one where force_full_rows is
+            // true and every row redraws anyway, and the chrome is
+            // regenerated each paint regardless.
+            const preserve_back = paint_policy.preserve_back;
+            if (log_enabled) applog.appLog(
+                "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
+                .{
+                    @as(u32, @intFromBool(preserve_back)),
+                    @as(u32, @intFromBool(did_need_seed)),
+                    @as(u32, @intFromBool(seed_pending_snapshot)),
+                    @as(u32, @intFromBool(seed_clear)),
+                },
+            );
+
+            const row_draw_params = app_mod.RowModeDrawParams{
+                .content_height = content_height,
+                .row_h_px = row_h_px,
+                .x_offset = content_x_offset_i32,
+                .y_offset = content_y_offset_i32,
+                .content_right = content_right_i32,
+                .preserve_back = preserve_back,
+                // Per-row scissor when we're either past seed mode or
+                // preserving a valid back_tex (incremental updates on top of
+                // a previously-painted frame). Only the fresh-from-scratch
+                // seed path (back_tex_valid=false) keeps the full-area scissor.
+                .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
+                .root_rows_may_be_empty = tbs_snapshot.layers.len > 1,
+                .content_width = content_width,
+                .content_y_offset = content_y_offset,
+                .content_x_offset = content_x_offset,
+                .sidebar_right_width = sidebar_right_width,
+                .tabbar_bg_color = tabbar_bg_color,
+                // The root layer drives the pixel space core
+                // vertices arrive in. It sits at the surface origin
+                // today; an anchored float will carry its own
+                // offset once the core emits multi-layer layouts.
+                .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+                .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+                // Under ext_multigrid the root grid carries only
+                // chrome, so the glow pass has to extract the
+                // layers as well or the buffer text never lights.
+                .bloom_layers = if (tbs_snapshot.layers.len > 1)
+                    app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
+                else
+                    null,
+            };
+
+            // Shared with the external driver: row VBs, the scroll
+            // pixel shift, the layer plan under app.mu (after the
+            // renderer context, the order the layer draw uses), then
+            // the row frame. Layer present rects are added in the
+            // plan's own app.mu hold: added in a hold of their own
+            // before it, a layer the core dirtied in between was
+            // drawn but not presented until the next paint.
+            const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.surf), .{
+                .snapshot = tbs_snapshot,
+                .rows_to_draw = rows_to_draw,
+                .row_vb_len = committed.row_map.items.len,
+                .total_rows = effective_rows,
+                .preserve_back = preserve_back,
+                .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                .layer_present = .{
+                    .rects = present_rects,
+                    .right = client.right,
+                    .bottom = client.bottom,
+                    .cursor_grid = cursor_grid,
+                    .cursor_rows = cursor_erase_rows,
+                },
+                .frame = .{
+                    .root_grid_id = 1,
+                    .layers = &.{},
+                    .row_map = committed.row_map.items,
+                    .rows_to_draw = &.{},
+                    .cursor_verts = cursor_verts_snapshot,
+                    .cursor_row = committed_cursor.last_cursor_row,
+                    .cursor_grid = cursor_grid,
+                    .cursor_erase_rows = cursor_erase_rows,
+                    .cursor_layer_origin = cursor_layer_origin,
+                    .blink_visible = app.cursor_blink.visible,
+                    .force_full_rows = force_full_rows,
+                    .layer_layout_stale = false,
+                    .layer_commit_stale = false,
+                    .glow = if (glow_enabled) app_mod.RowFrameGlow{
+                        .intensity = glow_intensity,
+                        .radius_scale = glow_radius_scale,
+                        .cursor_visible = app.cursor_blink.visible,
+                    } else null,
+                    .draw_params = row_draw_params,
+                    .log_enabled = log_enabled,
+                },
+            }) catch {
+                recoverMainPaintFailure(hwnd, app);
+                return;
+            };
+            if (pass.stale) {
+                // Nothing reached back_tex but the scrollbar underlay restore:
+                // hand the damage back and repaint now. Not a failure, so no
+                // backoff and no full repaint.
+                app.surf.tbs.returnUndrawnDamage(dirty_row_keys.items, force_full_rows);
+                app.mu.lockUncancelable(core.clock.io());
+                if (seed_clear) app.seed_clear_pending = true;
+                app.paint_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch app_mod.requestMainFullPaintLocked(app);
+                if (restored_scrollbar_rect) |r| app.paint_rects.append(app.alloc, r) catch app_mod.requestMainFullPaintLocked(app);
+                app.mu.unlock(core.clock.io());
+                _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                return;
+            }
+            // Add bottom gutter rect if client area extends beyond the grid area.
+            // This ensures the gutter is properly cleared in all swapchain buffers
+            // during partial present, preventing ghost artifacts from stale content.
+            // The gutter starts at the snapped grid bottom (content_height, derived
+            // from the client and row height, so never stale). It used to start at the
+            // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
+            // present of rows 5 to the bottom of the window.
+            if (present_rects.items.len != 0) {
+                const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
+                if (grid_bottom > 0 and grid_bottom < client.bottom) {
+                    const gutter_rc: c.RECT = .{
+                        .left = 0,
+                        .top = grid_bottom,
+                        .right = client.right,
+                        .bottom = client.bottom,
+                    };
+                    present.add(gutter_rc);
+                }
+            }
+
+            // The gutter and chrome bands widen only a list that
+            // already has content, so they come after everything
+            // that can make it non-empty, the layers included.
+            // The chrome outside the content area — the tabline with
+            // its close and new-tab buttons, the caption buttons, the
+            // sidebar — is redrawn into back_tex on EVERY paint, from
+            // hover state that produces no row damage and no paint
+            // rect. Nothing above ever added its band here, so it
+            // reached the screen only on a frame that happened to
+            // present in full: the moment anything else put a rect in
+            // this list (a blinking cursor is enough), the present
+            // went partial and the newly drawn hover was left in
+            // back_tex. Only widen a list that already has content —
+            // an empty list still means "present everything", which
+            // covers the chrome anyway.
+            if (present_rects.items.len != 0) {
+                if (content_y_offset_i32 > 0) {
+                    present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
+                }
+                if (content_x_offset_i32 > 0) {
+                    present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
+                }
+                if (sidebar_right_width) |rw| {
+                    const right_strip_left: i32 =
+                        client.right - @as(i32, @intCast(rw));
+                    if (rw > 0 and right_strip_left > 0) {
+                        present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
+                    }
+                }
+            }
+
+            // The client rect can be a resize ahead of the buffer.
+            present.finish(g.width, g.height);
+
+            // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
+            if (applog.isEnabled()) {
+                applog.appLog(
+                    "[win] WM_PAINT(row) present_rects={d} (rows_to_draw={d})\n",
+                    .{ present_rects.items.len, rows_to_draw.items.len },
+                );
+
+                if (present_rects.items.len != 0) {
+                    var u: c.RECT = present_rects.items[0];
+                    var j: usize = 1;
+                    while (j < present_rects.items.len) : (j += 1) {
+                        u = callbacks.unionRect(u, present_rects.items[j]);
+                    }
+
+                    applog.appLog(
+                        "[win]   present_union=({d},{d})-({d},{d})\n",
+                        .{ u.left, u.top, u.right, u.bottom },
+                    );
+
+                    var k: usize = 0;
+                    while (k < present_rects.items.len) : (k += 1) {
+                        const r = present_rects.items[k];
+                        applog.appLog(
+                            "[win]   present[{d}]=({d},{d})-({d},{d})\n",
+                            .{ k, r.left, r.top, r.right, r.bottom },
+                        );
+                    }
+                } else {
+                    applog.appLog("[win]   present_rects is EMPTY\n", .{});
+                }
+
+                if (cursor_rc_opt) |cr| {
+                    applog.appLog(
+                        "[win]   cursor_rc=({d},{d})-({d},{d})\n",
+                        .{ cr.left, cr.top, cr.right, cr.bottom },
+                    );
+                }
+            }
+
+            const row_frame = pass.frame;
+            if (row_frame.row_vb_budget_exceeded) {
+                app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
+                return;
+            }
+
+            if (log_enabled) applog.appLog(
+                "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d} committed_rows={d} committed_cols={d} row_map_len={d}\n",
+                .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
+            );
+
+            const row_draw_result = row_frame.rows;
+            const drawn_rows = row_draw_result.metrics.drawn_rows;
+            const skipped_empty = row_draw_result.metrics.skipped_empty;
+            const failed_rows = row_draw_result.metrics.failed_rows;
+            const first_empty_row = row_draw_result.metrics.first_empty_row;
+            const log_vb_upload_rows = row_draw_result.metrics.vb_upload_rows;
+            const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
+            const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
+            const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
+
+            if (log_enabled) {
+                applog.appLog(
+                    "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
+                    .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
+                );
+                if (first_empty_row) |erow| {
+                    applog.appLog(
+                        "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
+                        .{ erow, rows_snapshot, row_verts_len },
+                    );
+                }
+            }
+
+            if (log_enabled and force_full_rows and skipped_empty != 0) {
+                applog.appLog(
+                    "[win] WM_PAINT(row) WARN skip_present missing_rows={d} rows={d} row_verts_len={d}\n",
+                    .{ skipped_empty, rows_snapshot, row_verts_len },
+                );
+            }
+
+            if (log_enabled) {
+                var log_present_rects_area_px: u64 = 0;
+
+                // --- log: present_rects area (sum of rect areas) ---
+                if (present_rects.items.len != 0) {
+                    var pi: usize = 0;
+                    while (pi < present_rects.items.len) : (pi += 1) {
+                        const r = present_rects.items[pi];
+                        const w_i32: i32 = r.right - r.left;
+                        const h_i32: i32 = r.bottom - r.top;
+                        if (w_i32 > 0 and h_i32 > 0) {
+                            log_present_rects_area_px +=
+                                @as(u64, @intCast(w_i32)) * @as(u64, @intCast(h_i32));
+                        }
+                    }
+                }
+
+                applog.appLog(
+                    "[win] WM_PAINT(row-frame) drawn_rows={d} rows_to_draw={d} present_rects={d} present_area_px={d} vb_upload_rows={d} vb_upload_rows_bytes={d} vb_upload_cursor={d} vb_upload_cursor_bytes={d}\n",
+                    .{
+                        drawn_rows, // NOTE: variable within row-vb block. See note below
+                        rows_to_draw.items.len,
+                        present_rects.items.len,
+                        log_present_rects_area_px,
+                        log_vb_upload_rows,
+                        log_vb_upload_rows_bytes,
+                        @as(u32, if (cursor_verts_snapshot.len != 0) 1 else 0),
+                        @as(u64, cursor_verts_snapshot.len * @sizeOf(core.Vertex)),
+                    },
+                );
+            }
+
+            if (log_enabled) {
+                t_present_start_ns = core.clock.nowNs();
+            }
+
+            var layout_ok: bool = true;
+            var metrics_ok: bool = true;
+            app.mu.lockUncancelable(core.clock.io());
+            layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
+            metrics_ok = row_mode and committed_metrics_gen == app.shared_metrics_gen;
+            app.mu.unlock(core.clock.io());
+
+            // Shared with the external driver (render_helpers.presentGate);
+            // the seed and chrome terms are this surface's own.
+            // A paint against a newer layout or metrics, or with
+            // rows that never reached back_tex, is refused and the
+            // common recovery path requeues a full redraw.
+            var present_in = render_helpers.PresentGateInputs{
+                .layout_ok = layout_ok,
+                .metrics_ok = !row_mode or metrics_ok,
+                .frame_incomplete = row_frame.incomplete(),
+                .force_full_rows = force_full_rows,
+                .preserve_back = preserve_back,
+                .rows = effective_rows,
+                .rows_to_draw = rows_to_draw.items.len,
+                .skipped_empty = skipped_empty,
+                .custom_shader = g.custom_shader_pipelines.items.len != 0,
+                .present_rects = present_rects.items.len,
+                .present_rects_overflowed = present.full,
+                .seed = .{
+                    .pending = seed_pending_snapshot,
+                    .clear = seed_clear,
+                    .back_tex_valid = back_tex_valid_snapshot,
+                    .rows_mismatch = rows_mismatch,
+                    .row_valid_count = effective_row_valid_count,
+                },
+                .empty_damage_presents_all = true,
+            };
+            const allow_present = render_helpers.presentGate(present_in).verdict == .present;
+
+            if (log_enabled) applog.appLog(
+                "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
+                .{
+                    allow_present,
+                    seed_pending_snapshot,
+                    preserve_back,
+                    back_tex_valid_snapshot,
+                    rows_mismatch,
+                    effective_rows,
+                    effective_row_valid_count,
+                    skipped_empty,
+                    failed_rows,
+                    row_draw_result.metrics.empty_rows,
+                    rows_to_draw.items.len,
+                    force_full_rows,
+                    tbs_snapshot.layers.len,
+                },
+            );
+
+            if (allow_present) {
+                present_frame: {
+                    // Save only the track strip before drawing the
+                    // alpha-blended overlay. The next fade/update paint
+                    // restores this clean copy instead of clearing and
+                    // regenerating the entire row set.
+                    const captured_scrollbar_rect = scrollbar.drawOverlay(
+                        app,
+                        g,
+                        scrollbar.mainSurface(hwnd, app),
+                        scrollbar_alpha_snapshot,
+                        client.right,
+                        client.bottom,
+                        &app.surf.paint.scrollbar_vb,
+                        &app.surf.paint.scrollbar_vb_bytes,
+                    ) catch |e| {
+                        if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
+                        break :present_frame;
+                    };
+                    // An empty list already presents it.
+                    if (present_rects.items.len != 0) present.addOpt(captured_scrollbar_rect);
+
+                    // When seed_clear is true, the back buffer was just cleared.
+                    // We must do a full present to sync the cleared state to all swapchain buffers,
+                    // otherwise areas not covered by partial present rects may show stale content.
+                    // seed_pending alone no longer forces a full present: when
+                    // back_tex_valid_snapshot is true the swapchain has already been
+                    // synced to a complete frame, and partial present rects keep
+                    // DXGI from copying unchanged regions every paint.
+                    // A custom shader writes the complete current
+                    // swapchain buffer from inside the present
+                    // (drawCustomShaderPass), while the other
+                    // rotating buffers record only this frame's
+                    // partial damage. Mark them all full so
+                    // disabling the shader cannot expose stale
+                    // shader pixels outside the dirty rectangles.
+                    // The external driver has carried this term
+                    // since its present grew the shader pass.
+                    // Re-asked: the scrollbar overlay above can have
+                    // overflowed the rect list since the gate ran.
+                    present_in.present_rects_overflowed = present.full;
+                    const present_gate = render_helpers.presentGate(present_in);
+                    const force_full_present = present_gate.full;
+                    const present_rects_slice: []const c.RECT =
+                        if (force_full_present) &[_]c.RECT{} else present_rects.items;
+
+                    // NOTE: an empty rect list here is read by the
+                    // renderer as whole-surface damage, so this
+                    // paint costs a full CopyResource + Present1.
+                    // Skipping it instead is WRONG: main's damage
+                    // bookkeeping covers grid rows and the cursor
+                    // only, while the tabline, its close/new-tab
+                    // buttons and the caption buttons are redrawn
+                    // into back_tex from hover state that produces
+                    // no rect at all. Skipping left every one of
+                    // those hovers invisible.
+
+
+                    if (g.presentFromBack(present_rects_slice, force_full_present)) {
+                        render_ok = true;
+                        // Assign back_tex_valid directly so it can also transition
+                        // true → false in the same paint. Two paths to true:
+                        //
+                        //   1. preserve_back was true AND back_tex_valid_snapshot was
+                        //      true. The previous paint left back_tex in a valid state
+                        //      and this paint only overlaid dirty rows on top of it —
+                        //      back_tex is still valid even if this paint didn't render
+                        //      every row.
+                        //
+                        //   2. We just rendered a complete frame regardless of prior
+                        //      state. "Complete" here is render-side completeness
+                        //      (skipped_empty == 0 and rows_to_draw covers every row),
+                        //      not Neovim-side validation (row_valid_count). The
+                        //      distinction matters for minimize/restore, where
+                        //      row_valid is unsetAll'd by WM_SIZE but row_verts still
+                        //      holds full pre-minimize data — a seed_clear paint
+                        //      redraws every row from that data and back_tex becomes
+                        //      complete even with row_valid_count == 0.
+                        //
+                        // Both conditions fail (preserve_back=false AND incomplete
+                        // render) → back_tex_valid falls to false. This is the
+                        // critical case for the on_vertices_row dimension-change path:
+                        // seed_clear bypasses the row_valid completeness check at
+                        // allow_present and presents anyway, so without an explicit
+                        // false-assignment a stale snapshot value would survive a
+                        // paint that wiped back_tex.
+                        app.mu.lockUncancelable(core.clock.io());
+                        app.back_tex_valid = present_gate.back_tex_valid;
+                        app.mu.unlock(core.clock.io());
+                        // last_painted_cursor_row is tracked by drawCursorOverlay above.
+                    } else |e| {
+                        if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
+                    }
+
+                    if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
+                        app.mu.lockUncancelable(core.clock.io());
+                        app.seed_pending = false;
+                        app_mod.requestMainFullPaintLocked(app);
+                        app.seed_clear_pending = true;
+                        app.mu.unlock(core.clock.io());
+                        // Also set TBS pending_paint_full for next paint cycle.
+                        app.surf.tbs.requestFullPaint();
+                        if (log_enabled) applog.appLog(
+                            "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
+                            .{ effective_rows, effective_row_valid_count },
+                        );
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+                }
+            } else if (log_enabled) {
+                var resize_age_ms: i64 = -1;
+                const last_resize_ns = app.last_resize_ns;
+                if (last_resize_ns != 0) {
+                    const now_ns = core.clock.nowNs();
+                    const diff_ns = now_ns - last_resize_ns;
+                    if (diff_ns > 0) {
+                        resize_age_ms = @intCast(@divTrunc(diff_ns, 1_000_000));
+                    } else {
+                        resize_age_ms = 0;
+                    }
+                }
+                applog.appLog(
+                    "[win] WM_PAINT(row) skip_present seed_pending={d} rows={d} rows_cur={d} row_valid={d} rows_to_draw={d} skipped_empty={d} row_verts_len={d} force_full_rows={d} layout_gen={d} layout_ok={d} rows_mismatch={d} resize_age_ms={d}\n",
+                    .{
+                        @as(u32, @intFromBool(seed_pending_snapshot)),
+                        effective_rows,
+                        rows_snapshot,
+                        effective_row_valid_count,
+                        rows_to_draw.items.len,
+                        skipped_empty,
+                        row_verts_len,
+                        @as(u32, @intFromBool(force_full_rows)),
+                        row_layout_gen_snapshot,
+                        @as(u32, @intFromBool(layout_ok)),
+                        @as(u32, @intFromBool(rows_mismatch)),
+                        resize_age_ms,
+                    },
+                );
+            }
+
+            if (log_enabled) {
+                const t_done_ns: i128 = core.clock.nowNs();
+                const snapshot_us: u64 = @intCast(@divTrunc(@max(0, t_snapshot_end_ns - t_snapshot_start_ns), 1000));
+                const atlas_us: u64 = @intCast(@divTrunc(@max(0, t_atlas_end_ns - t_snapshot_end_ns), 1000));
+                const row_us: u64 = @intCast(@divTrunc(@max(0, t_present_start_ns - t_row_start_ns), 1000));
+                const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_present_start_ns), 1000));
+                const total_us: u64 = row_us + present_us;
+                const vb_upload_us: u64 = @intCast(@divTrunc(@max(0, log_vb_upload_ns), 1000));
+                const draw_vb_us: u64 = @intCast(@divTrunc(@max(0, log_draw_vb_ns), 1000));
+                applog.appLog(
+                    "[perf] row_mode_ui snapshot_us={d} atlas_us={d} rows={d} vb_upload_us={d} draw_vb_us={d} row_us={d} present_us={d} total_us={d}\n",
+                    .{ snapshot_us, atlas_us, rows_to_draw.items.len, vb_upload_us, draw_vb_us, row_us, present_us, total_us },
+                );
+            }
+        }
+    }
+
+    // A Present that failed with a device-removed code sets
+    // `device_lost` on the renderer and still returns normally, so a
+    // paint can report success on a device that is already gone. The
+    // external driver tests this right after its own present; main
+    // did not, and left recovery to whatever woke the next WM_PAINT.
+    // With no external window and a cursor that does not blink,
+    // nothing does until Neovim redraws, so the window sat frozen.
+    if (render_ok) {
+        if (app.renderer) |*r| {
+            if (r.device_lost) render_ok = false;
+        }
+    }
+
+    // Recover dirty state if rendering failed, so the next
+    // WM_PAINT will retry a full redraw instead of showing stale content.
+    if (!render_ok) {
+        recoverMainPaintFailure(hwnd, app);
+    } else {
+        app.surf.completePaintRetry();
+    }
+
+    // Update IME preedit overlay (separate popup window)
+    input.updateImePreeditOverlay(hwnd, app);
+
+    // Tabline is now rendered via D3D11 texture (see renderTablineToD3D call before gpu rendering)
+}
+
 pub export fn WndProc(
     hwnd: c.HWND,
     msg: c.UINT,
@@ -1962,1295 +3268,7 @@ pub export fn WndProc(
             const log_enabled = applog.isEnabled();
             if (log_enabled) applog.appLog("WM_PAINT tid={d}", .{c.GetCurrentThreadId()});
 
-            if (getApp(hwnd)) |app| {
-                app.surf.paint_retry_deadline_ms = 0;
-                app.surf.paint_retry.paintStarted();
-                // Reentrant relative to either: another WM_PAINT already
-                // rendering on this thread (g.lockContext() below is a
-                // non-recursive std.Io.Mutex), or the TIMER_CUSTOM_SHADER_ANIM
-                // handler's presentShaderAnimationFrame() mid-Present on the
-                // same D3D immediate context — either one's DXGI Present()
-                // can pump the Win32 message queue and deliver this WM_PAINT
-                // reentrantly on the same thread.
-                if (app.paintReentrancyBlocked()) {
-                    app.consumeReentrantPaint(hwnd);
-                    return 0;
-                }
-                // Also completes closes whose PostMessageW failed because the
-                // UI queue was full. Successful posts are harmlessly
-                // idempotent if this paint reaches the pending state first.
-                external_windows.closePendingExternalWindowsOnUIThread(app);
-                app.wm_paint_in_progress = true;
-                defer {
-                    app.wm_paint_in_progress = false;
-                    _ = app.finishActiveOperation();
-                }
-
-                var ps: c.PAINTSTRUCT = undefined;
-                const begin_hdc = c.BeginPaint(hwnd, &ps);
-                defer _ = c.EndPaint(hwnd, &ps);
-                if (log_enabled) {
-                    applog.appLog(
-                        "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
-                        .{
-                            @intFromBool(begin_hdc != null),
-                            ps.rcPaint.left,
-                            ps.rcPaint.top,
-                            ps.rcPaint.right,
-                            ps.rcPaint.bottom,
-                            @intFromBool(ps.fErase != 0),
-                            @intFromBool(app.wm_paint_reinvalidate_all),
-                        },
-                    );
-                }
-
-                // While minimized, GetClientRect returns the iconic size
-                // (e.g. 160x28); letting drawEx → resize run would shrink
-                // swapchain/back_tex to that size and discard their contents,
-                // so the next restore would Present an empty surface as a
-                // gray rectangle. BeginPaint/EndPaint above still consumes
-                // the paint region so Windows stops re-issuing WM_PAINT.
-                if (c.IsIconic(hwnd) != 0) {
-                    return 0;
-                }
-
-                // Log first paint with content timing (startup performance)
-                if (!app.first_paint_logged and app.renderer != null) {
-                    if (log_enabled) {
-                        var first_paint_t: c.LARGE_INTEGER = undefined;
-                        _ = c.QueryPerformanceCounter(&first_paint_t);
-                        const first_paint_ms = @divTrunc((first_paint_t.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
-                        applog.appLog("[TIMING] First WM_PAINT (renderer ready): {d}ms from main()\n", .{first_paint_ms});
-                    }
-                    app.first_paint_logged = true;
-                }
-
-                // Renderer not yet initialized (deferred init pending). Fill
-                // the paint rect with the colorscheme bg if Neovim has
-                // already pushed default_colors_set; otherwise fall back to
-                // black to match the legacy behavior. Without the bg path,
-                // the early frames of startup show a black flash even when
-                // the colorscheme is light.
-                if (app.renderer == null) {
-                    const hdc = ps.hdc;
-                    app.mu.lockUncancelable(core.clock.io());
-                    const bg_rgb = app.colorscheme_bg;
-                    app.mu.unlock(core.clock.io());
-                    if (bg_rgb != 0xFFFFFFFF) {
-                        // Win32 COLORREF is 0x00BBGGRR — swap from our 0x00RRGGBB.
-                        const r: u32 = (bg_rgb >> 16) & 0xFF;
-                        const g: u32 = (bg_rgb >> 8) & 0xFF;
-                        const b: u32 = bg_rgb & 0xFF;
-                        const colorref: c.COLORREF = @intCast((b << 16) | (g << 8) | r);
-                        if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling bg=0x{x:0>6}", .{bg_rgb});
-                        const brush = c.CreateSolidBrush(colorref);
-                        if (brush != null) {
-                            _ = c.FillRect(hdc, &ps.rcPaint, brush);
-                            _ = c.DeleteObject(@ptrCast(brush));
-                        } else {
-                            const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
-                            _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
-                        }
-                    } else {
-                        if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling black (bg unset)", .{});
-                        const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
-                        _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
-                    }
-                    return 0;
-                }
-
-                var dirty: ?c.RECT =
-                    if (ps.rcPaint.right > ps.rcPaint.left and ps.rcPaint.bottom > ps.rcPaint.top)
-                        ps.rcPaint
-                    else
-                        null;
-
-                // Consume need_full_seed ONCE here.
-                const did_need_seed = app.need_full_seed.swap(false, .seq_cst);
-                if (did_need_seed) {
-                    // Keep rows/cols synced to client size before we snapshot row-mode state.
-                    app.mu.lockUncancelable(core.clock.io());
-                    updateRowsColsFromClientForce(hwnd, app);
-                    app.mu.unlock(core.clock.io());
-
-                    // IMPORTANT: do not hold app.mu while calling into core.
-                    updateLayoutToCore(hwnd, app);
-
-                    // Force full redraw request on this paint.
-                    dirty = null;
-
-                    // Ensure we get a paint covering the whole surface.
-                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                    app_mod.requestMainFullPaint(app);
-                }
-
-                // Note: row_mode/rows/main_verts length are logged after snapshotting under lock.
-                // if (dirty) |r| {
-                //     applog.appLog("[win]   dirty_rect=({d},{d})-({d},{d})\n", .{ r.left, r.top, r.right, r.bottom });
-                // }
-
-                // Phase timing for WM_PAINT
-                var t_snapshot_start_ns: i128 = 0;
-                var t_snapshot_end_ns: i128 = 0;
-                var t_atlas_end_ns: i128 = 0;
-                if (log_enabled) {
-                    t_snapshot_start_ns = core.clock.nowNs();
-                }
-
-                const glow = app_mod.glowPaintSettings(app);
-                const glow_enabled = glow.enabled;
-                const glow_intensity = glow.intensity;
-                const glow_radius_scale = glow.radius_scale;
-
-                // The atlas transaction must cover the TBS and atlas snapshots,
-                // not only the eventual draw. Otherwise a reset can commit
-                // between acquireForPaint() and a later admission check, leaving
-                // this paint with old UVs and the newly uploaded atlas.
-                if (!app.beginAtlasPaintOrRequestFull(&app.surf.tbs)) return 0;
-                defer app.endAtlasPaint();
-
-                // Step 1: TBS acquire (rotation_mu short lock).
-                // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
-                const tbs_snapshot = app.surf.tbs.acquireForPaint(app.alloc);
-                defer if (app_mod.releasePaintSnapshot(
-                    &app.surf.tbs,
-                    tbs_snapshot,
-                    &app.surf.paint_retry,
-                    app.atlas_reset_active.load(.seq_cst),
-                )) {
-                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                };
-                const committed = &app.surf.tbs.sets[tbs_snapshot.committed_index];
-                const committed_cursor = &app.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
-
-                // Step 2: UI metadata snapshot (app.mu short lock).
-                app.mu.lockUncancelable(core.clock.io());
-                app.surf.has_committed_cursor = committed_cursor.verts.items.len > 0;
-                if (app.surf.surface.rows == 0) {
-                    updateRowsColsFromClient(hwnd, app);
-                }
-
-                // Read vertex-related state from TBS committed set (refcount-protected, lock-free).
-                const row_mode = committed.row_mode;
-                // The generation this committed set's vertices were generated
-                // against. `row_layout_gen` and `shared_metrics_gen` are bumped
-                // together, but the only gate below compares `row_layout_gen`
-                // to THIS paint's snapshot — i.e. the already-new value — so a
-                // paint landing after a guifont/linespace/DPI change and before
-                // the core's re-flush passed it and drew the old set against the
-                // new row height. Rows and columns need not have changed, so the
-                // rows_mismatch test does not catch it either. The external
-                // driver has always refused such a set.
-                const committed_metrics_gen = committed.metrics_gen;
-                const rows_snapshot: u32 = committed.rows;
-                const row_verts_len: u32 = @intCast(committed.row_map.items.len);
-
-                // Read UI metadata under app.mu.
-                const seed_pending_snapshot = app.seed_pending;
-                const seed_clear_pending_snapshot = app.seed_clear_pending;
-                const back_tex_valid_snapshot = app.back_tex_valid;
-                // The surface's own "repaint everything" request, consumed the
-                // way the external driver consumes its copy. Every setter also
-                // raised a seed flag or the TBS one, so this driver never read
-                // it; a setter that raises only this one now reaches a paint.
-                const surface_paint_full_snapshot = app.surf.surface.paint_full;
-                app.surf.surface.paint_full = false;
-                const row_valid_count_snapshot = app.row_valid_count;
-                const row_layout_gen_snapshot: u64 = app.row_layout_gen;
-                const shared_metrics_gen_snapshot: u64 = app.shared_metrics_gen;
-                const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
-                const row_h_px_snapshot: u32 = app.rowHeightPx();
-                const scrollbar_alpha_snapshot = app.surf.scrollbar.alpha;
-
-                // IMPORTANT: do NOT copy renderer/atlas structs here.
-                // Take pointers to the option payloads instead.
-                var atlas_ptr: ?*dwrite_d2d.Renderer = null;
-                var gpu_ptr: ?*d3d11.Renderer = null;
-                if (app.atlas) |*a| atlas_ptr = a;
-                if (app.renderer) |*g| gpu_ptr = g;
-                // Pulled every paint, as the external driver does: a push from
-                // default_colors_set missed a renderer created later (deferred
-                // init, device-lost recovery), which then cleared black.
-                if (gpu_ptr) |g| {
-                    if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
-                }
-                var atlas_reset_consumed = false;
-                var atlas_generation: u64 = 0;
-
-                // If the glyph atlas was reset, all cached row vertex UVs are stale.
-                // Request a full re-seed so the core regenerates every row.
-                // Guard with renderer mutex (recreateAtlasTexture sets the flag
-                // under a.mu).
-                if (atlas_ptr) |a| {
-                    const gen = app_mod.atlasPaintGeneration(a, true);
-                    atlas_generation = gen.generation;
-                    if (gen.reset) {
-                        // The texture itself is resized by syncSharedAtlas
-                        // below, after app.mu is released (D3D creation can
-                        // pump messages).
-                        atlas_reset_consumed = true;
-                        app.need_full_seed.store(true, .seq_cst);
-                        app_mod.requestMainFullPaintLocked(app);
-                        // The full atlas upload a reset owes is asked below of
-                        // the generation the reset bumped.
-                    }
-                }
-
-                // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
-                // The bitset iterator yields sorted, unique row indices — no dedup needed.
-                const dirty_row_keys = &app.surf.paint.dirty_row_keys;
-                dirty_row_keys.clearRetainingCapacity();
-                var paint_snapshot_ok = true;
-
-                if (row_mode) {
-                    paint_snapshot_ok = app.surf.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
-                }
-
-                // Use committed.rows (content rows from core) as the baseline,
-                // not app.surf.surface.rows (global grid rows) which includes
-                // tabline/statusline rows that never receive vertex data.
-                var effective_rows: u32 = committed.rows;
-                var rows_mismatch: bool = false;
-                if (row_mode and row_mode_max_row_end_snapshot != 0 and row_mode_max_row_end_snapshot < effective_rows) {
-                    effective_rows = row_mode_max_row_end_snapshot;
-                    rows_mismatch = true;
-                }
-                const effective_row_valid_count: u32 =
-                    if (effective_rows < row_valid_count_snapshot) effective_rows else row_valid_count_snapshot;
-
-                const paint_rects_snapshot = &app.wm_paint_rects_snapshot;
-                paint_rects_snapshot.clearRetainingCapacity();
-                paint_rects_snapshot.ensureTotalCapacity(app.alloc, app.paint_rects.items.len) catch {
-                    paint_snapshot_ok = false;
-                };
-                if (paint_snapshot_ok) {
-                    paint_rects_snapshot.appendSliceAssumeCapacity(app.paint_rects.items);
-                    app.paint_rects.clearRetainingCapacity();
-                }
-
-                const paint_full_snapshot = tbs_snapshot.paint_full;
-
-                app.mu.unlock(core.clock.io());
-
-                if (!paint_snapshot_ok) {
-                    recoverMainPaintFailure(hwnd, app);
-                    return 0;
-                }
-
-                // A set generated against metrics this paint no longer has is
-                // refused before anything is drawn, as the external driver
-                // refuses it: drawn first, its rows reached back_tex at the old
-                // row height and only the present was refused. The present-time
-                // check below stays for a change landing during the draw. After
-                // the atlas recreate above, which this paint has already
-                // consumed the request for (the texture follows the atlas's
-                // size at every sync, so nothing is lost).
-                if (row_mode and committed_metrics_gen != shared_metrics_gen_snapshot) {
-                    recoverMainPaintFailure(hwnd, app);
-                    return 0;
-                }
-
-                if (log_enabled) {
-                    t_snapshot_end_ns = core.clock.nowNs();
-                }
-
-                if (log_enabled) {
-                    applog.appLog(
-                        "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d}\n",
-                        .{
-                            ps.rcPaint.left,                       ps.rcPaint.top,                        ps.rcPaint.right,                 ps.rcPaint.bottom,
-                            if (dirty == null) "null" else "rect", @as(u32, @intFromBool(did_need_seed)), @as(u32, @intFromBool(row_mode)), rows_snapshot,
-                            row_verts_len,
-                        },
-                    );
-                    if (row_mode and rows_mismatch) {
-                        applog.appLog(
-                            "[win] WM_PAINT(row) WARN rows_mismatch rows={d} max_row_end={d} row_verts_len={d}\n",
-                            .{ rows_snapshot, row_mode_max_row_end_snapshot, row_verts_len },
-                        );
-                    }
-                }
-
-                // The shared atlas texture: resized, then the uploads it is
-                // owed, whichever window's paint comes first.
-                var atlas_uploaded = false;
-                if (atlas_ptr) |a| {
-                    if (gpu_ptr) |g| {
-                        g.lockContext();
-                        defer g.unlockContext();
-                        const sync = app_mod.syncSharedAtlas(app, a, g, atlas_generation, &app.surf.atlas_seen_upload_seq);
-                        if (!sync.ok) {
-                            // Do not draw against a texture missing pixels
-                            // committed UVs reference. A consumed reset stays
-                            // owed, for the re-seed it drives.
-                            if (atlas_reset_consumed) {
-                                a.mu.lockUncancelable(core.clock.io());
-                                a.atlas_reset_pending = true;
-                                a.mu.unlock(core.clock.io());
-                            }
-                            recoverMainPaintFailure(hwnd, app);
-                            if (log_enabled) applog.appLog("[win] atlas sync failed; requeued full paint\n", .{});
-                            return 0;
-                        }
-                        atlas_uploaded = sync.uploaded;
-                    }
-                }
-                if (log_enabled and atlas_uploaded) {
-                    applog.appLog("[win] atlas_uploads flushed (cursor={d})\n", .{app.atlas_upload_cursor});
-                }
-                if (log_enabled) {
-                    t_atlas_end_ns = core.clock.nowNs();
-                }
-
-                var render_ok = false;
-                if (gpu_ptr) |g| {
-                    // Lock D3D context for thread-safe rendering
-                    g.lockContext();
-                    defer g.unlockContext();
-
-                    // The resize the external driver does before drawing. A
-                    // WM_SIZE deferred while an external window was being
-                    // created left the swapchain at the old size; drawEx then
-                    // recreated back_tex mid-paint and kept only the dirty rows
-                    // of the new one while still reporting it valid.
-                    // A failed resize fails the paint, as on the external
-                    // driver: drawing on would retry it inside drawEx and
-                    // report a partial frame over a fresh back_tex valid.
-                    const resized_before_draw = app_mod.resizeSurfaceIfNeeded(g, false) catch |e| {
-                        if (applog.isEnabled()) applog.appLog("[win] WM_PAINT pre-draw resize failed: {any}\n", .{e});
-                        recoverMainPaintFailure(hwnd, app);
-                        return 0;
-                    };
-
-                    // Calculate content width for "always" scrollbar mode
-                    var client_for_content: c.RECT = undefined;
-                    _ = c.GetClientRect(hwnd, &client_for_content);
-                    const client_width_u32: u32 = @intCast(@max(1, client_for_content.right - client_for_content.left));
-                    const content_width: ?u32 = if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
-                        getEffectiveContentWidth(app, client_width_u32)
-                    else
-                        null;
-
-                    // Where grid 1 starts: the rule the hit tests and the
-                    // cursor damage rect use. Both chrome sizes are non-zero,
-                    // so a zero offset means no tabbar / left sidebar.
-                    const origin = input.surfaceOriginPx(app, true);
-                    const content_y_offset: ?u32 = if (origin.y > 0) @intCast(origin.y) else null;
-                    const content_x_offset: ?u32 = if (origin.x > 0) @intCast(origin.x) else null;
-
-                    // Sidebar right width (reduces content area from right edge)
-                    const sidebar_right_width: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
-                        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                    else
-                        null;
-
-                    // Tabbar background color - fallback strip shown if the
-                    // tabline texture is not yet generated (initial frame or
-                    // update failure). Track the OS light/dark theme cache so
-                    // the fallback matches currentTitlebarPalette().bar_bg
-                    // (RGB(32,32,32) dark / RGB(240,240,240) light).
-                    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
-                        (if (g_os_dark_theme_cached)
-                            [4]f32{ 32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0 }
-                        else
-                            [4]f32{ 240.0 / 255.0, 240.0 / 255.0, 240.0 / 255.0, 1.0 })
-                    else
-                        null;
-                    const content_x_offset_i32: i32 = if (content_x_offset) |off| @intCast(off) else 0;
-                    const content_y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                    const content_right_i32 = render_helpers.mainContentRightPx(
-                        content_width,
-                        client_width_u32,
-                        content_x_offset orelse 0,
-                        sidebar_right_width orelse 0,
-                    );
-
-                    // Snap viewport height to cell boundaries to match core's NDC calculation.
-                    // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
-                    // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
-                    // misalignment between vertex positions and scissor rects (which causes stripes).
-                    const content_height: u32 = app_mod.snappedContentHeight(
-                        @intCast(@max(1, client_for_content.bottom - client_for_content.top)),
-                        row_h_px_snapshot,
-                        content_y_offset orelse 0,
-                    );
-
-                    // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
-                    // This avoids DWM composition issues by keeping GDI rendering offscreen
-                    if (app.ext_tabline_enabled) {
-                        if (app.tabline_style == .titlebar) {
-                            const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
-                            const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
-                            tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
-                        } else if (app.tabline_style == .sidebar) {
-                            // Called unconditionally: unlike the tabline, the sidebar
-                            // has no tab_count gate, and it draws an empty strip rather
-                            // than releasing anything when there are no tabs.
-                            const sw: u32 = @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))));
-                            const sh: u32 = @intCast(@max(1, client_for_content.bottom));
-                            tabline_mod.renderSidebarToD3D(app, sw, sh);
-                        }
-                    }
-
-                    if (!row_mode) {
-                        app.surf.dropRowVBs(app);
-
-                        // A mode transition can leave a row-mode scrollbar in
-                        // retained back_tex. Restore it and widen this flat
-                        // draw's damage so the clean strip is also presented.
-                        const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
-                            if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
-                            recoverMainPaintFailure(hwnd, app);
-                            return 0;
-                        };
-                        if (restored_scrollbar_rect) |restored_rect| {
-                            dirty = if (dirty) |old| callbacks.unionRect(old, restored_rect) else restored_rect;
-                        }
-
-                        // Before the first row commit: background and chrome
-                        // only. Do NOT hold app.mu here: Present can pump
-                        // Win32 messages, and a re-entrant handler taking
-                        // app.mu would self-deadlock.
-                        non_row: {
-                            g.drawEx(&.{}, &.{}, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity }) catch |e| {
-                                if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
-                                break :non_row;
-                            };
-                            var dirty_rects: [1]c.RECT = undefined;
-                            if (dirty) |r| dirty_rects[0] = r;
-                            g.presentFromBack(dirty_rects[0..@intFromBool(dirty != null)], dirty == null) catch |e| {
-                                if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
-                                break :non_row;
-                            };
-                            render_ok = true;
-                            // No row is committed yet, so a background-only
-                            // frame is the whole content: back_tex is valid if
-                            // drawEx kept a valid one (it clears on dirty ==
-                            // null or opacity < 1.0) or redrew all of it.
-                            const draw_preserved =
-                                back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
-                            const rendered_complete =
-                                !seed_pending_snapshot and dirty == null;
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.back_tex_valid = draw_preserved or rendered_complete;
-                            app.mu.unlock(core.clock.io());
-                        }
-                    } else {
-                        // --- Row-mode ---
-                        var t_row_start_ns: i128 = 0;
-                        var t_present_start_ns: i128 = 0;
-                        if (log_enabled) {
-                            t_row_start_ns = core.clock.nowNs();
-                        }
-
-                        // Build sorted, deduplicated list of rows to draw.
-                        const rows_to_draw = &app.surf.paint.rows_to_draw;
-
-                        // Transparency mode (opacity<1.0) must force full rows too:
-                        // preserve_back=false clears back_tex entirely in drawEx, so if only
-                        // dirty rows are drawn the unchanged rows disappear.  Matches
-                        // drawNormalExtRowMode's force_full_rows logic for external windows.
-                        //
-                        // seed_pending alone no longer forces a full redraw: when
-                        // back_tex_valid_snapshot is true the previous frame is preserved on
-                        // back_tex, so incremental dirty/scroll updates suffice. Limiting the
-                        // seed_pending reason to !back_tex_valid_snapshot keeps the
-                        // fresh-from-scratch seed path (initial attach, real resize) doing
-                        // full redraws while restoring partial-redraw / DXGI scroll fast paths
-                        // when the seed has stuck for unrelated reasons (e.g. zero validity
-                        // bits propagated through swapAndShiftRows after WM_SIZE no-op).
-                        //
-                        // seed_clear_pending_snapshot is the tight coupling: whenever the
-                        // back_tex is going to be cleared this frame (preserve_back=false via
-                        // the seed_clear branch), every row must be redrawn. Not every
-                        // seed_clear_pending setter co-sets paint_full / need_full_seed (e.g.
-                        // the on_vertices_row dimension-change path at callbacks.zig:1067), so
-                        // relying on those flags alone leaves a window where back_tex is
-                        // cleared but only dirty rows are drawn — non-dirty rows show the
-                        // clear color until Neovim re-sends grid_line.
-                        //
-                        // An empty ps.rcPaint is not a redraw-all request. Every
-                        // Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so the
-                        // paint DC has no visible region and BeginPaint clips
-                        // rcPaint to nothing on every paint. The app's own damage
-                        // (tbs.pending_dirty -> dirty_row_keys, plus
-                        // paint_full_snapshot) is what computeRowsToDraw reads.
-                        // A cursor that moved to another grid forces one too.
-                        // cursor_erase_rows below carries the row the LAST paint
-                        // drew the cursor on, and that row belongs to whichever
-                        // grid held the cursor then; everything that places it
-                        // — the rows_to_draw insert, markLayerCursorRow — uses
-                        // the grid holding it now. Under ext_multigrid every
-                        // window is a layer, so a cursor leaving one would have
-                        // its old row repainted in the wrong window and the old
-                        // block would stay. A window switch is a user action and
-                        // already repaints most of the surface. Same reasoning,
-                        // and the same fix, as drawNormalExternalSurfaceRowMode.
-                        const cursor_grid_changed =
-                            tbs_snapshot.cursor_layer_grid_id != app.surf.paint.last_painted_cursor_grid;
-                        // Everything seed-shaped is this driver's own
-                        // "repaint everything" request; the terms both drivers
-                        // share live in render_helpers.paintPolicy.
-                        const paint_policy = render_helpers.paintPolicy(.{
-                            .force_full =
-                                resized_before_draw or
-                                did_need_seed or
-                                paint_full_snapshot or
-                                surface_paint_full_snapshot or
-                                seed_clear_pending_snapshot or
-                                (seed_pending_snapshot and !back_tex_valid_snapshot),
-                            .cursor_grid_changed = cursor_grid_changed,
-                            .glow_enabled = glow_enabled,
-                            .opacity = g.opacity,
-                            .back_tex_valid = back_tex_valid_snapshot,
-                        });
-                        const force_full_rows = paint_policy.force_full_rows;
-
-                        if (log_enabled) {
-                            applog.appLog(
-                                "[win] force_full_rows={d} seed={d} nodirty={d} paintfull={d} seedclear={d} seedpend_notex={d} glow={d} opacity={d}\n",
-                                .{
-                                    @intFromBool(force_full_rows),
-                                    @intFromBool(did_need_seed),
-                                    @intFromBool(dirty == null),
-                                    @intFromBool(paint_full_snapshot),
-                                    @intFromBool(seed_clear_pending_snapshot),
-                                    @intFromBool(seed_pending_snapshot and !back_tex_valid_snapshot),
-                                    @intFromBool(glow_enabled),
-                                    @intFromBool(g.opacity < 1.0),
-                                },
-                            );
-                        }
-
-                        const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
-                        const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
-
-                        if (!app_mod.computeRowsToDraw(
-                            app.alloc,
-                            rows_to_draw,
-                            force_full_rows,
-                            dirty_row_keys.items,
-                            total_rows_for_enum,
-                            max_valid_row,
-                        )) {
-                            recoverMainPaintFailure(hwnd, app);
-                            return 0;
-                        }
-
-                        // If atlas was uploaded but no rows will be drawn in this frame,
-                        // request a full repaint so newly uploaded glyphs become visible.
-                        if (render_helpers.atlasUploadOwesFullPaint(atlas_uploaded, rows_to_draw.items.len != 0)) {
-                            app_mod.requestMainFullPaint(app);
-                            app.surf.tbs.requestFullPaint();
-                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                        }
-
-                        if (log_enabled) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) force_full_rows={d} rows_to_draw={d} dirty_keys={d} row_verts_len={d}\n",
-                                .{
-                                    @as(u32, @intFromBool(force_full_rows)),
-                                    rows_to_draw.items.len,
-                                    dirty_row_keys.items.len,
-                                    row_verts_len,
-                                },
-                            );
-                            if (force_full_rows and effective_rows == 0) {
-                                applog.appLog(
-                                    "[win] WM_PAINT(row) WARN rows_unknown skip_present rows_to_draw={d} row_verts_len={d}\n",
-                                    .{ rows_to_draw.items.len, row_verts_len },
-                                );
-                            }
-                            if (force_full_rows and effective_rows != 0 and rows_to_draw.items.len != effective_rows) {
-                                applog.appLog(
-                                    "[win] WM_PAINT(row) WARN partial_full_rows rows={d} rows_to_draw={d}\n",
-                                    .{ effective_rows, rows_to_draw.items.len },
-                                );
-                            }
-                            if (!force_full_rows and rows_to_draw.items.len == 0 and (dirty_row_keys.items.len != 0 or paint_rects_snapshot.items.len != 0)) {
-                                applog.appLog(
-                                    "[win] WM_PAINT(row) WARN empty_rows_to_draw rows={d} row_verts_len={d} dirty_keys={d} paint_rects={d}\n",
-                                    .{ rows_snapshot, row_verts_len, dirty_row_keys.items.len, paint_rects_snapshot.items.len },
-                                );
-                            }
-                        }
-
-                        // --- Build present dirty from actual drawn row_rc + cursor_rc (don't use rcPaint) ---
-                        // Read cursor verts from TBS committed set (refcount-protected, lock-free).
-                        const cursor_verts_snapshot: []const core.Vertex = committed_cursor.verts.items;
-                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cursor_verts_snapshot.len});
-                        var client: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client);
-
-                        // Core vertices are grid-local pixels. The root grid's
-                        // layer sits at the surface origin, but a cursor in
-                        // any other grid the surface draws as a layer needs
-                        // that layer's origin added before its position means
-                        // anything in screen space.
-                        // Keyed on the grid the snapshot says holds the cursor,
-                        // the same transaction as the vertices.
-                        const cursor_layer_origin_px = render_helpers.layerOriginPx(
-                            app_mod.SurfaceLayer,
-                            tbs_snapshot.layers.slice(),
-                            tbs_snapshot.cursor_layer_grid_id,
-                            1,
-                        );
-                        const cursor_layer_x_px: f32 = @floatFromInt(cursor_layer_origin_px[0]);
-                        const cursor_layer_y_px: f32 = @floatFromInt(cursor_layer_origin_px[1]);
-
-                        // Where the cursor's grid sits on the surface: its
-                        // layer's origin plus the content viewport's, the same
-                        // translation the row pass draws it with. One bounds
-                        // serves both the damage rectangle and the shader
-                        // uniform; they used to be two loops over the same
-                        // vertices, one integer and one float.
-                        const cursor_origin_x: f32 = @as(f32, @floatFromInt(content_x_offset orelse 0)) + cursor_layer_x_px;
-                        const cursor_origin_y: f32 = @as(f32, @floatFromInt(content_y_offset orelse 0)) + cursor_layer_y_px;
-                        const cursor_bounds = core.cursor_rect.bounds(
-                            core.Vertex,
-                            cursor_verts_snapshot,
-                            cursor_origin_x,
-                            cursor_origin_y,
-                        );
-                        // The damage consumer needs whole pixels, clipped to
-                        // the client; an empty result is dropped rather than
-                        // handed on.
-                        const cursor_rc_opt: ?c.RECT = if (cursor_bounds) |cb| blk: {
-                            const ir = core.cursor_rect.inflateClip(cb, client.right, client.bottom) orelse break :blk null;
-                            break :blk .{ .left = ir.left, .top = ir.top, .right = ir.right, .bottom = ir.bottom };
-                        } else null;
-
-                        // Feed cursor state into the custom shader uniforms
-                        // (Ghostty 1.1+ iCurrentCursor / iPreviousCursor /
-                        // iTimeCursorChange etc.). No-op when the rect + color
-                        // match the last call. Ghostty's cursor shaders read
-                        // the y component as the BOTTOM edge of the rect
-                        // (center is `y - h/2`, rect spans `y-h..y`).
-                        if (cursor_bounds) |cb| {
-                            if (app.renderer) |*r_sh| {
-                                r_sh.setCursorShaderState(
-                                    .{ cb.left, cb.bottom, cb.width(), cb.height() },
-                                    cursor_verts_snapshot[0].color,
-                                );
-                            }
-                        }
-
-                        // cell_h + linespace, as the external driver reads it.
-                        const row_h_px_u32: u32 = row_h_px_snapshot;
-                        const row_h_px: i32 = @intCast(row_h_px_u32);
-
-                        // Where the cursor's own layer sits, so the overlay is
-                        // placed with that layer's transform rather than the
-                        // root grid's. The grid id comes from the same
-                        // transaction as the cursor vertices.
-                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
-                        const cursor_layer_origin: [2]f32 = .{ cursor_layer_x_px, cursor_layer_y_px };
-
-                        // The rows the cursor overlay would otherwise erase:
-                        // where the previous cursor was baked into back_tex,
-                        // and where this one lands. Both are grid-local rows of
-                        // the cursor's own grid. Repainting them from that
-                        // grid's vertices is what removes the previous cursor,
-                        // so the overlay's blink-off clear — a full-content-
-                        // width band it can only refill from one grid — never
-                        // has to run.
-                        const cursor_erase_rows: [2]?u32 = .{
-                            app.surf.paint.last_painted_cursor_row,
-                            committed_cursor.last_cursor_row,
-                        };
-                        render_helpers.insertCursorEraseRows(
-                            app.alloc,
-                            rows_to_draw,
-                            cursor_erase_rows,
-                            max_valid_row,
-                            cursor_grid == 1,
-                        );
-
-                        // Reserve every rect this paint can add: one span per
-                        // dirty row, the copied paint damage, one per layer,
-                        // and eight singletons — restored and captured
-                        // scrollbar, rcPaint, gutter, cursor, three chrome
-                        // strips.
-                        var present = app_mod.PresentRectBuilder.begin(
-                            &app.surf.paint.present_rects,
-                            app.alloc,
-                            rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 8,
-                        );
-                        const present_rects = present.list;
-
-                        // The scrollbar is alpha-blended into retained back_tex.
-                        // Restore only its narrow saved underlay before applying
-                        // this frame's row/cursor updates; the returned strip is
-                        // real back_tex damage and must reach every swapchain
-                        // buffer through the per-buffer damage queue.
-                        const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
-                            if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
-                            recoverMainPaintFailure(hwnd, app);
-                            return 0;
-                        };
-                        present.addOpt(restored_scrollbar_rect);
-
-                        // Build full-width present_rects initially.
-                        // After the row drawing loop, we may replace with cursor rects if no content changed.
-                        // Add content_y_offset for ext_tabline (present_rects are in screen coords)
-                        const present_y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                        if (rows_to_draw.items.len != 0) {
-                            present.addRowSpans(rows_to_draw.items, present_y_offset, client.right, row_h_px);
-                        } else {
-                            present.addOpt(dirty);
-                        }
-
-                        // Always include explicit paint rects (cursor damage) in present set.
-                        for (paint_rects_snapshot.items) |r| present.add(r);
-                        present.addOpt(cursor_rc_opt);
-
-                        // row-setup drawEx is the ONLY drawEx in row-mode WM_PAINT.
-                        // When did_need_seed is true, we must NOT preserve old back buffer contents,
-                        // so integrate "seed-clear" behavior here (no extra drawEx).
-                        // With TBS, committed set is read-only — only clear row_valid under app.mu.
-                        app.mu.lockUncancelable(core.clock.io());
-
-                        // Use the snapshot rather than a live re-read so seed_clear matches the
-                        // value force_full_rows above was computed from. If an RPC callback
-                        // (e.g. on_vertices_row dimension change) sets app.seed_clear_pending
-                        // between the snapshot and this point, the new request is handled by
-                        // the next WM_PAINT — never in a frame where force_full_rows was false.
-                        const seed_clear = did_need_seed or seed_clear_pending_snapshot;
-                        if (seed_clear) {
-                            // Only consume the pending flag when no RPC dimension change has
-                            // landed since the snapshot. A bumped row_layout_gen means the new
-                            // committed set will need its own clear at the new dimensions;
-                            // leaving seed_clear_pending=true defers that to the next paint.
-                            if (app.row_layout_gen == row_layout_gen_snapshot) {
-                                app.seed_clear_pending = false;
-                            }
-                            // Only unset validity for rows beyond current grid
-                            const current_rows = committed.rows;
-                            var clear_idx: usize = current_rows;
-                            while (clear_idx < app.row_valid.bit_length) : (clear_idx += 1) {
-                                if (app.row_valid.isSet(clear_idx)) {
-                                    app.row_valid.unset(clear_idx);
-                                    if (app.row_valid_count > 0) {
-                                        app.row_valid_count -= 1;
-                                    }
-                                }
-                            }
-                        }
-                        app.mu.unlock(core.clock.io());
-
-                        // Gate preservation on back_tex_valid (mirror of macOS hasPresentedOnce
-                        // plus explicit invalidation on font/linespace/DPI changes) rather than
-                        // on !seed_pending. seed_pending alone gets stuck in a dead state when
-                        // a scroll arrives before Neovim finishes re-sending grid_line for all
-                        // rows: swapAndShiftRows propagates zero validity bits through every
-                        // shifted slot, row_valid_count never reaches total_rows, and the old
-                        // gating cleared back_tex on every frame.
-                        // Transparency mode (opacity<1.0) must still force clear: premultiplied
-                        // alpha blending accumulates on retained back_tex, producing faint ghost
-                        // text on rows that are drawn over without an intervening clear (matches
-                        // external window logic in drawNormalExtRowMode).
-                        // From the shared policy above. It is stricter than the
-                        // terms spelled out here used to be — it also refuses on
-                        // paint_full and on a cursor that changed grid — but every
-                        // case it newly refuses is one where force_full_rows is
-                        // true and every row redraws anyway, and the chrome is
-                        // regenerated each paint regardless.
-                        const preserve_back = paint_policy.preserve_back;
-                        if (log_enabled) applog.appLog(
-                            "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
-                            .{
-                                @as(u32, @intFromBool(preserve_back)),
-                                @as(u32, @intFromBool(did_need_seed)),
-                                @as(u32, @intFromBool(seed_pending_snapshot)),
-                                @as(u32, @intFromBool(seed_clear)),
-                            },
-                        );
-
-                        const row_draw_params = app_mod.RowModeDrawParams{
-                            .content_height = content_height,
-                            .row_h_px = row_h_px,
-                            .x_offset = content_x_offset_i32,
-                            .y_offset = content_y_offset_i32,
-                            .content_right = content_right_i32,
-                            .preserve_back = preserve_back,
-                            // Per-row scissor when we're either past seed mode or
-                            // preserving a valid back_tex (incremental updates on top of
-                            // a previously-painted frame). Only the fresh-from-scratch
-                            // seed path (back_tex_valid=false) keeps the full-area scissor.
-                            .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
-                            .root_rows_may_be_empty = tbs_snapshot.layers.len > 1,
-                            .content_width = content_width,
-                            .content_y_offset = content_y_offset,
-                            .content_x_offset = content_x_offset,
-                            .sidebar_right_width = sidebar_right_width,
-                            .tabbar_bg_color = tabbar_bg_color,
-                            // The root layer drives the pixel space core
-                            // vertices arrive in. It sits at the surface origin
-                            // today; an anchored float will carry its own
-                            // offset once the core emits multi-layer layouts.
-                            .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
-                            .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
-                            // Under ext_multigrid the root grid carries only
-                            // chrome, so the glow pass has to extract the
-                            // layers as well or the buffer text never lights.
-                            .bloom_layers = if (tbs_snapshot.layers.len > 1)
-                                app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
-                            else
-                                null,
-                        };
-
-                        // Shared with the external driver: row VBs, the scroll
-                        // pixel shift, the layer plan under app.mu (after the
-                        // renderer context, the order the layer draw uses), then
-                        // the row frame. Layer present rects are added in the
-                        // plan's own app.mu hold: added in a hold of their own
-                        // before it, a layer the core dirtied in between was
-                        // drawn but not presented until the next paint.
-                        const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.surf), .{
-                            .snapshot = tbs_snapshot,
-                            .rows_to_draw = rows_to_draw,
-                            .row_vb_len = committed.row_map.items.len,
-                            .total_rows = effective_rows,
-                            .preserve_back = preserve_back,
-                            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
-                            .layer_present = .{
-                                .rects = present_rects,
-                                .right = client.right,
-                                .bottom = client.bottom,
-                            },
-                            .frame = .{
-                                .root_grid_id = 1,
-                                .layers = &.{},
-                                .row_map = committed.row_map.items,
-                                .rows_to_draw = &.{},
-                                .cursor_verts = cursor_verts_snapshot,
-                                .cursor_row = committed_cursor.last_cursor_row,
-                                .cursor_grid = cursor_grid,
-                                .cursor_erase_rows = cursor_erase_rows,
-                                .cursor_layer_origin = cursor_layer_origin,
-                                .blink_visible = app.cursor_blink.visible,
-                                .force_full_rows = force_full_rows,
-                                .layer_layout_stale = false,
-                                .layer_commit_stale = false,
-                                .glow = if (glow_enabled) app_mod.RowFrameGlow{
-                                    .intensity = glow_intensity,
-                                    .radius_scale = glow_radius_scale,
-                                    .cursor_visible = app.cursor_blink.visible,
-                                } else null,
-                                .draw_params = row_draw_params,
-                                .log_enabled = log_enabled,
-                            },
-                        }) catch {
-                            recoverMainPaintFailure(hwnd, app);
-                            return 0;
-                        };
-                        // Add bottom gutter rect if client area extends beyond the grid area.
-                        // This ensures the gutter is properly cleared in all swapchain buffers
-                        // during partial present, preventing ghost artifacts from stale content.
-                        // The gutter starts at the snapped grid bottom (content_height, derived
-                        // from the client and row height, so never stale). It used to start at the
-                        // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
-                        // present of rows 5 to the bottom of the window.
-                        if (present_rects.items.len != 0) {
-                            const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
-                            if (grid_bottom > 0 and grid_bottom < client.bottom) {
-                                const gutter_rc: c.RECT = .{
-                                    .left = 0,
-                                    .top = grid_bottom,
-                                    .right = client.right,
-                                    .bottom = client.bottom,
-                                };
-                                present.add(gutter_rc);
-                            }
-                        }
-
-                        // The gutter and chrome bands widen only a list that
-                        // already has content, so they come after everything
-                        // that can make it non-empty, the layers included.
-                        // The chrome outside the content area — the tabline with
-                        // its close and new-tab buttons, the caption buttons, the
-                        // sidebar — is redrawn into back_tex on EVERY paint, from
-                        // hover state that produces no row damage and no paint
-                        // rect. Nothing above ever added its band here, so it
-                        // reached the screen only on a frame that happened to
-                        // present in full: the moment anything else put a rect in
-                        // this list (a blinking cursor is enough), the present
-                        // went partial and the newly drawn hover was left in
-                        // back_tex. Only widen a list that already has content —
-                        // an empty list still means "present everything", which
-                        // covers the chrome anyway.
-                        if (present_rects.items.len != 0) {
-                            if (content_y_offset_i32 > 0) {
-                                present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
-                            }
-                            if (content_x_offset_i32 > 0) {
-                                present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
-                            }
-                            if (sidebar_right_width) |rw| {
-                                const right_strip_left: i32 =
-                                    client.right - @as(i32, @intCast(rw));
-                                if (rw > 0 and right_strip_left > 0) {
-                                    present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
-                                }
-                            }
-                        }
-
-                        // The client rect can be a resize ahead of the buffer.
-                        present.finish(g.width, g.height);
-
-                        // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
-                        if (applog.isEnabled()) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) present_rects={d} (rows_to_draw={d})\n",
-                                .{ present_rects.items.len, rows_to_draw.items.len },
-                            );
-
-                            if (present_rects.items.len != 0) {
-                                var u: c.RECT = present_rects.items[0];
-                                var j: usize = 1;
-                                while (j < present_rects.items.len) : (j += 1) {
-                                    u = callbacks.unionRect(u, present_rects.items[j]);
-                                }
-
-                                applog.appLog(
-                                    "[win]   present_union=({d},{d})-({d},{d})\n",
-                                    .{ u.left, u.top, u.right, u.bottom },
-                                );
-
-                                var k: usize = 0;
-                                while (k < present_rects.items.len) : (k += 1) {
-                                    const r = present_rects.items[k];
-                                    applog.appLog(
-                                        "[win]   present[{d}]=({d},{d})-({d},{d})\n",
-                                        .{ k, r.left, r.top, r.right, r.bottom },
-                                    );
-                                }
-                            } else {
-                                applog.appLog("[win]   present_rects is EMPTY\n", .{});
-                            }
-
-                            if (cursor_rc_opt) |cr| {
-                                applog.appLog(
-                                    "[win]   cursor_rc=({d},{d})-({d},{d})\n",
-                                    .{ cr.left, cr.top, cr.right, cr.bottom },
-                                );
-                            }
-                        }
-
-                        const row_frame = pass.frame;
-                        if (row_frame.row_vb_budget_exceeded) {
-                            app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
-                            return 0;
-                        }
-
-                        if (log_enabled) applog.appLog(
-                            "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d} committed_rows={d} committed_cols={d} row_map_len={d}\n",
-                            .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
-                        );
-
-                        const row_draw_result = row_frame.rows;
-                        const drawn_rows = row_draw_result.metrics.drawn_rows;
-                        const skipped_empty = row_draw_result.metrics.skipped_empty;
-                        const failed_rows = row_draw_result.metrics.failed_rows;
-                        const first_empty_row = row_draw_result.metrics.first_empty_row;
-                        const log_vb_upload_rows = row_draw_result.metrics.vb_upload_rows;
-                        const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
-                        const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
-                        const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
-
-                        if (log_enabled) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
-                                .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
-                            );
-                            if (first_empty_row) |erow| {
-                                applog.appLog(
-                                    "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
-                                    .{ erow, rows_snapshot, row_verts_len },
-                                );
-                            }
-                        }
-
-                        if (log_enabled and force_full_rows and skipped_empty != 0) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) WARN skip_present missing_rows={d} rows={d} row_verts_len={d}\n",
-                                .{ skipped_empty, rows_snapshot, row_verts_len },
-                            );
-                        }
-
-                        if (log_enabled) {
-                            var log_present_rects_area_px: u64 = 0;
-
-                            // --- log: present_rects area (sum of rect areas) ---
-                            if (present_rects.items.len != 0) {
-                                var pi: usize = 0;
-                                while (pi < present_rects.items.len) : (pi += 1) {
-                                    const r = present_rects.items[pi];
-                                    const w_i32: i32 = r.right - r.left;
-                                    const h_i32: i32 = r.bottom - r.top;
-                                    if (w_i32 > 0 and h_i32 > 0) {
-                                        log_present_rects_area_px +=
-                                            @as(u64, @intCast(w_i32)) * @as(u64, @intCast(h_i32));
-                                    }
-                                }
-                            }
-
-                            applog.appLog(
-                                "[win] WM_PAINT(row-frame) drawn_rows={d} rows_to_draw={d} present_rects={d} present_area_px={d} vb_upload_rows={d} vb_upload_rows_bytes={d} vb_upload_cursor={d} vb_upload_cursor_bytes={d}\n",
-                                .{
-                                    drawn_rows, // NOTE: variable within row-vb block. See note below
-                                    rows_to_draw.items.len,
-                                    present_rects.items.len,
-                                    log_present_rects_area_px,
-                                    log_vb_upload_rows,
-                                    log_vb_upload_rows_bytes,
-                                    @as(u32, if (cursor_verts_snapshot.len != 0) 1 else 0),
-                                    @as(u64, cursor_verts_snapshot.len * @sizeOf(core.Vertex)),
-                                },
-                            );
-                        }
-
-                        if (log_enabled) {
-                            t_present_start_ns = core.clock.nowNs();
-                        }
-
-                        var layout_ok: bool = true;
-                        var metrics_ok: bool = true;
-                        app.mu.lockUncancelable(core.clock.io());
-                        layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
-                        metrics_ok = row_mode and committed_metrics_gen == app.shared_metrics_gen;
-                        app.mu.unlock(core.clock.io());
-
-                        // Shared with the external driver (render_helpers.presentGate);
-                        // the seed and chrome terms are this surface's own.
-                        // A paint against a newer layout or metrics, or with
-                        // rows that never reached back_tex, is refused and the
-                        // common recovery path requeues a full redraw.
-                        var present_in = render_helpers.PresentGateInputs{
-                            .layout_ok = layout_ok,
-                            .metrics_ok = !row_mode or metrics_ok,
-                            .frame_incomplete = row_frame.incomplete(),
-                            .force_full_rows = force_full_rows,
-                            .preserve_back = preserve_back,
-                            .rows = effective_rows,
-                            .rows_to_draw = rows_to_draw.items.len,
-                            .skipped_empty = skipped_empty,
-                            .custom_shader = g.custom_shader_pipelines.items.len != 0,
-                            .present_rects = present_rects.items.len,
-                            .present_rects_overflowed = present.full,
-                            .seed = .{
-                                .pending = seed_pending_snapshot,
-                                .clear = seed_clear,
-                                .back_tex_valid = back_tex_valid_snapshot,
-                                .rows_mismatch = rows_mismatch,
-                                .row_valid_count = effective_row_valid_count,
-                            },
-                            .empty_damage_presents_all = true,
-                        };
-                        const allow_present = render_helpers.presentGate(present_in).verdict == .present;
-
-                        if (log_enabled) applog.appLog(
-                            "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
-                            .{
-                                allow_present,
-                                seed_pending_snapshot,
-                                preserve_back,
-                                back_tex_valid_snapshot,
-                                rows_mismatch,
-                                effective_rows,
-                                effective_row_valid_count,
-                                skipped_empty,
-                                failed_rows,
-                                row_draw_result.metrics.empty_rows,
-                                rows_to_draw.items.len,
-                                force_full_rows,
-                                tbs_snapshot.layers.len,
-                            },
-                        );
-
-                        if (allow_present) {
-                            present_frame: {
-                                // Save only the track strip before drawing the
-                                // alpha-blended overlay. The next fade/update paint
-                                // restores this clean copy instead of clearing and
-                                // regenerating the entire row set.
-                                const captured_scrollbar_rect = scrollbar.drawOverlay(
-                                    app,
-                                    g,
-                                    scrollbar.mainSurface(hwnd, app),
-                                    scrollbar_alpha_snapshot,
-                                    client.right,
-                                    client.bottom,
-                                    &app.surf.paint.scrollbar_vb,
-                                    &app.surf.paint.scrollbar_vb_bytes,
-                                ) catch |e| {
-                                    if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
-                                    break :present_frame;
-                                };
-                                // An empty list already presents it.
-                                if (present_rects.items.len != 0) present.addOpt(captured_scrollbar_rect);
-
-                                // When seed_clear is true, the back buffer was just cleared.
-                                // We must do a full present to sync the cleared state to all swapchain buffers,
-                                // otherwise areas not covered by partial present rects may show stale content.
-                                // seed_pending alone no longer forces a full present: when
-                                // back_tex_valid_snapshot is true the swapchain has already been
-                                // synced to a complete frame, and partial present rects keep
-                                // DXGI from copying unchanged regions every paint.
-                                // A custom shader writes the complete current
-                                // swapchain buffer from inside the present
-                                // (drawCustomShaderPass), while the other
-                                // rotating buffers record only this frame's
-                                // partial damage. Mark them all full so
-                                // disabling the shader cannot expose stale
-                                // shader pixels outside the dirty rectangles.
-                                // The external driver has carried this term
-                                // since its present grew the shader pass.
-                                // Re-asked: the scrollbar overlay above can have
-                                // overflowed the rect list since the gate ran.
-                                present_in.present_rects_overflowed = present.full;
-                                const present_gate = render_helpers.presentGate(present_in);
-                                const force_full_present = present_gate.full;
-                                const present_rects_slice: []const c.RECT =
-                                    if (force_full_present) &[_]c.RECT{} else present_rects.items;
-
-                                // NOTE: an empty rect list here is read by the
-                                // renderer as whole-surface damage, so this
-                                // paint costs a full CopyResource + Present1.
-                                // Skipping it instead is WRONG: main's damage
-                                // bookkeeping covers grid rows and the cursor
-                                // only, while the tabline, its close/new-tab
-                                // buttons and the caption buttons are redrawn
-                                // into back_tex from hover state that produces
-                                // no rect at all. Skipping left every one of
-                                // those hovers invisible.
-
-
-                                if (g.presentFromBack(present_rects_slice, force_full_present)) {
-                                    render_ok = true;
-                                    // Assign back_tex_valid directly so it can also transition
-                                    // true → false in the same paint. Two paths to true:
-                                    //
-                                    //   1. preserve_back was true AND back_tex_valid_snapshot was
-                                    //      true. The previous paint left back_tex in a valid state
-                                    //      and this paint only overlaid dirty rows on top of it —
-                                    //      back_tex is still valid even if this paint didn't render
-                                    //      every row.
-                                    //
-                                    //   2. We just rendered a complete frame regardless of prior
-                                    //      state. "Complete" here is render-side completeness
-                                    //      (skipped_empty == 0 and rows_to_draw covers every row),
-                                    //      not Neovim-side validation (row_valid_count). The
-                                    //      distinction matters for minimize/restore, where
-                                    //      row_valid is unsetAll'd by WM_SIZE but row_verts still
-                                    //      holds full pre-minimize data — a seed_clear paint
-                                    //      redraws every row from that data and back_tex becomes
-                                    //      complete even with row_valid_count == 0.
-                                    //
-                                    // Both conditions fail (preserve_back=false AND incomplete
-                                    // render) → back_tex_valid falls to false. This is the
-                                    // critical case for the on_vertices_row dimension-change path:
-                                    // seed_clear bypasses the row_valid completeness check at
-                                    // allow_present and presents anyway, so without an explicit
-                                    // false-assignment a stale snapshot value would survive a
-                                    // paint that wiped back_tex.
-                                    app.mu.lockUncancelable(core.clock.io());
-                                    app.back_tex_valid = present_gate.back_tex_valid;
-                                    app.mu.unlock(core.clock.io());
-                                    // last_painted_cursor_row is tracked by drawCursorOverlay above.
-                                } else |e| {
-                                    if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
-                                }
-
-                                if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
-                                    app.mu.lockUncancelable(core.clock.io());
-                                    app.seed_pending = false;
-                                    app_mod.requestMainFullPaintLocked(app);
-                                    app.seed_clear_pending = true;
-                                    app.mu.unlock(core.clock.io());
-                                    // Also set TBS pending_paint_full for next paint cycle.
-                                    app.surf.tbs.requestFullPaint();
-                                    if (log_enabled) applog.appLog(
-                                        "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
-                                        .{ effective_rows, effective_row_valid_count },
-                                    );
-                                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                                }
-                            }
-                        } else if (log_enabled) {
-                            var resize_age_ms: i64 = -1;
-                            const last_resize_ns = app.last_resize_ns;
-                            if (last_resize_ns != 0) {
-                                const now_ns = core.clock.nowNs();
-                                const diff_ns = now_ns - last_resize_ns;
-                                if (diff_ns > 0) {
-                                    resize_age_ms = @intCast(@divTrunc(diff_ns, 1_000_000));
-                                } else {
-                                    resize_age_ms = 0;
-                                }
-                            }
-                            applog.appLog(
-                                "[win] WM_PAINT(row) skip_present seed_pending={d} rows={d} rows_cur={d} row_valid={d} rows_to_draw={d} skipped_empty={d} row_verts_len={d} force_full_rows={d} layout_gen={d} layout_ok={d} rows_mismatch={d} resize_age_ms={d}\n",
-                                .{
-                                    @as(u32, @intFromBool(seed_pending_snapshot)),
-                                    effective_rows,
-                                    rows_snapshot,
-                                    effective_row_valid_count,
-                                    rows_to_draw.items.len,
-                                    skipped_empty,
-                                    row_verts_len,
-                                    @as(u32, @intFromBool(force_full_rows)),
-                                    row_layout_gen_snapshot,
-                                    @as(u32, @intFromBool(layout_ok)),
-                                    @as(u32, @intFromBool(rows_mismatch)),
-                                    resize_age_ms,
-                                },
-                            );
-                        }
-
-                        if (log_enabled) {
-                            const t_done_ns: i128 = core.clock.nowNs();
-                            const snapshot_us: u64 = @intCast(@divTrunc(@max(0, t_snapshot_end_ns - t_snapshot_start_ns), 1000));
-                            const atlas_us: u64 = @intCast(@divTrunc(@max(0, t_atlas_end_ns - t_snapshot_end_ns), 1000));
-                            const row_us: u64 = @intCast(@divTrunc(@max(0, t_present_start_ns - t_row_start_ns), 1000));
-                            const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_present_start_ns), 1000));
-                            const total_us: u64 = row_us + present_us;
-                            const vb_upload_us: u64 = @intCast(@divTrunc(@max(0, log_vb_upload_ns), 1000));
-                            const draw_vb_us: u64 = @intCast(@divTrunc(@max(0, log_draw_vb_ns), 1000));
-                            applog.appLog(
-                                "[perf] row_mode_ui snapshot_us={d} atlas_us={d} rows={d} vb_upload_us={d} draw_vb_us={d} row_us={d} present_us={d} total_us={d}\n",
-                                .{ snapshot_us, atlas_us, rows_to_draw.items.len, vb_upload_us, draw_vb_us, row_us, present_us, total_us },
-                            );
-                        }
-                    }
-                }
-
-                // A Present that failed with a device-removed code sets
-                // `device_lost` on the renderer and still returns normally, so a
-                // paint can report success on a device that is already gone. The
-                // external driver tests this right after its own present; main
-                // did not, and left recovery to whatever woke the next WM_PAINT.
-                // With no external window and a cursor that does not blink,
-                // nothing does until Neovim redraws, so the window sat frozen.
-                if (render_ok) {
-                    if (app.renderer) |*r| {
-                        if (r.device_lost) render_ok = false;
-                    }
-                }
-
-                // Recover dirty state if rendering failed, so the next
-                // WM_PAINT will retry a full redraw instead of showing stale content.
-                if (!render_ok) {
-                    recoverMainPaintFailure(hwnd, app);
-                } else {
-                    app.surf.completePaintRetry();
-                }
-
-                // Update IME preedit overlay (separate popup window)
-                input.updateImePreeditOverlay(hwnd, app);
-
-                // Tabline is now rendered via D3D11 texture (see renderTablineToD3D call before gpu rendering)
-            }
+            if (getApp(hwnd)) |app| paintMainWindow(hwnd, app, log_enabled);
 
             return 0;
         },

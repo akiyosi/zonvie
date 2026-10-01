@@ -819,6 +819,8 @@ fn drawNormalExternalSurfaceRowMode(
             .rects = present.list,
             .right = @intCast(g.width),
             .bottom = @intCast(draw_params.content_height),
+            .cursor_grid = tbs_snap.cursor_layer_grid_id,
+            .cursor_rows = cursor_erase_rows,
         },
         .frame = .{
             .root_grid_id = grid_id,
@@ -843,6 +845,12 @@ fn drawNormalExternalSurfaceRowMode(
             .log_enabled = log_enabled,
         },
     });
+    if (pass.stale) {
+        // Nothing reached back_tex but the scrollbar underlay restore, whose
+        // strip spans every row: hand the damage back for a repaint now.
+        ext_win.surf.tbs.returnUndrawnDamage(dirty_row_keys, force_full_rows or restored_scrollbar_rect != null);
+        return error.LayerFrameStale;
+    }
     const row_frame = pass.frame;
     const scroll_damage = pass.scroll_damage;
 
@@ -3465,6 +3473,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             tbs_snapshot,
             row_h_px_snapshot,
         ) catch |e| {
+            if (e == error.LayerFrameStale) {
+                // Not a failure: no backoff, no full repaint.
+                _ = c.InvalidateRect(hwnd, null, 0);
+                return;
+            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
                 app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());

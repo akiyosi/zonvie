@@ -31,6 +31,10 @@ pub const redraw_handler = @import("redraw_handler.zig");
 pub const highlight = @import("highlight.zig");
 pub const log_mod = @import("log.zig");
 
+test {
+    _ = @import("abi_header_test.zig");
+}
+
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
 pub const DECO_UNDERCURL: u32 = 1 << 0;
 pub const DECO_UNDERLINE: u32 = 1 << 1;
@@ -66,12 +70,6 @@ pub const Layer = extern struct {
     /// Back-to-front index; 0 == root grid.
     z: i32,
     flags: u32,
-
-    comptime {
-        if (@sizeOf(Layer) != 40) {
-            @compileError("Layer struct size mismatch! Expected 40 bytes.");
-        }
-    }
 };
 
 pub const Vertex = extern struct {
@@ -81,41 +79,6 @@ pub const Vertex = extern struct {
     grid_id: i64, // 1 = global grid, >1 = Neovim window grid, negative = core-owned grid
     deco_flags: u32, // DECO_* flags for decoration type
     deco_phase: f32, // phase offset for undercurl (cell column position)
-
-    // Verify struct layout matches C ABI expectations:
-    // - position:   8 bytes @ offset 0
-    // - texCoord:   8 bytes @ offset 8
-    // - color:      16 bytes @ offset 16 (aligned to 16)
-    // - grid_id:    8 bytes @ offset 32
-    // - deco_flags: 4 bytes @ offset 40
-    // - deco_phase: 4 bytes @ offset 44
-    // - Total: 48 bytes
-    comptime {
-        if (@sizeOf(Vertex) != 48) {
-            @compileError("Vertex struct size mismatch! Expected 48 bytes.");
-        }
-        if (@alignOf(Vertex) != 16) {
-            @compileError("Vertex struct alignment mismatch! Expected 16-byte alignment.");
-        }
-        if (@offsetOf(Vertex, "position") != 0) {
-            @compileError("Vertex.position offset mismatch! Expected 0.");
-        }
-        if (@offsetOf(Vertex, "texCoord") != 8) {
-            @compileError("Vertex.texCoord offset mismatch! Expected 8.");
-        }
-        if (@offsetOf(Vertex, "color") != 16) {
-            @compileError("Vertex.color offset mismatch! Expected 16.");
-        }
-        if (@offsetOf(Vertex, "grid_id") != 32) {
-            @compileError("Vertex.grid_id offset mismatch! Expected 32.");
-        }
-        if (@offsetOf(Vertex, "deco_flags") != 40) {
-            @compileError("Vertex.deco_flags offset mismatch! Expected 40.");
-        }
-        if (@offsetOf(Vertex, "deco_phase") != 44) {
-            @compileError("Vertex.deco_phase offset mismatch! Expected 44.");
-        }
-    }
 };
 
 pub const GlyphEntry = extern struct {
@@ -262,8 +225,9 @@ pub const GridInfo = extern struct {
     // Lets a frontend route smooth-scroll following: a window-anchored float
     // follows only that window, not any window it merely overlaps.
     anchor_grid: i64,
-    // 1 if this float has been repositioned (row changed) since creation, i.e. it
-    // tracks the buffer on scroll. A fixed float stays 0 and must not pixel-shift.
+    // 1 if this float tracks the buffer on scroll: relative='win' with a bufpos,
+    // as nvim_win_get_config reports it. 0 until answered, and for every other
+    // float, which must not pixel-shift.
     follows_scroll: i32,
     // 1 if this grid is an external (separate top-level) window. Such grids are
     // reported with start (0,0) and must be excluded from main-window hit-testing.
@@ -277,12 +241,9 @@ pub const GridInfo = extern struct {
     // one. A grid placed by another surface reports start_row/start_col in
     // that surface's space, so a frontend must not hit-test it as its own.
     placed_by_surface: i64,
-    // Neovim's composition index, and the core's tie-breaker after it. With
-    // zindex and grid_id these are the order a surface's layers are drawn in,
-    // back to front, so a frontend can say which of two grids is on top
-    // without inventing an order of its own.
-    compindex: i64,
-    draw_order: u64,
+    // This grid's z in the layer list its surface last published (0 for a
+    // surface root or a grid not yet published). Larger is drawn on top.
+    layer_z: i64,
 };
 
 /// Viewport info for scrollbar rendering
@@ -352,83 +313,15 @@ pub const PopupmenuColors = extern struct {
 /// include/zonvie_core.h. Bump it whenever a field is removed, reordered, or
 /// has its signature changed. Appending a new callback at the end stays
 /// backward compatible through callbacks_size and must NOT bump it.
-pub const CALLBACKS_ABI_VERSION: u32 = 1;
-
-/// Every field of Callbacks and the byte offset it must keep. Bump
-/// CALLBACKS_ABI_VERSION and update this table together: removing, reordering
-/// or retyping a field moves every offset after it while @sizeOf(Callbacks)
-/// can stay the same, so callbacks_size cannot see it. Appending a callback
-/// only adds a row here and keeps the version.
-const callbacks_layout = [_]struct { []const u8, usize }{
-    .{ "abi_version", 0 },
-    .{ "on_vertices_row", 8 },
-    .{ "on_atlas_ensure_glyph", 16 },
-    .{ "on_atlas_ensure_glyph_styled", 24 },
-    .{ "on_log", 32 },
-    .{ "on_guifont", 40 },
-    .{ "on_linespace", 48 },
-    .{ "on_exit", 56 },
-    .{ "on_set_title", 64 },
-    .{ "on_external_window", 72 },
-    .{ "on_external_window_close", 80 },
-    .{ "on_cursor_grid_changed", 88 },
-    .{ "on_cmdline_show", 96 },
-    .{ "on_cmdline_hide", 104 },
-    .{ "on_cmdline_pos", 112 },
-    .{ "on_cmdline_special_char", 120 },
-    .{ "on_cmdline_block_show", 128 },
-    .{ "on_cmdline_block_append", 136 },
-    .{ "on_cmdline_block_hide", 144 },
-    .{ "on_popupmenu_show", 152 },
-    .{ "on_popupmenu_hide", 160 },
-    .{ "on_popupmenu_select", 168 },
-    .{ "on_msg_show", 176 },
-    .{ "on_msg_clear", 184 },
-    .{ "on_msg_showmode", 192 },
-    .{ "on_msg_showcmd", 200 },
-    .{ "on_msg_ruler", 208 },
-    .{ "on_msg_history_show", 216 },
-    .{ "on_clipboard_get", 224 },
-    .{ "on_clipboard_set", 232 },
-    .{ "on_ssh_auth_prompt", 240 },
-    .{ "on_tabline_update", 248 },
-    .{ "on_tabline_hide", 256 },
-    .{ "on_grid_scroll", 264 },
-    .{ "on_ime_off", 272 },
-    .{ "on_quit_requested", 280 },
-    .{ "on_rasterize_glyph", 288 },
-    .{ "on_atlas_upload", 296 },
-    .{ "on_atlas_create", 304 },
-    .{ "on_flush_begin", 312 },
-    .{ "on_flush_end", 320 },
-    .{ "on_default_colors_set", 328 },
-    .{ "on_win_move", 336 },
-    .{ "on_win_exchange", 344 },
-    .{ "on_win_rotate", 352 },
-    .{ "on_win_resize_equal", 360 },
-    .{ "on_win_move_cursor", 368 },
-    .{ "on_shape_text_run", 376 },
-    .{ "on_rasterize_glyph_by_id", 384 },
-    .{ "on_get_ascii_table", 392 },
-    .{ "on_grid_row_scroll", 400 },
-    .{ "on_restart", 408 },
-    .{ "on_connect", 416 },
-    .{ "on_agent_status", 424 },
-    .{ "on_main_grid_size", 432 },
-    .{ "on_surface_layout", 440 },
-    .{ "on_grid_destroy", 448 },
-};
+pub const CALLBACKS_ABI_VERSION: u32 = 2;
 
 pub const Callbacks = extern struct {
     /// Must equal CALLBACKS_ABI_VERSION; zonvie_core_create returns null
-    /// otherwise. callbacks_size can only report that the struct's LENGTH
-    /// changed, never that its LAYOUT did: commit 935bdc0 removed two
-    /// callbacks and appended two, so a consumer built before it passes a
-    /// callbacks_size equal to the current @sizeOf while every pointer from
-    /// on_vertices_row onward sits at the wrong offset. The field is first on
-    /// purpose -- a stale build has a function pointer at that offset and
-    /// cannot match the version by accident. It defaults to the current
-    /// version because any Zig caller is compiled against this very layout.
+    /// otherwise. callbacks_size only sees the struct's length, not a field
+    /// removed or reordered in the middle. The field sits where a stale build
+    /// has its first function pointer, so a stale consumer cannot pass a
+    /// matching value by accident. Defaults to the current version because
+    /// any Zig caller is compiled against this very layout.
     abi_version: u32 = CALLBACKS_ABI_VERSION,
 
     on_vertices_row: ?OnVerticesRowFn = null,
@@ -537,14 +430,6 @@ pub const Callbacks = extern struct {
         view: zonvie_msg_view_type,
         chunks: [*]const MsgChunk,
         chunk_count: usize,
-    ) callconv(.c) void = null,
-
-    /// Reserved for layout; the core never invokes it (see zonvie_core.h).
-    on_msg_history_show: ?*const fn (
-        ctx: ?*anyopaque,
-        entries: [*]const MsgHistoryEntry,
-        entry_count: usize,
-        prev_cmd: c_int,
     ) callconv(.c) void = null,
 
     // Clipboard callbacks
@@ -670,28 +555,11 @@ pub const Callbacks = extern struct {
     ) callconv(.c) void = null,
     on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
 
-    // No total-size assertion: appending a callback is a legal, ABI-compatible
-    // change. What must hold is that the version stays readable at offset 0 by
-    // any caller, whatever the rest of the struct grows into.
+    // Field layout is checked against include/zonvie_core.h in
+    // abi_header_test.zig; the version must stay readable at offset 0.
     comptime {
         if (@offsetOf(Callbacks, "abi_version") != 0) {
             @compileError("Callbacks.abi_version offset mismatch! Expected 0.");
-        }
-        if (@sizeOf(@FieldType(Callbacks, "abi_version")) != 4) {
-            @compileError("Callbacks.abi_version size mismatch! Expected 4 bytes.");
-        }
-        @setEvalBranchQuota(20000);
-        const fields = @typeInfo(Callbacks).@"struct".fields;
-        for (fields[0..@min(fields.len, callbacks_layout.len)], 0..) |f, i| {
-            if (!std.mem.eql(u8, f.name, callbacks_layout[i][0]) or
-                @offsetOf(Callbacks, f.name) != callbacks_layout[i][1])
-            {
-                @compileError("Callbacks layout changed at field '" ++ f.name ++
-                    "': bump CALLBACKS_ABI_VERSION (and ZONVIE_CALLBACKS_ABI_VERSION in include/zonvie_core.h) and update callbacks_layout together.");
-            }
-        }
-        if (fields.len != callbacks_layout.len) {
-            @compileError("Callbacks field count changed: add each appended callback to callbacks_layout; a removal must also bump CALLBACKS_ABI_VERSION.");
         }
     }
 };
@@ -807,7 +675,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_msg_showmode = box.cb.on_msg_showmode,
         .on_msg_showcmd = box.cb.on_msg_showcmd,
         .on_msg_ruler = box.cb.on_msg_ruler,
-        .on_msg_history_show = box.cb.on_msg_history_show,
 
         // Clipboard callbacks
         .on_clipboard_get = box.cb.on_clipboard_get,
@@ -1168,16 +1035,6 @@ pub const RowScrollMergeC = extern struct {
     _pad: u32 = 0,
 };
 
-comptime {
-    if (@sizeOf(row_scroll.Staged) != 7 * 4) @compileError("zonvie_row_scroll layout drifted from the header");
-    if (@offsetOf(RowScrollMergeC, "has_superseded") != 14 * 4) @compileError("field order drifted from the header");
-}
-
-comptime {
-    if (@sizeOf(cursor_rect.Rect) != 4 * 4) @compileError("zonvie_cursor_rect layout drifted from the header");
-    if (@sizeOf(win_layout.Frame) != 8 + 4 * 8) @compileError("zonvie_win_frame layout drifted from the header");
-}
-
 /// The cursor's bounds on a surface: the vertex box moved to the origin that
 /// places its grid. False, leaving *out untouched, for no vertices.
 pub export fn zonvie_core_cursor_rect(
@@ -1230,11 +1087,6 @@ pub const OverBlitRowsC = extern struct {
     has_under: u32,
     has_shifted: u32,
 };
-
-comptime {
-    if (@sizeOf(OverBlitRowsC) != 9 * 4) @compileError("zonvie_over_blit_rows layout drifted from the header");
-    if (@offsetOf(OverBlitRowsC, "has_above") != 6 * 4) @compileError("field order drifted from the header");
-}
 
 pub export fn zonvie_core_row_scroll_over_blit_rows(
     plan: ?*const row_scroll.Plan,
@@ -3357,7 +3209,7 @@ pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void
 fn forceResendAll(cp: *core.Core) void {
     // A newly registered surface needs placement as well as retained rows.
     var layout_it = cp.last_surface_layout.valueIterator();
-    while (layout_it.next()) |layout| layout.valid = false;
+    while (layout_it.next()) |layout| layout.invalidate();
     cp.grid.markEverySurfaceDirty();
     cp.grid.cursor_rev +%= 1;
     // A prior failed flush may have moved the cursor between external

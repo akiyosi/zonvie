@@ -117,6 +117,7 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     try syncVertexBudgetAggregate(core, true);
     core.grid.main_buf.vertex_budget_touched = false;
+    core.grid.main_buf.reshaped_in_txn = false;
     // The intrusive touched list is rebuilt from the head, so a sub-grid whose
     // flag survived a torn-down transaction would never be re-linked and would
     // escape the per-surface limit. Clearing main's flag defensively and not
@@ -126,9 +127,11 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     while (sg_it.next()) |sg| {
         sg.vertex_budget_touched = false;
         sg.vertex_budget_touched_next = null;
+        sg.reshaped_in_txn = false;
     }
     core.vertex_budget_touched_grid_head = null;
     core.vertex_budget_transaction_active = true;
+    beginLedgerJournal(core);
 }
 
 fn validateCompletedVertexBudget(core: *Core) !void {
@@ -199,6 +202,13 @@ fn saveLedger(core: *Core, buf: *const grid_mod.GridBuf, saved: *nvim_core.Saved
     return true;
 }
 
+fn restoreReshapedLedger(buf: *grid_mod.GridBuf) void {
+    if (!buf.reshaped_in_txn) return;
+    buf.surface_vertex_count = buf.reshaped_from_vertex_count;
+    buf.vertex_row_ledger_valid = false;
+    buf.markAllDirty();
+}
+
 fn restoreLedger(buf: *grid_mod.GridBuf, saved: *const nvim_core.SavedLedger) void {
     buf.surface_vertex_count = saved.surface_vertex_count;
     if (!saved.ledger_valid) {
@@ -215,61 +225,64 @@ fn restoreLedger(buf: *grid_mod.GridBuf, saved: *const nvim_core.SavedLedger) vo
     }
 }
 
-/// Snapshot every row ledger so a frontend rejection can put the accounting
-/// back exactly as the still-committed frame left it. Returns false when the
-/// snapshot could not be taken, in which case the caller must fall back to the
-/// invalidate-everything recovery.
-fn snapshotVertexRowLedgers(core: *Core) bool {
-    // Retire last attempt's entries before recording this one's.
+/// Retire the previous attempt's saved ledgers. Each grid's ledger is saved
+/// on this attempt's first write to it (saveLedgerOnFirstWrite), so a flush
+/// pays for the grids it touches, not for every grid.
+fn beginLedgerJournal(core: *Core) void {
+    core.flush_ledger_journal_failed = false;
     core.flush_main_ledger.live = false;
     var stale = core.flush_subgrid_ledgers.valueIterator();
     while (stale.next()) |entry| entry.live = false;
-
-    var sg_it = core.grid.sub_grids.iterator();
-    while (sg_it.next()) |e| {
-        const gop = core.flush_subgrid_ledgers.getOrPut(core.alloc, e.key_ptr.*) catch return false;
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        if (!saveLedger(core, e.value_ptr, gop.value_ptr)) return false;
-    }
     // Drop entries of destroyed grids. Neovim never reuses a grid handle, so
     // kept entries only grew the map with every float ever opened.
     while (core.flush_subgrid_ledgers.count() > core.grid.sub_grids.count()) {
         var dead_id: ?i64 = null;
         var dead_it = core.flush_subgrid_ledgers.iterator();
         while (dead_it.next()) |e| {
-            if (e.value_ptr.live) continue;
+            if (core.grid.sub_grids.contains(e.key_ptr.*)) continue;
             dead_id = e.key_ptr.*;
             break;
         }
         var kv = core.flush_subgrid_ledgers.fetchRemove(dead_id orelse break).?;
         kv.value.counts.deinit(core.alloc);
     }
-    // Last: its `live` says the whole snapshot was taken.
-    return saveLedger(core, &core.grid.main_buf, &core.flush_main_ledger);
+}
+
+/// Save `buf`'s ledger before this attempt first changes it. A failure here
+/// leaves the refusal path to the invalidate-everything recovery.
+fn saveLedgerOnFirstWrite(core: *Core, grid_id: i64, buf: *const grid_mod.GridBuf) void {
+    if (!core.vertex_budget_transaction_active or buf.vertex_budget_touched) return;
+    if (grid_id == 1) {
+        if (!saveLedger(core, buf, &core.flush_main_ledger)) core.flush_ledger_journal_failed = true;
+        return;
+    }
+    const gop = core.flush_subgrid_ledgers.getOrPut(core.alloc, grid_id) catch {
+        core.flush_ledger_journal_failed = true;
+        return;
+    };
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    if (!saveLedger(core, buf, gop.value_ptr)) core.flush_ledger_journal_failed = true;
 }
 
 fn restoreVertexRowLedgers(core: *Core) bool {
-    if (!core.flush_main_ledger.live) return false;
-    // Check every surface before mutating any: a half-applied restore would
-    // leave some grids accounted against the committed frame and others not,
-    // which is worse than the conservative full invalidation.
-    var check = core.flush_subgrid_ledgers.iterator();
-    while (check.next()) |e| {
-        if (!e.value_ptr.live) continue;
-        if (!core.grid.sub_grids.contains(e.key_ptr.*)) return false;
-    }
-
-    restoreLedger(&core.grid.main_buf, &core.flush_main_ledger);
+    if (core.flush_ledger_journal_failed) return false;
+    if (core.flush_main_ledger.live) restoreLedger(&core.grid.main_buf, &core.flush_main_ledger);
+    restoreReshapedLedger(&core.grid.main_buf);
     var it = core.flush_subgrid_ledgers.iterator();
     while (it.next()) |e| {
         if (!e.value_ptr.live) continue;
-        restoreLedger(core.grid.sub_grids.getPtr(e.key_ptr.*).?, e.value_ptr);
+        // Destroyed inside the flush: its ledger went with it.
+        const buf = core.grid.sub_grids.getPtr(e.key_ptr.*) orelse continue;
+        restoreLedger(buf, e.value_ptr);
     }
-    // Summed rather than taken from the snapshot: a grid created inside the
-    // flush (cmdline, popupmenu) has no entry and keeps the rows it charged.
     var subgrid_total: usize = 0;
     var sg_it = core.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| subgrid_total +|= sg.surface_vertex_count;
+    while (sg_it.next()) |sg| {
+        // A grid created inside the flush was reshaped from nothing, and the
+        // committed frame holds nothing of it.
+        restoreReshapedLedger(sg);
+        subgrid_total +|= sg.surface_vertex_count;
+    }
     core.grid.subgrid_surface_vertex_count = subgrid_total;
     return true;
 }
@@ -372,6 +385,7 @@ fn replaceGridSurfaceRowVertexCount(
     new_count: usize,
 ) !void {
     try syncVertexBudgetAggregate(core, false);
+    saveLedgerOnFirstWrite(core, grid_id, buf);
     touchGridVertexBudget(core, grid_id, buf);
     prepareVertexRowLedgerForWrite(core, grid_id, buf);
     const old_surface_count = buf.surface_vertex_count;
@@ -2798,16 +2812,7 @@ pub const FlushCtx = struct {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
         try beginVertexBudgetTransaction(ctx.core);
-        // Before the dirty snapshot, so an aborted attempt still owes them.
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
-        // Remember what this attempt is about to consume. A frontend that
-        // later refuses to publish owes exactly this much on the retry, not a
-        // full-viewport resend (see the abort branch below).
-        var dirty_snapshot_valid = true;
-        ctx.core.grid.snapshotDirty(ctx.core.alloc, &ctx.core.flush_dirty_snapshot) catch {
-            dirty_snapshot_valid = false;
-        };
-        if (!snapshotVertexRowLedgers(ctx.core)) dirty_snapshot_valid = false;
 
         // === PERF LOG: flush開始 ===
         const perf_enabled = ctx.core.log.cb != null;
@@ -2962,8 +2967,7 @@ pub const FlushCtx = struct {
             // the full-invalidation path.
             const frontend_refused_publication = ctx.core.flush_aborted and
                 !ctx.core.flush_atlas_corrupted and
-                ctx.core.flush_retryable and
-                dirty_snapshot_valid;
+                ctx.core.flush_retryable;
             // A begin rejection keeps the budget (nothing was consumed) but
             // publishes nothing, so the mirrors are as stale as they were.
             const mirror_stale_before = ctx.core.display_mirror_stale;
@@ -2979,6 +2983,8 @@ pub const FlushCtx = struct {
                     ctx.core.removeGlyphMirror(grid_id);
                 }
                 ctx.core.grid.destroyed_pending.clearRetainingCapacity();
+                ctx.core.grid.commitOwed();
+                commitSurfaceLayouts(ctx.core);
                 ctx.core.finishAtlasMaintenance();
                 ctx.core.grid.clearScrolledGrids();
                 var sg_it = ctx.core.grid.sub_grids.valueIterator();
@@ -2989,33 +2995,12 @@ pub const FlushCtx = struct {
                 // checks consume it.
                 ctx.core.atlas_reset_during_flush = false;
                 if (!aborted_at_flush_begin) {
-                    // on_flush_end itself may reject the transaction after main
-                    // and external generation already cleared dirty flags.
-                    // Restore what this attempt consumed. The frontend keeps
-                    // its previously committed frame on screen when it refuses
-                    // to publish, so every other row is still correct there —
-                    // resending all of them turned a routine backpressure
-                    // rejection (atlas back-sync in flight) into a whole
-                    // viewport re-shape and re-rasterization. Only a failed
-                    // snapshot falls back to the unconditional full resend.
-                    // Successfully invoked on_grid_scroll IDs are consumed at
-                    // the call site; any unvisited IDs remain in the compact
-                    // prefix/per-grid bits for retry.
-                    // The snapshot covers the sub-grids too, so each of them
-                    // owes exactly the rows this attempt consumed. Only a
-                    // failed snapshot falls back to the full resend.
-                    if (dirty_snapshot_valid) {
-                        ctx.core.grid.restoreDirty(&ctx.core.flush_dirty_snapshot);
-                    } else {
-                        ctx.core.grid.markEverySurfaceDirty();
-                    }
+                    // Everything this attempt sent is owed again, on top of
+                    // what changed after it was sent; the frontend kept its
+                    // committed frame, so nothing else is.
+                    ctx.core.grid.returnOwed();
                     ctx.core.force_ext_cursor_recheck = true;
-                    // notifySurfaceLayouts runs before on_flush_end, so a late
-                    // abort cancels the transaction that carried the layout
-                    // while its signature is already recorded. Drop the
-                    // signatures so the retry republishes them.
-                    var layout_it = ctx.core.last_surface_layout.valueIterator();
-                    while (layout_it.next()) |layout| layout.valid = false;
+                    discardStagedSurfaceLayouts(ctx.core);
                 }
                 // A due maintenance reprobe may already have invalidated its
                 // negative entries before a later consumer rejected the flush.
@@ -3028,14 +3013,21 @@ pub const FlushCtx = struct {
                     ctx.core.rearmAtlasMaintenanceAfterAbort(retry_at);
                 }
                 if (!aborted_at_flush_begin) {
-                    var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                    while (sg_it.next()) |sg| {
-                        // The restored dirty set names only the rows the
-                        // scroll vacated, and the frontend dropped the shift
-                        // with the bracket. Without the op the retry can send
-                        // neither, so it sends every row.
-                        if (sg.last_scroll_op != null) sg.markAllDirty();
-                        sg.clearScrollState();
+                    var sg_it = ctx.core.grid.sub_grids.iterator();
+                    while (sg_it.next()) |entry| {
+                        const sg = entry.value_ptr;
+                        if (!sg.row_shift_sent) continue;
+                        // The frontend dropped the shift with the bracket, so
+                        // the retry sends it again; the mirror moved with the
+                        // first send and moves back here, or the retry would
+                        // move it twice.
+                        if (sg.last_scroll_op) |op| {
+                            if (gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols)) |region| {
+                                ctx.core.shiftGlyphMirror(entry.key_ptr.*, region.row_start, region.row_end, -op.rows);
+                            }
+                        }
+                        sg.row_shift_sent = false;
+                        sg.row_scroll_notify_pending = true;
                     }
                 }
             }
@@ -3291,6 +3283,7 @@ pub const FlushCtx = struct {
                     // and mirror (invalidateMirroredFrameState) left external
                     // windows that were not resent under-counted and blocked
                     // atlas GC until each of their rows was redrawn.
+                    saveLedgerOnFirstWrite(ctx.core, 1, &ctx.core.grid.main_buf);
                     if (ctx.core.glyph_mirror.getPtr(1)) |m| {
                         for (m.rows.items) |*r| r.clearRetainingCapacity();
                         if (m.valid.bit_length != 0) m.valid.unsetAll();
@@ -3300,7 +3293,7 @@ pub const FlushCtx = struct {
                     ctx.core.flush_vertex_count_aggregate -|= main_buf.surface_vertex_count;
                     main_buf.surface_vertex_count = 0;
                     main_buf.vertex_row_ledger_valid = true;
-                    ctx.core.grid.clearDirty();
+                    main_buf.consumeDirtyForSend(true);
                 }
             }
             return;
@@ -3314,10 +3307,7 @@ pub const FlushCtx = struct {
             const need_main: bool = ctx.core.grid.main_buf.anyDirty();
 
             // If nothing changed, avoid doing any work.
-            if (!need_main) {
-                ctx.core.grid.clearDirty();
-                return;
-            }
+            if (!need_main) return;
 
 
             if (need_main) {
@@ -3602,7 +3592,7 @@ pub const FlushCtx = struct {
                     // zonvie_core_retry_flush's has_pending check seeing nothing
                     // pending, losing this content until an unrelated later edit
                     // happens to touch the same rows.
-                    if (!ctx.core.flush_aborted) ctx.core.grid.clearDirty();
+                    if (!ctx.core.flush_aborted) ctx.core.grid.main_buf.consumeDirtyForSend(rebuild_all or saw_atlas_reset);
                     if (had_glyph_miss or saw_atlas_reset) {
                         // Not after a retry that survived the reset: it rebuilt
                         // every root row against the new atlas, and marking them
@@ -3724,17 +3714,50 @@ pub const FlushCtx = struct {
 /// What was last published for one surface, so a layout is re-sent only when it
 /// actually changed. Holding the layers themselves makes the comparison exact
 /// rather than a hash that could suppress a needed update.
+///
+/// `layers` is what a committed flush published; `staged` is what the open
+/// flush sent. The commit promotes the staged copy, a refusal drops it, so a
+/// refused flush owes exactly its own layout and nothing it did not change.
 pub const SurfaceLayoutSig = struct {
     layers: c_api.render_layout.List(c_api.Layer) = .{},
     valid: bool = false,
     surface_rows: u32 = 0,
     surface_cols: u32 = 0,
+    staged: c_api.render_layout.List(c_api.Layer) = .{},
+    staged_valid: bool = false,
+    staged_rows: u32 = 0,
+    staged_cols: u32 = 0,
+
+    fn deinit(self: *SurfaceLayoutSig) void {
+        self.layers.deinit();
+        self.staged.deinit();
+    }
+
+    pub fn invalidate(self: *SurfaceLayoutSig) void {
+        self.valid = false;
+        self.staged_valid = false;
+    }
+
+    fn commit(self: *SurfaceLayoutSig) void {
+        if (!self.staged_valid) return;
+        std.mem.swap(c_api.render_layout.List(c_api.Layer), &self.layers, &self.staged);
+        self.surface_rows = self.staged_rows;
+        self.surface_cols = self.staged_cols;
+        self.valid = true;
+        self.staged_valid = false;
+    }
 
     fn matches(self: *const SurfaceLayoutSig, layers: []const c_api.Layer, rows: u32, cols: u32) bool {
-        if (!self.valid or self.layers.len != layers.len) return false;
-        if (self.surface_rows != rows or self.surface_cols != cols) return false;
+        if (self.staged_valid) return layersMatch(self.staged.slice(), self.staged_rows, self.staged_cols, layers, rows, cols);
+        if (!self.valid) return false;
+        return layersMatch(self.layers.slice(), self.surface_rows, self.surface_cols, layers, rows, cols);
+    }
+
+    fn layersMatch(prev: []const c_api.Layer, prev_rows: u32, prev_cols: u32, layers: []const c_api.Layer, rows: u32, cols: u32) bool {
+        if (prev.len != layers.len) return false;
+        if (prev_rows != rows or prev_cols != cols) return false;
         // Layer has no equality operator; every field is compared.
-        for (self.layers.slice(), layers) |a, b| {
+        for (prev, layers) |a, b| {
             if (a.grid_id != b.grid_id or
                 a.anchor_grid != b.anchor_grid or
                 a.x_px != b.x_px or
@@ -3750,7 +3773,28 @@ pub const SurfaceLayoutSig = struct {
 
 pub fn releaseSurfaceLayouts(self: *Core) void {
     var it = self.last_surface_layout.valueIterator();
-    while (it.next()) |layout| layout.layers.deinit();
+    while (it.next()) |layout| layout.deinit();
+}
+
+/// `grid_id`'s z in the layer list `surface_id` last committed, 0 when it is
+/// not there (a root, or not yet published).
+pub fn publishedLayerZ(self: *Core, surface_id: i64, grid_id: i64) i64 {
+    const sig = self.last_surface_layout.getPtr(surface_id) orelse return 0;
+    if (!sig.valid) return 0;
+    for (sig.layers.slice()) |layer| {
+        if (layer.grid_id == grid_id) return layer.z;
+    }
+    return 0;
+}
+
+fn commitSurfaceLayouts(self: *Core) void {
+    var it = self.last_surface_layout.valueIterator();
+    while (it.next()) |layout| layout.commit();
+}
+
+fn discardStagedSurfaceLayouts(self: *Core) void {
+    var it = self.last_surface_layout.valueIterator();
+    while (it.next()) |layout| layout.staged_valid = false;
 }
 
 /// Frontends stamp these core-thread records with their callback flush ID.
@@ -3988,14 +4032,14 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
             }
         }
     }
-    sig.valid = false;
-    sig.layers.resize(self.alloc, &self.layout_budget, layers.len) catch |err| {
+    sig.staged_valid = false;
+    sig.staged.resize(self.alloc, &self.layout_budget, layers.len) catch |err| {
         failSurfaceLayout(self, err);
         return false;
     };
-    @memcpy(sig.layers.items[0..layers.len], layers);
-    sig.surface_rows = rows;
-    sig.surface_cols = cols;
+    @memcpy(sig.staged.items[0..layers.len], layers);
+    sig.staged_rows = rows;
+    sig.staged_cols = cols;
 
     traceRender(self, "event=layout_stage surface={d} layers={d} rows={d} cols={d} metadata_bytes={d}\n", .{ surface_id, layers.len, rows, cols, self.layout_budget.live_bytes.load(.monotonic) });
     if (self.log.verbose and self.log.cb != null and !self.log.perf_only and !self.log.scroll_only) {
@@ -4003,7 +4047,9 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
     }
     cb(self.ctx, surface_id, layers.ptr, layers.len, rows, cols);
     if (self.flush_aborted) return false;
-    sig.valid = true;
+    sig.staged_valid = true;
+    // Outside a flush bracket nothing can refuse it later.
+    if (!self.vertex_budget_transaction_active) sig.commit();
     return true;
 }
 
@@ -4038,11 +4084,6 @@ pub fn notifySurfaceLayouts(self: *Core) void {
 fn publishSurfaceLayouts(self: *Core) void {
     if (self.flush_aborted) return;
 
-    // Before the layers are read: this batch's scroll, if it had one, is the
-    // evidence for which floats track the buffer. It is still pending here --
-    // clearScrolledGrids runs at transaction end, after this.
-    self.grid.settleFloatScrollFollowing();
-
     if (self.cb.on_surface_layout != null) {
         if (!emitSurfaceLayout(self, 1)) return;
         var ext_it = self.grid.external_grids.keyIterator();
@@ -4059,7 +4100,7 @@ fn publishSurfaceLayouts(self: *Core) void {
         while (sig_it.next()) |entry| {
             const id = entry.key_ptr.*;
             if (id == 1 or self.grid.external_grids.contains(id)) continue;
-            entry.value_ptr.layers.deinit();
+            entry.value_ptr.deinit();
             self.last_surface_layout.removeByPtr(entry.key_ptr);
         }
     }
@@ -4550,6 +4591,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
             };
         }
         finishVertexBudgetTransaction(self, commit);
+        if (commit) self.grid.commitOwed() else self.grid.returnOwed();
     };
 
     // Reuse row_verts buffer for external grid vertices (per-row)
@@ -4634,6 +4676,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         var ext_had_glyph_miss: bool = false;
         // Rows this pass regenerated, for the [ext_grid_row] report.
         var regen_count: u32 = 0;
+        var sent_every_row = need_full_redraw;
 
         ext_verts.clearRetainingCapacity();
 
@@ -4665,6 +4708,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
             // asking whether it ran, and the two could disagree.
             const ext_scroll_needs_full_regen: bool =
                 sg.last_scroll_op != null and !sg.row_shift_sent;
+            if (ext_scroll_needs_full_regen) sent_every_row = true;
 
             // The cursor is a separate layer emitted after the row loop, never
             // inline in row vertices, which is what stops it ghosting across a
@@ -4782,7 +4826,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         });
 
         // Skipped on mid-flush abort: keep dirty so the rows are re-sent.
-        if (!self.flush_aborted) sg.clearDirtyContent();
+        if (!self.flush_aborted) sg.consumeDirtyForSend(sent_every_row);
         // Re-mark dirty so the failed rows regenerate next flush.
         if (ext_had_row_error) {
             sg.markAllDirty();
@@ -5425,9 +5469,7 @@ pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 /// split (<C-w>ge) keeps its old main-grid position as its origin, and adding
 /// that origin put the popup that far away from the cell; a float the window
 /// hosts was published under its own id, found no window, and was placed
-/// against the main window. win_pos holds floats anchored into an external
-/// window in global units, the same space externalCompositeOriginRow undoes
-/// for damage.
+/// against the main window.
 pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
     if (anchor_grid == 1 or g.external_grids.contains(anchor_grid)) {
         return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
@@ -8507,18 +8549,17 @@ test "a refused flush restores reshaped and newly created grids without a full i
     try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 1, 10);
     try replaceGridSurfaceRowVertexCount(&core, 3, core.grid.sub_grids.getPtr(3).?, 0, 10);
     try validateCompletedVertexBudget(&core);
-    try std.testing.expect(snapshotVertexRowLedgers(&core));
     finishVertexBudgetTransaction(&core, true);
 
     // A destroyed grid's saved ledger goes with it.
     try core.grid.destroyGrid(3);
-    try std.testing.expect(snapshotVertexRowLedgers(&core));
+    try beginVertexBudgetTransaction(&core);
     try std.testing.expectEqual(@as(u32, 1), core.flush_subgrid_ledgers.count());
+    finishVertexBudgetTransaction(&core, true);
 
     // Inside the refused attempt: grid 2 is reshaped (the popupmenu) and
     // grid 4 is created and charged (the cmdline).
     try beginVertexBudgetTransaction(&core);
-    try std.testing.expect(snapshotVertexRowLedgers(&core));
     try core.grid.resizeGrid(2, 3, 1);
     try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 5);
     try core.grid.resizeGrid(4, 1, 1);
@@ -8532,8 +8573,12 @@ test "a refused flush restores reshaped and newly created grids without a full i
     try std.testing.expect(!reshaped.vertex_row_ledger_valid);
     try std.testing.expect(reshaped.dirty_all);
     try std.testing.expectEqual(@as(usize, 20), reshaped.surface_vertex_count);
-    try std.testing.expectEqual(@as(usize, 7), core.grid.sub_grids.getPtr(4).?.surface_vertex_count);
-    try std.testing.expectEqual(@as(usize, 27), core.grid.subgrid_surface_vertex_count);
+    // The refused frame never reached the frontend, so the created grid holds
+    // nothing there; it is resent whole.
+    const created = core.grid.sub_grids.getPtr(4).?;
+    try std.testing.expectEqual(@as(usize, 0), created.surface_vertex_count);
+    try std.testing.expect(created.dirty_all);
+    try std.testing.expectEqual(@as(usize, 20), core.grid.subgrid_surface_vertex_count);
 }
 
 test "a refused flush restores a reshaped grid 1 alone and keeps the sub-grid ledgers" {
@@ -8552,7 +8597,6 @@ test "a refused flush restores a reshaped grid 1 alone and keeps the sub-grid le
 
     // Grid 1 reshaped inside the refused attempt (re-entrant layout update).
     try beginVertexBudgetTransaction(&core);
-    try std.testing.expect(snapshotVertexRowLedgers(&core));
     try core.grid.resize(3, 4);
     try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 1);
     try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 5);
@@ -8900,6 +8944,8 @@ test "row scroll hint covers composited grids and waits for the external seed" {
     try core.grid.resizeGrid(1, 4, 4);
     try core.grid.resizeGrid(2, 4, 4);
     try core.grid.setWinPos(2, 42, 0, 0);
+    // Committed: a grid resized in the scrolling batch gets no shift.
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
     var state = State{};
     core.ctx = &state;
 
@@ -14688,8 +14734,9 @@ test "an external surface publishes its root and anchored float layers" {
     try core.grid.resizeGrid(2, 5, 20);
     try std.testing.expect(try core.grid.setWinExternalPosAt(2, 42, 4, 8));
     // Float content is independent of its external anchor's row contents.
+    // Stored in the external window's own cells.
     try core.grid.resizeGrid(3, 2, 4);
-    try core.grid.setWinFloatPos(3, 43, 6, 11, 50, 0, 2, true);
+    try core.grid.setWinFloatPos(3, 43, 2, 3, 50, 0, 2, true);
 
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.seen_ext);
@@ -14910,6 +14957,9 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     try core.grid.setWinPos(2, 101, 0, 0);
     try core.grid.resizeGrid(3, 10, 20);
     try core.grid.setWinPos(3, 102, 0, 20);
+    // Committed: a grid resized in the scrolling batch gets no shift.
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    core.grid.sub_grids.getPtr(3).?.clearScrollState();
 
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
@@ -14926,6 +14976,7 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try core.grid.resizeGrid(4, 3, 8);
     try core.grid.setWinFloatPos(4, 103, 2, 2, 50, 0, 1, true);
+    core.grid.sub_grids.getPtr(4).?.clearScrollState();
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 3), state.calls);
@@ -16456,10 +16507,9 @@ test "popupmenu anchor is published in the coordinates of the window that shows 
     try std.testing.expectEqual(@as(i64, 6), p.win);
     try std.testing.expectEqual(@as(i32, 3), p.row);
 
-    // A float the detached window hosts: win_pos holds it in global units
-    // (origin + local 6, 8). The popup goes to the HOST window, at the
-    // float's place inside it.
-    try g.win_pos.put(g.alloc, 7, .{ .row = 16, .col = 28, .anchor_grid = 5 });
+    // A float the detached window hosts, at (6, 8) of that window's cells.
+    // The popup goes to the HOST window, at the float's place inside it.
+    try g.win_pos.put(g.alloc, 7, .{ .row = 6, .col = 8, .anchor_grid = 5 });
     p = popupmenuAnchorPlacement(g, 7, 1, 2);
     try std.testing.expectEqual(@as(i64, 5), p.win);
     try std.testing.expectEqual(@as(i32, 7), p.row);
@@ -16661,4 +16711,545 @@ test "the cursor's glyph quads come from one emitter and trim box drawing to the
     span = Span.ofGlyph(out.items);
     try std.testing.expectApproxEqAbs(@as(f32, 9), span[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 22), span[1], 0.001);
+}
+
+/// A frontend that records what each flush sent and can refuse a bracket at
+/// on_flush_end, the way both frontends cancel a write set they cannot publish.
+const TxnProbe = struct {
+    core: *Core,
+    refuse_next_end: bool = false,
+    grid_ids: [16]i64 = undefined,
+    grid_rows: [16]u32 = undefined,
+    grids: usize = 0,
+    layout_calls: u32 = 0,
+    shift_calls: u32 = 0,
+
+    fn rowsFor(self: *const TxnProbe, grid_id: i64) u32 {
+        for (self.grid_ids[0..self.grids], self.grid_rows[0..self.grids]) |id, n| {
+            if (id == grid_id) return n;
+        }
+        return 0;
+    }
+
+    fn totalRows(self: *const TxnProbe) u32 {
+        var total: u32 = 0;
+        for (self.grid_rows[0..self.grids]) |n| total += n;
+        return total;
+    }
+
+    fn reset(self: *TxnProbe) void {
+        self.grids = 0;
+        self.layout_calls = 0;
+        self.shift_calls = 0;
+    }
+
+    fn attach(self: *TxnProbe) void {
+        self.core.ctx = self;
+        self.core.cb.on_vertices_row = onRow;
+        self.core.cb.on_surface_layout = onLayout;
+        self.core.cb.on_grid_row_scroll = onRowScroll;
+        self.core.cb.on_flush_end = onFlushEnd;
+        self.core.cb.on_rasterize_glyph = rasterize;
+        self.core.cb.on_atlas_upload = upload;
+        self.core.cb.on_atlas_create = create;
+    }
+
+    fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+        _ = row_start;
+        _ = verts;
+        _ = vert_count;
+        _ = total_rows;
+        _ = total_cols;
+        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+        const self: *TxnProbe = @ptrCast(@alignCast(ctx.?));
+        for (self.grid_ids[0..self.grids], 0..) |id, i| {
+            if (id == grid_id) {
+                self.grid_rows[i] += row_count;
+                return;
+            }
+        }
+        self.grid_ids[self.grids] = grid_id;
+        self.grid_rows[self.grids] = row_count;
+        self.grids += 1;
+    }
+
+    fn onLayout(ctx: ?*anyopaque, surface_id: i64, layers: [*]const c_api.Layer, count: usize, surface_rows: u32, surface_cols: u32) callconv(.c) void {
+        _ = surface_id;
+        _ = layers;
+        _ = count;
+        _ = surface_rows;
+        _ = surface_cols;
+        const self: *TxnProbe = @ptrCast(@alignCast(ctx.?));
+        self.layout_calls += 1;
+    }
+
+    fn onRowScroll(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_end: u32, col_start: u32, col_end: u32, rows_delta: i32, total_rows: u32, total_cols: u32) callconv(.c) void {
+        _ = grid_id;
+        _ = row_start;
+        _ = row_end;
+        _ = col_start;
+        _ = col_end;
+        _ = rows_delta;
+        _ = total_rows;
+        _ = total_cols;
+        const self: *TxnProbe = @ptrCast(@alignCast(ctx.?));
+        self.shift_calls += 1;
+    }
+
+    fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *TxnProbe = @ptrCast(@alignCast(ctx.?));
+        if (!self.refuse_next_end) return;
+        self.refuse_next_end = false;
+        self.core.flush_aborted = true;
+    }
+
+    fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+        _ = ctx;
+        _ = scalar;
+        _ = style_flags;
+        out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+        return 1;
+    }
+    fn upload(ctx: ?*anyopaque, dx: u32, dy: u32, w: u32, h: u32, b: *const c_api.GlyphBitmap) callconv(.c) void {
+        _ = ctx;
+        _ = dx;
+        _ = dy;
+        _ = w;
+        _ = h;
+        _ = b;
+    }
+    fn create(ctx: ?*anyopaque, aw: u32, ah: u32) callconv(.c) void {
+        _ = ctx;
+        _ = aw;
+        _ = ah;
+    }
+};
+
+/// A 24x80 main surface with two 24x40 splits as layers, every row holding a
+/// glyph, settled so the next flush is incremental.
+fn initTxnCore(core: *Core) !void {
+    try core.grid.resize(24, 80);
+    try core.grid.resizeGrid(2, 24, 40);
+    try core.grid.setWinPos(2, 102, 0, 0);
+    try core.grid.resizeGrid(3, 24, 40);
+    try core.grid.setWinPos(3, 103, 0, 40);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 80;
+    core.drawable_h_px = 24;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    core.ext_cmdline_enabled = true;
+    core.ext_popupmenu_enabled = true;
+    core.grid.cmdline_default_cols = 12;
+    core.grid.screen_cols = 80;
+    for (2..4) |gid| {
+        for (0..24) |r| core.grid.putCellGrid(@intCast(gid), @intCast(r), 0, 'A' + @as(u32, @intCast(r)), 0);
+    }
+}
+
+test "a refused flush owes the rows of a cmdline grid it created" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "echo" }}, 4, ':', "", 0, 1, 0);
+    probe.reset();
+    probe.refuse_next_end = true;
+    try flush_ctx.onFlush(24, 80);
+    // Vacuity gate: the refused bracket did carry the cmdline's row.
+    try std.testing.expect(probe.rowsFor(grid_mod.CMDLINE_GRID_ID) != 0);
+
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expect(probe.rowsFor(grid_mod.CMDLINE_GRID_ID) != 0);
+}
+
+test "a refused flush owes the rows of a popupmenu grid it created" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+
+    var items = [_]grid_mod.PopupmenuItem{ .{ .word = "alpha" }, .{ .word = "beta" } };
+    try core.grid.setPopupmenuShow(&items, 0, 2, 3, 2);
+    probe.reset();
+    probe.refuse_next_end = true;
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expect(probe.rowsFor(grid_mod.POPUPMENU_GRID_ID) != 0);
+
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expect(probe.rowsFor(grid_mod.POPUPMENU_GRID_ID) != 0);
+}
+
+test "a refused flush owes the rows it wrote into an existing cmdline grid" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "e" }}, 1, ':', "", 0, 1, 0);
+    try flush_ctx.onFlush(24, 80);
+    try flush_ctx.onFlush(24, 80);
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "ec" }}, 2, ':', "", 0, 1, 0);
+    probe.reset();
+    probe.refuse_next_end = true;
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expect(probe.rowsFor(grid_mod.CMDLINE_GRID_ID) != 0);
+
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expect(probe.rowsFor(grid_mod.CMDLINE_GRID_ID) != 0);
+}
+
+test "one refused flush owes only the rows it sent, not every layer and layout" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+    try flush_ctx.onFlush(24, 80);
+
+    core.grid.putCellGrid(2, 5, 1, 'x', 0);
+    probe.reset();
+    probe.refuse_next_end = true;
+    try flush_ctx.onFlush(24, 80);
+    const refused_rows = probe.totalRows();
+    try std.testing.expect(refused_rows != 0);
+
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqual(@as(u32, 1), probe.rowsFor(2));
+    try std.testing.expectEqual(@as(u32, 0), probe.rowsFor(3));
+    try std.testing.expect(probe.totalRows() <= refused_rows);
+    try std.testing.expectEqual(@as(u32, 0), probe.layout_calls);
+}
+
+test "a refused flush keeps the row shift for its retry" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+    try flush_ctx.onFlush(24, 80);
+
+    core.grid.scrollGrid(2, 0, 24, 0, 40, 1, 0);
+    probe.reset();
+    probe.refuse_next_end = true;
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqual(@as(u32, 1), probe.shift_calls);
+
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqual(@as(u32, 1), probe.shift_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.rowsFor(2));
+}
+
+test "a row shift is allowed up to half the region and refused past it" {
+    // gridScrollFastPathRegion: |delta| <= height / 2 shifts, one more does not.
+    const op_ok = grid_mod.ScrollDelta{ .top = 0, .bot = 10, .left = 0, .right = 20, .rows = 5, .cols = 0 };
+    const op_up_ok = grid_mod.ScrollDelta{ .top = 0, .bot = 10, .left = 0, .right = 20, .rows = -5, .cols = 0 };
+    const op_too_far = grid_mod.ScrollDelta{ .top = 0, .bot = 10, .left = 0, .right = 20, .rows = 6, .cols = 0 };
+    const op_up_too_far = grid_mod.ScrollDelta{ .top = 0, .bot = 10, .left = 0, .right = 20, .rows = -6, .cols = 0 };
+    try std.testing.expect(gridScrollFastPathRegion(op_ok, 10, 20, 10, 20) != null);
+    try std.testing.expect(gridScrollFastPathRegion(op_up_ok, 10, 20, 10, 20) != null);
+    try std.testing.expect(gridScrollFastPathRegion(op_too_far, 10, 20, 10, 20) == null);
+    try std.testing.expect(gridScrollFastPathRegion(op_up_too_far, 10, 20, 10, 20) == null);
+}
+
+test "a grid resized in the batch it scrolls gets no row shift" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+
+    try core.grid.resizeGrid(2, 30, 40);
+    core.grid.scrollGrid(2, 0, 30, 0, 40, 1, 0);
+    probe.reset();
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqual(@as(u32, 0), probe.shift_calls);
+    try std.testing.expectEqual(@as(u32, 30), probe.rowsFor(2));
+}
+
+/// A frontend that keeps per-row content (a hash of each row's vertices) and
+/// applies a flush's transactional callbacks only when its on_flush_end is
+/// accepted, the way both frontends stage a write set and promote it at commit.
+const ModelFrontend = struct {
+    const RowTable = std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(u64));
+    const Op = union(enum) {
+        row: struct { grid_id: i64, row: u32, total_rows: u32, hash: u64 },
+        shift: struct { grid_id: i64, row_start: u32, row_end: u32, delta: i32 },
+        destroy: i64,
+    };
+
+    alloc: std.mem.Allocator,
+    core: *Core,
+    committed: RowTable = .{},
+    staged: std.ArrayListUnmanaged(Op) = .empty,
+    refuse_next_end: bool = false,
+    rows_sent: u32 = 0,
+    oom: bool = false,
+
+    fn deinit(self: *ModelFrontend) void {
+        deinitTable(self.alloc, &self.committed);
+        self.staged.deinit(self.alloc);
+    }
+
+    fn deinitTable(alloc: std.mem.Allocator, table: *RowTable) void {
+        var it = table.valueIterator();
+        while (it.next()) |rows| rows.deinit(alloc);
+        table.deinit(alloc);
+    }
+
+    fn attach(self: *ModelFrontend) void {
+        self.core.ctx = self;
+        self.core.cb.on_vertices_row = onRow;
+        self.core.cb.on_grid_row_scroll = onRowScroll;
+        self.core.cb.on_grid_destroy = onDestroy;
+        self.core.cb.on_flush_begin = onBegin;
+        self.core.cb.on_flush_end = onEnd;
+        self.core.cb.on_rasterize_glyph = TxnProbe.rasterize;
+        self.core.cb.on_atlas_upload = TxnProbe.upload;
+        self.core.cb.on_atlas_create = TxnProbe.create;
+    }
+
+    fn stage(self: *ModelFrontend, op: Op) void {
+        self.staged.append(self.alloc, op) catch {
+            self.oom = true;
+        };
+    }
+
+    fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        self.staged.clearRetainingCapacity();
+        self.rows_sent = 0;
+    }
+
+    fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+        _ = total_cols;
+        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        // Positions are grid-local, so a row moved by a shift is drawn
+        // translated; compare rows relative to their own top.
+        const row_top: f32 = @floatFromInt(row_start * @max(1, self.core.cell_h_px));
+        var h = std.hash.Wyhash.init(0);
+        if (verts) |v| for (v[0..vert_count]) |vert| {
+            var rel = vert;
+            rel.position[1] -= row_top;
+            h.update(std.mem.asBytes(&rel));
+        };
+        var r: u32 = 0;
+        while (r < row_count) : (r += 1) {
+            self.stage(.{ .row = .{ .grid_id = grid_id, .row = row_start + r, .total_rows = total_rows, .hash = h.final() } });
+            self.rows_sent += 1;
+        }
+    }
+
+    fn onRowScroll(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_end: u32, col_start: u32, col_end: u32, rows_delta: i32, total_rows: u32, total_cols: u32) callconv(.c) void {
+        _ = col_start;
+        _ = col_end;
+        _ = total_rows;
+        _ = total_cols;
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        self.stage(.{ .shift = .{ .grid_id = grid_id, .row_start = row_start, .row_end = row_end, .delta = rows_delta } });
+    }
+
+    fn onDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        self.stage(.{ .destroy = grid_id });
+    }
+
+    fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        if (self.refuse_next_end) {
+            self.refuse_next_end = false;
+            self.core.flush_aborted = true;
+        }
+        if (self.core.flush_aborted) return;
+        for (self.staged.items) |op| applyOp(self.alloc, &self.committed, op) catch {
+            self.oom = true;
+        };
+    }
+
+    /// Unknown content: a row the frontend has never been sent.
+    const UNKNOWN: u64 = 0;
+
+    fn applyOp(alloc: std.mem.Allocator, table: *RowTable, op: Op) !void {
+        switch (op) {
+            .row => |r| {
+                const gop = try table.getOrPut(alloc, r.grid_id);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                if (gop.value_ptr.items.len != r.total_rows) {
+                    const old_len = gop.value_ptr.items.len;
+                    try gop.value_ptr.resize(alloc, r.total_rows);
+                    if (r.total_rows > old_len) @memset(gop.value_ptr.items[old_len..], UNKNOWN);
+                }
+                if (r.row < gop.value_ptr.items.len) gop.value_ptr.items[r.row] = r.hash;
+            },
+            .shift => |s| {
+                const rows = (table.getPtr(s.grid_id) orelse return).items;
+                const end = @min(s.row_end, @as(u32, @intCast(rows.len)));
+                if (s.row_start >= end) return;
+                const shift: u32 = @intCast(@abs(s.delta));
+                if (s.delta > 0) {
+                    var r = s.row_start;
+                    while (r < end) : (r += 1) rows[r] = if (r + shift < end) rows[r + shift] else UNKNOWN;
+                } else {
+                    var r = end;
+                    while (r > s.row_start) {
+                        r -= 1;
+                        rows[r] = if (r >= s.row_start + shift) rows[r - shift] else UNKNOWN;
+                    }
+                }
+            },
+            .destroy => |id| {
+                if (table.fetchRemove(id)) |kv| {
+                    var rows = kv.value;
+                    rows.deinit(alloc);
+                }
+            },
+        }
+    }
+
+    /// Every row the core would generate now, from a forced full resend that
+    /// this model also applies, so the two must agree afterwards.
+    fn checkAgainstFullResend(self: *ModelFrontend, flush_ctx: *FlushCtx, rows: u32, cols: u32) !void {
+        var before: RowTable = .{};
+        defer deinitTable(self.alloc, &before);
+        var it = self.committed.iterator();
+        while (it.next()) |e| {
+            var copy: std.ArrayListUnmanaged(u64) = .empty;
+            try copy.appendSlice(self.alloc, e.value_ptr.items);
+            try before.put(self.alloc, e.key_ptr.*, copy);
+        }
+
+        self.core.grid.markEverySurfaceDirty();
+        try flush_ctx.onFlush(rows, cols);
+        try std.testing.expect(!self.oom);
+
+        // Each grid the full resend covered must have matched row for row.
+        var oracle: RowTable = .{};
+        defer deinitTable(self.alloc, &oracle);
+        for (self.staged.items) |op| {
+            if (op == .row) try applyOp(self.alloc, &oracle, op);
+        }
+        var oit = oracle.iterator();
+        while (oit.next()) |e| {
+            const had = before.get(e.key_ptr.*) orelse {
+                std.debug.print("model: grid {d} missing on the frontend\n", .{e.key_ptr.*});
+                return error.TestUnexpectedResult;
+            };
+            if (had.items.len != e.value_ptr.items.len) {
+                std.debug.print("model: grid {d} has {d} rows, core {d}\n", .{ e.key_ptr.*, had.items.len, e.value_ptr.items.len });
+                return error.TestUnexpectedResult;
+            }
+            for (had.items, e.value_ptr.items, 0..) |a, b, row| {
+                if (a != b) {
+                    std.debug.print("model: grid {d} row {d} differs\n", .{ e.key_ptr.*, row });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+};
+
+test "random edits and refusals leave the frontend holding exactly what the core would send" {
+    const seeds = [_]u64{ 1, 2, 3, 42, 1234 };
+    for (seeds) |seed| try runFlushModel(seed);
+}
+
+fn runFlushModel(seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    var model = ModelFrontend{ .alloc = std.testing.allocator, .core = &core };
+    defer model.deinit();
+    model.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+
+    var cmdline_open = false;
+    var float_open = false;
+    var step: u32 = 0;
+    while (step < 120) : (step += 1) {
+        const ops = rand.intRangeAtMost(u32, 1, 4);
+        for (0..ops) |_| {
+            switch (rand.intRangeLessThan(u32, 0, 9)) {
+                0, 1, 2 => {
+                    const gid: i64 = if (float_open) rand.intRangeAtMost(i64, 2, 4) else rand.intRangeAtMost(i64, 2, 3);
+                    const rows: u32 = if (gid == 4) 5 else 24;
+                    core.grid.putCellGrid(gid, rand.uintLessThan(u32, rows), rand.uintLessThan(u32, 8), 'a' + rand.uintLessThan(u32, 26), 0);
+                },
+                3 => {
+                    const delta: i32 = if (rand.boolean()) rand.intRangeAtMost(i32, 1, 6) else -rand.intRangeAtMost(i32, 1, 6);
+                    const gid: i64 = rand.intRangeAtMost(i64, 2, 3);
+                    core.grid.scrollGrid(gid, 0, 24, 0, 40, delta, 0);
+                    // Neovim redraws the rows a scroll vacates.
+                    const vacated: u32 = @intCast(@abs(delta));
+                    const first: u32 = if (delta > 0) 24 - vacated else 0;
+                    for (first..first + vacated) |r| core.grid.putCellGrid(gid, @intCast(r), 0, 'A' + rand.uintLessThan(u32, 26), 0);
+                },
+                4 => {
+                    if (cmdline_open) {
+                        core.grid.setCmdlineHide(1);
+                    } else {
+                        try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "echo" }}, 4, ':', "", 0, 1, 0);
+                    }
+                    cmdline_open = !cmdline_open;
+                },
+                5 => {
+                    if (float_open) {
+                        try core.grid.destroyGrid(4);
+                    } else {
+                        try core.grid.resizeGrid(4, 5, 10);
+                        try core.grid.setWinFloatPos(4, 104, 2, 3, 50, 0, 1, true);
+                        for (0..5) |r| core.grid.putCellGrid(4, @intCast(r), 0, 'f', 0);
+                    }
+                    float_open = !float_open;
+                },
+                6 => core.grid.putCellGrid(1, rand.uintLessThan(u32, 24), rand.uintLessThan(u32, 80), 'm', 0),
+                7 => if (float_open) try core.grid.setWinFloatPos(4, 104, rand.uintLessThan(u32, 10), rand.uintLessThan(u32, 30), 50, 0, 1, true),
+                else => {},
+            }
+        }
+
+        const refuse = rand.uintLessThan(u32, 3) == 0;
+        model.refuse_next_end = refuse;
+        try flush_ctx.onFlush(24, 80);
+        if (refuse) {
+            // The retry owes no more than the refused bracket sent.
+            const refused_rows = model.rows_sent;
+            try flush_ctx.onFlush(24, 80);
+            try std.testing.expect(model.rows_sent <= refused_rows);
+        }
+        try std.testing.expect(!model.oom);
+        if (step % 10 == 9) model.checkAgainstFullResend(&flush_ctx, 24, 80) catch |err| {
+            std.debug.print("model: seed={d} step={d}\n", .{ seed, step });
+            return err;
+        };
+    }
+    try model.checkAgainstFullResend(&flush_ctx, 24, 80);
 }
