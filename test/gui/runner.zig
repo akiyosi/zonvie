@@ -180,6 +180,14 @@ test "gui:visual_partial_matches_full" {
     try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
+test "gui:visual_partial_matches_full_extwin" {
+    try gated(can_capture, @import("scenarios/visual/partial_matches_full_extwin.zig"));
+}
+
+test "gui:visual_partial_matches_full_float_move" {
+    try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
+}
+
 test "gui:visual_split_divider_survives_layer_redraw" {
     try gated(can_capture, @import("scenarios/visual/split_divider_survives_layer_redraw.zig"));
 }
