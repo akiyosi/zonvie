@@ -63,9 +63,26 @@ const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
 
-fn vertexBudgetExceeded(core: *Core) error{VertexBudgetExceeded} {
+/// Vertex budget overflow error paths (3 distinct contexts).
+const VertexBudgetError = error{
+    VertexBudgetExceededPerCallback,   // Single row exceeds 256 MiB
+    VertexBudgetExceededPerSurface,    // Grid surface total exceeds 256 MiB
+    VertexBudgetExceededAggregate,     // Main + all subgrids exceeds 512 MiB
+};
+
+fn vertexBudgetExceededPerCallback(core: *Core) VertexBudgetError {
     core.flush_retryable = false;
-    return error.VertexBudgetExceeded;
+    return error.VertexBudgetExceededPerCallback;
+}
+
+fn vertexBudgetExceededPerSurface(core: *Core) VertexBudgetError {
+    core.flush_retryable = false;
+    return error.VertexBudgetExceededPerSurface;
+}
+
+fn vertexBudgetExceededAggregate(core: *Core) VertexBudgetError {
+    core.flush_retryable = false;
+    return error.VertexBudgetExceededAggregate;
 }
 
 /// Assert: precondition that vertex_budget_transaction_active == false.
@@ -221,12 +238,12 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
 /// Validate that all touched grids respect per-surface and aggregate vertex budget.
 /// Precondition: vertex_budget_transaction_active == true (called during active transaction).
 /// Postcondition: verifies all touched grids have surface_vertex_count ≤ MAX_VERTICES_PER_SURFACE.
-fn validateCompletedVertexBudget(core: *Core) !void {
+fn validateCompletedVertexBudget(core: *Core) VertexBudgetError!void {
     try syncVertexBudgetAggregate(core, true);
     if (core.grid.main_buf.vertex_budget_touched and
         core.grid.main_buf.surface_vertex_count > MAX_VERTICES_PER_SURFACE)
     {
-        return vertexBudgetExceeded(core);
+        return vertexBudgetExceededPerSurface(core);
     }
     var grid_id = core.vertex_budget_touched_grid_head;
     var visited: usize = 0;
@@ -234,17 +251,17 @@ fn validateCompletedVertexBudget(core: *Core) !void {
     while (grid_id) |current_grid_id| : (visited += 1) {
         if (visited > max_grids) {
             // Cycle detected in touched list — invariant violation
-            return vertexBudgetExceeded(core);
+            return vertexBudgetExceededPerSurface(core);
         }
         const sg = core.grid.sub_grids.get(current_grid_id) orelse
-            return vertexBudgetExceeded(core);
+            return vertexBudgetExceededPerSurface(core);
         if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
-            return vertexBudgetExceeded(core);
+            return vertexBudgetExceededPerSurface(core);
         }
         grid_id = sg.vertex_budget_touched_next;
     }
     if (core.flush_vertex_count_aggregate > MAX_VERTICES_AGGREGATE) {
-        return vertexBudgetExceeded(core);
+        return vertexBudgetExceededAggregate(core);
     }
 }
 
@@ -449,30 +466,48 @@ fn prepareVertexRowLedgerForWrite(core: *Core, grid_id: i64, buf: *grid_mod.Grid
     buf.vertex_row_ledger_valid = true;
 }
 
+/// Pure computation: calculate updated surface and aggregate counts after row vertex replacement.
+/// Precondition: old_count, new_count, aggregate inputs are valid; no overflow in sub operations.
+/// Postcondition: returns (new_surface, new_aggregate) or error on arithmetic overflow.
+fn replaceSurfaceRowVertexCountCompute(
+    old_count: usize,
+    new_count: usize,
+    surface_count: usize,
+    aggregate_count: usize,
+) VertexBudgetError!struct { surface: usize, aggregate: usize } {
+    if (new_count > MAX_VERTICES_PER_CALLBACK) {
+        return error.VertexBudgetExceededPerCallback;
+    }
+    const without_old = surface_count -| old_count;
+    const new_surface = std.math.add(usize, without_old, new_count) catch
+        return error.VertexBudgetExceededPerSurface;
+    const aggregate_without_old = aggregate_count -| old_count;
+    const new_aggregate = std.math.add(usize, aggregate_without_old, new_count) catch
+        return error.VertexBudgetExceededAggregate;
+    return .{ .surface = new_surface, .aggregate = new_aggregate };
+}
+
 fn replaceSurfaceRowVertexCount(
     core: *Core,
     surface_count: *usize,
     row_counts: []usize,
     row: usize,
     new_count: usize,
-) !void {
+) VertexBudgetError!void {
     if (row_counts.len == 0 and new_count == 0) {
         surface_count.* = 0;
         return;
     }
-    if (row >= row_counts.len or new_count > MAX_VERTICES_PER_CALLBACK) {
-        return vertexBudgetExceeded(core);
+    if (row >= row_counts.len) {
+        return error.VertexBudgetExceededPerCallback;
     }
     const old_count = row_counts[row];
-    const without_old = surface_count.* -| old_count;
-    const new_surface = std.math.add(usize, without_old, new_count) catch
-        return vertexBudgetExceeded(core);
-    const aggregate_without_old = core.flush_vertex_count_aggregate -| old_count;
-    const new_aggregate = std.math.add(usize, aggregate_without_old, new_count) catch
-        return vertexBudgetExceeded(core);
+    const result = try replaceSurfaceRowVertexCountCompute(
+        old_count, new_count, surface_count.*, core.flush_vertex_count_aggregate
+    );
     row_counts[row] = new_count;
-    surface_count.* = new_surface;
-    core.flush_vertex_count_aggregate = new_aggregate;
+    surface_count.* = result.surface;
+    core.flush_vertex_count_aggregate = result.aggregate;
 }
 
 /// Publish `new_count` as grid `grid_id`'s vertex count for `row`, replacing
