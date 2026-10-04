@@ -68,22 +68,42 @@ fn vertexBudgetExceeded(core: *Core) error{VertexBudgetExceeded} {
     return error.VertexBudgetExceeded;
 }
 
+/// Pure computation: calculate target capacity for row vertex buffer.
+/// Implements geometric growth clamped to max_vertices budget.
+/// Precondition: current_len + additional must not overflow usize.
+/// Postcondition: returns target_capacity where needed ≤ target ≤ max_vertices.
+fn computeRequiredVertexCapacity(
+    current_len: usize,
+    current_capacity: usize,
+    additional_vertices: usize,
+    max_vertices: usize,
+) !usize {
+    const needed = std.math.add(usize, current_len, additional_vertices) catch
+        return error.VertexBudgetExceeded;
+    if (needed > max_vertices) return error.VertexBudgetExceeded;
+    if (needed <= current_capacity) return current_capacity;
+
+    // ArrayList's normal geometric growth may retain capacity beyond the
+    // callback byte limit. Grow geometrically here, but clamp the precise
+    // allocation itself to the remaining fixed budget.
+    const geometric = std.math.add(usize, current_capacity, current_capacity / 2 + 8) catch max_vertices;
+    const target = @min(max_vertices, @max(needed, geometric));
+    return target;
+}
+
 fn ensureRowVertexCapacity(
     core: *Core,
     out: *std.ArrayListUnmanaged(c_api.Vertex),
     max_vertices: usize,
     additional_vertices: usize,
 ) !void {
-    const needed = std.math.add(usize, out.items.len, additional_vertices) catch
-        return vertexBudgetExceeded(core);
-    if (needed > max_vertices) return vertexBudgetExceeded(core);
-    if (needed <= out.capacity) return;
-
-    // ArrayList's normal geometric growth may retain capacity beyond the
-    // callback byte limit. Grow geometrically here, but clamp the precise
-    // allocation itself to the remaining fixed budget.
-    const geometric = std.math.add(usize, out.capacity, out.capacity / 2 + 8) catch max_vertices;
-    const target = @min(max_vertices, @max(needed, geometric));
+    const target = computeRequiredVertexCapacity(
+        out.items.len,
+        out.capacity,
+        additional_vertices,
+        max_vertices,
+    ) catch return vertexBudgetExceeded(core);
+    if (target <= out.capacity) return;
     try out.ensureTotalCapacityPrecise(core.alloc, target);
 }
 
@@ -98,24 +118,45 @@ fn ensureRowQuadCapacity(
     try ensureRowVertexCapacity(core, out, max_vertices, additional);
 }
 
-fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
-    const aggregate = std.math.add(
-        usize,
-        core.grid.main_buf.surface_vertex_count,
-        core.grid.subgrid_surface_vertex_count,
-    ) catch return vertexBudgetExceeded(core);
+/// Pure computation: sum main and subgrid vertex counts with bounds checking.
+/// Precondition: overflow detection via catch.
+/// Postcondition: returns aggregate count iff within limits or enforce_limits=false.
+fn computeVertexBudgetAggregate(
+    main_count: usize,
+    subgrid_count: usize,
+    enforce_limits: bool,
+) !usize {
+    const aggregate = std.math.add(usize, main_count, subgrid_count) catch
+        return error.VertexBudgetExceeded;
     if (enforce_limits and
-        (core.grid.main_buf.surface_vertex_count > MAX_VERTICES_PER_SURFACE or
+        (main_count > MAX_VERTICES_PER_SURFACE or
             aggregate > MAX_VERTICES_AGGREGATE))
     {
-        return vertexBudgetExceeded(core);
+        return error.VertexBudgetExceeded;
     }
+    return aggregate;
+}
+
+fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
+    // Precondition: caller must ensure grid state is stable (typically grid_mu held for reading).
+    // In transaction context, grid mutations should be bounded by vertex_budget_transaction_active.
+    const aggregate = try computeVertexBudgetAggregate(
+        core.grid.main_buf.surface_vertex_count,
+        core.grid.subgrid_surface_vertex_count,
+        enforce_limits,
+    );
     core.flush_vertex_count_aggregate = aggregate;
 }
 
+/// Begin a vertex budget transaction.
+/// Precondition: vertex_budget_transaction_active must be false.
+/// Postcondition: On success, vertex_budget_transaction_active == true and all touched flags cleared.
+/// On error, state is unchanged (early return prevents flag setup).
 fn beginVertexBudgetTransaction(core: *Core) !void {
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
+    // Validate budget before any state changes. Early return does not corrupt touched list.
     try syncVertexBudgetAggregate(core, true);
+    // State changes follow successful budget validation.
     core.grid.main_buf.vertex_budget_touched = false;
     core.grid.main_buf.reshaped_in_txn = false;
     // The intrusive touched list is rebuilt from the head, so a sub-grid whose

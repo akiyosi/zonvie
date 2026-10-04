@@ -72,6 +72,13 @@ pub const RedrawEvent = enum {
 
 /// Parse Neovim ext type handle (tab, buffer, window handles).
 /// Neovim sends handles as ext types with data containing big-endian integer.
+/// Parse a Neovim handle (window/tab/buffer ID) from MessagePack EXT.
+/// Returns 0 if EXT is empty, malformed, or decode fails.
+/// NOTE: Handle 0 is invalid in Neovim's RPC protocol. Caller must treat 0 as:
+/// - "parse error" in guard conditions (e.g., grid creation fallback to main window)
+/// - "unknown handle" in UI state update (e.g., skip if handle unrecognized)
+/// Returning 0 on all error paths ensures caller has a safe default; do not silently
+/// accept 0 as a valid grid ID without explicit handle validation.
 fn parseExtHandle(ext: mp.Ext) i64 {
     // Neovim encodes window/tab/buffer handles as MessagePack EXT with the
     // payload itself a nested MessagePack integer (e.g. handle 128 is the
@@ -81,10 +88,10 @@ fn parseExtHandle(ext: mp.Ext) i64 {
     // branch already pre-unwraps well-formed integer payloads into `.int`
     // before this function ever sees a `.ext` Value, so this only runs on
     // malformed/edge-case payloads mp.decode itself failed to unwrap.
-    if (ext.data.len == 0) return 0;
+    if (ext.data.len == 0) return 0;  // Empty EXT → invalid handle
     var sr = mp.SliceReader{ .data = ext.data };
-    const ib0 = sr.readByte() catch return 0;
-    const v = mp.decodeInt(&sr, ib0) catch return 0;
+    const ib0 = sr.readByte() catch return 0;  // Read error → invalid handle
+    const v = mp.decodeInt(&sr, ib0) catch return 0;  // Decode error → invalid handle
     return v;
 }
 
