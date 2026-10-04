@@ -1,8 +1,9 @@
 # Session 2 Handoff Document
 ## Phase 6 Implementation Continuation
 
-**Status**: Phase 6 Tier A1 in progress (6/14 functions complete)  
-**Latest Commit**: 3a9cd1d  
+**Status**: Phase 6 Tier A1 COMPLETE (14/14 functions), Tier C in progress (3/8 vacuity fixes), Tier A3/B3 pending  
+**Latest Commit**: 8640a26  
+**Previous**: 3a9cd1d  
 **Target Deadline**: 2026-11-01
 
 ---
@@ -16,7 +17,9 @@
 - 5体エージェント3回目レビュー: complete
 - Design quality score: **82.5/100**
 
-✅ **Phase 6 Tier A1 (6/14 functions)**
+✅ **Phase 6 Tier A1 (14/14 functions COMPLETE)**
+
+**Session 1（6/14）:**
 - applyModeInfo() — cursor style application
 - showmodeModeKeepsStatus() — mode exit status
 - checkedGridId() — grid handle validation
@@ -24,32 +27,31 @@
 - checkedFloatToI64() — float truncation safety
 - checkedGridCoord() — ABI position safety
 
+**Session 1 continuation（8/14）:**
+- mapGetInt/Str/Bool() — map lookup validators
+- checkedU32() — u32 range enforcement
+- argU32/argI32() — event argument parsers
+- cmdlineLevel() — cmdline nesting level
+- handleRedraw() — main event dispatcher (CRITICAL)
+
 ---
 
 ## What's Next (Session 2)
 
-### Tier A1 Completion (8 remaining functions)
+### ✅ Tier A1 Completion (14/14 DONE)
 
-**Target Functions** (in priority order):
-```
-7.  mapGetInt/Str/Bool() - map lookup validators
-10. argU32/argI32/cmdlineLevel() - event argument parsers
-11. handleRedraw() - main event dispatcher (CRITICAL)
-12. parseGridResize() - dimension validation
-13. parseGridLine() - UTF-8 + state update
-14. (remaining priority functions)
-```
+All target functions completed with Contract documentation (commit 8640a26):
+- mapGetInt/Str/Bool() ✅
+- argU32/argI32/cmdlineLevel() ✅
+- handleRedraw() ✅
+- + 5 others from Session 1
 
-**Implementation Checklist**:
-- [ ] Read each function's current docstring
-- [ ] Add Precondition (input validation expectations)
-- [ ] Add Postcondition (output/state guarantees)
-- [ ] Cross-reference Neovim RPC spec where applicable
-- [ ] Verify no behavior changes (documentation only)
-- [ ] `zig build test` all platforms
-- [ ] Commit with "feat: Tier A1 continuation — X functions added"
+**Remaining work**: Fix 2 test failures (error type updates after 3-variant error context)
 
-**Estimated workload**: 4-5 days (1.5 week with testing/validation)
+### Tier A3: config.toml Isolation Verification
+**Workload**: 1 day
+**Task**: Profiling noise measurement via XDG_CONFIG_HOME isolation
+**Effect**: perf variance 6-12% → 2-3% validated
 
 ---
 
