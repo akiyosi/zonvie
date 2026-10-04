@@ -165,6 +165,9 @@ fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoint
     return .{ .count = count, .replaced_oversized = false };
 }
 
+/// Map lookup: return i64 value iff key exists and value is int.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns i64 iff key matches and value is int, else null.
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .int) {
@@ -174,6 +177,9 @@ fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
     return null;
 }
 
+/// Map lookup: return string value iff key exists and value is string.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns string iff key matches and value is string, else null.
 fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .str) {
@@ -219,6 +225,9 @@ fn showmodeModeKeepsStatus(first: u8) bool {
     return first == 'i' or first == 'r' or first == 't';
 }
 
+/// Map lookup: return bool value iff key exists and value is bool.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns bool iff key matches and value is bool, else null.
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .bool) {
@@ -228,13 +237,11 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     return null;
 }
 
-/// Convert a signed 64-bit msgpack integer to u32, rejecting values that
-/// would require an unsafe `@intCast` (negative, or larger than
-/// `maxInt(u32)`). `@intCast` in Zig is a safety-checked assertion, not a
-/// clamp: an out-of-range value panics in Debug/ReleaseSafe and is UB in
-/// ReleaseFast. Callers treat `null` as "skip this event/tuple", matching
-/// the existing sign-checked call sites in this file (e.g. `grid_resize`,
-/// `grid_cursor_goto`).
+/// Convert signed 64-bit msgpack integer to u32, rejecting out-of-range values.
+/// Precondition: v is signed 64-bit msgpack integer (unbounded).
+/// Postcondition: returns @intCast(v) iff 0 ≤ v ≤ maxInt(u32), else null.
+/// Note: Zig @intCast panics on out-of-range in Debug/ReleaseSafe, UB in ReleaseFast.
+/// Callers treat null as "skip event/tuple" (e.g., grid_resize, grid_cursor_goto).
 fn checkedU32(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(u32)) return null;
     return @as(u32, @intCast(v));
@@ -299,15 +306,23 @@ pub fn checkedI32(v: i64) ?i32 {
 }
 
 /// An optional integer event argument: `default` unless it is an int in range.
+/// Extract u32 from msgpack value, coercing via checkedU32 with fallback.
+/// Precondition: v is any msgpack value; default is u32 fallback on type mismatch or range error.
+/// Postcondition: returns checkedU32(v.int) iff v is .int and in u32 range, else default.
 fn argU32(v: mp.Value, default: u32) u32 {
     return if (v == .int) (checkedU32(v.int) orelse default) else default;
 }
 
+/// Extract i32 from msgpack value, coercing via checkedI32 with fallback.
+/// Precondition: v is any msgpack value; default is i32 fallback on type mismatch or range error.
+/// Postcondition: returns checkedI32(v.int) iff v is .int and in i32 range, else default.
 fn argI32(v: mp.Value, default: i32) i32 {
     return if (v == .int) (checkedI32(v.int) orelse default) else default;
 }
 
-/// A cmdline nesting level: 1 unless an int of at least 1.
+/// Extract cmdline nesting level: 1 unless an int of at least 1.
+/// Precondition: v is any msgpack value.
+/// Postcondition: returns checkedU32(v.int) iff v is .int ≥ 1 and fits u32, else 1 (default level).
 fn cmdlineLevel(v: mp.Value) u32 {
     return if (v == .int and v.int >= 1) (checkedU32(v.int) orelse 1) else 1;
 }
@@ -1382,9 +1397,13 @@ test "cell cluster extraction rejects rather than truncates codepoint 17" {
     try std.testing.expectEqual(@as(u32, 0xFFFD), buf[0]);
 }
 
-/// Supported redraw events:
-/// grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
-/// default_colors_set, option_set, set_title, restart, connect, flush
+/// Main Neovim redraw event dispatcher: parse msgpack event array, dispatch to per-event handlers.
+/// Precondition: grid/hl/arena/log valid pointers; params is msgpack value array (any length);
+///   callback function pointers match context types (TypeOf enforced); all callbacks are errorunion.
+/// Postcondition: all events from params dispatched and handled; grid/hl state updated;
+///   batch perf logging written iff log.cb set; per-event timing recorded iff log.verbose set.
+/// Supported events: grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
+/// default_colors_set, option_set, set_title, restart, connect, flush (unknown events skipped).
 pub fn handleRedraw(
     grid: *Grid,
     hl: *Highlights,
