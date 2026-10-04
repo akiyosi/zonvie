@@ -187,8 +187,14 @@ fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
 
 /// Begin a vertex budget transaction.
 /// Precondition: vertex_budget_transaction_active must be false.
-/// Postcondition: On success, vertex_budget_transaction_active == true and all touched flags cleared.
-/// On error, state is unchanged (early return prevents flag setup).
+/// Postcondition (on success):
+///   - vertex_budget_transaction_active == true
+///   - All grid touched flags cleared; vertex_budget_touched_grid_head == null
+///   - flush_ledger_journal_failed == false (via beginLedgerJournal)
+/// Postcondition (on error):
+///   - vertex_budget_transaction_active == false (unchanged)
+///   - core.flush_retryable == false (side effect: nvim will be terminated on unrecoverable budget overflow)
+///   - All other state unchanged; early return prevents corrupted touched list
 fn beginVertexBudgetTransaction(core: *Core) !void {
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     // Validate budget before any state changes. Early return does not corrupt touched list.
@@ -212,6 +218,9 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     beginLedgerJournal(core);
 }
 
+/// Validate that all touched grids respect per-surface and aggregate vertex budget.
+/// Precondition: vertex_budget_transaction_active == true (called during active transaction).
+/// Postcondition: verifies all touched grids have surface_vertex_count ≤ MAX_VERTICES_PER_SURFACE.
 fn validateCompletedVertexBudget(core: *Core) !void {
     try syncVertexBudgetAggregate(core, true);
     if (core.grid.main_buf.vertex_budget_touched and
@@ -220,7 +229,13 @@ fn validateCompletedVertexBudget(core: *Core) !void {
         return vertexBudgetExceeded(core);
     }
     var grid_id = core.vertex_budget_touched_grid_head;
-    while (grid_id) |current_grid_id| {
+    var visited: usize = 0;
+    const max_grids = core.grid.sub_grids.count() + 1;
+    while (grid_id) |current_grid_id| : (visited += 1) {
+        if (visited > max_grids) {
+            // Cycle detected in touched list — invariant violation
+            return vertexBudgetExceeded(core);
+        }
         const sg = core.grid.sub_grids.get(current_grid_id) orelse
             return vertexBudgetExceeded(core);
         if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
@@ -306,6 +321,14 @@ fn restoreLedger(buf: *grid_mod.GridBuf, saved: *const nvim_core.SavedLedger) vo
 /// Retire the previous attempt's saved ledgers. Each grid's ledger is saved
 /// on this attempt's first write to it (saveLedgerOnFirstWrite), so a flush
 /// pays for the grids it touches, not for every grid.
+/// Precondition:
+///   - vertex_budget_transaction_active must be false before first call
+///   - No concurrent ledger writes during transaction
+/// Postcondition:
+///   - flush_ledger_journal_failed = false (ready for saveLedgerOnFirstWrite calls)
+///   - flush_main_ledger.live = false (old state discarded)
+///   - All subgrid entries marked live = false
+///   - Destroyed grid entries cleaned up (Neovim never reuses grid handles)
 fn beginLedgerJournal(core: *Core) void {
     core.flush_ledger_journal_failed = false;
     core.flush_main_ledger.live = false;
@@ -2889,6 +2912,8 @@ pub const FlushCtx = struct {
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
+        // Verify no orphaned transaction from previous attempt's error path.
+        assertTransactionInactive(ctx.core);
         try beginVertexBudgetTransaction(ctx.core);
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
 
