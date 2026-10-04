@@ -183,6 +183,18 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
+/* Validate preconditions for on_vertices_row callback.
+   Returns 1 if all preconditions hold, 0 on violation.
+   Frontend should call this in debug mode to catch misuse early.
+   Checks: grid_id valid, vert_count consistent with flags, layer placement bounds. */
+ZONVIE_API int zonvie_validate_vertices_row_preconditions(
+    const zonvie_vertex* verts,
+    size_t vert_count,
+    uint32_t flags,
+    uint32_t total_rows,
+    uint32_t total_cols
+);
+
 /* on_vertices_row layers are independent:
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
