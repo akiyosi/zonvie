@@ -68,6 +68,43 @@ fn vertexBudgetExceeded(core: *Core) error{VertexBudgetExceeded} {
     return error.VertexBudgetExceeded;
 }
 
+/// Assert: precondition that vertex_budget_transaction_active == false.
+/// Used to catch early-return cases where state cleanup was incomplete.
+fn assertTransactionInactive(core: *const Core) void {
+    std.debug.assert(!core.vertex_budget_transaction_active);
+}
+
+/// Clear all touched vertex budget surfaces (safe linked-list traversal).
+/// Precondition: must be called after transaction completes (success or error).
+/// Postcondition: all touched flags and linked-list cleared; transaction_active = false.
+fn clearAllTouchedVertexBudgets(core: *Core) void {
+    core.grid.main_buf.vertex_budget_touched = false;
+    var grid_id = core.vertex_budget_touched_grid_head;
+    var visited: usize = 0;
+    const max_grids = core.grid.sub_grids.count() + 1;
+    while (grid_id) |current_grid_id| : (visited += 1) {
+        if (visited > max_grids) {
+            // Cycle detected — emergency cleanup
+            var it = core.grid.sub_grids.valueIterator();
+            while (it.next()) |sg| {
+                sg.vertex_budget_touched = false;
+                sg.vertex_budget_touched_next = null;
+            }
+            break;
+        }
+        if (core.grid.sub_grids.getPtr(current_grid_id)) |sg| {
+            sg.vertex_budget_touched = false;
+            const next = sg.vertex_budget_touched_next;
+            sg.vertex_budget_touched_next = null;
+            grid_id = next;
+        } else {
+            break;
+        }
+    }
+    core.vertex_budget_touched_grid_head = null;
+    core.vertex_budget_transaction_active = false;
+}
+
 /// Pure computation: calculate target capacity for row vertex buffer.
 /// Implements geometric growth clamped to max_vertices budget.
 /// Precondition: current_len + additional must not overflow usize.
