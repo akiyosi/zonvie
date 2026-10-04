@@ -184,6 +184,8 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 }
 
 /// Apply mode_infos[idx] to the grid's live cursor style fields.
+/// Precondition: grid must be a valid Grid pointer; idx is bounds-unchecked.
+/// Postcondition: grid.cursor_shape, cursor_attr_id, blink_* fields updated to match mode idx.
 ///
 /// Both mode_info_set and mode_change need this. The live fields are a
 /// snapshot of a table entry, so a table rebuilt by `:set guicursor` must be
@@ -211,6 +213,8 @@ fn applyModeInfo(grid: *Grid, idx: usize) void {
 
 /// Modes whose exit may leave a stale showmode, by the first byte of the
 /// mode_change name ("insert", "replace", "terminal").
+/// Precondition: first is a single u8 byte (invariant: always true).
+/// Postcondition: returns true iff mode name starts with 'i', 'r', or 't'.
 fn showmodeModeKeepsStatus(first: u8) bool {
     return first == 'i' or first == 'r' or first == 't';
 }
