@@ -280,6 +280,8 @@ fn appendContentChunks(
 /// Neovim allocates grid handles from a positive signed-int domain. Metal's
 /// vertex input and scroll-offset ABI consume the low signed 32 bits, so reject
 /// values outside that producer domain before they can enter shared grid state.
+/// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
+/// Postcondition: returns v iff 0 < v <= i32.max, else null (producer domain enforcement).
 fn checkedGridId(v: i64) ?i64 {
     if (v <= 0 or v > std.math.maxInt(i32)) return null;
     return v;
@@ -289,6 +291,8 @@ fn checkedGridId(v: i64) ?i64 {
 /// the i32 range. Exposed as `pub` because `rpc_session.zig`'s
 /// `handleWinMoveCursor` — a directly reachable RPC *request* handler, not
 /// just a redraw event — needs the identical guard.
+/// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
+/// Postcondition: returns v as i32 iff i32.min <= v <= i32.max, else null.
 pub fn checkedI32(v: i64) ?i32 {
     if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return null;
     return @as(i32, @intCast(v));
@@ -310,6 +314,8 @@ fn cmdlineLevel(v: mp.Value) u32 {
 
 /// Truncate one finite Msgpack float to i64 without letting @intFromFloat
 /// assert on NaN, infinity, or a value outside the integer domain.
+/// Precondition: v is a MessagePack float value (range unbounded per spec).
+/// Postcondition: returns @intFromFloat(v) iff finite and in i64 range, else null.
 fn checkedFloatToI64(v: f64) ?i64 {
     if (!std.math.isFinite(v)) return null;
     const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
@@ -320,6 +326,8 @@ fn checkedFloatToI64(v: f64) ?i64 {
 
 /// Grid positions cross i32 frontend ABI fields. Reject, rather than wrap or
 /// clamp, an event which cannot be represented consistently by every consumer.
+/// Precondition: v is a signed 64-bit integer representing a grid position.
+/// Postcondition: returns v as u32 iff 0 <= v <= i32.max, else null (ABI safety).
 fn checkedGridCoord(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(i32)) return null;
     return @intCast(v);
