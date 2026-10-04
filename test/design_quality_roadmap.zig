@@ -49,6 +49,9 @@
 //   File: build.zig or profiling docs
 //   Effect: Reliable performance measurements; logging doesn't pollute results
 
+// Phase 6-8 Implementation Roadmap
+// =================================
+//
 // Phase 6 (HIGH) — Testability Final Optimization & Release Prep:
 //
 // TODO: Phase 4 test expect()実装（1週間）
@@ -67,11 +70,60 @@
 //   Setup: XDG_CONFIG_HOME=/tmp/zonvie_profile_$$ でconfig隔離
 //   Measurement: perf variance 6-12% → 2-3% 達成確認
 //
+// Phase 7 (MEDIUM) — Technology Debt Reduction (3-4 weeks):
+//
+// TODO: Paired Assertions caller-side check拡張（3週間）
+//   Target: redraw_handler.zig 32関数、flush_helpers 12関数
+//   Effect: Assertion Coverage 68 → 82/100 (+14pt)
+//   Validation: Neovim RPC invariant detection +20%
+//
+// TODO: Recovery Action Strategy Implementation（1.5-2週間）
+//   Target: PerCallback/PerSurface/Aggregate各種の handler
+//   Effect: Operational precision +18pt、recovery reliability +25%
+//   Integration: Error Context 3種化との統合
+//
+// TODO: ロック保持下の間接副作用隔離（2-3日）
+//   Target: grid.sub_grids.getPtr()反復中の状態変更
+//   Effect: 副作用隔離 +4-6pt
+//   Pattern: Borrowed reference + validation guard
+//
+// Phase 8 (LONG-TERM) — Architectural Improvements (4-8+ weeks):
+//
+// TODO: Surface Unification macOS ↔ Windows（3-4週間）
+//   Target: draw backend統一、OS固有コード削減
+//   Effect: 保守性 +20pt、バグ減少 30%
+//   Dependencies: Per-grid damage fixes、shader harmonization
+//
+// TODO: Instanced Rendering拡張 Windows（2-3週間）
+//   Target: macOS完了、Windows Phase D実装
+//   Effect: 性能向上 15-20%
+//   Branch: feature/instanced-rendering
+//
+// TODO: GridMutexGuard Type-Safety（15-20行）
+//   Target: grid_mu ロック忘却の型システム防止
+//   Effect: Contract Clarity +5-8pt、Runtime Safety +12pt
+//   Pattern: Zig comptime validation
+//
 // Summary:
 // - Phase 1-3: Precondition clarity + pure function extraction + encapsulation (DONE - 4593d9d)
 // - Phase 4-5: Error Context 3種化 + 計算部分抽出（DONE - 06bebce）
-// - Phase 6: テスト実装完成 + Testability最適化（IN PROGRESS）
-// - Total 15 recommendations from Zig design quality survey → 18 fixes delivered
-// - Design quality score: 38 → 82.5/100 (+117%)
-// - Target completion: 2026-11-01 (3-4 weeks)
-// - Merge status: ✅ GO (Risk: LOW)
+// - Phase 6: テスト実装完成 + Testability最適化（2026-11-01 target）
+// - Phase 7: Technology Debt削減（Paired Assertions + Recovery Strategy）
+// - Phase 8: Architectural改善（Surface unification + Instanced rendering）
+//
+// Total fixes: 18 (Phase 1-5) + 12+ (Phase 6-8) = 30+
+// Design quality score trajectory:
+//   - Initial: 38/100
+//   - After Phase 1-5: 82.5/100 (+117%)
+//   - After Phase 6: 88/100 (estimated)
+//   - After Phase 7: 94/100 (estimated)
+//   - Phase 8+: 96+/100 (continuous improvement)
+//
+// Target completion: 2026-12-31（Phase 8）
+// Merge status: ✅ GO (Risk: LOW) - Phase 6 interim gate
+//
+// Multi-session implementation plan:
+// - Session 1 (current): Phase 1-5 implementation + Phase 6-8 planning (COMPLETE)
+// - Session 2: Phase 6 redraw_handler Contract doc + Tier A completion
+// - Session 3: Phase 7 Paired Assertions + Recovery strategy
+// - Session 4+: Phase 8 Surface unification + Instanced rendering
