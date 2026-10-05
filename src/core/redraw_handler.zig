@@ -173,6 +173,7 @@ fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoint
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns i64 iff key matches and value is int, else null.
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
+    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .int) {
             return p.val.int;
@@ -185,6 +186,7 @@ fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns string iff key matches and value is string, else null.
 fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
+    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .str) {
             return p.val.str;
@@ -235,6 +237,7 @@ fn showmodeModeKeepsStatus(first: u8) bool {
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns bool iff key matches and value is bool, else null.
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
+    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .bool) {
             return p.val.bool;
@@ -249,6 +252,7 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
 /// Note: Zig @intCast panics on out-of-range in Debug/ReleaseSafe, UB in ReleaseFast.
 /// Callers treat null as "skip event/tuple" (e.g., grid_resize, grid_cursor_goto).
 fn checkedU32(v: i64) ?u32 {
+    std.debug.assert(v >= std.math.minInt(i64));
     if (v < 0 or v > std.math.maxInt(u32)) return null;
     return @as(u32, @intCast(v));
 }
