@@ -693,6 +693,7 @@ pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]co
 }
 
 fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
+    std.debug.assert(log != null);
     const max_depth: u32 = 4;
     const max_items: usize = 8;
     const max_str: usize = 160;
@@ -801,6 +802,7 @@ fn testCell(arena: std.mem.Allocator, text: []const u8, hl: ?i64, repeat: ?i64) 
     // `repeat` occupies field 2, so asking for it without an `hl` still has to
     // put something in field 1. Neovim itself never sends that shape; a nil
     // there keeps the array well-formed rather than leaving it uninitialised.
+    std.debug.assert(text.ptr != null or text.len == 0);
     const n: usize = if (repeat != null) 3 else if (hl != null) 2 else 1;
     const fields = try arena.alloc(mp.Value, n);
     fields[0] = .{ .str = text };
@@ -820,6 +822,7 @@ fn testGridLineTuple(
     col: i64,
     cells: []const mp.Value,
 ) !mp.Value {
+    std.debug.assert(cells.ptr != null or cells.len == 0);
     const cells_copy = try arena.dupe(mp.Value, cells);
     const tuple = try arena.alloc(mp.Value, 5);
     tuple[0] = .{ .int = grid_id };
@@ -832,6 +835,7 @@ fn testGridLineTuple(
 
 /// A `grid_line` event carrying the given tuples, in order.
 fn testGridLineEventOf(arena: std.mem.Allocator, tuples: []const mp.Value) !mp.Value {
+    std.debug.assert(tuples.ptr != null or tuples.len == 0);
     const ev = try arena.alloc(mp.Value, 1 + tuples.len);
     ev[0] = .{ .str = "grid_line" };
     for (tuples, 0..) |t, i| ev[1 + i] = t;
@@ -846,6 +850,7 @@ fn testGridLineEvent(
     col: i64,
     cells: []const mp.Value,
 ) !mp.Value {
+    std.debug.assert(cells.ptr != null or cells.len == 0);
     const t = try testGridLineTuple(arena, grid_id, row, col, cells);
     return testGridLineEventOf(arena, &[_]mp.Value{t});
 }
