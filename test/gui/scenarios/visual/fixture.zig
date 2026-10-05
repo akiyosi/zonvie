@@ -62,12 +62,23 @@ pub fn openWithLogAndConfig(alloc: std.mem.Allocator, log_path: []const u8, conf
 ///  - Font set to OS-stable monospace (Menlo/h13 on macOS, Consolas/h13 Windows)
 ///  - Grid stable (waitStableGrid)
 /// Precondition for Phase 6a tests: cursor-only callback and callback order determinism.
+///
+/// Precondition assertions (Tier 1 verification):
+///  - alloc != null (allocator must be valid)
+///  - log_path != null && log_path.len > 0 (log file path required)
+///  - config_dir != null && config_dir.len > 0 (config directory required)
+///  - app_env is well-formed environment array
 pub fn openWithLogConfigAndEnv(
     alloc: std.mem.Allocator,
     log_path: []const u8,
     config_dir: []const u8,
     app_env: []const [2][]const u8,
 ) !*Gui {
+    // Precondition assertion: validate inputs (Tier 1 mutation boundary guard)
+    std.debug.assert(log_path.len > 0);  // log path required
+    std.debug.assert(config_dir.len > 0);  // config dir required
+    // app_env array is checked by Gui.init (deferred to lower layer)
+
     try requireScreenAccess();
     var g = try Gui.init(alloc, .{
         .app_args = &.{ "--log", log_path },

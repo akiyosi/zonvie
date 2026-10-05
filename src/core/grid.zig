@@ -1811,6 +1811,13 @@ pub const Grid = struct {
     /// Move overflow entries during a scroll operation.
     /// Entries in the scroll region are shifted by `shift_rows`, entries in the
     /// vacated band are removed.
+    ///
+    /// Precondition (Tier 1 mutation boundary):
+    /// - Caller must ensure scratch buffers have capacity:
+    ///   self.overflow_key_scratch.capacity >= grid.overflow_count
+    ///   self.overflow_moved_scratch.capacity >= grid.overflow_count
+    /// - Capacity is guaranteed at insertion time (addOverflowIndexAssumeCapacity),
+    ///   so no allocation or OOM branch occurs after base cells have moved.
     pub fn scrollOverflow(self: *Grid, grid_id: i64, top: u32, bot: u32, left: u32, right: u32, rows_delta: i32) void {
         const grid_overflow_count = self.overflowCountForGrid(grid_id);
         if (grid_overflow_count == 0) return;
