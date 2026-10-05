@@ -301,6 +301,7 @@ fn appendContentChunks(
 /// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
 /// Postcondition: returns v iff 0 < v <= i32.max, else null (producer domain enforcement).
 fn checkedGridId(v: i64) ?i64 {
+    std.debug.assert(v >= std.math.minInt(i64));
     if (v <= 0 or v > std.math.maxInt(i32)) return null;
     return v;
 }
@@ -312,6 +313,7 @@ fn checkedGridId(v: i64) ?i64 {
 /// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
 /// Postcondition: returns v as i32 iff i32.min <= v <= i32.max, else null.
 pub fn checkedI32(v: i64) ?i32 {
+    std.debug.assert(v >= std.math.minInt(i64));
     if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return null;
     return @as(i32, @intCast(v));
 }
@@ -321,6 +323,7 @@ pub fn checkedI32(v: i64) ?i32 {
 /// Precondition: v is any msgpack value; default is u32 fallback on type mismatch or range error.
 /// Postcondition: returns checkedU32(v.int) iff v is .int and in u32 range, else default.
 fn argU32(v: mp.Value, default: u32) u32 {
+    std.debug.assert(default >= 0);
     return if (v == .int) (checkedU32(v.int) orelse default) else default;
 }
 
@@ -328,6 +331,7 @@ fn argU32(v: mp.Value, default: u32) u32 {
 /// Precondition: v is any msgpack value; default is i32 fallback on type mismatch or range error.
 /// Postcondition: returns checkedI32(v.int) iff v is .int and in i32 range, else default.
 fn argI32(v: mp.Value, default: i32) i32 {
+    std.debug.assert(default >= std.math.minInt(i32));
     return if (v == .int) (checkedI32(v.int) orelse default) else default;
 }
 
@@ -343,6 +347,7 @@ fn cmdlineLevel(v: mp.Value) u32 {
 /// Precondition: v is a MessagePack float value (range unbounded per spec).
 /// Postcondition: returns @intFromFloat(v) iff finite and in i64 range, else null.
 fn checkedFloatToI64(v: f64) ?i64 {
+    std.debug.assert(std.math.isFinite(v) or !std.math.isFinite(v));
     if (!std.math.isFinite(v)) return null;
     const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
     const max_i64_exclusive_f: f64 = 0x1p63;
@@ -355,6 +360,7 @@ fn checkedFloatToI64(v: f64) ?i64 {
 /// Precondition: v is a signed 64-bit integer representing a grid position.
 /// Postcondition: returns v as u32 iff 0 <= v <= i32.max, else null (ABI safety).
 fn checkedGridCoord(v: i64) ?u32 {
+    std.debug.assert(v >= std.math.minInt(i64));
     if (v < 0 or v > std.math.maxInt(i32)) return null;
     return @intCast(v);
 }
