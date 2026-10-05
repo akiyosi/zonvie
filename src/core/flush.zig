@@ -1,5 +1,17 @@
 // flush.zig — Flush pipeline, ext_* UI notification subsystems.
 // Extracted from nvim_core.zig. Free functions take *Core as first parameter.
+//
+// Callback Invocation Order (guaranteed):
+//   beginVertexBudgetTransaction()
+//      → on_flush_begin callback (vertex transaction open)
+//        → for each dirty region: on_vertices_row callback (per-grid or per-row)
+//      → on_flush_end callback (transaction commit, all rows submitted)
+//   validateCompletedVertexBudget()
+//
+// This order is enforced via defer guards in the flush transaction machinery.
+// Frontend implementations (macOS, Windows) depend on this order for atlas
+// transaction lifecycle and GPU command buffer sequencing. Changes to this
+// order require updates to both consumers.
 
 const std = @import("std");
 const clock = @import("clock.zig");
@@ -63,11 +75,12 @@ const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
 
-/// Vertex budget overflow error paths (3 distinct contexts).
+/// Vertex budget and shaping buffer errors.
 const VertexBudgetError = error{
     VertexBudgetExceededPerCallback,   // Single row exceeds 256 MiB
     VertexBudgetExceededPerSurface,    // Grid surface total exceeds 256 MiB
     VertexBudgetExceededAggregate,     // Main + all subgrids exceeds 512 MiB
+    OutOfMemory,                        // ShapingBuffers allocation failed (transient)
 };
 
 fn vertexBudgetExceededPerCallback(core: *Core) VertexBudgetError {
@@ -1570,6 +1583,13 @@ fn cancelFlushForAtlasReset(core: *Core) void {
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
+///
+/// Postcondition: appends vertices to `out` in 5-pass order (background, under-deco,
+/// glyphs, over-deco, cursor). `stats.pass_ends[i]` is relative to `out.items.len` at entry
+/// (i.e., `out.items[out_start + stats.pass_ends[i-1]..out_start + stats.pass_ends[i]]`
+/// yields pass i vertices). Partial redraw callers must preserve prior rows and use
+/// `pass_ends` offsets to identify new vertex ranges. Buffer is append-only; existing
+/// items are never modified.
 pub fn generateRowVertices(
     core: *Core,
     p: RowGenParams,

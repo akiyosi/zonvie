@@ -1441,6 +1441,10 @@ test "cell cluster extraction rejects rather than truncates codepoint 17" {
 ///   batch perf logging written iff log.cb set; per-event timing recorded iff log.verbose set.
 /// Supported events: grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
 /// default_colors_set, option_set, set_title, restart, connect, flush (unknown events skipped).
+/// Dispatch Neovim redraw batch. Processes events (grid_line, grid_scroll, hl_attr_define, etc.)
+/// under grid_mu lock. Mutation boundary: grid cells, row dirty bits, highlights.
+/// Read-only: grid.cursor_row/col (caller via grid_cursor_goto), grid.rows/cols (frozen during batch).
+/// Precondition: grid.rows, grid.cols not modified during batch dispatch.
 pub fn handleRedraw(
     grid: *Grid,
     hl: *Highlights,
@@ -1459,11 +1463,9 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
-    // === Paired Assertions: caller-side precondition checks ===
-    std.debug.assert(grid != null);  // Grid pointer must be valid
-    std.debug.assert(hl != null);    // Highlights pointer must be valid
-    std.debug.assert(log != null);   // Logger pointer must be valid
-    // params may be empty (valid batch with no events)
+    // Precondition: grid, hl, log pointers are valid (asserted by caller).
+    // Mutation boundary: grid cells, row dirty bits, highlights.
+    // Params may be empty (valid batch with no events).
 
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]

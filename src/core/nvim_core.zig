@@ -3773,6 +3773,14 @@ pub const Core = struct {
     /// the locked section, another thread (zonvie_core_retry_flush on the UI
     /// thread) could read or clobber it mid-callback and self-deadlock on
     /// grid_mu.
+    ///
+    /// LOCK PATTERN (defer to unlockGridAsRedrawOwner):
+    ///   - This is a non-reentrant lock. Callback re-entry from updateLayoutPx
+    ///     is guarded by onRedrawThread() to avoid deadlock.
+    ///   - Post-processing (pending_grid_resizes, pending_win_ops) is held under
+    ///     grid_mu; the lock is not released until all grid mutations complete.
+    ///   - Multi-grid parallelism is NOT supported: grid_mu serializes all grid
+    ///     updates. Callers must not assume parallel grid dispatch is safe.
     pub fn lockGridAsRedrawOwner(self: *Core) void {
         self.grid_mu.lockUncancelable(clock.io());
         self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
