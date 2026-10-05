@@ -71,11 +71,14 @@ const VertexBudgetError = error{
 };
 
 fn vertexBudgetExceededPerCallback(core: *Core) VertexBudgetError {
+    // Tier D1: PerCallback recovery — skip single row, continue batch
     core.flush_retryable = false;
+    core.vertex_budget_current_row_skipped = true;
     return error.VertexBudgetExceededPerCallback;
 }
 
 fn vertexBudgetExceededPerSurface(core: *Core) VertexBudgetError {
+    // Tier D1: PerSurface recovery — abort surface, fallback to main
     core.flush_retryable = false;
     return error.VertexBudgetExceededPerSurface;
 }
