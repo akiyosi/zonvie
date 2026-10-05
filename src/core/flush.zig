@@ -276,6 +276,8 @@ fn validateCompletedVertexBudget(core: *Core) !void {
 }
 
 fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void {
+    std.debug.assert(grid_id > 0);
+    std.debug.assert(buf != null);
     if (buf.vertex_budget_touched) return;
     buf.vertex_budget_touched = true;
     if (grid_id == 1) return;
@@ -284,12 +286,14 @@ fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void
 }
 
 fn clearTouchedVertexBudgetSurfaces(core: *Core) void {
+    std.debug.assert(core != null);
     core.grid.main_buf.vertex_budget_touched = false;
     var grid_id = core.vertex_budget_touched_grid_head;
     while (grid_id) |current_grid_id| {
         const sg = core.grid.sub_grids.getPtr(current_grid_id) orelse {
             // Grid mutation is serialized by grid_mu, but make invariant
             // failure cleanup total rather than leaving stale active links.
+            // Tier B1: recovery strategy — reset all touched flags on mutation error
             var sg_it = core.grid.sub_grids.valueIterator();
             while (sg_it.next()) |remaining| {
                 remaining.vertex_budget_touched = false;
