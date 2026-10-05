@@ -1,0 +1,23 @@
+# Phase 7 Tier B1/D1実装完遂状況
+
+## Tier B1: Lock Isolation + Grid Mutation Serialization
+- beginVertexBudgetTransaction: grid_mu lock guard assertion + documentation ✅
+- validateCompletedVertexBudget: transaction state validation + assert ✅
+- touchGridVertexBudget: grid_id bounds check + grid_mu serialization ✅
+- clearTouchedVertexBudgetSurfaces: recovery strategy documentation + error handling ✅
+
+実装概要：grid_mu 持続中のsub_grids反復により、並行mutation防止。
+
+## Tier D1: Recovery Action Strategy Handler
+- vertexBudgetExceededPerCallback: skip row on overflow (macOS Metal単一行buffer)
+- vertexBudgetExceededPerSurface: fallback to main surface rendering
+- vertexBudgetExceededAggregate: fatal recovery (nvim child termination)
+
+実装概要：エラーコンテキスト3種に対応。
+
+## 残件
+- Recovery handlers本体の実装（現在：declaration only）
+- Grid mutation watchdog（cycle detection実装済み）
+- Multi-grid capacity gate同期化
+
+実装難易度：中程度（已実装のlock isolation基盤上で構築）
