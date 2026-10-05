@@ -90,6 +90,12 @@ fn vertexBudgetExceededPerCallback(core: *Core) VertexBudgetError {
     return error.VertexBudgetExceededPerCallback;
 }
 
+// OutOfMemory error handling strategy:
+// - Returned by: ShapingBuffers.ensureCapacity (burst allocation for text shaping)
+// - Recovery: Transient. Caller catches OutOfMemory → abort_flush + dirty_state_restore
+// - Frontend observes: no vertices submitted on error path; partial redraw state preserved
+// - Re-try: Same dirty regions on next flush with reduced content or post-GC retry
+
 fn vertexBudgetExceededPerSurface(core: *Core) VertexBudgetError {
     // Tier D1: PerSurface recovery — abort surface, fallback to main
     core.flush_retryable = false;
