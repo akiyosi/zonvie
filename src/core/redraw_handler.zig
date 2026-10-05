@@ -421,10 +421,12 @@ const GuiFontList = struct {
 };
 
 fn isSpaceAfterComma(c: u8) bool {
+    std.debug.assert(c >= 0);
     return c == ' ' or c == '\t';
 }
 
 fn isWinGuiFontSpec(s: []const u8) bool {
+    std.debug.assert(s.ptr != null or s.len == 0);
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
     const opts = s[colon + 1 ..];
 
