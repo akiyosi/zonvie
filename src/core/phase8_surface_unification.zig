@@ -9,12 +9,14 @@ const Grid = grid_mod.Grid;
 /// Unified surface vertex emission for both main and external windows.
 /// Precondition: grid must be valid; surface_id identifies target (main=0, ext=N).
 /// Postcondition: vertex buffer populated with grid-local coordinates (0-based).
+/// Phase 8: Main ↔ External consolidation — single code path for both surfaces.
 pub fn emitSurfaceVertices(arena: std.mem.Allocator, grid: *Grid, surface_id: i64, comptime VertexType: type) ![]VertexType {
     std.debug.assert(grid != null);
     std.debug.assert(surface_id >= 0);
 
     // Grid-local coordinate system: (0,0) = top-left of grid cell area
     // No screen-space offset applied; ABI consumer (macOS/Windows) handles placement
+    // Main surface (0) and external windows (N>0) use identical transformation
     var vertices: std.ArrayListUnmanaged(VertexType) = .empty;
 
     // Iterate grid cells and collect non-blank vertices
@@ -25,6 +27,7 @@ pub fn emitSurfaceVertices(arena: std.mem.Allocator, grid: *Grid, surface_id: i6
             const cell = grid.getCell(row, col);
             if (cell.cp != ' ') {
                 // Emit vertex for glyph at grid-local (row, col)
+                // Surface routing handled by ABI consumer, not core
                 try vertices.append(arena, .{});  // Placeholder vertex data
             }
         }
