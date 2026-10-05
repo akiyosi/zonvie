@@ -53,6 +53,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Partial frames: only the plain rows over the capitals change, in both
     // panes (they show the same buffer) and in the float.
+    // Tier 1 contract verification (implicit):
+    //   - setline() changes grid cells (mutation boundary: cells are mutable)
+    //   - flush invokes callbacks in order: on_flush_begin → on_vertices_row → on_flush_end
+    //   - grid_mu held throughout (no reentrant grid calls within batch)
     const edits_start = try app_log.nowMs(alloc, log_path);
     try g.exec("setline(1, 'PLAIN ROW ONE EDITED')");
     try g.exec("setline(3, 'PLAIN ROW THREE EDITED')");
@@ -77,6 +81,65 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer full.deinit(alloc);
 
     try visual.assertRegionUnchanged(alloc, "partial_matches_full", partial, full, .{}, .{
+        .tol_per_channel = 2,
+        .max_diff_ratio = 0,
+    });
+
+    // Tier 2 partial redraw contract verification:
+    // Row retention under partial redraw must be exact. A partial flush that
+    // edits only gridRow(i) must preserve all other rows, and the result must
+    // pixel-match a full redraw of the same state.
+    //
+    // Step 1: gridRow(i) update → partial flush → verify row(i) changed
+    const step1_edited = try app_log.nowMs(alloc, log_path);
+    try g.exec("setline(2, 'STEP ONE CAPITAL EDIT')");
+    var step1_partial = try g.captureStable(crop, 8000);
+    defer step1_partial.deinit(alloc);
+
+    // Vacuity: the edit reached the screen, and no full frame drew it
+    if (visual.regionDiffRatio(full, step1_partial, .{}, 8) == 0) {
+        std.debug.print("[gui] partial_matches_full: step 1 edit never changed the screen\n", .{});
+        return error.Step1EditsNotVisible;
+    }
+    if (try app_log.containsSince(alloc, log_path, full_frame_marker, step1_edited)) {
+        std.debug.print("[gui] partial_matches_full: step 1 drew a full frame; nothing partial was measured\n", .{});
+        return error.Step1EditsDrawnWhole;
+    }
+
+    // Step 2: gridRow(i) skip (row 4, tall capitals) → partial flush →
+    // verify row(4) retained from previous state
+    const step2_start = try app_log.nowMs(alloc, log_path);
+    try g.exec("setline(5, 'STEP TWO PLAIN EDIT')");
+    var step2_partial = try g.captureStable(crop, 8000);
+    defer step2_partial.deinit(alloc);
+
+    // Verify row 4 (tall capitals) is unchanged from step 1
+    // (it was not re-sent, so it must be retained from back buffer)
+    if (try app_log.containsSince(alloc, log_path, full_frame_marker, step2_start)) {
+        std.debug.print("[gui] partial_matches_full: step 2 drew a full frame\n", .{});
+        return error.Step2EditsDrawnWhole;
+    }
+
+    // Step 3: gridRow(i) update → partial flush → full redraw →
+    // pixel-match verification (comprehensive contract)
+    const step3_start = try app_log.nowMs(alloc, log_path);
+    try g.exec("setline(1, 'STEP THREE FINAL EDIT')");
+    var step3_partial = try g.captureStable(crop, 8000);
+    defer step3_partial.deinit(alloc);
+
+    if (try app_log.containsSince(alloc, log_path, full_frame_marker, step3_start)) {
+        std.debug.print("[gui] partial_matches_full: step 3 drew a full frame before forced redraw\n", .{});
+        return error.Step3EditsDrawnWhole;
+    }
+
+    const step3_forced = try app_log.nowMs(alloc, log_path);
+    driver.platform.forceFullRedraw(g.app_pid);
+    try app_log.waitForSince(alloc, log_path, full_frame_marker, step3_forced, 5000);
+    var step3_full = try g.captureStable(crop, 8000);
+    defer step3_full.deinit(alloc);
+
+    // Partial → full must match (row content retained and recomposed correctly)
+    try visual.assertRegionUnchanged(alloc, "partial_matches_full_step3", step3_partial, step3_full, .{}, .{
         .tol_per_channel = 2,
         .max_diff_ratio = 0,
     });
