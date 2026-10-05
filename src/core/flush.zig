@@ -223,6 +223,13 @@ fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
 ///   - All other state unchanged; early return prevents corrupted touched list
 fn beginVertexBudgetTransaction(core: *Core) !void {
     std.debug.assert(!core.vertex_budget_transaction_active);
+    // Tier B1: Multi-grid capacity gate — ensure all sub-grids within budget before txn
+    var sg_it = core.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| {
+        if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
+            return vertexBudgetExceededPerSurface(core);
+        }
+    }
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     // Validate budget before any state changes. Early return does not corrupt touched list.
     try syncVertexBudgetAggregate(core, true);
