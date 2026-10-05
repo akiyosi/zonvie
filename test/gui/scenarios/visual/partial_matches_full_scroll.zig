@@ -18,7 +18,7 @@ const crop: driver.capture.Crop = .{ .w_pt = 700, .h_pt = 480 };
 
 const tall = "\u{00C5}\u{00C9}\u{00CE}\u{00D6}\u{00DC} \u{00C5}\u{00C9}\u{00CE}\u{00D6}\u{00DC} \u{00C5}\u{00C9}\u{00CE}\u{00D6}\u{00DC}";
 
-pub fn run(_: std.mem.Allocator) !void {
+pub fn run(alloc: std.mem.Allocator) !void {
     // TODO: Zig 0.16 fs API — deleteFile skipped for now
     var g = try fixture.openWithLogConfigAndEnv(alloc, log_path, "test/gui/fixtures/config", &.{
         .{ "ZONVIE_TEST_FULL_REDRAW", "1" },
