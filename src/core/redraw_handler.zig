@@ -101,7 +101,6 @@ fn parseExtHandle(ext: mp.Ext) i64 {
 /// mutating the grid instead of silently publishing a truncated cluster.
 /// Extract codepoints: caller-side check — buf must be [16]u32
 fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
-    std.debug.assert(buf != null);
     if (utf8.len == 0) {
         buf[0] = 0;
         return 1;
@@ -161,7 +160,6 @@ const ExtractedCellCodepoints = struct {
 /// its flush event).
 /// Tier A2: caller-side buf pointer validation
 fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoints {
-    std.debug.assert(buf != null);
     const count = extractAllCodepoints(utf8, buf) catch {
         buf[0] = 0xFFFD;
         return .{ .count = 1, .replaced_oversized = true };
@@ -173,7 +171,6 @@ fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoint
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns i64 iff key matches and value is int, else null.
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
-    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .int) {
             return p.val.int;
@@ -186,7 +183,6 @@ fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns string iff key matches and value is string, else null.
 fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
-    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .str) {
             return p.val.str;
@@ -210,7 +206,6 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 /// the default block with no blink, not whatever the last mode left.
 /// Tier A2: grid pointer + idx bounds validation
 fn applyModeInfo(grid: *Grid, idx: usize) void {
-    std.debug.assert(grid != null);
     const mi: ModeInfo = if (!grid.cursor_style_enabled)
         .{}
     else if (idx < grid.mode_infos.items.len)
@@ -238,7 +233,6 @@ fn showmodeModeKeepsStatus(first: u8) bool {
 /// Precondition: m is valid Pair array, key is UTF-8 string.
 /// Postcondition: returns bool iff key matches and value is bool, else null.
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
-    std.debug.assert(m.ptr != null or m.len == 0);
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .bool) {
             return p.val.bool;
@@ -286,7 +280,6 @@ fn appendContentChunks(
     values: []const mp.Value,
     comptime require_two: bool,
 ) !void {
-    std.debug.assert(list != null);
     for (values) |chunk_v| {
         if (chunk_v != .arr) continue;
         const chunk = chunk_v.arr;
@@ -411,7 +404,6 @@ fn toRgbOpt(v: ?i64) ?u32 {
 }
 
 fn tupleIter(a: []mp.Value) []mp.Value {
-    std.debug.assert(a.ptr != null or a.len == 0);
     if (a.len <= 1) return &[_]mp.Value{};
     return a[1..];
 }
@@ -426,7 +418,6 @@ fn isSpaceAfterComma(c: u8) bool {
 }
 
 fn isWinGuiFontSpec(s: []const u8) bool {
-    std.debug.assert(s.ptr != null or s.len == 0);
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
     const opts = s[colon + 1 ..];
 
@@ -450,7 +441,6 @@ fn isWinGuiFontSpec(s: []const u8) bool {
 }
 
 fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    std.debug.assert(raw.ptr != null or raw.len == 0);
     if (!isWinGuiFontSpec(raw)) return try arena.dupe(u8, raw);
 
     const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return try arena.dupe(u8, raw);
@@ -473,7 +463,6 @@ fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]c
 
 /// Parse Vim/Neovim 'guifont' list (comma-separated, with escaping).
 fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
-    std.debug.assert(s.ptr != null or s.len == 0);
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var cur: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -560,7 +549,6 @@ pub const GuiFontResolved = struct {
 /// Try to parse a colon-separated token as an OpenType feature.
 /// Accepted formats: "+liga", "-dlig", "ss01=2", "zero" (4-char tag = enable).
 pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
-    std.debug.assert(tok.ptr != null or tok.len == 0);
     if (tok.len == 0) return null;
 
     var tag_str: []const u8 = undefined;
@@ -594,8 +582,6 @@ pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
 /// token is ignored. Returns how many were written (at most `out.len`). The
 /// one reading of a candidate line's feature field for every frontend.
 pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
-    std.debug.assert(list.ptr != null or list.len == 0);
-    std.debug.assert(out.ptr != null or out.len == 0);
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |raw| {
@@ -613,7 +599,6 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
     // point_size default: 14
-    std.debug.assert(cand.ptr != null or cand.len == 0);
     var name_part: []const u8 = cand;
     var point: f64 = 14.0;
     var features: std.ArrayListUnmanaged(FontFeature) = .empty;
@@ -663,7 +648,6 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
 
 pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
     // "<name>\t<size>" or "<name>\t<size>\t<features>"
-    std.debug.assert(r.name.ptr != null or r.name.len == 0);
     if (r.features.len == 0) {
         return try std.fmt.allocPrint(arena, "{s}\t{d}", .{ r.name, r.point_size });
     }
@@ -693,7 +677,6 @@ pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]co
 }
 
 fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
-    std.debug.assert(log != null);
     const max_depth: u32 = 4;
     const max_items: usize = 8;
     const max_str: usize = 160;
@@ -802,7 +785,6 @@ fn testCell(arena: std.mem.Allocator, text: []const u8, hl: ?i64, repeat: ?i64) 
     // `repeat` occupies field 2, so asking for it without an `hl` still has to
     // put something in field 1. Neovim itself never sends that shape; a nil
     // there keeps the array well-formed rather than leaving it uninitialised.
-    std.debug.assert(text.ptr != null or text.len == 0);
     const n: usize = if (repeat != null) 3 else if (hl != null) 2 else 1;
     const fields = try arena.alloc(mp.Value, n);
     fields[0] = .{ .str = text };
@@ -822,7 +804,6 @@ fn testGridLineTuple(
     col: i64,
     cells: []const mp.Value,
 ) !mp.Value {
-    std.debug.assert(cells.ptr != null or cells.len == 0);
     const cells_copy = try arena.dupe(mp.Value, cells);
     const tuple = try arena.alloc(mp.Value, 5);
     tuple[0] = .{ .int = grid_id };
@@ -835,7 +816,6 @@ fn testGridLineTuple(
 
 /// A `grid_line` event carrying the given tuples, in order.
 fn testGridLineEventOf(arena: std.mem.Allocator, tuples: []const mp.Value) !mp.Value {
-    std.debug.assert(tuples.ptr != null or tuples.len == 0);
     const ev = try arena.alloc(mp.Value, 1 + tuples.len);
     ev[0] = .{ .str = "grid_line" };
     for (tuples, 0..) |t, i| ev[1 + i] = t;
@@ -850,7 +830,6 @@ fn testGridLineEvent(
     col: i64,
     cells: []const mp.Value,
 ) !mp.Value {
-    std.debug.assert(cells.ptr != null or cells.len == 0);
     const t = try testGridLineTuple(arena, grid_id, row, col, cells);
     return testGridLineEventOf(arena, &[_]mp.Value{t});
 }
