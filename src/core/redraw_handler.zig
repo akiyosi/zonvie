@@ -230,6 +230,7 @@ fn applyModeInfo(grid: *Grid, idx: usize) void {
 /// Precondition: first is a single u8 byte (invariant: always true).
 /// Postcondition: returns true iff mode name starts with 'i', 'r', or 't'.
 fn showmodeModeKeepsStatus(first: u8) bool {
+    std.debug.assert(first >= 0);
     return first == 'i' or first == 'r' or first == 't';
 }
 
@@ -285,6 +286,7 @@ fn appendContentChunks(
     values: []const mp.Value,
     comptime require_two: bool,
 ) !void {
+    std.debug.assert(list != null);
     for (values) |chunk_v| {
         if (chunk_v != .arr) continue;
         const chunk = chunk_v.arr;
