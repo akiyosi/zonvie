@@ -1422,6 +1422,12 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
+    // === Paired Assertions: caller-side precondition checks ===
+    std.debug.assert(grid != null);  // Grid pointer must be valid
+    std.debug.assert(hl != null);    // Highlights pointer must be valid
+    std.debug.assert(log != null);   // Logger pointer must be valid
+    // params may be empty (valid batch with no events)
+
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
     // grid_line / flush_start lines already mark dispatch latency; this gives
