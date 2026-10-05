@@ -261,8 +261,8 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     // theirs was the asymmetry; `GridBuf.resize` nulling `vertex_budget_touched_next`
     // mid-transaction is the path that can leave one set.
     // === Tier B1: grid_mu held for all sub_grids iteration (locked access) ===
-    var sg_it = core.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| {
+    var sg_it_reset = core.grid.sub_grids.valueIterator();
+    while (sg_it_reset.next()) |sg| {
         sg.vertex_budget_touched = false;
         sg.vertex_budget_touched_next = null;
         sg.reshaped_in_txn = false;  // State change guarded by grid_mu
@@ -306,7 +306,6 @@ fn validateCompletedVertexBudget(core: *Core) !void {
 
 fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void {
     std.debug.assert(grid_id > 0);
-    std.debug.assert(buf != null);
     if (buf.vertex_budget_touched) return;
     buf.vertex_budget_touched = true;
     if (grid_id == 1) return;
@@ -315,7 +314,6 @@ fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void
 }
 
 fn clearTouchedVertexBudgetSurfaces(core: *Core) void {
-    std.debug.assert(core != null);
     core.grid.main_buf.vertex_budget_touched = false;
     var grid_id = core.vertex_budget_touched_grid_head;
     while (grid_id) |current_grid_id| {

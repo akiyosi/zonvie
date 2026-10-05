@@ -686,6 +686,37 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(lig_tests).step);
 
+    // Phase 6 Contract Verification Tests: Verify Tier 1-3 quality improvements
+    const callback_order_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/contract_callback_order.zig"),
+    });
+    const callback_order_tests = b.addTest(.{
+        .root_module = callback_order_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(callback_order_tests).step);
+
+    const mutation_boundary_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/contract_mutation_boundary.zig"),
+    });
+    const mutation_boundary_tests = b.addTest(.{
+        .root_module = mutation_boundary_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(mutation_boundary_tests).step);
+
+    const allocation_guard_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/contract_allocation_guard.zig"),
+    });
+    const allocation_guard_tests = b.addTest(.{
+        .root_module = allocation_guard_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(allocation_guard_tests).step);
+
     // E2E harness: drives a REAL headless nvim through the core pipeline
     // (rpc_session → redraw_handler → grid → flush) and asserts on logical
     // grid state. Separate `zig build e2e` step (not part of `zig build
