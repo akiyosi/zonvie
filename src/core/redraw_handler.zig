@@ -450,6 +450,7 @@ fn isWinGuiFontSpec(s: []const u8) bool {
 }
 
 fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    std.debug.assert(raw.ptr != null or raw.len == 0);
     if (!isWinGuiFontSpec(raw)) return try arena.dupe(u8, raw);
 
     const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return try arena.dupe(u8, raw);
@@ -472,6 +473,7 @@ fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]c
 
 /// Parse Vim/Neovim 'guifont' list (comma-separated, with escaping).
 fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
+    std.debug.assert(s.ptr != null or s.len == 0);
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var cur: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -558,6 +560,7 @@ pub const GuiFontResolved = struct {
 /// Try to parse a colon-separated token as an OpenType feature.
 /// Accepted formats: "+liga", "-dlig", "ss01=2", "zero" (4-char tag = enable).
 pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
+    std.debug.assert(tok.ptr != null or tok.len == 0);
     if (tok.len == 0) return null;
 
     var tag_str: []const u8 = undefined;
@@ -591,6 +594,8 @@ pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
 /// token is ignored. Returns how many were written (at most `out.len`). The
 /// one reading of a candidate line's feature field for every frontend.
 pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
+    std.debug.assert(list.ptr != null or list.len == 0);
+    std.debug.assert(out.ptr != null or out.len == 0);
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |raw| {
@@ -608,6 +613,7 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
     // point_size default: 14
+    std.debug.assert(cand.ptr != null or cand.len == 0);
     var name_part: []const u8 = cand;
     var point: f64 = 14.0;
     var features: std.ArrayListUnmanaged(FontFeature) = .empty;
@@ -657,6 +663,7 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
 
 pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
     // "<name>\t<size>" or "<name>\t<size>\t<features>"
+    std.debug.assert(r.name.ptr != null or r.name.len == 0);
     if (r.features.len == 0) {
         return try std.fmt.allocPrint(arena, "{s}\t{d}", .{ r.name, r.point_size });
     }
