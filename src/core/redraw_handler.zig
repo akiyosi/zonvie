@@ -159,7 +159,9 @@ const ExtractedCellCodepoints = struct {
 /// the wire handler substitutes one visible replacement glyph instead of
 /// truncating the cluster or aborting the rest of the redraw batch (including
 /// its flush event).
+/// Tier A2: caller-side buf pointer validation
 fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoints {
+    std.debug.assert(buf != null);
     const count = extractAllCodepoints(utf8, buf) catch {
         buf[0] = 0xFFFD;
         return .{ .count = 1, .replaced_oversized = true };
@@ -204,7 +206,9 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 ///
 /// With cursor_style_enabled false (`:set guicursor=`) the UI picks the style:
 /// the default block with no blink, not whatever the last mode left.
+/// Tier A2: grid pointer + idx bounds validation
 fn applyModeInfo(grid: *Grid, idx: usize) void {
+    std.debug.assert(grid != null);
     const mi: ModeInfo = if (!grid.cursor_style_enabled)
         .{}
     else if (idx < grid.mode_infos.items.len)
@@ -269,6 +273,7 @@ fn checkedU32(v: i64) ?u32 {
 ///
 /// `text` is borrowed from `arena`. The grid dupes it into its own allocator
 /// when it stores it; duping here would put an allocation on a redraw path.
+/// Tier A2: grid pointer validation for chunk append
 fn appendContentChunks(
     comptime T: type,
     arena: std.mem.Allocator,
