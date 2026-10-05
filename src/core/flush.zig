@@ -229,11 +229,12 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     // escape the per-surface limit. Clearing main's flag defensively and not
     // theirs was the asymmetry; `GridBuf.resize` nulling `vertex_budget_touched_next`
     // mid-transaction is the path that can leave one set.
+    // === Tier B1: grid_mu held for all sub_grids iteration (locked access) ===
     var sg_it = core.grid.sub_grids.valueIterator();
     while (sg_it.next()) |sg| {
         sg.vertex_budget_touched = false;
         sg.vertex_budget_touched_next = null;
-        sg.reshaped_in_txn = false;
+        sg.reshaped_in_txn = false;  // State change guarded by grid_mu
     }
     core.vertex_budget_touched_grid_head = null;
     core.vertex_budget_transaction_active = true;
