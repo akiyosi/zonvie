@@ -46,7 +46,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const edits_start = try app_log.nowMs(alloc, log_path);
     try g.exec("luaeval('vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(_G.z_ext), 0, 1, false, {\"PLAIN ROW ONE EDITED\"})')");
     try g.exec("luaeval('vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(_G.z_ext), 2, 3, false, {\"PLAIN ROW THREE EDITED\"})')");
-    var partial = try g.captureStable(crop, 8000);
+    // Extended wait for external window rendering
+    var partial = try g.captureStable(crop, 15000);
     defer partial.deinit(alloc);
 
     // Vacuity checks.
