@@ -1319,6 +1319,14 @@ pub const RowGenStats = struct {
     // glyph_ns - shape_us*1000 - atlas_ensure_ns - quad_emit_ns.
     atlas_ensure_ns: i64 = 0, // ensureGlyphPhase2 / ensureGlyphByID / ensure_styled / ensure_base
     quad_emit_ns: i64 = 0, // pushGlyphQuadAssumeCapacity
+
+    // BASELINE METRICS (Tier 3 measurement infrastructure):
+    // Golden baseline stored in golden.csv (cold start excluded, warm-phase mean).
+    // Metrics used for performance regression detection:
+    //   - shape_cache_hits / (hits + misses) = hit rate (target >85% steady-state)
+    //   - glyph_ns / (bg_ns + under_ns + glyph_ns + strike_ns + overline_ns) = glyph fraction
+    //   - Allocation count derivable from GeneralPurposeAllocator instrumentation
+    // Update golden.csv after Performance A/B confirms >=1% improvement.
 };
 
 /// The root row pass's per-flush perf counters and their log lines.
@@ -1623,6 +1631,14 @@ pub fn generateRowVertices(
     // Pass 3 sub-timing accumulators. Copied into stats before return.
     var atlas_ensure_ns_acc: i64 = 0;
     var quad_emit_ns_acc: i64 = 0;
+
+    // HOT-PATH ALLOCATION GUARD (Tier 3 instrumentation):
+    // This function must not heap-allocate (CLAUSE D.48 hot-path rule).
+    // Verify via GeneralPurposeAllocator.stats delta or compile-time analysis.
+    // If allocation detected, investigate:
+    //   - ShapingBuffers.ensureCapacity growth (arena pre-size in init)
+    //   - out.ArrayListUnmanaged append (caller pre-allocates per-row capacity)
+    //   - Glyph rasterization (atlas ensure; pre-shaping avoids burst allocation)
 
     // ── Pass 1: Background (run-length by bgRGB + grid_id) ──────────
     {
