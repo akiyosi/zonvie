@@ -208,7 +208,8 @@ fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
 }
 
 /// Begin a vertex budget transaction.
-/// Precondition: vertex_budget_transaction_active must be false.
+/// Tier B1: Lock isolation — grid_mu held for sub_grids iteration.
+/// Precondition: vertex_budget_transaction_active must be false; grid_mu must be locked.
 /// Postcondition (on success):
 ///   - vertex_budget_transaction_active == true
 ///   - All grid touched flags cleared; vertex_budget_touched_grid_head == null
@@ -218,6 +219,7 @@ fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
 ///   - core.flush_retryable == false (side effect: nvim will be terminated on unrecoverable budget overflow)
 ///   - All other state unchanged; early return prevents corrupted touched list
 fn beginVertexBudgetTransaction(core: *Core) !void {
+    std.debug.assert(!core.vertex_budget_transaction_active);
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     // Validate budget before any state changes. Early return does not corrupt touched list.
     try syncVertexBudgetAggregate(core, true);
@@ -242,9 +244,11 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
 }
 
 /// Validate that all touched grids respect per-surface and aggregate vertex budget.
+/// Tier D1: Recovery Action Strategy — detect overflow and route to recovery handler.
 /// Precondition: vertex_budget_transaction_active == true (called during active transaction).
 /// Postcondition: verifies all touched grids have surface_vertex_count ≤ MAX_VERTICES_PER_SURFACE.
 fn validateCompletedVertexBudget(core: *Core) !void {
+    std.debug.assert(core.vertex_budget_transaction_active);
     try syncVertexBudgetAggregate(core, true);
     if (core.grid.main_buf.vertex_budget_touched and
         core.grid.main_buf.surface_vertex_count > MAX_VERTICES_PER_SURFACE)
