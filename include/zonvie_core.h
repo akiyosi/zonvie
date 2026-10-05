@@ -738,6 +738,27 @@ typedef int (*zonvie_on_clipboard_set_fn)(
     size_t len
 );
 
+/* Error cause codes for callback error reporting (ZONVIE_CALLBACK_ERROR_REPORTING).
+   Optional callback on_callback_error reports the cause and affected component.
+   Frontend may log, metrics-track, or ignore based on severity and context. */
+typedef enum {
+    ZONVIE_CALLBACK_ERROR_OOM = 1,              /* Out-of-memory during vertex/glyph work */
+    ZONVIE_CALLBACK_ERROR_GLYPH_RASTERIZE = 2, /* Rasterize callback failed or returned 0 */
+    ZONVIE_CALLBACK_ERROR_ATLAS_FULL = 3,       /* Atlas full; reset on next frame */
+    ZONVIE_CALLBACK_ERROR_SHAPE_FAILED = 4,     /* Text shaping returned invalid result */
+} zonvie_callback_error_code;
+
+/* Called when a callback encounters an error during redraw.
+   code: the error cause (zonvie_callback_error_code)
+   component: affected grid or component name (e.g., "atlas_ensure", "shape_text_run")
+   may contain additional context or be empty.
+   May be NULL (feature opt-in). Core continues on error; this is informational. */
+typedef void (*zonvie_on_callback_error_fn)(
+    void* ctx,
+    zonvie_callback_error_code code,
+    const char* component, size_t component_len
+);
+
 /* Layout version of zonvie_callbacks. Bump it whenever a field is removed,
    reordered, or has its signature changed. Appending a new callback at the
    end stays backward compatible through callbacks_size and must NOT bump it.
@@ -927,6 +948,11 @@ typedef struct zonvie_callbacks {
        it rather than read pointers at shifted offsets. */
     zonvie_on_surface_layout_fn on_surface_layout;
     zonvie_on_grid_destroy_fn on_grid_destroy;
+
+    /* Callback error reporting (ZONVIE_CALLBACK_ERROR_REPORTING gate).
+       Optional: NULL disables error reporting. Core continues after error;
+       this is informational. Appended at the end for ABI compat. */
+    zonvie_on_callback_error_fn on_callback_error;
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

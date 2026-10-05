@@ -5238,10 +5238,20 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // --- Dirty marking ---
     // Row updates (on_vertices_row) should NOT expand a global dirtyRect,
     // because we can scissor per-row in draw().
+
+    /// Mark rows dirty. Acquires lock internally. For hot-path use when rows
+    /// are submitted one at a time from on_vertices_row callback.
     func markDirtyRows(rowStart: Int, rowCount: Int) {
         lock.lock()
         defer { lock.unlock() }
+        markDirtyRowsLocked(rowStart: rowStart, rowCount: rowCount)
+    }
 
+    /// Mark rows dirty. Caller must hold lock. Use in batch operations to avoid
+    /// per-row lock acquisition. Hot-path optimization: reduces contention on
+    /// per-row callback paths.
+    func markDirtyRowsLocked(rowStart: Int, rowCount: Int) {
+        // Lock is held by caller
         if rowCount > 0 {
             let end = max(rowStart, rowStart + rowCount)
             pendingDirtyRows.insert(integersIn: rowStart..<end)
@@ -5253,12 +5263,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // Rect-based dirty (cursor union, partial updates) can keep a dirty rect.
-    // We also record rows so rowMode can redraw only those rows.
+    /// Mark rect dirty. Acquires lock internally.
     func markDirtyRect(rowStart: Int, rowCount: Int, rectPx: NSRect) {
         lock.lock()
         defer { lock.unlock() }
+        markDirtyRectLocked(rowStart: rowStart, rowCount: rowCount, rectPx: rectPx)
+    }
 
+    /// Mark rect dirty. Caller must hold lock. Use in batch operations to avoid
+    /// per-operation lock acquisition.
+    func markDirtyRectLocked(rowStart: Int, rowCount: Int, rectPx: NSRect) {
+        // Lock is held by caller
         if let cur = pendingDirtyRectPx {
             pendingDirtyRectPx = cur.union(rectPx)
         } else {

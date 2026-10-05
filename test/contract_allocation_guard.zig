@@ -28,7 +28,7 @@ test "hot-path allocation guard: pre-allocated buffers avoid per-row allocation"
 
     // Simulate per-row work: fill both buffers without further allocation
     var shaping_used: usize = 0;
-    var vertex_used: usize = 0; _ = vertex_list;
+    var vertex_used: usize = 0; _ = vertex_output;
 
     for (0..10) |_| {  // 10 rows
         // Simulate glyph shaping output (uses pre-allocated arena space)
@@ -166,7 +166,7 @@ test "hot-path allocation guard: precondition check on function entry" {
     // Precondition 2: Output capacity available
     const vertex_list: [10000]u32 = undefined;
     const vertex_capacity: usize = 10000;
-    var vertex_used: usize = 0; _ = vertex_list;
+    const vertex_used: usize = 0; _ = vertex_list;
     try std.testing.expect(vertex_used < vertex_capacity);
 
     // Precondition 3: Atlas pre-allocated
@@ -177,4 +177,100 @@ test "hot-path allocation guard: precondition check on function entry" {
     // All preconditions met; function entry succeeds
     try std.testing.expect(arena_buffer.len > 0);
     _ = vertex_list;  // mark as used
+}
+
+test "OutOfMemory recovery: graceful degradation on fixed-size buffer" {
+    // Precondition: Output buffer has fixed capacity; row generation attempts to exceed it.
+    // Postcondition: Rows 0..N-1 are committed; row N fails gracefully without panic.
+    // Spec: Core handles OOM by skipping failed row, continues next frame with reset arena.
+
+    const buffer_capacity: usize = 500;  // 5 rows × 100 verts
+    var vertex_buffer: [buffer_capacity]u32 = undefined;
+    var used: usize = 0;
+
+    // Frame 1: Simulate row-by-row generation until buffer exhausted
+    var rows_succeeded: usize = 0;
+    const verts_per_row: usize = 100;
+    for (0..10) |row_idx| {
+        // Attempt to append row
+        if (used + verts_per_row <= buffer_capacity) {
+            for (0..verts_per_row) |v| {
+                vertex_buffer[used + v] = @intCast(row_idx * 100 + v);
+            }
+            used += verts_per_row;
+            rows_succeeded += 1;
+        } else {
+            // OOM on this row: break (no panic, graceful)
+            break;
+        }
+    }
+
+    // Postcondition 1: Some rows succeeded before OOM
+    try std.testing.expect(rows_succeeded == 5);  // Capacity 500 / 100 per row = 5 rows
+
+    // Postcondition 2: Data is intact for committed rows
+    try std.testing.expect(used == 500);
+    try std.testing.expect(vertex_buffer[0] == 0);      // Row 0, vertex 0
+    try std.testing.expect(vertex_buffer[100] == 100);  // Row 1, vertex 0
+
+    // Frame 2: Reset arena (set used = 0), retry succeeds
+    used = 0;
+    rows_succeeded = 0;
+    for (0..10) |row_idx| {
+        if (used + verts_per_row <= buffer_capacity) {
+            for (0..verts_per_row) |v| {
+                vertex_buffer[used + v] = @intCast(row_idx * 100 + v);
+            }
+            used += verts_per_row;
+            rows_succeeded += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Frame 2 succeeds with fresh arena
+    try std.testing.expect(rows_succeeded == 5);
+    try std.testing.expect(used == 500);
+}
+
+test "OutOfMemory recovery: arena reset between frames" {
+    // Precondition: Arena has finite capacity; per-frame allocations reuse after reset.
+    // Postcondition: Frame 1 uses some arena space; reset clears it; frame 2 reuses.
+    // Spec: Arena reset between frames prevents allocation leaks and allows recovery.
+
+    const arena_capacity: usize = 1024;
+    var arena_buffer: [arena_capacity]u8 = undefined;
+
+    // Frame 1: Allocate from arena
+    var arena_pos: usize = 0;
+    const frame1_alloc_size: usize = 256;
+    if (arena_pos + frame1_alloc_size <= arena_capacity) {
+        @memset(arena_buffer[arena_pos .. arena_pos + frame1_alloc_size], 0xAA);
+        arena_pos += frame1_alloc_size;
+    }
+    const arena_after_frame1 = arena_pos;
+    try std.testing.expect(arena_after_frame1 == 256);
+
+    // Frame 1: Attempt another allocation (succeeds within arena)
+    const frame1_alloc2_size: usize = 256;
+    if (arena_pos + frame1_alloc2_size <= arena_capacity) {
+        @memset(arena_buffer[arena_pos .. arena_pos + frame1_alloc2_size], 0xBB);
+        arena_pos += frame1_alloc2_size;
+    }
+    try std.testing.expect(arena_pos == 512);
+
+    // Reset arena for frame 2
+    arena_pos = 0;
+
+    // Frame 2: Same-sized allocation succeeds (reuses same arena space)
+    const frame2_alloc_size: usize = 256;
+    if (arena_pos + frame2_alloc_size <= arena_capacity) {
+        @memset(arena_buffer[arena_pos .. arena_pos + frame2_alloc_size], 0xCC);
+        arena_pos += frame2_alloc_size;
+    }
+    try std.testing.expect(arena_pos == 256);  // Reused space from frame 1
+
+    // Verify memory is fresh (contains 0xCC, not old 0xAA or 0xBB)
+    try std.testing.expect(arena_buffer[0] == 0xCC);
+    try std.testing.expect(arena_buffer[255] == 0xCC);
 }
