@@ -99,7 +99,9 @@ fn parseExtHandle(ext: mp.Ext) i64 {
 /// Returns the number of codepoints written (including the first).
 /// If the string exceeds the lossless inline cell representation, fail before
 /// mutating the grid instead of silently publishing a truncated cluster.
+/// Extract codepoints: caller-side check — buf must be [16]u32
 fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
+    std.debug.assert(buf != null);
     if (utf8.len == 0) {
         buf[0] = 0;
         return 1;
