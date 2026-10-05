@@ -55,6 +55,13 @@ pub fn openWithLogAndConfig(alloc: std.mem.Allocator, log_path: []const u8, conf
     return openWithLogConfigAndEnv(alloc, log_path, config_dir, &.{});
 }
 
+/// Initialize GUI with custom environment. Ensures:
+///  - Screen capture permission available (macOS Screen Recording, Windows)
+///  - Window pinned to fixed position (80, 80) for pixel-determinism
+///  - Cursor blinker disabled (guicursor=a:blinkon0)
+///  - Font set to OS-stable monospace (Menlo/h13 on macOS, Consolas/h13 Windows)
+///  - Grid stable (waitStableGrid)
+/// Precondition for Phase 6a tests: cursor-only callback and callback order determinism.
 pub fn openWithLogConfigAndEnv(
     alloc: std.mem.Allocator,
     log_path: []const u8,
