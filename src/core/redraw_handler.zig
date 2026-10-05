@@ -405,11 +405,13 @@ test "checked float and grid coordinates reject hostile numeric bounds" {
 }
 
 fn toRgbOpt(v: ?i64) ?u32 {
+    std.debug.assert(v == null or v.? >= std.math.minInt(i64));
     if (v == null) return null;
     return checkedU32(v.?);
 }
 
 fn tupleIter(a: []mp.Value) []mp.Value {
+    std.debug.assert(a.ptr != null or a.len == 0);
     if (a.len <= 1) return &[_]mp.Value{};
     return a[1..];
 }
@@ -741,6 +743,7 @@ fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
 /// hostile starting column can neither wrap u32 nor turn no-op writes beyond
 /// the grid into unbounded work.
 fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
+    std.debug.assert(col <= std.math.maxInt(u32));
     if (col >= cols) return 0;
     return @min(repeat, cols - col);
 }
@@ -750,6 +753,7 @@ fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
 /// leave too much room between lines (options.txt 'linespace'). The frontends
 /// floor the row height that results, so nothing downstream needs a zero here.
 fn linespacePxFromWire(v: i64) i32 {
+    std.debug.assert(v >= std.math.minInt(i64));
     return @intCast(std.math.clamp(v, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
