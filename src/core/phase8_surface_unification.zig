@@ -17,10 +17,20 @@ pub fn emitSurfaceVertices(arena: std.mem.Allocator, grid: *Grid, surface_id: i6
     // No screen-space offset applied; ABI consumer (macOS/Windows) handles placement
     var vertices: std.ArrayListUnmanaged(VertexType) = .empty;
 
-    // Placeholder: grid iteration + vertex generation
-    // Real implementation: integrate with vertexgen.zig emitGridGlyphs()
+    // Iterate grid cells and collect non-blank vertices
+    var row: u32 = 0;
+    while (row < grid.rows) : (row += 1) {
+        var col: u32 = 0;
+        while (col < grid.cols) : (col += 1) {
+            const cell = grid.getCell(row, col);
+            if (cell.cp != ' ') {
+                // Emit vertex for glyph at grid-local (row, col)
+                try vertices.append(arena, .{});  // Placeholder vertex data
+            }
+        }
+    }
 
-    return vertices.items;
+    return try arena.dupe(VertexType, vertices.items);
 }
 
 /// Test: grid-local coordinates are preserved across surfaces
