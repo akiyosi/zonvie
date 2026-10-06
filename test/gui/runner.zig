@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const driver = @import("driver.zig");
+const gui_io = @import("gui_io.zig");
 const testing = std.testing;
 
 /// CI sets ZONVIE_GUI_REQUIRE so a runner without nvim or the app fails
@@ -55,12 +56,31 @@ const is_macos = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 const can_capture = driver.capture.supported;
 
+/// The build runner holds a test's stderr until the test process ends, so a
+/// scenario that hangs until the CI step timeout leaves no trace of which one
+/// it was. The watchdog names it and ends the process instead.
+const watchdog_limit_s = 300;
+var watchdog_gen = std.atomic.Value(u64).init(0);
+
+fn watchdog(gen: u64, name: []const u8) void {
+    var waited_s: u32 = 0;
+    while (waited_s < watchdog_limit_s) : (waited_s += 1) {
+        gui_io.sleepNs(std.time.ns_per_s);
+        if (watchdog_gen.load(.monotonic) != gen) return;
+    }
+    std.debug.print("[gui] watchdog: {s} still running after {d}s; aborting\n", .{ name, watchdog_limit_s });
+    std.process.exit(1);
+}
+
 /// Run scenario `M` when the comptime gate `ok` holds, else skip. `M.run` is
 /// referenced only in the taken branch, so a host that fails the gate never
 /// analyzes it.
 fn gated(comptime ok: bool, comptime M: type) !void {
     if (ok) {
         try requirePrereqs();
+        const gen = watchdog_gen.fetchAdd(1, .monotonic) + 1;
+        defer _ = watchdog_gen.fetchAdd(1, .monotonic);
+        if (std.Thread.spawn(.{}, watchdog, .{ gen, @typeName(M) })) |t| t.detach() else |_| {}
         try M.run(testing.allocator);
     } else {
         return error.SkipZigTest;
