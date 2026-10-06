@@ -14,7 +14,12 @@ const Styles = hlmod.Styles;
 const Logger = @import("log.zig").Logger;
 const clock = @import("clock.zig");
 
-/// All redraw events handled by `handleRedraw`. Order is not significant;
+/// All redraw events handled by `handleRedraw`. Most events are order-independent,
+/// but the following ordering MUST be preserved:
+///   - mode_info_set MUST come before grid_line in the same batch
+///     (Neovim may omit mode_change; mode_info_set updates the mode table)
+///   - hl_attr_define MUST come before grid_line (grid_line references highlight IDs)
+///
 /// `std.meta.stringToEnum` is used for perfect-hash-style dispatch.
 /// Unknown event names (e.g., future Neovim additions) return null and are skipped.
 pub const RedrawEvent = enum {

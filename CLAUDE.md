@@ -79,6 +79,13 @@ When changing redraw or layout handling, verify the affected events against the 
 - Comments state invariants and reasons; history (commit hashes, "previously", "this branch") belongs in commit messages.
 - Use explicit unit suffixes in names where relevant: `_px`, `_pt`, `_rows`, `_cols`, `26_6`.
 
+## File Access Boundaries
+
+- Do not access, read, write, or modify paths outside this repository.
+- All file operations must be strictly limited to the repository root and its subdirectories.
+- Never assume the presence of files outside the repo (e.g. home directories, system paths, sibling projects).
+- **Exception:** `tmp/` directory within the repository is freely accessible for reading, writing, and temporary file operations (e.g., agent outputs, intermediate analysis, log files).
+
 ## Build / Test
 
 Common commands:
