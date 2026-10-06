@@ -557,6 +557,11 @@ pub const Callbacks = extern struct {
     ) callconv(.c) void = null,
     on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
 
+    // Callback error reporting (ZONVIE_CALLBACK_ERROR_REPORTING gate).
+    // Optional: NULL disables error reporting. Core continues after error;
+    // this is informational. Appended at the end for ABI compat.
+    on_callback_error: ?*const fn (ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void = null,
+
     // Field layout is checked against include/zonvie_core.h in
     // abi_header_test.zig; the version must stay readable at offset 0.
     comptime {
