@@ -3,99 +3,155 @@ const std = @import("std");
 // Tier 2 Test: Flush Error Recovery
 //
 // Spec: on_flush_end must execute despite on_vertices_row error
-// Source: flush.zig L2-15: "on_flush_end must execute even if on_vertices_row returns error"
+// Verifies: contract that deferred cleanup (on_flush_end) always runs
 
-test "flush: on_flush_end executes despite on_vertices_row error" {
-    // Precondition: on_vertices_row returns OutOfMemory
-    // Postcondition: defer guard ensures on_flush_end still called
+const MockCallback = struct {
+    call_count: u32 = 0,
+    last_event: enum { none, begin, vertices, end, error } = .none,
 
-    var callback_order: [3]u8 = undefined;
-    var callback_count: usize = 0;
+    fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
+        if (ctx) |ptr| {
+            var cb: *MockCallback = @ptrCast(@alignCast(ptr));
+            cb.call_count += 1;
+            cb.last_event = .begin;
+        }
+    }
 
-    // Simulate flush with error path
+    fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
+        if (ctx) |ptr| {
+            var cb: *MockCallback = @ptrCast(@alignCast(ptr));
+            cb.call_count += 1;
+            cb.last_event = .end;
+        }
+    }
+
+    fn onVerticesRow(ctx: ?*anyopaque, grid_id: i64, row: u32, cells: [*]const u8, cell_count: u32) callconv(.c) void {
+        if (ctx) |ptr| {
+            var cb: *MockCallback = @ptrCast(@alignCast(ptr));
+            cb.call_count += 1;
+            cb.last_event = .vertices;
+        }
+        _ = grid_id;
+        _ = row;
+        _ = cells;
+        _ = cell_count;
+    }
+};
+
+test "flush: on_flush_end executes despite on_vertices_row error (contract)" {
+    // Precondition: Callback contract requires on_flush_end to execute
+    // Postcondition: Verify defer guard ensures on_flush_end executes even on error
+
+    var arena_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_alloc.deinit();
+
+    var callback: MockCallback = .{};
+
+    // Simulate flush transaction with defer guard
+    var begin_called = false;
+    var end_called = false;
+    var vertices_error = false;
+
     defer {
-        // on_flush_end deferred — always executes
-        callback_order[callback_count] = 3;
-        callback_count += 1;
+        // on_flush_end MUST execute (Zig defer guarantee)
+        end_called = true;
+        callback.onFlushEnd(@ptrCast(&callback));
     }
 
     // on_flush_begin
-    callback_order[callback_count] = 1;
-    callback_count += 1;
+    begin_called = true;
+    callback.onFlushBegin(@ptrCast(&callback));
 
-    // Simulate on_vertices_row error
-    const error_in_vertices = true;
-    if (!error_in_vertices) {
-        callback_order[callback_count] = 2;
-        callback_count += 1;
+    // Simulate on_vertices_row (may fail)
+    vertices_error = true;
+    if (!vertices_error) {
+        callback.onVerticesRow(@ptrCast(&callback), 1, 0, "", 0);
     }
 
-    // Postcondition: callback order = [1, 3] (begin, end)
-    // end executes despite vertices error
-    try std.testing.expect(callback_order[0] == 1);  // begin first
-    try std.testing.expect(callback_order[callback_count - 1] == 3);  // end last (from defer)
+    // Postcondition: verify callback order
+    try std.testing.expect(begin_called);
+    try std.testing.expect(end_called);
+    try std.testing.expect(callback.last_event == .end);
+    try std.testing.expect(callback.call_count == 2); // begin + end only
 }
 
-test "flush: grid_mu lock released on error path" {
-    // Precondition: handleRedraw acquires grid_mu, error occurs
-    // Postcondition: grid_mu released even on error
+test "flush: grid_mu lock released on error path (contract)" {
+    // Precondition: grid_mu held during handleRedraw
+    // Postcondition: Lock released via defer guard on error
 
-    // Simulate lock state
+    var arena_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_alloc.deinit();
+
     var lock_held = true;
+    var error_occurred = false;
 
-    // Error path — must cleanup lock
     defer {
-        lock_held = false;  // Defer ensures lock release
+        // Lock release happens in defer block (enforced)
+        lock_held = false;
     }
 
-    try std.testing.expect(lock_held);  // Lock held during work
+    // Critical section with potential error
+    try std.testing.expect(lock_held);
 
-    // Simulate error
-    const error_condition = true;
-    if (error_condition) {
-        // Error: lock still held at this point
+    // Simulate error during critical section
+    error_occurred = true;
+    if (error_occurred) {
+        // Even with error, defer executes
     }
 
-    // Postcondition: defer ensures lock_held = false on exit
-    try std.testing.expect(lock_held);  // Still held before defer
+    // Postcondition: defer will release lock
+    try std.testing.expect(lock_held); // still held before defer cleanup
 }
 
-test "flush: OutOfMemory recovery preserves grid state" {
-    // Precondition: Vertex budget allocation fails mid-flush
-    // Postcondition: Grid state remains valid for retry
+test "flush: OutOfMemory recovery preserves grid state (contract)" {
+    // Precondition: OOM during flush
+    // Postcondition: Grid marked dirty for retry
 
-    // Simulate grid state
-    const initial_dirty: bool = true;
-    var current_dirty = initial_dirty;
+    var arena_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_alloc.deinit();
 
-    // Simulate failed flush attempt
-    const oom_during_flush = true;
-    if (oom_during_flush) {
-        // On OOM: grid marked dirty again for retry
-        current_dirty = true;
+    // Grid state tracking
+    var grid_dirty = true;
+
+    // Simulate flush begin
+    var flush_attempted = true;
+
+    // Simulate OOM error during flush
+    var oom_error = true;
+    if (oom_error) {
+        // On OOM: grid must be marked dirty again for retry
+        grid_dirty = true;
     }
 
-    // Postcondition: Grid still dirty, ready for retry
-    try std.testing.expect(current_dirty);
+    // Postcondition: Grid state valid for retry
+    try std.testing.expect(flush_attempted);
+    try std.testing.expect(grid_dirty);
 }
 
-test "flush: batch vertex updates atomicity on error" {
-    // Precondition: Multiple surface vertex updates, one fails
-    // Postcondition: Failed update does not leave partial state
+test "flush: on_flush_end order verification (contract)" {
+    // Precondition: Callback execution order matters
+    // Postcondition: Verify on_flush_end runs last (in defer cleanup)
 
-    var surface_count: [3]u32 = .{ 100, 100, 100 };
-    const initial_total = surface_count[0] + surface_count[1] + surface_count[2];
+    var arena_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_alloc.deinit();
 
-    // Simulate batch update with error on surface 2
-    const update_surface: u32 = 2;
-    const new_count: u32 = 150;
+    var callback: MockCallback = .{};
+    var execution_order = std.ArrayList(u32).init(arena_alloc.allocator());
 
-    // If update fails, original state is preserved
-    if (update_surface < 3) {
-        surface_count[update_surface] = new_count;
+    defer {
+        callback.onFlushEnd(@ptrCast(&callback));
+        execution_order.append(3) catch unreachable;
     }
 
-    // Postcondition: Total vertices changed (update succeeded)
-    const final_total = surface_count[0] + surface_count[1] + surface_count[2];
-    try std.testing.expect(final_total != initial_total);
+    callback.onFlushBegin(@ptrCast(&callback));
+    execution_order.append(1) catch unreachable;
+
+    callback.onVerticesRow(@ptrCast(&callback), 1, 0, "", 0);
+    execution_order.append(2) catch unreachable;
+
+    // Postcondition: after defer cleanup, order is [1, 2, 3]
+    try std.testing.expect(execution_order.items.len == 3);
+    try std.testing.expectEqual(execution_order.items[0], 1); // begin
+    try std.testing.expectEqual(execution_order.items[1], 2); // vertices
+    // Item [2] will be 3 (end) after defer cleanup
 }

@@ -1472,7 +1472,7 @@ fn ensureShapingScratch(core: *Core, run_len: usize) !void {
 /// Convert a failed shape callback into the existing per-scalar fallback path.
 /// gid=0 deliberately selects the .notdef branch below, which resolves every
 /// scalar through ensureGlyphPhase2 while preserving wide-cell column widths.
-fn setShapingScalarFallback(bufs: *vertexgen.ShapingBuffers, col_widths: []const u32) usize {
+fn setShapingScalarFallback(bufs: *vertexgen.ShapingBuffers, col_widths: []const u32, alloc: std.mem.Allocator) !usize {
     var glyph_count: usize = 0;
     for (col_widths, 0..) |width, scalar_index| {
         // Overflow scalars belong to the preceding cell and have zero width.
@@ -1486,7 +1486,7 @@ fn setShapingScalarFallback(bufs: *vertexgen.ShapingBuffers, col_widths: []const
         bufs.y_off.items[glyph_count] = 0;
         glyph_count += 1;
     }
-    bufs.setLen(glyph_count);
+    try bufs.setLen(alloc, glyph_count);
     return glyph_count;
 }
 
@@ -2023,7 +2023,7 @@ pub fn generateRowVertices(
                             if (core.flush_aborted) return error.FlushAborted;
 
                             if (glyph_count == 0) {
-                                final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                final_glyph_count = try setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count], core.alloc);
                                 shape_callback_fallback = true;
                             } else if (glyph_count > scalar_count) {
                                 final_glyph_count = glyph_count;
@@ -2050,7 +2050,7 @@ pub fn generateRowVertices(
                                 }
                                 if (core.flush_aborted) return error.FlushAborted;
                                 if (final_glyph_count == 0) {
-                                    final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                    final_glyph_count = try setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count], core.alloc);
                                     shape_callback_fallback = true;
                                 } else if (final_glyph_count > glyph_count) {
                                     // The second call was given the exact capacity
@@ -2065,7 +2065,7 @@ pub fn generateRowVertices(
                             if (!shape_callback_fallback and
                                 !shapeClustersValid(bufs.clusters.items, final_glyph_count, scalar_count))
                             {
-                                final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                final_glyph_count = try setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count], core.alloc);
                                 shape_callback_fallback = true;
                             }
 
