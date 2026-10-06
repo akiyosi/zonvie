@@ -1471,6 +1471,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_grid_row_scroll = callbacks.onGridRowScroll,
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,
+        .on_callback_error = callbacks.onCallbackError,
     };
 }
 

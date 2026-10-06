@@ -1598,6 +1598,13 @@ final class ZonvieCore {
                 }
                 ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=destroy_stage grid=\(gridId)")
                 me.pendingGridDestroys.append(gridId)
+            },
+            on_callback_error: { ctx, code, component, componentLen in
+                _ = ctx
+                let componentStr = component.map { ptr in
+                    String(bytes: UnsafeRawBufferPointer(start: ptr, count: Int(componentLen)), encoding: .utf8) ?? ""
+                } ?? ""
+                ZonvieCore.appLog("callback error: code=\(code) component=\(componentStr)")
             }
         )
 

@@ -2684,3 +2684,9 @@ fn storeMainSurfaceLayerRowLocked(
     }
     return true;
 }
+
+pub fn onCallbackError(ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void {
+    _ = ctx;
+    const component_str = if (component_len > 0) component[0..component_len] else "";
+    applog.appLog("callback error: code={d} component={s}\n", .{ code, component_str });
+}
