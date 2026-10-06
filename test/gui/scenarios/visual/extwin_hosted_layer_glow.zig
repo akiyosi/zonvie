@@ -67,6 +67,8 @@ const ext_rows: u32 = 20;
 const ext_cols: u32 = 60;
 const float_rows: u32 = 12;
 const float_row0: u32 = 3;
+const float_col0: u32 = 2;
+const float_cols: u32 = 44;
 
 /// Rows of the float, 0-based within it: four of text, then eight blank. The
 /// control band is the last four, so the four between them absorb the bleed.
@@ -84,12 +86,23 @@ const blank_band_max = 0.01;
 /// external grid, and the capture includes the title bar, so the row height
 /// comes out slightly HIGH — which shrinks the bands rather than letting them
 /// reach into each other.
+///
+/// Horizontally the band is the float's columns only: the overlay scrollbar
+/// along the window's right edge fades out between the two captures, and a
+/// full-width band counted that as light reaching the blank rows. The capture
+/// width includes the scrollbar, so the columns likewise come out narrower.
 fn floatBand(img: capture.Image, row0: u32, count: u32) visual.Region {
     const h: f64 = @floatFromInt(img.h);
     const cell_h = h / @as(f64, @floatFromInt(ext_rows));
     const top = (@as(f64, @floatFromInt(float_row0 + row0))) * cell_h;
     const bottom = top + @as(f64, @floatFromInt(count)) * cell_h;
-    return .{ .y0 = top / h, .y1 = @min(1.0, bottom / h) };
+    const cols: f64 = @floatFromInt(ext_cols);
+    return .{
+        .x0 = @as(f64, @floatFromInt(float_col0)) / cols,
+        .x1 = @as(f64, @floatFromInt(float_col0 + float_cols)) / cols,
+        .y0 = top / h,
+        .y1 = @min(1.0, bottom / h),
+    };
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
