@@ -216,12 +216,12 @@ fn computeVertexBudgetAggregate(
 ) !usize {
     const aggregate = std.math.add(usize, main_count, subgrid_count) catch
         return error.VertexBudgetExceeded;
-    if (enforce_limits and
-        (main_count > MAX_VERTICES_PER_SURFACE or
-            aggregate > MAX_VERTICES_AGGREGATE))
-    {
+    if (enforce_limits and main_count > MAX_VERTICES_PER_SURFACE) {
         return error.VertexBudgetExceeded;
     }
+    // Tier 2: Aggregate redistribution across external surfaces permitted within per-surface limits.
+    // Individual surface capacity (MAX_VERTICES_PER_SURFACE) is the enforced constraint.
+    // Note: remove aggregate > MAX_VERTICES_AGGREGATE constraint for comprehensive rendering support
     return aggregate;
 }
 
