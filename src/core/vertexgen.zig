@@ -38,12 +38,26 @@ pub const ShapingBuffers = struct {
                self.y_off.capacity >= cap;
     }
 
-    /// Set the logical length of all buffers (must have capacity).
-    /// Hot-path safe when called after preSizeForFlush().
-    /// Precondition: capacity >= n (should be verified via preSizeForFlush estimate).
-    pub fn setLen(self: *ShapingBuffers, n: usize) void {
-        // TODO: Verify capacity; if insufficient, indicates preSizeForFlush() estimate needs tuning.
-        // For now: setLen always succeeds (test harness may exceed initial estimate during setup).
+    /// Set the logical length of all buffers.
+    /// Hot-path: assumes capacity pre-sized via preSizeForFlush(); no allocation.
+    /// Setup-phase fallback: if capacity insufficient, dynamically allocates (contract violation detection).
+    pub fn setLen(self: *ShapingBuffers, alloc: ?std.mem.Allocator, n: usize) !void {
+        // If capacity is already sufficient, hot-path: no allocation.
+        if (self.hasCapacity(n)) {
+            self.glyph_ids.items.len = n;
+            self.clusters.items.len = n;
+            self.x_adv.items.len = n;
+            self.y_adv.items.len = n;
+            self.x_off.items.len = n;
+            self.y_off.items.len = n;
+            return;
+        }
+
+        // Setup-phase fallback: capacity insufficient; dynamically allocate.
+        // This indicates preSizeForFlush() estimate was too small (tuning needed).
+        if (alloc == null) @panic("ShapingBuffers.setLen: capacity insufficient and no allocator provided");
+
+        try self.ensureCapacity(alloc.?, n);
         self.glyph_ids.items.len = n;
         self.clusters.items.len = n;
         self.x_adv.items.len = n;
