@@ -72,6 +72,24 @@ fn watchdog(gen: u64, name: []const u8) void {
     std.process.exit(1);
 }
 
+/// Each scenario's start and end, rewritten to a file after every line. CI
+/// uploads tmp/, so a run cut off by the step timeout still shows how far it
+/// got and whether the last scenario ever returned.
+const progress_path = "tmp/gui_progress.txt";
+var progress_buf: [16 * 1024]u8 = undefined;
+var progress_len: usize = 0;
+var progress_timer: ?gui_io.Timer = null;
+
+fn progress(comptime fmt: []const u8, args: anytype) void {
+    const t = progress_timer orelse gui_io.Timer.start();
+    progress_timer = t;
+    const secs = @as(f64, @floatFromInt(t.read())) / std.time.ns_per_s;
+    const line = std.fmt.bufPrint(progress_buf[progress_len..], "{d:8.1}s " ++ fmt ++ "\n", .{secs} ++ args) catch return;
+    progress_len += line.len;
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+    std.Io.Dir.cwd().writeFile(gui_io.io(), .{ .sub_path = progress_path, .data = progress_buf[0..progress_len] }) catch {};
+}
+
 /// Run scenario `M` when the comptime gate `ok` holds, else skip. `M.run` is
 /// referenced only in the taken branch, so a host that fails the gate never
 /// analyzes it.
@@ -81,7 +99,12 @@ fn gated(comptime ok: bool, comptime M: type) !void {
         const gen = watchdog_gen.fetchAdd(1, .monotonic) + 1;
         defer _ = watchdog_gen.fetchAdd(1, .monotonic);
         if (std.Thread.spawn(.{}, watchdog, .{ gen, @typeName(M) })) |t| t.detach() else |_| {}
-        try M.run(testing.allocator);
+        progress("start {s}", .{@typeName(M)});
+        M.run(testing.allocator) catch |e| {
+            progress("end   {s}: {t}", .{ @typeName(M), e });
+            return e;
+        };
+        progress("end   {s}: ok", .{@typeName(M)});
     } else {
         return error.SkipZigTest;
     }
