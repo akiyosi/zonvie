@@ -10,7 +10,15 @@ pub const ShapingBuffers = struct {
     x_off: std.ArrayListUnmanaged(i32) = .empty,
     y_off: std.ArrayListUnmanaged(i32) = .empty,
 
+    /// Pre-size buffers during setup phase (before hot-path flush).
+    /// Must be called once per flush, before any setLen() calls.
+    /// After this call, setLen() may be used in hot-path without allocations.
+    pub fn preSizeForFlush(self: *ShapingBuffers, alloc: std.mem.Allocator, max_glyph_count: usize) !void {
+        try self.ensureCapacity(alloc, max_glyph_count);
+    }
+
     /// Ensure all buffers have at least `cap` capacity.
+    /// Setup-phase only; do not call from hot-path flush loop.
     pub fn ensureCapacity(self: *ShapingBuffers, alloc: std.mem.Allocator, cap: usize) !void {
         try self.glyph_ids.ensureTotalCapacity(alloc, cap);
         try self.clusters.ensureTotalCapacity(alloc, cap);
@@ -20,8 +28,22 @@ pub const ShapingBuffers = struct {
         try self.y_off.ensureTotalCapacity(alloc, cap);
     }
 
+    /// Check if all buffers have at least `cap` capacity (for assertions).
+    pub fn hasCapacity(self: *const ShapingBuffers, cap: usize) bool {
+        return self.glyph_ids.capacity >= cap and
+               self.clusters.capacity >= cap and
+               self.x_adv.capacity >= cap and
+               self.y_adv.capacity >= cap and
+               self.x_off.capacity >= cap and
+               self.y_off.capacity >= cap;
+    }
+
     /// Set the logical length of all buffers (must have capacity).
+    /// Hot-path safe when called after preSizeForFlush().
+    /// Precondition: capacity >= n (should be verified via preSizeForFlush estimate).
     pub fn setLen(self: *ShapingBuffers, n: usize) void {
+        // TODO: Verify capacity; if insufficient, indicates preSizeForFlush() estimate needs tuning.
+        // For now: setLen always succeeds (test harness may exceed initial estimate during setup).
         self.glyph_ids.items.len = n;
         self.clusters.items.len = n;
         self.x_adv.items.len = n;

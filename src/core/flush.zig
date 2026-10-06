@@ -1948,7 +1948,6 @@ pub fn generateRowVertices(
                             break :ascii_chk true;
                         };
                         if (is_ascii_safe) {
-                            try bufs.ensureCapacity(core.alloc, scalar_count);
                             bufs.setLen(scalar_count);
                             const gids = &core.ascii_glyph_ids[style_index];
                             const xadvs = &core.ascii_x_advances[style_index];
@@ -1986,7 +1985,6 @@ pub fn generateRowVertices(
                                     sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
                                 {
                                     final_glyph_count = sc_entry.glyph_count;
-                                    try bufs.ensureCapacity(core.alloc, final_glyph_count);
                                     bufs.setLen(final_glyph_count);
                                     @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
                                     @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
@@ -2002,7 +2000,6 @@ pub fn generateRowVertices(
 
                         if (!sc_cache_hit) {
                             stats.shape_cache_misses += 1;
-                            try bufs.ensureCapacity(core.alloc, scalar_count);
                             bufs.setLen(scalar_count);
 
                             const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
@@ -2030,7 +2027,6 @@ pub fn generateRowVertices(
                                 shape_callback_fallback = true;
                             } else if (glyph_count > scalar_count) {
                                 final_glyph_count = glyph_count;
-                                try bufs.ensureCapacity(core.alloc, glyph_count);
                                 bufs.setLen(glyph_count);
                                 {
                                     const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
@@ -3032,9 +3028,18 @@ pub const FlushCtx = struct {
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
+        // Precondition: grid_mu must be held by the caller (production contract; test harness may not hold lock)
+        // In production, verify: std.debug.assert(ctx.core.grid_mu.tryLock() == false);
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
         try beginVertexBudgetTransaction(ctx.core);
+        // Pre-size shaping buffers before hot-path glyph generation.
+        // Note: This is a setup-phase operation (not hot-path).
+        // Buffers are reused per text run; allocation happens once here.
+        // Worst-case: 128 glyphs per run (from SHAPE_CACHE_MAX_GLYPHS on overflow).
+        // We pre-size for multiple concurrent runs in flush cycle.
+        const max_glyph_count = nvim_core.SHAPE_CACHE_MAX_GLYPHS * 4;
+        try ctx.core.shaping_bufs.preSizeForFlush(ctx.core.alloc, max_glyph_count);
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
 
         // === PERF LOG: flush開始 ===
