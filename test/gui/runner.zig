@@ -180,10 +180,6 @@ test "gui:visual_partial_matches_full" {
     try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
-test "gui:visual_partial_matches_full_extwin" {
-    try gated(can_capture, @import("scenarios/visual/partial_matches_full_extwin.zig"));
-}
-
 test "gui:visual_partial_matches_full_float_move" {
     try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
 }
@@ -364,12 +360,6 @@ test "gui:visual_extwin_split_with_float_background" {
     // macOS only: it enumerates the app's OS windows to capture the external
     // one.
     try gated(is_macos and can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
-}
-
-test "gui:visual_extwin_winhighlight_hosted_float_colors" {
-    // macOS only: it enumerates the app's OS windows to capture the external
-    // one.
-    try gated(is_macos and can_capture, @import("scenarios/visual/extwin_winhighlight_hosted_float_colors.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {

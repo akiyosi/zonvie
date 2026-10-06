@@ -6503,10 +6503,12 @@ test "an aborted flush leaves the committed layer rows and their damage alone" {
     tbs.cancelFlush();
 
     var pinned = tbs.acquireForPaint(alloc);
-    defer _ = LayerTestProbe.unpin(&tbs, &pinned);
     try std.testing.expectEqual(@as(?f32, 1.0), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 0));
     try std.testing.expectEqual(@as(?f32, null), LayerTestProbe.layerMarker(&tbs, pinned.committed_index, 2, 1));
     try std.testing.expectEqual(@as(usize, 0), pinned.layer_damage.len);
+    // A paint still pinned would make the next acquire a nested one, which
+    // carries no damage by design.
+    _ = LayerTestProbe.unpin(&tbs, &pinned);
 
     // A later flush must not publish the cancelled row's damage either.
     try LayerTestProbe.writeLayer(&tbs, alloc, 2, 2, 3.0, 3);
