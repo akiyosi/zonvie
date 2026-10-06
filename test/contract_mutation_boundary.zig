@@ -55,10 +55,9 @@ test "mutation boundary: cursor position is immutable during batch" {
     // Simulate multiple grid_line events (rows 20, 21, 22)
     for (20..23) |row| {
         for (0..80) |col| {
-            grid_state.cells[row][col] = 'X';  // Modify row: _=grid_state for mutability check
+            grid_state.cells[row][col] = 'X';  // Modify row
         }
     }
-    _ = grid_state;  // mark as intentionally used
 
     // Verify cursor did not move (immutable during batch)
     try std.testing.expectEqual(grid_state.cursor_row, initial_cursor_row);
@@ -133,7 +132,7 @@ test "mutation boundary: precondition on grid_mu lock during handleRedraw" {
     // Spec: Lock ownership is asserted at handleRedraw entry (via onRedrawThread()).
 
     // Simulate lock state
-    const lock_state = struct {
+    var lock_state = struct {
         is_locked: bool = false,
         owner_thread: u32 = 0,
         current_thread: u32 = 1,
@@ -172,7 +171,7 @@ test "mutation boundary: post-processing held under grid_mu (reentrancy guard)" 
     try std.testing.expectEqual(lock_state.reentry_count, 0);
 
     // Simulate event dispatch (mutations)
-    const events_processed: u32 = 5;
+    // In a real scenario, this would process grid_line and other events
 
     // Simulate post-processing
     // (grid state cleanup, dirty region consolidation)

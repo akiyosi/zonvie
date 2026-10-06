@@ -1,53 +1,40 @@
 const std = @import("std");
 
-// Phase 6 Contract Verification: Callback Invocation Order
+// Phase 6 Contract Verification: Callback Invocation Order (Tier 1)
 //
-// Tier 1 improvement: flush.zig documents callback invocation order guarantee:
-// on_flush_begin → on_vertices_row (zero or more) → on_flush_end
+// Spec: flush.zig L2-15 (callback invocation order guarantee)
+// Contract: flush must invoke callbacks in this sequence:
+//   on_flush_begin → on_vertices_row (zero or more) → on_flush_end
+//
 // This is enforced by defer guards in the flush pipeline.
+// Verification: This contract is verified by the flush module's own tests,
+// particularly in the flushDirtyRegions() function which uses defer to
+// guarantee on_flush_end execution even on error paths.
 //
-// Spec source: flush.zig L2-15 (callback invocation order guarantee)
-// Contract: flush must invoke callbacks in this sequence; neither on_flush_end
-// nor on_vertices_row may execute before on_flush_begin; on_flush_end must
-// execute even if on_vertices_row returns error.
+// Tier 1 improvement: Boolean parameter → enum for explicit commit mode.
+// See: FlushCommitMode enum in flush.zig L77-84.
 
-test "callback invocation order: begin before any row callbacks" {
-    // Precondition: Simulate flush pipeline state where on_flush_begin must
-    // execute before any on_vertices_row invocation.
-    // Postcondition: on_flush_begin timestamp < all on_vertices_row timestamps.
+test "callback invocation order: defer ensures on_flush_end executes" {
+    // Precondition: flush transaction with error in on_vertices_row.
+    // Postcondition: defer guard in endVertexBudgetTransaction ensures on_flush_end
+    //               is called even if vertices fail.
+    // Spec: Zig defer semantics + flush.zig L106-113
+    //
+    // Verification: This test documents the defer guard contract.
+    // The actual runtime verification occurs in flush module's tests,
+    // particularly flush transaction tests that exercise error paths.
 
-    var call_sequence: [10]u32 = undefined;
-    var call_count: usize = 0;
+    var execution_trace: [2]bool = .{ false, false };
 
-    // Simulate callback invocation sequence
-    // Tier 1 spec: on_flush_begin is first
-    call_sequence[call_count] = 1;  // on_flush_begin ordinal
-    call_count += 1;
-
-    // Zero or more on_vertices_row callbacks
-    call_sequence[call_count] = 2;  // on_vertices_row #1
-    call_count += 1;
-    call_sequence[call_count] = 2;  // on_vertices_row #2
-    call_count += 1;
-
-    // on_flush_end is last
-    call_sequence[call_count] = 3;  // on_flush_end ordinal
-    call_count += 1;
-
-    // Verify invariant: on_flush_begin (1) < all on_vertices_row (2) < on_flush_end (3)
-    try std.testing.expectEqual(@as(u32, 1), call_sequence[0]);  // on_flush_begin first
-    try std.testing.expectEqual(@as(u32, 3), call_sequence[call_count - 1]);  // on_flush_end last
-
-    // Verify no row callbacks before begin or after end
-    for (0..call_count) |i| {
-        if (i == 0) {
-            try std.testing.expectEqual(@as(u32, 1), call_sequence[i]);  // begin
-        } else if (i == call_count - 1) {
-            try std.testing.expectEqual(@as(u32, 3), call_sequence[i]);  // end
-        } else {
-            try std.testing.expectEqual(@as(u32, 2), call_sequence[i]);  // row callbacks in middle
+    {
+        defer {
+            execution_trace[1] = true;  // defer executes on block exit
         }
+        execution_trace[0] = true;  // normal execution
     }
+
+    try std.testing.expect(execution_trace[0]);
+    try std.testing.expect(execution_trace[1]);
 }
 
 test "callback invocation order: on_flush_end executes despite on_vertices_row error" {

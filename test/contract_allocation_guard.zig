@@ -28,7 +28,7 @@ test "hot-path allocation guard: pre-allocated buffers avoid per-row allocation"
 
     // Simulate per-row work: fill both buffers without further allocation
     var shaping_used: usize = 0;
-    var vertex_used: usize = 0; _ = vertex_output;
+    var vertex_used: usize = 0;
 
     for (0..10) |_| {  // 10 rows
         // Simulate glyph shaping output (uses pre-allocated arena space)
@@ -58,14 +58,18 @@ test "hot-path allocation guard: atlas ensure does not allocate (pre-sized)" {
     // Postcondition: atlas.ensure(glyph_id) returns existing slot; no heap allocation.
     // Spec: Atlas growth is out-of-path; per-frame rendering uses pre-sized atlas.
 
-    // Simulate pre-allocated atlas (2048 × 2048 RGBA8 = 16 MiB)
+    // Simulate pre-allocated atlas size (2048 × 2048 RGBA8 = 16 MiB)
+    // Use heap allocation to avoid stack overflow in test
     const atlas_width: usize = 2048;
     const atlas_height: usize = 2048;
     const bytes_per_pixel: usize = 4;  // RGBA8
     const atlas_size_bytes = atlas_width * atlas_height * bytes_per_pixel;
 
-    var atlas_texture: [2048 * 2048 * 4]u8 = undefined;
-    @memset(&atlas_texture, 0);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const atlas_texture = try alloc.alloc(u8, atlas_size_bytes);
+    defer alloc.free(atlas_texture);
 
     // Simulate per-frame atlas.ensure() calls (10 glyphs per frame)
     for (0..10) |glyph_id| {
@@ -158,25 +162,29 @@ test "hot-path allocation guard: precondition check on function entry" {
     // Postcondition: Function may proceed without violating allocation contract.
     // Spec: Precondition assertion should catch misuse (e.g., missing pre-allocation).
 
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
     // Precondition 1: Arena initialized
-    var arena_buffer: [64 * 1024]u8 = undefined;
-    @memset(&arena_buffer, 0);
+    const arena_buffer = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(arena_buffer);
     try std.testing.expect(arena_buffer.len > 0);
 
     // Precondition 2: Output capacity available
-    const vertex_list: [10000]u32 = undefined;
     const vertex_capacity: usize = 10000;
-    const vertex_used: usize = 0; _ = vertex_list;
+    const vertex_list = try alloc.alloc(u32, vertex_capacity);
+    defer alloc.free(vertex_list);
+    const vertex_used: usize = 0;
     try std.testing.expect(vertex_used < vertex_capacity);
 
-    // Precondition 3: Atlas pre-allocated
-    var atlas: [2048 * 2048 * 4]u8 = undefined;
-    @memset(&atlas, 0);
+    // Precondition 3: Atlas pre-allocated (64 KB instead of 16 MiB to avoid memory pressure)
+    const atlas = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(atlas);
     try std.testing.expect(atlas.len > 0);
 
     // All preconditions met; function entry succeeds
     try std.testing.expect(arena_buffer.len > 0);
-    _ = vertex_list;  // mark as used
 }
 
 test "OutOfMemory recovery: graceful degradation on fixed-size buffer" {

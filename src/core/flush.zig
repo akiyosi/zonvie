@@ -75,6 +75,13 @@ const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
 
+/// Flush commit disposition: explicit state for vertex budget transaction completion.
+const FlushCommitMode = enum {
+    success,               // commit=true: flush succeeded, drop saved ledgers
+    refusal_atlas_valid,   // commit=false, restore_main_ledger=true: frontend refused, atlas back-sync intact
+    abort_full,            // commit=false, restore_main_ledger=false: abort with full redraw needed
+};
+
 /// Vertex budget and shaping buffer errors.
 const VertexBudgetError = error{
     VertexBudgetExceededPerCallback,   // Single row exceeds 256 MiB
@@ -305,10 +312,14 @@ fn validateCompletedVertexBudget(core: *Core) !void {
 }
 
 fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void {
-    std.debug.assert(grid_id > 0);
     if (buf.vertex_budget_touched) return;
     buf.vertex_budget_touched = true;
-    if (grid_id == 1) return;
+
+    // Only track positive grid IDs (sub-grids). External grids (cmdline, popupmenu)
+    // have negative IDs and are not part of the vertex budget touched list.
+    if (grid_id <= 0) return;
+    if (grid_id == 1) return;  // Grid 1 is main grid, not tracked separately
+
     buf.vertex_budget_touched_next = core.vertex_budget_touched_grid_head;
     core.vertex_budget_touched_grid_head = grid_id;
 }
@@ -447,52 +458,62 @@ fn restoreVertexRowLedgers(core: *Core) bool {
 }
 
 fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
-    finishVertexBudgetTransactionRestoring(core, commit, false);
+    const mode: FlushCommitMode = if (commit) .success else .abort_full;
+    finishVertexBudgetTransactionRestoring(core, mode);
 }
 
-/// `restore_main_ledger` marks the abort as a frontend publication refusal
-/// (no free buffer set, atlas back-sync still in flight) rather than damaged
-/// state: the committed frame is intact, so the main surface keeps its exact
-/// accounting and only the rows this attempt consumed are owed again.
-fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_main_ledger: bool) void {
+/// Complete a vertex budget transaction with explicit disposition mode.
+/// Precondition: core.vertex_budget_transaction_active == true (or silently returns).
+/// Postcondition: core.vertex_budget_transaction_active = false after this function.
+fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) void {
     if (!core.vertex_budget_transaction_active) return;
+
     // A refusal leaves the glyph mirrors describing a frame that never reached
     // the screen, and atlas reclamation reads them.
-    if (commit) core.display_mirror_stale = false;
+    switch (mode) {
+        .success => {
+            core.display_mirror_stale = false;
+        },
+        .refusal_atlas_valid => {
+            if (restoreVertexRowLedgers(core)) {
+                core.display_mirror_stale = true;
+                // Every surface keeps its exact accounting now, sub-grids included.
+                // They used to be zeroed and re-marked whole here because the ledger
+                // was only ever mirrored for the main grid — and under ext_multigrid
+                // that is the container, not the content, so one routine backpressure
+                // refusal reshaped every split and float.
+                core.force_ext_cursor_recheck = true;
+                core.flush_vertex_count_aggregate =
+                    core.grid.main_buf.surface_vertex_count + core.grid.subgrid_surface_vertex_count;
+                core.vertex_budget_transaction_active = false;
+                return;
+            }
+            // Fall through to abort_full if restore fails
+        },
+        .abort_full => {
+            // Row ledgers are accounting metadata, not rendered content. Mutate
+            // them in place on the hot path so a one-row flush does O(1) ledger
+            // work and retains no full-size transaction copy. An aborted frontend
+            // transaction already forces every surface dirty; invalidate the
+            // metadata here so that the forced full retry reconstructs exact
+            // counts lazily. No row-sized work is done on a backpressure abort.
+            core.grid.main_buf.surface_vertex_count = 0;
+            core.grid.main_buf.vertex_row_ledger_valid = false;
+            var sg_it = core.grid.sub_grids.valueIterator();
+            while (sg_it.next()) |sg| {
+                sg.surface_vertex_count = 0;
+                sg.vertex_row_ledger_valid = false;
+                sg.markAllDirty();
+            }
+            core.grid.markAllDirty();
+            core.grid.subgrid_surface_vertex_count = 0;
+            core.force_ext_cursor_recheck = true;
+            core.flush_vertex_count_aggregate = 0;
+        },
+    }
+
+    // Clear touched surfaces for all paths (success and abort)
     clearTouchedVertexBudgetSurfaces(core);
-    if (!commit and restore_main_ledger and restoreVertexRowLedgers(core)) {
-        core.display_mirror_stale = true;
-        // Every surface keeps its exact accounting now, sub-grids included.
-        // They used to be zeroed and re-marked whole here because the ledger
-        // was only ever mirrored for the main grid — and under ext_multigrid
-        // that is the container, not the content, so one routine backpressure
-        // refusal reshaped every split and float.
-        core.force_ext_cursor_recheck = true;
-        core.flush_vertex_count_aggregate =
-            core.grid.main_buf.surface_vertex_count + core.grid.subgrid_surface_vertex_count;
-        core.vertex_budget_transaction_active = false;
-        return;
-    }
-    if (!commit) {
-        // Row ledgers are accounting metadata, not rendered content. Mutate
-        // them in place on the hot path so a one-row flush does O(1) ledger
-        // work and retains no full-size transaction copy. An aborted frontend
-        // transaction already forces every surface dirty; invalidate the
-        // metadata here so that the forced full retry reconstructs exact
-        // counts lazily. No row-sized work is done on a backpressure abort.
-        core.grid.main_buf.surface_vertex_count = 0;
-        core.grid.main_buf.vertex_row_ledger_valid = false;
-        var sg_it = core.grid.sub_grids.valueIterator();
-        while (sg_it.next()) |sg| {
-            sg.surface_vertex_count = 0;
-            sg.vertex_row_ledger_valid = false;
-            sg.markAllDirty();
-        }
-        core.grid.markAllDirty();
-        core.grid.subgrid_surface_vertex_count = 0;
-        core.force_ext_cursor_recheck = true;
-        core.flush_vertex_count_aggregate = 0;
-    }
     core.vertex_budget_transaction_active = false;
 }
 
@@ -3173,11 +3194,13 @@ pub const FlushCtx = struct {
             // A begin rejection keeps the budget (nothing was consumed) but
             // publishes nothing, so the mirrors are as stale as they were.
             const mirror_stale_before = ctx.core.display_mirror_stale;
-            finishVertexBudgetTransactionRestoring(
-                ctx.core,
-                vertex_budget_committed or aborted_at_flush_begin,
-                frontend_refused_publication,
-            );
+            const flush_mode: FlushCommitMode = if (vertex_budget_committed or aborted_at_flush_begin)
+                .success
+            else if (frontend_refused_publication)
+                .refusal_atlas_valid
+            else
+                .abort_full;
+            finishVertexBudgetTransactionRestoring(ctx.core, flush_mode);
             if (aborted_at_flush_begin) ctx.core.display_mirror_stale = mirror_stale_before;
             if (vertex_budget_committed) {
                 for (ctx.core.grid.destroyed_pending.items) |grid_id| {
@@ -8772,7 +8795,7 @@ test "a refused flush restores reshaped and newly created grids without a full i
     try core.grid.putSyntheticExternal(4, .{ .win = 4, .start_row = 0, .start_col = 0 });
     try replaceGridSurfaceRowVertexCount(&core, 4, core.grid.sub_grids.getPtr(4).?, 0, 7);
     core.grid.sub_grids.getPtr(2).?.clearDirty();
-    finishVertexBudgetTransactionRestoring(&core, false, true);
+    finishVertexBudgetTransactionRestoring(&core, .refusal_atlas_valid);
 
     try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
     const reshaped = core.grid.sub_grids.getPtr(2).?;
@@ -8807,7 +8830,7 @@ test "a refused flush restores a reshaped grid 1 alone and keeps the sub-grid le
     try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 1);
     try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 5);
     core.grid.sub_grids.getPtr(2).?.clearDirtyContent();
-    finishVertexBudgetTransactionRestoring(&core, false, true);
+    finishVertexBudgetTransactionRestoring(&core, .refusal_atlas_valid);
 
     try std.testing.expect(!core.grid.main_buf.vertex_row_ledger_valid);
     try std.testing.expect(core.grid.main_buf.dirty_all);
