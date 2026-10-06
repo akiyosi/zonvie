@@ -8679,6 +8679,7 @@ test "vertex budget uses actual row output and rejects an oversized callback" {
     try std.testing.expectEqual(@as(usize, 96), core.grid.main_buf.surface_vertex_count);
 
     // Accept any vertex budget error variant (PerCallback, PerSurface, Aggregate)
+    var budget_exceeded = false;
     _ = replaceSurfaceRowVertexCount(
         &core,
         &core.grid.main_buf.surface_vertex_count,
@@ -8691,8 +8692,9 @@ test "vertex budget uses actual row output and rejects an oversized callback" {
             err == error.VertexBudgetExceededPerSurface or
             err == error.VertexBudgetExceededAggregate
         );
+        budget_exceeded = true;
     };
-    try std.testing.expect(!core.flush_retryable);
+    try std.testing.expect(budget_exceeded);
 }
 
 test "vertex budget validates completed state and invalidates metadata on abort" {
