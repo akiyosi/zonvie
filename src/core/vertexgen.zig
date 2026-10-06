@@ -40,9 +40,9 @@ pub const ShapingBuffers = struct {
 
     /// Set the logical length of all buffers.
     /// Hot-path: assumes capacity pre-sized via preSizeForFlush(); no allocation.
-    /// Setup-phase fallback: if capacity insufficient, dynamically allocates (contract violation detection).
+    /// Setup-phase fallback: if capacity insufficient, dynamically allocates.
     pub fn setLen(self: *ShapingBuffers, alloc: ?std.mem.Allocator, n: usize) !void {
-        // If capacity is already sufficient, hot-path: no allocation.
+        // Fast-path: capacity is sufficient, no allocation needed.
         if (self.hasCapacity(n)) {
             self.glyph_ids.items.len = n;
             self.clusters.items.len = n;

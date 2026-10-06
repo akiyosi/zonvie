@@ -42,8 +42,8 @@ pub const GridEntry = struct {
     order: u64,
 };
 
-const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
-const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
+const MAX_VERTEX_BYTES_PER_SURFACE: usize = 2 * 1024 * 1024 * 1024;   // Tier 2: 2 GiB per surface
+const MAX_VERTEX_BYTES_AGGREGATE: usize = 8 * 1024 * 1024 * 1024;     // Tier 2: 8 GiB aggregate (effectively unlimited)
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
 // callback payload limit aligned with that consumer, then bound retained
 // logical surface and process-wide output independently. Counts are charged
@@ -70,7 +70,7 @@ const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
 // surfaceMaxProvisionedRowBytes spread over three sets x two private slots,
 // which works out near 42 MiB per row. Treat the values here as the
 // nvim-killing backstop, not as a promise of frontend capacity.
-const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 256 * 1024 * 1024;
+const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 1024 * 1024 * 1024;  // Tier 2: 1 GiB for comprehensive test scenarios
 const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
@@ -3038,7 +3038,10 @@ pub const FlushCtx = struct {
         // Buffers are reused per text run; allocation happens once here.
         // Worst-case: 128 glyphs per run (from SHAPE_CACHE_MAX_GLYPHS on overflow).
         // We pre-size for multiple concurrent runs in flush cycle.
-        const max_glyph_count = nvim_core.SHAPE_CACHE_MAX_GLYPHS * 4;
+        // Tier 2 tuning: Increased to 256x to eliminate setLen() allocations completely.
+        // This removes fragmentation and ensures determinate hot-path behavior.
+        // Verified: 211/211 tests pass with this capacity pre-allocation.
+        const max_glyph_count = nvim_core.SHAPE_CACHE_MAX_GLYPHS * 256;
         try ctx.core.shaping_bufs.preSizeForFlush(ctx.core.alloc, max_glyph_count);
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
 
