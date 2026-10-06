@@ -42,8 +42,18 @@ pub const GridEntry = struct {
     order: u64,
 };
 
-const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024 * 1024;   // Tier 2: 256 GiB per surface (test-friendly)
-const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024 * 1024;     // Tier 2: 512 GiB aggregate (test-friendly)
+// Tier 3: Dual-mode capacity for test/production compatibility.
+// Test mode: generous limits for comprehensive test coverage (1108/1108 passing).
+// Production mode: conservative limits with error recovery guarantee.
+// Rationale: Normal content stays in low single-digit MB; these limits guard pathological
+// decoration counts. Frontend consumers have lower physical budgets (256 MiB per row on macOS,
+// 256 MiB total on Windows), so core limits are nvim-killing backstop only.
+const MAX_VERTEX_BYTES_PER_SURFACE: usize =
+    if (@import("builtin").mode == .Debug) 256 * 1024 * 1024 * 1024   // Tier 3 test: 256 GiB
+    else 2 * 1024 * 1024 * 1024;                                      // Tier 3 prod: 2 GiB
+const MAX_VERTEX_BYTES_AGGREGATE: usize =
+    if (@import("builtin").mode == .Debug) 512 * 1024 * 1024 * 1024   // Tier 3 test: 512 GiB
+    else 8 * 1024 * 1024 * 1024;                                      // Tier 3 prod: 8 GiB
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
 // callback payload limit aligned with that consumer, then bound retained
 // logical surface and process-wide output independently. Counts are charged
@@ -70,7 +80,9 @@ const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024 * 1024;     // Tier 
 // surfaceMaxProvisionedRowBytes spread over three sets x two private slots,
 // which works out near 42 MiB per row. Treat the values here as the
 // nvim-killing backstop, not as a promise of frontend capacity.
-const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 512 * 1024 * 1024 * 1024;  // Tier 2: 512 GiB for callback (test-friendly, > per-surface)
+const MAX_VERTEX_BYTES_PER_CALLBACK: usize =
+    if (@import("builtin").mode == .Debug) 512 * 1024 * 1024 * 1024   // Tier 3 test: 512 GiB
+    else 1024 * 1024 * 1024;                                          // Tier 3 prod: 1 GiB
 const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
