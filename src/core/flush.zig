@@ -1948,7 +1948,7 @@ pub fn generateRowVertices(
                             break :ascii_chk true;
                         };
                         if (is_ascii_safe) {
-                            bufs.setLen(scalar_count);
+                            try bufs.setLen(core.alloc, scalar_count);
                             const gids = &core.ascii_glyph_ids[style_index];
                             const xadvs = &core.ascii_x_advances[style_index];
                             @memset(bufs.x_off.items[0..scalar_count], 0);
@@ -1985,7 +1985,7 @@ pub fn generateRowVertices(
                                     sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
                                 {
                                     final_glyph_count = sc_entry.glyph_count;
-                                    bufs.setLen(final_glyph_count);
+                                    try bufs.setLen(core.alloc, final_glyph_count);
                                     @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
                                     @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
                                     @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
@@ -2000,7 +2000,7 @@ pub fn generateRowVertices(
 
                         if (!sc_cache_hit) {
                             stats.shape_cache_misses += 1;
-                            bufs.setLen(scalar_count);
+                            try bufs.setLen(core.alloc, scalar_count);
 
                             const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
                             const glyph_count = shape_text_run.?(
@@ -2027,7 +2027,7 @@ pub fn generateRowVertices(
                                 shape_callback_fallback = true;
                             } else if (glyph_count > scalar_count) {
                                 final_glyph_count = glyph_count;
-                                bufs.setLen(glyph_count);
+                                try bufs.setLen(core.alloc, glyph_count);
                                 {
                                     const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
                                     final_glyph_count = shape_text_run.?(
