@@ -1506,6 +1506,11 @@ pub fn handleRedraw(
         }
     }
 
+    // Callback ordering contract guards: mode_info_set and hl_attr_define
+    // MUST be processed before grid_line events.
+    var mode_info_set_applied = false;
+    var hl_attr_define_applied = false;
+
     for (params) |ev| {
         if (ev != .arr) continue;
         const a = ev.arr;
@@ -2113,6 +2118,7 @@ pub fn handleRedraw(
                         }
                     }
                 }
+                hl_attr_define_applied = true;
             },
             .hl_group_set => {
                 for (tuples) |tv| {
@@ -2314,6 +2320,7 @@ pub fn handleRedraw(
                 // here or the cursor keeps its old shape until the mode changes.
                 applyModeInfo(grid, grid.current_mode_idx);
                 grid.cursor_rev +%= 1;
+                mode_info_set_applied = true;
             },
             .mode_change => {
                 // ["mode_change", mode, mode_idx]
@@ -2387,6 +2394,14 @@ pub fn handleRedraw(
                 grid.cursor_rev +%= 1;
             },
             .grid_line => {
+                // Precondition: mode_info_set MUST come before grid_line
+                //               hl_attr_define MUST come before grid_line
+                if (!mode_info_set_applied) {
+                    log.write("[warning] grid_line received before mode_info_set; mode table may be incomplete\n", .{});
+                }
+                if (!hl_attr_define_applied) {
+                    log.write("[warning] grid_line received before hl_attr_define; highlight IDs may be undefined\n", .{});
+                }
                 if (log_on_batch) grid_line_tuple_total +%= @intCast(tuples.len);
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
