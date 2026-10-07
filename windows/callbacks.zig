@@ -596,7 +596,7 @@ pub fn onVerticesRow(
             .external_root => true,
             .main_root, .main_layer, .external_layer, .unplaced => false,
         };
-        if ((flags & 2) == 0 and !ext_registered) {
+        if ((flags & app_mod.VERT_UPDATE_CURSOR) == 0 and !ext_registered) {
             const row_verts: []const app_mod.Vertex =
                 if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
             if (storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols, row_route)) {
@@ -622,7 +622,7 @@ pub fn onVerticesRow(
         // row so they are drawn as part of content (same as pre-refactor).
         // Next content update for this row will replace everything via
         // storeSurfaceRowVerts, clearing old cursor verts.
-        const is_cursor_update = (flags & 2) != 0; // VERT_UPDATE_CURSOR
+        const is_cursor_update = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
 
         // A newly-created HWND can still have a pending CPU frame when the
         // UI thread hit OOM while seeding its TBS. Keep subsequent core
@@ -968,7 +968,7 @@ pub fn onVerticesRow(
     if (app.surf.tbs.is_in_flush) {
         const write_set = app.surf.tbs.writeSet();
         write_set.row_mode = true;
-        if ((flags & 2) == 0) write_set.metrics_gen = app.shared_metrics_gen;
+        if ((flags & app_mod.VERT_UPDATE_CURSOR) == 0) write_set.metrics_gen = app.shared_metrics_gen;
         if (total_rows != write_set.rows) {
             // Reserve both variable-size structures before releasing the old
             // slot map. On OOM the write set remains a valid shallow copy and

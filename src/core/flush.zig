@@ -268,7 +268,6 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
             return vertexBudgetExceededPerSurface(core);
         }
     }
-    if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     // Validate budget before any state changes. Early return does not corrupt touched list.
     try syncVertexBudgetAggregate(core, true);
     // State changes follow successful budget validation.
@@ -733,6 +732,8 @@ pub const RenderCells = struct {
 
 /// Scan u32 array for end of run (4-wide SIMD with scalar tail).
 pub inline fn simdFindRunEndU32(items: []const u32, start: usize, limit: usize, target: u32) usize {
+    std.debug.assert(start <= limit);
+    std.debug.assert(limit <= items.len);
     var i = start;
     const V = @Vector(4, u32);
     const t: V = @splat(target);
@@ -756,6 +757,8 @@ pub inline fn simdFindRunEndU32(items: []const u32, start: usize, limit: usize, 
 
 /// Scan i64 array for end of run (2-wide SIMD with scalar tail).
 pub inline fn simdFindRunEndI64(items: []const i64, start: usize, limit: usize, target: i64) usize {
+    std.debug.assert(start <= limit);
+    std.debug.assert(limit <= items.len);
     var i = start;
     const V = @Vector(2, i64);
     const t: V = @splat(target);
@@ -775,6 +778,8 @@ pub inline fn simdFindRunEndI64(items: []const i64, start: usize, limit: usize, 
 
 /// Scan u8 array for end of run (16-wide SIMD with scalar tail).
 pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, target: u8) usize {
+    std.debug.assert(start <= limit);
+    std.debug.assert(limit <= items.len);
     var i = start;
     const V = @Vector(16, u8);
     const t: V = @splat(target);
@@ -851,6 +856,13 @@ pub inline fn simdFindRunEndMulti(
     glow_t: u8,
     has_glow: bool,
 ) usize {
+    std.debug.assert(start <= limit);
+    std.debug.assert(limit <= fg.len);
+    std.debug.assert(limit <= bg.len);
+    std.debug.assert(limit <= grid.len);
+    std.debug.assert(limit <= deco.len);
+    std.debug.assert(!has_style or limit <= style.len);
+    std.debug.assert(!has_glow or limit <= glow.len);
     const N = 8;
     var i = start;
     const fg_tv: @Vector(N, u32) = @splat(fg_t);
@@ -3041,7 +3053,6 @@ pub const FlushCtx = struct {
         // In production, verify: std.debug.assert(ctx.core.grid_mu.tryLock() == false);
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
-        try beginVertexBudgetTransaction(ctx.core);
         // Pre-size shaping buffers before hot-path glyph generation.
         // Note: This is a setup-phase operation (not hot-path).
         // Buffers are reused per text run; allocation happens once here.
@@ -3052,6 +3063,8 @@ pub const FlushCtx = struct {
         // Verified: 211/211 tests pass with this capacity pre-allocation.
         const max_glyph_count = nvim_core.SHAPE_CACHE_MAX_GLYPHS * 256;
         try ctx.core.shaping_bufs.preSizeForFlush(ctx.core.alloc, max_glyph_count);
+        // Opened after the last fallible setup step: only the defer below closes it.
+        try beginVertexBudgetTransaction(ctx.core);
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
 
         // === PERF LOG: flush開始 ===
@@ -7741,6 +7754,47 @@ fn cmdlineHasControlChars(chunks: []const grid_mod.CmdlineChunk) bool {
     return false;
 }
 
+fn refRunEnd(comptime T: type, items: []const T, start: usize, limit: usize, target: T) usize {
+    var i = start;
+    while (i < limit and items[i] == target) : (i += 1) {}
+    return i;
+}
+
+test "the SIMD run-end scans agree with a scalar scan at every start, limit and break" {
+    // Runs of one value with sparse breaks hit both the vector body and the
+    // tail; lengths 0..33 cover every remainder of the 2/4/8/16 strides.
+    var prng = std.Random.DefaultPrng.init(0x5eed_51ad);
+    const rand = prng.random();
+    var u32s: [33]u32 = undefined;
+    var i64s: [33]i64 = undefined;
+    var u8s: [33]u8 = undefined;
+    var u32b: [33]u32 = undefined;
+    var u32d: [33]u32 = undefined;
+    var u8g: [33]u8 = undefined;
+    for (0..200) |_| {
+        for (0..33) |k| {
+            u32s[k] = if (rand.uintLessThan(u8, 8) == 0) 9 else 7;
+            i64s[k] = if (rand.uintLessThan(u8, 8) == 0) -3 else 5;
+            u8s[k] = if (rand.uintLessThan(u8, 8) == 0) 1 else 0;
+            u32b[k] = if (rand.uintLessThan(u8, 16) == 0) 2 else 4;
+            u32d[k] = if (rand.uintLessThan(u8, 16) == 0) 6 else 8;
+            u8g[k] = if (rand.uintLessThan(u8, 16) == 0) 3 else 0;
+        }
+        for (0..34) |limit| {
+            for (0..limit + 1) |start| {
+                try std.testing.expectEqual(refRunEnd(u32, &u32s, start, limit, 7), simdFindRunEndU32(&u32s, start, limit, 7));
+                try std.testing.expectEqual(refRunEnd(i64, &i64s, start, limit, 5), simdFindRunEndI64(&i64s, start, limit, 5));
+                try std.testing.expectEqual(refRunEnd(u8, &u8s, start, limit, 0), simdFindRunEndU8(&u8s, start, limit, 0));
+                const want = @min(
+                    @min(refRunEnd(u32, &u32s, start, limit, 7), refRunEnd(u32, &u32b, start, limit, 4)),
+                    @min(@min(refRunEnd(i64, &i64s, start, limit, 5), refRunEnd(u32, &u32d, start, limit, 8)), @min(refRunEnd(u8, &u8s, start, limit, 0), refRunEnd(u8, &u8g, start, limit, 0))),
+                );
+                try std.testing.expectEqual(want, simdFindRunEndMulti(start, limit, &u32s, 7, &u32b, 4, &i64s, 5, &u32d, 8, &u8s, 0xFF, 0, true, &u8g, 0, true));
+            }
+        }
+    }
+}
+
 test "the cmdline control-character scan and the panel writer take invalid UTF-8" {
     const chunks = [_]grid_mod.CmdlineChunk{
         .{ .hl_id = 0, .text = "a\xff\xe3" },
@@ -8956,6 +9010,32 @@ test "deferred external pass shares the main vertex budget transaction" {
     try std.testing.expectEqual(@as(u32, 1), state.main_rows);
     try std.testing.expectEqual(@as(u32, 1), state.external_rows);
     try std.testing.expect(state.external_saw_shared_transaction);
+    try std.testing.expect(!core.vertex_budget_transaction_active);
+}
+
+test "an OOM while pre-sizing shaping buffers leaves no vertex budget transaction open" {
+    // An open transaction makes the next flush trip assertTransactionInactive.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try core.grid.resize(1, 1);
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+
+    // Without this the pre-size allocates nothing and the OOM never fires.
+    try std.testing.expect(!core.shaping_bufs.hasCapacity(nvim_core.SHAPE_CACHE_MAX_GLYPHS * 256));
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try std.testing.expectError(error.OutOfMemory, flush_ctx.onFlush(1, 1));
+    try std.testing.expect(!core.vertex_budget_transaction_active);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try flush_ctx.onFlush(1, 1);
     try std.testing.expect(!core.vertex_budget_transaction_active);
 }
 

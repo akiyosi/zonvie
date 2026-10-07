@@ -2603,6 +2603,7 @@ pub const Grid = struct {
 
         if (self.sub_grids.fetchRemove(grid_id)) |kv| {
             var buf = kv.value;
+            std.debug.assert(self.total_grid_cells >= buf.cells.len);
             self.total_grid_cells -= buf.cells.len;
             self.subgrid_surface_vertex_count -|= buf.surface_vertex_count;
             buf.deinit(self.alloc);
@@ -2859,6 +2860,9 @@ pub const Grid = struct {
         // The rows this grid covered are the frontend's to repaint, from the
         // layout it publishes.
         _ = self.win_pos.remove(grid_id);
+        // The window id is unreachable once grid_win_ids drops it, so a later
+        // win_close could no longer release the answer; a re-show asks again.
+        if (self.grid_win_ids.get(grid_id)) |win_id| _ = self.float_follows.remove(win_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
@@ -5109,6 +5113,35 @@ test "a float follows the scroll only once Neovim says it is placed at a buffer 
 
     try grid.destroyGrid(5);
     try std.testing.expect(!grid.float_follows.contains(1005));
+}
+
+test "a hidden float's follows answer is dropped and asked again when it is shown" {
+    // Neovim sends win_hide for every window of a tab that is left
+    // (window.c win_ui_flush), then win_close/grid_destroy when the tab closes,
+    // and re-sends win_float_pos when a hidden float is shown again.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 20, 40);
+    try grid.resizeGrid(2, 20, 40);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.resizeGrid(5, 3, 10);
+    try grid.setWinFloatPos(5, 1005, 4, 2, 50, 0, 2, true);
+    grid.float_config_wanted.clearRetainingCapacity();
+    grid.setFloatFollows(1005, true);
+    try std.testing.expect(grid.float_follows.contains(1005));
+
+    try grid.hideWin(5);
+    try std.testing.expect(!grid.float_follows.contains(1005));
+
+    try grid.setWinFloatPos(5, 1005, 4, 2, 50, 0, 2, true);
+    try std.testing.expectEqualSlices(i64, &.{1005}, grid.float_config_wanted.items);
+    try std.testing.expect(!grid.win_pos.get(5).?.follows_scroll);
+    grid.setFloatFollows(1005, true);
+    try std.testing.expect(grid.win_pos.get(5).?.follows_scroll);
+
+    try grid.hideWin(5);
+    try grid.destroyGrid(5);
+    try std.testing.expectEqual(@as(usize, 0), grid.float_follows.count());
 }
 
 test "floats keep their place inside a window that is detached and brought back" {

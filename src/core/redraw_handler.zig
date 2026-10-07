@@ -230,7 +230,6 @@ fn applyModeInfo(grid: *Grid, idx: usize) void {
 /// Precondition: first is a single u8 byte (invariant: always true).
 /// Postcondition: returns true iff mode name starts with 'i', 'r', or 't'.
 fn showmodeModeKeepsStatus(first: u8) bool {
-    std.debug.assert(first >= 0);
     return first == 'i' or first == 'r' or first == 't';
 }
 
@@ -252,7 +251,6 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
 /// Note: Zig @intCast panics on out-of-range in Debug/ReleaseSafe, UB in ReleaseFast.
 /// Callers treat null as "skip event/tuple" (e.g., grid_resize, grid_cursor_goto).
 fn checkedU32(v: i64) ?u32 {
-    std.debug.assert(v >= std.math.minInt(i64));
     if (v < 0 or v > std.math.maxInt(u32)) return null;
     return @as(u32, @intCast(v));
 }
@@ -301,7 +299,6 @@ fn appendContentChunks(
 /// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
 /// Postcondition: returns v iff 0 < v <= i32.max, else null (producer domain enforcement).
 fn checkedGridId(v: i64) ?i64 {
-    std.debug.assert(v >= std.math.minInt(i64));
     if (v <= 0 or v > std.math.maxInt(i32)) return null;
     return v;
 }
@@ -313,7 +310,6 @@ fn checkedGridId(v: i64) ?i64 {
 /// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
 /// Postcondition: returns v as i32 iff i32.min <= v <= i32.max, else null.
 pub fn checkedI32(v: i64) ?i32 {
-    std.debug.assert(v >= std.math.minInt(i64));
     if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return null;
     return @as(i32, @intCast(v));
 }
@@ -323,7 +319,6 @@ pub fn checkedI32(v: i64) ?i32 {
 /// Precondition: v is any msgpack value; default is u32 fallback on type mismatch or range error.
 /// Postcondition: returns checkedU32(v.int) iff v is .int and in u32 range, else default.
 fn argU32(v: mp.Value, default: u32) u32 {
-    std.debug.assert(default >= 0);
     return if (v == .int) (checkedU32(v.int) orelse default) else default;
 }
 
@@ -331,7 +326,6 @@ fn argU32(v: mp.Value, default: u32) u32 {
 /// Precondition: v is any msgpack value; default is i32 fallback on type mismatch or range error.
 /// Postcondition: returns checkedI32(v.int) iff v is .int and in i32 range, else default.
 fn argI32(v: mp.Value, default: i32) i32 {
-    std.debug.assert(default >= std.math.minInt(i32));
     return if (v == .int) (checkedI32(v.int) orelse default) else default;
 }
 
@@ -347,7 +341,6 @@ fn cmdlineLevel(v: mp.Value) u32 {
 /// Precondition: v is a MessagePack float value (range unbounded per spec).
 /// Postcondition: returns @intFromFloat(v) iff finite and in i64 range, else null.
 fn checkedFloatToI64(v: f64) ?i64 {
-    std.debug.assert(std.math.isFinite(v) or !std.math.isFinite(v));
     if (!std.math.isFinite(v)) return null;
     const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
     const max_i64_exclusive_f: f64 = 0x1p63;
@@ -360,7 +353,6 @@ fn checkedFloatToI64(v: f64) ?i64 {
 /// Precondition: v is a signed 64-bit integer representing a grid position.
 /// Postcondition: returns v as u32 iff 0 <= v <= i32.max, else null (ABI safety).
 fn checkedGridCoord(v: i64) ?u32 {
-    std.debug.assert(v >= std.math.minInt(i64));
     if (v < 0 or v > std.math.maxInt(i32)) return null;
     return @intCast(v);
 }
@@ -403,7 +395,6 @@ test "checked float and grid coordinates reject hostile numeric bounds" {
 }
 
 fn toRgbOpt(v: ?i64) ?u32 {
-    std.debug.assert(v == null or v.? >= std.math.minInt(i64));
     if (v == null) return null;
     return checkedU32(v.?);
 }
@@ -418,7 +409,6 @@ const GuiFontList = struct {
 };
 
 fn isSpaceAfterComma(c: u8) bool {
-    std.debug.assert(c >= 0);
     return c == ' ' or c == '\t';
 }
 
@@ -741,7 +731,6 @@ fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
 /// hostile starting column can neither wrap u32 nor turn no-op writes beyond
 /// the grid into unbounded work.
 fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
-    std.debug.assert(col <= std.math.maxInt(u32));
     if (col >= cols) return 0;
     return @min(repeat, cols - col);
 }
@@ -751,7 +740,6 @@ fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
 /// leave too much room between lines (options.txt 'linespace'). The frontends
 /// floor the row height that results, so nothing downstream needs a zero here.
 fn linespacePxFromWire(v: i64) i32 {
-    std.debug.assert(v >= std.math.minInt(i64));
     return @intCast(std.math.clamp(v, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
@@ -1506,11 +1494,6 @@ pub fn handleRedraw(
         }
     }
 
-    // Callback ordering contract guards: mode_info_set and hl_attr_define
-    // MUST be processed before grid_line events.
-    var mode_info_set_applied = false;
-    var hl_attr_define_applied = false;
-
     for (params) |ev| {
         if (ev != .arr) continue;
         const a = ev.arr;
@@ -1775,11 +1758,6 @@ pub fn handleRedraw(
                     // Neovim re-composites grid 2 as a fallback in the same batch.
                     if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
                         grid.composited_win_closed = true;
-                    }
-                    // Neovim never reuses a window handle; hideWin forgets
-                    // which one this grid showed.
-                    if (is_close) {
-                        if (grid.grid_win_ids.get(grid_id)) |win_id| _ = grid.float_follows.remove(win_id);
                     }
                     try grid.hideWin(grid_id);
                     // On permanent close, remove from ext_windows tracking.
@@ -2118,7 +2096,6 @@ pub fn handleRedraw(
                         }
                     }
                 }
-                hl_attr_define_applied = true;
             },
             .hl_group_set => {
                 for (tuples) |tv| {
@@ -2320,7 +2297,6 @@ pub fn handleRedraw(
                 // here or the cursor keeps its old shape until the mode changes.
                 applyModeInfo(grid, grid.current_mode_idx);
                 grid.cursor_rev +%= 1;
-                mode_info_set_applied = true;
             },
             .mode_change => {
                 // ["mode_change", mode, mode_idx]
@@ -2394,14 +2370,6 @@ pub fn handleRedraw(
                 grid.cursor_rev +%= 1;
             },
             .grid_line => {
-                // Precondition: mode_info_set MUST come before grid_line
-                //               hl_attr_define MUST come before grid_line
-                if (!mode_info_set_applied) {
-                    log.write("[warning] grid_line received before mode_info_set; mode table may be incomplete\n", .{});
-                }
-                if (!hl_attr_define_applied) {
-                    log.write("[warning] grid_line received before hl_attr_define; highlight IDs may be undefined\n", .{});
-                }
                 if (log_on_batch) grid_line_tuple_total +%= @intCast(tuples.len);
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
