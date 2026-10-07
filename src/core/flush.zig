@@ -294,12 +294,12 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
 /// Tier D1: Recovery Action Strategy — detect overflow and route to recovery handler.
 /// Precondition: vertex_budget_transaction_active == true (called during active transaction).
 /// Precondition: vertex_budget_transaction_active == true.
-/// Postcondition: aggregate budget validated; per-surface limits are soft (aggregate redistribution permitted).
+/// Postcondition: grid 1 and every touched sub-grid are within MAX_VERTICES_PER_SURFACE.
+/// Only the completed frame is checked: row-by-row replacement may pass through
+/// a mixed old/new total above the limit.
 fn validateCompletedVertexBudget(core: *Core) !void {
     std.debug.assert(core.vertex_budget_transaction_active);
     try syncVertexBudgetAggregate(core, true);
-    // Tier 2: Per-surface limits are soft; aggregate redistribution permitted.
-    // Individual grids may exceed their notional per-surface budget if aggregate remains valid.
     var grid_id = core.vertex_budget_touched_grid_head;
     var visited: usize = 0;
     const max_grids = core.grid.sub_grids.count() + 1;
@@ -310,13 +310,12 @@ fn validateCompletedVertexBudget(core: *Core) !void {
         }
         const sg = core.grid.sub_grids.get(current_grid_id) orelse
             return vertexBudgetExceededPerSurface(core);
-        // Tier 2: Per-surface limits are soft; aggregate redistribution permitted.
-        // Individual grids may temporarily exceed their notional per-surface budget
-        // if aggregate remains within per-surface max. This enables dynamic rebalancing.
+        if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
+            return vertexBudgetExceededPerSurface(core);
+        }
         grid_id = sg.vertex_budget_touched_next;
     }
-    // Tier 2: Aggregate redistribution across external surfaces permitted within per-surface limits.
-    // No global aggregate constraint; per-surface limits (MAX_VERTICES_PER_SURFACE) are enforced.
+    // No aggregate limit across surfaces; each surface's limit is the constraint.
 }
 
 fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void {
@@ -8822,18 +8821,41 @@ test "vertex budget permits aggregate redistribution across external surfaces" {
 
     try beginVertexBudgetTransaction(&core);
     const destination = core.grid.sub_grids.getPtr(2).?;
-    try replaceGridSurfaceRowVertexCount(&core, 2, destination, 0, MAX_VERTICES_PER_CALLBACK);
+    // Within both the row and the surface limit, whichever is smaller in this build.
+    const moved = @min(MAX_VERTICES_PER_CALLBACK, MAX_VERTICES_PER_SURFACE);
+    try replaceGridSurfaceRowVertexCount(&core, 2, destination, 0, moved);
     try replaceGridSurfaceRowVertexCount(&core, 3, source, 0, 0);
     try replaceGridSurfaceRowVertexCount(&core, 3, source, 1, 0);
     try validateCompletedVertexBudget(&core);
     finishVertexBudgetTransaction(&core, true);
 
-    try std.testing.expectEqual(MAX_VERTICES_PER_CALLBACK, destination.surface_vertex_count);
+    try std.testing.expectEqual(moved, destination.surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 0), source.surface_vertex_count);
     try std.testing.expectEqual(
-        MAX_VERTICES_PER_SURFACE + MAX_VERTICES_PER_CALLBACK,
+        MAX_VERTICES_PER_SURFACE + moved,
         core.flush_vertex_count_aggregate,
     );
+}
+
+test "a completed flush that leaves a sub-grid above its surface limit is rejected" {
+    // beginVertexBudgetTransaction rejects such a sub-grid; letting this flush
+    // commit would fail every later one instead of this one.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 1);
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    sg.vertex_row_ledger_valid = true;
+    sg.vertex_row_counts[0] = MAX_VERTICES_PER_SURFACE - 1;
+    sg.vertex_row_counts[1] = 0;
+    sg.surface_vertex_count = MAX_VERTICES_PER_SURFACE - 1;
+    core.grid.subgrid_surface_vertex_count = sg.surface_vertex_count;
+
+    try beginVertexBudgetTransaction(&core);
+    defer finishVertexBudgetTransaction(&core, false);
+    try replaceGridSurfaceRowVertexCount(&core, 2, sg, 1, 6);
+    try std.testing.expectError(error.VertexBudgetExceededPerSurface, validateCompletedVertexBudget(&core));
 }
 
 test "a refused flush restores reshaped and newly created grids without a full invalidation" {

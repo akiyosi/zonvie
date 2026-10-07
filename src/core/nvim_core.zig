@@ -544,6 +544,12 @@ pub const Core = struct {
     retained_uv_shadow: [retained_shadow_slots]std.ArrayListUnmanaged(f32) = @splat(.empty),
     retained_shadow_age: [retained_shadow_slots]u8 = @splat(retained_shadow_expiry),
     retained_shadow_next: usize = 0,
+    /// UVs a mirrored row showed before this flush rewrote it. The frontend
+    /// keeps drawing them until the flush commits, so the mid-flush collection
+    /// counts them live. Reset when the next flush starts.
+    flush_replaced_uvs: std.ArrayListUnmanaged(f32) = .empty,
+    /// A replaced row could not be recorded: liveness is incomplete until reset.
+    flush_replaced_uvs_lost: bool = false,
     flush_vertex_count_aggregate: usize = 0,
     vertex_budget_transaction_active: bool = false,
     vertex_budget_touched_grid_head: ?i64 = null,
@@ -1234,6 +1240,7 @@ pub const Core = struct {
         self.float_config_requests.deinit(self.alloc);
         self.float_config_outbox.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
+        self.flush_replaced_uvs.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
         self.key_buf.deinit(self.alloc);
@@ -1917,7 +1924,10 @@ pub const Core = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const m = gop.value_ptr;
         if (m.rows.items.len != rows_total) {
-            for (m.rows.items) |*r| r.deinit(self.alloc);
+            for (m.rows.items, 0..) |*r, i| {
+                self.keepReplacedRowUvs(m, i, r);
+                r.deinit(self.alloc);
+            }
             // deinit leaves the lists undefined; drop them before the resize so
             // a failed grow cannot leave freed lists behind for a second free.
             m.rows.clearRetainingCapacity();
@@ -1935,6 +1945,7 @@ pub const Core = struct {
         }
         if (row >= m.rows.items.len) return;
         var dst = &m.rows.items[row];
+        self.keepReplacedRowUvs(m, row, dst);
         dst.clearRetainingCapacity();
         // Glyph quads only: a solid quad carries the (-1,-1) sentinel and
         // references no shelf. The dedup drops a quad's repeat of each v.
@@ -2798,6 +2809,14 @@ pub const Core = struct {
         self.retained_shadow_next = (slot + 1) % self.retained_uv_shadow.len;
     }
 
+    fn keepReplacedRowUvs(self: *Core, m: *const GlyphMirror, row: usize, old: *const std.ArrayListUnmanaged(f32)) void {
+        if (old.items.len == 0) return;
+        if (row >= m.valid.bit_length or !m.valid.isSet(row)) return;
+        self.flush_replaced_uvs.appendSlice(self.alloc, old.items) catch {
+            self.flush_replaced_uvs_lost = true;
+        };
+    }
+
     /// Test seam: whether a departed row's UV is still counted live.
     pub fn departedUvIsLive(self: *Core, uv_y: f32) bool {
         for (self.retained_shadow_age, &self.retained_uv_shadow) |age, *buf| {
@@ -2827,6 +2846,10 @@ pub const Core = struct {
     /// longer than one flush.
     pub fn collectAtlasGarbageIfNeeded(self: *Core) void {
         self.ageRetainedShadows();
+        // Mirrors describe the screen again: the previous flush committed, or
+        // was refused and display_mirror_stale holds collection off.
+        self.flush_replaced_uvs.clearRetainingCapacity();
+        self.flush_replaced_uvs_lost = false;
         if (self.atlas_packer == null) return;
         const packer = &(self.atlas_packer.?);
         const total: u64 = @as(u64, packer.width) * packer.height;
@@ -2873,6 +2896,10 @@ pub const Core = struct {
         if (self.atlas_packer == null) return false;
         if (self.display_mirror_stale) {
             if (log_on) self.log.write("[perf] atlas_gc skip=display_mirror_stale\n", .{});
+            return false;
+        }
+        if (self.flush_replaced_uvs_lost) {
+            if (log_on) self.log.write("[perf] atlas_gc skip=replaced_uvs_lost\n", .{});
             return false;
         }
         if (!self.mainRowsAccountedForCollect()) {
@@ -2922,6 +2949,9 @@ pub const Core = struct {
         }
         for (self.cursor_verts.items) |v| {
             markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+        }
+        for (self.flush_replaced_uvs.items) |uv_y| {
+            markShelfLiveForUv(packer, order, &live, uv_y);
         }
         // The row this flush is composing right now. Its quads are not
         // mirrored yet, and a glyph it took from the cache was allocated in
@@ -7698,6 +7728,33 @@ test "a surface that outlived its grid buffer is read from its mirror" {
     try addMirroredExternalSurface(&fresh, 7, false);
     fresh.glyph_mirror.getPtr(7).?.valid.unset(1);
     try std.testing.expect(!fresh.collectAtlasGarbage());
+}
+
+test "a mid-flush collection keeps the shelves of rows this flush rewrote until the next flush" {
+    // The frontend shows the committed frame until on_flush_end, and Windows
+    // presents atlas uploads before that. Recycling the shelf a rewritten row
+    // used to draw from would overwrite glyphs still on screen.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, true);
+    // Closes shelf 2, so the collection below has a dead shelf to reclaim.
+    _ = core.atlas_packer.?.alloc(12, 1).?;
+
+    core.collectAtlasGarbageIfNeeded();
+    const v = [_]c_api.Vertex{mirrorGlyphVert(7, shelfUvY(&core, 1))};
+    core.recordGlyphMirrorRow(7, 0, 2, &v);
+    core.recordGlyphMirrorRow(7, 1, 2, &v);
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+    try std.testing.expect(!core.atlas_packer.?.shelves[1].recycled);
+    try std.testing.expect(core.atlas_packer.?.shelves[2].recycled);
+
+    // The next flush starts from the committed rewrite: shelf 0 is free.
+    core.collectAtlasGarbageIfNeeded();
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(core.atlas_packer.?.shelves[0].recycled);
 }
 
 

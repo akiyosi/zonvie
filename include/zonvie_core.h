@@ -183,18 +183,6 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
-/* Validate preconditions for on_vertices_row callback.
-   Returns 1 if all preconditions hold, 0 on violation.
-   Frontend should call this in debug mode to catch misuse early.
-   Checks: grid_id valid, vert_count consistent with flags, layer placement bounds. */
-ZONVIE_API int zonvie_validate_vertices_row_preconditions(
-    const zonvie_vertex* verts,
-    size_t vert_count,
-    uint32_t flags,
-    uint32_t total_rows,
-    uint32_t total_cols
-);
-
 /* on_vertices_row layers are independent:
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
@@ -1868,10 +1856,14 @@ ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
    this flush (e.g. no free buffer set, or a late buffer commit failed).
    Sets an internal flag that causes the flush pipeline to skip vertex generation,
    atlas operations, and vertex submission when called before those stages.
-   An on_flush_end abort invalidates the current core accounting ledger and
-   restores dirty state before the flush transaction returns.
    on_flush_end is still called (via defer) so the frontend can clean up.
-   The aborted flush's dirty state is preserved — next flush retries everything. */
+   The frontend must keep its last committed frame: the core does not resend
+   everything. An on_flush_begin abort sends nothing and changes no accounting.
+   A later abort restores the row accounting of the committed frame, and the
+   next flush resends only the rows this attempt sent plus rows changed since.
+   If that accounting could not be journaled (allocation failure), and on a
+   core-side hard failure (atlas corruption, vertex budget violation) instead
+   invalidates all accounting and marks every grid dirty. */
 ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
 
 /* Mark the current UI session failed after a frontend-side fixed physical
