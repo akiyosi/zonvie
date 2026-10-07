@@ -1575,7 +1575,10 @@ pub const TripleBufferedSurface = struct {
             // The rows already pending moved with this flush's shift.
             if (f.scroll) |s| p.addShift(s);
             if (f.full) p.full = true;
-            p.rows.setUnion(f.rows);
+            // Recycled entries keep their longest length, so the two can
+            // differ; getOrAdd made p at least as long as f.
+            var it = f.rows.iterator(.{});
+            while (it.next()) |row| p.rows.set(row);
         }
         const staged = staged_layers orelse return;
         for (staged.slice(), 0..) |layer, index| {
@@ -6556,6 +6559,35 @@ test "a layer shift carries the pending damage with the rows" {
     try std.testing.expect(d.rows.isSet(5));
     try std.testing.expect(!d.full);
     try std.testing.expectEqual(@as(i32, 1), d.scroll.?.rows_delta);
+}
+
+test "a commit merges layer damage whose recycled entries differ in length" {
+    // Damage entries are recycled by position and only ever grow, so the
+    // pending and flush entries for one grid can carry different bit lengths.
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{ 2, 3, 4 }, 6, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 6);
+    tbs.commitFlush(alloc);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 3, 0, 1.0, 6);
+    tbs.commitFlush(alloc);
+    {
+        var drain = tbs.acquireForPaint(alloc);
+        _ = LayerTestProbe.unpin(&tbs, &drain);
+    }
+
+    // Grid 3 lands in a fresh 3-bit flush entry but a recycled 6-bit pending one.
+    try LayerTestProbe.writeLayer(&tbs, alloc, 4, 0, 1.0, 6);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 3, 2, 2.0, 3);
+    tbs.commitFlush(alloc);
+
+    var pinned = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &pinned);
+    try std.testing.expect(LayerTestProbe.damageFor(pinned, 3).?.rows.isSet(2));
+    try std.testing.expect(LayerTestProbe.damageFor(pinned, 4).?.rows.isSet(0));
 }
 
 test "a layer the layout no longer places releases its rows at commit" {
