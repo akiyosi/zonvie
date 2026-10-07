@@ -25,7 +25,6 @@ var g_queue_stop: bool = false;
 var g_queue_mu: std.Io.Mutex = .init;
 var g_queue_cond: std.Io.Condition = .init;
 var g_log_thread: ?std.Thread = null;
-var g_queue_busy_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_full_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_stopped_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_shutdown_drop_bytes: std.atomic.Value(u64) = .init(0);
@@ -45,17 +44,16 @@ fn enqueueLocked(bytes: []const u8) bool {
 }
 
 fn enqueueDropSummaryLocked(required_after: usize) void {
-    const busy = g_queue_busy_drops.load(.acquire);
     const full = g_queue_full_drops.load(.acquire);
     const stopped = g_queue_stopped_drops.load(.acquire);
     const format = g_format_drops.load(.acquire);
-    if (busy == 0 and full == 0 and stopped == 0 and format == 0) return;
+    if (full == 0 and stopped == 0 and format == 0) return;
 
     var buf: [192]u8 = undefined;
     const summary = std.fmt.bufPrint(
         &buf,
-        "[log] dropped messages: busy={d} full={d} stopped={d} format={d}\n",
-        .{ busy, full, stopped, format },
+        "[log] dropped messages: full={d} stopped={d} format={d}\n",
+        .{ full, stopped, format },
     ) catch return;
     if (summary.len > queue_capacity - g_queue_len or
         required_after > queue_capacity - g_queue_len - summary.len)
@@ -63,7 +61,6 @@ fn enqueueDropSummaryLocked(required_after: usize) void {
         return;
     }
 
-    _ = g_queue_busy_drops.fetchSub(busy, .acq_rel);
     _ = g_queue_full_drops.fetchSub(full, .acq_rel);
     _ = g_queue_stopped_drops.fetchSub(stopped, .acq_rel);
     _ = g_format_drops.fetchSub(format, .acq_rel);
@@ -71,10 +68,10 @@ fn enqueueDropSummaryLocked(required_after: usize) void {
 }
 
 fn enqueue(bytes: []const u8) void {
-    if (!g_queue_mu.tryLock()) {
-        _ = g_queue_busy_drops.fetchAdd(1, .monotonic);
-        return;
-    }
+    // Waits rather than drops: the lock guards only ring copies of at most
+    // 8 KiB, never the sink I/O, so the wait is bounded and a line is lost
+    // only when the ring is full.
+    g_queue_mu.lockUncancelable(clock.io());
     defer g_queue_mu.unlock(clock.io());
 
     if (g_queue_stop) {
@@ -95,10 +92,7 @@ fn enqueueParts(parts: []const []const u8) void {
     for (parts) |part| {
         required = std.math.add(usize, required, part.len) catch return;
     }
-    if (!g_queue_mu.tryLock()) {
-        _ = g_queue_busy_drops.fetchAdd(1, .monotonic);
-        return;
-    }
+    g_queue_mu.lockUncancelable(clock.io());
     defer g_queue_mu.unlock(clock.io());
 
     if (g_queue_stop) {
@@ -147,17 +141,16 @@ fn outputDebug(bytes: []const u8) void {
 
 fn logThreadMain() void {
     defer {
-        const busy = g_queue_busy_drops.load(.acquire);
         const full = g_queue_full_drops.load(.acquire);
         const stopped = g_queue_stopped_drops.load(.acquire);
         const format = g_format_drops.load(.acquire);
         const shutdown_bytes = g_queue_shutdown_drop_bytes.load(.acquire);
-        if (busy != 0 or full != 0 or stopped != 0 or format != 0 or shutdown_bytes != 0) {
+        if (full != 0 or stopped != 0 or format != 0 or shutdown_bytes != 0) {
             var summary_buf: [224]u8 = undefined;
             if (std.fmt.bufPrint(
                 &summary_buf,
-                "[log] final drops: busy={d} full={d} stopped={d} format={d} shutdown_bytes={d}\n",
-                .{ busy, full, stopped, format, shutdown_bytes },
+                "[log] final drops: full={d} stopped={d} format={d} shutdown_bytes={d}\n",
+                .{ full, stopped, format, shutdown_bytes },
             )) |summary| {
                 writeChunk(summary);
             } else |_| {}
@@ -267,7 +260,6 @@ fn shouldEmitBytes(prefix: []const u8, bytes: []const u8) bool {
 }
 
 pub const DropStats = struct {
-    busy: u64,
     full: u64,
     stopped: u64,
     format: u64,
@@ -278,7 +270,6 @@ pub const DropStats = struct {
 /// on the asynchronous writer reaching a final summary during process exit.
 pub fn dropStats() DropStats {
     return .{
-        .busy = g_queue_busy_drops.load(.acquire),
         .full = g_queue_full_drops.load(.acquire),
         .stopped = g_queue_stopped_drops.load(.acquire),
         .format = g_format_drops.load(.acquire),
@@ -362,14 +353,14 @@ pub fn deinit() void {
 
     const drops = dropStats();
     const sink_inflight = g_sink_inflight_bytes.load(.acquire);
-    if (drops.busy != 0 or drops.full != 0 or drops.stopped != 0 or
+    if (drops.full != 0 or drops.stopped != 0 or
         drops.format != 0 or drops.shutdown_bytes != 0 or queued_at_shutdown != 0 or sink_inflight != 0)
     {
         var summary_buf: [256]u8 = undefined;
         const summary = std.fmt.bufPrint(
             &summary_buf,
-            "[log] final drops: busy={d} full={d} stopped={d} format={d} shutdown_bytes={d}\n",
-            .{ drops.busy, drops.full, drops.stopped, drops.format, drops.shutdown_bytes +| @as(u64, @intCast(queued_at_shutdown)) +| sink_inflight },
+            "[log] final drops: full={d} stopped={d} format={d} shutdown_bytes={d}\n",
+            .{ drops.full, drops.stopped, drops.format, drops.shutdown_bytes +| @as(u64, @intCast(queued_at_shutdown)) +| sink_inflight },
         ) catch "[log] final drop summary formatting failed\n";
         // The consumer may be permanently blocked in its configured sink.
         // Emit the summary synchronously only to the debugger channel before
@@ -388,17 +379,23 @@ pub fn deinit() void {
     }
 }
 
-test "logging producer drops instead of waiting for the queue mutex" {
+test "logging producer waits for the queue mutex instead of dropping" {
     clock.init();
-    g_queue_busy_drops.store(0, .release);
     g_queue_stop = false;
+    g_queue_head = 0;
+    g_queue_len = 0;
 
     g_queue_mu.lockUncancelable(clock.io());
-    enqueue("contended");
+    const producer = try std.Thread.spawn(.{}, enqueue, .{"contended"});
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    const len_while_held = g_queue_len;
     g_queue_mu.unlock(clock.io());
+    producer.join();
 
-    try std.testing.expectEqual(@as(u64, 1), g_queue_busy_drops.load(.acquire));
-    g_queue_busy_drops.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 0), len_while_held);
+    try std.testing.expectEqualStrings("contended", g_queue[0..g_queue_len]);
+    g_queue_head = 0;
+    g_queue_len = 0;
 }
 
 test "multipart logging drops atomically when the ring is full" {

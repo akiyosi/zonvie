@@ -96,6 +96,13 @@ fn fastPathFrames(alloc: std.mem.Allocator, since_ms: f64) !FastPath {
         const regen = app_log.field(line, "regen_count") orelse continue;
         if (regen > out.max_regen) out.max_regen = regen;
     }
+    // The Windows log drops a line that loses its queue lock race. The core's
+    // line and the frontend's acceptance of the same shift are separate
+    // enqueues, so a shift is missed only when both are.
+    if (builtin.os.tag == .windows) {
+        const accepted = try app_log.countLinesSince(alloc, log_path, "[ext_applyRowScroll] gridId=", since_ms);
+        out.frames = @max(out.frames, accepted);
+    }
     return out;
 }
 

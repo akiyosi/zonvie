@@ -28,7 +28,8 @@
 // Windows has no idle gate to trace: it paints the main window only when a
 // flush invalidates it. So there the first phase counts main frames outright,
 // and the second counts main frames whose editor layer encoded more than the
-// cursor's two rows, which is the whole pass a cursor-only frame must not run.
+// cursor's damage band (its rows, a band row and an ink row each way), which
+// is the whole pass a cursor-only frame must not run.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -86,8 +87,9 @@ fn windowsFrames(alloc: std.mem.Allocator, since_ms: f64) !struct { main: usize,
     return .{ .main = main, .external = external };
 }
 
-/// Windows: layer draws since since_ms that encoded more than the cursor's
-/// old and new rows.
+/// Windows: layer draws since since_ms that encoded more than the band a
+/// cursor move repaints: its old and new rows, grown by the band's row and
+/// the ink row on each side.
 fn windowsWholeLayerDraws(alloc: std.mem.Allocator, since_ms: f64) !usize {
     const lines = try app_log.linesSince(alloc, log_path, "[layer_draw] gridId=", since_ms);
     defer alloc.free(lines);
@@ -95,7 +97,7 @@ fn windowsWholeLayerDraws(alloc: std.mem.Allocator, since_ms: f64) !usize {
     var it = std.mem.splitScalar(u8, lines, '\n');
     while (it.next()) |line| {
         const rows = app_log.field(line, "rows") orelse continue;
-        if (rows > 2) n += 1;
+        if (rows > 2 + 2 * 2) n += 1;
     }
     return n;
 }

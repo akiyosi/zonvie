@@ -65,7 +65,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
 
     try runPhase(alloc, g, "single", single_steps, false);
-    try runPhase(alloc, g, "burst", single_steps, true);
+    // The core refuses a shift past half the region (the vacated rows would
+    // outnumber the kept ones), so a burst taller than that tests nothing on a
+    // short window.
+    const half_rows: usize = @intCast(@divTrunc(try g.evalInt("winheight(0)"), 2));
+    try runPhase(alloc, g, "burst", @min(single_steps, half_rows), true);
 }
 
 /// Scroll `steps` rows by pressing `j` from the bottom line of the window,

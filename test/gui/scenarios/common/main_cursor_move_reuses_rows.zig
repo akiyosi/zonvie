@@ -23,10 +23,13 @@
 // and correctly redraws.
 //
 // Windows has no skip-the-pass frame: it erases the previous cursor by
-// repainting the cursor's old and new rows from their vertices. Under
-// ext_multigrid the editor window is a layer, so its [layer_draw] line says
-// how many of its rows a frame encoded, and a reused frame there is one that
-// encoded at most those two.
+// repainting the cursor's old and new rows from their vertices, as a damage
+// band (src/core/damage_bands.zig), which grows a row each way and then draws
+// a row more each way for ink. Under ext_multigrid the editor window is a
+// layer, so its [layer_draw] line says how many of its rows a frame encoded,
+// and a reused frame there is one that encoded that band and no more. A layer
+// that drew no row is not a reused frame: it is a layer the move never
+// reached.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -48,11 +51,12 @@ const min_reuse_frames = 3;
 
 const marker = "[draw] skipMainPass=true (noop";
 
-/// The cursor's old row and its new one.
-const cursor_rows = 2;
+/// The cursor's old row and its new one, grown by the band's row and the ink
+/// row on each side.
+const cursor_band_rows = 2 + 2 * 2;
 
-/// Windows: frames whose editor-layer draw encoded no more than the cursor's
-/// rows, out of a layer taller than that.
+/// Windows: frames whose editor-layer draw encoded the cursor's band and no
+/// more, out of a layer taller than that.
 fn windowsReuseFrames(alloc: std.mem.Allocator, since_ms: f64) !usize {
     const lines = try app_log.linesSince(alloc, log_path, "[layer_draw] gridId=", since_ms);
     defer alloc.free(lines);
@@ -61,7 +65,7 @@ fn windowsReuseFrames(alloc: std.mem.Allocator, since_ms: f64) !usize {
     while (it.next()) |line| {
         const rows = app_log.field(line, "rows") orelse continue;
         const of = app_log.field(line, "of") orelse continue;
-        if (of > cursor_rows and rows <= cursor_rows) n += 1;
+        if (of > cursor_band_rows and rows > 0 and rows <= cursor_band_rows) n += 1;
     }
     return n;
 }
