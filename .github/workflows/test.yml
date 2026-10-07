@@ -206,6 +206,17 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      # setup-zig keeps only the global cache; the compiled core and its
+      # glslang/SPIRV-Cross deps land in the local one, and rebuilding them
+      # from scratch takes most of the build step's budget. Saved per commit,
+      # restored from the newest earlier save.
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-local-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-${{ runner.os }}-${{ env.ZIG_VERSION }}-
       - name: Build macOS app
         run: |
           zig build
