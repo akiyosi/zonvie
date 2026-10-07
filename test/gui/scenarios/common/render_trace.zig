@@ -35,6 +35,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
         const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(64 * 1024 * 1024));
         defer alloc.free(data);
         const frontend = if (builtin.os.tag == .windows) "side=windows" else "side=macos";
+        // Windows frees a destroyed grid's rows with the commit whose layout
+        // drops it, so it traces the destroy alone; macOS stages it and
+        // releases after on_flush_end.
+        const stage_event = if (builtin.os.tag == .windows) "event=destroy " else "event=destroy_stage";
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
             if (std.mem.indexOf(u8, line, "side=core") == null or
@@ -46,9 +50,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
             var others = std.mem.splitScalar(u8, data, '\n');
             while (others.next()) |other| {
                 if (flushId(other) != id or std.mem.indexOf(u8, other, frontend) == null) continue;
-                if (std.mem.indexOf(u8, other, "event=destroy_stage") != null) saw_stage = true;
+                if (std.mem.indexOf(u8, other, stage_event) != null) saw_stage = true;
                 if (std.mem.indexOf(u8, other, "event=end outcome=commit") != null) saw_commit = true;
-                if (std.mem.indexOf(u8, other, "event=destroy_release") != null) saw_release = true;
+                if (builtin.os.tag == .windows or std.mem.indexOf(u8, other, "event=destroy_release") != null) saw_release = true;
             }
             if (saw_stage and saw_commit and saw_release) {
                 std.debug.print("[gui] render_trace: matching core/frontend destruction commit flush={d}\n", .{id});
