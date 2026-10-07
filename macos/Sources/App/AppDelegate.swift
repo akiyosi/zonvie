@@ -494,8 +494,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        // AppKit also hands this process's own command-line arguments here as
+        // documents, including option values such as `--log <path>`. The
+        // command line is already handled at startup, and a Finder open never
+        // arrives through it, so any path it names is not a document.
+        let cwd = FileManager.default.currentDirectoryPath
+        let argPaths = Set(CommandLine.arguments.dropFirst().map {
+            URL(fileURLWithPath: $0, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true)).standardizedFileURL.path
+        })
+        let documents = filenames.filter { filename in
+            if argPaths.contains(URL(fileURLWithPath: filename).standardizedFileURL.path) {
+                ZonvieCore.appLog("zonvie: skipping '\(filename)' - command-line argument")
+                return false
+            }
+            return true
+        }
+
         // Filter out files that don't exist
-        let validFiles = filenames.filter { filename in
+        let validFiles = documents.filter { filename in
             if !FileManager.default.fileExists(atPath: filename) {
                 ZonvieCore.appLog("zonvie: skipping '\(filename)' - file doesn't exist")
                 return false
