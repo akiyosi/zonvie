@@ -20,7 +20,13 @@
 // the row it enters, which is real content change and correctly redraws; with
 // it on this scenario would measure Neovim's highlighting, not the GUI.
 //
-// macOS-only: ExternalGridView is macOS frontend code.
+// Windows logs the same line when no content row was drawn, but it still
+// repaints the cursor's old and new rows from their vertices: that is how it
+// erases the previous cursor. The claim tested there is the weaker "content
+// rows are kept".
+//
+// Blinking is off so a blink toggle, which also keeps every row, cannot make
+// up the count.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -66,7 +72,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const open_mark = try app_log.lineMark(alloc, log_path);
 
     try g.exec(
-        "luaeval('(function() vim.o.cursorline = false vim.o.number = false " ++
+        "luaeval('(function() vim.o.cursorline = false vim.o.number = false vim.o.guicursor = \"a:block-blinkon0\" " ++
             "local b = vim.api.nvim_create_buf(false, true) local l = {} " ++
             "for i = 1, 400 do l[i] = string.format(\"%3d plain line\", i) end " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, false, l) " ++

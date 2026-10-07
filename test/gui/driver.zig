@@ -499,7 +499,7 @@ pub const Gui = struct {
     }
 };
 
-// ── External windows (macOS only: built on platform.windowsForPid) ─────
+// ── External windows (built on platform.windowsForPid) ─────
 
 pub const max_windows = 16;
 

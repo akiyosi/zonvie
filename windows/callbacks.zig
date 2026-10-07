@@ -1360,6 +1360,12 @@ pub fn onGridRowScroll(
 
     ext_win.surf.flush_needs_invalidate = true;
     // InvalidateRect deferred to onFlushEnd for coalescing.
+    // The line macOS logs for an external root's row shift; here it is logged
+    // only once the slots are remapped, since every refusal above aborts.
+    if (applog.isEnabled()) applog.appLog(
+        "[ext_applyRowScroll] gridId={d} rowStart={d} rowEnd={d} rowsDelta={d} isInFlush=true\n",
+        .{ grid_id, row_start, row_end, rows_delta },
+    );
 }
 
 /// Called at the start of each flush cycle (core thread, on_flush_begin callback).
@@ -1962,6 +1968,8 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         font_changed = new_font_generation != prev_font_generation;
         if (applog.isEnabled()) {
             applog.appLog("onGuiFont: applied name='{s}' pt={d} cell=({d},{d})", .{ applied_name, applied_pt, metrics.w_px, metrics.h_px });
+            // The cell size in the field form the GUI driver parses.
+            applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ metrics.w_px, metrics.h_px });
             if (font_changed) {
                 applog.appLog("onGuiFont: font changed (gen {}->{}), invalidating core glyph cache\n", .{ prev_font_generation, new_font_generation });
             }

@@ -748,6 +748,11 @@ fn drawNormalExternalSurfaceRowMode(
     // as the main driver reads it: a frame that only redraws the cursor's two
     // rows leaves the rest sampling the atlas as it was before the upload.
     ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0;
+    // macOS's line for a frame that keeps every content row. Here the cursor's
+    // two rows are still repainted from their vertices, below.
+    if (!ext_win.paint_drew_root_rows and !force_full_rows and applog.isVerbose()) {
+        applog.appLog("[render_trace] side=windows event=retained_content_reuse surface={d} root_row_draws=0\n", .{grid_id});
+    }
     render_pipeline_helpers.insertCursorEraseRows(
         app.alloc,
         rows_to_draw,
@@ -1809,6 +1814,8 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     if (applog.isEnabled()) applog.appLog("[win] created external window hwnd={*} for grid_id={d}\n", .{ hwnd, req.grid_id });
+    // The same line macOS logs, so the GUI driver finds the grid on both.
+    if (!is_special_window and applog.isEnabled()) applog.appLog("[external_window] open gridId={d} win={d} rows={d} cols={d}\n", .{ req.grid_id, req.win, req.rows, req.cols });
 
     // For cmdline window: if there's a confirm/prompt dialog visible, put message BELOW cmdline
     // This is needed because confirm dialog is shown before cmdline window is created

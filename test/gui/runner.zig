@@ -268,14 +268,11 @@ test "gui:visual_cmdline_cursor_animation" {
 }
 
 test "gui:visual_continuous_j_scroll_matches_jump" {
-    // macOS only: counts the macOS frontend's [layer_row_scroll] line.
-    try gated(is_macos, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_extwin_continuous_j_scroll_matches_jump" {
-    // macOS only: it drives the macOS external-window surface and reads that
-    // frontend's [ext_applyRowScroll] line.
-    try gated(is_macos, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_incremental_scroll_matches_jump" {
@@ -295,22 +292,18 @@ test "gui:visual_float_over_scrolled_split" {
 }
 
 test "gui:visual_extfloat_over_scrolled_anchor" {
-    // macOS only: enumerates the app's OS windows to find the external one
-    // and captures that window rather than the main one.
-    try gated(is_macos, @import("scenarios/visual/extfloat_over_scrolled_anchor.zig"));
+    try gated(can_capture, @import("scenarios/visual/extfloat_over_scrolled_anchor.zig"));
 }
 
 test "gui:visual_extfloat_opaque_partial" {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime can_capture) {
         try requirePrereqs();
         try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").runOpaque(testing.allocator);
     } else return error.SkipZigTest;
 }
 
 test "gui:visual_extfloat_over_born_external_anchor" {
-    // macOS only: enumerates the app's OS windows to find the external one
-    // and captures that window rather than the main one.
-    try gated(is_macos, @import("scenarios/visual/extfloat_over_born_external_anchor.zig"));
+    try gated(can_capture, @import("scenarios/visual/extfloat_over_born_external_anchor.zig"));
 }
 
 test "gui:visual_scrollbind_layers_blit_matches_jump" {
@@ -322,8 +315,7 @@ test "gui:visual_proportional_font_support" {
 }
 
 test "gui:visual_shader_covers_all_grids" {
-    // macOS only: reads the macOS frontend's [resizeExternalWindows] line.
-    try gated(is_macos, @import("scenarios/visual/shader_covers_all_grids.zig"));
+    try gated(can_capture, @import("scenarios/visual/shader_covers_all_grids.zig"));
 }
 
 test "gui:cmdline_cursor_shader_rect" {
@@ -380,13 +372,11 @@ test "gui:extwin_hosted_float_phantom_hit" {
 }
 
 test "gui:extwin_cursor_move_reuses_rows" {
-    // macOS only: ExternalGridView is macOS frontend code.
-    try gated(is_macos, @import("scenarios/macos/extwin_cursor_move_reuses_rows.zig"));
+    try gated(true, @import("scenarios/common/extwin_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_hosted_layer_row_gating" {
-    // macOS only: ExternalGridView is macOS frontend code.
-    try gated(is_macos, @import("scenarios/macos/extwin_hosted_layer_row_gating.zig"));
+    try gated(true, @import("scenarios/common/extwin_hosted_layer_row_gating.zig"));
 }
 
 test "gui:extwin_blink_without_cursor_skips" {
@@ -400,9 +390,7 @@ test "gui:cmdline_does_not_stall_extwin" {
 }
 
 test "gui:visual_extwin_split_with_float_background" {
-    // macOS only: it enumerates the app's OS windows to capture the external
-    // one.
-    try gated(is_macos and can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
+    try gated(can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {
@@ -412,9 +400,7 @@ test "gui:visual_hosted_float_scroll_band" {
 }
 
 test "gui:visual_extwin_hosted_layer_glow" {
-    // macOS only: it enumerates the app's OS windows and captures a
-    // non-main one, and the bloom path under test is macOS frontend code.
-    try gated(is_macos and can_capture, @import("scenarios/visual/extwin_hosted_layer_glow.zig"));
+    try gated(can_capture, @import("scenarios/visual/extwin_hosted_layer_glow.zig"));
 }
 
 test "gui:main_float_mouse_disabled_scroll" {
@@ -439,18 +425,15 @@ test "gui:extwin_animated_shader_reuses_rows" {
 }
 
 test "gui:main_idle_while_extwin_updates" {
-    // macOS only: GridSurfaceRenderer is macOS frontend code.
-    try gated(is_macos, @import("scenarios/macos/main_idle_while_extwin_updates.zig"));
+    try gated(true, @import("scenarios/common/main_idle_while_extwin_updates.zig"));
 }
 
 test "gui:main_cursor_move_reuses_rows" {
-    // macOS only: GridSurfaceRenderer is macOS frontend code.
-    try gated(is_macos, @import("scenarios/macos/main_cursor_move_reuses_rows.zig"));
+    try gated(true, @import("scenarios/common/main_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_float_follows_externalized_anchor" {
-    // macOS only: external windows and their surface plumbing are frontend code.
-    try gated(is_macos, @import("scenarios/macos/extwin_float_follows_externalized_anchor.zig"));
+    try gated(true, @import("scenarios/common/extwin_float_follows_externalized_anchor.zig"));
 }
 
 test "gui:extwin_float_wheel_scroll" {

@@ -122,6 +122,58 @@ pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
     return ctx.found;
 }
 
+/// A window and its bounds. `number` is the HWND value: USER handles are
+/// 32-bit significant on 64-bit Windows, so it round-trips through
+/// `handleOf`.
+pub const MainWindow = struct { number: u32, bounds: Bounds };
+
+pub fn handleOf(number: u32) W.HWND {
+    return @ptrFromInt(@as(usize, number));
+}
+
+fn windowOf(hwnd: W.HWND) ?MainWindow {
+    var r: RECT = undefined;
+    if (GetWindowRect(hwnd, &r) == 0) return null;
+    return .{
+        .number = @truncate(@intFromPtr(hwnd)),
+        .bounds = .{
+            .x = @floatFromInt(r.left),
+            .y = @floatFromInt(r.top),
+            .w = @floatFromInt(r.right - r.left),
+            .h = @floatFromInt(r.bottom - r.top),
+        },
+    };
+}
+
+const ListCtx = struct { pid: W.DWORD, out: []MainWindow, len: usize = 0 };
+
+fn listCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
+    const ctx: *ListCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    if (ctx.len == ctx.out.len) return 0;
+    var wpid: W.DWORD = 0;
+    _ = GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != ctx.pid) return 1;
+    if (IsWindowVisible(hwnd) == 0) return 1;
+    var buf: [64]u16 = undefined;
+    if (!isZonvieClass(classOf(hwnd, &buf))) return 1;
+    ctx.out[ctx.len] = windowOf(hwnd) orelse return 1;
+    ctx.len += 1;
+    return 1;
+}
+
+/// Fill `out` with the app's visible Zonvie windows (main, external grids,
+/// cmdline and message popups), front to back: EnumWindows walks top-level
+/// windows in z-order.
+pub fn windowsForPid(pid: i32, out: []MainWindow) usize {
+    var ctx = ListCtx{ .pid = @intCast(pid), .out = out };
+    _ = EnumWindows(listCb, @bitCast(@intFromPtr(&ctx)));
+    return ctx.len;
+}
+
+pub fn mainWindowForPid(pid: i32) ?MainWindow {
+    return windowOf(mainWindowHandleForPid(pid) orelse return null);
+}
+
 const HandleCtx = struct { pid: W.DWORD, found: ?W.HWND = null };
 
 fn handleCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {

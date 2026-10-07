@@ -4146,6 +4146,12 @@ pub fn drawSurfaceLayers(
             "[layer_draw] gridId={d} rows={d} of={d} blit={d} failed={d}\n",
             .{ layer.grid_id, encoded, row_limit, @as(u32, @intFromBool(band_drawn)), failed_rows },
         );
+        // A layer an external window hosts gets macOS's line for it too;
+        // layers[0] is the surface's root.
+        if (log_enabled and layers[0].grid_id != 1) applog.appLog(
+            "[ext_layer_draw] surface={d} gridId={d} rows={d} of={d}\n",
+            .{ layers[0].grid_id, layer.grid_id, encoded, row_limit },
+        );
     }
     // Restore the surface's own pixel space for whatever draws next.
     g.setLayerTransform(0, 0, base_vp.w, base_vp.h) catch {

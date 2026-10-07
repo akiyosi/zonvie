@@ -25,9 +25,13 @@
 // verdict, and the frame ran the whole main pass. Counted as cursor-only
 // frames drawn less the main passes they logged skipping.
 //
-// macOS-only: GridSurfaceRenderer is macOS frontend code.
+// Windows has no idle gate to trace: it paints the main window only when a
+// flush invalidates it. So there the first phase counts main frames outright,
+// and the second counts main frames whose editor layer encoded more than the
+// cursor's two rows, which is the whole pass a cursor-only frame must not run.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
@@ -66,6 +70,34 @@ fn cursorOnlyMainPasses(alloc: std.mem.Allocator, since_ms: f64) !usize {
     std.debug.print("[gui] cursor-only main frames: {d}; main passes skipped: {d}\n", .{ drawn, skipped });
     if (drawn == 0) return error.NoCursorOnlyFrame;
     return drawn -| skipped;
+}
+
+/// Windows: main frames since since_ms, and frames any other surface drew.
+fn windowsFrames(alloc: std.mem.Allocator, since_ms: f64) !struct { main: usize, external: usize } {
+    const lines = try app_log.linesSince(alloc, log_path, "[trace] event=frame_done surface=", since_ms);
+    defer alloc.free(lines);
+    var main: usize = 0;
+    var external: usize = 0;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        const surface = app_log.field(line, "surface") orelse continue;
+        if (surface == 1) main += 1 else external += 1;
+    }
+    return .{ .main = main, .external = external };
+}
+
+/// Windows: layer draws since since_ms that encoded more than the cursor's
+/// old and new rows.
+fn windowsWholeLayerDraws(alloc: std.mem.Allocator, since_ms: f64) !usize {
+    const lines = try app_log.linesSince(alloc, log_path, "[layer_draw] gridId=", since_ms);
+    defer alloc.free(lines);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        const rows = app_log.field(line, "rows") orelse continue;
+        if (rows > 2) n += 1;
+    }
+    return n;
 }
 
 /// Frames any external surface drew.
@@ -120,8 +152,16 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
     gui_io.sleepNs(400 * std.time.ns_per_ms);
 
-    const empty = try emptyCommitFrames(alloc, t0);
-    const ext_draws = try externalDraws(alloc, t0);
+    var empty: usize = undefined;
+    var ext_draws: usize = undefined;
+    if (builtin.os.tag == .windows) {
+        const f = try windowsFrames(alloc, t0);
+        empty = f.main;
+        ext_draws = f.external;
+    } else {
+        empty = try emptyCommitFrames(alloc, t0);
+        ext_draws = try externalDraws(alloc, t0);
+    }
     std.debug.print(
         "[gui] main frames drawn for an empty commit: {d}; external frames drawn: {d}\n",
         .{ empty, ext_draws },
@@ -149,7 +189,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
     gui_io.sleepNs(400 * std.time.ns_per_ms);
 
-    const passes = try cursorOnlyMainPasses(alloc, t1);
+    const passes = if (builtin.os.tag == .windows) blk: {
+        if ((try windowsFrames(alloc, t1)).main == 0) return error.NoCursorOnlyFrame;
+        break :blk try windowsWholeLayerDraws(alloc, t1);
+    } else try cursorOnlyMainPasses(alloc, t1);
     std.debug.print("[gui] cursor-only main frames that ran the main pass: {d}\n", .{passes});
     if (passes != 0) return error.MainPassForCursorOnlyFrame;
 }

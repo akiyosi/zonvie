@@ -20,16 +20,16 @@
 // float to the editor, the float belongs on the main window by protocol and no
 // GUI can do otherwise — that outcome is reported distinctly from a GUI-side
 // failure to follow the anchor.
-//
-// macOS-only: external windows and their surface plumbing are frontend code.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_extwin_float_follows_anchor.log";
+const trace_side = if (builtin.os.tag == .windows) "side=windows" else "side=macos";
 
 /// The last layer count `side` published for `surface` since `since_ms`.
 fn lastLayerCount(
@@ -102,7 +102,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.debug.print("[gui] the float was given a window of its own before the move\n", .{});
         return error.FloatGotItsOwnWindow;
     }
-    const main_layers_before = try waitLayerCount(alloc, 1, "side=macos", 0, 10_000);
+    const main_layers_before = try waitLayerCount(alloc, 1, trace_side, 0, 10_000);
 
     // The move under test.
     const t0 = try app_log.nowMs(alloc, log_path);
@@ -121,8 +121,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const ext_grid = try app_log.externalWindowGrid(alloc, log_path, t0);
 
-    const ext_layers = try waitLayerCount(alloc, ext_grid, "side=macos", t0, 10_000);
-    const main_layers_after = try waitLayerCount(alloc, 1, "side=macos", t0, 10_000);
+    const ext_layers = try waitLayerCount(alloc, ext_grid, trace_side, t0, 10_000);
+    const main_layers_after = try waitLayerCount(alloc, 1, trace_side, t0, 10_000);
 
     std.debug.print(
         "[gui] ext grid {d}: layers={d:.0}; main surface layers {d:.0} -> {d:.0}; " ++

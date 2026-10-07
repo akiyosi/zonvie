@@ -14,6 +14,7 @@
 // processed, and a green vertical band at iCurrentCursor.x.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
@@ -156,7 +157,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // The cell width the app is actually laying out with, which turns a
     // window's screen column into the x the band must land on.
     const cell_w = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+        // macOS logs the cell size when it resizes external windows to it;
+        // Windows when it applies a font.
+        const metrics_marker = if (builtin.os.tag == .windows) "[cell_metrics]" else "[resizeExternalWindows]";
+        const line = (try app_log.lastLineSince(alloc, log_path, metrics_marker, 0)) orelse
             return error.CellMetricsUnknown;
         defer alloc.free(line);
         break :blk app_log.field(line, "cellW") orelse return error.CellMetricsUnknown;

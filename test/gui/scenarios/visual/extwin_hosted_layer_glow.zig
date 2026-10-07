@@ -43,9 +43,6 @@
 //
 // Relational — the same screen with glow off and glow on — so it needs no
 // golden and is immune to per-host font and DPI drift.
-//
-// macOS-only: it enumerates the app's OS windows to find the external one and
-// captures that window rather than the main one.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -83,8 +80,8 @@ const blank_band_max = 0.01;
 
 /// A band of the captured window covering `row0..row0+count` of the float,
 /// as a fraction of the capture. The float sits `float_row0` rows down the
-/// external grid, and the capture includes the title bar, so the row height
-/// comes out slightly HIGH — which shrinks the bands rather than letting them
+/// external grid, and the macOS capture includes the title bar (the Windows
+/// one is the client area alone), so the row height comes out slightly HIGH — which shrinks the bands rather than letting them
 /// reach into each other.
 ///
 /// Horizontally the band is the float's columns only: the overlay scrollbar

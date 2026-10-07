@@ -24,7 +24,8 @@
 // three scenarios parse that one by field name and would silently skip a
 // line shaped differently. See logHostedLayerDraw's doc comment.
 //
-// macOS-only: ExternalGridView is macOS frontend code.
+// Windows draws a layer's rows from a per-layer bitset, so it cannot encode
+// one twice by construction; there the scenario guards that construction.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

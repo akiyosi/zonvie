@@ -2,7 +2,7 @@
 // redraw anything, the way the same move does not redraw an external window's
 // rows.
 //
-// The twin of scenarios/macos/extwin_cursor_move_reuses_rows.zig, and the
+// The twin of scenarios/common/extwin_cursor_move_reuses_rows.zig, and the
 // reason it is a pair: the two surfaces used to reach the same picture by
 // different routes. `ExternalGridView` recognises a cursor-only commit and
 // reuses the surface. The main surface marked the cursor's ROOT row dirty from
@@ -22,9 +22,14 @@
 // the row the cursor leaves and the row it enters, which is real content change
 // and correctly redraws.
 //
-// macOS-only: GridSurfaceRenderer is macOS frontend code.
+// Windows has no skip-the-pass frame: it erases the previous cursor by
+// repainting the cursor's old and new rows from their vertices. Under
+// ext_multigrid the editor window is a layer, so its [layer_draw] line says
+// how many of its rows a frame encoded, and a reused frame there is one that
+// encoded at most those two.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 const app_log = @import("../../app_log.zig");
@@ -42,6 +47,24 @@ const key_gap_ms = 120;
 const min_reuse_frames = 3;
 
 const marker = "[draw] skipMainPass=true (noop";
+
+/// The cursor's old row and its new one.
+const cursor_rows = 2;
+
+/// Windows: frames whose editor-layer draw encoded no more than the cursor's
+/// rows, out of a layer taller than that.
+fn windowsReuseFrames(alloc: std.mem.Allocator, since_ms: f64) !usize {
+    const lines = try app_log.linesSince(alloc, log_path, "[layer_draw] gridId=", since_ms);
+    defer alloc.free(lines);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        const rows = app_log.field(line, "rows") orelse continue;
+        const of = app_log.field(line, "of") orelse continue;
+        if (of > cursor_rows and rows <= cursor_rows) n += 1;
+    }
+    return n;
+}
 
 pub fn run(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
@@ -80,7 +103,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const row_after = try g.evalInt("line('.')");
     const topline_after = try g.evalInt("line('w0')");
-    const frames = try app_log.countLinesSince(alloc, log_path, marker, t0);
+    const frames = if (builtin.os.tag == .windows)
+        try windowsReuseFrames(alloc, t0)
+    else
+        try app_log.countLinesSince(alloc, log_path, marker, t0);
 
     std.debug.print(
         "[gui] main cursor: row {d} -> {d}, topline {d} -> {d}, reuse frames={d}\n",

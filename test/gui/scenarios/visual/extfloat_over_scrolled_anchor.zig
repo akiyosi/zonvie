@@ -29,11 +29,9 @@
 // Sabotaged by aiming the jump 3 rows off, it reports 0.2719 against a 0.0002
 // threshold and the heatmap prints the float's own rectangle, so the float's
 // pixels are inside what the comparison sees.
-//
-// macOS-only: it enumerates the app's OS windows to find the external one and
-// captures that window rather than the main one.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const capture = driver.capture;
@@ -335,6 +333,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
         .{},
     );
     if (std.mem.endsWith(u8, config_dir, "config_hosted_opaque")) {
+        const t_partial = try app_log.nowMs(alloc, log_path);
         try g.exec("luaeval('(function() vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(_G.z_float), 1, 2, false, {\"CHANGED HOSTED ROW\"}) return 1 end)()')");
         var partial = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer partial.deinit(alloc);
@@ -343,11 +342,21 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
         var full = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer full.deinit(alloc);
         try visual.assertRegionUnchanged(alloc, "hosted_partial_matches_full", full, partial, region, .{});
-        const partial_lines = try app_log.linesSince(alloc, log_path, "event=hosted_partial", 0);
+        // macOS names the partial recompose; Windows draws hosted layers from
+        // their own damage, so there a hosted draw of some but not all of the
+        // layer's rows is the same claim.
+        const partial_marker = if (builtin.os.tag == .windows) "[ext_layer_draw] surface=" else "event=hosted_partial";
+        const partial_lines = try app_log.linesSince(alloc, log_path, partial_marker, t_partial);
         defer alloc.free(partial_lines);
         var saw_partial_band = false;
         var partial_it = std.mem.splitScalar(u8, partial_lines, '\n');
         while (partial_it.next()) |line| {
+            if (builtin.os.tag == .windows) {
+                const rows = app_log.field(line, "rows") orelse continue;
+                const of = app_log.field(line, "of") orelse continue;
+                if (rows > 0 and rows < of) saw_partial_band = true;
+                continue;
+            }
             const rows = app_log.field(line, "dirty_rows") orelse continue;
             if (rows > 0 and rows < @as(f64, @floatFromInt(a_height))) saw_partial_band = true;
         }

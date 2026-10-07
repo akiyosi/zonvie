@@ -14,8 +14,6 @@
 // so with a float the window was never given one and stayed black. Full
 // opacity keeps the captured colour meaningful; the default fixture's 0.5
 // would show the desktop through a correct window too.
-//
-// macOS-only: it enumerates the app's OS windows to capture the external one.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

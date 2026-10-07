@@ -34,9 +34,6 @@
 // control route, -1 on the suspect route, and the -1 must stay, since
 // `zonvie_core_is_float_external` reads it) and asserts the same property
 // against the anchor's dirty set.
-//
-// macOS-only: it enumerates the app's OS windows to find the external one and
-// captures that window rather than the main one.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
