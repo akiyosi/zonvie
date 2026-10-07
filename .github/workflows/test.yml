@@ -172,9 +172,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gui-test-windows
+          # The exe and its PDB symbolize the raw addresses a panic logs.
           path: |
             tmp/
             test/gui/golden/windows/
+            windows/zig-out/zonvie.exe
+            windows/zig-out/zonvie.pdb
           if-no-files-found: ignore
           retention-days: 7
 
