@@ -427,12 +427,17 @@ pub const ShelfPacker = struct {
         return self.shelves[index].recycled and self.shelves[index].x == 1;
     }
 
-    /// Unused atlas area in pixels: the bump frontier plus what reclaimed
-    /// shelves still have to the right of their reuse cursor.
+    /// Unused atlas area in pixels: the rows below the open shelf, the open
+    /// shelf to the right of the bump cursor, and what reclaimed shelves still
+    /// have to the right of their reuse cursor.
     pub fn freeAreaPx(self: *const ShelfPacker) u64 {
         var free: u64 = 0;
-        if (self.height > self.next_y) {
-            free += @as(u64, self.height - self.next_y) * self.width;
+        const open_end = self.next_y + self.row_h;
+        if (self.height > open_end) {
+            free += @as(u64, self.height - open_end) * self.width;
+        }
+        if (self.width > self.next_x) {
+            free += @as(u64, self.width - self.next_x) * self.row_h;
         }
         var i: u32 = 0;
         while (i < self.shelf_count) : (i += 1) {
@@ -673,6 +678,17 @@ test "a band closed with the shelf table full joins the shelf above it and is re
     try std.testing.expectEqual(@as(u32, 1), p.recycleDeadShelves(&live));
     try std.testing.expect(p.shelves[last].recycled);
     try std.testing.expectEqual(@as(u32, last), p.shelfIndexForY(band_y + band_h - 1).?);
+}
+
+test "freeAreaPx counts the open shelf's right remainder and not its filled part" {
+    var p = ShelfPacker.init(64, 100);
+    const r = p.alloc(8, 8).?; // packed 10x10 at (1,1)
+    try std.testing.expectEqual(@as(u32, 10), r.w);
+    // Below the open shelf: rows 11..100 across the full width. Inside it:
+    // columns 11..64 of its 10 rows.
+    const below: u64 = (100 - 11) * 64;
+    const open_rest: u64 = (64 - 11) * 10;
+    try std.testing.expectEqual(below + open_rest, p.freeAreaPx());
 }
 
 test "a glyph exactly as wide as the atlas still lands on the first row" {

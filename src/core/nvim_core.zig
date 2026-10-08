@@ -51,6 +51,31 @@ pub const GlyphCacheProbe = struct {
     insert: usize,
 };
 
+pub const AtlasFullState = struct {
+    atlas_w: u32,
+    atlas_h: u32,
+    resets_this_flush: u8,
+    has_capacity_negative: bool,
+    negative_recovery_armed: bool,
+};
+
+pub const AtlasFullAction = enum { grow, reset_same_size, negative };
+
+/// What to do when a glyph does not fit even after reclamation. A full atlas
+/// grows geometrically up to the frontend-safe maximum. At the maximum, one
+/// same-size reset per flush is allowed for a fresh capacity observation or an
+/// armed delayed recovery. Once a capacity miss is negative-cached, ordinary
+/// flushes wait for that episode's deadline instead of recreating the texture
+/// for every new glyph; if an allowed repack also fills, later misses in the
+/// flush become negative entries and the row retry converges.
+pub fn atlasFullAction(s: AtlasFullState) AtlasFullAction {
+    if (s.atlas_w < config.atlas_size_max or s.atlas_h < config.atlas_size_max) return .grow;
+    if (s.resets_this_flush == 0 and (!s.has_capacity_negative or s.negative_recovery_armed)) {
+        return .reset_same_size;
+    }
+    return .negative;
+}
+
 pub const GlyphCacheSlotKey = struct {
     key: u64,
     hash: u32,
@@ -2643,37 +2668,32 @@ pub const Core = struct {
             rect = packer.alloc(bm.width, bm.height);
         }
 
-        // A full atlas grows geometrically up to the configured/frontend-safe
-        // maximum. At the maximum, permit one same-size reset for a fresh
-        // capacity observation or an armed delayed recovery. Once a capacity
-        // miss is negative-cached, ordinary flushes must wait for that
-        // episode's deadline instead of recreating the texture for every new
-        // glyph edit. If an allowed repack also fills, subsequent misses in
-        // this flush become negative entries and the row retry converges.
-        if (rect == null and
-            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
-        {
-            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
-            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
-            self.atlas_reset_during_flush = true;
-            self.perf_atlas_full_reset_count +%= 1;
-            self.resetCoreAtlas();
-            if (self.flush_aborted) return null;
-            packer = &(self.atlas_packer.?);
-            alloc_reset_seq = self.atlas_reset_seq;
-            rect = packer.alloc(bm.width, bm.height);
-        } else if (rect == null and
-            self.atlas_full_resets_this_flush == 0 and
-            (!self.atlas_has_capacity_negative or self.atlas_negative_recovery_armed))
-        {
-            self.atlas_full_resets_this_flush = 1;
-            self.atlas_reset_during_flush = true;
-            self.perf_atlas_full_reset_count +%= 1;
-            self.resetCoreAtlas();
-            if (self.flush_aborted) return null;
-            packer = &(self.atlas_packer.?);
-            alloc_reset_seq = self.atlas_reset_seq;
-            rect = packer.alloc(bm.width, bm.height);
+        if (rect == null) {
+            const action = atlasFullAction(.{
+                .atlas_w = self.atlas_w,
+                .atlas_h = self.atlas_h,
+                .resets_this_flush = self.atlas_full_resets_this_flush,
+                .has_capacity_negative = self.atlas_has_capacity_negative,
+                .negative_recovery_armed = self.atlas_negative_recovery_armed,
+            });
+            switch (action) {
+                .grow, .reset_same_size => {
+                    if (action == .grow) {
+                        self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+                        self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
+                    } else {
+                        self.atlas_full_resets_this_flush = 1;
+                    }
+                    self.atlas_reset_during_flush = true;
+                    self.perf_atlas_full_reset_count +%= 1;
+                    self.resetCoreAtlas();
+                    if (self.flush_aborted) return null;
+                    packer = &(self.atlas_packer.?);
+                    alloc_reset_seq = self.atlas_reset_seq;
+                    rect = packer.alloc(bm.width, bm.height);
+                },
+                .negative => {},
+            }
         }
         if (rect == null) {
             self.recordAtlasCapacityNegative();
@@ -6082,6 +6102,53 @@ test "glyph cache two-choice probe preserves a primary collision" {
 
     try std.testing.expectEqual(probe_a.insert, glyphCacheProbe(&keys, key_a, hash).hit.?);
     try std.testing.expectEqual(probe_b.insert, glyphCacheProbe(&keys, key_b, hash).hit.?);
+}
+
+test "a full atlas grows below the maximum, resets once at it, then negative-caches" {
+    const max = config.atlas_size_max;
+    const base: AtlasFullState = .{
+        .atlas_w = max,
+        .atlas_h = max,
+        .resets_this_flush = 0,
+        .has_capacity_negative = false,
+        .negative_recovery_armed = false,
+    };
+    const Case = struct { s: AtlasFullState, want: AtlasFullAction };
+    const cases = [_]Case{
+        // Either dimension below the maximum grows, whatever else holds.
+        .{ .s = blk: {
+            var s = base;
+            s.atlas_w = max / 2;
+            s.resets_this_flush = 1;
+            s.has_capacity_negative = true;
+            break :blk s;
+        }, .want = .grow },
+        .{ .s = blk: {
+            var s = base;
+            s.atlas_h = max / 2;
+            break :blk s;
+        }, .want = .grow },
+        // At the maximum: a fresh observation earns one reset per flush.
+        .{ .s = base, .want = .reset_same_size },
+        .{ .s = blk: {
+            var s = base;
+            s.resets_this_flush = 1;
+            break :blk s;
+        }, .want = .negative },
+        // A negative-cached miss waits for its deadline, unless recovery is armed.
+        .{ .s = blk: {
+            var s = base;
+            s.has_capacity_negative = true;
+            break :blk s;
+        }, .want = .negative },
+        .{ .s = blk: {
+            var s = base;
+            s.has_capacity_negative = true;
+            s.negative_recovery_armed = true;
+            break :blk s;
+        }, .want = .reset_same_size },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, atlasFullAction(c.s));
 }
 
 test "glyph cache slot keys separate every style of a code and never equal the empty key" {

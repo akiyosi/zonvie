@@ -2308,6 +2308,7 @@ pub fn handleRedraw(
             },
             .mode_change => {
                 // ["mode_change", mode, mode_idx]
+                var mode_applied = false;
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
@@ -2319,6 +2320,7 @@ pub fn handleRedraw(
                     const idx = std.math.cast(usize, idx64) orelse continue;
 
                     grid.current_mode_idx = idx;
+                    mode_applied = true;
 
                     applyModeInfo(grid, idx);
 
@@ -2365,9 +2367,12 @@ pub fn handleRedraw(
                         }
                     }
                 }
-                // Request IME off on any mode change (config check done by nvim_core)
-                grid.ime_off_requested = true;
-                grid.cursor_rev +%= 1;
+                // Request IME off on any mode change (config check done by nvim_core).
+                // A batch with no well-formed tuple changed no mode.
+                if (mode_applied) {
+                    grid.ime_off_requested = true;
+                    grid.cursor_rev +%= 1;
+                }
             },
             .busy_start => {
                 grid.cursor_visible = false;
@@ -3576,6 +3581,28 @@ fn testModeChange(arena: std.mem.Allocator, mode: []const u8) ![]mp.Value {
     t[0] = .{ .str = mode };
     t[1] = .{ .int = 0 };
     return testEvent(arena, "mode_change", t);
+}
+
+test "a mode_change with no well-formed tuple neither requests IME off nor bumps the cursor" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const bad = try arena.alloc(mp.Value, 2);
+    bad[0] = .{ .str = "insert" };
+    bad[1] = .{ .str = "not an index" };
+    const rev = grid.cursor_rev;
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_change", bad));
+    try std.testing.expect(!grid.ime_off_requested);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "insert"));
+    try std.testing.expect(grid.ime_off_requested);
+    try std.testing.expect(grid.cursor_rev != rev);
 }
 
 test "mode_info_set keeps at most max_mode_infos entries of an oversized table" {
