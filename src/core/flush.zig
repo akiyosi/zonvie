@@ -14,6 +14,7 @@
 // order require updates to both consumers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
@@ -479,6 +480,7 @@ fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
 /// Postcondition: core.vertex_budget_transaction_active = false after this function.
 fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) void {
     if (!core.vertex_budget_transaction_active) return;
+    defer assertIntegrity(core);
 
     // A refusal leaves the glyph mirrors describing a frame that never reached
     // the screen, and atlas reclamation reads them.
@@ -527,6 +529,46 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
     // Clear touched surfaces for all paths (success and abort)
     clearTouchedVertexBudgetSurfaces(core);
     core.vertex_budget_transaction_active = false;
+}
+
+/// Debug-only check, at the end of every vertex budget transaction, of the
+/// bookkeeping a flush leaves behind:
+///   - vertex budget: a valid row ledger sums to its surface count, the
+///     sub-grid total and the aggregate match the surfaces they sum;
+///   - glyph mirror: a mirror's valid bits cover exactly its rows, and every
+///     recorded UV row coordinate lies inside the atlas;
+///   - atlas: the packer matches the atlas size and its own invariants.
+fn assertIntegrity(core: *const Core) void {
+    if (builtin.mode != .Debug) return;
+    assertLedgerIntegrity(&core.grid.main_buf);
+    var subgrid_total: usize = 0;
+    var sg_it = core.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| {
+        assertLedgerIntegrity(sg);
+        subgrid_total += sg.surface_vertex_count;
+    }
+    std.debug.assert(core.grid.subgrid_surface_vertex_count == subgrid_total);
+    std.debug.assert(core.flush_vertex_count_aggregate == core.grid.main_buf.surface_vertex_count + subgrid_total);
+
+    var mirror_it = core.glyph_mirror.valueIterator();
+    while (mirror_it.next()) |m| {
+        std.debug.assert(m.valid.bit_length == 0 or m.valid.bit_length == m.rows.items.len);
+        for (m.rows.items) |row| {
+            for (row.items) |v| std.debug.assert(v >= 0 and v <= 1);
+        }
+    }
+
+    if (core.atlas_packer) |*packer| {
+        std.debug.assert(packer.width == core.atlas_w and packer.height == core.atlas_h);
+        packer.assertIntegrity();
+    }
+}
+
+fn assertLedgerIntegrity(buf: *const grid_mod.GridBuf) void {
+    if (!buf.vertex_row_ledger_valid) return;
+    var sum: usize = 0;
+    for (buf.vertex_row_counts) |n| sum += n;
+    std.debug.assert(sum == buf.surface_vertex_count);
 }
 
 /// Reset one grid's row ledger before it is written again. Only a sub-grid
@@ -2466,9 +2508,9 @@ pub fn generateRowVertices(
                                 break :gid_blk false;
                             }
                             if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const key = (@as(u64, gid) << 2) | @as(u64, style_index);
-                                const hash_val = (gid *% 2654435761) ^ style_index;
-                                const probe = nvim_core.glyphCacheProbe(glyph_keys_id.?, key, hash_val);
+                                const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                                const key = slot_key.key;
+                                const probe = nvim_core.glyphCacheProbe(glyph_keys_id.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
                                     ge = glyph_cache_id.?[hit_idx];
                                     break :gid_blk true;
@@ -2793,9 +2835,9 @@ pub fn generateRowVertices(
                                 }
                             }
                             if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const key = (@as(u64, scalar) << 2) | @as(u64, style_index);
-                                const hash_val = (scalar *% 2654435761) ^ style_index;
-                                const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, key, hash_val);
+                                const slot_key = nvim_core.glyphCacheSlotKey(scalar, style_index);
+                                const key = slot_key.key;
+                                const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
                                     ge = glyph_cache_non_ascii.?[hit_idx];
                                     break :blk true;
@@ -7494,8 +7536,7 @@ pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, co
 /// Overflow extras are folded into the key so different ZWJ sequences with the same
 /// first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct cache entries.
 pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u64 {
-    // Start with base key: scalar + style
-    var key: u64 = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
+    var key: u64 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).key;
     // Fold in overflow codepoints. Rotate between folds so the key depends
     // on extras ORDER, not just their multiset -- plain XOR-fold alone is
     // commutative, so two different-order sequences of the same codepoints
@@ -7513,7 +7554,7 @@ pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u
 
 /// Build a cache hash index for a cell's full cluster.
 fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u32 {
-    var h: u32 = (first_scalar *% 2654435761) ^ style_index;
+    var h: u32 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).hash;
     if (overflow) |extras| {
         for (extras) |cp| {
             h ^= cp *% 2246822519;
@@ -7621,9 +7662,9 @@ fn ensureCachedPhase2Glyph(
                     if (core.glyph_keys_by_id) |keys| {
                         if (cache.len != 0 and cache.len == keys.len) {
                             const gid = glyph_ids[0];
-                            const key = (@as(u64, gid) << 2) | @as(u64, style_index);
-                            const hash = (gid *% 2654435761) ^ style_index;
-                            const probe = nvim_core.glyphCacheProbe(keys, key, hash);
+                            const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                            const key = slot_key.key;
+                            const probe = nvim_core.glyphCacheProbe(keys, key, slot_key.hash);
                             if (probe.hit) |hit| {
                                 resolved = cache[hit];
                             } else if (core.ensureGlyphByID(gid, style_flags)) |entry| {
@@ -8642,14 +8683,17 @@ test "zero-sized main still commits external grid transaction" {
     // retry publishes the same transition and only then consumes it.
     try core.grid.resize(2, 2);
     try core.grid.resize(2, 0);
+    // The committed frame's 12 vertices belong to rows a 2x0 grid no longer
+    // has, so its ledger cannot itemize them.
     core.grid.main_buf.surface_vertex_count = 12;
+    core.grid.main_buf.vertex_row_ledger_valid = false;
     core.flush_vertex_count_aggregate = 12;
     state.abort_main_layout = true;
     try flush_ctx.onFlush(2, 0);
     try std.testing.expect(core.grid.main_buf.dirty_all);
     // A publication refusal leaves the committed frame on screen, so the
-    // accounting that described it survives instead of being invalidated.
-    try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
+    // accounting that described it survives instead of being zeroed.
+    try std.testing.expect(!core.grid.main_buf.vertex_row_ledger_valid);
     try std.testing.expectEqual(@as(usize, 12), core.grid.main_buf.surface_vertex_count);
 
     state.abort_main_layout = false;
@@ -8812,7 +8856,7 @@ test "vertex budget permits aggregate redistribution across external surfaces" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try core.grid.resize(2, 80);
-    @memset(core.grid.main_buf.vertex_row_counts, MAX_VERTICES_PER_CALLBACK);
+    core.grid.main_buf.vertex_row_counts[0] = MAX_VERTICES_PER_SURFACE;
     core.grid.main_buf.surface_vertex_count = MAX_VERTICES_PER_SURFACE;
 
     try core.grid.resizeGrid(2, 1, 1);
@@ -8820,7 +8864,7 @@ test "vertex budget permits aggregate redistribution across external surfaces" {
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
     try core.grid.putSyntheticExternal(3, .{ .win = 3, .start_row = 0, .start_col = 0 });
     const source = core.grid.sub_grids.getPtr(3).?;
-    @memset(source.vertex_row_counts, MAX_VERTICES_PER_CALLBACK);
+    source.vertex_row_counts[0] = MAX_VERTICES_PER_SURFACE;
     source.surface_vertex_count = MAX_VERTICES_PER_SURFACE;
     core.grid.subgrid_surface_vertex_count = source.surface_vertex_count;
 
@@ -10221,9 +10265,9 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
 
     const gid: u32 = 77;
     const style_index: u32 = 0;
-    const key = (@as(u64, gid) << 2) | style_index;
-    const hash = (gid *% 2654435761) ^ style_index;
-    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, hash);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+    const key = slot_key.key;
+    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     var shaped_entry = std.mem.zeroes(c_api.GlyphEntry);
     shaped_entry.bbox_size_px = .{ 7, 1 };
     core.glyph_cache_by_id.?[probe.insert] = shaped_entry;
@@ -10522,9 +10566,9 @@ test "box drawing glyph quads are trimmed to their cell rows" {
     core.cb.on_atlas_upload = State.upload;
     core.cb.on_atlas_create = State.create;
     const gid: u32 = 42;
-    const key = (@as(u64, gid) << 2);
-    const hash = gid *% 2654435761;
-    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, hash);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, 0);
+    const key = slot_key.key;
+    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     core.glyph_cache_by_id.?[probe.insert] = entry;
     core.glyph_keys_by_id.?[probe.insert] = key;
 

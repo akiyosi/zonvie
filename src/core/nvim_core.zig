@@ -51,6 +51,22 @@ pub const GlyphCacheProbe = struct {
     insert: usize,
 };
 
+pub const GlyphCacheSlotKey = struct {
+    key: u64,
+    hash: u32,
+};
+
+/// Key and probe hash of a glyph cache entry: a glyph id (by-id cache) or a
+/// scalar (non-ASCII cache) plus a style index in 0..3. Every writer and reader
+/// of a cache must use this, or entries silently miss or hit across styles.
+pub fn glyphCacheSlotKey(code: u32, style_index: u32) GlyphCacheSlotKey {
+    std.debug.assert(style_index < 4);
+    return .{
+        .key = (@as(u64, code) << 2) | @as(u64, style_index),
+        .hash = (code *% 2654435761) ^ style_index,
+    };
+}
+
 /// Two-choice, allocation-free probe for the fixed-size glyph caches. Two
 /// keys that collide at the primary index can coexist at independent secondary
 /// indices; when both are occupied a stable hash bit selects the victim.
@@ -3099,9 +3115,9 @@ pub const Core = struct {
                 const gid = gids[scalar];
                 if (gid == 0) continue; // .notdef
 
-                const key = (@as(u64, gid) << 2) | @as(u64, si);
-                const hash_val = (gid *% 2654435761) ^ @as(u32, @intCast(si));
-                const probe = glyphCacheProbe(keys, key, hash_val);
+                const slot_key = glyphCacheSlotKey(gid, @intCast(si));
+                const key = slot_key.key;
+                const probe = glyphCacheProbe(keys, key, slot_key.hash);
                 const scalar_index = scalar * 4 + si;
 
                 // Already cached by glyph ID. Mirror it into the canonical
@@ -6066,6 +6082,20 @@ test "glyph cache two-choice probe preserves a primary collision" {
 
     try std.testing.expectEqual(probe_a.insert, glyphCacheProbe(&keys, key_a, hash).hit.?);
     try std.testing.expectEqual(probe_b.insert, glyphCacheProbe(&keys, key_b, hash).hit.?);
+}
+
+test "glyph cache slot keys separate every style of a code and never equal the empty key" {
+    for ([_]u32{ 0, 1, 0x754C, std.math.maxInt(u32) }) |code| {
+        for (0..4) |style_a| {
+            const a = glyphCacheSlotKey(code, @intCast(style_a));
+            try std.testing.expect(a.key != GLYPH_CACHE_INVALID_KEY);
+            for (0..4) |style_b| {
+                if (style_a == style_b) continue;
+                try std.testing.expect(a.key != glyphCacheSlotKey(code, @intCast(style_b)).key);
+            }
+            try std.testing.expect(a.key != glyphCacheSlotKey(code +% 1, @intCast(style_a)).key);
+        }
+    }
 }
 
 test "aborted atlas upload rolls back shelf allocation" {

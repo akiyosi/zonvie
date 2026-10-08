@@ -2,6 +2,8 @@
 // Zero allocations: all state is inline fields.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
 
 pub const Rect = struct {
     x: u32,
@@ -12,8 +14,9 @@ pub const Rect = struct {
 
 /// Upper bound on tracked shelves. A shelf is as tall as the tallest glyph
 /// that opened it, so a small font over a tall atlas produces many of them.
-/// Exceeding this sets `shelf_overflow`, which only disables recycling — bump
-/// packing stays exact.
+/// A shelf closed past this joins the unrecycled shelf above it; only when there
+/// is none does it set `shelf_overflow` and go untracked until a reset. Bump
+/// packing stays exact either way.
 pub const max_shelves = 1024;
 
 /// One closed shelf. `x` is the reuse cursor and is only meaningful while
@@ -58,6 +61,8 @@ pub const ShelfPacker = struct {
     undo_y: u32 = 0,
     undo_row_h: u32 = 0,
     undo_shelf_count: u32 = 0,
+    /// Set when the undone bump closed its shelf into an existing one.
+    undo_extend: ?struct { index: u32, h: u16, epoch: u32 } = null,
 
     pub fn init(w: u32, h: u32) ShelfPacker {
         return .{ .width = w, .height = h };
@@ -78,7 +83,10 @@ pub const ShelfPacker = struct {
 
         // Reclaimed shelves first, tightest height that still fits, so a tall
         // shelf stays available for a tall glyph.
-        if (self.allocFromRecycled(packed_w, packed_h)) |rect| return rect;
+        if (self.allocFromRecycled(packed_w, packed_h)) |rect| {
+            self.assertIntegrity();
+            return rect;
+        }
 
         // Wrap to next shelf row if current row is too narrow. Computed
         // tentatively: a rejected allocation must leave the packer untouched.
@@ -122,6 +130,7 @@ pub const ShelfPacker = struct {
         self.undo_y = self.next_y;
         self.undo_row_h = self.row_h;
         self.undo_shelf_count = self.shelf_count;
+        self.undo_extend = null;
         if (wrapped) self.closeShelf(self.next_y, self.row_h);
 
         const rect = Rect{
@@ -133,6 +142,7 @@ pub const ShelfPacker = struct {
         self.next_x = nx + packed_w;
         self.next_y = ny;
         self.row_h = @max(rh, packed_h);
+        self.assertIntegrity();
         return rect;
     }
 
@@ -146,6 +156,10 @@ pub const ShelfPacker = struct {
                 self.next_y = self.undo_y;
                 self.row_h = self.undo_row_h;
                 self.shelf_count = self.undo_shelf_count;
+                if (self.undo_extend) |e| {
+                    self.shelves[e.index].h = e.h;
+                    self.shelves[e.index].epoch = e.epoch;
+                }
             },
             .recycled => {
                 // The split shrank this shelf and appended the surplus band,
@@ -158,6 +172,7 @@ pub const ShelfPacker = struct {
             },
         }
         self.undo_kind = .none;
+        self.assertIntegrity();
     }
 
     fn allocFromRecycled(self: *ShelfPacker, packed_w: u32, packed_h: u32) ?Rect {
@@ -222,7 +237,24 @@ pub const ShelfPacker = struct {
 
     fn closeShelf(self: *ShelfPacker, y: u32, h: u32) void {
         if (h == 0) return;
-        if (self.shelf_count >= max_shelves or y > 0xFFFF or h > 0xFFFF) {
+        if (y > 0xFFFF or h > 0xFFFF) {
+            self.shelf_overflow = true;
+            return;
+        }
+        if (self.shelf_count >= max_shelves) {
+            // With no slot left, the band joins the unrecycled shelf directly
+            // above it, so it is reclaimed together with that shelf instead of
+            // being unreclaimable until a full reset. The joined shelf is live
+            // whenever either part is, which only delays reclamation.
+            if (self.unrecycledShelfEndingAt(y)) |idx| {
+                const joined_h = @as(u32, self.shelves[idx].h) + h;
+                if (joined_h <= 0xFFFF) {
+                    self.undo_extend = .{ .index = idx, .h = self.shelves[idx].h, .epoch = self.shelves[idx].epoch };
+                    self.shelves[idx].h = @intCast(joined_h);
+                    self.shelves[idx].epoch = self.epoch;
+                    return;
+                }
+            }
             self.shelf_overflow = true;
             return;
         }
@@ -234,6 +266,15 @@ pub const ShelfPacker = struct {
             .epoch = self.epoch,
         };
         self.shelf_count += 1;
+    }
+
+    fn unrecycledShelfEndingAt(self: *const ShelfPacker, y: u32) ?u32 {
+        var i: u32 = 0;
+        while (i < self.shelf_count) : (i += 1) {
+            const shelf = self.shelves[i];
+            if (!shelf.recycled and @as(u32, shelf.y) + shelf.h == y) return i;
+        }
+        return null;
     }
 
     /// Index of the closed shelf covering `y`, or null when `y` belongs to the
@@ -313,6 +354,7 @@ pub const ShelfPacker = struct {
             recycled += 1;
         }
         if (recycled != 0) self.undo_kind = .none;
+        self.assertIntegrity();
         return recycled;
     }
 
@@ -356,6 +398,29 @@ pub const ShelfPacker = struct {
         // condition: its only other exit is a full atlas reset, which drops
         // every glyph cache — exactly what reclamation exists to avoid.
         if (self.shelf_count < max_shelves) self.shelf_overflow = false;
+        self.assertIntegrity();
+    }
+
+    /// Debug-only check of the packer's invariants, run at the end of every
+    /// mutator: closed shelves are disjoint bands above the bump frontier, and
+    /// every reuse cursor stays inside the atlas.
+    pub fn assertIntegrity(self: *const ShelfPacker) void {
+        if (builtin.mode != .Debug) return;
+        assert(self.shelf_count <= max_shelves);
+        assert(self.next_x >= 1 and self.next_x <= self.width + self.padding);
+        assert(self.next_x != 1 or self.row_h == 0);
+        assert(self.next_y >= 1 and self.next_y + self.row_h <= self.height);
+        var order: [max_shelves]u16 = undefined;
+        const n = self.buildYOrder(&order);
+        var prev_end: u32 = 1;
+        for (order[0..n]) |idx| {
+            const shelf = self.shelves[idx];
+            assert(shelf.h > 0);
+            assert(shelf.y >= prev_end);
+            prev_end = @as(u32, shelf.y) + shelf.h;
+            assert(prev_end <= self.next_y);
+            assert(!shelf.recycled or (shelf.x >= 1 and shelf.x <= self.width));
+        }
     }
 
     fn isFreeBand(self: *const ShelfPacker, index: u32) bool {
@@ -387,6 +452,7 @@ pub const ShelfPacker = struct {
         self.shelf_count = 0;
         self.shelf_overflow = false;
         self.undo_kind = .none;
+        self.assertIntegrity();
     }
 
     /// Compute normalized UV coordinates for a glyph bitmap placed at (rect_x, rect_y).
@@ -549,8 +615,16 @@ test "undoLastAlloc fully reverts an allocation that split a reclaimed shelf" {
 test "reclamation recovers after shelf tracking overflows" {
     var p = ShelfPacker.init(16, 4096);
 
-    // Drive shelf_count past max_shelves so closeShelf latches the flag.
-    _ = closeNShelves(&p, max_shelves + 1);
+    // Fill the table, then recycle the shelf above the open one so the next
+    // closed band has nothing to join and the flag latches.
+    _ = closeNShelves(&p, max_shelves);
+    try std.testing.expectEqual(max_shelves, p.shelf_count);
+    p.beginEpoch();
+    var live_but_last = [_]bool{true} ** max_shelves;
+    live_but_last[max_shelves - 1] = false;
+    try std.testing.expectEqual(@as(u32, 1), p.recycleDeadShelves(&live_but_last));
+    // Taller than the recycled shelf, so it bump-allocates and closes the band.
+    _ = p.alloc(12, 4).?;
     try std.testing.expect(p.shelf_overflow);
     try std.testing.expectEqual(max_shelves, p.shelf_count);
 
@@ -571,6 +645,34 @@ test "reclamation recovers after shelf tracking overflows" {
     _ = closeNShelves(&p, 1);
     try std.testing.expect(p.shelf_count > before);
     try std.testing.expect(!p.shelf_overflow);
+}
+
+test "a band closed with the shelf table full joins the shelf above it and is reclaimed with it" {
+    var p = ShelfPacker.init(16, 4096);
+    _ = closeNShelves(&p, max_shelves);
+    const last = max_shelves - 1;
+    const last_h = p.shelves[last].h;
+    const band_y = p.next_y;
+    const band_h = p.row_h;
+
+    _ = p.alloc(12, 1).?;
+    try std.testing.expect(!p.shelf_overflow);
+    try std.testing.expectEqual(max_shelves, p.shelf_count);
+    try std.testing.expectEqual(@as(u32, last), p.shelfIndexForY(band_y).?);
+    try std.testing.expectEqual(@as(u32, last_h) + band_h, p.shelves[last].h);
+
+    // A rejected upload undoes the join as well as the cursor.
+    p.undoLastAlloc();
+    try std.testing.expectEqual(last_h, p.shelves[last].h);
+    try std.testing.expect(p.shelfIndexForY(band_y) == null);
+
+    _ = p.alloc(12, 1).?;
+    p.beginEpoch();
+    var live = [_]bool{true} ** max_shelves;
+    live[last] = false;
+    try std.testing.expectEqual(@as(u32, 1), p.recycleDeadShelves(&live));
+    try std.testing.expect(p.shelves[last].recycled);
+    try std.testing.expectEqual(@as(u32, last), p.shelfIndexForY(band_y + band_h - 1).?);
 }
 
 test "a glyph exactly as wide as the atlas still lands on the first row" {

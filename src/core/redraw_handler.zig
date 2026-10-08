@@ -196,6 +196,11 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Upper bound on the mode_info_set table, well above Neovim's 18 modes so a
+/// later Neovim's extra modes still fit. A mode_change past it keeps the
+/// current style, as for any index the table lacks.
+const max_mode_infos = 256;
+
 /// Apply mode_infos[idx] to the grid's live cursor style fields.
 /// Precondition: grid must be a valid Grid pointer; idx is bounds-unchecked.
 /// Postcondition: grid.cursor_shape, cursor_attr_id, blink_* fields updated to match mode idx.
@@ -2231,10 +2236,13 @@ pub fn handleRedraw(
                     if (t[1] != .arr) continue;
                     const arr = t[1].arr;
 
+                    // Neovim sends SHAPE_IDX_COUNT (18) entries; the cap only
+                    // keeps a broken server from sizing a long-lived table.
+                    const modes = arr[0..@min(arr.len, max_mode_infos)];
                     grid.mode_infos.clearRetainingCapacity();
-                    try grid.mode_infos.ensureTotalCapacity(grid.alloc, arr.len);
+                    try grid.mode_infos.ensureTotalCapacity(grid.alloc, modes.len);
 
-                    for (arr, 0..) |mv, mode_idx| {
+                    for (modes, 0..) |mv, mode_idx| {
                         var mi: ModeInfo = .{};
                         if (mv == .map) {
                             const m = mv.map;
@@ -3568,6 +3576,31 @@ fn testModeChange(arena: std.mem.Allocator, mode: []const u8) ![]mp.Value {
     t[0] = .{ .str = mode };
     t[1] = .{ .int = 0 };
     return testEvent(arena, "mode_change", t);
+}
+
+test "mode_info_set keeps at most max_mode_infos entries of an oversized table" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const modes = try arena.alloc(mp.Value, max_mode_infos + 50);
+    for (modes) |*m| m.* = .{ .int = 0 };
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+    try std.testing.expectEqual(@as(usize, max_mode_infos), grid.mode_infos.items.len);
+
+    // Neovim's own 18-entry table is kept whole.
+    const t18 = try arena.alloc(mp.Value, 2);
+    t18[0] = .{ .bool = true };
+    t18[1] = .{ .arr = modes[0..18] };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t18));
+    try std.testing.expectEqual(@as(usize, 18), grid.mode_infos.items.len);
 }
 
 test "win_move, win_exchange and win_rotate queue their own fields and drop a short tuple" {
