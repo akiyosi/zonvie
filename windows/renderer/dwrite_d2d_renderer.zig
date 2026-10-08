@@ -214,12 +214,11 @@ pub const Renderer = struct {
     // temporary buffer for a single glyph (padded) generation
     glyph_tmp: std.ArrayListUnmanaged(u8) = .empty,
 
-    // Append-only queue of atlas dirty rects. Entries are appended when glyphs
-    // are rasterized and consumed independently by each D3D window via
-    // per-consumer cursors. Only cleared on atlas reset.
+    // Queue of atlas dirty rects, appended when glyphs are rasterized. The one
+    // consumer (App.atlas_upload_cursor; every window borrows the owner's
+    // texture) releases what it uploaded, and an atlas reset drops the rest.
     pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .empty,
     // Monotonic sequence number of the first entry in pending_uploads.
-    // Advances only on atlas reset (when all entries become invalid).
     // head_seq = pending_upload_base_seq + pending_uploads.items.len.
     pending_upload_base_seq: u64 = 0,
 
@@ -1112,7 +1111,9 @@ pub const Renderer = struct {
                 "[atlas] uploadAtlasRegion: rejecting out-of-bounds region dest=({d},{d}) size={d}x{d} atlas={d}x{d}\n",
                 .{ dest_x, dest_y, width, height, self.atlas_w, self.atlas_h },
             );
-            return;
+            // The caller must abort the flush: the core would otherwise cache
+            // UVs for pixels that never landed.
+            return error.AtlasRegionOutOfBounds;
         }
 
         const pixels = bitmap.pixels orelse return;
@@ -1299,6 +1300,14 @@ pub const Renderer = struct {
         cursor: u64,
         success: bool,
     };
+
+    /// Forget the rects before `consumed_seq`, which the consumer holding that
+    /// cursor has uploaded. Valid only while that consumer is the sole one.
+    pub fn releaseConsumedUploads(self: *Renderer, consumed_seq: u64) void {
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        render_pipeline_helpers.releaseConsumedAtlasUploads(c.D2D1_RECT_U, &self.pending_uploads, &self.pending_upload_base_seq, consumed_seq);
+    }
 
     pub fn flushPendingAtlasUploadsSinceToD3D(self: *Renderer, d3d: anytype, since_seq: u64) D3DUploadResult {
         self.mu.lockUncancelable(core.clock.io());

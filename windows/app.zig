@@ -3499,6 +3499,7 @@ pub fn syncSharedAtlas(
     }
     if (need_full or upload.cursor != app.atlas_upload_cursor) app.atlas_upload_seq +%= 1;
     app.atlas_upload_cursor = upload.cursor;
+    atlas.releaseConsumedUploads(upload.cursor);
     if (need_full) app.atlas_upload.fullUploaded(generation);
     const uploaded = seen_seq.* != app.atlas_upload_seq;
     seen_seq.* = app.atlas_upload_seq;

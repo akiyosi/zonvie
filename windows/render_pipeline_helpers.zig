@@ -284,6 +284,18 @@ pub const PaintRetryState = struct {
 pub const atlas_full_upload_rect_threshold: usize = 64;
 pub const atlas_full_upload_area_divisor: u64 = 4;
 
+/// Drop the queued atlas upload rects before `consumed_seq`, the cursor of a
+/// consumer that has uploaded them. `base_seq` is the sequence of `list[0]`;
+/// the head (`base_seq + list.len`) is unchanged, and capacity is kept so the
+/// queue stops allocating once it reaches its working size.
+pub fn releaseConsumedAtlasUploads(comptime T: type, list: *std.ArrayListUnmanaged(T), base_seq: *u64, consumed_seq: u64) void {
+    if (consumed_seq <= base_seq.*) return;
+    const n: usize = @intCast(@min(consumed_seq - base_seq.*, list.items.len));
+    std.mem.copyForwards(T, list.items[0 .. list.items.len - n], list.items[n..]);
+    list.shrinkRetainingCapacity(list.items.len - n);
+    base_seq.* += n;
+}
+
 /// Decide when a per-consumer dirty-rect replay should collapse to one full
 /// atlas upload. Rect may be any type with left/top/right/bottom integer fields.
 pub fn shouldUseFullAtlasUpload(rects: anytype, atlas_w: u32, atlas_h: u32) bool {

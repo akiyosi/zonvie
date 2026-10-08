@@ -1052,13 +1052,13 @@ pub fn onVerticesRow(
         // split it per-row (no per-row vertex boundaries in the API).
         // Do NOT store the combined vertices — they would render garbled at
         // row_start while other rows show stale content.
-        // Instead, keep existing row vertices intact and request a full re-seed
-        // so the core resends each row individually.
+        // Instead, keep existing row vertices intact and request a full re-seed.
         //
-        // NOTE: This relies on Core's flush loop responding to need_full_seed
-        // by iterating per-row with row_count=1 (see src/core/flush.zig).
-        // If a future Core change sends row_count>1 even for re-seed responses,
-        // the API contract must be extended with per-row vertex counts.
+        // Unreachable with the current core, which sends row_count 0 or 1
+        // (src/core/flush.zig). The ABI allows more but gives no per-row vertex
+        // boundaries, and need_full_seed only makes WM_PAINT resend the layout
+        // and repaint: nothing asks the core to resend these rows. A core that
+        // sends row_count>1 needs the ABI extended first.
         if (log_verbose) applog.appLog(
             "[win] on_vertices_row row_count>1 ({d}) row_start={d} -> requesting re-seed\n",
             .{ row_count, row_start },
@@ -1653,9 +1653,15 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
     }
 
     if (atlasForCoreCallback(app)) |a| {
-        a.uploadAtlasRegion(dest_x, dest_y, width, height, bitmap) catch {
+        a.uploadAtlasRegion(dest_x, dest_y, width, height, bitmap) catch |err| {
+            // Nothing was written: the core and this atlas disagree on its
+            // size. Aborting makes the core roll the glyph back uncached.
+            if (err == error.AtlasRegionOutOfBounds) {
+                abortAtlasFlush(app, "atlas upload region outside the atlas");
+                return;
+            }
             // The CPU mirror (atlas_cpu) was already written; the only
-            // failure point is the dirty-rect enqueue (OOM). The core caches
+            // other failure is the dirty-rect enqueue (OOM). The core caches
             // the GlyphEntry as valid after this callback, so without
             // recovery the glyph would stay blank until an atlas reset.
             // Recover from the mirror: bump the reset generation so every
@@ -2556,12 +2562,26 @@ pub fn onSurfaceLayout(
     surf.flush_needs_invalidate = true;
 }
 
-/// A destroyed grid's rows go with the commit whose layout no longer places
-/// it (TripleBufferedSurface.pruneLayerRows), so there is nothing to release
-/// here.
+/// A destroyed grid's layer rows go with the commit whose layout no longer
+/// places it (TripleBufferedSurface.pruneLayerRows); only a pending capture is
+/// released here.
 pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
     traceRender(app, "event=destroy grid={d}\n", .{grid_id});
+    // Rows for a grid no surface placed are parked as a pending capture, which
+    // only an external window for this id would consume. A destroyed id gets
+    // no such window, so release it here or it lives until shutdown.
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    var i: usize = 0;
+    while (i < app.pending_external_verts.items.len) {
+        if (app.pending_external_verts.items[i].grid_id == grid_id) {
+            var dropped = app.pending_external_verts.swapRemove(i);
+            dropped.deinit(app.alloc);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// True when the main surface places `grid_id` as one of its layers. The

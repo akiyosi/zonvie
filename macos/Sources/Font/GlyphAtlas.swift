@@ -2371,6 +2371,10 @@ final class GlyphAtlas {
     /// If atlas was modified during this flush, swaps front/back and returns new front.
     /// If not modified, returns current front without swap.
     func commitAndSnapshotFrontTexture() -> CommitResult {
+        // Precondition: endFlushUploadTransaction() succeeded. Swapping with
+        // staged pixels still in the CPU shadow would publish UVs into a
+        // texture that does not hold them.
+        assert(!flushUploadTransactionOpen, "atlas commit with staged pixels not uploaded")
         // If this flush modified the atlas, a deferred back blit must complete
         // before back becomes front. Poll only: commitFlush runs with grid_mu
         // held and must abort/retry rather than waiting on the GPU.

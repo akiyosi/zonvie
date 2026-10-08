@@ -353,6 +353,32 @@ test "atlas upload policy bounds calls by rect count or dirty area" {
     try std.testing.expect(helpers.shouldUseFullAtlasUpload(&many, 4096, 4096));
 }
 
+test "consumed atlas upload rects are released without moving the head sequence" {
+    // The queue only shrank on an atlas reset, which shelf reclamation keeps
+    // from happening, so it grew by one rect per glyph for the whole session.
+    var list: std.ArrayListUnmanaged(u32) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try list.appendSlice(std.testing.allocator, &.{ 10, 11, 12, 13 });
+    var base: u64 = 100;
+
+    helpers.releaseConsumedAtlasUploads(u32, &list, &base, 102);
+    try std.testing.expectEqual(@as(u64, 102), base);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 13 }, list.items);
+
+    // A cursor at or behind the base releases nothing.
+    helpers.releaseConsumedAtlasUploads(u32, &list, &base, 101);
+    try std.testing.expectEqual(@as(u64, 102), base);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 13 }, list.items);
+
+    const capacity = list.capacity;
+    helpers.releaseConsumedAtlasUploads(u32, &list, &base, 104);
+    try std.testing.expectEqual(@as(u64, 104), base);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+    try std.testing.expectEqual(capacity, list.capacity);
+    // base + len, the head a consumer resumes from, never moves backwards.
+    try std.testing.expectEqual(@as(u64, 104), base + list.items.len);
+}
+
 const Rect = struct {
     left: i32,
     top: i32,

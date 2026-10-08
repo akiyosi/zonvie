@@ -5173,6 +5173,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int, totalCols: Int) {
         guard isInFlush else {
+            // The only caller is gated by ZonvieCore.beginMainFlushIfNeeded().
+            assertionFailure("submitVerticesRowRaw called outside flush bracket")
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
         }

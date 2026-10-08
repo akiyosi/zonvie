@@ -99,6 +99,7 @@ const VertexBudgetError = error{
     VertexBudgetExceededPerCallback,   // Single row exceeds 256 MiB
     VertexBudgetExceededPerSurface,    // Grid surface total exceeds 256 MiB
     VertexBudgetExceededAggregate,     // Main + all subgrids exceeds 512 MiB
+    VertexBudgetInvariantViolated,     // Ledger state this file maintains is inconsistent
     OutOfMemory,                        // ShapingBuffers allocation failed (transient)
 };
 
@@ -119,6 +120,12 @@ fn vertexBudgetExceededPerSurface(core: *Core) VertexBudgetError {
     // Tier D1: PerSurface recovery — abort surface, fallback to main
     core.flush_retryable = false;
     return error.VertexBudgetExceededPerSurface;
+}
+
+/// Not a budget overflow: reported apart so the hard-failure log names a bug.
+fn vertexBudgetInvariantViolated(core: *Core) VertexBudgetError {
+    core.flush_retryable = false;
+    return error.VertexBudgetInvariantViolated;
 }
 
 fn vertexBudgetExceededAggregate(core: *Core) VertexBudgetError {
@@ -304,12 +311,10 @@ fn validateCompletedVertexBudget(core: *Core) !void {
     var visited: usize = 0;
     const max_grids = core.grid.sub_grids.count() + 1;
     while (grid_id) |current_grid_id| : (visited += 1) {
-        if (visited > max_grids) {
-            // Cycle detected in touched list — invariant violation
-            return vertexBudgetExceededPerSurface(core);
-        }
+        // A cycle, or a touched grid that no longer exists.
+        if (visited > max_grids) return vertexBudgetInvariantViolated(core);
         const sg = core.grid.sub_grids.get(current_grid_id) orelse
-            return vertexBudgetExceededPerSurface(core);
+            return vertexBudgetInvariantViolated(core);
         if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
             return vertexBudgetExceededPerSurface(core);
         }
@@ -568,7 +573,7 @@ fn replaceSurfaceRowVertexCount(
         return;
     }
     if (row >= row_counts.len) {
-        return error.VertexBudgetExceededPerCallback;
+        return error.VertexBudgetInvariantViolated;
     }
     const old_count = row_counts[row];
     const result = try replaceSurfaceRowVertexCountCompute(
@@ -8856,6 +8861,23 @@ test "a completed flush that leaves a sub-grid above its surface limit is reject
     defer finishVertexBudgetTransaction(&core, false);
     try replaceGridSurfaceRowVertexCount(&core, 2, sg, 1, 6);
     try std.testing.expectError(error.VertexBudgetExceededPerSurface, validateCompletedVertexBudget(&core));
+}
+
+test "a touched list naming a missing grid is reported as an invariant violation, not a budget overflow" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 1);
+    try beginVertexBudgetTransaction(&core);
+    defer finishVertexBudgetTransaction(&core, false);
+    core.vertex_budget_touched_grid_head = 999;
+    try std.testing.expectError(error.VertexBudgetInvariantViolated, validateCompletedVertexBudget(&core));
+    try std.testing.expect(!core.flush_retryable);
+
+    var counts = [_]usize{0};
+    try std.testing.expectError(
+        error.VertexBudgetInvariantViolated,
+        replaceSurfaceRowVertexCount(&core, &core.grid.main_buf.surface_vertex_count, &counts, 1, 6),
+    );
 }
 
 test "a refused flush restores reshaped and newly created grids without a full invalidation" {
