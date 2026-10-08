@@ -4330,9 +4330,16 @@ final class ZonvieCore {
     /// The main surface joins a flush on its first write, as an external one
     /// does below; a refusal cancels the whole flush the same way.
     func beginMainFlushIfNeeded() -> Bool {
-        guard let renderer = terminalView?.renderer else { return false }
+        if externalFlushAborted || !coreFlushActive {
+            return terminalView?.renderer.isFlushOpen ?? false
+        }
+        guard let renderer = terminalView?.renderer else {
+            // Nothing received this surface's content, so the core must not
+            // commit it; the retry resends everything once a view is wired.
+            abortFlushAfterBeginFailure(surface: 1)
+            return false
+        }
         if renderer.isFlushOpen { return true }
-        if externalFlushAborted || !coreFlushActive { return false }
         if renderer.beginFlush() { return true }
         abortFlushAfterBeginFailure(surface: 1)
         return false

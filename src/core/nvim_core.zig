@@ -1226,6 +1226,7 @@ pub const Core = struct {
             error.VertexBudgetExceededPerSurface,
             error.VertexBudgetExceededAggregate,
             error.VertexBudgetInvariantViolated,
+            error.ShapeCallbackInvalidCount,
             error.MessageTooLarge,
             error.FrameTooLarge,
             => true,

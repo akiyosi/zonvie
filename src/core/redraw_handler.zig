@@ -2250,13 +2250,13 @@ pub fn handleRedraw(
                     if (t.len < 2 or t[1] != .arr) continue;
                     const arr = t[1].arr;
 
-                    grid.cursor_style_enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
-
                     // Neovim sends SHAPE_IDX_COUNT (18) entries; the cap only
                     // keeps a broken server from sizing a long-lived table.
                     const modes = arr[0..@min(arr.len, max_mode_infos)];
-                    grid.mode_infos.clearRetainingCapacity();
                     try grid.mode_infos.ensureTotalCapacity(grid.alloc, modes.len);
+
+                    grid.cursor_style_enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
+                    grid.mode_infos.clearRetainingCapacity();
 
                     for (modes, 0..) |mv, mode_idx| {
                         if (mv != .map and log.cb != null) {
@@ -3619,6 +3619,34 @@ test "a mode_info_set with no well-formed tuple changes neither the flag, the ta
     short[0] = .{ .bool = true };
     try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", short));
     try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+}
+
+test "a mode_info_set that cannot size its table changes neither the flag nor the table" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var grid = Grid.init(failing.allocator());
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+    const rev = grid.cursor_rev;
+
+    const modes = try arena.alloc(mp.Value, 18);
+    for (modes) |*m| m.* = .{ .int = 0 };
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t)));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.mode_infos.items[0].shape);
     try std.testing.expectEqual(rev, grid.cursor_rev);
 }
 

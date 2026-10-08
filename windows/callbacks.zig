@@ -1043,7 +1043,11 @@ pub fn onVerticesRow(
 
         // TBS: COW detach + write to slot, mark flush_dirty.
         if (app.surf.tbs.is_in_flush) {
-            if (!app.surf.tbs.writeFlushRow(app.alloc, row, if (verts_ptr) |p| p[0..vert_count] else &.{})) failFlush(app);
+            if (!app.surf.tbs.writeFlushRow(app.alloc, row, if (verts_ptr) |p| p[0..vert_count] else &.{})) {
+                // The row was not stored, so it must not count toward the seed.
+                failFlush(app);
+                return;
+            }
         }
     } else if (disposition == .multi_row) {
         // Multi-row path: the vertex array covers multiple rows but we cannot

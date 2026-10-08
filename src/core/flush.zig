@@ -8972,6 +8972,11 @@ test "every vertex budget violation is a hard render failure, an allocation fail
     try std.testing.expect(!Core.isHardRenderFailure(error.OutOfMemory));
 }
 
+test "a shaping callback that breaks its count contract is a hard render failure" {
+    // A retry sends the same text to the same callback, so it cannot recover.
+    try std.testing.expect(Core.isHardRenderFailure(error.ShapeCallbackInvalidCount));
+}
+
 test "a budget violation charging a main row fails the session inside the flush" {
     const Noop = struct {
         fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
