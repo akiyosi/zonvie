@@ -61,6 +61,7 @@ pub const ShelfPacker = struct {
     undo_y: u32 = 0,
     undo_row_h: u32 = 0,
     undo_shelf_count: u32 = 0,
+    undo_overflow: bool = false,
     /// Set when the undone bump closed its shelf into an existing one.
     undo_extend: ?struct { index: u32, h: u16, epoch: u32 } = null,
 
@@ -131,6 +132,7 @@ pub const ShelfPacker = struct {
         self.undo_row_h = self.row_h;
         self.undo_shelf_count = self.shelf_count;
         self.undo_extend = null;
+        self.undo_overflow = self.shelf_overflow;
         if (wrapped) self.closeShelf(self.next_y, self.row_h);
 
         const rect = Rect{
@@ -149,6 +151,7 @@ pub const ShelfPacker = struct {
     /// Undo the most recent successful `alloc`. Only valid immediately after
     /// that call, before any other allocation.
     pub fn undoLastAlloc(self: *ShelfPacker) void {
+        assert(self.undo_kind != .none);
         switch (self.undo_kind) {
             .none => {},
             .bump => {
@@ -156,6 +159,7 @@ pub const ShelfPacker = struct {
                 self.next_y = self.undo_y;
                 self.row_h = self.undo_row_h;
                 self.shelf_count = self.undo_shelf_count;
+                self.shelf_overflow = self.undo_overflow;
                 if (self.undo_extend) |e| {
                     self.shelves[e.index].h = e.h;
                     self.shelves[e.index].epoch = e.epoch;
@@ -339,8 +343,11 @@ pub const ShelfPacker = struct {
     /// Make every closed shelf whose `live` entry is false available for reuse.
     /// Returns how many shelves became reusable. The caller is responsible for
     /// having proven that nothing on screen references those shelves and for
-    /// invalidating the glyph cache entries that point into them.
+    /// invalidating the glyph cache entries that point into them. A shelf that
+    /// absorbed a band closed with the table full is one index, live when either
+    /// part is.
     pub fn recycleDeadShelves(self: *ShelfPacker, live: []const bool) u32 {
+        assert(live.len >= self.shelf_count);
         var recycled: u32 = 0;
         var i: u32 = 0;
         while (i < self.shelf_count and i < live.len) : (i += 1) {
@@ -421,6 +428,7 @@ pub const ShelfPacker = struct {
             assert(prev_end <= self.next_y);
             assert(!shelf.recycled or (shelf.x >= 1 and shelf.x <= self.width));
         }
+        assert(self.freeAreaPx() <= @as(u64, self.height - 1) * self.width);
     }
 
     fn isFreeBand(self: *const ShelfPacker, index: u32) bool {
@@ -631,6 +639,11 @@ test "reclamation recovers after shelf tracking overflows" {
     // Taller than the recycled shelf, so it bump-allocates and closes the band.
     _ = p.alloc(12, 4).?;
     try std.testing.expect(p.shelf_overflow);
+    // A rejected upload means the band was never closed.
+    p.undoLastAlloc();
+    try std.testing.expect(!p.shelf_overflow);
+    _ = p.alloc(12, 4).?;
+    try std.testing.expect(p.shelf_overflow);
     try std.testing.expectEqual(max_shelves, p.shelf_count);
 
     p.beginEpoch();
@@ -689,6 +702,28 @@ test "freeAreaPx counts the open shelf's right remainder and not its filled part
     const below: u64 = (100 - 11) * 64;
     const open_rest: u64 = (64 - 11) * 10;
     try std.testing.expectEqual(below + open_rest, p.freeAreaPx());
+}
+
+test "freeAreaPx counts reclaimed shelves right of their cursor and closed unreclaimed shelves as full" {
+    var p = ShelfPacker.init(64, 200);
+    _ = p.alloc(10, 60).?; // packed 12x62 at (1,1)
+    _ = p.alloc(50, 8).?; // wraps: shelf 0 = [1,63)
+    _ = p.alloc(50, 8).?; // wraps: shelf 1 = [63,73); open shelf at y 73, next_x 53
+    try std.testing.expectEqual(@as(u32, 2), p.shelf_count);
+    p.beginEpoch();
+    _ = p.recycleDeadShelves(&[_]bool{ false, true });
+    // Splits shelf 0 into a 6px shelf with cursor 7 and a 56px surplus band.
+    _ = p.alloc(4, 4).?;
+    try std.testing.expectEqual(@as(u32, 3), p.shelf_count);
+    try std.testing.expectEqual(@as(u16, 7), p.shelves[0].x);
+    try std.testing.expect(!p.shelves[1].recycled);
+
+    const below: u64 = (200 - 83) * 64;
+    const open_rest: u64 = (64 - 53) * 10;
+    const reclaimed_rest: u64 = (64 - 7) * 6;
+    const surplus_band: u64 = (64 - 1) * 56;
+    // Shelf 1 is closed and not reclaimed: none of it is free.
+    try std.testing.expectEqual(below + open_rest + reclaimed_rest + surplus_band, p.freeAreaPx());
 }
 
 test "a glyph exactly as wide as the atlas still lands on the first row" {

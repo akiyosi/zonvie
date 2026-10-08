@@ -287,13 +287,193 @@ pub const atlas_full_upload_area_divisor: u64 = 4;
 /// Drop the queued atlas upload rects before `consumed_seq`, the cursor of a
 /// consumer that has uploaded them. `base_seq` is the sequence of `list[0]`;
 /// the head (`base_seq + list.len`) is unchanged, and capacity is kept so the
-/// queue stops allocating once it reaches its working size.
+/// queue stops allocating once it reaches its working size. A cursor past the
+/// head would mean rects were uploaded that were never queued.
 pub fn releaseConsumedAtlasUploads(comptime T: type, list: *std.ArrayListUnmanaged(T), base_seq: *u64, consumed_seq: u64) void {
+    std.debug.assert(consumed_seq <= base_seq.* + list.items.len);
     if (consumed_seq <= base_seq.*) return;
     const n: usize = @intCast(@min(consumed_seq - base_seq.*, list.items.len));
     std.mem.copyForwards(T, list.items[0 .. list.items.len - n], list.items[n..]);
     list.shrinkRetainingCapacity(list.items.len - n);
     base_seq.* += n;
+}
+
+/// Where the frontend places the grid an on_vertices_row callback names.
+pub const RowGridRoute = enum { main_root, main_layer, external_root, external_layer, unplaced };
+
+/// Whether a cursor-only update (CURSOR set, MAIN clear) is the main surface's
+/// cursor: grid 1's, or a grid the main surface places as a layer. Any other
+/// grid's cursor goes to the external path.
+pub fn mainSurfaceTakesCursor(grid_id: i64, route: RowGridRoute) bool {
+    if (grid_id == 1) return true;
+    return switch (route) {
+        .main_root, .main_layer => true,
+        .external_root, .external_layer, .unplaced => false,
+    };
+}
+
+/// zonvie_core.h: "clearing a different grid must not clear the current
+/// owner's cursor". An empty cursor set from a grid that does not own the
+/// surface's one cursor is ignored.
+pub fn ignoresCursorClear(vert_count: usize, owner_grid_id: i64, grid_id: i64) bool {
+    return vert_count == 0 and owner_grid_id != grid_id;
+}
+
+pub const ExternalRowInputs = struct {
+    /// VERT_UPDATE_CURSOR.
+    cursor: bool,
+    route: RowGridRoute,
+    /// A live, non-closing window can take the update now (no pending
+    /// capture of this grid exists). Unused for a layer row.
+    live_window: bool,
+};
+
+pub const ExternalRowDisposition = enum {
+    /// Stored in the layer of the surface that places the grid.
+    layer_row,
+    live_cursor,
+    live_row,
+    /// Captured for a window that does not exist yet (or replaces a closing one).
+    pending_cursor,
+    pending_row,
+};
+
+/// Disposition of an on_vertices_row callback for a grid other than 1 that the
+/// main surface's cursor path did not take. Cursor updates never become layer
+/// rows: rows and cursor are independent layers.
+pub fn externalRowDisposition(in: ExternalRowInputs) ExternalRowDisposition {
+    if (!in.cursor) switch (in.route) {
+        .main_root, .main_layer, .external_layer => return .layer_row,
+        .external_root, .unplaced => {},
+    };
+    if (in.live_window) return if (in.cursor) .live_cursor else .live_row;
+    return if (in.cursor) .pending_cursor else .pending_row;
+}
+
+pub const MainRowInputs = struct {
+    /// VERT_UPDATE_MAIN.
+    main: bool,
+    row_start: u32,
+    row_count: u32,
+    vert_count: usize,
+    total_rows: u32,
+    total_cols: u32,
+};
+
+pub const MainRowDisposition = enum {
+    /// MAIN clear: existing row contents are retained.
+    retain_rows,
+    /// The zero-cell transition: no row content survives.
+    layout_only,
+    /// A row the authoritative total_rows does not contain.
+    out_of_range,
+    single_row,
+    /// No per-row vertex boundaries: keep rows and re-seed.
+    multi_row,
+    /// No row payload; only the layout is applied.
+    no_row,
+};
+
+/// Disposition of a grid-1 on_vertices_row callback (after the cursor-only
+/// route), from the zonvie_core.h on_vertices_row contract.
+pub fn mainRowDisposition(in: MainRowInputs) MainRowDisposition {
+    if (!in.main) return .retain_rows;
+    if (in.row_count == 0 and in.vert_count == 0 and (in.total_rows == 0 or in.total_cols == 0)) return .layout_only;
+    if (in.total_rows != 0 and in.row_start >= in.total_rows) return .out_of_range;
+    return switch (in.row_count) {
+        0 => .no_row,
+        1 => .single_row,
+        else => .multi_row,
+    };
+}
+
+/// Damage not yet copied from a persistent back buffer into each rotating
+/// swapchain buffer. A buffer is either `full` or holds `count` rects, no two
+/// of which overlap or touch; overflowing `max_rects` promotes it to full.
+/// Fixed storage: queueing never allocates.
+pub fn BackDamageQueue(comptime Rect: type, comptime buffers: usize, comptime max_rects: usize) type {
+    comptime std.debug.assert(max_rects <= std.math.maxInt(u8));
+    return struct {
+        const Self = @This();
+        const Coord = @FieldType(Rect, "left");
+
+        full: [buffers]bool = [_]bool{true} ** buffers,
+        count: [buffers]u8 = [_]u8{0} ** buffers,
+        rects: [buffers][max_rects]Rect = undefined,
+
+        /// Mark the first `n` buffers (at most `buffers`) for a full copy.
+        pub fn markFull(self: *Self, n: usize) void {
+            for (0..@min(n, buffers)) |i| {
+                self.full[i] = true;
+                self.count[i] = 0;
+            }
+        }
+
+        /// `rect` clipped to [0,width)x[0,height), or null when empty.
+        pub fn clampRect(rect: Rect, width: u32, height: u32) ?Rect {
+            var r = rect;
+            r.left = @max(0, r.left);
+            r.top = @max(0, r.top);
+            r.right = @min(@as(Coord, @intCast(width)), r.right);
+            r.bottom = @min(@as(Coord, @intCast(height)), r.bottom);
+            return if (r.right > r.left and r.bottom > r.top) r else null;
+        }
+
+        fn append(self: *Self, index: usize, rect: Rect) void {
+            if (self.full[index]) return;
+
+            var merged = rect;
+            var count: usize = self.count[index];
+            var i: usize = 0;
+            while (i < count) {
+                const old = self.rects[index][i];
+                if (merged.left <= old.right and merged.right >= old.left and
+                    merged.top <= old.bottom and merged.bottom >= old.top)
+                {
+                    merged = .{
+                        .left = @min(old.left, merged.left),
+                        .top = @min(old.top, merged.top),
+                        .right = @max(old.right, merged.right),
+                        .bottom = @max(old.bottom, merged.bottom),
+                    };
+                    count -= 1;
+                    self.rects[index][i] = self.rects[index][count];
+                    // The grown rect may now touch one already passed.
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+
+            if (count == max_rects) {
+                self.full[index] = true;
+                self.count[index] = 0;
+                return;
+            }
+            self.rects[index][count] = merged;
+            self.count[index] = @intCast(count + 1);
+        }
+
+        /// Queue a present's damage on the first `buffer_count` buffers. A rect
+        /// that clamps to nothing makes every one of them full.
+        pub fn queue(self: *Self, rects: []const Rect, full: bool, buffer_count: usize, width: u32, height: u32) void {
+            if (full) return self.markFull(buffer_count);
+            for (rects) |raw| {
+                const rect = clampRect(raw, width, height) orelse return self.markFull(buffer_count);
+                for (0..@min(buffer_count, buffers)) |i| self.append(i, rect);
+            }
+        }
+
+        pub fn pending(self: *const Self, index: usize) []const Rect {
+            return self.rects[index][0..self.count[index]];
+        }
+
+        /// Buffer `index` now matches the back buffer.
+        pub fn clear(self: *Self, index: usize) void {
+            self.full[index] = false;
+            self.count[index] = 0;
+        }
+    };
 }
 
 /// Decide when a per-consumer dirty-rect replay should collapse to one full
@@ -822,6 +1002,23 @@ pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
 /// edge measured from x=0 (the client width, less an "always" scrollbar).
 pub fn contentViewportWidthPx(base_w: u32, x_offset: u32, sidebar_right_w: u32) u32 {
     return if (base_w > x_offset + sidebar_right_w) base_w - x_offset - sidebar_right_w else 1;
+}
+
+/// drawEx's scissor for a content viewport at (x, y) of size w x h: `dirty`
+/// (viewport-relative) translated to render-target space and clamped to the
+/// viewport's right/bottom edges and the target's origin, or the whole viewport.
+pub fn contentScissor(comptime Rect: type, x: u32, y: u32, w: u32, h: u32, dirty: ?Rect) Rect {
+    const Coord = @FieldType(Rect, "left");
+    const x_i: Coord = @intCast(x);
+    const y_i: Coord = @intCast(y);
+    const right: Coord = @intCast(x + w);
+    const bottom: Coord = @intCast(y + h);
+    return if (dirty) |r| .{
+        .left = @max(0, x_i + r.left),
+        .top = @max(0, y_i + r.top),
+        .right = @min(x_i + r.right, right),
+        .bottom = @min(y_i + r.bottom, bottom),
+    } else .{ .left = x_i, .top = y_i, .right = right, .bottom = bottom };
 }
 
 /// Right edge of the main paint's row scissors: the viewport's right edge.

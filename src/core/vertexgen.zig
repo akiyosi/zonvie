@@ -10,9 +10,8 @@ pub const ShapingBuffers = struct {
     x_off: std.ArrayListUnmanaged(i32) = .empty,
     y_off: std.ArrayListUnmanaged(i32) = .empty,
 
-    /// Pre-size buffers during setup phase (before hot-path flush).
-    /// Must be called once per flush, before any setLen() calls.
-    /// After this call, setLen() may be used in hot-path without allocations.
+    /// Pre-size buffers once per flush, before any setLen() call. setLen()
+    /// allocates nothing for a run of at most `max_glyph_count` glyphs.
     pub fn preSizeForFlush(self: *ShapingBuffers, alloc: std.mem.Allocator, max_glyph_count: usize) !void {
         try self.ensureCapacity(alloc, max_glyph_count);
     }
@@ -38,9 +37,10 @@ pub const ShapingBuffers = struct {
                self.y_off.capacity >= cap;
     }
 
-    /// Set the logical length of all buffers.
-    /// Hot-path: assumes capacity pre-sized via preSizeForFlush(); no allocation.
-    /// Setup-phase fallback: if capacity insufficient, dynamically allocates.
+    /// Set the logical length of all buffers. Allocates when `n` exceeds the
+    /// pre-sized capacity: a run's glyph count is bounded neither by the
+    /// pre-size (a row may hold MAX_GRID_COLS cells plus overflow scalars) nor
+    /// by its scalar count (the shaper may return more glyphs).
     pub fn setLen(self: *ShapingBuffers, alloc: ?std.mem.Allocator, n: usize) !void {
         // Fast-path: capacity is sufficient, no allocation needed.
         if (self.hasCapacity(n)) {
@@ -53,8 +53,6 @@ pub const ShapingBuffers = struct {
             return;
         }
 
-        // Setup-phase fallback: capacity insufficient; dynamically allocate.
-        // This indicates preSizeForFlush() estimate was too small (tuning needed).
         if (alloc == null) @panic("ShapingBuffers.setLen: capacity insufficient and no allocator provided");
 
         try self.ensureCapacity(alloc.?, n);

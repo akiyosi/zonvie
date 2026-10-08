@@ -3207,7 +3207,7 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
 }
 
 // Abort the current flush cycle.
-// Called from on_flush_begin when the frontend cannot accept this flush.
+// Called from on_flush_begin or on_flush_end when the frontend cannot accept this flush.
 pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

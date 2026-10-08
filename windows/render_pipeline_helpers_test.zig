@@ -931,6 +931,112 @@ test "the present gate answers what the external driver answered, for every inpu
     }
 }
 
+/// Every main-driver input the oracle sweep covers, with its gate. The named
+/// properties below hold over this whole space independently of the oracle.
+fn sweepMainGate(comptime check: fn (helpers.PresentGateInputs, helpers.PresentGate) anyerror!void) !void {
+    var bits: u32 = 0;
+    while (bits < (1 << 12)) : (bits += 1) {
+        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
+            for ([_]u32{ 0, 1 }) |skipped_empty| {
+                for ([_]usize{ 0, 4 }) |rows| {
+                    for ([_]usize{ 0, 4 }) |row_valid_count| {
+                        const in = helpers.PresentGateInputs{
+                            .layout_ok = bits & (1 << 0) != 0,
+                            .metrics_ok = bits & (1 << 1) != 0,
+                            .frame_incomplete = bits & (1 << 2) != 0,
+                            .force_full_rows = bits & (1 << 3) != 0,
+                            .preserve_back = bits & (1 << 4) != 0,
+                            .custom_shader = bits & (1 << 5) != 0,
+                            .present_rects_overflowed = bits & (1 << 6) != 0,
+                            .present_rects = if (bits & (1 << 7) != 0) 2 else 0,
+                            .rows = rows,
+                            .rows_to_draw = rows_to_draw,
+                            .skipped_empty = skipped_empty,
+                            .empty_damage_presents_all = true,
+                            .seed = .{
+                                .pending = bits & (1 << 8) != 0,
+                                .clear = bits & (1 << 9) != 0,
+                                .back_tex_valid = bits & (1 << 10) != 0,
+                                .rows_mismatch = bits & (1 << 11) != 0,
+                                .row_valid_count = row_valid_count,
+                            },
+                        };
+                        try check(in, helpers.presentGate(in));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn drewEveryRow(in: helpers.PresentGateInputs) bool {
+    return in.skipped_empty == 0 and in.rows_to_draw == in.rows;
+}
+
+test "present gate property: a stale layout, stale metrics or incomplete frame never presents" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete)
+                try std.testing.expectEqual(helpers.PresentVerdict.refuse, g.verdict);
+        }
+    }.f);
+}
+
+test "present gate property: a cleared back buffer presents to every swapchain buffer" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete or !in.seed.?.clear) return;
+            try std.testing.expectEqual(helpers.PresentVerdict.present, g.verdict);
+            try std.testing.expect(g.full);
+        }
+    }.f);
+}
+
+test "present gate property: a seed with a row-count mismatch presents only when it drew rows and skipped none" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            const s = in.seed.?;
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete) return;
+            if (s.clear or !s.pending or !in.preserve_back or !s.rows_mismatch or in.rows == 0) return;
+            const want: helpers.PresentVerdict = if (in.rows_to_draw != 0 and in.skipped_empty == 0) .present else .refuse;
+            try std.testing.expectEqual(want, g.verdict);
+        }
+    }.f);
+}
+
+test "present gate property: the first seed present without a back buffer covers every row, in full" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            const s = in.seed.?;
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete) return;
+            if (s.clear or !s.pending or !in.preserve_back or s.back_tex_valid or s.rows_mismatch) return;
+            if (g.verdict == .present) {
+                try std.testing.expect(in.rows != 0 and s.row_valid_count == in.rows and drewEveryRow(in));
+                try std.testing.expect(g.full);
+            }
+        }
+    }.f);
+}
+
+test "present gate property: no row count yet never presents unless the seed resets the buffer" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            const s = in.seed.?;
+            if (in.rows != 0 or s.clear or (s.pending and !in.preserve_back)) return;
+            try std.testing.expect(g.verdict != .present);
+        }
+    }.f);
+}
+
+test "present gate property: a frame that drew every row leaves back_tex valid" {
+    try sweepMainGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (in.rows != 0 and drewEveryRow(in)) try std.testing.expect(g.back_tex_valid);
+            if (!in.preserve_back and !(in.rows != 0 and drewEveryRow(in))) try std.testing.expect(!g.back_tex_valid);
+        }
+    }.f);
+}
+
 test "a surface whose chrome draws without damage never skips an empty present" {
     const in = helpers.PresentGateInputs{
         .force_full_rows = false,
@@ -1691,4 +1797,184 @@ test "the cursor row scissor stays inside the cursor's layer" {
         TestRect{ .left = 10, .top = 30, .right = 10 + 240, .bottom = 46 },
         helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 0, 240, 0, 16),
     );
+}
+
+// --- on_vertices_row disposition (zonvie_core.h, on_vertices_row) ---
+
+test "a cursor-only update is the main surface's for grid 1 and its layers, the external path's otherwise" {
+    const R = helpers.RowGridRoute;
+    // Grid 1 never needs a route.
+    for ([_]R{ .main_root, .main_layer, .external_root, .external_layer, .unplaced }) |r|
+        try std.testing.expect(helpers.mainSurfaceTakesCursor(1, r));
+    try std.testing.expect(helpers.mainSurfaceTakesCursor(5, .main_layer));
+    try std.testing.expect(helpers.mainSurfaceTakesCursor(5, .main_root));
+    try std.testing.expect(!helpers.mainSurfaceTakesCursor(5, .external_root));
+    try std.testing.expect(!helpers.mainSurfaceTakesCursor(5, .external_layer));
+    try std.testing.expect(!helpers.mainSurfaceTakesCursor(5, .unplaced));
+}
+
+test "clearing a different grid's cursor does not clear the owner's" {
+    // Header: "clearing a different grid must not clear the current owner's cursor".
+    try std.testing.expect(helpers.ignoresCursorClear(0, 1, 5));
+    // The owner's own clear applies.
+    try std.testing.expect(!helpers.ignoresCursorClear(0, 5, 5));
+    // A non-empty cursor from any grid takes ownership.
+    try std.testing.expect(!helpers.ignoresCursorClear(6, 1, 5));
+    try std.testing.expect(!helpers.ignoresCursorClear(6, 5, 5));
+}
+
+test "external row disposition: every route crossed with cursor and window liveness" {
+    const R = helpers.RowGridRoute;
+    const D = helpers.ExternalRowDisposition;
+    const Case = struct { cursor: bool, route: R, live: bool, want: D };
+    const cases = [_]Case{
+        // A row for a grid some surface places as a layer goes to that layer,
+        // whatever window exists.
+        .{ .cursor = false, .route = .main_root, .live = false, .want = .layer_row },
+        .{ .cursor = false, .route = .main_layer, .live = true, .want = .layer_row },
+        .{ .cursor = false, .route = .main_layer, .live = false, .want = .layer_row },
+        .{ .cursor = false, .route = .external_layer, .live = true, .want = .layer_row },
+        .{ .cursor = false, .route = .external_layer, .live = false, .want = .layer_row },
+        // An external root or unplaced grid: its window, or a pending capture.
+        .{ .cursor = false, .route = .external_root, .live = true, .want = .live_row },
+        .{ .cursor = false, .route = .external_root, .live = false, .want = .pending_row },
+        .{ .cursor = false, .route = .unplaced, .live = true, .want = .live_row },
+        .{ .cursor = false, .route = .unplaced, .live = false, .want = .pending_row },
+        // A cursor update never replaces row contents, so it is never a layer row.
+        .{ .cursor = true, .route = .main_layer, .live = true, .want = .live_cursor },
+        .{ .cursor = true, .route = .external_layer, .live = true, .want = .live_cursor },
+        .{ .cursor = true, .route = .external_layer, .live = false, .want = .pending_cursor },
+        .{ .cursor = true, .route = .external_root, .live = true, .want = .live_cursor },
+        .{ .cursor = true, .route = .external_root, .live = false, .want = .pending_cursor },
+        .{ .cursor = true, .route = .unplaced, .live = false, .want = .pending_cursor },
+    };
+    for (cases) |cs| {
+        try std.testing.expectEqual(cs.want, helpers.externalRowDisposition(.{
+            .cursor = cs.cursor,
+            .route = cs.route,
+            .live_window = cs.live,
+        }));
+    }
+}
+
+test "main row disposition follows the on_vertices_row contract" {
+    const D = helpers.MainRowDisposition;
+    const Case = struct { main: bool, row_start: u32, row_count: u32, vert_count: usize, rows: u32, cols: u32, want: D };
+    const cases = [_]Case{
+        // "When MAIN is not set, existing row contents must be retained."
+        .{ .main = false, .row_start = 0, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .retain_rows },
+        .{ .main = false, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 0, .want = .retain_rows },
+        // Layout-only zero-cell transition: row_count 0, no verts, a zero dimension.
+        .{ .main = true, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 10, .want = .layout_only },
+        .{ .main = true, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 0, .want = .layout_only },
+        .{ .main = true, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 0, .want = .layout_only },
+        // Both dimensions non-zero: not a zero-cell layout.
+        .{ .main = true, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 10, .want = .no_row },
+        // total_rows is authoritative: a row outside it is not row content.
+        .{ .main = true, .row_start = 4, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .out_of_range },
+        .{ .main = true, .row_start = 9, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 10, .want = .out_of_range },
+        // No row count yet (first seed): a row payload is still row content.
+        .{ .main = true, .row_start = 0, .row_count = 1, .vert_count = 6, .rows = 0, .cols = 10, .want = .single_row },
+        .{ .main = true, .row_start = 3, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .single_row },
+        // An empty row is still a row: it replaces the old contents.
+        .{ .main = true, .row_start = 0, .row_count = 1, .vert_count = 0, .rows = 4, .cols = 10, .want = .single_row },
+        .{ .main = true, .row_start = 0, .row_count = 2, .vert_count = 12, .rows = 4, .cols = 10, .want = .multi_row },
+    };
+    for (cases) |cs| {
+        try std.testing.expectEqual(cs.want, helpers.mainRowDisposition(.{
+            .main = cs.main,
+            .row_start = cs.row_start,
+            .row_count = cs.row_count,
+            .vert_count = cs.vert_count,
+            .total_rows = cs.rows,
+            .total_cols = cs.cols,
+        }));
+    }
+}
+
+// --- back-buffer damage queue ---
+
+const Damage = helpers.BackDamageQueue(TestRect, 4, 64);
+
+fn tr(l: i32, t: i32, r: i32, b: i32) TestRect {
+    return .{ .left = l, .top = t, .right = r, .bottom = b };
+}
+
+test "back damage: a new queue owes every buffer a full copy" {
+    const q = Damage{};
+    for (q.full) |f| try std.testing.expect(f);
+}
+
+test "back damage: overlapping rects merge transitively into one" {
+    var q = Damage{};
+    q.clear(0);
+    // Two disjoint rects, then one that bridges them.
+    q.queue(&.{ tr(0, 0, 10, 10), tr(20, 0, 30, 10) }, false, 1, 100, 100);
+    try std.testing.expectEqual(@as(usize, 2), q.pending(0).len);
+    q.queue(&.{tr(5, 0, 25, 10)}, false, 1, 100, 100);
+    try std.testing.expectEqualSlices(TestRect, &.{tr(0, 0, 30, 10)}, q.pending(0));
+}
+
+test "back damage: only the first buffer_count buffers are queued" {
+    var q = Damage{};
+    for (0..4) |i| q.clear(i);
+    q.queue(&.{tr(0, 0, 10, 10)}, false, 2, 100, 100);
+    try std.testing.expectEqual(@as(usize, 1), q.pending(0).len);
+    try std.testing.expectEqual(@as(usize, 1), q.pending(1).len);
+    try std.testing.expectEqual(@as(usize, 0), q.pending(2).len);
+}
+
+test "back damage: the 65th disjoint rect promotes the buffer to a full copy" {
+    var q = Damage{};
+    q.clear(0);
+    var i: i32 = 0;
+    while (i < 64) : (i += 1) q.queue(&.{tr(i * 3, 0, i * 3 + 1, 1)}, false, 1, 1000, 10);
+    try std.testing.expect(!q.full[0]);
+    try std.testing.expectEqual(@as(usize, 64), q.pending(0).len);
+    q.queue(&.{tr(500, 5, 501, 6)}, false, 1, 1000, 10);
+    try std.testing.expect(q.full[0]);
+    try std.testing.expectEqual(@as(usize, 0), q.pending(0).len);
+}
+
+test "back damage: a rect that clamps to nothing makes every queued buffer full" {
+    var q = Damage{};
+    for (0..4) |i| q.clear(i);
+    q.queue(&.{ tr(0, 0, 10, 10), tr(200, 200, 300, 300) }, false, 3, 100, 100);
+    try std.testing.expect(q.full[0] and q.full[1] and q.full[2]);
+    try std.testing.expect(!q.full[3]);
+}
+
+test "back damage: rects clamp to the target" {
+    try std.testing.expectEqual(@as(?TestRect, tr(0, 0, 100, 50)), Damage.clampRect(tr(-5, -5, 120, 50), 100, 80));
+    try std.testing.expectEqual(@as(?TestRect, null), Damage.clampRect(tr(10, 10, 10, 20), 100, 80));
+}
+
+test "back damage: a full queue request drops the buffers' rects" {
+    var q = Damage{};
+    q.clear(0);
+    q.queue(&.{tr(0, 0, 10, 10)}, false, 1, 100, 100);
+    q.queue(&.{}, true, 1, 100, 100);
+    try std.testing.expect(q.full[0]);
+    try std.testing.expectEqual(@as(usize, 0), q.pending(0).len);
+}
+
+// --- content viewport scissor ---
+
+test "content scissor is the whole viewport without a dirty rect" {
+    try std.testing.expectEqual(tr(10, 20, 110, 70), helpers.contentScissor(TestRect, 10, 20, 100, 50, null));
+}
+
+test "content scissor translates a dirty rect into render-target space" {
+    try std.testing.expectEqual(tr(15, 25, 40, 45), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(5, 5, 30, 25)));
+}
+
+test "content scissor clamps a dirty rect past the viewport's right and bottom edges" {
+    try std.testing.expectEqual(tr(15, 25, 110, 70), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(5, 5, 500, 500)));
+}
+
+test "content scissor clamps a negative dirty origin to the render target's origin, not the viewport's" {
+    // A dirty rect left of the viewport keeps the viewport-relative offset
+    // down to the target's own origin.
+    try std.testing.expectEqual(tr(0, 0, 40, 45), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(-30, -30, 30, 25)));
+    try std.testing.expectEqual(tr(5, 15, 40, 45), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(-5, -5, 30, 25)));
 }

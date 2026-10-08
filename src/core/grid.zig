@@ -568,7 +568,8 @@ fn scrollCells(
 /// `rows` is negated when negative, except that `minInt(i32)` has no positive
 /// counterpart -- negating it overflows -- so it reports `height`, the
 /// smallest value that still satisfies every caller's `shift >= height` test
-/// and sends them down the clear-the-whole-region path.
+/// and sends them down the clear-the-whole-region path. scrollGrid clamps the
+/// delta to the region height first, so the redraw path never reaches that arm.
 fn scrollShift(rows: i32, height: u32) u32 {
     if (rows == std.math.minInt(i32)) return height;
     const a: i32 = if (rows < 0) -rows else rows;
@@ -814,7 +815,9 @@ pub const GridBuf = struct {
     rows: u32 = 0,
     cols: u32 = 0,
     cells: []Cell = &[_]Cell{},
-    dirty: bool = true, // Dirty flag for external grid vertex updates
+    // Set whenever dirty_all or a dirty_rows bit is set (and also by a
+    // zero-cell resize, which sets no bit); anyDirty() is the row test.
+    dirty: bool = true,
     dirty_rows: std.DynamicBitSetUnmanaged = .{}, // Row-level dirty tracking for partial updates
     // Dominates dirty_rows: when set, every row in [0, rows) is dirty and the
     // per-row bits are not maintained. Only clearDirtyContent() clears it.
@@ -949,7 +952,8 @@ pub const GridBuf = struct {
         self.dirty_all = true;
     }
 
-    /// Returns true if the cell was actually changed.
+    /// Returns true if the cell was actually changed. Outside
+    /// [0, rows) x [0, cols) it writes nothing and returns false; never clamps.
     fn putCell(self: *GridBuf, row: u32, col: u32, cp: u32, hl: u32) bool {
         if (row >= self.rows or col >= self.cols) return false;
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
@@ -963,6 +967,9 @@ pub const GridBuf = struct {
         return true;
     }
 
+    /// Outside [0, rows) x [0, cols) returns `{cp=0, hl=0}`, which is
+    /// indistinguishable from a stored U+0000; bounds-check first when that
+    /// matters.
     fn getCell(self: *const GridBuf, row: u32, col: u32) Cell {
         if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
@@ -971,36 +978,30 @@ pub const GridBuf = struct {
 
     /// Implements the "grid_scroll" UI event for a sub-grid.
     /// Note: 'cols' is reserved (currently always 0 in Nvim) and is ignored.
+    /// Precondition: the region and delta are normalised (scrollGrid), and no
+    /// flush bracket is open, so `owed_rows` need not move with the cells.
     fn scroll(
         self: *GridBuf,
-        top_in: u32,
-        bot_in: u32,
-        left_in: u32,
-        right_in: u32,
+        top: u32,
+        bot: u32,
+        left: u32,
+        right: u32,
         rows: i32,
         cols: i32,
     ) void {
         _ = cols;
-
-        if (self.rows == 0 or self.cols == 0) return;
-        if (rows == 0) return;
-
-        // Safety check: ensure cells buffer is correctly sized
-        const expected_len: usize = @as(usize, self.rows) * @as(usize, self.cols);
-        if (self.cells.len < expected_len) return;
-
-        const top: u32 = if (top_in > self.rows) self.rows else top_in;
-        const bot: u32 = if (bot_in > self.rows) self.rows else bot_in;
-        const left: u32 = if (left_in > self.cols) self.cols else left_in;
-        const right: u32 = if (right_in > self.cols) self.cols else right_in;
-        if (top >= bot or left >= right) return;
+        std.debug.assert(!self.owed);
+        std.debug.assert(rows != 0);
+        std.debug.assert(top < bot and bot <= self.rows);
+        std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(self.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;
         const shift: u32 = scrollShift(rows, height);
 
-        // Keep the last-submitted vertex ledger aligned with the frontend's
-        // row-slot scroll. This is allocation-free and touches only the same
-        // row interval already being moved below.
+        // The ledger follows the core's cells, not the frontend's row slots:
+        // a scroll the frontend does not shift (partial width, more than half
+        // the region) makes the flush regenerate every row, which rewrites it.
         if (self.vertex_row_ledger_valid and self.vertex_row_counts.len >= self.rows) {
             if (shift >= height) {
                 for (top..bot) |row| {
@@ -1101,10 +1102,10 @@ pub const GridBuf = struct {
         if (self.dirty_all or sent_all) {
             self.owed = true;
             self.owed_all = true;
-        } else if (self.owed_rows.bit_length == self.dirty_rows.bit_length) {
-            self.owed_rows.setUnion(self.dirty_rows);
         } else {
-            self.owed_all = true;
+            // resize sizes both bitsets together.
+            std.debug.assert(self.owed_rows.bit_length == self.dirty_rows.bit_length);
+            self.owed_rows.setUnion(self.dirty_rows);
         }
         self.clearDirtyContent();
     }
@@ -1124,10 +1125,9 @@ pub const GridBuf = struct {
         self.dirty = true;
         if (self.owed_all) {
             self.dirty_all = true;
-        } else if (self.owed_rows.bit_length == self.dirty_rows.bit_length) {
-            self.dirty_rows.setUnion(self.owed_rows);
         } else {
-            self.dirty_all = true;
+            std.debug.assert(self.owed_rows.bit_length == self.dirty_rows.bit_length);
+            self.dirty_rows.setUnion(self.owed_rows);
         }
         self.commitOwed();
     }
@@ -1702,6 +1702,7 @@ pub const Grid = struct {
     fn ensureOverflowGridIndexCapacity(self: *Grid, key: OverflowKey) !void {
         const gop = try self.overflow_by_grid.getOrPut(self.alloc, key.grid_id);
         if (!gop.found_existing) gop.value_ptr.* = .{};
+        errdefer if (!gop.found_existing) self.releaseOverflowIndexForGrid(key.grid_id);
         try gop.value_ptr.keys.ensureUnusedCapacity(self.alloc, 1);
         try gop.value_ptr.positions.ensureUnusedCapacity(self.alloc, 1);
     }
@@ -1812,12 +1813,10 @@ pub const Grid = struct {
     /// Entries in the scroll region are shifted by `shift_rows`, entries in the
     /// vacated band are removed.
     ///
-    /// Precondition (Tier 1 mutation boundary):
-    /// - Caller must ensure scratch buffers have capacity:
-    ///   self.overflow_key_scratch.capacity >= grid.overflow_count
-    ///   self.overflow_moved_scratch.capacity >= grid.overflow_count
-    /// - Capacity is guaranteed at insertion time (addOverflowIndexAssumeCapacity),
-    ///   so no allocation or OOM branch occurs after base cells have moved.
+    /// Relies on the Grid invariant that both overflow scratch buffers hold
+    /// at least `cell_overflow.count()` entries, which putCellGridCluster
+    /// upholds via ensureOverflowScratchCapacity before every insert; callers
+    /// owe nothing, and no allocation happens after the base cells moved.
     pub fn scrollOverflow(self: *Grid, grid_id: i64, top: u32, bot: u32, left: u32, right: u32, rows_delta: i32) void {
         const grid_overflow_count = self.overflowCountForGrid(grid_id);
         if (grid_overflow_count == 0) return;
@@ -1831,8 +1830,7 @@ pub const Grid = struct {
         }
 
         // Collect only sparse overflow entries, not every cell in the scroll
-        // rectangle. Scratch capacity is guaranteed at insertion time, so no
-        // allocation or OOM branch exists after base cells have moved.
+        // rectangle.
         std.debug.assert(self.overflow_key_scratch.capacity >= grid_overflow_count);
         std.debug.assert(self.overflow_moved_scratch.capacity >= grid_overflow_count);
         self.overflow_key_scratch.clearRetainingCapacity();
@@ -1904,9 +1902,9 @@ pub const Grid = struct {
     };
 
     pub fn setGridMetricsPx(self: *Grid, grid_id: i64, cell_w_px: u32, cell_h_px: u32) !void {
-        const cw = if (cell_w_px == 0) 1 else cell_w_px;
-        const ch = if (cell_h_px == 0) 1 else cell_h_px;
-        try self.grid_metrics.put(self.alloc, grid_id, .{ .cell_w_px = cw, .cell_h_px = ch });
+        // Placement divides by the cell size; the layout path maps 0 to 1 px.
+        std.debug.assert(cell_w_px != 0 and cell_h_px != 0);
+        try self.grid_metrics.put(self.alloc, grid_id, .{ .cell_w_px = cell_w_px, .cell_h_px = cell_h_px });
     }
 
     pub fn getGridMetricsPx(self: *const Grid, grid_id: i64) CellMetricsPx {
@@ -1977,8 +1975,9 @@ pub const Grid = struct {
         while (sg_it.next()) |sg| sg.returnOwed();
     }
 
-    pub fn clear(self: *Grid) void {
-        @memset(self.main_buf.cells, .{ .cp = ' ', .hl = 0 });
+    /// Debug check of the `rows`/`cols` mirror of `main_buf`; for flush entry.
+    pub fn assertMainShapeMirrored(self: *const Grid) void {
+        std.debug.assert(self.rows == self.main_buf.rows and self.cols == self.main_buf.cols);
     }
 
     pub fn resize(self: *Grid, rows: u32, cols: u32) !void {
@@ -2018,28 +2017,22 @@ pub const Grid = struct {
 
     /// Implements the "grid_scroll" UI event by copying a rectangular region.
     /// Note: 'cols' is reserved (currently always 0 in Nvim); checked for no-op detection but not used in scroll logic.
+    /// Precondition: the region and delta are normalised (scrollGrid).
     pub fn scroll(
         self: *Grid,
-        top_in: u32,
-        bot_in: u32,
-        left_in: u32,
-        right_in: u32,
+        top: u32,
+        bot: u32,
+        left: u32,
+        right: u32,
         rows: i32,
         cols: i32,
     ) void {
-        if (self.rows == 0 or self.cols == 0) return;
-        if (rows == 0 and cols == 0) return;
-
-        const top: u32 = if (top_in > self.rows) self.rows else top_in;
-        const bot: u32 = if (bot_in > self.rows) self.rows else bot_in;
-        const left: u32 = if (left_in > self.cols) self.cols else left_in;
-        const right: u32 = if (right_in > self.cols) self.cols else right_in;
-
-        if (top >= bot or left >= right) return;
+        _ = cols;
+        std.debug.assert(rows != 0);
+        std.debug.assert(top < bot and bot <= self.rows);
+        std.debug.assert(left < right and right <= self.cols);
 
         const height: u32 = bot - top;
-
-        if (rows == 0) return;
 
         const shift: u32 = scrollShift(rows, height);
 
@@ -2076,6 +2069,7 @@ pub const Grid = struct {
             // pass has already cleared the rows by then), so a shrink under
             // the cursor must bump it to reach the out-of-grid empty set.
             if (shape_changed and self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
+            self.invalidateCursorOutside(grid_id, rows, cols);
             // Remove overflow entries that fall outside the new dimensions.
             // Entries within [0, rows) x [0, cols) are preserved (matching
             // the cell copy behavior of resize()).
@@ -2093,6 +2087,7 @@ pub const Grid = struct {
             if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
+            self.invalidateCursorOutside(grid_id, rows, cols);
 
             // The pixels the resize exposes are the frontend's, from the
             // layout it publishes. A resize to or from a zero dimension also
@@ -2122,12 +2117,23 @@ pub const Grid = struct {
         // (regenerateRootsWhoseDefaultBgRuleFlipped).
     }
 
+    /// Keeps `cursor_valid => cursor inside cursor_grid` across a shrink.
+    /// Neovim's own cursor never leaves its grid, so a shrink past it is
+    /// followed by a grid_cursor_goto to a different cell; until then nothing
+    /// is drawn, as the consumers' bounds checks already did. Clamping instead
+    /// would draw a cursor on a cell Neovim never named.
+    fn invalidateCursorOutside(self: *Grid, grid_id: i64, rows: u32, cols: u32) void {
+        if (!self.cursor_valid or self.cursor_grid != grid_id) return;
+        if (self.cursor_row < rows and self.cursor_col < cols) return;
+        self.cursor_valid = false;
+        self.cursor_rev +%= 1;
+    }
+
     pub fn clearGrid(self: *Grid, grid_id: i64) void {
         if (grid_id == 1) {
             self.glyph_working_set_rev +%= 1;
-            self.clear();
+            self.main_buf.clear();
             self.clearOverflowForGrid(1);
-            self.markAllDirty();
             // The cursor cell's glyph is gone; see resizeGrid.
             if (self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
             return;
@@ -2304,6 +2310,7 @@ pub const Grid = struct {
     /// pair a new base scalar with stale/missing variation selectors, combining
     /// marks, or ZWJ components. At the bounded overflow limit, a new cluster
     /// degrades visibly to U+FFFD without aborting the surrounding redraw batch.
+    /// An unknown grid or a cell outside it is ignored; never clamps.
     pub fn putCellGridCluster(
         self: *Grid,
         grid_id: i64,
@@ -2335,10 +2342,13 @@ pub const Grid = struct {
             // scrollOverflow must stay allocation-free after cells move. Grow
             // its bounded sparse scratch before publishing a new map entry.
             try self.ensureOverflowScratchCapacity(self.cell_overflow.count() + @intFromBool(is_new));
-            if (is_new) try self.ensureOverflowGridIndexCapacity(key);
-            // Publish overflow before the infallible base-cell mutation.
-            // AutoHashMap.put leaves an old entry intact on OOM.
-            try self.cell_overflow.put(self.alloc, key, value);
+            // Every fallible step precedes the first publish, so OOM leaves
+            // neither a map entry nor an empty per-grid index behind.
+            if (is_new) {
+                try self.cell_overflow.ensureUnusedCapacity(self.alloc, 1);
+                try self.ensureOverflowGridIndexCapacity(key);
+            }
+            self.cell_overflow.putAssumeCapacity(key, value);
             if (is_new) self.addOverflowIndexAssumeCapacity(key);
         } else if (self.overflowCountForGrid(grid_id) != 0) {
             // Single-scalar cells dominate grid_line. Preserve the empty-map
@@ -2997,6 +3007,8 @@ pub const Grid = struct {
         return self.external_grids.contains(grid_id);
     }
 
+    /// Ignores an unknown grid or a cell outside it, leaving the previous
+    /// cursor in place; never clamps.
     pub fn setCursor(self: *Grid, grid_id: i64, row: u32, col: u32) void {
         const buf = self.bufForConst(grid_id) orelse return;
         if (row >= buf.rows or col >= buf.cols) return;
@@ -4208,6 +4220,7 @@ fn checkClusterAllocationFailure(alloc: std.mem.Allocator) !void {
         // side may publish if hash-map growth fails.
         try std.testing.expectEqual(Cell{ .cp = 'A', .hl = 7 }, grid.getCellGrid(1, 0, 0));
         try std.testing.expect(grid.getOverflow(1, 0, 0) == null);
+        try std.testing.expect(!grid.overflow_by_grid.contains(1));
         return err;
     };
 
@@ -4304,6 +4317,84 @@ test "subgrid scroll keeps submitted vertex counts aligned with row slots" {
     grid_buf.scroll(0, 4, 0, 1, -1, 0);
     try std.testing.expectEqualSlices(usize, &.{ 0, 20, 30, 40 }, grid_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
+}
+
+test "partial-width subgrid scroll shifts the ledger with the core's cells" {
+    // The ledger follows the cells even though the frontend will not shift a
+    // partial-width region; the flush then regenerates every row and rewrites
+    // it, so the sum invariant still holds.
+    var grid_buf: GridBuf = .{};
+    defer grid_buf.deinit(std.testing.allocator);
+    try grid_buf.resize(std.testing.allocator, 4, 4);
+    @memcpy(grid_buf.vertex_row_counts, &[_]usize{ 10, 20, 30, 40 });
+    grid_buf.surface_vertex_count = 100;
+
+    grid_buf.scroll(0, 4, 1, 3, 1, 0);
+    try std.testing.expectEqualSlices(usize, &.{ 20, 30, 40, 0 }, grid_buf.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
+}
+
+fn overflowScrollFixture(grid: *Grid) !void {
+    try grid.resizeGrid(1, 4, 4);
+    try grid.putCellGridCluster(1, 1, 0, 'a', 0, &.{0x0301});
+    try grid.putCellGridCluster(1, 2, 3, 'b', 0, &.{0x0302});
+}
+
+test "scrollOverflow moves clusters down on a negative delta" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 4, -1);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 2, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 3, 3).?);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+}
+
+test "scrollOverflow leaves clusters outside the column range in place" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 2, 1);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 0, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 2, 3).?);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+}
+
+test "scrollOverflow by the region height clears every cluster in it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 4, 4);
+    try std.testing.expectEqual(@as(usize, 0), grid.overflowCountForGrid(1));
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_overflow.count());
+}
+
+test "shrinking a grid under the cursor invalidates it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 4, 4);
+    try grid.resizeGrid(2, 4, 4);
+
+    // In bounds after the shrink: the cursor stays valid where it was.
+    grid.setCursor(2, 1, 1);
+    try grid.resizeGrid(2, 2, 2);
+    try std.testing.expect(grid.cursor_valid);
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_row);
+
+    // Outside the new shape: Neovim keeps its cursor inside the grid, so a
+    // grid_cursor_goto to a different cell follows; until then there is none.
+    grid.setCursor(2, 1, 1);
+    const rev = grid.cursor_rev;
+    try grid.resizeGrid(2, 1, 2);
+    try std.testing.expect(!grid.cursor_valid);
+    try std.testing.expect(grid.cursor_rev != rev);
+
+    grid.setCursor(1, 3, 3);
+    try grid.resizeGrid(1, 4, 3);
+    try std.testing.expect(!grid.cursor_valid);
 }
 
 test "viewport metadata ignores unknown grids, except margins" {

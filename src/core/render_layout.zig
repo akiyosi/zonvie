@@ -71,7 +71,11 @@ pub fn List(comptime T: type) type {
                     self.items = s.items[0..len];
                     return;
                 }
-            } else if (len == 0) return;
+            }
+            if (len == 0) {
+                self.deinit();
+                return;
+            }
             const old_capacity = if (self.storage) |s| s.items.len else 0;
             const capacity = if (len > old_capacity) @max(len, old_capacity *| 2) else old_capacity;
             const data_bytes = std.math.mul(usize, capacity, @sizeOf(T)) catch return error.LayoutBudgetExceeded;
@@ -99,6 +103,22 @@ pub fn List(comptime T: type) type {
             self.items[old_len] = value;
         }
     };
+}
+
+test "emptying a shared layout drops the reference without a new block" {
+    var budget = Budget{};
+    var list = List(u64){};
+    defer list.deinit();
+    try list.resize(std.testing.allocator, &budget, 4);
+    var snapshot = list.retain();
+    defer snapshot.deinit();
+    const before = budget.live_bytes.load(.monotonic);
+
+    try list.resize(std.testing.allocator, &budget, 0);
+    try std.testing.expect(list.storage == null);
+    try std.testing.expectEqual(@as(usize, 0), list.len);
+    try std.testing.expectEqual(before, budget.live_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 4), snapshot.len);
 }
 
 test "layout replacement preserves paint snapshots and reuses exclusive capacity" {

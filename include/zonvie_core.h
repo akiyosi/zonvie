@@ -208,7 +208,7 @@ typedef void (*zonvie_on_vertices_row_fn)(
    A grid resized in the same batch gets no shift: its rows are resent. A grid
    moved to another surface also has all its rows resent, so a shift never
    refers to rows held for a different surface.
-   Fired after abort check, before clearDirty. */
+   Fired after abort check, before consumeDirtyForSend. */
 typedef void (*zonvie_on_grid_row_scroll_fn)(
     void* ctx,
     int64_t grid_id,

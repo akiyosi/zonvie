@@ -52,12 +52,9 @@ pub const GridEntry = struct {
 const MAX_VERTEX_BYTES_PER_SURFACE: usize =
     if (@import("builtin").mode == .Debug) 256 * 1024 * 1024 * 1024   // Tier 3 test: 256 GiB
     else 2 * 1024 * 1024 * 1024;                                      // Tier 3 prod: 2 GiB
-const MAX_VERTEX_BYTES_AGGREGATE: usize =
-    if (@import("builtin").mode == .Debug) 512 * 1024 * 1024 * 1024   // Tier 3 test: 512 GiB
-    else 8 * 1024 * 1024 * 1024;                                      // Tier 3 prod: 8 GiB
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
-// callback payload limit aligned with that consumer, then bound retained
-// logical surface and process-wide output independently. Counts are charged
+// callback payload limit aligned with that consumer, then bound each retained
+// logical surface independently. Counts are charged
 // from generated output, not from a per-cell estimate: blank grids remain
 // cheap while overflow clusters are accounted at their actual glyph count.
 //
@@ -86,7 +83,6 @@ const MAX_VERTEX_BYTES_PER_CALLBACK: usize =
     else 1024 * 1024 * 1024;                                          // Tier 3 prod: 1 GiB
 const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
-const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
 
 /// Flush commit disposition: explicit state for vertex budget transaction completion.
 const FlushCommitMode = enum {
@@ -97,28 +93,23 @@ const FlushCommitMode = enum {
 
 /// Vertex budget and shaping buffer errors.
 const VertexBudgetError = error{
-    VertexBudgetExceededPerCallback,   // Single row exceeds 256 MiB
-    VertexBudgetExceededPerSurface,    // Grid surface total exceeds 256 MiB
-    VertexBudgetExceededAggregate,     // Main + all subgrids exceeds 512 MiB
+    VertexBudgetExceededPerCallback,   // One row exceeds MAX_VERTICES_PER_CALLBACK
+    VertexBudgetExceededPerSurface,    // One grid surface exceeds MAX_VERTICES_PER_SURFACE
+    VertexBudgetExceededAggregate,     // The summed counts overflow usize
     VertexBudgetInvariantViolated,     // Ledger state this file maintains is inconsistent
     OutOfMemory,                        // ShapingBuffers allocation failed (transient)
 };
 
+// Every budget error is a hard render failure (Core.isHardRenderFailure): the
+// flush is aborted and the session ends. OutOfMemory is not: the flush is
+// aborted with dirty state kept and stays retryable (abortFlushForRowError).
+
 fn vertexBudgetExceededPerCallback(core: *Core) VertexBudgetError {
-    // Tier D1: PerCallback recovery — skip single row, continue batch
     core.flush_retryable = false;
-    core.vertex_budget_current_row_skipped = true;
     return error.VertexBudgetExceededPerCallback;
 }
 
-// OutOfMemory error handling strategy:
-// - Returned by: ShapingBuffers.ensureCapacity (burst allocation for text shaping)
-// - Recovery: Transient. Caller catches OutOfMemory → abort_flush + dirty_state_restore
-// - Frontend observes: no vertices submitted on error path; partial redraw state preserved
-// - Re-try: Same dirty regions on next flush with reduced content or post-GC retry
-
 fn vertexBudgetExceededPerSurface(core: *Core) VertexBudgetError {
-    // Tier D1: PerSurface recovery — abort surface, fallback to main
     core.flush_retryable = false;
     return error.VertexBudgetExceededPerSurface;
 }
@@ -134,9 +125,15 @@ fn vertexBudgetExceededAggregate(core: *Core) VertexBudgetError {
     return error.VertexBudgetExceededAggregate;
 }
 
-/// Unified error handler for vertex budget exceeded (defaults to Aggregate context).
-fn vertexBudgetExceeded(core: *Core) VertexBudgetError {
-    return vertexBudgetExceededAggregate(core);
+/// Abort the flush for an error raised while generating or charging a row.
+/// A fixed resource-limit violation also ends the session; anything else
+/// (allocation failure) leaves the abort retryable.
+fn abortFlushForRowError(core: *Core, err: anyerror) void {
+    core.flush_aborted = true;
+    if (Core.isHardRenderFailure(err)) {
+        core.flush_retryable = false;
+        core.failHardRender(err);
+    }
 }
 
 /// Assert: precondition that vertex_budget_transaction_active == false.
@@ -210,7 +207,7 @@ fn ensureRowVertexCapacity(
         out.capacity,
         additional_vertices,
         max_vertices,
-    ) catch return vertexBudgetExceeded(core);
+    ) catch return vertexBudgetExceededPerCallback(core);
     if (target <= out.capacity) return;
     try out.ensureTotalCapacityPrecise(core.alloc, target);
 }
@@ -222,13 +219,13 @@ fn ensureRowQuadCapacity(
     quad_count: usize,
 ) !void {
     const additional = std.math.mul(usize, quad_count, 6) catch
-        return vertexBudgetExceeded(core);
+        return vertexBudgetExceededPerCallback(core);
     try ensureRowVertexCapacity(core, out, max_vertices, additional);
 }
 
-/// Pure computation: sum main and subgrid vertex counts with bounds checking.
-/// Precondition: overflow detection via catch.
-/// Postcondition: returns aggregate count iff within limits or enforce_limits=false.
+/// Pure computation: sum main and subgrid vertex counts. Fails when the sum
+/// overflows, or when `enforce_limits` and grid 1 exceeds its surface limit.
+/// There is no aggregate limit: each surface's limit is the constraint.
 fn computeVertexBudgetAggregate(
     main_count: usize,
     subgrid_count: usize,
@@ -239,9 +236,6 @@ fn computeVertexBudgetAggregate(
     if (enforce_limits and main_count > MAX_VERTICES_PER_SURFACE) {
         return error.VertexBudgetExceeded;
     }
-    // Tier 2: Aggregate redistribution across external surfaces permitted within per-surface limits.
-    // Individual surface capacity (MAX_VERTICES_PER_SURFACE) is the enforced constraint.
-    // Note: remove aggregate > MAX_VERTICES_AGGREGATE constraint for comprehensive rendering support
     return aggregate;
 }
 
@@ -263,21 +257,21 @@ fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
 ///   - vertex_budget_transaction_active == true
 ///   - All grid touched flags cleared; vertex_budget_touched_grid_head == null
 ///   - flush_ledger_journal_failed == false (via beginLedgerJournal)
-/// Postcondition (on error):
+/// Postcondition (on error, VertexBudgetInvariantViolated):
 ///   - vertex_budget_transaction_active == false (unchanged)
-///   - core.flush_retryable == false (side effect: nvim will be terminated on unrecoverable budget overflow)
+///   - core.flush_retryable == false; the session is ended as a hard failure
 ///   - All other state unchanged; early return prevents corrupted touched list
 fn beginVertexBudgetTransaction(core: *Core) !void {
     std.debug.assert(!core.vertex_budget_transaction_active);
-    // Tier B1: Multi-grid capacity gate — ensure all sub-grids within budget before txn
+    // validateCompletedVertexBudget refuses to commit a frame over a surface
+    // limit, so a surface found over one here is broken bookkeeping.
     var sg_it = core.grid.sub_grids.valueIterator();
     while (sg_it.next()) |sg| {
         if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
-            return vertexBudgetExceededPerSurface(core);
+            return vertexBudgetInvariantViolated(core);
         }
     }
-    // Validate budget before any state changes. Early return does not corrupt touched list.
-    try syncVertexBudgetAggregate(core, true);
+    syncVertexBudgetAggregate(core, true) catch return vertexBudgetInvariantViolated(core);
     // State changes follow successful budget validation.
     core.grid.main_buf.vertex_budget_touched = false;
     core.grid.main_buf.reshaped_in_txn = false;
@@ -482,14 +476,14 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
     if (!core.vertex_budget_transaction_active) return;
     defer assertIntegrity(core);
 
-    // A refusal leaves the glyph mirrors describing a frame that never reached
-    // the screen, and atlas reclamation reads them.
+    // A refusal or an abort leaves the glyph mirrors describing a frame that
+    // never reached the screen, and atlas reclamation reads them.
     switch (mode) {
         .success => {
             core.display_mirror_stale = false;
         },
-        .refusal_atlas_valid => {
-            if (restoreVertexRowLedgers(core)) {
+        .refusal_atlas_valid, .abort_full => {
+            if (mode == .refusal_atlas_valid and restoreVertexRowLedgers(core)) {
                 core.display_mirror_stale = true;
                 // Every surface keeps its exact accounting now, sub-grids included.
                 // They used to be zeroed and re-marked whole here because the ledger
@@ -502,9 +496,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
                 core.vertex_budget_transaction_active = false;
                 return;
             }
-            // Fall through to abort_full if restore fails
-        },
-        .abort_full => {
+            // An abort, or a refusal whose ledgers could not be journaled.
             // Row ledgers are accounting metadata, not rendered content. Mutate
             // them in place on the hot path so a one-row flush does O(1) ledger
             // work and retains no full-size transaction copy. An aborted frontend
@@ -523,6 +515,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
             core.grid.subgrid_surface_vertex_count = 0;
             core.force_ext_cursor_recheck = true;
             core.flush_vertex_count_aggregate = 0;
+            core.display_mirror_stale = true;
         },
     }
 
@@ -654,7 +647,7 @@ fn replaceGridSurfaceRowVertexCount(
         usize,
         core.grid.subgrid_surface_vertex_count,
         buf.surface_vertex_count,
-    ) catch return vertexBudgetExceeded(core);
+    ) catch return vertexBudgetExceededAggregate(core);
 }
 
 
@@ -1713,7 +1706,7 @@ pub fn generateRowVertices(
     // full redraw — and only ever feeds the verbose-tier breakdown, so it is
     // gated separately from the per-row pass timers above.
     const log_glyph_timing = log_enabled and core.log.verbose;
-    if (out_start > p.max_vertices) return vertexBudgetExceeded(core);
+    if (out_start > p.max_vertices) return vertexBudgetExceededPerCallback(core);
     // Pass 3 sub-timing accumulators. Copied into stats before return.
     var atlas_ensure_ns_acc: i64 = 0;
     var quad_emit_ns_acc: i64 = 0;
@@ -3099,14 +3092,10 @@ pub const FlushCtx = struct {
         // In production, verify: std.debug.assert(ctx.core.grid_mu.tryLock() == false);
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
-        // Pre-size shaping buffers before hot-path glyph generation.
-        // Note: This is a setup-phase operation (not hot-path).
-        // Buffers are reused per text run; allocation happens once here.
-        // Worst-case: 128 glyphs per run (from SHAPE_CACHE_MAX_GLYPHS on overflow).
-        // We pre-size for multiple concurrent runs in flush cycle.
-        // Tier 2 tuning: Increased to 256x to eliminate setLen() allocations completely.
-        // This removes fragmentation and ensures determinate hot-path behavior.
-        // Verified: 211/211 tests pass with this capacity pre-allocation.
+        ctx.core.grid.assertMainShapeMirrored();
+        // Pre-size the shaping buffers so a run of up to this many glyphs
+        // allocates nothing in the row loop; a longer run still grows them
+        // there (ShapingBuffers.setLen).
         const max_glyph_count = nvim_core.SHAPE_CACHE_MAX_GLYPHS * 256;
         try ctx.core.shaping_bufs.preSizeForFlush(ctx.core.alloc, max_glyph_count);
         // Opened after the last fallible setup step: only the defer below closes it.
@@ -3374,10 +3363,7 @@ pub const FlushCtx = struct {
             // state only after every row was generated, so moving vertices
             // between rows cannot fail on a mixed old/new intermediate ledger.
             if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
-                validateCompletedVertexBudget(ctx.core) catch |err| {
-                    ctx.core.flush_aborted = true;
-                    ctx.core.failHardRender(err);
-                };
+                validateCompletedVertexBudget(ctx.core) catch |err| abortFlushForRowError(ctx.core, err);
             }
         }
 
@@ -3619,7 +3605,10 @@ pub const FlushCtx = struct {
                     var had_glyph_miss: bool = false;
                     const row_cells = &ctx.core.row_cells;
                     if (cols != 0) {
-                        try row_cells.ensureTotalCapacity(ctx.core.alloc, cols);
+                        row_cells.ensureTotalCapacity(ctx.core.alloc, cols) catch |err| {
+                            abortFlushForRowError(ctx.core, err);
+                            return;
+                        };
                         row_cells.setLen(cols);
                     }
 
@@ -3776,8 +3765,7 @@ pub const FlushCtx = struct {
                             const row_gen_stats = generateGridRow(ctx.core, main_src, r, glow_enabled, out) catch |err| {
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
-                                ctx.core.flush_aborted = true;
-                                if (Core.isHardRenderFailure(err)) ctx.core.failHardRender(err);
+                                abortFlushForRowError(ctx.core, err);
                                 break;
                             };
                             had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
@@ -3856,7 +3844,10 @@ pub const FlushCtx = struct {
                             // Charge the exact generated row before invoking the
                             // frontend: overflow clusters then count all emitted
                             // glyphs, and blank cells are charged nothing.
-                            try chargeGridRow(ctx.core, main_src, r, out.items);
+                            chargeGridRow(ctx.core, main_src, r, out.items) catch |err| {
+                                abortFlushForRowError(ctx.core, err);
+                                break;
+                            };
 
                             var t_row_before_cb: i128 = 0;
                             if (log_enabled) {
@@ -5078,8 +5069,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
                     ext_verts.clearRetainingCapacity();
                     ext_had_row_error = true;
-                    self.flush_aborted = true;
-                    if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+                    abortFlushForRowError(self, err);
                     break;
                 };
                 ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
@@ -5101,8 +5091,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 // cancelled commit discards owes the ledger nothing.
                 chargeGridRow(self, ext_src, row, ext_verts.items) catch |err| {
                     ext_had_row_error = true;
-                    self.flush_aborted = true;
-                    self.failHardRender(err);
+                    abortFlushForRowError(self, err);
                     break;
                 };
                 sendGridRow(self, row_cb, ext_src, row, ext_verts.items);
@@ -5657,10 +5646,11 @@ pub fn sendCmdlineHide(self: *Core) void {
         self.log.write("[cmdline] hide: restoring cursor to pre_cmdline: grid={d} row={d} col={d}\n", .{
             self.pre_cmdline_cursor_grid, self.pre_cmdline_cursor_row, self.pre_cmdline_cursor_col,
         });
-        self.grid.cursor_grid = self.pre_cmdline_cursor_grid;
-        self.grid.cursor_row = self.pre_cmdline_cursor_row;
-        self.grid.cursor_col = self.pre_cmdline_cursor_col;
+        // The saved cell may have left a grid shrunk meanwhile: then the
+        // cursor stays invalid until Neovim places it.
+        self.grid.cursor_valid = false;
         self.grid.cursor_rev +%= 1;
+        self.grid.setCursor(self.pre_cmdline_cursor_grid, self.pre_cmdline_cursor_row, self.pre_cmdline_cursor_col);
     }
 
     // Neovim does NOT send msg_clear after confirm dialog is answered via cmdline.
@@ -8087,6 +8077,22 @@ test "a block cmdline saves the pre-cmdline cursor, as the single-line path does
     try std.testing.expectEqual(@as(u32, 7), core.pre_cmdline_cursor_col);
 }
 
+test "cmdline hide does not restore a cursor outside a grid that shrank meanwhile" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+    core.grid.setCursor(1, 3, 7);
+    try std.testing.expect(core.grid.cursor_valid);
+
+    const line0 = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "a" }};
+    try core.grid.setCmdlineBlockShow(&.{&line0});
+    notifyCmdlineChanges(&core);
+    try std.testing.expectEqual(grid_mod.CMDLINE_GRID_ID, core.grid.cursor_grid);
+
+    try core.grid.resize(2, 5);
+    sendCmdlineHide(&core);
+    try std.testing.expect(!core.grid.cursor_valid);
+}
+
 test "cmdline block output: block lines and the current line" {
     var core = try initCmdlineTestCore();
     defer core.deinitForTest();
@@ -8693,8 +8699,10 @@ test "zero-sized main still commits external grid transaction" {
     try std.testing.expect(core.grid.main_buf.dirty_all);
     // A publication refusal leaves the committed frame on screen, so the
     // accounting that described it survives instead of being zeroed.
-    try std.testing.expect(!core.grid.main_buf.vertex_row_ledger_valid);
     try std.testing.expectEqual(@as(usize, 12), core.grid.main_buf.surface_vertex_count);
+    try std.testing.expectEqual(12 + core.grid.subgrid_surface_vertex_count, core.flush_vertex_count_aggregate);
+    try std.testing.expect(core.display_mirror_stale);
+    try std.testing.expect(core.force_ext_cursor_recheck);
 
     state.abort_main_layout = false;
     try flush_ctx.onFlush(2, 0);
@@ -8797,23 +8805,13 @@ test "vertex budget uses actual row output and rejects an oversized callback" {
     );
     try std.testing.expectEqual(@as(usize, 96), core.grid.main_buf.surface_vertex_count);
 
-    // Accept any vertex budget error variant (PerCallback, PerSurface, Aggregate)
-    var budget_exceeded = false;
-    _ = replaceSurfaceRowVertexCount(
+    try std.testing.expectError(error.VertexBudgetExceededPerCallback, replaceSurfaceRowVertexCount(
         &core,
         &core.grid.main_buf.surface_vertex_count,
         core.grid.main_buf.vertex_row_counts,
         0,
         MAX_VERTICES_PER_CALLBACK + 1,
-    ) catch |err| {
-        try std.testing.expect(
-            err == error.VertexBudgetExceededPerCallback or
-            err == error.VertexBudgetExceededPerSurface or
-            err == error.VertexBudgetExceededAggregate
-        );
-        budget_exceeded = true;
-    };
-    try std.testing.expect(budget_exceeded);
+    ));
 }
 
 test "vertex budget validates completed state and invalidates metadata on abort" {
@@ -8922,6 +8920,130 @@ test "a touched list naming a missing grid is reported as an invariant violation
         error.VertexBudgetInvariantViolated,
         replaceSurfaceRowVertexCount(&core, &core.grid.main_buf.surface_vertex_count, &counts, 1, 6),
     );
+}
+
+test "a refusal whose ledger journal failed invalidates every grid's accounting" {
+    // zonvie_core_abort_flush: accounting that could not be journaled is
+    // invalidated and every grid is marked dirty.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 3);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 10);
+    const sub = core.grid.sub_grids.getPtr(2).?;
+    core.grid.main_buf.clearDirty();
+    sub.clearDirty();
+    core.flush_ledger_journal_failed = true;
+    finishVertexBudgetTransactionRestoring(&core, .refusal_atlas_valid);
+
+    try std.testing.expect(core.grid.main_buf.dirty_all);
+    try std.testing.expect(sub.dirty_all);
+    try std.testing.expect(!core.grid.main_buf.vertex_row_ledger_valid);
+    try std.testing.expect(!sub.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), sub.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), core.flush_vertex_count_aggregate);
+}
+
+test "a core-side abort leaves the glyph mirrors marked stale" {
+    // The aborted frame never reached the screen, so the mirrors no longer
+    // describe what the frontend shows.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 4);
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 3);
+    finishVertexBudgetTransactionRestoring(&core, .abort_full);
+    try std.testing.expect(core.display_mirror_stale);
+}
+
+test "every vertex budget violation is a hard render failure, an allocation failure is not" {
+    for ([_]anyerror{
+        error.VertexBudgetExceeded,
+        error.VertexBudgetExceededPerCallback,
+        error.VertexBudgetExceededPerSurface,
+        error.VertexBudgetExceededAggregate,
+        error.VertexBudgetInvariantViolated,
+    }) |err| try std.testing.expect(Core.isHardRenderFailure(err));
+    try std.testing.expect(!Core.isHardRenderFailure(error.OutOfMemory));
+}
+
+test "a budget violation charging a main row fails the session inside the flush" {
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 2);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.cb.on_vertices_row = Noop.onRow;
+    // Any vertex charged on top of this overflows the aggregate.
+    core.grid.subgrid_surface_vertex_count = std.math.maxInt(usize);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 2);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(!core.flush_retryable);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+}
+
+test "an allocation failure in the main row pass is a retryable abort, not an error" {
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    core.drawable_w_px = 64;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.cb.on_vertices_row = Noop.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+
+    // The row scratch has to grow for the wider grid.
+    try core.grid.resizeGrid(1, 1, 64);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try flush_ctx.onFlush(1, 64);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.flush_retryable);
+    try std.testing.expect(!core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try flush_ctx.onFlush(1, 64);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+}
+
+test "a sub-grid over its surface limit at flush begin is reported as an invariant violation" {
+    // validateCompletedVertexBudget refuses to commit such a frame, so one
+    // found at the next flush's begin is broken bookkeeping, not content.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 1);
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    sg.surface_vertex_count = MAX_VERTICES_PER_SURFACE + 1;
+    core.grid.subgrid_surface_vertex_count = sg.surface_vertex_count;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try std.testing.expectError(error.VertexBudgetInvariantViolated, flush_ctx.onFlush(1, 1));
+    try std.testing.expect(!core.flush_retryable);
+    try std.testing.expect(!core.vertex_budget_transaction_active);
 }
 
 test "a refused flush restores reshaped and newly created grids without a full invalidation" {
@@ -9586,8 +9708,8 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
 
     var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
     defer out.deinit(core.alloc);
-    // Accept any vertex budget error variant
-    _ = generateRowVertices(&core, .{
+    // A row larger than one callback may carry is the per-callback tier.
+    try std.testing.expectError(error.VertexBudgetExceededPerCallback, generateRowVertices(&core, .{
         .row = 0,
         .cols = 3,
         .cell_w = 1,
@@ -9599,13 +9721,7 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
         .is_cmdline = false,
         .glow_enabled = false,
         .max_vertices = 12,
-    }, &out) catch |err| {
-        try std.testing.expect(
-            err == error.VertexBudgetExceededPerCallback or
-            err == error.VertexBudgetExceededPerSurface or
-            err == error.VertexBudgetExceededAggregate
-        );
-    };
+    }, &out));
     try std.testing.expectEqual(@as(usize, 12), out.items.len);
     try std.testing.expect(out.capacity <= 12);
     try std.testing.expect(!core.flush_retryable);

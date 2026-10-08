@@ -185,6 +185,17 @@ test "a full output list keeps every damaged pixel in its last band" {
     try std.testing.expectEqual(Band{ .top_px = 10, .bottom_px = 120 }, out[0]);
 }
 
+test "a row taller than the surface yields one whole-surface band" {
+    var out: [4]Band = undefined;
+    var n = bands(&.{ .{ .top_px = 20, .bottom_px = 30 }, .{ .top_px = 150, .bottom_px = 160 } }, 300, 200, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(Band{ .top_px = 0, .bottom_px = 200 }, out[0]);
+    // The widening and join-gap arithmetic must not overflow i32.
+    n = bands(&.{.{ .top_px = 20, .bottom_px = 30 }}, std.math.maxInt(i32), 200, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(Band{ .top_px = 0, .bottom_px = 200 }, out[0]);
+}
+
 test "a surface past the bitmap is redrawn whole" {
     var out: [4]Band = undefined;
     const n = bands(&.{.{ .top_px = 20, .bottom_px = 30 }}, 10, max_height_px + 1, &out);

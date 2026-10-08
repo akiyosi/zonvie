@@ -111,6 +111,13 @@ pub fn atlasFullAction(s: AtlasFullState) AtlasFullAction {
     return .negative;
 }
 
+/// Whether a glyph whose packed box is `packed_w` x `packed_h` overflows the
+/// current texture while a larger one may still hold it.
+pub fn glyphNeedsGrow(packed_w: u32, packed_h: u32, atlas_w: u32, atlas_h: u32) bool {
+    return (packed_w > atlas_w or packed_h > atlas_h) and
+        (atlas_w < config.atlas_size_max or atlas_h < config.atlas_size_max);
+}
+
 pub const GlyphCacheSlotKey = struct {
     key: u64,
     hash: u32,
@@ -1215,6 +1222,10 @@ pub const Core = struct {
             error.LayoutTooComplex,
             error.LayoutBudgetExceeded,
             error.VertexBudgetExceeded,
+            error.VertexBudgetExceededPerCallback,
+            error.VertexBudgetExceededPerSurface,
+            error.VertexBudgetExceededAggregate,
+            error.VertexBudgetInvariantViolated,
             error.MessageTooLarge,
             error.FrameTooLarge,
             => true,
@@ -2656,6 +2667,18 @@ pub const Core = struct {
         };
     }
 
+    /// Replace the atlas texture, doubled toward the maximum when `grow`.
+    /// Every UV issued so far is invalid afterwards.
+    fn replaceAtlas(self: *Core, grow: bool) void {
+        if (grow) {
+            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
+        }
+        self.atlas_reset_during_flush = true;
+        self.perf_atlas_full_reset_count +%= 1;
+        self.resetCoreAtlas();
+    }
+
     /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
     /// Handles whitespace, oversized glyphs, bounded atlas growth, UV computation.
     /// A glyph that cannot fit at the maximum atlas size returns a zero-bbox
@@ -2678,14 +2701,8 @@ pub const Core = struct {
 
         // Grow before packing when a single glyph cannot fit the current
         // texture. Growth invalidates every old UV, exactly like a reset.
-        while ((packed_w > self.atlas_w or packed_h_with_border > self.atlas_h) and
-            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
-        {
-            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
-            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
-            self.atlas_reset_during_flush = true;
-            self.perf_atlas_full_reset_count +%= 1;
-            self.resetCoreAtlas();
+        while (glyphNeedsGrow(packed_w, packed_h_with_border, self.atlas_w, self.atlas_h)) {
+            self.replaceAtlas(true);
             if (self.flush_aborted) return null;
         }
 
@@ -2722,15 +2739,8 @@ pub const Core = struct {
             });
             switch (action) {
                 .grow, .reset_same_size => {
-                    if (action == .grow) {
-                        self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
-                        self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
-                    } else {
-                        self.atlas_full_resets_this_flush = 1;
-                    }
-                    self.atlas_reset_during_flush = true;
-                    self.perf_atlas_full_reset_count +%= 1;
-                    self.resetCoreAtlas();
+                    if (action == .reset_same_size) self.atlas_full_resets_this_flush = 1;
+                    self.replaceAtlas(action == .grow);
                     if (self.flush_aborted) return null;
                     packer = &(self.atlas_packer.?);
                     alloc_reset_seq = self.atlas_reset_seq;
@@ -2892,9 +2902,13 @@ pub const Core = struct {
     fn keepReplacedRowUvs(self: *Core, m: *const GlyphMirror, row: usize, old: *const std.ArrayListUnmanaged(f32)) void {
         if (old.items.len == 0) return;
         if (row >= m.valid.bit_length or !m.valid.isSet(row)) return;
-        self.flush_replaced_uvs.appendSlice(self.alloc, old.items) catch {
+        // Reserved at flush begin, so the row path never allocates. A row
+        // past the reserve degrades to no mid-flush collection.
+        if (self.flush_replaced_uvs.unusedCapacitySlice().len < old.items.len) {
             self.flush_replaced_uvs_lost = true;
-        };
+            return;
+        }
+        self.flush_replaced_uvs.appendSliceAssumeCapacity(old.items);
     }
 
     /// Test seam: whether a departed row's UV is still counted live.
@@ -2930,6 +2944,16 @@ pub const Core = struct {
         // was refused and display_mirror_stale holds collection off.
         self.flush_replaced_uvs.clearRetainingCapacity();
         self.flush_replaced_uvs_lost = false;
+        // Each mirrored row is replaced at most once per flush, except by the
+        // row retry after an atlas reset, which only costs mid-flush collection.
+        var mirrored_uvs: usize = 0;
+        var mirror_it = self.glyph_mirror.valueIterator();
+        while (mirror_it.next()) |m| {
+            for (m.rows.items) |row| mirrored_uvs += row.items.len;
+        }
+        self.flush_replaced_uvs.ensureTotalCapacity(self.alloc, mirrored_uvs) catch {
+            self.flush_replaced_uvs_lost = true;
+        };
         if (self.atlas_packer == null) return;
         const packer = &(self.atlas_packer.?);
         const total: u64 = @as(u64, packer.width) * packer.height;
@@ -6222,6 +6246,21 @@ test "a full atlas grows below the maximum, resets once at it, then negative-cac
     for (cases) |c| try std.testing.expectEqual(c.want, atlasFullAction(c.s));
 }
 
+test "a glyph grows the atlas only when it overflows a texture that can still grow" {
+    const max = config.atlas_size_max;
+    const Case = struct { w: u32, h: u32, atlas_w: u32, atlas_h: u32, want: bool };
+    const cases = [_]Case{
+        .{ .w = 10, .h = 10, .atlas_w = max / 2, .atlas_h = max / 2, .want = false },
+        .{ .w = max / 2 + 1, .h = 1, .atlas_w = max / 2, .atlas_h = max / 2, .want = true },
+        .{ .w = 1, .h = max / 2 + 1, .atlas_w = max / 2, .atlas_h = max / 2, .want = true },
+        // Either dimension below the maximum can still grow.
+        .{ .w = max + 1, .h = 1, .atlas_w = max, .atlas_h = max / 2, .want = true },
+        // At the maximum the glyph is a permanent miss, not a growth.
+        .{ .w = max + 1, .h = 1, .atlas_w = max, .atlas_h = max, .want = false },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, glyphNeedsGrow(c.w, c.h, c.atlas_w, c.atlas_h));
+}
+
 test "glyph cache slot keys separate every style of a code and never equal the empty key" {
     for ([_]u32{ 0, 1, 0x754C, std.math.maxInt(u32) }) |code| {
         for (0..4) |style_a| {
@@ -7992,6 +8031,26 @@ test "a row a shift vacated stays live while the frontend may still draw it" {
     var i: u8 = 0;
     while (i < retained_shadow_expiry) : (i += 1) core.ageRetainedShadows();
     try std.testing.expect(!core.departedUvIsLive(0.75));
+}
+
+test "replacing mirrored rows during a flush allocates nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+
+    const old = [_]c_api.Vertex{mirrorGlyphVert(2, 0.25)};
+    core.recordGlyphMirrorRow(2, 0, 2, &old);
+    core.recordGlyphMirrorRow(2, 1, 2, &old);
+    // Flush begin.
+    core.collectAtlasGarbageIfNeeded();
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const new = [_]c_api.Vertex{mirrorGlyphVert(2, 0.5)};
+    core.recordGlyphMirrorRow(2, 0, 2, &new);
+    core.recordGlyphMirrorRow(2, 1, 2, &new);
+    try std.testing.expect(!core.flush_replaced_uvs_lost);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.25 }, core.flush_replaced_uvs.items);
 }
 
 test "a drawable-only resize regenerates nothing" {

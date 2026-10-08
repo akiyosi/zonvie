@@ -201,9 +201,29 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 /// current style, as for any index the table lacks.
 const max_mode_infos = 256;
 
+/// Decode one mode_info map. Absent or ill-typed keys keep the ModeInfo
+/// default. A cell_percentage of 0 is what Neovim sends for a block entry
+/// (cursor_shape.c never sets it), so it, and anything outside (0,100], means
+/// a full cell.
+fn decodeModeInfo(m: []mp.Pair) ModeInfo {
+    var mi: ModeInfo = .{};
+    if (mapGetStr(m, "cursor_shape")) |s| {
+        if (std.mem.eql(u8, s, "block")) mi.shape = .block else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
+    }
+    if (mapGetInt(m, "cell_percentage")) |p| {
+        if (p > 0 and p <= 100) mi.cell_percentage = @intCast(p);
+    }
+    if (mapGetInt(m, "attr_id")) |a| mi.attr_id = checkedU32(a) orelse 0;
+    if (mapGetInt(m, "blinkwait")) |v| mi.blink_wait_ms = checkedU32(v) orelse 0;
+    if (mapGetInt(m, "blinkon")) |v| mi.blink_on_ms = checkedU32(v) orelse 0;
+    if (mapGetInt(m, "blinkoff")) |v| mi.blink_off_ms = checkedU32(v) orelse 0;
+    return mi;
+}
+
 /// Apply mode_infos[idx] to the grid's live cursor style fields.
-/// Precondition: grid must be a valid Grid pointer; idx is bounds-unchecked.
-/// Postcondition: grid.cursor_shape, cursor_attr_id, blink_* fields updated to match mode idx.
+/// Postcondition: with cursor_style_enabled false, the UI default style is
+/// applied whatever idx is; otherwise an idx inside the table applies that
+/// entry, and one past it leaves every field untouched.
 ///
 /// Both mode_info_set and mode_change need this. The live fields are a
 /// snapshot of a table entry, so a table rebuilt by `:set guicursor` must be
@@ -1411,17 +1431,17 @@ test "cell cluster extraction rejects rather than truncates codepoint 17" {
     try std.testing.expectEqual(@as(u32, 0xFFFD), buf[0]);
 }
 
-/// Main Neovim redraw event dispatcher: parse msgpack event array, dispatch to per-event handlers.
-/// Precondition: grid/hl/arena/log valid pointers; params is msgpack value array (any length);
-///   callback function pointers match context types (TypeOf enforced); all callbacks are errorunion.
-/// Postcondition: all events from params dispatched and handled; grid/hl state updated;
-///   batch perf logging written iff log.cb set; per-event timing recorded iff log.verbose set.
-/// Supported events: grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
-/// default_colors_set, option_set, set_title, restart, connect, flush (unknown events skipped).
-/// Dispatch Neovim redraw batch. Processes events (grid_line, grid_scroll, hl_attr_define, etc.)
-/// under grid_mu lock. Mutation boundary: grid cells, row dirty bits, highlights.
-/// Read-only: grid.cursor_row/col (caller via grid_cursor_goto), grid.rows/cols (frozen during batch).
-/// Precondition: grid.rows, grid.cols not modified during batch dispatch.
+/// Apply one Neovim `redraw` notification to grid and hl, called under grid_mu.
+/// params may be empty and comes from the server, so it is untrusted.
+///
+/// Events are applied in order, each seeing the state the previous ones left:
+/// `grid_resize` reshapes a grid mid-batch, and `flush` hands the grid's
+/// current rows/cols to flush_fn. Unknown events are skipped.
+///
+/// A malformed tuple or event is skipped and the rest of the batch still
+/// applies. Resource exhaustion (OOM, a rejected `grid_resize`, too many
+/// window placements) and callback errors return the error at once, leaving
+/// earlier events applied; the caller then abandons the batch.
 pub fn handleRedraw(
     grid: *Grid,
     hl: *Highlights,
@@ -1440,10 +1460,6 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
-    // Precondition: grid, hl, log pointers are valid (asserted by caller).
-    // Mutation boundary: grid cells, row dirty bits, highlights.
-    // Params may be empty (valid batch with no events).
-
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
     // grid_line / flush_start lines already mark dispatch latency; this gives
@@ -1718,6 +1734,7 @@ pub fn handleRedraw(
                     const startrow = checkedGridCoord(t[2].int) orelse continue;
                     const startcol = checkedGridCoord(t[3].int) orelse continue;
                     log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
+                    if (log.cb != null and grid.bufForConst(grid_id) == null) log.write("[win_pos] grid {d} before its grid_resize\n", .{grid_id});
 
                     // If this grid is tracked as an ext_windows grid (created by win_split),
                     // re-register it as external instead of compositing. This happens when
@@ -2025,6 +2042,7 @@ pub fn handleRedraw(
                     if (rows == 0) continue;
 
                     if (log.cb != null) {
+                        if (grid.bufForConst(grid_id) == null) log.write("grid_scroll to grid {d} before its grid_resize\n", .{grid_id});
                         const target = grid.bufForConst(grid_id) orelse &grid.main_buf;
                         log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
                             grid_id, top, bot, left, right, rows, cols, target.rows, target.cols,
@@ -2225,16 +2243,14 @@ pub fn handleRedraw(
             },
             .mode_info_set => {
                 // ["mode_info_set", cursor_style_enabled, mode_info]
+                var table_applied = false;
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
-                    if (t.len < 2) continue;
-
-                    const enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
-                    grid.cursor_style_enabled = enabled;
-
-                    if (t[1] != .arr) continue;
+                    if (t.len < 2 or t[1] != .arr) continue;
                     const arr = t[1].arr;
+
+                    grid.cursor_style_enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
 
                     // Neovim sends SHAPE_IDX_COUNT (18) entries; the cap only
                     // keeps a broken server from sizing a long-lived table.
@@ -2243,46 +2259,12 @@ pub fn handleRedraw(
                     try grid.mode_infos.ensureTotalCapacity(grid.alloc, modes.len);
 
                     for (modes, 0..) |mv, mode_idx| {
-                        var mi: ModeInfo = .{};
-                        if (mv == .map) {
-                            const m = mv.map;
-
-                            if (mapGetStr(m, "cursor_shape")) |s| {
-                                if (std.mem.eql(u8, s, "block")) mi.shape = .block else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
-                                // Debug: log parsed shape
-                                if (log.cb != null) {
-                                    log.write("  parse mode[{d}]: cursor_shape='{s}' -> {s}\n", .{
-                                        mode_idx, s, @tagName(mi.shape),
-                                    });
-                                }
-                            }
-                            if (mapGetInt(m, "cell_percentage")) |p64| {
-                                var p = p64;
-                                if (p <= 0) p = 100;
-                                if (p > 100) p = 100;
-                                mi.cell_percentage = @as(u8, @intCast(p));
-                            }
-                            if (mapGetInt(m, "attr_id")) |a64| {
-                                mi.attr_id = checkedU32(a64) orelse 0;
-                            }
-                            // Parse blink parameters
-                            if (mapGetInt(m, "blinkwait")) |bw| {
-                                mi.blink_wait_ms = checkedU32(bw) orelse 0;
-                            }
-                            if (mapGetInt(m, "blinkon")) |bon| {
-                                mi.blink_on_ms = checkedU32(bon) orelse 0;
-                            }
-                            if (mapGetInt(m, "blinkoff")) |boff| {
-                                mi.blink_off_ms = checkedU32(boff) orelse 0;
-                            }
-                        } else {
-                            // Debug: mv is not a map
-                            if (log.cb != null) {
-                                log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
-                            }
+                        if (mv != .map and log.cb != null) {
+                            log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
                         }
-                        grid.mode_infos.appendAssumeCapacity(mi);
+                        grid.mode_infos.appendAssumeCapacity(if (mv == .map) decodeModeInfo(mv.map) else .{});
                     }
+                    table_applied = true;
 
                     // Debug log: mode_info_set processed
                     if (log.cb != null) {
@@ -2303,8 +2285,10 @@ pub fn handleRedraw(
                 // The table just changed under the current mode (`:set guicursor`).
                 // Neovim sends no mode_change for it, so re-resolve the live style
                 // here or the cursor keeps its old shape until the mode changes.
-                applyModeInfo(grid, grid.current_mode_idx);
-                grid.cursor_rev +%= 1;
+                if (table_applied) {
+                    applyModeInfo(grid, grid.current_mode_idx);
+                    grid.cursor_rev +%= 1;
+                }
             },
             .mode_change => {
                 // ["mode_change", mode, mode_idx]
@@ -2413,7 +2397,11 @@ pub fn handleRedraw(
                     // Resolved once per grid_line tuple (grid_id is constant within
                     // it); used by the repeat clamp below. A per-cell sub_grids
                     // lookup here would be a hash probe on the grid_line hot path.
-                    const grid_cols: u32 = if (grid.bufForConst(grid_id)) |buf| buf.cols else 0;
+                    const grid_cols: u32 = if (grid.bufForConst(grid_id)) |buf| buf.cols else blk: {
+                        // Neovim always sends grid_resize first; every cell is dropped.
+                        if (log.cb != null) log.write("grid_line to grid {d} before its grid_resize\n", .{grid_id});
+                        break :blk 0;
+                    };
 
                     // "hl" is a state that persists across cell tuples within THIS grid_line event.
                     // - If hl is omitted, keep previous hl value.
@@ -3603,6 +3591,88 @@ test "a mode_change with no well-formed tuple neither requests IME off nor bumps
     try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "insert"));
     try std.testing.expect(grid.ime_off_requested);
     try std.testing.expect(grid.cursor_rev != rev);
+}
+
+test "a mode_info_set with no well-formed tuple changes neither the flag, the table nor the cursor" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+    const rev = grid.cursor_rev;
+
+    const junk = try arena.alloc(mp.Value, 2);
+    junk[0] = .{ .bool = true };
+    junk[1] = .{ .str = "junk" };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", junk));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.mode_infos.items[0].shape);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+
+    const short = try arena.alloc(mp.Value, 1);
+    short[0] = .{ .bool = true };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", short));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+}
+
+test "a mode_change to an index past the table keeps the current style" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = true;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25, .blink_on_ms = 400 });
+    applyModeInfo(&grid, 0);
+
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .str = "insert" };
+    t[1] = .{ .int = 5 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_change", t));
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.cursor_shape);
+    try std.testing.expectEqual(@as(u8, 25), grid.cursor_cell_percentage);
+    try std.testing.expectEqual(@as(u32, 400), grid.cursor_blink_on_ms);
+}
+
+test "decodeModeInfo follows the guicursor table Neovim sends" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const pair = struct {
+        fn int(k: []const u8, v: i64) mp.Pair {
+            return .{ .key = .{ .str = k }, .val = .{ .int = v } };
+        }
+        fn str(k: []const u8, v: []const u8) mp.Pair {
+            return .{ .key = .{ .str = k }, .val = .{ .str = v } };
+        }
+    };
+    const Case = struct { pairs: []const mp.Pair, want: ModeInfo };
+    // cursor_shape.c: a block entry keeps the table's initial percentage 0, so
+    // 0 means a full cell. `ver150` passes Neovim's parser; a cursor cannot
+    // exceed its cell. Neovim's parser never yields a negative.
+    const cases = [_]Case{
+        .{ .pairs = &.{ pair.str("cursor_shape", "block"), pair.int("cell_percentage", 0) }, .want = .{ .shape = .block, .cell_percentage = 100 } },
+        .{ .pairs = &.{ pair.str("cursor_shape", "vertical"), pair.int("cell_percentage", 25) }, .want = .{ .shape = .vertical, .cell_percentage = 25 } },
+        .{ .pairs = &.{ pair.str("cursor_shape", "horizontal"), pair.int("cell_percentage", 150) }, .want = .{ .shape = .horizontal, .cell_percentage = 100 } },
+        .{ .pairs = &.{pair.int("cell_percentage", -3)}, .want = .{ .cell_percentage = 100 } },
+        .{ .pairs = &.{pair.str("cursor_shape", "bogus")}, .want = .{} },
+        .{ .pairs = &.{ pair.int("blinkwait", 700), pair.int("blinkon", 400), pair.int("blinkoff", 250), pair.int("attr_id", 9) }, .want = .{ .blink_wait_ms = 700, .blink_on_ms = 400, .blink_off_ms = 250, .attr_id = 9 } },
+        .{ .pairs = &.{ pair.int("blinkon", -1), pair.int("attr_id", -1) }, .want = .{} },
+    };
+    for (cases) |c| {
+        const m = try arena.dupe(mp.Pair, c.pairs);
+        try std.testing.expectEqual(c.want, decodeModeInfo(m));
+    }
 }
 
 test "mode_info_set keeps at most max_mode_infos entries of an oversized table" {

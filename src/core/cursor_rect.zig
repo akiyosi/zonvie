@@ -63,7 +63,8 @@ pub fn bounds(comptime V: type, verts: []const V, origin_x: f32, origin_y: f32) 
 /// Inflate to whole pixels (floor the near edges, ceil the far ones) and clip
 /// to a `clip_w` by `clip_h` surface. Null when nothing is left inside it: a
 /// damage consumer must not be handed an empty rectangle, which some presenters
-/// read as "everything".
+/// read as "everything". Precondition: every edge is finite and within i32
+/// range (core vertex positions are surface-sized); otherwise the cast is UB.
 pub fn inflateClip(r: Rect, clip_w: i32, clip_h: i32) ?IntRect {
     var l: i32 = @intFromFloat(@floor(r.left));
     var t: i32 = @intFromFloat(@floor(r.top));

@@ -1663,13 +1663,13 @@ pub const TripleBufferedSurface = struct {
     }
 
     /// One core row into the open flush's write set: detach, write, mark it
-    /// changed. A row past `ws.rows` is ignored. False means the caller must
+    /// changed. A row past `ws.rows` (authoritative total_rows) is refused. False means the caller must
     /// abort the flush: a row written but not marked is dropped by commitFlush
     /// and skipped by the paint, and a failed detach or append would publish a
     /// stale or blank row.
     pub fn writeFlushRow(self: *TripleBufferedSurface, alloc: std.mem.Allocator, row: u32, verts: []const Vertex) bool {
         const ws = self.writeSet();
-        if (ws.rows != 0 and row >= ws.rows) return true;
+        if (ws.rows != 0 and row >= ws.rows) return false;
         ws.row_mode = true;
         if (!ws.ensureRowStorage(alloc, row)) return false;
         const slot = self.cowDetachRow(alloc, row) orelse return false;
@@ -4394,7 +4394,7 @@ pub const PresentRectBuilder = struct {
 
     /// Drop what lies past the back buffer: a rect that clamps to EMPTY inside
     /// the presenter marks every swapchain buffer fully damaged
-    /// (clampBackDamageRect), and producers name rows past it after a shrink.
+    /// (BackDamage.clampRect), and producers name rows past it after a shrink.
     pub fn clamp(self: *PresentRectBuilder, width: u32, height: u32) void {
         if (self.list.items.len == 0) return;
         self.list.items.len = render_pipeline_helpers.clampPresentRects(c.RECT, self.list.items, @intCast(width), @intCast(height));
@@ -6392,7 +6392,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     }
 }
 
-test "writeFlushRow ignores a row past the write set and marks the one it writes" {
+test "writeFlushRow refuses a row past the write set and marks the one it writes" {
     const alloc = std.testing.allocator;
     var tbs = TripleBufferedSurface{};
     defer tbs.deinit(alloc);
@@ -6401,7 +6401,7 @@ test "writeFlushRow ignores a row past the write set and marks the one it writes
     ws.rows = 2;
     try std.testing.expect(tbs.prepareRowSyncTracking(alloc, 2));
 
-    try std.testing.expect(tbs.writeFlushRow(alloc, 5, &.{}));
+    try std.testing.expect(!tbs.writeFlushRow(alloc, 5, &.{}));
     try std.testing.expect(ws.row_map.items.len <= 2);
 
     try std.testing.expect(tbs.writeFlushRow(alloc, 1, &.{}));

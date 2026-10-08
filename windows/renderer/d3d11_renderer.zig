@@ -11,6 +11,14 @@ const CustomShaderPipeline = custom_shader_mod.CustomShaderPipeline;
 const MaxSwapchainBuffers: usize = 4;
 const MaxPendingBackDamageRects: usize = 64;
 
+const CtxOwnerTid = if (std.debug.runtime_safety) std.atomic.Value(usize) else void;
+
+fn currentTid() usize {
+    return @intCast(std.Thread.getCurrentId());
+}
+
+const BackDamage = render_pipeline_helpers.BackDamageQueue(c.RECT, MaxSwapchainBuffers, MaxPendingBackDamageRects);
+
 const BackCopyDamage = struct {
     full: bool = false,
     rect_count: usize = 0,
@@ -260,6 +268,8 @@ pub const Renderer = struct {
 
     // Mutex to protect D3D11 device context access (context is single-threaded)
     ctx_mu: std.Io.Mutex = .init,
+    /// Debug-only: the thread holding ctx_mu (0 when unlocked).
+    ctx_owner_tid: CtxOwnerTid = if (std.debug.runtime_safety) .init(0) else {},
 
     // D3D11 core
     device: ?*c.ID3D11Device = null,
@@ -277,9 +287,7 @@ pub const Renderer = struct {
     bb_rtvs: [MaxSwapchainBuffers]?*c.ID3D11RenderTargetView = .{ null, null, null, null },
     // Damage not yet copied from persistent back_tex into each rotating
     // swapchain buffer. Fixed storage avoids per-present allocation.
-    bb_pending_full: [MaxSwapchainBuffers]bool = .{ true, true, true, true },
-    bb_pending_rect_count: [MaxSwapchainBuffers]u8 = .{ 0, 0, 0, 0 },
-    bb_pending_rects: [MaxSwapchainBuffers][MaxPendingBackDamageRects]c.RECT = undefined,
+    bb_damage: BackDamage = .{},
 
     // Persistent back buffer (like macOS backBuffer)
     back_tex: ?*c.ID3D11Texture2D = null,
@@ -652,13 +660,21 @@ pub const Renderer = struct {
         self.default_bg_rgb.store(rgb, .release);
     }
 
+    /// Lock the D3D11 immediate context (not thread-safe). Every function
+    /// documented "Caller holds ctx_mu" requires this; not reentrant.
     pub fn lockContext(self: *Renderer) void {
         self.ctx_mu.lockUncancelable(core.clock.io());
+        if (std.debug.runtime_safety) self.ctx_owner_tid.store(currentTid(), .monotonic);
     }
 
     /// Unlock the D3D11 device context.
     pub fn unlockContext(self: *Renderer) void {
+        if (std.debug.runtime_safety) self.ctx_owner_tid.store(0, .monotonic);
         self.ctx_mu.unlock(core.clock.io());
+    }
+
+    fn assertContextLocked(self: *const Renderer) void {
+        if (std.debug.runtime_safety) std.debug.assert(self.ctx_owner_tid.load(.monotonic) == currentTid());
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -778,77 +794,12 @@ pub const Renderer = struct {
     }
 
     fn resetBackBufferDamage(self: *Renderer) void {
-        for (0..MaxSwapchainBuffers) |i| {
-            self.bb_pending_full[i] = true;
-            self.bb_pending_rect_count[i] = 0;
-        }
-    }
-
-    fn clampBackDamageRect(self: *const Renderer, rect: c.RECT) ?c.RECT {
-        var r = rect;
-        r.left = @max(0, r.left);
-        r.top = @max(0, r.top);
-        r.right = @min(@as(i32, @intCast(self.width)), r.right);
-        r.bottom = @min(@as(i32, @intCast(self.height)), r.bottom);
-        return if (r.right > r.left and r.bottom > r.top) r else null;
-    }
-
-    fn appendBackDamage(self: *Renderer, buffer_index: usize, rect: c.RECT) void {
-        if (self.bb_pending_full[buffer_index]) return;
-
-        var merged = rect;
-        var count: usize = self.bb_pending_rect_count[buffer_index];
-        var i: usize = 0;
-        while (i < count) {
-            const old = self.bb_pending_rects[buffer_index][i];
-            if (merged.left <= old.right and merged.right >= old.left and
-                merged.top <= old.bottom and merged.bottom >= old.top)
-            {
-                merged = .{
-                    .left = @min(old.left, merged.left),
-                    .top = @min(old.top, merged.top),
-                    .right = @max(old.right, merged.right),
-                    .bottom = @max(old.bottom, merged.bottom),
-                };
-                count -= 1;
-                self.bb_pending_rects[buffer_index][i] = self.bb_pending_rects[buffer_index][count];
-                i = 0;
-                continue;
-            }
-            i += 1;
-        }
-
-        if (count == MaxPendingBackDamageRects) {
-            self.bb_pending_full[buffer_index] = true;
-            self.bb_pending_rect_count[buffer_index] = 0;
-            return;
-        }
-        self.bb_pending_rects[buffer_index][count] = merged;
-        self.bb_pending_rect_count[buffer_index] = @intCast(count + 1);
+        self.bb_damage.markFull(MaxSwapchainBuffers);
     }
 
     fn queueBackDamage(self: *Renderer, rects: []const c.RECT, full: bool) void {
         const count: usize = @intCast(@max(@as(u32, 1), self.swapchain_buf_count));
-        if (full) {
-            for (0..@min(count, MaxSwapchainBuffers)) |i| {
-                self.bb_pending_full[i] = true;
-                self.bb_pending_rect_count[i] = 0;
-            }
-            return;
-        }
-
-        for (rects) |raw| {
-            const rect = self.clampBackDamageRect(raw) orelse {
-                for (0..@min(count, MaxSwapchainBuffers)) |i| {
-                    self.bb_pending_full[i] = true;
-                    self.bb_pending_rect_count[i] = 0;
-                }
-                return;
-            };
-            for (0..@min(count, MaxSwapchainBuffers)) |i| {
-                self.appendBackDamage(i, rect);
-            }
-        }
+        self.bb_damage.queue(rects, full, count, self.width, self.height);
     }
 
     /// Copy only the current rotating buffer, including damage accumulated
@@ -868,18 +819,18 @@ pub const Renderer = struct {
         const src: *c.ID3D11Resource = @ptrCast(back_tex);
         const vtbl = ctx.*.lpVtbl;
 
-        if (self.bb_pending_full[index]) {
+        if (self.bb_damage.full[index]) {
             const copy = vtbl.*.CopyResource orelse return error.RenderResourcesUnavailable;
             copy(ctx, dst, src);
-            self.bb_pending_full[index] = false;
-            self.bb_pending_rect_count[index] = 0;
+            self.bb_damage.clear(index);
             return .{ .full = true };
         }
 
-        const count: usize = self.bb_pending_rect_count[index];
+        const pending = self.bb_damage.pending(index);
+        const count: usize = pending.len;
         if (count == 0) return .{};
         const copy = vtbl.*.CopySubresourceRegion orelse return error.RenderResourcesUnavailable;
-        for (self.bb_pending_rects[index][0..count], 0..) |rect, i| {
+        for (pending, 0..) |rect, i| {
             const box: c.D3D11_BOX = .{
                 .left = @intCast(rect.left),
                 .top = @intCast(rect.top),
@@ -891,7 +842,7 @@ pub const Renderer = struct {
             copy(ctx, dst, 0, @intCast(rect.left), @intCast(rect.top), 0, src, 0, &box);
             out_rects[i] = rect;
         }
-        self.bb_pending_rect_count[index] = 0;
+        self.bb_damage.clear(index);
         return .{ .rect_count = count };
     }
 
@@ -1001,7 +952,9 @@ pub const Renderer = struct {
         self.needs_resize_retry = false;
     }
 
+    /// Caller holds ctx_mu.
     pub fn atlasUploadRect(self: *Renderer, x: u32, y: u32, w: u32, h: u32, data: [*]const u8, row_pitch: u32) bool {
+        self.assertContextLocked();
         if (applog.isEnabled()) {
             const tex_ptr: usize = if (self.atlas_tex) |p| @intFromPtr(p) else 0;
             const ctx_ptr: usize = if (self.ctx) |p| @intFromPtr(p) else 0;
@@ -1091,6 +1044,7 @@ pub const Renderer = struct {
         glow_intensity: f32 = 0.8,
     };
 
+    /// Caller holds ctx_mu.
     pub fn drawEx(
         self: *Renderer,
         main: []const core.Vertex,
@@ -1098,6 +1052,7 @@ pub const Renderer = struct {
         dirty_rect: ?c.RECT,
         opts: DrawOpts,
     ) !void {
+        self.assertContextLocked();
         var t_draw_start: i128 = 0;
         if (applog.isEnabled()) t_draw_start = core.clock.nowNs();
 
@@ -1316,7 +1271,9 @@ pub const Renderer = struct {
         _ = self.presentSwapchain(sc, &params);
     }
 
+    /// Caller holds ctx_mu.
     pub fn presentFromBack(self: *Renderer, rects: []const c.RECT, force_full_copy: bool) !void {
+        self.assertContextLocked();
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
         const ctx = self.ctx orelse return error.NoContext;
         const sc = self.swapchain orelse return error.NoSwapchain;
@@ -1678,11 +1635,13 @@ pub const Renderer = struct {
         vb_bytes_ptr.* = new_bytes;
     }
 
+    /// Caller holds ctx_mu.
     pub fn uploadVertsToVB(
         self: *Renderer,
         vb: *c.ID3D11Buffer,
         verts: []const core.Vertex,
     ) !void {
+        self.assertContextLocked();
         if (verts.len == 0) return;
 
         const ctx = self.ctx orelse return error.NoContext;
@@ -1705,7 +1664,9 @@ pub const Renderer = struct {
         unmap0(ctx, res);
     }
 
+    /// Caller holds ctx_mu.
     pub fn drawVB(self: *Renderer, vb: *c.ID3D11Buffer, vert_count: usize) !void {
+        self.assertContextLocked();
         if (vert_count == 0) return;
 
         const ctx = self.ctx orelse return error.NoContext;
@@ -1823,16 +1784,7 @@ pub const Renderer = struct {
         };
         if (ctx_vtbl.*.RSSetViewports) |f| f(ctx, 1, &vp);
 
-        const x_i: c.LONG = @intCast(x);
-        const y_i: c.LONG = @intCast(y);
-        const right: c.LONG = @intCast(x + w);
-        const bottom: c.LONG = @intCast(y + h);
-        var sr: c.D3D11_RECT = if (dirty) |r| .{
-            .left = @max(0, x_i + r.left),
-            .top = @max(0, y_i + r.top),
-            .right = @min(x_i + r.right, right),
-            .bottom = @min(y_i + r.bottom, bottom),
-        } else .{ .left = x_i, .top = y_i, .right = right, .bottom = bottom };
+        var sr: c.D3D11_RECT = render_pipeline_helpers.contentScissor(c.D3D11_RECT, x, y, w, h, dirty);
         if (ctx_vtbl.*.RSSetScissorRects) |f| f(ctx, 1, &sr);
     }
 
@@ -2212,7 +2164,9 @@ pub const Renderer = struct {
     /// scroll region from current row data — the gap-row expansion it
     /// otherwise computes from the CPU-side accumulated shift only covers
     /// the vacated band, on the assumption this copy succeeded.
+    /// Caller holds ctx_mu.
     pub fn scrollBackTex(self: *Renderer, scroll_rect: c.RECT, dy_px: i32) bool {
+        self.assertContextLocked();
         if (dy_px == 0) return true;
         const ctx = self.ctx orelse return false;
         const back_tex = self.back_tex orelse return false;
@@ -2388,7 +2342,7 @@ pub const Renderer = struct {
             return error.ScrollbarUnderlayAlreadyValid;
         }
 
-        const rect = self.clampBackDamageRect(raw_rect) orelse return null;
+        const rect = BackDamage.clampRect(raw_rect, self.width, self.height) orelse return null;
         const rect_w: u32 = @intCast(rect.right - rect.left);
         const rect_h: u32 = @intCast(rect.bottom - rect.top);
         errdefer {
@@ -3985,6 +3939,7 @@ pub const Renderer = struct {
     /// are expressed in; pass 0 for both to submit clip-space vertices under
     /// the identity transform. A failed map leaves the previous transform
     /// bound, so the draw that needed this one must not run.
+    /// Caller holds ctx_mu.
     pub fn setLayerTransform(
         self: *Renderer,
         origin_x_px: f32,
@@ -3992,6 +3947,7 @@ pub const Renderer = struct {
         extent_w_px: f32,
         extent_h_px: f32,
     ) error{LayerTransformMapFailed}!void {
+        self.assertContextLocked();
         const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
             .{ 1, 1, 0, 0, 0, 0, 0, 0 }
         else .{
