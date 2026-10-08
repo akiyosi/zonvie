@@ -1786,12 +1786,16 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             self.grid.pending_grid_resizes.clearRetainingCapacity();
 
             // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
-            // Grid 1 normally echoes the size the frontend asked for through
-            // updateLayoutPx; a different size means Neovim changed it itself, so
-            // ask the frontend to resize its window to match.
+            // Grid 1 normally echoes a size the frontend asked for through
+            // updateLayoutPx. Any requested size still awaiting its answer
+            // counts, not only the latest: a late answer to an older request
+            // is not Neovim's own resize. Anything else is, so ask the frontend
+            // to resize its window to match.
             if (self.grid.pending_main_grid_size) |sz| {
                 self.grid.pending_main_grid_size = null;
-                if (self.last_layout_rows != 0 and self.last_layout_cols != 0 and
+                const answers_request = self.requested_main_sizes.consumeAnswer(sz.rows, sz.cols);
+                if (!answers_request and
+                    self.last_layout_rows != 0 and self.last_layout_cols != 0 and
                     (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
                 {
                     if (self.cb.on_main_grid_size) |cb| {

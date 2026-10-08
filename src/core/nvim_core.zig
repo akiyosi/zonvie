@@ -51,6 +51,41 @@ pub const GlyphCacheProbe = struct {
     insert: usize,
 };
 
+/// The last few main grid sizes requested from Neovim and not yet answered.
+/// Bounded: an answer Neovim coalesced away never arrives, so the oldest entry
+/// is dropped to make room.
+pub const LayoutRequestLog = struct {
+    const capacity = 4;
+    sizes: [capacity]grid_mod.GridSize = undefined,
+    len: usize = 0,
+
+    pub fn record(self: *LayoutRequestLog, rows: u32, cols: u32) void {
+        if (self.len == capacity) {
+            std.mem.copyForwards(grid_mod.GridSize, self.sizes[0 .. capacity - 1], self.sizes[1..capacity]);
+            self.len -= 1;
+        }
+        self.sizes[self.len] = .{ .rows = rows, .cols = cols };
+        self.len += 1;
+    }
+
+    /// Whether `rows x cols` answers a recorded request. The answer and every
+    /// older request are retired: Neovim answers in request order.
+    pub fn consumeAnswer(self: *LayoutRequestLog, rows: u32, cols: u32) bool {
+        for (self.sizes[0..self.len], 0..) |s, i| {
+            if (s.rows != rows or s.cols != cols) continue;
+            const rest = self.len - (i + 1);
+            std.mem.copyForwards(grid_mod.GridSize, self.sizes[0..rest], self.sizes[i + 1 .. self.len]);
+            self.len = rest;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn clear(self: *LayoutRequestLog) void {
+        self.len = 0;
+    }
+};
+
 pub const AtlasFullState = struct {
     atlas_w: u32,
     atlas_h: u32,
@@ -803,6 +838,13 @@ pub const Core = struct {
 
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
+    /// Main grid sizes this UI asked for that Neovim has not confirmed yet,
+    /// oldest first. A grid_resize answering an older request can arrive after
+    /// a newer one was sent (a font change re-requests the same window in new
+    /// cells), and must not read as Neovim resizing the grid itself. Written
+    /// under grid_mu, except by notifyLayoutReady before the attach handoff,
+    /// like last_layout_rows/cols.
+    requested_main_sizes: LayoutRequestLog = .{},
     // Serializes ui_attached publication and deferred focus/resize state.
     // Lock order when both are needed:
     // pending_resize_mu -> write_queue_mu.
@@ -1585,6 +1627,7 @@ pub const Core = struct {
         self.grid.pending_grid_resizes.clearRetainingCapacity();
         self.grid.pending_win_ops.clearRetainingCapacity();
         self.grid.pending_main_grid_size = null;
+        self.requested_main_sizes.clear();
 
         // The frontends key per-grid render storage by grid_id and release it
         // only on on_grid_destroy -- the ABI says a grid that merely leaves the
@@ -1715,6 +1758,7 @@ pub const Core = struct {
         // Pre-set last_layout to suppress a redundant resize after attach.
         self.last_layout_rows = rows;
         self.last_layout_cols = cols;
+        self.requested_main_sizes.record(rows, cols);
         self.ui_attach_ready = true;
         self.ui_attach_cond.signal(clock.io());
         self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
@@ -3927,6 +3971,7 @@ pub const Core = struct {
         if (self.resize(rows, cols)) {
             self.last_layout_rows = rows;
             self.last_layout_cols = cols;
+            self.requested_main_sizes.record(rows, cols);
         }
         return vertex_geometry_changed;
     }
@@ -6102,6 +6147,32 @@ test "glyph cache two-choice probe preserves a primary collision" {
 
     try std.testing.expectEqual(probe_a.insert, glyphCacheProbe(&keys, key_a, hash).hit.?);
     try std.testing.expectEqual(probe_b.insert, glyphCacheProbe(&keys, key_b, hash).hit.?);
+}
+
+test "a late answer to an older main grid request is an echo, a size nobody asked for is not" {
+    var log: LayoutRequestLog = .{};
+    // A relaunch: the restored window in the default font's cells, then the
+    // user's font re-requests the same window in smaller cells.
+    log.record(33, 94);
+    log.record(37, 99);
+    // Neovim answers the older request after the newer one was sent.
+    try std.testing.expect(log.consumeAnswer(33, 94));
+    try std.testing.expect(log.consumeAnswer(37, 99));
+    // `:set lines=40 columns=80` was never requested.
+    try std.testing.expect(!log.consumeAnswer(40, 80));
+    // Answering a request retires it and every older one.
+    log.record(10, 10);
+    log.record(20, 20);
+    try std.testing.expect(log.consumeAnswer(20, 20));
+    try std.testing.expect(!log.consumeAnswer(10, 10));
+}
+
+test "the main grid request log keeps only the newest requests" {
+    var log: LayoutRequestLog = .{};
+    var i: u32 = 1;
+    while (i <= LayoutRequestLog.capacity + 1) : (i += 1) log.record(i, i);
+    try std.testing.expect(!log.consumeAnswer(1, 1));
+    try std.testing.expect(log.consumeAnswer(LayoutRequestLog.capacity + 1, LayoutRequestLog.capacity + 1));
 }
 
 test "a full atlas grows below the maximum, resets once at it, then negative-caches" {
