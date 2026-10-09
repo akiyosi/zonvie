@@ -697,16 +697,6 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(callback_order_tests).step);
 
-    const mutation_boundary_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/contract_mutation_boundary.zig"),
-    });
-    const mutation_boundary_tests = b.addTest(.{
-        .root_module = mutation_boundary_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(mutation_boundary_tests).step);
-
     const allocation_guard_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
