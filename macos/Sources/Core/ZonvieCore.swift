@@ -798,10 +798,16 @@ final class ZonvieCore {
 
                 switch core.resolveGridRoute(gridId: gridId) {
                 case .deferred(let surfaceId):
+                    // Dropped without aborting: the host's registration forces
+                    // a full resend of every row it owns, so the committed
+                    // flush loses nothing this row carried.
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(surfaceId) grid=\(gridId) reason=host_not_registered")
 
                 case .mainRoot:
-                    guard let view = core.terminalView, core.beginMainFlushIfNeeded() else { return }
+                    // beginMainFlushIfNeeded first: it aborts the flush when no
+                    // renderer can take the row, which a nil-view short-circuit
+                    // would skip, letting the core commit a row nobody stored.
+                    guard core.beginMainFlushIfNeeded(), let view = core.terminalView else { return }
                     view.submitVerticesRowRaw(
                         rowStart: rs,
                         rowCount: rc,
@@ -820,7 +826,7 @@ final class ZonvieCore {
                     // renderer here and the view there, but the two arms ask it
                     // the same two questions with the same argument types.
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=1 grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
-                    guard let renderer = core.terminalView?.renderer, core.beginMainFlushIfNeeded() else { return }
+                    guard core.beginMainFlushIfNeeded(), let renderer = core.terminalView?.renderer else { return }
                     switch update {
                     case .main:
                         renderer.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,

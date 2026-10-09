@@ -265,24 +265,75 @@ private enum SurfaceRowProvisionTests {
 
         // The detach candidate is now wide enough for this narrow row and is no
         // longer oversize-rejected, so only the in-flight guard can exclude it.
-        guard let detached = ensureSurfaceRowBuffer(
+        // Either in-flight position has to reject it: the pool path compares
+        // against both tuple members.
+        for (label, inflight) in [("first", (ownBuffer, nil)), ("second", (nil, ownBuffer))] as [(String, (MTLBuffer?, MTLBuffer?))] {
+            target.detachPoolRowBuffers[0] = ownBuffer
+            target.rowState.buffers[0] = committed
+            target.rowState.capacities[0] = source.rowState.capacities[0]
+            guard let detached = ensureSurfaceRowBuffer(
+                bufferSet: target,
+                sourceSet: source,
+                device: device,
+                row: 0,
+                vertexCount: 1,
+                maxRowBuffers: 16,
+                inflightRowBuffers: inflight
+            ) else {
+                require(false, "alias-guarded detach failed to produce a writable row (\(label) in-flight slot)")
+                return
+            }
+            require(detached !== committed, "detach wrote into the committed row buffer (\(label) in-flight slot)")
+            require(detached !== ownBuffer, "detach wrote into a GPU in-flight row buffer (\(label) in-flight slot)")
+            require(
+                target.rowState.buffers[0] === detached,
+                "detached row buffer was not published to the write set (\(label) in-flight slot)"
+            )
+        }
+
+        // A set that already shared the committed buffer stages THAT buffer as
+        // its detach candidate on the next copy. With nothing in flight, only
+        // the src clause keeps the write out of the committed row.
+        target.rowState.buffers[0] = committed
+        target.rowState.capacities[0] = source.rowState.capacities[0]
+        copySurfaceBufferSetRowState(from: source, to: target)
+        require(
+            target.detachPoolRowBuffers[0] === committed,
+            "second shallow copy did not stage the committed buffer as the detach candidate"
+        )
+        guard let detachedFromSrcPool = ensureSurfaceRowBuffer(
             bufferSet: target,
             sourceSet: source,
             device: device,
             row: 0,
             vertexCount: 1,
             maxRowBuffers: 16,
-            inflightRowBuffers: (ownBuffer, nil)
+            inflightRowBuffers: (nil, nil)
         ) else {
-            require(false, "alias-guarded detach failed to produce a writable row")
+            require(false, "detach with a src-aliased pool candidate failed to produce a writable row")
             return
         }
-        require(detached !== committed, "detach wrote into the committed row buffer")
-        require(detached !== ownBuffer, "detach wrote into a GPU in-flight row buffer")
         require(
-            target.rowState.buffers[0] === detached,
-            "detached row buffer was not published to the write set"
+            detachedFromSrcPool !== committed,
+            "detach reused a pool candidate that aliases the committed row buffer"
         )
+    }
+
+    private static func verifyGpuReadCompletionReleasesMarkedSet(device: MTLDevice) {
+        // A completion gives back exactly the mark draw() took: one release
+        // per mark, and the set is free again afterwards.
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+        var gpuInFlightCount = [0, 1, 0]
+        var retirement = SurfaceRowStorageRetirementState()
+        completeSurfaceGpuRead(
+            setIndex: 1,
+            gpuInFlightCount: &gpuInFlightCount,
+            bufferSets: sets,
+            committedSetIndex: 1,
+            retirement: &retirement
+        )
+        require(gpuInFlightCount == [0, 0, 0], "completion did not release the marked set")
+        _ = device
     }
 
     private static func verifyPrivateSlotReuseHonoursAliasGuards(device: MTLDevice) {
@@ -705,6 +756,7 @@ private enum SurfaceRowProvisionTests {
         verifyOversizedRowReuseAvoidsAllocation(device: device)
         verifyRowReuseHonoursAliasGuards(device: device)
         verifyPrivateSlotReuseHonoursAliasGuards(device: device)
+        verifyGpuReadCompletionReleasesMarkedSet(device: device)
         for shape in [(3, 0), (0, 4), (0, 0)] {
             let layoutSet = SurfaceBufferSet()
             require(

@@ -422,13 +422,18 @@ pub fn onVerticesRow(
         vert_count == 0 and
         (total_rows == 0 or total_cols == 0);
 
+    // zonvie_core.h: exactly one of MAIN and CURSOR is set. A callback with
+    // neither carries no layer, so no row may be replaced by it.
+    const is_main_update = (flags & app_mod.VERT_UPDATE_MAIN) != 0;
+    const is_cursor_update = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
+    std.debug.assert(is_main_update != is_cursor_update);
+    if (!is_main_update and !is_cursor_update) return;
+
     // In row-only ABI configurations the core sends the main-window cursor
     // through this callback with CURSOR set and MAIN clear. It has its own
     // cursor-layer transaction (storeMainSurfaceCursor); the row payload must
     // never replace or dirty the main row set.
-    if ((flags & app_mod.VERT_UPDATE_CURSOR) != 0 and
-        (flags & app_mod.VERT_UPDATE_MAIN) == 0)
-    {
+    if (is_cursor_update and !is_main_update) {
         // A grid the main surface places as a layer owns the surface's one
         // cursor. Remember which layer it is so the overlay is drawn with that
         // layer's transform. Grid 1 needs no route lookup.
@@ -580,8 +585,7 @@ pub fn onVerticesRow(
         // layout is already published, and the ABI requires tolerating rows
         // for a grid that is in no layer yet.
         const row_route = resolveGridRouteLocked(app, grid_id);
-        const is_cursor_update = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
-        if (render_helpers.externalRowDisposition(.{ .cursor = is_cursor_update, .route = routeKind(row_route), .live_window = false }) == .layer_row) {
+        if (render_helpers.externalRowDisposition(.{ .main = is_main_update, .cursor = is_cursor_update, .route = routeKind(row_route), .live_window = false }) == .layer_row) {
             const row_verts: []const app_mod.Vertex =
                 if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
             const stored = storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols, row_route);
@@ -642,6 +646,7 @@ pub fn onVerticesRow(
             break :blk ext_win;
         };
         const disposition = render_helpers.externalRowDisposition(.{
+            .main = is_main_update,
             .cursor = is_cursor_update,
             .route = routeKind(row_route),
             .live_window = live_ext_win != null,
@@ -900,7 +905,7 @@ pub fn onVerticesRow(
     }
 
     const disposition = render_helpers.mainRowDisposition(.{
-        .main = (flags & app_mod.VERT_UPDATE_MAIN) != 0,
+        .main = is_main_update,
         .row_start = row_start,
         .row_count = row_count,
         .vert_count = vert_count,

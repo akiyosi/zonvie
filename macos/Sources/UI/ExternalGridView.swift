@@ -1643,6 +1643,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     private func completeSurfaceCursorGpuReadLocked(_ slotIndex: Int) {
+        assert(slotIndex >= 0 && slotIndex < cursorGpuInFlightCount.count && cursorGpuInFlightCount[slotIndex] > 0,
+               "cursor slot released without a matching in-flight mark")
         guard slotIndex >= 0,
               slotIndex < cursorGpuInFlightCount.count,
               cursorGpuInFlightCount[slotIndex] > 0

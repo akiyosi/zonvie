@@ -429,7 +429,9 @@ fn beginLedgerJournal(core: *Core) void {
 /// leaves the refusal path to the invalidate-everything recovery.
 fn saveLedgerOnFirstWrite(core: *Core, grid_id: i64, buf: *const grid_mod.GridBuf) void {
     if (!core.vertex_budget_transaction_active or buf.vertex_budget_touched) return;
+    // The journal holds the pre-flush ledger: one save per grid per attempt.
     if (grid_id == 1) {
+        std.debug.assert(!core.flush_main_ledger.live);
         if (!saveLedger(core, buf, &core.flush_main_ledger)) core.flush_ledger_journal_failed = true;
         return;
     }
@@ -438,18 +440,25 @@ fn saveLedgerOnFirstWrite(core: *Core, grid_id: i64, buf: *const grid_mod.GridBu
         return;
     };
     if (!gop.found_existing) gop.value_ptr.* = .{};
+    std.debug.assert(!gop.value_ptr.live);
     if (!saveLedger(core, buf, gop.value_ptr)) core.flush_ledger_journal_failed = true;
 }
 
 fn restoreVertexRowLedgers(core: *Core) bool {
     if (core.flush_ledger_journal_failed) return false;
-    if (core.flush_main_ledger.live) restoreLedger(&core.grid.main_buf, &core.flush_main_ledger);
+    // A live entry was saved by this attempt's first write to its grid, so
+    // the grid is touched, or reshaped since (GridBuf.resize clears touched).
+    if (core.flush_main_ledger.live) {
+        std.debug.assert(core.grid.main_buf.vertex_budget_touched or core.grid.main_buf.reshaped_in_txn);
+        restoreLedger(&core.grid.main_buf, &core.flush_main_ledger);
+    }
     restoreReshapedLedger(&core.grid.main_buf);
     var it = core.flush_subgrid_ledgers.iterator();
     while (it.next()) |e| {
         if (!e.value_ptr.live) continue;
         // Destroyed inside the flush: its ledger went with it.
         const buf = core.grid.sub_grids.getPtr(e.key_ptr.*) orelse continue;
+        std.debug.assert(buf.vertex_budget_touched or buf.reshaped_in_txn);
         restoreLedger(buf, e.value_ptr);
     }
     var subgrid_total: usize = 0;
@@ -1657,7 +1666,32 @@ fn chargeGridRow(core: *Core, src: GridRowSource, row: u32, verts: []const c_api
 /// the layout-only signal, and the Windows root path unwraps it.
 fn sendGridRow(core: *Core, row_cb: anytype, src: GridRowSource, row: u32, verts: []const c_api.Vertex) void {
     traceRender(core, "event=row_send grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ src.grid_id, row, verts.len, src.rows, src.cols });
-    row_cb(core.ctx, src.grid_id, row, 1, verts.ptr, verts.len, c_api.VERT_UPDATE_MAIN, src.rows, src.cols);
+    sendRowUpdate(core, row_cb, src.grid_id, row, 1, verts.ptr, verts.len, .main, src.rows, src.cols);
+}
+
+const RowUpdateKind = enum { main, cursor };
+
+/// The one on_vertices_row emission point. A send carries exactly one of
+/// MAIN and CURSOR: a frontend replaces row contents on MAIN, so a cursor
+/// send carrying it would overwrite the row with cursor quads.
+fn sendRowUpdate(
+    core: *Core,
+    row_cb: anytype,
+    grid_id: i64,
+    row_start: u32,
+    row_count: u32,
+    verts: ?[*]const c_api.Vertex,
+    vert_count: usize,
+    kind: RowUpdateKind,
+    rows: u32,
+    cols: u32,
+) void {
+    const flags: u32 = switch (kind) {
+        .main => c_api.VERT_UPDATE_MAIN,
+        .cursor => c_api.VERT_UPDATE_CURSOR,
+    };
+    std.debug.assert(@popCount(flags & (c_api.VERT_UPDATE_MAIN | c_api.VERT_UPDATE_CURSOR)) == 1);
+    row_cb(core.ctx, grid_id, row_start, row_count, verts, vert_count, flags, rows, cols);
 }
 
 /// Cancel this flush because the atlas was replaced under it: rows already
@@ -3100,6 +3134,8 @@ pub const FlushCtx = struct {
         try ctx.core.shaping_bufs.preSizeForFlush(ctx.core.alloc, max_glyph_count);
         // Opened after the last fallible setup step: only the defer below closes it.
         try beginVertexBudgetTransaction(ctx.core);
+        // No error may leave the open bracket: a `try` below fails to compile.
+        errdefer comptime unreachable;
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
 
         // === PERF LOG: flush開始 ===
@@ -3541,41 +3577,22 @@ pub const FlushCtx = struct {
 
             if (ctx.core.cb.on_vertices_row) |row_cb| {
                 if (need_main) {
-                    row_cb(
-                        ctx.core.ctx,
-                        1,
-                        0,
-                        0,
-                        null,
-                        0,
-                        c_api.VERT_UPDATE_MAIN,
-                        rows,
-                        cols,
-                    );
+                    sendRowUpdate(ctx.core, row_cb, 1, 0, 0, null, 0, .main, rows, cols);
                     if (ctx.core.flush_aborted) return;
                     // A grid with no cells draws no cursor.
-                    row_cb(
-                        ctx.core.ctx,
-                        1,
-                        0,
-                        0,
-                        null,
-                        0,
-                        c_api.VERT_UPDATE_CURSOR,
-                        rows,
-                        cols,
-                    );
+                    sendRowUpdate(ctx.core, row_cb, 1, 0, 0, null, 0, .cursor, rows, cols);
                     if (ctx.core.flush_aborted) return;
                     // Only grid 1 was resent: resetting every grid's ledger
                     // and mirror (invalidateMirroredFrameState) left external
                     // windows that were not resent under-counted and blocked
                     // atlas GC until each of their rows was redrawn.
-                    saveLedgerOnFirstWrite(ctx.core, 1, &ctx.core.grid.main_buf);
+                    const main_buf = &ctx.core.grid.main_buf;
+                    saveLedgerOnFirstWrite(ctx.core, 1, main_buf);
+                    touchGridVertexBudget(ctx.core, 1, main_buf);
                     if (ctx.core.glyph_mirror.getPtr(1)) |m| {
                         for (m.rows.items) |*r| r.clearRetainingCapacity();
                         if (m.valid.bit_length != 0) m.valid.unsetAll();
                     }
-                    const main_buf = &ctx.core.grid.main_buf;
                     @memset(main_buf.vertex_row_counts, 0);
                     ctx.core.flush_vertex_count_aggregate -|= main_buf.surface_vertex_count;
                     main_buf.surface_vertex_count = 0;
@@ -3757,14 +3774,11 @@ pub const FlushCtx = struct {
 
                             // On error (e.g. buffer allocation failure), skip this
                             // row so partial vertices are not cached or sent.
-                            // markAllDirty alone would only make the CONTENT
-                            // eligible next flush; it would not stop this flush's
-                            // write-set, with this row missing, from committing as
-                            // a successful frame. flush_aborted is what makes both
-                            // frontends cancel the bracket instead.
+                            // flush_aborted makes both frontends cancel the
+                            // bracket; the row keeps its dirty bit (nothing was
+                            // consumed), so the retry owes it and nothing more.
                             const row_gen_stats = generateGridRow(ctx.core, main_src, r, glow_enabled, out) catch |err| {
                                 out.clearRetainingCapacity();
-                                had_glyph_miss = true;
                                 abortFlushForRowError(ctx.core, err);
                                 break;
                             };
@@ -3877,13 +3891,10 @@ pub const FlushCtx = struct {
                         break; // Normal exit from retry_loop
                     }
 
-                    // A row_cb in the loop above may have aborted this flush
-                    // (e.g. Windows row-buffer OOM), and the frontend cancels
-                    // its whole triple-buffer bracket — nothing composed above
-                    // reached the screen. clearDirty() here would leave
-                    // zonvie_core_retry_flush's has_pending check seeing nothing
-                    // pending, losing this content until an unrelated later edit
-                    // happens to touch the same rows.
+                    // Dirty state is moved to owed, not cleared: the outer
+                    // defer commits it with the bracket or returns it
+                    // (returnOwed) when the frontend refuses. Not consumed on
+                    // an abort raised inside the loop, since nothing was sent.
                     if (!ctx.core.flush_aborted) ctx.core.grid.main_buf.consumeDirtyForSend(rebuild_all or saw_atlas_reset);
                     if (had_glyph_miss or saw_atlas_reset) {
                         // Not after a retry that survived the reset: it rebuilt
@@ -4750,13 +4761,13 @@ fn sendGridCursor(
             };
 
             traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, out.items.len });
-            row_cb(self.ctx, grid_id, cur_row, 1, out.items.ptr, out.items.len, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+            sendRowUpdate(self, row_cb, grid_id, cur_row, 1, out.items.ptr, out.items.len, .cursor, buf.rows, buf.cols);
             self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, out.items.len });
         } else {
             // Outside a grid that shrank under it: Neovim moves the cursor in
             // a later batch, and until then the one this grid drew must go.
             traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
-            row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+            sendRowUpdate(self, row_cb, grid_id, 0, 1, null, 0, .cursor, buf.rows, buf.cols);
         }
     } else if (cursor_was_on_this_grid or self.force_ext_cursor_recheck) {
         // Cursor left this grid, or was hidden on it: send an empty cursor to
@@ -4765,7 +4776,7 @@ fn sendGridCursor(
         // so clearing every OTHER grid is a harmless no-op for clean grids and
         // closes the gap for the misnamed one.
         traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
-        row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+        sendRowUpdate(self, row_cb, grid_id, 0, 1, null, 0, .cursor, buf.rows, buf.cols);
         self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
     }
     return true;
@@ -4964,7 +4975,6 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         const viewport_cols = sg.cols;
         const viewport_rows = sg.rows;
         var ext_saw_atlas_reset: bool = false;
-        var ext_had_row_error: bool = false;
         var ext_had_glyph_miss: bool = false;
         // Rows this pass regenerated, for the [ext_grid_row] report.
         var regen_count: u32 = 0;
@@ -5057,7 +5067,6 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
                 const row_est = @as(usize, sg.cols) * 24 + 12;
                 ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
-                    ext_had_row_error = true;
                     // The frontend must cancel this bracket rather than
                     // commit it with this row silently missing; the outer
                     // grid loop's flush_aborted check stops the rest.
@@ -5068,7 +5077,6 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 composeGridRow(self, ext_src, row, ext_tables, &hl_cache_hits, &hl_cache_misses);
                 const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
                     ext_verts.clearRetainingCapacity();
-                    ext_had_row_error = true;
                     abortFlushForRowError(self, err);
                     break;
                 };
@@ -5090,7 +5098,6 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 // Charged after the reset check, as the root is: a row the
                 // cancelled commit discards owes the ledger nothing.
                 chargeGridRow(self, ext_src, row, ext_verts.items) catch |err| {
-                    ext_had_row_error = true;
                     abortFlushForRowError(self, err);
                     break;
                 };
@@ -5115,12 +5122,10 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
             grid_id, hl_cache_hits, hl_cache_misses,
         });
 
-        // Skipped on mid-flush abort: keep dirty so the rows are re-sent.
+        // Dirty state is moved to owed; the outer defer commits or returns
+        // it (returnOwed). A row error aborted before anything was consumed,
+        // so the failed rows stay dirty and the retry owes exactly them.
         if (!self.flush_aborted) sg.consumeDirtyForSend(sent_every_row);
-        // Re-mark dirty so the failed rows regenerate next flush.
-        if (ext_had_row_error) {
-            sg.markAllDirty();
-        }
         // A rasterizer miss is transient (font backend/cache publication may
         // complete before the next frame), so keep the grid dirty rather than
         // let the missing glyph become permanently blank.
@@ -9033,6 +9038,48 @@ test "an allocation failure in the main row pass is a retryable abort, not an er
     try std.testing.expect(!core.grid.main_buf.anyDirty());
 }
 
+test "an allocation failure in a row owes only the rows the attempt consumed" {
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 16);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_rasterize_glyph = TxnProbe.rasterize;
+    core.cb.on_atlas_upload = TxnProbe.upload;
+    core.cb.on_atlas_create = TxnProbe.create;
+    core.grid.putCell(0, 0, 'A', 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 16);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+
+    // A row of cached glyphs: the only allocation left is the row's vertex
+    // scratch growing, which is a row error, not a glyph miss.
+    for (0..16) |c| core.grid.putCell(1, @intCast(c), 'A', 0);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try flush_ctx.onFlush(2, 16);
+    // Vacuity gate: the attempt did fail on an allocation inside the bracket.
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.flush_retryable);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    try std.testing.expect(core.grid.main_buf.isRowDirty(1));
+    try std.testing.expect(!core.grid.main_buf.isRowDirty(0));
+}
+
 test "a sub-grid over its surface limit at flush begin is reported as an invariant violation" {
     // validateCompletedVertexBudget refuses to commit such a frame, so one
     // found at the next flush's begin is broken bookkeeping, not content.
@@ -9160,6 +9207,68 @@ test "external vertex aggregate follows lifecycle without layout-order scans" {
     try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 0), surface.surface_vertex_count);
     try std.testing.expect(!surface.vertex_row_ledger_valid);
+}
+
+test "a refused attempt that wrote a grid twice restores the pre-flush ledger, not its first write" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    const main_buf = core.grid.bufFor(1).?;
+    const surface = core.grid.sub_grids.getPtr(2).?;
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, main_buf, 0, 3);
+    try replaceGridSurfaceRowVertexCount(&core, 1, main_buf, 1, 4);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 0, 10);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 1, 20);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, main_buf, 0, 1);
+    try replaceGridSurfaceRowVertexCount(&core, 1, main_buf, 1, 2);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 0, 5);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 1, 7);
+    finishVertexBudgetTransactionRestoring(&core, .refusal_atlas_valid);
+
+    try std.testing.expectEqualSlices(usize, &.{ 3, 4 }, main_buf.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 7), main_buf.surface_vertex_count);
+    try std.testing.expectEqualSlices(usize, &.{ 10, 20 }, surface.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 30), surface.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 30), core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 37), core.flush_vertex_count_aggregate);
+}
+
+test "a refused attempt does not restore an untouched grid from an earlier attempt's journal" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 4);
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    const surface = core.grid.sub_grids.getPtr(2).?;
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 0, 10);
+    try replaceGridSurfaceRowVertexCount(&core, 2, surface, 1, 20);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+
+    // Between flushes the committed ledger moves on; the journal of the
+    // committed attempt must not be replayed onto it.
+    core.grid.scrollGrid(2, 0, 2, 0, 1, 1, 0);
+    const scrolled_count = surface.surface_vertex_count;
+    try std.testing.expect(scrolled_count != 30);
+    var scrolled_rows: [2]usize = undefined;
+    @memcpy(&scrolled_rows, surface.vertex_row_counts);
+
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 3);
+    finishVertexBudgetTransactionRestoring(&core, .refusal_atlas_valid);
+
+    try std.testing.expectEqual(scrolled_count, surface.surface_vertex_count);
+    try std.testing.expectEqualSlices(usize, &scrolled_rows, surface.vertex_row_counts);
+    try std.testing.expectEqual(scrolled_count, core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
 }
 
 test "deferred external pass shares the main vertex budget transaction" {
@@ -9569,10 +9678,11 @@ test "external row scroll eligibility fails closed on non-representable regions"
     try std.testing.expect(gridScrollFastPathRegion(full, 4, 4, 2, 5) == null);
 }
 
-test "row-only vertex consumer receives main rows and cursor layer" {
+test "row-only vertex consumer receives main rows and cursor layer, never both in one send" {
     const State = struct {
         main_calls: u32 = 0,
         cursor_calls: u32 = 0,
+        mixed_calls: u32 = 0,
 
         fn onRow(
             ctx: ?*anyopaque,
@@ -9595,6 +9705,7 @@ test "row-only vertex consumer receives main rows and cursor layer" {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (flags & c_api.VERT_UPDATE_MAIN != 0) self.main_calls += 1;
             if (flags & c_api.VERT_UPDATE_CURSOR != 0) self.cursor_calls += 1;
+            if (@popCount(flags & (c_api.VERT_UPDATE_MAIN | c_api.VERT_UPDATE_CURSOR)) != 1) self.mixed_calls += 1;
         }
     };
 
@@ -9615,6 +9726,7 @@ test "row-only vertex consumer receives main rows and cursor layer" {
     try flush_ctx.onFlush(2, 2);
     try std.testing.expect(state.main_calls >= 2);
     try std.testing.expectEqual(@as(u32, 1), state.cursor_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.mixed_calls);
 }
 
 test "standalone subgrid clear emits each covered retained main row" {
@@ -17504,6 +17616,26 @@ test "a refused flush keeps the row shift for its retry" {
     try flush_ctx.onFlush(24, 80);
     try std.testing.expectEqual(@as(u32, 1), probe.shift_calls);
     try std.testing.expectEqual(@as(u32, 1), probe.rowsFor(2));
+
+    // The glyph mirror followed the shift the refused bracket dropped and
+    // then the retry's; after both it must describe the rows the frontend
+    // holds, which a full resend records from scratch.
+    var after_retry: [24]u64 = undefined;
+    for (&after_retry, 0..) |*d, r| d.* = glyphMirrorRowDigest(&core, 2, @intCast(r));
+    core.grid.markEverySurfaceDirty();
+    try flush_ctx.onFlush(24, 80);
+    var full: [24]u64 = undefined;
+    for (&full, 0..) |*d, r| d.* = glyphMirrorRowDigest(&core, 2, @intCast(r));
+    try std.testing.expectEqualSlices(u64, &full, &after_retry);
+}
+
+/// Hash of one mirrored row: its valid bit and recorded UVs.
+fn glyphMirrorRowDigest(core: *const Core, grid_id: i64, row: u32) u64 {
+    const m = core.glyph_mirror.getPtr(grid_id).?;
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&m.valid.isSet(row)));
+    h.update(std.mem.sliceAsBytes(m.rows.items[row].items));
+    return h.final();
 }
 
 test "a row shift is allowed up to half the region and refused past it" {
@@ -17553,6 +17685,8 @@ const ModelFrontend = struct {
     refuse_next_end: bool = false,
     rows_sent: u32 = 0,
     oom: bool = false,
+    /// A callback carried both MAIN and CURSOR, or neither.
+    bad_flags: bool = false,
 
     fn deinit(self: *ModelFrontend) void {
         deinitTable(self.alloc, &self.committed);
@@ -17591,8 +17725,11 @@ const ModelFrontend = struct {
 
     fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
         _ = total_cols;
-        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
         const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        // A MAIN send replaces row contents, so a cursor send must never
+        // carry it; every send is exactly one of the two.
+        if (@popCount(flags & (c_api.VERT_UPDATE_MAIN | c_api.VERT_UPDATE_CURSOR)) != 1) self.bad_flags = true;
+        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
         // Positions are grid-local, so a row moved by a shift is drawn
         // translated; compare rows relative to their own top.
         const row_top: f32 = @floatFromInt(row_start * @max(1, self.core.cell_h_px));
@@ -17719,16 +17856,22 @@ const ModelFrontend = struct {
 
 test "random edits and refusals leave the frontend holding exactly what the core would send" {
     const seeds = [_]u64{ 1, 2, 3, 42, 1234 };
-    for (seeds) |seed| try runFlushModel(seed);
+    for (seeds) |seed| try runFlushModel(seed, false);
 }
 
-fn runFlushModel(seed: u64) !void {
+test "random edits, cursor moves and refusals keep every send either MAIN or CURSOR" {
+    const seeds = [_]u64{ 7, 42 };
+    for (seeds) |seed| try runFlushModel(seed, true);
+}
+
+fn runFlushModel(seed: u64, cursor_visible: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try initTxnCore(&core);
+    core.grid.cursor_visible = cursor_visible;
     var model = ModelFrontend{ .alloc = std.testing.allocator, .core = &core };
     defer model.deinit();
     model.attach();
@@ -17776,7 +17919,7 @@ fn runFlushModel(seed: u64) !void {
                 },
                 6 => core.grid.putCellGrid(1, rand.uintLessThan(u32, 24), rand.uintLessThan(u32, 80), 'm', 0),
                 7 => if (float_open) try core.grid.setWinFloatPos(4, 104, rand.uintLessThan(u32, 10), rand.uintLessThan(u32, 30), 50, 0, 1, true),
-                else => {},
+                else => if (cursor_visible) core.grid.setCursor(rand.intRangeAtMost(i64, 1, 3), rand.uintLessThan(u32, 24), rand.uintLessThan(u32, 40)),
             }
         }
 
@@ -17790,6 +17933,7 @@ fn runFlushModel(seed: u64) !void {
             try std.testing.expect(model.rows_sent <= refused_rows);
         }
         try std.testing.expect(!model.oom);
+        try std.testing.expect(!model.bad_flags);
         if (step % 10 == 9) model.checkAgainstFullResend(&flush_ctx, 24, 80) catch |err| {
             std.debug.print("model: seed={d} step={d}\n", .{ seed, step });
             return err;

@@ -1216,19 +1216,20 @@ pub const Core = struct {
 
     pub fn isHardRenderFailure(reason: anyerror) bool {
         return switch (reason) {
-            error.GridTooLarge,
-            error.TooManySubgrids,
-            error.TooManyWindowPlacements,
-            error.LayoutTooComplex,
-            error.LayoutBudgetExceeded,
-            error.VertexBudgetExceeded,
-            error.VertexBudgetExceededPerCallback,
-            error.VertexBudgetExceededPerSurface,
-            error.VertexBudgetExceededAggregate,
-            error.VertexBudgetInvariantViolated,
-            error.ShapeCallbackInvalidCount,
-            error.MessageTooLarge,
-            error.FrameTooLarge,
+            // Reach this through rpc_session's redraw/stream failure handlers.
+            error.GridTooLarge, // grid.zig resizeGrid / checkedAggregateCellCount
+            error.TooManySubgrids, // grid.zig subgrid insertion
+            error.TooManyWindowPlacements, // grid.zig window placement tables
+            error.LayoutBudgetExceeded, // render_layout.zig Budget.reserve
+            error.MessageTooLarge, // msgpack.zig decode budget
+            error.FrameTooLarge, // rpc_session.zig frame buffer cap
+            // Reach this from the flush path.
+            error.VertexBudgetExceeded, // flush.zig surface/row vertex caps; c_api.zig failHardRender
+            error.VertexBudgetExceededPerCallback, // flush.zig per-callback cap
+            error.VertexBudgetExceededPerSurface, // flush.zig per-surface cap
+            error.VertexBudgetExceededAggregate, // flush.zig aggregate cap
+            error.VertexBudgetInvariantViolated, // flush.zig validateCompletedVertexBudget
+            error.ShapeCallbackInvalidCount, // flush.zig shaping callback contract
             => true,
             else => false,
         };
@@ -3358,6 +3359,12 @@ pub const Core = struct {
         // full atlas is encountered.
         self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
         self.resetGlyphCacheFlags();
+        // Postcondition: no cache slot may still name a UV in the old texture.
+        if (@import("builtin").mode == .Debug) {
+            if (self.glyph_valid_ascii) |valid| for (valid) |v| std.debug.assert(!v);
+            if (self.glyph_keys_non_ascii) |keys| for (keys) |k| std.debug.assert(k == GLYPH_CACHE_INVALID_KEY);
+            if (self.glyph_keys_by_id) |keys| for (keys) |k| std.debug.assert(k == GLYPH_CACHE_INVALID_KEY);
+        }
         self.atlas_initialized = true;
         if (self.cb.on_atlas_create) |f| {
             const log_on = self.log.cb != null;
@@ -6634,6 +6641,25 @@ test "atlas grows and maximum-size full retry converges" {
     try std.testing.expect(!core.atlas_has_capacity_negative);
     core.finishAtlasCapacityRetry();
     try std.testing.expect(!core.atlas_negative_recovery_armed);
+}
+
+test "replacing the atlas invalidates every glyph cache slot" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+
+    const scalar_index = @as(usize, 'A') * 4;
+    core.glyph_valid_ascii.?[scalar_index] = true;
+    core.glyph_keys_non_ascii.?[0] = 0x1234;
+    core.glyph_keys_by_id.?[0] = 0x5678;
+
+    // Every UV issued so far names the old texture; a slot that survives
+    // would draw from an atlas that no longer exists.
+    core.replaceAtlas(false);
+    try std.testing.expect(!core.glyph_valid_ascii.?[scalar_index]);
+    for (core.glyph_valid_ascii.?) |v| try std.testing.expect(!v);
+    for (core.glyph_keys_non_ascii.?) |k| try std.testing.expectEqual(GLYPH_CACHE_INVALID_KEY, k);
+    for (core.glyph_keys_by_id.?) |k| try std.testing.expectEqual(GLYPH_CACHE_INVALID_KEY, k);
 }
 
 test "capacity-negative retry is selective and backs off after repeated failure" {

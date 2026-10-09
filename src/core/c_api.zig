@@ -947,10 +947,10 @@ pub export fn zonvie_core_notify_layout_ready(p: ?*zonvie_core, rows: u32, cols:
     box.core.notifyLayoutReady(rows, cols);
 }
 
-pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: usize) callconv(.c) void {
-    if (p == null) return;
+pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: ?[*]const u8, len: usize) callconv(.c) void {
+    if (p == null or keys == null or len == 0) return;
     const box = asBox(p.?);
-    box.core.sendInput(keys[0..len]);
+    box.core.sendInput(keys.?[0..len]);
 }
 
 pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
@@ -1184,14 +1184,14 @@ pub export fn zonvie_core_set_focus(p: ?*zonvie_core, gained: bool) callconv(.c)
 /// `:set guifont?` reports what the frontend is actually rendering.
 pub export fn zonvie_core_set_option_value(
     p: ?*zonvie_core,
-    name: [*]const u8,
+    name: ?[*]const u8,
     name_len: usize,
-    value: [*]const u8,
+    value: ?[*]const u8,
     value_len: usize,
 ) callconv(.c) void {
-    if (p == null) return;
+    if (p == null or name == null or name_len == 0 or value == null) return;
     const box = asBox(p.?);
-    box.core.requestSetOptionValue(name[0..name_len], value[0..value_len]) catch {};
+    box.core.requestSetOptionValue(name.?[0..name_len], value.?[0..value_len]) catch {};
 }
 
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
@@ -1205,26 +1205,26 @@ pub export fn zonvie_core_request_win_close(p: ?*zonvie_core, grid_id: i64) call
     return @intFromBool(sent);
 }
 
-pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
-    if (p == null) return;
+pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: ?[*]const u8, len: usize) callconv(.c) void {
+    if (p == null or cmd == null or len == 0) return;
     const box = asBox(p.?);
-    box.core.requestCommand(cmd[0..len]) catch {};
+    box.core.requestCommand(cmd.?[0..len]) catch {};
 }
 
 /// Open `count` UTF-8 paths with `:drop` (all in one command) or, with
 /// `tab_per_file`, one `:tab drop` each. Escaped server-side by fnameescape.
 pub export fn zonvie_core_drop_paths(
     p: ?*zonvie_core,
-    paths: [*]const [*]const u8,
-    lens: [*]const usize,
+    paths: ?[*]const [*]const u8,
+    lens: ?[*]const usize,
     count: usize,
     tab_per_file: c_int,
 ) callconv(.c) void {
-    if (p == null or count == 0) return;
+    if (p == null or paths == null or lens == null or count == 0) return;
     const box = asBox(p.?);
     const slices = box.core.alloc.alloc([]const u8, count) catch return;
     defer box.core.alloc.free(slices);
-    for (slices, 0..) |*s, i| s.* = paths[i][0..lens[i]];
+    for (slices, 0..) |*s, i| s.* = paths.?[i][0..lens.?[i]];
     box.core.requestDropPaths(slices, tab_per_file != 0) catch {};
 }
 
@@ -1237,14 +1237,28 @@ pub export fn zonvie_core_drop_paths(
 /// preedit itself (extmark mode disabled, or not in insert/replace mode).
 pub export fn zonvie_core_set_preedit(
     p: ?*zonvie_core,
-    text: [*]const u8,
+    text: ?[*]const u8,
     len: usize,
     target_start: usize,
     target_end: usize,
 ) callconv(.c) c_int {
     if (p == null) return 0;
     const box = asBox(p.?);
-    return if (box.core.setPreedit(text[0..len], target_start, target_end)) 1 else 0;
+    const text_slice: []const u8 = if (text != null and len > 0) text.?[0..len] else &[_]u8{};
+    return if (box.core.setPreedit(text_slice, target_start, target_end)) 1 else 0;
+}
+
+test "the five byte-buffer entry points ignore a NULL buffer instead of dereferencing it" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    zonvie_core_send_input(p, null, 3);
+    zonvie_core_set_option_value(p, null, 3, null, 3);
+    zonvie_core_set_option_value(p, "guifont", 7, null, 3);
+    zonvie_core_send_command(p, null, 3);
+    zonvie_core_drop_paths(p, null, null, 1, 0);
+    const one_len = [_]usize{1};
+    zonvie_core_drop_paths(p, null, &one_len, 1, 0);
+    try std.testing.expectEqual(@as(c_int, 0), zonvie_core_set_preedit(p, null, 3, 0, 0));
 }
 
 /// Clear any inline preedit extmark (called on IME commit or cancel).
@@ -2680,12 +2694,15 @@ pub const zonvie_msg_view_type = enum(c_int) {
 };
 
 /// Message event type (C ABI compatible - must match C enum size)
+/// Non-exhaustive: the value arrives raw from C, so an out-of-range int must
+/// reach the `_` arm rather than be undefined behaviour.
 pub const zonvie_msg_event = enum(c_int) {
     msg_show = 0,
     msg_showmode = 1,
     msg_showcmd = 2,
     msg_ruler = 3,
     msg_history_show = 4,
+    _,
 };
 
 /// Result of routing a message
@@ -2789,6 +2806,7 @@ pub export fn zonvie_core_route_message(
         .msg_showcmd => .msg_showcmd,
         .msg_ruler => .msg_ruler,
         .msg_history_show => .msg_history_show,
+        _ => return default_result,
     };
 
     // Get kind string
@@ -3455,9 +3473,12 @@ pub export fn zonvie_core_update_layout_px_locked(
 // Output: compiled source in the target shading language (MSL or HLSL).
 // Implementation: glslang (GLSL -> SPIR-V) + SPIRV-Cross (SPIR-V -> target).
 
+/// Non-exhaustive: the value arrives raw from C, so an out-of-range int must
+/// reach the `_` arm rather than be undefined behaviour.
 pub const zonvie_shader_target = enum(c_int) {
     msl = 0, // Metal Shading Language
     hlsl = 1, // HLSL (shader model 5.0)
+    _,
 };
 
 comptime {
@@ -3589,6 +3610,7 @@ pub export fn zonvie_shader_compile_glsl(
     const t: shader_compiler.Target = switch (target) {
         .msl => .msl,
         .hlsl => .hlsl,
+        _ => return buildShaderError("unknown shader target"),
     };
     const compiled = shader_compiler.compileGlslToTarget(gpa, src, t) catch |err| {
         return switch (err) {
@@ -3652,6 +3674,20 @@ test "the exported route API reports every view as its matching ABI view" {
         const result = zonvie_core_route_message(p, .msg_show, case.kind, 1);
         try std.testing.expectEqualStrings(@tagName(case.expect), @tagName(result.view));
     }
+}
+
+test "an out-of-range C enum value routes to the default view and fails shader compilation" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const routed = zonvie_core_route_message(p, @enumFromInt(99), "k", 1);
+    try std.testing.expectEqual(zonvie_msg_view_type.ext_float, routed.view);
+    try std.testing.expectEqual(@as(f32, 4.0), routed.timeout);
+
+    const src = "void main() {}";
+    var result = zonvie_shader_compile_glsl(src.ptr, src.len, @enumFromInt(99));
+    defer zonvie_shader_result_destroy(&result);
+    try std.testing.expect(result.data == null);
+    try std.testing.expectEqualStrings("unknown shader target", std.mem.span(result.error_msg.?));
 }
 
 test "the null-handle config values match what a default config would build" {

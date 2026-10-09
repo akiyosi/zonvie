@@ -2276,6 +2276,7 @@ pub const Renderer = struct {
     /// The returned rectangle must be included in the next present damage.
     /// Caller must hold lockContext().
     pub fn restoreScrollbarUnderlay(self: *Renderer) !?c.RECT {
+        self.assertContextLocked();
         if (!self.scrollbar_underlay_state.valid) return null;
         errdefer {
             safeRelease(&self.scrollbar_underlay_tex);
@@ -2338,6 +2339,7 @@ pub const Renderer = struct {
     /// it is recreated only when the track geometry changes. Caller must hold
     /// lockContext(), and must restore a prior underlay before capturing again.
     pub fn captureScrollbarUnderlay(self: *Renderer, raw_rect: c.RECT) !?c.RECT {
+        self.assertContextLocked();
         if (self.scrollbar_underlay_state.valid) {
             return error.ScrollbarUnderlayAlreadyValid;
         }

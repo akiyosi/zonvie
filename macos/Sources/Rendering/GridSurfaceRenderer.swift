@@ -504,6 +504,10 @@ enum VertexRowUpdate {
     case main, cursorOnly, none
 
     init(flags: UInt32) {
+        // The core sets exactly one of MAIN and CURSOR; both is a core bug.
+        // Release keeps the MAIN-wins fallback below.
+        assert(flags & UInt32(ZONVIE_VERT_UPDATE_MAIN) == 0 || flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) == 0,
+               "on_vertices_row flags set both MAIN and CURSOR")
         if flags & UInt32(ZONVIE_VERT_UPDATE_MAIN) != 0 {
             self = .main
         } else if flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) != 0 {
@@ -1434,12 +1438,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // one discipline means adding a reader here cannot race.
         lock.lock()
         pendingSurfaceLayers = layers
+        let stagedOwner = cursorOwner.staged ?? 1
         lock.unlock()
         // Removing or migrating the owner also removes its surface overlay.
         // Stage this with placement so abort preserves the old complete frame.
-        if !layers.contains(where: { $0.gridId == (cursorOwner.staged ?? 1) }) {
-            submitLayerCursor(gridId: cursorOwner.staged ?? 1, ptr: nil, count: 0)
+        if !layers.contains(where: { $0.gridId == stagedOwner }) {
+            submitLayerCursor(gridId: stagedOwner, ptr: nil, count: 0)
+            lock.lock()
             cursorOwner.stage(1)
+            lock.unlock()
         }
     }
 
@@ -1463,6 +1470,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// cursor, and it has to be placed with its own layer's transform.
     /// Shared with ExternalGridView. This surface's root is grid 1, so that is
     /// what "no particular layer" means here and the owner is never nil.
+    /// Every access, staged and committed, is under `lock`: the core thread
+    /// stages while the draw thread reads the committed half.
     private var cursorOwner = SurfaceCursorOwner(initial: 1)
     var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
 
@@ -1483,8 +1492,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // external surface has always refused here; the root path warns.
         guard isInFlush else { return }
         // Cursor clears are grid-local even though the surface has one overlay.
-        guard cursorOwner.admit(gridId, count: count, rootRow: rootRow) else {
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(cursorOwner.staged ?? 1) reason=empty_nonowner")
+        lock.lock()
+        let admitted = cursorOwner.admit(gridId, count: count, rootRow: rootRow)
+        let stagedOwner = cursorOwner.staged ?? 1
+        lock.unlock()
+        guard admitted else {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(stagedOwner) reason=empty_nonowner")
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=1 grid=\(gridId) vertices=\(count)")
@@ -1888,6 +1901,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// external surface's is. Caller holds `lock`.
     private func completeSurfaceFrameReadLocked(rowSet: Int, cursorSlot: Int) {
         completeSurfaceGpuReadLocked(rowSet)
+        assert(cursorSlot >= 0 && cursorSlot < cursorGpuInFlightCount.count && cursorGpuInFlightCount[cursorSlot] > 0,
+               "cursor slot released without a matching in-flight mark")
         guard cursorSlot >= 0, cursorSlot < cursorGpuInFlightCount.count,
               cursorGpuInFlightCount[cursorSlot] > 0 else { return }
         cursorGpuInFlightCount[cursorSlot] -= 1

@@ -2608,6 +2608,10 @@ func completeSurfaceGpuRead(
     committedSetIndex: Int,
     retirement: inout SurfaceRowStorageRetirementState
 ) {
+    // A release without a matching mark is a double release or a mark/complete
+    // index mismatch; the guard below only keeps Release from going negative.
+    assert(setIndex >= 0 && setIndex < gpuInFlightCount.count && gpuInFlightCount[setIndex] > 0,
+           "GPU read released for a set that was never marked in flight")
     guard setIndex >= 0,
           setIndex < gpuInFlightCount.count,
           gpuInFlightCount[setIndex] > 0

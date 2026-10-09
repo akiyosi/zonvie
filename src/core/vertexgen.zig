@@ -41,7 +41,7 @@ pub const ShapingBuffers = struct {
     /// pre-sized capacity: a run's glyph count is bounded neither by the
     /// pre-size (a row may hold MAX_GRID_COLS cells plus overflow scalars) nor
     /// by its scalar count (the shaper may return more glyphs).
-    pub fn setLen(self: *ShapingBuffers, alloc: ?std.mem.Allocator, n: usize) !void {
+    pub fn setLen(self: *ShapingBuffers, alloc: std.mem.Allocator, n: usize) !void {
         // Fast-path: capacity is sufficient, no allocation needed.
         if (self.hasCapacity(n)) {
             self.glyph_ids.items.len = n;
@@ -53,9 +53,7 @@ pub const ShapingBuffers = struct {
             return;
         }
 
-        if (alloc == null) @panic("ShapingBuffers.setLen: capacity insufficient and no allocator provided");
-
-        try self.ensureCapacity(alloc.?, n);
+        try self.ensureCapacity(alloc, n);
         self.glyph_ids.items.len = n;
         self.clusters.items.len = n;
         self.x_adv.items.len = n;
@@ -74,6 +72,23 @@ pub const ShapingBuffers = struct {
         self.y_off.deinit(alloc);
     }
 };
+
+test "setLen allocates nothing up to the pre-sized capacity and fails past it" {
+    var bufs = ShapingBuffers{};
+    defer bufs.deinit(std.testing.allocator);
+    try bufs.preSizeForFlush(std.testing.allocator, 64);
+    const cap = @min(bufs.glyph_ids.capacity, @min(bufs.clusters.capacity, @min(bufs.x_adv.capacity, @min(bufs.y_adv.capacity, @min(bufs.x_off.capacity, bufs.y_off.capacity)))));
+    try std.testing.expect(cap >= 64);
+
+    // Every allocation request fails, so a setLen that succeeds made none.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var n: usize = 0;
+    while (n <= cap) : (n += 1) {
+        try bufs.setLen(failing.allocator(), n);
+        try std.testing.expectEqual(n, bufs.glyph_ids.items.len);
+    }
+    try std.testing.expectError(error.OutOfMemory, bufs.setLen(failing.allocator(), cap + 1));
+}
 
 pub fn fixed26_6ToPx(v: i32) f32 {
     return @as(f32, @floatFromInt(v)) / 64.0;

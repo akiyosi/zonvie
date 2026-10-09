@@ -320,6 +320,8 @@ pub fn ignoresCursorClear(vert_count: usize, owner_grid_id: i64, grid_id: i64) b
 }
 
 pub const ExternalRowInputs = struct {
+    /// VERT_UPDATE_MAIN.
+    main: bool,
     /// VERT_UPDATE_CURSOR.
     cursor: bool,
     route: RowGridRoute,
@@ -329,6 +331,8 @@ pub const ExternalRowInputs = struct {
 };
 
 pub const ExternalRowDisposition = enum {
+    /// Neither MAIN nor CURSOR: existing row contents are retained.
+    retain_rows,
     /// Stored in the layer of the surface that places the grid.
     layer_row,
     live_cursor,
@@ -340,8 +344,9 @@ pub const ExternalRowDisposition = enum {
 
 /// Disposition of an on_vertices_row callback for a grid other than 1 that the
 /// main surface's cursor path did not take. Cursor updates never become layer
-/// rows: rows and cursor are independent layers.
+/// rows: rows and cursor are independent layers, and only MAIN replaces a row.
 pub fn externalRowDisposition(in: ExternalRowInputs) ExternalRowDisposition {
+    if (!in.main and !in.cursor) return .retain_rows;
     if (!in.cursor) switch (in.route) {
         .main_root, .main_layer, .external_layer => return .layer_row,
         .external_root, .unplaced => {},

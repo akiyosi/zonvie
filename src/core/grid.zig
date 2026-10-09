@@ -1140,7 +1140,9 @@ pub const GridBuf = struct {
     }
 
     /// Clear all state after a non-transactional caller has consumed it.
+    /// Precondition: no flush bracket is open, or its owed rows would be lost.
     pub fn clearDirty(self: *GridBuf) void {
+        std.debug.assert(!self.owed);
         self.clearDirtyContent();
         self.clearScrollState();
     }
@@ -1678,7 +1680,7 @@ pub const Grid = struct {
         // grid_resize will markAllDirty too, but this is the no-op-resize
         // case (same dimensions) where redraw_handler doesn't reach
         // resizeGrid.
-        self.main_buf.dirty_all = true;
+        self.main_buf.markAllDirty();
     }
 
     // ── Cell overflow helpers ────────────────────────────────────────
@@ -2017,7 +2019,8 @@ pub const Grid = struct {
 
     /// Implements the "grid_scroll" UI event by copying a rectangular region.
     /// Note: 'cols' is reserved (currently always 0 in Nvim); checked for no-op detection but not used in scroll logic.
-    /// Precondition: the region and delta are normalised (scrollGrid).
+    /// Precondition: the region and delta are normalised (scrollGrid), and no
+    /// flush bracket is open, so `owed_rows` need not move with the cells.
     pub fn scroll(
         self: *Grid,
         top: u32,
@@ -2028,9 +2031,11 @@ pub const Grid = struct {
         cols: i32,
     ) void {
         _ = cols;
+        std.debug.assert(!self.main_buf.owed);
         std.debug.assert(rows != 0);
         std.debug.assert(top < bot and bot <= self.rows);
         std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(self.main_buf.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;
 
@@ -4564,6 +4569,7 @@ test "a refused send owes its rows back on top of later changes, a commit drops 
     try std.testing.expect(!sg.anyDirty());
     sg.markDirtyRow(3);
     grid.returnOwed();
+    try std.testing.expect(sg.dirty);
     try std.testing.expect(sg.isRowDirty(1));
     try std.testing.expect(sg.isRowDirty(3));
     try std.testing.expect(!sg.isRowDirty(0));
@@ -4573,12 +4579,74 @@ test "a refused send owes its rows back on top of later changes, a commit drops 
     grid.commitOwed();
     grid.returnOwed();
     try std.testing.expect(!sg.anyDirty());
+    try std.testing.expect(!sg.dirty);
 
     // A pass that regenerated every row owes every row.
     sg.markDirtyRow(2);
     sg.consumeDirtyForSend(true);
     grid.returnOwed();
+    try std.testing.expect(sg.dirty);
     try std.testing.expect(sg.dirty_all);
+
+    // A resize inside the bracket: the owed rows no longer line up with the
+    // new shape, so a refusal owes the whole grid, not the rebuilt-empty bits.
+    sg.clearDirtyContent();
+    sg.markDirtyRow(1);
+    sg.consumeDirtyForSend(false);
+    try grid.resizeGrid(2, 5, 3);
+    try std.testing.expect(sg.owed_all);
+    sg.clearDirtyContent();
+    grid.returnOwed();
+    try std.testing.expect(sg.dirty);
+    try std.testing.expect(sg.dirty_all);
+    sg.consumeDirtyForSend(false);
+    try std.testing.expect(sg.owed_all);
+    grid.commitOwed();
+}
+
+test "scrollOverflow drops the cluster a partial shift scrolls off the region" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+    try grid.putCellGridCluster(1, 3, 2, 'c', 0, &.{0x0303});
+    try std.testing.expectEqual(@as(usize, 3), grid.overflowCountForGrid(1));
+
+    // Shift 1 of a 4-row region: row 3 leaves through the bottom edge.
+    grid.scrollOverflow(1, 0, 4, 0, 4, -1);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+    try std.testing.expect(grid.getOverflow(1, 3, 2) == null);
+    try std.testing.expect(grid.getOverflow(1, 4, 2) == null);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 2, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 3, 3).?);
+
+    // Shift 3 on the opposite delta: row 2 leaves through the top edge.
+    grid.scrollOverflow(1, 0, 4, 0, 4, 3);
+    try std.testing.expectEqual(@as(usize, 1), grid.overflowCountForGrid(1));
+    try std.testing.expect(grid.getOverflow(1, 2, 0) == null);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 0, 3).?);
+}
+
+test "win_viewport: a delta of exactly the window height is a scroll, one more is a jump" {
+    // :help ui-events, win_viewport: scroll_delta "contains how much the top
+    // line of a window moved since win_viewport was last emitted ... When
+    // scrolling more than a full screen it is an approximate value." Exactly
+    // one screen is still an exact movement to smooth; past it is a jump that
+    // restarts the running total.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 8);
+
+    try grid.setViewport(1, 1000, 0, 10, 0, 0, 100, 3);
+    try grid.setViewport(1, 1000, 10, 20, 10, 0, 100, 10);
+    try std.testing.expectEqual(@as(i64, 13), grid.viewport.get(1).?.uncovered_scroll_rows);
+
+    try grid.setViewport(1, 1000, 21, 31, 21, 0, 100, 11);
+    try std.testing.expectEqual(@as(i64, 0), grid.viewport.get(1).?.uncovered_scroll_rows);
+
+    try grid.setViewport(1, 1000, 11, 21, 11, 0, 100, -10);
+    try std.testing.expectEqual(@as(i64, -10), grid.takeUncoveredScrollRows(1));
+    try grid.setViewport(1, 1000, 0, 10, 0, 0, 100, -11);
+    try std.testing.expectEqual(@as(i64, 0), grid.takeUncoveredScrollRows(1));
 }
 
 test "every status channel stores, replaces and dirties independently" {
@@ -4936,9 +5004,15 @@ test "a session reset shows a cursor the old session's busy_start hid" {
     defer grid.deinit();
     // What busy_start writes; its busy_stop was lost with the old session.
     grid.cursor_visible = false;
+    try grid.resize(4, 4);
+    grid.main_buf.clearDirtyContent();
 
     grid.resetForNewSession();
     try std.testing.expect(grid.cursor_visible);
+    // dirty_all implies dirty: the first flush must see grid 1 as owing rows
+    // through either predicate.
+    try std.testing.expect(grid.main_buf.dirty_all);
+    try std.testing.expect(grid.main_buf.dirty);
 }
 
 test "destroying an external grid owes the main viewport no repaint" {

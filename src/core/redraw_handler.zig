@@ -10,7 +10,6 @@ const TabEntry = grid_mod.TabEntry;
 const BufferEntry = grid_mod.BufferEntry;
 const hlmod = @import("highlight.zig");
 const Highlights = hlmod.Highlights;
-const Styles = hlmod.Styles;
 const Logger = @import("log.zig").Logger;
 const clock = @import("clock.zig");
 
@@ -278,6 +277,14 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
 fn checkedU32(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(u32)) return null;
     return @as(u32, @intCast(v));
+}
+
+/// Pass a checked* result through, logging the drop when it is null: a value
+/// Neovim sent outside the range the grid can address is the server's fault
+/// and must leave a trace, like the other rejected tuples do.
+fn loggedRange(log: *Logger, comptime event: []const u8, raw: i64, checked: anytype) @TypeOf(checked) {
+    if (checked == null and log.cb != null) log.write("[redraw] " ++ event ++ " tuple dropped: {d} out of range\n", .{raw});
+    return checked;
 }
 
 /// Decode a msgpack `[attr_id, text]` content array, appending one chunk per
@@ -854,6 +861,12 @@ fn testGridLineEvent(
 
 fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, events: []mp.Value) !void {
     var log = Logger{};
+    try runRedrawEventsLogged(grid, hl, arena, events, &log);
+}
+
+/// runRedrawEvents with a caller-owned Logger, for tests that assert on what
+/// the handler logs.
+fn runRedrawEventsLogged(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, events: []mp.Value, log: *Logger) !void {
     const noop = struct {
         fn preFlush(_: *u8) anyerror!void {}
         fn flush(_: *u8, _: u32, _: u32) anyerror!void {}
@@ -866,7 +879,7 @@ fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, event
         hl,
         arena,
         events,
-        &log,
+        log,
         &ctx,
         noop.preFlush,
         noop.flush,
@@ -1600,8 +1613,8 @@ pub fn handleRedraw(
                     if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
-                    const row = checkedU32(t[1].int) orelse continue;
-                    const col = checkedU32(t[2].int) orelse continue;
+                    const row = loggedRange(log, "grid_cursor_goto", t[1].int, checkedU32(t[1].int)) orelse continue;
+                    const col = loggedRange(log, "grid_cursor_goto", t[2].int, checkedU32(t[2].int)) orelse continue;
                     grid.setCursor(grid_id, row, col);
                 }
             },
@@ -1731,8 +1744,8 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     const win_id = t[1].int;
-                    const startrow = checkedGridCoord(t[2].int) orelse continue;
-                    const startcol = checkedGridCoord(t[3].int) orelse continue;
+                    const startrow = loggedRange(log, "win_pos", t[2].int, checkedGridCoord(t[2].int)) orelse continue;
+                    const startcol = loggedRange(log, "win_pos", t[3].int, checkedGridCoord(t[3].int)) orelse continue;
                     log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
                     if (log.cb != null and grid.bufForConst(grid_id) == null) log.write("[win_pos] grid {d} before its grid_resize\n", .{grid_id});
 
@@ -1795,18 +1808,19 @@ pub fn handleRedraw(
                     if (tv != .arr) continue;
                     const t = tv.arr;
                     if (t.len < 8) continue;
-                    if (t[0] != .int) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or
+                        t[4] != .int or t[5] != .int or t[6] != .int or t[7] != .int) continue;
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     // t[1] is the window handle. Kept so window-local options
                     // can be addressed from a grid id.
-                    const win = if (t[1] == .int) t[1].int else 0;
-                    const topline = if (t[2] == .int) t[2].int else 0;
-                    const botline = if (t[3] == .int) t[3].int else 0;
-                    const curline = if (t[4] == .int) t[4].int else 0;
-                    const curcol = if (t[5] == .int) t[5].int else 0;
-                    const line_count = if (t[6] == .int) t[6].int else 0;
-                    const scroll_delta = if (t[7] == .int) t[7].int else 0;
+                    const win = t[1].int;
+                    const topline = t[2].int;
+                    const botline = t[3].int;
+                    const curline = t[4].int;
+                    const curcol = t[5].int;
+                    const line_count = t[6].int;
+                    const scroll_delta = t[7].int;
 
                     log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
                     try grid.setViewport(grid_id, win, topline, botline, curline, curcol, line_count, scroll_delta);
@@ -2027,12 +2041,12 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
 
-                    const top = checkedU32(t[1].int) orelse continue;
-                    const bot = checkedU32(t[2].int) orelse continue;
-                    const left = checkedU32(t[3].int) orelse continue;
-                    const right = checkedU32(t[4].int) orelse continue;
-                    const rows = checkedI32(t[5].int) orelse continue;
-                    const cols = checkedI32(t[6].int) orelse continue;
+                    const top = loggedRange(log, "grid_scroll", t[1].int, checkedU32(t[1].int)) orelse continue;
+                    const bot = loggedRange(log, "grid_scroll", t[2].int, checkedU32(t[2].int)) orelse continue;
+                    const left = loggedRange(log, "grid_scroll", t[3].int, checkedU32(t[3].int)) orelse continue;
+                    const right = loggedRange(log, "grid_scroll", t[4].int, checkedU32(t[4].int)) orelse continue;
+                    const rows = loggedRange(log, "grid_scroll", t[5].int, checkedI32(t[5].int)) orelse continue;
+                    const cols = loggedRange(log, "grid_scroll", t[6].int, checkedI32(t[6].int)) orelse continue;
 
                     // No-op scroll: avoid touching dirty state for nothing.
                     // Neovim's spec reserves `cols` for future use (always 0
@@ -2071,14 +2085,9 @@ pub fn handleRedraw(
 
                     const id_u32: u32 = checkedU32(t[0].int) orelse continue;
 
+                    var attr: hlmod.Attr = .{};
                     if (t[1] == .map) {
                         const m = t[1].map;
-
-                        const fg = toRgbOpt(mapGetInt(m, "foreground"));
-                        const bg = toRgbOpt(mapGetInt(m, "background"));
-                        const sp = toRgbOpt(mapGetInt(m, "special"));
-
-                        const reverse = mapGetBool(m, "reverse") orelse false;
 
                         var blend_u8: u8 = 0;
                         if (mapGetInt(m, "blend")) |b64| {
@@ -2088,7 +2097,12 @@ pub fn handleRedraw(
                             blend_u8 = @as(u8, @intCast(b));
                         }
 
-                        const styles: Styles = .{
+                        attr = .{
+                            .fg = toRgbOpt(mapGetInt(m, "foreground")),
+                            .bg = toRgbOpt(mapGetInt(m, "background")),
+                            .sp = toRgbOpt(mapGetInt(m, "special")),
+                            .reverse = mapGetBool(m, "reverse") orelse false,
+                            .blend = blend_u8,
                             .italic = mapGetBool(m, "italic") orelse false,
                             .bold = mapGetBool(m, "bold") orelse false,
                             .strikethrough = mapGetBool(m, "strikethrough") orelse false,
@@ -2098,26 +2112,35 @@ pub fn handleRedraw(
                             .underdotted = mapGetBool(m, "underdotted") orelse false,
                             .underdashed = mapGetBool(m, "underdashed") orelse false,
                             .overline = mapGetBool(m, "overline") orelse false,
+                            .has_url = (mapGetStr(m, "url") != null),
                         };
-
-                        const has_url = (mapGetStr(m, "url") != null);
-
-                        try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
-                    } else {
-                        try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
                     }
 
                     // ext_hlstate's fourth element: the groups this attribute
                     // id was composed from, innermost last. `hi_name` is the
                     // syntax group, `ui_name` the builtin the UI knows it by;
-                    // record both, because a user names either one.
+                    // record both, because a user names either one. Decoded
+                    // into the batch arena first so the attribute and its
+                    // names are published as one step.
+                    var names: []const []const u8 = &.{};
                     if (t.len >= 4 and t[3] == .arr) {
+                        const buf = try arena.alloc([]const u8, 2 * t[3].arr.len);
+                        var n: usize = 0;
                         for (t[3].arr) |iv| {
                             if (iv != .map) continue;
-                            if (mapGetStr(iv.map, "hi_name")) |n| try hl.addAttrName(id_u32, n);
-                            if (mapGetStr(iv.map, "ui_name")) |n| try hl.addAttrName(id_u32, n);
+                            if (mapGetStr(iv.map, "hi_name")) |s| {
+                                buf[n] = s;
+                                n += 1;
+                            }
+                            if (mapGetStr(iv.map, "ui_name")) |s| {
+                                buf[n] = s;
+                                n += 1;
+                            }
                         }
+                        names = buf[0..n];
                     }
+
+                    try hl.defineWithNames(id_u32, attr, names);
                 }
             },
             .hl_group_set => {
@@ -2248,6 +2271,12 @@ pub fn handleRedraw(
                     if (tv != .arr) continue;
                     const t = tv.arr;
                     if (t.len < 2 or t[1] != .arr) continue;
+                    // The spec types cursor_style_enabled as a Boolean; a
+                    // tuple that breaks that is malformed, not "false".
+                    if (t[0] != .bool) {
+                        if (log.cb != null) log.write("mode_info_set: cursor_style_enabled is not a bool, tuple dropped\n", .{});
+                        continue;
+                    }
                     const arr = t[1].arr;
 
                     // Neovim sends SHAPE_IDX_COUNT (18) entries; the cap only
@@ -2255,7 +2284,7 @@ pub fn handleRedraw(
                     const modes = arr[0..@min(arr.len, max_mode_infos)];
                     try grid.mode_infos.ensureTotalCapacity(grid.alloc, modes.len);
 
-                    grid.cursor_style_enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
+                    grid.cursor_style_enabled = t[0].bool;
                     grid.mode_infos.clearRetainingCapacity();
 
                     for (modes, 0..) |mv, mode_idx| {
@@ -3850,4 +3879,289 @@ test "a float anchored in an external window taller than the main grid is placed
     try place(&grid, &hl, arena, "SW", 20, 5, 7);
     p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
     try std.testing.expectEqual(@as(i64, 17), p.row);
+}
+
+/// One grid_scroll event, fields in the order :help ui-events gives them:
+/// `["grid_scroll", grid, top, bot, left, right, rows, cols]`.
+fn testGridScrollEvent(arena: std.mem.Allocator, top: i64, bot: i64, left: i64, right: i64, rows: i64, cols: i64) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 7);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = top };
+    t[2] = .{ .int = bot };
+    t[3] = .{ .int = left };
+    t[4] = .{ .int = right };
+    t[5] = .{ .int = rows };
+    t[6] = .{ .int = cols };
+    return testEvent(arena, "grid_scroll", t);
+}
+
+/// Resize grid 1 to 4x4 through the handler and fill row r with four copies
+/// of `"abcd"[r]`, so each row is distinguishable after a scroll.
+fn testFillGrid4x4(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator) !void {
+    const t = try arena.alloc(mp.Value, 3);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = 4 }; // width
+    t[2] = .{ .int = 4 }; // height
+    try runRedrawEvents(grid, hl, arena, try testEvent(arena, "grid_resize", t));
+    const text = [_][]const u8{ "a", "b", "c", "d" };
+    for (text, 0..) |s, r| {
+        const cells = [_]mp.Value{try testCell(arena, s, 0, 4)};
+        var ev = [_]mp.Value{try testGridLineEvent(arena, 1, @intCast(r), 0, &cells)};
+        try runRedrawEvents(grid, hl, arena, &ev);
+    }
+}
+
+fn expectRow(grid: *const Grid, row: u32, cp: u32) !void {
+    for (0..4) |c| try std.testing.expectEqual(cp, grid.getCell(row, @intCast(c)).cp);
+}
+
+test "grid_scroll through the handler moves rows by the spec's sign, within its region, whatever cols says" {
+    // :help ui-events grid_scroll: "Scroll a region of grid. ... The
+    // region is [top, bot) x [left, right); rows > 0 moves the content up
+    // (row r receives what was at r + rows), rows < 0 moves it down; the
+    // rows that content moved away from are filled by later grid_line
+    // events and may be cleared meanwhile; `cols` is reserved for future
+    // use and always zero" -- a UI must accept the field, not reject on it.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    // Whole grid, rows = +1: every row takes the one below; the last is blank.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 0));
+    try expectRow(&grid, 0, 'b');
+    try expectRow(&grid, 1, 'c');
+    try expectRow(&grid, 2, 'd');
+    try expectRow(&grid, 3, ' ');
+
+    // Whole grid, rows = -1: the mirror image.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, -1, 0));
+    try expectRow(&grid, 0, ' ');
+    try expectRow(&grid, 1, 'a');
+    try expectRow(&grid, 2, 'b');
+    try expectRow(&grid, 3, 'c');
+
+    // Region [1, 3): rows 0 and 3 are outside it and keep their content.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 1, 3, 0, 4, 1, 0));
+    try expectRow(&grid, 0, 'a');
+    try expectRow(&grid, 1, 'c');
+    try expectRow(&grid, 2, ' ');
+    try expectRow(&grid, 3, 'd');
+
+    // cols = 7 is still a scroll of rows; it must not be dropped.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 7));
+    try expectRow(&grid, 0, 'b');
+    try expectRow(&grid, 3, ' ');
+}
+
+test "win_float_pos places each spec anchor corner at anchor_row/anchor_col" {
+    // :help ui-events win_float_pos: "anchor" is one of NW, NE, SW, SE --
+    // "which corner of the float to place at (anchor_row, anchor_col)"
+    // (nvim_open_win `anchor`). So an E anchor puts the float's right edge
+    // at anchor_col (top-left col = anchor_col - width) and an S anchor puts
+    // its bottom edge at anchor_row (top-left row = anchor_row - height).
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(3, 2, 3); // float: 2 rows x 3 cols
+
+    const cases = [_]struct { anchor: []const u8, row: u32, col: u32 }{
+        .{ .anchor = "NW", .row = 5, .col = 6 },
+        .{ .anchor = "NE", .row = 5, .col = 6 - 3 },
+        .{ .anchor = "SW", .row = 5 - 2, .col = 6 },
+        .{ .anchor = "SE", .row = 5 - 2, .col = 6 - 3 },
+    };
+    for (cases) |case| {
+        // 8-field form: no screen_row/screen_col, so the UI resolves the anchor.
+        const t = try arena.alloc(mp.Value, 8);
+        t[0] = .{ .int = 3 }; // grid
+        t[1] = .{ .int = 1003 }; // win
+        t[2] = .{ .str = case.anchor };
+        t[3] = .{ .int = 1 }; // anchor_grid
+        t[4] = .{ .int = 5 }; // anchor_row
+        t[5] = .{ .int = 6 }; // anchor_col
+        t[6] = .{ .bool = true }; // mouse_enabled
+        t[7] = .{ .int = 50 }; // zindex
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        const p = grid.win_pos.get(3).?;
+        try std.testing.expectEqual(case.row, p.row);
+        try std.testing.expectEqual(case.col, p.col);
+    }
+}
+
+fn checkHlAttrDefineAllocationFailure(alloc: std.mem.Allocator) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(alloc);
+    defer hl.deinit();
+
+    // ext_hlstate form: [id, rgb_attrs, cterm_attrs, info]
+    const attrs = try arena.alloc(mp.Pair, 1);
+    attrs[0] = .{ .key = .{ .str = "bold" }, .val = .{ .bool = true } };
+    const info_fields = try arena.alloc(mp.Pair, 2);
+    info_fields[0] = .{ .key = .{ .str = "hi_name" }, .val = .{ .str = "String" } };
+    info_fields[1] = .{ .key = .{ .str = "ui_name" }, .val = .{ .str = "Normal" } };
+    const info = try arena.alloc(mp.Value, 1);
+    info[0] = .{ .map = info_fields };
+    const t = try arena.alloc(mp.Value, 4);
+    t[0] = .{ .int = 42 };
+    t[1] = .{ .map = attrs };
+    t[2] = .{ .map = &[_]mp.Pair{} };
+    t[3] = .{ .arr = info };
+
+    runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "hl_attr_define", t)) catch |err| {
+        // The attribute and its names are one event: neither may be visible.
+        try std.testing.expect(!hl.map.contains(42));
+        try std.testing.expect(!hl.attr_names.contains(42));
+        return err;
+    };
+    try std.testing.expect(hl.map.get(42).?.bold);
+    const names = hl.attr_names.get(42).?;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("String", names[0]);
+    try std.testing.expectEqualStrings("Normal", names[1]);
+}
+
+test "hl_attr_define publishes the attribute and its names together or not at all" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHlAttrDefineAllocationFailure, .{});
+}
+
+test "win_viewport with a non-integer field is skipped, not applied with zeros" {
+    // :help ui-events win_viewport: every field after the grid is an
+    // Integer (win is a Window handle). A tuple that breaks that is
+    // malformed and must leave the viewport as it was.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const t = try arena.alloc(mp.Value, 8);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = 1000 };
+    t[2] = .{ .int = 10 }; // topline
+    t[3] = .{ .int = 14 }; // botline
+    t[4] = .{ .int = 12 }; // curline
+    t[5] = .{ .int = 0 }; // curcol
+    t[6] = .{ .int = 100 }; // line_count
+    t[7] = .{ .int = 0 }; // scroll_delta
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport", t));
+    try std.testing.expectEqual(@as(i64, 10), grid.viewport.get(1).?.topline);
+
+    // Each field in turn replaced by a string: none may apply.
+    for (1..8) |i| {
+        const bad = try arena.dupe(mp.Value, t);
+        bad[2] = .{ .int = 20 }; // would show up as topline if the tuple applied
+        bad[i] = .{ .str = "junk" };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport", bad));
+        try std.testing.expectEqual(@as(i64, 10), grid.viewport.get(1).?.topline);
+    }
+}
+
+test "a mode_info_set whose cursor_style_enabled is not a Boolean is skipped" {
+    // :help ui-events mode_info_set: "cursor_style_enabled is a boolean".
+    // Anything else is a malformed tuple: neither the flag nor the table
+    // may change, including an int that a lenient decoder would read as
+    // true.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+
+    const modes = try arena.alloc(mp.Value, 2);
+    for (modes) |*m| m.* = .{ .map = &[_]mp.Pair{} };
+    const first = [_]mp.Value{ .{ .int = 1 }, .{ .str = "true" }, .nil };
+    for (first) |f| {
+        const t = try arena.alloc(mp.Value, 2);
+        t[0] = f;
+        t[1] = .{ .arr = modes };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+        try std.testing.expect(!grid.cursor_style_enabled);
+        try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    }
+
+    // Control: the Boolean form applies.
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+    try std.testing.expect(grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 2), grid.mode_infos.items.len);
+}
+
+test "an out-of-range coordinate in grid_cursor_goto, win_pos or grid_scroll is logged when it is dropped" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const Count = struct {
+        n: u32 = 0,
+        fn cb(ctx: ?*anyopaque, p: [*]const u8, len: usize) callconv(.c) void {
+            if (std.mem.startsWith(u8, p[0..len], "[redraw] ")) @as(*@This(), @ptrCast(@alignCast(ctx.?))).n += 1;
+        }
+    };
+    var count = Count{};
+    var log = Logger{ .cb = Count.cb, .ctx = &count };
+    const beyond_u32: i64 = @as(i64, std.math.maxInt(u32)) + 1;
+
+    const goto = try arena.alloc(mp.Value, 3);
+    goto[0] = .{ .int = 1 };
+    goto[1] = .{ .int = beyond_u32 };
+    goto[2] = .{ .int = 0 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "grid_cursor_goto", goto), &log);
+    try std.testing.expectEqual(@as(u32, 1), count.n);
+
+    const pos = try arena.alloc(mp.Value, 6);
+    pos[0] = .{ .int = 1 };
+    pos[1] = .{ .int = 1000 };
+    pos[2] = .{ .int = 0 };
+    pos[3] = .{ .int = -1 };
+    pos[4] = .{ .int = 4 };
+    pos[5] = .{ .int = 4 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "win_pos", pos), &log);
+    try std.testing.expectEqual(@as(u32, 2), count.n);
+
+    const scroll = try arena.alloc(mp.Value, 7);
+    scroll[0] = .{ .int = 1 };
+    scroll[1] = .{ .int = 0 };
+    scroll[2] = .{ .int = 4 };
+    scroll[3] = .{ .int = 0 };
+    scroll[4] = .{ .int = 4 };
+    scroll[5] = .{ .int = beyond_u32 };
+    scroll[6] = .{ .int = 0 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "grid_scroll", scroll), &log);
+    try std.testing.expectEqual(@as(u32, 3), count.n);
+
+    // Control: a well-formed scroll logs no drop.
+    try runRedrawEventsLogged(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 0), &log);
+    try std.testing.expectEqual(@as(u32, 3), count.n);
 }

@@ -1826,20 +1826,20 @@ test "clearing a different grid's cursor does not clear the owner's" {
 test "external row disposition: every route crossed with cursor and window liveness" {
     const R = helpers.RowGridRoute;
     const D = helpers.ExternalRowDisposition;
-    const Case = struct { cursor: bool, route: R, live: bool, want: D };
+    const Case = struct { main: bool = false, cursor: bool, route: R, live: bool, want: D };
     const cases = [_]Case{
         // A row for a grid some surface places as a layer goes to that layer,
         // whatever window exists.
-        .{ .cursor = false, .route = .main_root, .live = false, .want = .layer_row },
-        .{ .cursor = false, .route = .main_layer, .live = true, .want = .layer_row },
-        .{ .cursor = false, .route = .main_layer, .live = false, .want = .layer_row },
-        .{ .cursor = false, .route = .external_layer, .live = true, .want = .layer_row },
-        .{ .cursor = false, .route = .external_layer, .live = false, .want = .layer_row },
+        .{ .main = true, .cursor = false, .route = .main_root, .live = false, .want = .layer_row },
+        .{ .main = true, .cursor = false, .route = .main_layer, .live = true, .want = .layer_row },
+        .{ .main = true, .cursor = false, .route = .main_layer, .live = false, .want = .layer_row },
+        .{ .main = true, .cursor = false, .route = .external_layer, .live = true, .want = .layer_row },
+        .{ .main = true, .cursor = false, .route = .external_layer, .live = false, .want = .layer_row },
         // An external root or unplaced grid: its window, or a pending capture.
-        .{ .cursor = false, .route = .external_root, .live = true, .want = .live_row },
-        .{ .cursor = false, .route = .external_root, .live = false, .want = .pending_row },
-        .{ .cursor = false, .route = .unplaced, .live = true, .want = .live_row },
-        .{ .cursor = false, .route = .unplaced, .live = false, .want = .pending_row },
+        .{ .main = true, .cursor = false, .route = .external_root, .live = true, .want = .live_row },
+        .{ .main = true, .cursor = false, .route = .external_root, .live = false, .want = .pending_row },
+        .{ .main = true, .cursor = false, .route = .unplaced, .live = true, .want = .live_row },
+        .{ .main = true, .cursor = false, .route = .unplaced, .live = false, .want = .pending_row },
         // A cursor update never replaces row contents, so it is never a layer row.
         .{ .cursor = true, .route = .main_layer, .live = true, .want = .live_cursor },
         .{ .cursor = true, .route = .external_layer, .live = true, .want = .live_cursor },
@@ -1847,9 +1847,17 @@ test "external row disposition: every route crossed with cursor and window liven
         .{ .cursor = true, .route = .external_root, .live = true, .want = .live_cursor },
         .{ .cursor = true, .route = .external_root, .live = false, .want = .pending_cursor },
         .{ .cursor = true, .route = .unplaced, .live = false, .want = .pending_cursor },
+        // zonvie_core.h: "When MAIN is not set, existing row contents must be
+        // retained." Neither flag replaces a row on any route.
+        .{ .cursor = false, .route = .main_layer, .live = true, .want = .retain_rows },
+        .{ .cursor = false, .route = .external_layer, .live = false, .want = .retain_rows },
+        .{ .cursor = false, .route = .external_root, .live = true, .want = .retain_rows },
+        .{ .cursor = false, .route = .external_root, .live = false, .want = .retain_rows },
+        .{ .cursor = false, .route = .unplaced, .live = false, .want = .retain_rows },
     };
     for (cases) |cs| {
         try std.testing.expectEqual(cs.want, helpers.externalRowDisposition(.{
+            .main = cs.main,
             .cursor = cs.cursor,
             .route = cs.route,
             .live_window = cs.live,
@@ -1913,6 +1921,15 @@ test "back damage: overlapping rects merge transitively into one" {
     try std.testing.expectEqual(@as(usize, 2), q.pending(0).len);
     q.queue(&.{tr(5, 0, 25, 10)}, false, 1, 100, 100);
     try std.testing.expectEqualSlices(TestRect, &.{tr(0, 0, 30, 10)}, q.pending(0));
+}
+
+test "back damage: rects that touch without overlapping merge into one" {
+    // The buffer holds rects "no two of which overlap or touch": two adjacent
+    // full-width row spans share an edge and become one span.
+    var q = Damage{};
+    q.clear(0);
+    q.queue(&.{ tr(0, 0, 100, 10), tr(0, 10, 100, 20) }, false, 1, 100, 100);
+    try std.testing.expectEqualSlices(TestRect, &.{tr(0, 0, 100, 20)}, q.pending(0));
 }
 
 test "back damage: only the first buffer_count buffers are queued" {

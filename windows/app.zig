@@ -1673,8 +1673,10 @@ pub const TripleBufferedSurface = struct {
         ws.row_mode = true;
         if (!ws.ensureRowStorage(alloc, row)) return false;
         const slot = self.cowDetachRow(alloc, row) orelse return false;
+        // Reserve before clearing: an OOM then keeps the row's previous content.
+        slot.verts.ensureTotalCapacity(alloc, verts.len) catch return false;
         slot.verts.clearRetainingCapacity();
-        slot.verts.appendSlice(alloc, verts) catch return false;
+        slot.verts.appendSliceAssumeCapacity(verts);
         self.pool.noteRowVerts(verts.len);
         slot.origin_row = row;
         slot.ver +%= 1;

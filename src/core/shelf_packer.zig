@@ -414,9 +414,11 @@ pub const ShelfPacker = struct {
     pub fn assertIntegrity(self: *const ShelfPacker) void {
         if (builtin.mode != .Debug) return;
         assert(self.shelf_count <= max_shelves);
-        assert(self.next_x >= 1 and self.next_x <= self.width + self.padding);
+        assert(self.next_x >= 1);
+        assert(self.next_x <= self.width + self.padding);
         assert(self.next_x != 1 or self.row_h == 0);
-        assert(self.next_y >= 1 and self.next_y + self.row_h <= self.height);
+        assert(self.next_y >= 1);
+        assert(self.next_y + self.row_h <= self.height);
         var order: [max_shelves]u16 = undefined;
         const n = self.buildYOrder(&order);
         var prev_end: u32 = 1;
@@ -565,7 +567,11 @@ test "the ordered lookup answers exactly what the linear scan answers" {
 
 test "shelves filled by the current epoch are not reclaimed" {
     var p = ShelfPacker.init(16, 4096);
+    // Away from epoch 0, which is also the default stamp: an unstamped shelf
+    // would otherwise be indistinguishable from one stamped by this epoch.
+    p.beginEpoch();
     _ = closeNShelves(&p, 3);
+    for (p.shelves[0..p.shelf_count]) |s| try std.testing.expectEqual(p.epoch, s.epoch);
 
     const live = [_]bool{ false, false, false };
     // Same epoch as the allocations: reclaiming these would pull the atlas out
@@ -575,6 +581,29 @@ test "shelves filled by the current epoch are not reclaimed" {
     // A later flush may take them.
     p.beginEpoch();
     try std.testing.expectEqual(@as(u32, 3), p.recycleDeadShelves(&live));
+}
+
+test "a reclaimed shelf refilled this epoch is protected like a bump shelf" {
+    var p = ShelfPacker.init(16, 4096);
+    _ = closeNShelves(&p, 1);
+    try std.testing.expectEqual(@as(u32, 1), p.shelf_count);
+
+    p.beginEpoch();
+    const live = [_]bool{false};
+    try std.testing.expectEqual(@as(u32, 1), p.recycleDeadShelves(&live));
+
+    // Same glyph size as the shelf, so this goes through the reuse path
+    // without splitting; the bump frontier must not move.
+    p.beginEpoch();
+    const next_y_before = p.next_y;
+    const r = p.alloc(12, 1).?;
+    try std.testing.expectEqual(@as(u32, p.shelves[0].y), r.y);
+    try std.testing.expectEqual(next_y_before, p.next_y);
+    try std.testing.expectEqual(p.epoch, p.shelves[0].epoch);
+
+    // Rows composed this flush reference the glyph just placed there.
+    try std.testing.expectEqual(@as(u32, 0), p.recycleDeadShelves(&live));
+    try std.testing.expect(p.shelves[0].x > 1);
 }
 
 test "merging adjacent reclaimed shelves preserves the covered band" {

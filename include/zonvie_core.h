@@ -175,15 +175,19 @@ typedef void (*zonvie_on_vertices_row_fn)(
                               // external root), a split or float layer, or a
                               // core-owned ZONVIE_GRID_ID_* grid; see on_surface_layout
     uint32_t row_start,       // inclusive
-    uint32_t row_count,       // number of rows
+    uint32_t row_count,       // number of rows: 0 (zero-cell transition or
+                              // cursor clear) or 1; the core never sends more
     const zonvie_vertex* verts,
     size_t vert_count,
-    uint32_t flags,           // reuse/update flags (e.g. ZONVIE_VERT_UPDATE_MAIN)
+    uint32_t flags,           // exactly one of ZONVIE_VERT_UPDATE_MAIN /
+                              // ZONVIE_VERT_UPDATE_CURSOR is set
     uint32_t total_rows,      // current grid total rows (for resize detection)
     uint32_t total_cols       // current grid total cols
 );
 
-/* on_vertices_row layers are independent:
+/* on_vertices_row layers are independent. Exactly one of MAIN and CURSOR is
+   set per callback; both set, or neither, never occurs, and a consumer may
+   assert it. row_count is 0 or 1.
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
      clears it. A cursor-only callback must not replace row contents.
