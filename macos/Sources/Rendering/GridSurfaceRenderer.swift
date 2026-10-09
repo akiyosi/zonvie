@@ -2736,6 +2736,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             || !flushDirtyRows.isEmpty || flushDirtyRectPx != nil
             || bgChanged
         if didMainWrite {
+            // draw() marks only the committed set, so a write set that differs
+            // from it was never read by the GPU while this flush filled it.
+            assert(writeSetIndex != committedSetIndex, "flush wrote into the committed row set")
+            assert(gpuInFlightCount[writeSetIndex] == 0, "flush wrote into a row set the GPU is reading")
             committedSetIndex = writeSetIndex
         }
         if didCursorWrite {
@@ -3359,6 +3363,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             currentCommitRevision = commitRevision
             gpuInFlightCount[csi] += 1  // Prevent beginFlush from using this set
             cursorGpuInFlightCount[cci] += 1
+            // surfaceInflightRowBuffers reports at most two in-flight sets; a
+            // third would escape the row-buffer alias guard.
+            assert(gpuInFlightCount.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } <= 2, "more than two row sets in flight")
 
             atlasTex = committedAtlasTexture  // same lock scope as vertex snapshot
             dirtyRectPxOpt = pendingDirtyRectPx

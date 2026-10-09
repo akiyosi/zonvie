@@ -1183,6 +1183,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[writeSetIndex].knownTotalCols)
             lock.lock()
             if publishedRows {
+                // draw() marks only the committed set, so a write set that
+                // differs from it was never read by the GPU while this flush filled it.
+                assert(writeSetIndex != committedSetIndex, "flush wrote into the committed row set")
+                assert(gpuInFlightCount[writeSetIndex] == 0, "flush wrote into a row set the GPU is reading")
                 committedSetIndex = writeSetIndex
             }
             // The cursor this bracket wrote becomes visible with the rows it
@@ -2196,6 +2200,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 committedGeneration: bufferSets[csi].fontGeneration
             )
             gpuInFlightCount[csi] += 1  // Prevent beginFlush from reusing this set
+            // surfaceInflightRowBuffers reports at most two in-flight sets; a
+            // third would escape the row-buffer alias guard.
+            assert(gpuInFlightCount.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } <= 2, "more than two row sets in flight")
             // The cursor rotates on its own index, so it is snapshotted and
             // protected on its own: this frame may draw a cursor published
             // after the row set it draws it over.

@@ -91,6 +91,24 @@ const FlushCommitMode = enum {
     abort_full,            // commit=false, restore_main_ledger=false: abort with full redraw needed
 };
 
+const FlushOutcome = struct {
+    aborted: bool,
+    atlas_corrupted: bool,
+    retryable: bool,
+    aborted_at_begin: bool,
+};
+
+/// How a closing flush settles its vertex budget transaction. A begin
+/// rejection consumed nothing, so it keeps the accounting like a commit; a
+/// retryable refusal with the atlas intact restores the saved ledgers; any
+/// other failure invalidates them all.
+fn flushCommitMode(o: FlushOutcome) FlushCommitMode {
+    if (o.aborted_at_begin) return .success;
+    if (!o.aborted and !o.atlas_corrupted) return .success;
+    if (o.aborted and !o.atlas_corrupted and o.retryable) return .refusal_atlas_valid;
+    return .abort_full;
+}
+
 /// Vertex budget and shaping buffer errors.
 const VertexBudgetError = error{
     VertexBudgetExceededPerCallback,   // One row exceeds MAX_VERTICES_PER_CALLBACK
@@ -3289,18 +3307,15 @@ pub const FlushCtx = struct {
             // hold their accounting instead of invalidating every row ledger.
             // A hard failure (atlas corruption, budget violation) still takes
             // the full-invalidation path.
-            const frontend_refused_publication = ctx.core.flush_aborted and
-                !ctx.core.flush_atlas_corrupted and
-                ctx.core.flush_retryable;
             // A begin rejection keeps the budget (nothing was consumed) but
             // publishes nothing, so the mirrors are as stale as they were.
             const mirror_stale_before = ctx.core.display_mirror_stale;
-            const flush_mode: FlushCommitMode = if (vertex_budget_committed or aborted_at_flush_begin)
-                .success
-            else if (frontend_refused_publication)
-                .refusal_atlas_valid
-            else
-                .abort_full;
+            const flush_mode = flushCommitMode(.{
+                .aborted = ctx.core.flush_aborted,
+                .atlas_corrupted = ctx.core.flush_atlas_corrupted,
+                .retryable = ctx.core.flush_retryable,
+                .aborted_at_begin = aborted_at_flush_begin,
+            });
             finishVertexBudgetTransactionRestoring(ctx.core, flush_mode);
             if (aborted_at_flush_begin) ctx.core.display_mirror_stale = mirror_stale_before;
             if (vertex_budget_committed) {
@@ -7798,6 +7813,47 @@ fn refRunEnd(comptime T: type, items: []const T, start: usize, limit: usize, tar
     var i = start;
     while (i < limit and items[i] == target) : (i += 1) {}
     return i;
+}
+
+test "every flush outcome settles the budget by the rule that names it" {
+    // Rows: aborted, atlas_corrupted, retryable, aborted_at_begin -> mode.
+    // From the rules at the call site: a begin rejection consumed nothing and
+    // keeps the accounting; a clean flush commits; a frontend refusal that
+    // left the atlas intact and may retry restores the saved ledgers; anything
+    // else (corruption, a hard failure) invalidates every ledger.
+    const Row = struct { a: bool, c: bool, r: bool, b: bool, want: FlushCommitMode };
+    const rows = [_]Row{
+        .{ .a = false, .c = false, .r = false, .b = false, .want = .success },
+        .{ .a = false, .c = false, .r = true, .b = false, .want = .success },
+        .{ .a = false, .c = true, .r = false, .b = false, .want = .abort_full },
+        .{ .a = false, .c = true, .r = true, .b = false, .want = .abort_full },
+        .{ .a = true, .c = false, .r = false, .b = false, .want = .abort_full },
+        .{ .a = true, .c = false, .r = true, .b = false, .want = .refusal_atlas_valid },
+        .{ .a = true, .c = true, .r = false, .b = false, .want = .abort_full },
+        .{ .a = true, .c = true, .r = true, .b = false, .want = .abort_full },
+        .{ .a = false, .c = false, .r = false, .b = true, .want = .success },
+        .{ .a = false, .c = false, .r = true, .b = true, .want = .success },
+        .{ .a = false, .c = true, .r = false, .b = true, .want = .success },
+        .{ .a = false, .c = true, .r = true, .b = true, .want = .success },
+        .{ .a = true, .c = false, .r = false, .b = true, .want = .success },
+        .{ .a = true, .c = false, .r = true, .b = true, .want = .success },
+        .{ .a = true, .c = true, .r = false, .b = true, .want = .success },
+        .{ .a = true, .c = true, .r = true, .b = true, .want = .success },
+    };
+    // Every one of the 16 inputs appears exactly once.
+    var seen = [_]bool{false} ** 16;
+    for (rows) |row| {
+        const idx = @as(usize, @intFromBool(row.a)) | @as(usize, @intFromBool(row.c)) << 1 |
+            @as(usize, @intFromBool(row.r)) << 2 | @as(usize, @intFromBool(row.b)) << 3;
+        try std.testing.expect(!seen[idx]);
+        seen[idx] = true;
+        try std.testing.expectEqual(row.want, flushCommitMode(.{
+            .aborted = row.a,
+            .atlas_corrupted = row.c,
+            .retryable = row.r,
+            .aborted_at_begin = row.b,
+        }));
+    }
 }
 
 test "the SIMD run-end scans agree with a scalar scan at every start, limit and break" {
