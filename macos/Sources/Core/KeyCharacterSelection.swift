@@ -15,8 +15,8 @@ enum KeyCharacterSelection {
     ///
     /// Both the main grid view and the external grid views call this. The rule
     /// used to be written out at each keyDown, and the two copies drifted:
-    /// `2e91d87` added it to one of them while its own message claimed to
-    /// "apply optionIsMeta logic consistently in both".
+    /// a change that set out to apply the optionIsMeta logic consistently in
+    /// both added it to only one of them.
     static func primaryCharacters(
         optionIsMeta: Bool,
         characters: String?,
@@ -49,25 +49,6 @@ enum KeyCharacterSelection {
         case 2: return modifierRawValue & 0x20 != 0      // only_left
         case 3: return modifierRawValue & 0x40 != 0      // only_right
         default: return true
-        }
-    }
-
-    /// Key codes that go straight to Neovim rather than through the input
-    /// context: Escape, the arrows, Return, Tab, both deletes, Home/End,
-    /// Page Up/Down and F1-F12.
-    static func isSpecialKeyCode(_ keyCode: UInt16) -> Bool {
-        switch keyCode {
-        case 0x35: return true  // Escape
-        case 0x7B, 0x7C, 0x7D, 0x7E: return true  // Arrow keys (left, right, down, up)
-        case 0x24: return true  // Return
-        case 0x30: return true  // Tab
-        case 0x33: return true  // Delete (Backspace)
-        case 0x75: return true  // Forward Delete
-        case 0x73, 0x77: return true  // Home, End
-        case 0x74, 0x79: return true  // Page Up, Page Down
-        case 0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64,
-             0x65, 0x6D, 0x67, 0x6F: return true  // F1-F12
-        default: return false
         }
     }
 

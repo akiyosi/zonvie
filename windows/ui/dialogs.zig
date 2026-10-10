@@ -1,9 +1,11 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const window_mod = @import("../window.zig");
+const render_helpers = @import("../render_pipeline_helpers.zig");
 
 // --- SSH Password Dialog state ---
 
@@ -23,6 +25,14 @@ pub var g_devcontainer_up_success: std.atomic.Value(bool) = std.atomic.Value(boo
 
 /// Handle SSH auth prompt on UI thread
 pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
+    // Take the prompt: the core thread frees and replaces the field, and this
+    // handler blocks on console input while using it.
+    app.mu.lockUncancelable(core.clock.io());
+    const prompt_owned = app.ssh_prompt_owned;
+    app.ssh_prompt_owned = null;
+    app.mu.unlock(core.clock.io());
+    defer if (prompt_owned) |buf| app.alloc.free(buf);
+
     // Check if we have pre-entered password from initial dialog
     if (app.ssh_password) |password| {
         if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt_ui: using pre-entered password ({d} chars)\n", .{password.len});
@@ -58,7 +68,7 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
 
     // Write prompt to console
     var written: c.DWORD = 0;
-    if (app.ssh_prompt_owned) |buf| {
+    if (prompt_owned) |buf| {
         _ = c.WriteConsoleA(hConsoleOut, buf.ptr, @intCast(buf.len), &written, null);
         _ = c.WriteConsoleA(hConsoleOut, " ", 1, &written, null);
     }
@@ -69,9 +79,14 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     _ = c.SetConsoleMode(hConsoleIn, console_mode & ~@as(c.DWORD, c.ENABLE_ECHO_INPUT));
 
     // Read password
-    var password_buf: [256]u8 = undefined;
-    var read: c.DWORD = 0;
-    _ = c.ReadConsoleA(hConsoleIn, &password_buf, 255, &read, null);
+    var password_w: [256]u16 = undefined;
+    defer std.crypto.secureZero(u16, &password_w);
+    // Every UTF-16 unit takes at most 3 UTF-8 bytes.
+    var password_buf: [password_w.len * 3]u8 = undefined;
+    defer std.crypto.secureZero(u8, &password_buf);
+    var read_w: c.DWORD = 0;
+    _ = c.ReadConsoleW(hConsoleIn, &password_w, password_w.len, &read_w, null);
+    const read = std.unicode.utf16LeToUtf8(&password_buf, password_w[0..@min(read_w, password_w.len)]) catch 0;
 
     // Restore console mode
     _ = c.SetConsoleMode(hConsoleIn, console_mode);
@@ -86,61 +101,67 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
         app_mod.zonvie_core_send_stdin_data(app.corep, &password_buf, @intCast(read));
     }
 
-    // Free the owned prompt buffer (no longer needed)
-    if (app.ssh_prompt_owned) |buf| {
-        app.alloc.free(buf);
-        app.ssh_prompt_owned = null;
-    }
-
     // Hide console after password entry
     _ = c.FreeConsole();
 }
 
-/// Simple password input dialog without username field
-pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16) bool {
-    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonviePasswordDialog");
-
-    // Register window class
+/// A dialog: registers `class_name` with `proc`, centres a `w` x `h` window
+/// on the monitor `owner` is on (the primary one with no owner) and matches
+/// the OS titlebar theme. `parent` and `create_param` go to CreateWindowExW.
+/// Null when creation failed.
+fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0]const u16, style: c.DWORD, ex_style: c.DWORD, w: i32, h: i32, owner: ?c.HWND, parent: c.HWND, create_param: ?*anyopaque) c.HWND {
     var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
     wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = passwordDialogProc;
+    wc.lpfnWndProc = proc;
     wc.hInstance = c.GetModuleHandleW(null);
     wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
     wc.hbrBackground = @ptrFromInt(@as(usize, 16)); // COLOR_BTNFACE + 1
     wc.lpszClassName = class_name;
     _ = c.RegisterClassExW(&wc);
 
+    const area = app_mod.monitorWorkArea(owner);
+    const x = area.left + @divTrunc(area.right - area.left - w, 2);
+    const y = area.top + @divTrunc(area.bottom - area.top - h, 2);
+    const hwnd = c.CreateWindowExW(
+        ex_style,
+        class_name,
+        title,
+        style,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null,
+        c.GetModuleHandleW(null),
+        create_param,
+    );
+    if (hwnd != null) window_mod.applyOsTitlebarTheme(hwnd);
+    return hwnd;
+}
+
+/// Simple password input dialog without username field. Runs in the
+/// ssh-askpass helper process, which has no app window to centre on.
+pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16) bool {
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonviePasswordDialog");
+
     // Store output pointer
     g_password_dialog_output = password_out;
     g_password_dialog_result = false;
 
-    // Create dialog window (centered on screen)
-    const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-    const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-    const dlg_w: i32 = 420;
-    const dlg_h: i32 = 180;
-    const dlg_x = @divTrunc(screen_w - dlg_w, 2);
-    const dlg_y = @divTrunc(screen_h - dlg_h, 2);
-
-    const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
+    const hwnd = createCenteredDialog(
         class_name,
+        passwordDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("SSH Authentication"),
         c.WS_POPUP | c.WS_CAPTION | c.WS_SYSMENU,
-        dlg_x,
-        dlg_y,
-        dlg_w,
-        dlg_h,
+        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
+        420,
+        180,
         null,
         null,
-        c.GetModuleHandleW(null),
         null,
     );
-
     if (hwnd == null) return false;
-
-    // Match OS light/dark titlebar theme — same as the main window.
-    window_mod.applyOsTitlebarTheme(hwnd);
 
     // Create prompt label
     _ = c.CreateWindowExW(
@@ -270,64 +291,28 @@ fn passwordDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
             c.PostQuitMessage(0);
             return 0;
         },
-        c.WM_SETTINGCHANGE => {
-            // Only consume the color-mode broadcast; let other
-            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
-            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
-            // Fall through to the default dispatch path below.
-        },
-        c.WM_THEMECHANGED => {
-            // Best-effort titlebar refresh, then fall through so the OS
-            // can run its standard handling for any non-caption surface.
-            _ = window_mod.handleThemeChanged(hwnd);
-            // Fall through to the default dispatch path below.
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-pub fn showDevcontainerProgressDialog(label_text: [*:0]const u16) void {
-    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieDevcontainerProgress");
-
-    // Register window class
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = devcontainerDialogProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
-    wc.hbrBackground = @ptrFromInt(@as(usize, 16)); // COLOR_BTNFACE + 1
-    wc.lpszClassName = class_name;
-    _ = c.RegisterClassExW(&wc);
-
-    // Create dialog window (centered on screen)
-    const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-    const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-    const dlg_w: i32 = 300;
-    const dlg_h: i32 = 80;
-    const dlg_x = @divTrunc(screen_w - dlg_w, 2);
-    const dlg_y = @divTrunc(screen_h - dlg_h, 2);
-
-    const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
-        class_name,
+/// `owner` is the main window; the dialog centres on its monitor.
+pub fn showDevcontainerProgressDialog(owner: c.HWND, label_text: [*:0]const u16) void {
+    const hwnd = createCenteredDialog(
+        std.unicode.utf8ToUtf16LeStringLiteral("ZonvieDevcontainerProgress"),
+        devcontainerDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer"),
         c.WS_POPUP | c.WS_CAPTION,
-        dlg_x,
-        dlg_y,
-        dlg_w,
-        dlg_h,
+        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
+        300,
+        80,
+        owner,
         null,
-        null,
-        c.GetModuleHandleW(null),
         null,
     );
-
     if (hwnd == null) return;
     g_devcontainer_dialog_hwnd = hwnd;
-
-    // Match OS light/dark titlebar theme — same as the main window.
-    window_mod.applyOsTitlebarTheme(hwnd);
 
     // Create label
     g_devcontainer_label_hwnd = c.CreateWindowExW(
@@ -374,18 +359,7 @@ fn devcontainerDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
             g_devcontainer_label_hwnd = null;
             return 0;
         },
-        c.WM_SETTINGCHANGE => {
-            // Only consume the color-mode broadcast; let other
-            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
-            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
-            // Fall through to the default dispatch path below.
-        },
-        c.WM_THEMECHANGED => {
-            // Best-effort titlebar refresh, then fall through so the OS
-            // can run its standard handling for any non-caption surface.
-            _ = window_mod.handleThemeChanged(hwnd);
-            // Fall through to the default dispatch path below.
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -528,6 +502,12 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
         local_app_data[0..local_app_data_len]
     else
         "C:\\Users\\Default\\AppData\\Local";
+    var nvim_config_dir: [640]u8 = undefined;
+    const nvim_config_dir_slice = std.fmt.bufPrint(&nvim_config_dir, "{s}\\nvim", .{nvim_config_path}) catch {
+        g_devcontainer_up_success.store(false, .seq_cst);
+        g_devcontainer_up_done.store(true, .seq_cst);
+        return;
+    };
 
     // Build command: devcontainer up with features and mount
     var cmd_buf: [4096]u8 = undefined;
@@ -535,18 +515,31 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     var writer = std.Io.Writer.fixed(&cmd_buf);
 
     writer.writeAll("cmd /c \"devcontainer up --workspace-folder \"\"") catch {};
-    writer.writeAll(workspace) catch {};
+    core.frontend_rules.writeDevcontainerPath(&writer, workspace) catch {};
     writer.writeAll("\"\"") catch {};
     if (config_path) |cfg| {
         writer.writeAll(" --config \"\"") catch {};
-        writer.writeAll(cfg) catch {};
+        core.frontend_rules.writeDevcontainerPath(&writer, cfg) catch {};
         writer.writeAll("\"\"") catch {};
     }
-    writer.writeAll(" --additional-features \"{\"\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\"\":{}}\"") catch {};
-    writer.writeAll(" --mount type=bind,source=") catch {};
-    writer.writeAll(nvim_config_path) catch {};
-    writer.writeAll("\\nvim,target=/nvim-config/nvim") catch {};
-    writer.writeAll(" --remove-existing-container\"") catch {};
+    // Only reached on a rebuild (see window.zig), so the container is always
+    // replaced. An argument with quotes is quoted for cmd, its own doubled.
+    var args_buf: [1024]u8 = undefined;
+    var args = std.mem.splitScalar(u8, core.frontend_rules.devcontainerUpArgs(&args_buf, nvim_config_dir_slice, true), 0);
+    while (args.next()) |arg| {
+        if (arg.len == 0) continue;
+        writer.writeByte(' ') catch {};
+        if (std.mem.indexOfScalar(u8, arg, '"') == null) {
+            writer.writeAll(arg) catch {};
+            continue;
+        }
+        writer.writeByte('"') catch {};
+        for (arg) |ch| {
+            if (ch == '"') writer.writeAll("\"\"") catch {} else writer.writeByte(ch) catch {};
+        }
+        writer.writeByte('"') catch {};
+    }
+    writer.writeByte('"') catch {};
 
     const cmd_slice = cmd_buf[0..writer.end];
     if (applog.isEnabled()) applog.appLog("[win] devcontainer up command: {s}\n", .{cmd_slice});
@@ -602,34 +595,48 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     g_devcontainer_up_done.store(true, .seq_cst);
 }
 
+/// Retry OpenClipboard a few times: another process (a clipboard manager,
+/// rdpclip, Office) can hold the exclusive clipboard lock for a few
+/// milliseconds. Runs on the UI thread, off any render path; blocks for at
+/// most (max_attempts - 1) * retry_interval_ms.
+fn openClipboardWithRetry(hwnd: c.HWND) bool {
+    var attempts: u8 = 0;
+    while (true) {
+        if (c.OpenClipboard(hwnd) != 0) return true;
+        attempts += 1;
+        if (attempts >= render_helpers.clipboard_open_max_attempts) return false;
+        c.Sleep(render_helpers.clipboard_open_retry_interval_ms);
+    }
+}
+
 /// Handle clipboard get on UI thread (called via WM_APP_CLIPBOARD_GET)
-pub fn handleClipboardGetOnUIThread(app: *App) void {
+pub fn handleClipboardGetOnUIThread(app: *App, seq: u32) void {
+    app.clipboard_mu.lockUncancelable(core.clock.io());
+    defer app.clipboard_mu.unlock(core.clock.io());
+    if (!claimClipboardRequest(app, seq)) return;
+    defer finishClipboardRequest(app);
+
     app.clipboard_len = 0;
     app.clipboard_result = 1; // Success (empty)
 
     const hwnd = app.hwnd orelse null;
 
-    // Open clipboard
-    if (c.OpenClipboard(hwnd) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: OpenClipboard failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
+    // Open clipboard. Still busy after retries is a real failure, not
+    // "success, empty" — the caller must not treat a transiently locked
+    // clipboard as an empty register.
+    if (!openClipboardWithRetry(hwnd)) {
+        if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: OpenClipboard failed (busy)\n", .{});
+        app.clipboard_result = 0;
         return;
     }
     defer _ = c.CloseClipboard();
 
     // Get CF_UNICODETEXT data
     const hdata = c.GetClipboardData(c.CF_UNICODETEXT);
-    if (hdata == null) {
-        // Empty clipboard
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (hdata == null) return; // Empty clipboard
 
     const ptr = c.GlobalLock(hdata);
-    if (ptr == null) {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (ptr == null) return;
     defer _ = c.GlobalUnlock(hdata);
 
     // Convert UTF-16 to UTF-8
@@ -645,10 +652,7 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
         null,
     );
 
-    if (utf8_len <= 0) {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (utf8_len <= 0) return;
 
     // utf8_len counts the terminating NUL that WideCharToMultiByte writes, so
     // the payload is one byte shorter and the buffer must hold both.
@@ -660,7 +664,6 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
                 .{needed + 1},
             );
             app.clipboard_len = 0;
-            _ = c.SetEvent(app.clipboard_event);
             return;
         };
         if (app.clipboard_buf.len != 0) app.alloc.free(app.clipboard_buf);
@@ -682,18 +685,14 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
 
     app.clipboard_len = needed;
     if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: len={d}\n", .{needed});
-
-    // Signal completion
-    _ = c.SetEvent(app.clipboard_event);
 }
 
 /// Put UTF-8 text on the Windows clipboard as CF_UNICODETEXT. Must run on the
-/// UI thread. An empty slice succeeds without touching the clipboard.
+/// UI thread. An empty slice replaces the clipboard with an empty string, as
+/// macOS does, so `:let @+ = ''` does not leave the old text for "+p.
 pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
-    if (text.len == 0) return true;
-
     // Convert UTF-8 to UTF-16
-    const wide_len = c.MultiByteToWideChar(
+    const wide_len: c_int = if (text.len == 0) 0 else c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
         @ptrCast(text.ptr),
@@ -702,14 +701,14 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
         0,
     );
 
-    if (wide_len <= 0) {
+    if (text.len != 0 and wide_len <= 0) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: UTF-8 to UTF-16 conversion failed\n", .{});
         return false;
     }
 
     // Open clipboard
-    if (c.OpenClipboard(owner_hwnd) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: OpenClipboard failed\n", .{});
+    if (!openClipboardWithRetry(owner_hwnd)) {
+        if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: OpenClipboard failed (busy)\n", .{});
         return false;
     }
     defer _ = c.CloseClipboard();
@@ -731,7 +730,7 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
     }
 
     // Convert and copy
-    _ = c.MultiByteToWideChar(
+    if (wide_len > 0) _ = c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
         @ptrCast(text.ptr),
@@ -757,19 +756,27 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
     return true;
 }
 
-/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET)
-pub fn handleClipboardSetOnUIThread(app: *App) void {
-    app.clipboard_result = 0; // Failure by default
+/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET). The
+/// payload is the app-owned copy in clipboard_buf.
+pub fn handleClipboardSetOnUIThread(app: *App, seq: u32) void {
+    app.clipboard_mu.lockUncancelable(core.clock.io());
+    defer app.clipboard_mu.unlock(core.clock.io());
+    if (!claimClipboardRequest(app, seq)) return;
+    defer finishClipboardRequest(app);
 
-    const data = app.clipboard_set_data orelse {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    };
-    const len = app.clipboard_set_len;
+    app.clipboard_result = if (setClipboardTextUtf8(app.hwnd orelse null, app.clipboard_buf[0..app.clipboard_len])) 1 else 0;
+}
 
-    if (setClipboardTextUtf8(app.hwnd orelse null, data[0..len])) {
-        app.clipboard_result = 1;
-    }
+/// Caller holds clipboard_mu. False when request `seq` is no longer pending:
+/// its caller timed out, and a later request may own the shared state.
+fn claimClipboardRequest(app: *App, seq: u32) bool {
+    return seq != 0 and app.clipboard_active_seq == seq;
+}
+
+/// Caller holds clipboard_mu. Clearing the active request is what tells the
+/// waiting core thread the result is complete.
+fn finishClipboardRequest(app: *App) void {
+    app.clipboard_active_seq = 0;
     _ = c.SetEvent(app.clipboard_event);
 }
 
@@ -823,27 +830,16 @@ pub fn showConnectionDialog(app: *App, owner: c.HWND) void {
         return;
     }
 
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = connectionDialogProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512));
-    wc.hbrBackground = c.GetSysColorBrush(c.COLOR_BTNFACE);
-    wc.lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectDialogWin");
-    _ = c.RegisterClassExW(&wc);
-
-    const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME,
-        wc.lpszClassName,
+    const hwnd = createCenteredDialog(
+        std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectDialogWin"),
+        connectionDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("Connect"),
         c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
-        c.CW_USEDEFAULT,
-        c.CW_USEDEFAULT,
+        c.WS_EX_DLGMODALFRAME,
         546,
         640,
         owner,
-        null,
-        wc.hInstance,
+        owner,
         app,
     );
     if (hwnd == null) return;
@@ -913,9 +909,10 @@ fn createRadio(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_in
 fn setEditTextUtf8(hwnd_opt: ?c.HWND, text: []const u8) void {
     const hwnd = hwnd_opt orelse return;
     if (text.len == 0) return;
-    var wide: [1024]u16 = std.mem.zeroes([1024]u16);
-    const wl = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
-    wide[@min(wl, wide.len - 1)] = 0;
+    var wide: [1024]u16 = undefined;
+    const cap = wide.len - 1;
+    const wl = std.unicode.utf8ToUtf16Le(wide[0..cap], app_mod.utf8ValidPrefix(text, cap)) catch return;
+    wide[wl] = 0;
     _ = c.SetWindowTextW(hwnd, &wide);
 }
 
@@ -1040,7 +1037,7 @@ fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.L
                     break :blk @ptrFromInt(@as(usize, @bitCast(v)));
                 };
                 if (app_opt) |app| {
-                    applyConnectionAndStart(app, owner);
+                    applyConnectionAndStart(app, owner, hwnd);
                     _ = c.DestroyWindow(hwnd);
                 } else if (applog.isEnabled()) {
                     applog.appLog("[win] connection dialog: GWLP_USERDATA missing, leaving dialog open\n", .{});
@@ -1052,6 +1049,7 @@ fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.L
             cancelConnectionDialog(hwnd);
             return 0;
         },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         c.WM_DESTROY => {
             g_connection_dialog_hwnd = null;
             g_conn_name_hwnd = null;
@@ -1094,10 +1092,24 @@ fn cancelConnectionDialog(hwnd: c.HWND) void {
 /// which builds the nvim command from ssh_mode/devcontainer_mode/ext_* and
 /// starts nvim. Dialog-provided strings are duped from app.alloc; they live
 /// for the process lifetime (single startup, freed on exit).
-fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
-    var nvim_buf: [512]u8 = undefined;
-    const nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
-    if (nvim_path.len != 0) {
+fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
+    var nvim_buf: [field_utf8_max]u8 = undefined;
+    var nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
+    // Explorer's "Copy as path" wraps the path in double quotes; one pair
+    // around the whole path is dropped. The spawn command's quoting cannot
+    // carry a quote inside a path (the --nvim rule in main.zig), so such a
+    // path is ignored, and said so.
+    if (nvim_path.len >= 2 and (nvim_path[0] == '"' or nvim_path[0] == '\'') and nvim_path[nvim_path.len - 1] == nvim_path[0]) {
+        nvim_path = nvim_path[1 .. nvim_path.len - 1];
+    }
+    const has_quote = std.mem.indexOfAny(u8, nvim_path, "'\"") != null;
+    if (has_quote) {
+        if (applog.isEnabled()) applog.appLog("[win] connection dialog: nvim path contains quote characters; ignoring it\n", .{});
+        // Owned by the dialog, which the box disables for its modal loop:
+        // owned by the main window, a second Connect click re-entered here.
+        _ = c.MessageBoxW(dialog, std.unicode.utf8ToUtf16LeStringLiteral("The Neovim path contains a quote character and was ignored."), std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"), c.MB_OK | c.MB_ICONWARNING);
+    }
+    if (nvim_path.len != 0 and !has_quote) {
         if (app.alloc.dupe(u8, nvim_path)) |p| {
             app.cli_nvim_path = p;
         } else |_| {}
@@ -1109,22 +1121,22 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
     if (is_ssh) {
         app.ssh_mode = true;
         app.devcontainer_mode = false;
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [field_utf8_max]u8 = undefined;
         const host = readWindowTextUtf8(g_conn_ssh_host_hwnd, &host_buf);
         app.ssh_host = if (host.len != 0) (app.alloc.dupe(u8, host) catch null) else null;
         var port_buf: [32]u8 = undefined;
         const port_text = readWindowTextUtf8(g_conn_ssh_port_hwnd, &port_buf);
         app.ssh_port = if (port_text.len != 0) (std.fmt.parseInt(u16, port_text, 10) catch null) else null;
-        var id_buf: [512]u8 = undefined;
+        var id_buf: [field_utf8_max]u8 = undefined;
         const identity = readWindowTextUtf8(g_conn_ssh_identity_hwnd, &id_buf);
         app.ssh_identity = if (identity.len != 0) (app.alloc.dupe(u8, identity) catch null) else null;
     } else if (is_devcontainer) {
         app.devcontainer_mode = true;
         app.ssh_mode = false;
-        var ws_buf: [512]u8 = undefined;
+        var ws_buf: [field_utf8_max]u8 = undefined;
         const ws = readWindowTextUtf8(g_conn_devcontainer_workspace_hwnd, &ws_buf);
         app.devcontainer_workspace = if (ws.len != 0) (app.alloc.dupe(u8, ws) catch null) else null;
-        var cfg_buf: [512]u8 = undefined;
+        var cfg_buf: [field_utf8_max]u8 = undefined;
         const cfg = readWindowTextUtf8(g_conn_devcontainer_config_hwnd, &cfg_buf);
         app.devcontainer_config = if (cfg.len != 0) (app.alloc.dupe(u8, cfg) catch null) else null;
         app.devcontainer_rebuild = isChecked(g_conn_devcontainer_rebuild_hwnd);
@@ -1142,7 +1154,7 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
     app.ext_tabline_enabled = isChecked(g_conn_ext_tabline_hwnd);
     app.ext_windows_enabled = isChecked(g_conn_ext_windows_hwnd);
 
-    applyConnectionEnvVars();
+    applyConnectionEnvVars(app.alloc);
 
     if (applog.isEnabled()) applog.appLog("[win] connection dialog: connect ssh={} devcontainer={}\n", .{ app.ssh_mode, app.devcontainer_mode });
 
@@ -1154,36 +1166,34 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
 
 /// Parse the env-vars edit (KEY=VALUE per line) and apply to the process
 /// environment so the spawned nvim inherits them. Mirrors the macOS setenv
-/// loop; SetEnvironmentVariableW is process-wide (startup one-shot).
-fn applyConnectionEnvVars() void {
+/// loop; SetEnvironmentVariableW is process-wide (startup one-shot). The text
+/// is read whole and stays UTF-16, so no line has a length limit.
+fn applyConnectionEnvVars(alloc: std.mem.Allocator) void {
     const hwnd = g_conn_env_hwnd orelse return;
-    var wide: [4096]u16 = std.mem.zeroes([4096]u16);
-    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    const text_len = c.GetWindowTextLengthW(hwnd);
+    if (text_len <= 0) return;
+    const buf = alloc.alloc(u16, @as(usize, @intCast(text_len)) + 1) catch return;
+    defer alloc.free(buf);
+    const len = c.GetWindowTextW(hwnd, buf.ptr, @intCast(buf.len));
     if (len <= 0) return;
-    var utf8_buf: [8192]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wide[0..@intCast(len)]) catch return;
-    var it = std.mem.splitScalar(u8, utf8_buf[0..utf8_len], '\n');
-    while (it.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        if (key.len == 0) continue;
-        const val = line[eq + 1 ..];
-        var key_w: [256]u16 = std.mem.zeroes([256]u16);
-        var val_w: [1024]u16 = std.mem.zeroes([1024]u16);
-        const kl = std.unicode.utf8ToUtf16Le(&key_w, key) catch continue;
-        key_w[@min(kl, key_w.len - 1)] = 0;
-        const vl = std.unicode.utf8ToUtf16Le(&val_w, val) catch continue;
-        val_w[@min(vl, val_w.len - 1)] = 0;
-        _ = c.SetEnvironmentVariableW(&key_w, &val_w);
+    var pos: usize = 0;
+    while (render_helpers.nextEnvAssignment(buf, @intCast(len), &pos)) |a| {
+        if (c.SetEnvironmentVariableW(&buf[a.key], &buf[a.value]) == 0) {
+            if (applog.isEnabled()) applog.appLog("[win] connection dialog: SetEnvironmentVariableW failed err={d}\n", .{c.GetLastError()});
+        }
     }
 }
 
+/// UTF-8 room for the longest text readWindowTextUtf8 reads (511 units).
+const field_utf8_max = 3 * 511;
+
+/// A UTF-16 unit converts to at most 3 UTF-8 bytes (a surrogate pair to 4),
+/// so reading at most `dest.len / 3` units always fits `dest`.
 fn readWindowTextUtf8(hwnd_opt: ?c.HWND, dest: []u8) []const u8 {
     const hwnd = hwnd_opt orelse return "";
-    var wide: [512]u16 = std.mem.zeroes([512]u16);
-    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    var wide: [512]u16 = undefined;
+    const max_units = @min(wide.len - 1, dest.len / 3);
+    const len = c.GetWindowTextW(hwnd, &wide, @intCast(max_units + 1));
     if (len <= 0) return "";
     const slice = wide[0..@intCast(len)];
     const utf8_len = std.unicode.utf16LeToUtf8(dest, slice) catch return "";

@@ -36,6 +36,30 @@ pub const WaitError = error{ Timeout, NvimExited };
 
 pub const AgentEvent = struct { tab: i64, state: u8, title: []u8 };
 
+/// Per-grid on_grid_row_scroll tally. The core fires that callback only for a
+/// grid whose whole batch of scrolls can be republished as ONE row shift, so a
+/// nonzero `calls` is itself the observation that the row-shift fast path was
+/// taken for that grid.
+pub const RowScrollRecord = struct {
+    grid_id: i64 = 0,
+    calls: u32 = 0,
+    last_rows_delta: i32 = 0,
+};
+
+/// A scenario asks about a handful of window grids, never an unbounded set, so
+/// the tally lives in a fixed table rather than a growing list.
+const max_row_scroll_grids = 16;
+
+/// One surface's last published layer list. A scenario's layouts hold a few
+/// windows, so the lists are fixed tables too; a longer one keeps its head.
+pub const LayoutRecord = struct {
+    surface_id: i64 = 0,
+    count: usize = 0,
+    layers: [max_layout_layers]zc.Layer = undefined,
+};
+const max_layout_surfaces = 8;
+const max_layout_layers = 32;
+
 /// One recorded on_msg_show callback. `view` is the routed view type; the
 /// core has already decided it, so scenarios assert on routing outcomes
 /// without reimplementing the route table.
@@ -140,6 +164,20 @@ pub const Harness = struct {
     /// cannot tell an abort that took effect from a write that did nothing.
     flush_aborts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    // grid_row_scroll recording, tallied per grid id. Two grids scrolling in
+    // one batch are two separate callbacks, so a single counter could not tell
+    // "every grid took the fast path" from "one grid took it twice".
+    row_scroll_mu: std.Io.Mutex = .init,
+    row_scrolls: [max_row_scroll_grids]RowScrollRecord = [_]RowScrollRecord{.{}} ** max_row_scroll_grids,
+    row_scroll_count: usize = 0,
+
+    // on_surface_layout recording: the last layer list each surface was told.
+    // Placement is what a frontend repaints a moved layer from, so this is the
+    // oracle for "the move reached the frontend".
+    layout_mu: std.Io.Mutex = .init,
+    layouts: [max_layout_surfaces]LayoutRecord = [_]LayoutRecord{.{}} ** max_layout_surfaces,
+    layout_count: usize = 0,
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -177,6 +215,8 @@ pub const Harness = struct {
             .on_external_window_close = onExternalWindowClose,
             .on_agent_status = onAgentStatus,
             .on_grid_scroll = onGridScroll,
+            .on_grid_row_scroll = onGridRowScroll,
+            .on_surface_layout = onSurfaceLayout,
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
@@ -261,6 +301,70 @@ pub const Harness = struct {
             // Same effect as zonvie_core_abort_flush from the frontend.
             h.core.flush_aborted = true;
         }
+    }
+
+    /// Row-shift fast path notification. Fires on the RPC thread inside the
+    /// flush bracket (flush.zig dispatches it before vertex generation), so it
+    /// is observable with no vertex callbacks installed. Guarded by its own
+    /// mutex; grid_mu is already held here and must not be taken.
+    fn onSurfaceLayout(
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const zc.Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void {
+        _ = surface_rows;
+        _ = surface_cols;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.layout_mu.lockUncancelable(zc.clock.io());
+        defer h.layout_mu.unlock(zc.clock.io());
+        const rec = for (h.layouts[0..h.layout_count]) |*r| {
+            if (r.surface_id == surface_id) break r;
+        } else blk: {
+            if (h.layout_count == max_layout_surfaces) return;
+            h.layout_count += 1;
+            break :blk &h.layouts[h.layout_count - 1];
+        };
+        rec.surface_id = surface_id;
+        rec.count = @min(count, max_layout_layers);
+        @memcpy(rec.layers[0..rec.count], layers[0..rec.count]);
+    }
+
+    fn onGridRowScroll(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = row_start;
+        _ = row_end;
+        _ = col_start;
+        _ = col_end;
+        _ = total_rows;
+        _ = total_cols;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |*rec| {
+            if (rec.grid_id != grid_id) continue;
+            rec.calls += 1;
+            rec.last_rows_delta = rows_delta;
+            return;
+        }
+        if (h.row_scroll_count == h.row_scrolls.len) return; // table full: drop
+        h.row_scrolls[h.row_scroll_count] = .{
+            .grid_id = grid_id,
+            .calls = 1,
+            .last_rows_delta = rows_delta,
+        };
+        h.row_scroll_count += 1;
     }
 
     fn onLog(_: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
@@ -422,12 +526,6 @@ pub const Harness = struct {
         };
     }
 
-    pub fn msgShowCount(h: *Harness) usize {
-        h.msg_mu.lockUncancelable(zc.clock.io());
-        defer h.msg_mu.unlock(zc.clock.io());
-        return h.msg_shows.items.len;
-    }
-
     /// True if any recorded on_msg_showmode matches `pred`.
     pub fn hasMsgShowmode(h: *Harness, comptime pred: fn (MsgShowEvent) bool) bool {
         h.msg_mu.lockUncancelable(zc.clock.io());
@@ -547,6 +645,79 @@ pub const Harness = struct {
             if (@as(u64, @intCast(zc.clock.nowNs() - t0)) / std.time.ns_per_ms >= timeout_ms) return WaitError.Timeout;
             std.Io.sleep(zc.clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
         }
+    }
+
+    // ── grid_row_scroll readback ───────────────────────────────────────
+
+    /// on_grid_row_scroll callbacks recorded for `grid_id` since the last
+    /// `resetRowScrolls`. Nonzero means the core published that grid's scroll
+    /// as a row shift instead of regenerating the scrolled band.
+    pub fn rowScrollCalls(h: *Harness, grid_id: i64) u32 {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |rec| {
+            if (rec.grid_id == grid_id) return rec.calls;
+        }
+        return 0;
+    }
+
+    /// `rows_delta` of the most recent on_grid_row_scroll for `grid_id`, 0 when
+    /// none was recorded. Positive means content moved up.
+    pub fn rowScrollDelta(h: *Harness, grid_id: i64) i32 {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |rec| {
+            if (rec.grid_id == grid_id) return rec.last_rows_delta;
+        }
+        return 0;
+    }
+
+    /// Forget every recorded row scroll, so a scenario can attribute what
+    /// follows to one gesture rather than to window setup.
+    pub fn resetRowScrolls(h: *Harness) void {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        h.row_scroll_count = 0;
+    }
+
+    // ── Layout readback ────────────────────────────────────────────────
+
+    /// Where the last layout published for `surface_id` placed `grid_id`, in
+    /// surface pixels; null when it did not place it.
+    pub fn layoutPlacement(h: *Harness, surface_id: i64, grid_id: i64) ?struct { x_px: i32, y_px: i32 } {
+        h.layout_mu.lockUncancelable(zc.clock.io());
+        defer h.layout_mu.unlock(zc.clock.io());
+        for (h.layouts[0..h.layout_count]) |*rec| {
+            if (rec.surface_id != surface_id) continue;
+            for (rec.layers[0..rec.count]) |l| {
+                if (l.grid_id == grid_id) return .{ .x_px = l.x_px, .y_px = l.y_px };
+            }
+        }
+        return null;
+    }
+
+    // ── Dirty-row readback ─────────────────────────────────────────────
+    //
+    // The dirty set is what a frontend would be asked to repaint. This harness
+    // leaves `on_vertices_row` null, so flush never reaches `clearDirty()` and
+    // the set only accumulates; a scenario therefore clears it itself to make
+    // the rows one gesture dirtied readable.
+
+    /// True when `grid_id` currently has row `row` marked for repaint.
+    pub fn isRowDirty(h: *Harness, grid_id: i64, row: u32) bool {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return false;
+        return buf.isRowDirty(row);
+    }
+
+    /// Drop `grid_id`'s accumulated dirty rows, so what follows can be
+    /// attributed to one gesture. Scroll provenance is left alone.
+    pub fn clearDirtyRows(h: *Harness, grid_id: i64) void {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return;
+        buf.clearDirtyContent();
     }
 
     // ── Neovim window observation ──────────────────────────────────────
@@ -685,14 +856,6 @@ pub const Harness = struct {
         return h.core.hl.getWithStyles(hl_id);
     }
 
-    /// Grid content revision counter (bumped on cell/layering/scroll changes).
-    /// Lets scenarios assert that an event triggered a recomposition.
-    pub fn contentRev(h: *Harness) u64 {
-        h.core.grid_mu.lockUncancelable(zc.clock.io());
-        defer h.core.grid_mu.unlock(zc.clock.io());
-        return h.core.grid.content_rev;
-    }
-
     /// Wait until the current mode name starts with `prefix`
     /// (e.g. "insert", "normal"; from mode_change events).
     pub fn waitMode(h: *Harness, prefix: []const u8, timeout_ms: u64) !void {
@@ -738,6 +901,18 @@ pub const Harness = struct {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.external_grids.contains(grid_id);
+    }
+
+    /// Where an external grid sat on the main surface before it was detached,
+    /// or -1 when it never was. Both paths that composite an anchored float
+    /// into an external grid's rows — `Grid.dirtyCompositedRow` and
+    /// `buildExternalFloatRowIndexWithLimits` — return early on a negative
+    /// `start_row`, so this is what says whether compositing is live at all.
+    pub fn externalGridStartRow(h: *Harness, grid_id: i64) i32 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const info = h.core.grid.external_grids.get(grid_id) orelse return -1;
+        return info.start_row;
     }
 
     /// Snapshot of all external grid ids. Caller owns slice.
@@ -959,20 +1134,5 @@ pub const Harness = struct {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.takeUncoveredScrollRows(grid_id);
-    }
-
-    /// Get cell width (in terminal cells) for a character.
-    /// Emoji and CJK are typically 2 cells; ASCII is 1 cell.
-    /// This is a simplified approximation; actual width depends on glyph metrics.
-    pub fn cellWidthAt(h: *Harness, grid_id: i64, row: u32, col: u32) u32 {
-        h.core.grid_mu.lockUncancelable(zc.clock.io());
-        defer h.core.grid_mu.unlock(zc.clock.io());
-        const c = h.core.grid.getCellGrid(grid_id, row, col);
-        // Simplified heuristic: codepoints > U+1F300 (emoji range) → 2 cells.
-        // Real logic depends on glyph metrics from the font.
-        if (c.cp == 0) return 0; // wide-char continuation or unset
-        if (c.cp > 0x1F300) return 2; // emoji range (approximate)
-        if (c.cp >= 0x2000) return 2; // CJK and similar
-        return 1;
     }
 };

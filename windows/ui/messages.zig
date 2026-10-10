@@ -7,6 +7,81 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
+const input = @import("../input.zig");
+const render_helpers = @import("../render_pipeline_helpers.zig");
+
+/// The main window's grid area in screen pixels: the client rect less its
+/// chrome (a titlebar tabline, a sidebar on either side). macOS measures
+/// against the terminal view for the same reason.
+fn mainSurfaceRect(client_screen: c.RECT, origin_x: c_int, origin_y: c_int, right_chrome_px: c_int) c.RECT {
+    return .{
+        .left = client_screen.left + origin_x,
+        .top = client_screen.top + origin_y,
+        .right = client_screen.right - right_chrome_px,
+        .bottom = client_screen.bottom,
+    };
+}
+
+/// The anchor's cell rect on a surface whose cell (0,0) is `surface`'s top-left.
+fn anchorCellRect(surface: c.RECT, a: app_mod.MsgAnchor, cell_w: u32, cell_h: u32) c.RECT {
+    const cw: c_int = @intCast(cell_w);
+    const ch: c_int = @intCast(cell_h);
+    return .{
+        .left = surface.left + a.start_col * cw,
+        .top = surface.top + a.start_row * ch,
+        .right = surface.left + (a.start_col + a.cols) * cw,
+        .bottom = surface.top + (a.start_row + a.rows) * ch,
+    };
+}
+
+/// Screen rect a message box is placed against: the monitor work area
+/// (.display), the window showing the cursor grid (.window), or the window
+/// grid the cursor is in, walked out of floats (.grid). The one rule for the
+/// ext-float create/update/reposition paths, the toast and the minis;
+/// macOS's msgTargetFrame. The core answers which surface and cells
+/// (zonvie_core_msg_anchor, from the flush that sent the message); this only
+/// maps a surface to its window. Takes `app.mu` itself, so call it with the
+/// lock NOT held, on the UI thread.
+pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
+    const main_hwnd = app.hwnd orelse return app_mod.monitorWorkArea(null);
+    if (mode == .display) return app_mod.monitorWorkArea(main_hwnd);
+
+    var anchor: app_mod.MsgAnchor = undefined;
+    const have_anchor = if (app.corep) |cp| app_mod.zonvie_core_msg_anchor(cp, &anchor) else false;
+    const surface_id: i64 = if (!have_anchor) 1 else if (mode == .window) anchor.cursor_surface else anchor.anchor_surface;
+
+    app.mu.lockUncancelable(core.clock.io());
+    const host_hwnd: ?c.HWND = if (surface_id != 1) (if (app.external_windows.get(surface_id)) |w| w.hwnd else null) else null;
+    const origin = input.surfaceOriginPx(app, true);
+    const right_chrome_px: c_int = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+        app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))
+    else
+        0;
+    const cell_w = app.cell_w_px;
+    const cell_h = app.rowHeightPx();
+    app.mu.unlock(core.clock.io());
+
+    // An external window's client area, as the main window's below and
+    // macOS's contentLayoutRect: its outer rect holds the title bar and the
+    // invisible resize borders.
+    const surface: c.RECT = blk: {
+        if (host_hwnd) |hwnd| {
+            if (clientScreenRect(hwnd)) |rect| break :blk rect;
+        }
+        const client = clientScreenRect(main_hwnd) orelse return app_mod.monitorWorkArea(main_hwnd);
+        break :blk mainSurfaceRect(client, origin.x, origin.y, right_chrome_px);
+    };
+    if (mode == .grid and have_anchor) return anchorCellRect(surface, anchor, cell_w, cell_h);
+    return surface;
+}
+
+fn clientScreenRect(hwnd: c.HWND) ?c.RECT {
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(hwnd, &client) == 0) return null;
+    var pt: c.POINT = .{ .x = 0, .y = 0 };
+    if (c.ClientToScreen(hwnd, &pt) == 0) return null;
+    return .{ .left = pt.x, .top = pt.y, .right = pt.x + client.right, .bottom = pt.y + client.bottom };
+}
 
 /// Hand a prepared request to the UI thread and wake it. Caller must already
 /// hold app.mu.
@@ -29,35 +104,27 @@ fn enqueuePendingMessage(app: *App, req: app_mod.PendingMessageRequest, what: []
 /// it. The .mini route and the fallback route for the views with no dedicated
 /// display did this identically.
 fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) void {
-    const idx = @intFromEnum(mini_id);
-    app.mu.lockUncancelable(core.clock.io());
-    @memcpy(app.mini_windows[idx].text[0..text.len], text);
-    app.mini_windows[idx].text_len = text.len;
-    app.mu.unlock(core.clock.io());
-
+    updateMiniText(app, mini_id, text);
     if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, @intFromEnum(mini_id)), 0);
     }
 }
 
-/// Append one chunk's text to `buf` at `len`, clamped to what is left, and
-/// return the new length. Three message paths concatenated chunks this way.
-///
-/// The caller decides what to do once the buffer is full: two of them break
-/// out of their loop, the history path keeps iterating and simply copies
-/// nothing more, since copy_len clamps to zero.
-fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
-    if (chunk.text_len == 0) return len;
+/// Append one chunk's text to `buf` at `len.*`, cut at a UTF-8 boundary to
+/// what is left. False once a chunk did not fit: later chunks must not follow
+/// the gap.
+fn appendChunkText(buf: []u8, len: *usize, chunk: app_mod.MsgChunk) bool {
+    if (chunk.text_len == 0) return true;
     const text = chunk.text[0..chunk.text_len];
-    const copy_len = @min(text.len, buf.len - len);
-    @memcpy(buf[len..][0..copy_len], text[0..copy_len]);
-    return len + copy_len;
+    const copy_len = render_helpers.utf8TruncLen(text, buf.len - len.*);
+    @memcpy(buf[len.*..][0..copy_len], text[0..copy_len]);
+    len.* += copy_len;
+    return copy_len == text.len;
 }
 
 /// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
-/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
-/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
-/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
+/// mid-codepoint-truncated tail; Utf8View.initUnchecked traps on that.
+/// Undecodable bytes become U+FFFD. Returns the UTF-16 length.
 fn utf8ToUtf16Lossy(dst: []u16, src: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;
@@ -105,18 +172,16 @@ pub fn onMsgShow(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     const kind_str = kind[0..kind_len];
 
-    // Build message text and get primary hl_id from first chunk
-    var msg_text: [2048]u8 = undefined;
+    // Build the text straight into the request: an intermediate 2 KiB buffer
+    // cut the core's 4 KiB confirm/history text (the choice line included).
+    var req = app_mod.PendingMessageRequest{};
+    const msg_text = &req.text;
     var msg_len: usize = 0;
     var primary_hl_id: u32 = 0;
     for (chunks[0..chunk_count]) |chunk| {
         if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-        msg_len = appendChunkText(&msg_text, msg_len, chunk);
-        if (msg_len >= msg_text.len) break;
+        if (!appendChunkText(msg_text, &msg_len, chunk)) break;
     }
-
-    // Convert timeout from milliseconds to seconds
-    const timeout_sec: f32 = @as(f32, @floatFromInt(timeout_ms)) / 1000.0;
 
     if (applog.isEnabled()) applog.appLog("[win] on_msg_show: kind={s} chunks={d} replace_last={d} history={d} append={d} msg_id={d} text=\"{s}\" view={d} timeout_ms={d}\n", .{
         kind_str, chunk_count, replace_last, history, append, msg_id, msg_text[0..msg_len], @intFromEnum(view), timeout_ms,
@@ -131,8 +196,6 @@ pub fn onMsgShow(
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
 
-    var req = app_mod.PendingMessageRequest{};
-    @memcpy(req.text[0..msg_len], msg_text[0..msg_len]);
     req.text_len = msg_len;
     const kind_copy_len = @min(kind_len, req.kind.len);
     @memcpy(req.kind[0..kind_copy_len], kind[0..kind_copy_len]);
@@ -141,7 +204,7 @@ pub fn onMsgShow(
     req.replace_last = @intCast(@as(u32, if (replace_last != 0) 1 else 0));
     req.append = @intCast(@as(u32, if (append != 0) 1 else 0));
     req.view_type = view;
-    req.timeout = timeout_sec;
+    req.timeout_ms = timeout_ms;
 
     enqueuePendingMessage(app, req, "message");
 }
@@ -150,32 +213,41 @@ pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_msg_clear\n", .{});
 
-    // Post message to UI thread to hide window
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_CLEAR, 0, 0);
-    }
+    // In the message queue, not a separate post: a WM_APP_MSG_SHOW already
+    // queued drains the statuses the core resends after this clear, and a
+    // clear handled after them wiped them.
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    enqueuePendingMessage(app, .{ .clear = true }, "clear");
+}
+
+/// on_msg_clear on the UI thread: the toast, its stack and the ext_float
+/// statuses (the core resends the ones it still holds).
+pub fn clearMessagesOnUIThread(app: *App, hwnd: c.HWND) void {
+    _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_AUTOHIDE);
+    app.status_messages = .{ null, null, null };
+    hideMessageWindow(app);
 }
 
 pub fn onMsgShowmode(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_showmode, .showmode, "showmode", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .showmode, "showmode", chunks, chunk_count);
 }
 
 pub fn onMsgShowcmd(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_showcmd, .showcmd, "showcmd", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .showcmd, "showcmd", chunks, chunk_count);
 }
 
 pub fn onMsgRuler(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_ruler, .ruler, "ruler", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .ruler, "ruler", chunks, chunk_count);
 }
 
 /// Common handler for showmode/showcmd/ruler that can route to mini or ext_float
 pub fn handleMsgMiniOrExtFloat(
     app: *App,
     view: app_mod.zonvie_msg_view_type,
-    event: core.zonvie_msg_event,
     mini_id: app_mod.MiniWindowId,
     kind_str: []const u8,
     chunks: [*]const app_mod.MsgChunk,
@@ -185,14 +257,10 @@ pub fn handleMsgMiniOrExtFloat(
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
     for (chunks[0..chunk_count]) |chunk| {
-        text_len = appendChunkText(&text_buf, text_len, chunk);
-        if (text_len >= text_buf.len) break;
+        if (!appendChunkText(&text_buf, &text_len, chunk)) break;
     }
 
-    // Get timeout from config
-    const route_result = app_mod.zonvie_core_route_message(app.corep, event, null, 1);
-
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\" view={d} timeout={d:.1}\n", .{ kind_str, chunk_count, text_buf[0..text_len], @intFromEnum(view), route_result.timeout });
+    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\" view={d}\n", .{ kind_str, chunk_count, text_buf[0..text_len], @intFromEnum(view) });
 
     // Route based on view type
     switch (view) {
@@ -204,8 +272,8 @@ pub fn handleMsgMiniOrExtFloat(
             // Update mini window
             updateMiniWindow(app, mini_id, text_buf[0..text_len]);
         },
-        .ext_float => {
-            // Queue message for ext_float display
+        // Queued: the toast and the tray balloon belong to the UI thread.
+        .ext_float, .notification => {
             app.mu.lockUncancelable(core.clock.io());
             defer app.mu.unlock(core.clock.io());
 
@@ -218,17 +286,11 @@ pub fn handleMsgMiniOrExtFloat(
             req.hl_id = 0;
             req.replace_last = 0;
             req.append = 0;
-            req.view_type = .ext_float;
-            req.timeout = route_result.timeout;
+            // No timeout: the status arm keeps the text until it is emptied.
+            req.view_type = view;
+            req.status = mini_id;
 
             enqueuePendingMessage(app, req, "message");
-        },
-        .notification => {
-            // Show OS notification via balloon
-            const text = text_buf[0..text_len];
-            if (app.tray_icon) |*tray| {
-                tray.showBalloon("Neovim", text);
-            }
         },
         else => {
             // Fallback to mini for other views (confirm, split)
@@ -237,90 +299,183 @@ pub fn handleMsgMiniOrExtFloat(
     }
 }
 
-/// Update mini window text directly (for UI thread usage)
+/// Update mini window text directly (for UI thread usage), bounded as macOS
+/// bounds it. Under app.mu: the core thread writes the same buffer in
+/// updateMiniWindow.
 pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) void {
     const idx = @intFromEnum(id);
-    const copy_len = @min(text.len, app.mini_windows[idx].text.len);
-    @memcpy(app.mini_windows[idx].text[0..copy_len], text[0..copy_len]);
-    app.mini_windows[idx].text_len = copy_len;
-}
-
-pub fn onMsgHistoryShow(
-    ctx: ?*anyopaque,
-    entries: ?[*]const core.MsgHistoryEntry,
-    entry_count: usize,
-    prev_cmd: c_int,
-) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx orelse return));
-
-    if (entries == null or entry_count == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: empty entries\n", .{});
-        return;
-    }
-
-    // Build combined content from all entries
-    var content_buf: [16384]u8 = undefined;
-    var content_len: usize = 0;
-
-    for (0..entry_count) |i| {
-        const entry = entries.?[i];
-        if (entry.chunk_count > 0) {
-            for (0..entry.chunk_count) |j| {
-                content_len = appendChunkText(&content_buf, content_len, entry.chunks[j]);
-            }
-            // Add newline between entries
-            if (content_len < content_buf.len - 1) {
-                content_buf[content_len] = '\n';
-                content_len += 1;
-            }
-        }
-    }
-
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: entries={d} prev_cmd={d} content_len={d}\n", .{ entry_count, prev_cmd, content_len });
-
-    // Queue for UI thread display - reuse message system for split view
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
+    app.mini_windows[idx].text_len = render_helpers.clampMiniContent(&app.mini_windows[idx].text, text);
+}
 
-    var req = app_mod.PendingMessageRequest{};
-    const copy_len = @min(content_len, req.text.len);
-    @memcpy(req.text[0..copy_len], content_buf[0..copy_len]);
-    req.text_len = copy_len;
-    req.kind_len = 0; // No specific kind for history
-    req.hl_id = 0;
-    req.replace_last = 0;
-    req.append = 0;
+/// The kinds Neovim blocks on (confirm, confirm_sub, number_prompt): centred
+/// over the app, height-clamped, no auto-hide, not joined with the toast
+/// stack. The core's list, which its router pins to the confirm view.
+pub const isConfirmKind = core.config.isInteractivePrompt;
 
-    enqueuePendingMessage(app, req, "history message");
+/// Whether the message window currently shows a blocking dialog, which a
+/// toast update must not re-lay or auto-hide while Neovim waits for input.
+pub fn messageWindowIsConfirm(app: *const App) bool {
+    const mw = app.message_window orelse return false;
+    return isConfirmKind(mw.kind[0..mw.kind_len]);
+}
+
+/// Bytes the message window keeps; one UTF-16 unit per byte decodes all of it.
+const message_text_capacity = @typeInfo(@FieldType(app_mod.MessageWindow, "text")).array.len;
+const mini_text_capacity = @typeInfo(@FieldType(app_mod.MiniWindowState, "text")).array.len;
+/// Inset of the message window's text from each edge, before DPI scaling.
+const message_text_pad_px: c_int = 12;
+
+fn fillMessageWindow(mw: *app_mod.MessageWindow, text: []const u8, msg: app_mod.DisplayMessage, line_count: u32, is_long_mode: bool) void {
+    const copy_len = @min(text.len, mw.text.len);
+    @memcpy(mw.text[0..copy_len], text[0..copy_len]);
+    mw.text_len = copy_len;
+    @memcpy(mw.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
+    mw.kind_len = msg.kind_len;
+    mw.hl_id = msg.hl_id;
+    mw.line_count = line_count;
+    mw.is_long_mode = is_long_mode;
+}
+
+/// The GDI font the message window and the minis draw in.
+fn createPanelFont(height_px: c_int) c.HFONT {
+    return c.CreateFontW(
+        height_px,
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.DEFAULT_QUALITY,
+        c.FIXED_PITCH | c.FF_MODERN,
+        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
+    );
+}
+
+/// ~75% of the editor cell height, so the mini reads as smaller than the
+/// editor and the ext_float window; floored for legibility.
+fn miniFontPx(app: *const App) c_int {
+    return @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(app.cell_h_px * 3, 4))));
+}
+/// Inset of a mini's text from its left and right edges, before DPI scaling.
+const mini_text_pad_px: c_int = 4;
+/// '\n' breaks lines (no DT_SINGLELINE), so DT_TOP: DT_VCENTER needs SINGLELINE.
+const mini_draw_flags: c.UINT = c.DT_CENTER | c.DT_TOP;
+
+fn colorrefFromRgb(rgb: u32) c.COLORREF {
+    return c.RGB(@as(u8, @truncate(rgb >> 16)), @as(u8, @truncate(rgb >> 8)), @as(u8, @truncate(rgb)));
+}
+
+fn colorrefFromFloat(rgb: [3]f32) c.COLORREF {
+    return c.RGB(
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[0], 0.0, 1.0) * 255.0))),
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[1], 0.0, 1.0) * 255.0))),
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[2], 0.0, 1.0) * 255.0))),
+    );
+}
+
+/// The message window's bg from the Normal bg: the cmdline's brightness rule,
+/// as the decorated surfaces and macOS's toast (lighter on dark schemes,
+/// darker on light ones).
+fn messageWindowBg(normal_bg: u32) c.COLORREF {
+    return colorrefFromFloat(app_mod.adjustBrightnessForCmdline(
+        @as(f32, @floatFromInt((normal_bg >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((normal_bg >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(normal_bg & 0xFF)) / 255.0,
+    ));
+}
+
+const TextSizePx = struct { w: c_int, h: c_int };
+
+/// What DrawTextW with `flags` would cover for `text` in the panel font at
+/// `font_px`, `width_px` wide. Boxes are sized with the font they are painted
+/// in, not with editor cell metrics.
+fn measureTextPx(hwnd: c.HWND, font_px: c_int, text: []const u16, width_px: c_int, flags: c.UINT) ?TextSizePx {
+    if (text.len == 0) return null;
+    const hdc = c.GetDC(hwnd) orelse return null;
+    defer _ = c.ReleaseDC(hwnd, hdc);
+    const hfont = createPanelFont(font_px);
+    const old_font = c.SelectObject(hdc, hfont);
+    defer {
+        _ = c.SelectObject(hdc, old_font);
+        _ = c.DeleteObject(hfont);
+    }
+    var rect: c.RECT = .{ .left = 0, .top = 0, .right = width_px, .bottom = 0 };
+    if (c.DrawTextW(hdc, @ptrCast(text.ptr), @intCast(text.len), &rect, flags | c.DT_CALCRECT) == 0) return null;
+    return .{ .w = rect.right - rect.left, .h = rect.bottom - rect.top };
+}
+
+/// Measure and paint of a wrapped toast. DT_EDITCONTROL breaks a word wider
+/// than the line (a path, a URL) instead of letting it run off the edge.
+const wrapped_draw_flags: c.UINT = c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK | c.DT_EDITCONTROL;
+
+fn wrappedTextHeightPx(hwnd: c.HWND, font_px: c_int, text: []const u8, width_px: c_int) ?c_int {
+    var utf16: [message_text_capacity]u16 = undefined;
+    const len = utf8ToUtf16Lossy(&utf16, text);
+    const size = measureTextPx(hwnd, font_px, utf16[0..len], width_px, wrapped_draw_flags) orelse return null;
+    return size.h;
+}
+
+/// Append `line` to the toast text at `len`, after a '\n' when it is not the
+/// first, cut at a UTF-8 boundary to what is left. False once the line did not
+/// fit: later lines must not follow the gap.
+fn appendToastLine(buf: []u8, len: *usize, line: []const u8) bool {
+    if (len.* > 0) {
+        if (len.* == buf.len) return false;
+        buf[len.*] = '\n';
+        len.* += 1;
+    }
+    const copy_len = render_helpers.utf8TruncLen(line, buf.len - len.*);
+    @memcpy(buf[len.*..][0..copy_len], line[0..copy_len]);
+    len.* += copy_len;
+    return copy_len == line.len;
+}
+
+/// Re-show the toast from the stack and the statuses, or hide it when both
+/// are empty. Statuses never enter or clear the stack. A blocking dialog
+/// stays.
+pub fn refreshToast(app: *App) void {
+    if (messageWindowIsConfirm(app)) return;
+    // The window takes its kind (colour) from the last stacked message, else
+    // from the last status.
+    var shown: ?*const app_mod.DisplayMessage = null;
+    for (&app.status_messages) |*entry| {
+        if (entry.*) |*m| shown = m;
+    }
+    const stack = app.display_messages.items;
+    if (stack.len > 0) shown = &stack[stack.len - 1];
+    if (shown) |m| showMessageWindowOnUIThread(app, m.*, false) else hideMessageWindow(app);
 }
 
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
     if (applog.isEnabled()) applog.appLog("[win] showMessageWindowOnUIThread: text_len={d} kind={s}\n", .{ msg.text_len, msg.kind[0..msg.kind_len] });
 
-    // Build combined content from display_messages stack
-    var combined_text: [16384]u8 = undefined;
+    const kind_str = msg.kind[0..msg.kind_len];
+    const is_confirm = isConfirmKind(kind_str);
+
+    // The toast is the stack's lines followed by the non-empty status lines,
+    // macOS's rule. A confirm dialog shows only its own text.
+    // Sized to what the window stores, so the line count covers only that.
+    var combined_text: [message_text_capacity]u8 = undefined;
     var combined_len: usize = 0;
-    for (app.display_messages.items) |dm| {
-        if (combined_len > 0 and combined_len < combined_text.len - 1) {
-            combined_text[combined_len] = '\n';
-            combined_len += 1;
-        }
-        const copy_len = @min(dm.text_len, combined_text.len - combined_len);
-        @memcpy(combined_text[combined_len..][0..copy_len], dm.text[0..copy_len]);
-        combined_len += copy_len;
-    }
+    var fits = true;
+    const stack: []const app_mod.DisplayMessage = if (is_confirm) &.{} else app.display_messages.items;
+    for (stack) |*dm| fits = fits and appendToastLine(&combined_text, &combined_len, dm.text[0..dm.text_len]);
     // Allocation failure while extending display_messages must not make the
     // current message disappear. The caller requests this fixed-buffer
-    // fallback when the append failed (and for split messages, which are not
-    // stored in the display stack at all).
-    if (include_msg and combined_len < combined_text.len) {
-        if (combined_len > 0 and combined_len < combined_text.len - 1) {
-            combined_text[combined_len] = '\n';
-            combined_len += 1;
+    // fallback when the append failed (and for confirm messages, which are
+    // not stored in the display stack at all).
+    if (include_msg) fits = fits and appendToastLine(&combined_text, &combined_len, msg.text[0..msg.text_len]);
+    if (!is_confirm) {
+        for (&app.status_messages) |*entry| {
+            if (entry.*) |*m| fits = fits and appendToastLine(&combined_text, &combined_len, m.text[0..m.text_len]);
         }
-        const copy_len = @min(msg.text_len, combined_text.len - combined_len);
-        @memcpy(combined_text[combined_len..][0..copy_len], msg.text[0..copy_len]);
-        combined_len += copy_len;
     }
 
     // Count lines for display calculation
@@ -329,17 +484,8 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         if (ch == '\n') line_count += 1;
     }
 
-    // Determine message type
-    const kind_str = msg.kind[0..msg.kind_len];
-    // number_prompt asks the user to pick a numbered choice, so it belongs
-    // with the other blocking dialogs: centered over the app, height-clamped,
-    // no auto-hide. The core pins every interactive prompt to the confirm
-    // view now, so a user can no longer route it elsewhere to escape the
-    // top-right toast placement it used to fall into.
-    const is_confirm = std.mem.eql(u8, kind_str, "confirm") or
-        std.mem.eql(u8, kind_str, "confirm_sub") or
-        std.mem.eql(u8, kind_str, "number_prompt");
-    const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
+    // Word-wrapped: a dialog, several lines, or a line wider than the cap.
+    var is_long_mode = is_confirm or line_count > 1;
 
     // External window with auto-hide
     const cell_h = app.rowHeightPx();
@@ -351,26 +497,49 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     _ = c.GetWindowRect(main_hwnd, &app_rect);
     const app_width = app_rect.right - app_rect.left;
     const app_height = app_rect.bottom - app_rect.top;
+    const target: c.RECT = if (is_confirm) app_rect else msgTargetRect(app, app.config.messages.msg_pos.ext_float);
 
     // Calculate window size based on message type
     var window_width: c_int = undefined;
     var window_height: c_int = undefined;
     const line_height: c_int = @as(c_int, @intCast(cell_h)) + app.scalePx(4);
+    const text_pad = app.scalePx(message_text_pad_px);
+    const stored = combined_text[0..combined_len];
 
     if (is_confirm) {
         // For confirm dialogs (like E325), use larger fixed width and calculate height
         // based on line count. The text will be word-wrapped.
         window_width = @max(app.scalePx(100), @min(app.scalePx(800), app_width - app.scalePx(40)));
         // Height: line_count * line_height + padding, but at least 200px for readability
-        const calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        var calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        // The paint word-wraps, so long E325 lines take several rows: measured
+        // as the paint draws them, or the choice line falls off the bottom.
+        if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
+            calc_height = @max(calc_height, text_h + 2 * text_pad);
+        }
         window_height = @max(app.scalePx(200), @min(calc_height, app_height - app.scalePx(100)));
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog: line_count={d} calc_height={d} window_height={d}\n", .{ line_count, calc_height, window_height });
     } else {
-        // For regular messages, use text-based width calculation
-        const text_len_int: c_int = @intCast(combined_len);
-        const estimated_width: c_int = @intCast(@as(u32, @intCast(text_len_int)) * (cell_h / 2) + @as(u32, @intCast(padding * 2)));
-        window_width = @max(app.scalePx(100), @min(estimated_width, app.scalePx(600)));
+        // The widest line in the paint font, capped at min(80% of the
+        // target, 600px) as macOS's toast.
+        var utf16: [message_text_capacity]u16 = undefined;
+        const utf16_len = utf8ToUtf16Lossy(&utf16, stored);
+        const text_w: c_int = if (measureTextPx(main_hwnd, @intCast(app.cell_h_px), utf16[0..utf16_len], 0, c.DT_LEFT | c.DT_TOP)) |size| size.w else 0;
+        const natural_width = text_w + 2 * padding;
+        const max_width = @min(@divTrunc((target.right - target.left) * 4, 5), app.scalePx(600));
+        window_width = @max(app.scalePx(100), @min(natural_width, max_width));
         window_height = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        // Text wider than the cap wraps, and the box grows to hold it: measured
+        // in the paint font, as macOS measures its toast. A single line was
+        // drawn DT_SINGLELINE and cut at the right edge.
+        // Several lines are measured too: line_height follows linespace, the
+        // paint font does not, so a negative linespace undercounts them.
+        if (natural_width > window_width) is_long_mode = true;
+        if (is_long_mode or line_count > 1) {
+            if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
+                window_height = @max(window_height, text_h + 2 * text_pad);
+            }
+        }
     }
 
     // Position based on message type (relative to app window)
@@ -396,43 +565,20 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
             }
         }
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog position: x={d} y={d} ext_cmdline={}\n", .{ window_x, window_y, app.ext_cmdline_enabled });
-    } else if (is_prompt) {
-        // Bottom center for other prompts (relative to app window)
-        window_x = app_rect.left + @divTrunc(app_width - window_width, 2);
-        window_y = app_rect.bottom - window_height - app.scalePx(40);
     } else {
-        // Top-right for regular messages (screen coordinates like msg_history/macOS)
-        const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-        window_x = screen_w - window_width - app.scalePx(10);
-        window_y = app.scalePx(10);
+        // Regular messages: top-right of msg_pos.ext_float's target, as
+        // msg_show and macOS's toast.
+        const pos = external_windows.msgFloatOrigin(app, target, window_width, null);
+        window_x = pos.x;
+        window_y = pos.y;
     }
 
-    // Check if this is a return_prompt (preserve layout from confirm dialog)
-    const is_return_prompt = std.mem.eql(u8, kind_str, "return_prompt");
-
     if (app.message_window) |*msg_win| {
-        // Update existing window
-        const copy_len = @min(combined_len, msg_win.text.len);
-        @memcpy(msg_win.text[0..copy_len], combined_text[0..copy_len]);
-        msg_win.text_len = copy_len;
-        @memcpy(msg_win.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
-        msg_win.kind_len = msg.kind_len;
-        msg_win.hl_id = msg.hl_id;
-        msg_win.line_count = line_count;
-
-        // For return_prompt, preserve the layout from the previous confirm dialog
-        if (is_return_prompt and msg_win.saved_width > 0) {
-            // Keep the saved is_long_mode and don't resize the window
-            msg_win.is_long_mode = msg_win.saved_is_long_mode;
-            // Just redraw without resizing
-            _ = c.InvalidateRect(msg_win.hwnd, null, c.TRUE);
-            _ = c.ShowWindow(msg_win.hwnd, c.SW_SHOWNOACTIVATE);
-            if (applog.isEnabled()) applog.appLog("[win] return_prompt: preserving layout (saved_width={d})\n", .{msg_win.saved_width});
-            return;
-        }
-
-        // Use long mode (word wrap) for confirm dialogs or multi-line messages
-        msg_win.is_long_mode = is_confirm or line_count > 1;
+        // Update existing window. Written under app.mu: onFlushEnd reads
+        // message_window on the core thread.
+        app.mu.lockUncancelable(core.clock.io());
+        fillMessageWindow(msg_win, combined_text[0..combined_len], msg, line_count, is_long_mode);
+        app.mu.unlock(core.clock.io());
 
         // Resize and reposition window
         _ = c.SetWindowPos(
@@ -444,13 +590,6 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
             window_height,
             c.SWP_NOZORDER | c.SWP_NOACTIVATE,
         );
-
-        // Save layout for return_prompt if this is a confirm dialog
-        if (is_confirm) {
-            msg_win.saved_width = window_width;
-            msg_win.saved_height = window_height;
-            msg_win.saved_is_long_mode = msg_win.is_long_mode;
-        }
 
         // Redraw the window
         _ = c.InvalidateRect(msg_win.hwnd, null, c.TRUE);
@@ -488,23 +627,11 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     }
 
     // Store window state
-    var msg_win = app_mod.MessageWindow{
-        .hwnd = msg_hwnd.?,
-        .line_count = line_count,
-        // Use long mode (word wrap) for confirm dialogs or multi-line messages
-        .is_long_mode = is_confirm or line_count > 1,
-        // Save layout for return_prompt if this is a confirm dialog
-        .saved_width = if (is_confirm) window_width else 0,
-        .saved_height = if (is_confirm) window_height else 0,
-        .saved_is_long_mode = is_confirm or line_count > 1,
-    };
-    const copy_len = @min(combined_len, msg_win.text.len);
-    @memcpy(msg_win.text[0..copy_len], combined_text[0..copy_len]);
-    msg_win.text_len = copy_len;
-    @memcpy(msg_win.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
-    msg_win.kind_len = msg.kind_len;
-    msg_win.hl_id = msg.hl_id;
+    var msg_win = app_mod.MessageWindow{ .hwnd = msg_hwnd.? };
+    fillMessageWindow(&msg_win, combined_text[0..combined_len], msg, line_count, is_long_mode);
+    app.mu.lockUncancelable(core.clock.io());
     app.message_window = msg_win;
+    app.mu.unlock(core.clock.io());
 
     // Set userdata so ExternalWndProc can find App
     _ = c.SetWindowLongPtrW(msg_hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
@@ -522,10 +649,15 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
 
 /// Hide and destroy message window
 pub fn hideMessageWindow(app: *App) void {
-    if (app.message_window) |*msg_win| {
+    if (app.message_window) |msg_win| {
         if (applog.isEnabled()) applog.appLog("[win] hiding message window\n", .{});
-        msg_win.deinit();
+        // Unpublished before it is destroyed: onFlushEnd invalidates it from
+        // the core thread under app.mu.
+        app.mu.lockUncancelable(core.clock.io());
         app.message_window = null;
+        app.mu.unlock(core.clock.io());
+        var closing = msg_win;
+        closing.deinit();
     }
     // Clear display messages stack
     app.display_messages.clearRetainingCapacity();
@@ -533,7 +665,8 @@ pub fn hideMessageWindow(app: *App) void {
 
 /// Resize external window asynchronously.
 /// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler.
-/// Handles cmdline (keep center), popupmenu (keep top-left), and regular ext_windows (keep top-left).
+/// The cmdline re-centres on its monitor, the message floats keep their
+/// top-right anchor, everything else keeps its top-left.
 pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
@@ -569,27 +702,15 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     if (is_cmdline) {
         // Re-center cmdline on the current monitor after font size change.
         // Preserving the old position caused visible drift on repeated changes.
-        const monitor = c.MonitorFromWindow(ext_hwnd, c.MONITOR_DEFAULTTONEAREST);
-        if (monitor) |mon| {
-            var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-            mi.cbSize = @sizeOf(c.MONITORINFO);
-            if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                const work_w = mi.rcWork.right - mi.rcWork.left;
-                const work_h = mi.rcWork.bottom - mi.rcWork.top;
-                pos_x = mi.rcWork.left + @divTrunc(work_w - window_w, 2);
-                pos_y = mi.rcWork.top + @divTrunc(work_h - window_h, 3);
-            } else {
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @divTrunc(screen_w - window_w, 2);
-                pos_y = @divTrunc(screen_h - window_h, 3);
-            }
-        } else {
-            const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-            const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-            pos_x = @divTrunc(screen_w - window_w, 2);
-            pos_y = @divTrunc(screen_h - window_h, 3);
-        }
+        const pos = external_windows.centredOnWorkArea(app_mod.monitorWorkArea(ext_hwnd), window_w, window_h, 3);
+        pos_x = pos.x;
+        pos_y = pos.y;
+    } else if (grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID) {
+        // The message floats keep their top-right anchor, as on every other
+        // re-layout; the top-left one grew them past the right margin.
+        const pos = external_windows.msgFloatTopRight(app, grid_id == app_mod.MSG_HISTORY_GRID_ID, window_w);
+        pos_x = pos.x;
+        pos_y = pos.y;
     } else {
         pos_x = current_rect.left;
         pos_y = current_rect.top;
@@ -638,330 +759,112 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         app.cmdline_saved_y = null;
     }
     app.mu.unlock(core.clock.io());
+
+    // The two message floats resize in hash-map order; msg_show may have been
+    // placed against msg_history's old bottom.
+    if (grid_id == app_mod.MSG_HISTORY_GRID_ID) external_windows.restackMsgShowBelowHistory(app);
 }
 
-/// Update ext-float (msg_show/msg_history) window positions
-/// Called asynchronously via WM_APP_UPDATE_EXT_FLOAT_POS to avoid deadlock
+/// Move the ext-float message windows (msg_show/msg_history and the toast)
+/// after the main window moved or resized (TIMER_REPOSITION_FLOATS).
 pub fn updateExtFloatPositions(app: *App) void {
-    const main_hwnd = app.hwnd orelse return;
+    const target_rect = msgTargetRect(app, app.config.messages.msg_pos.ext_float);
 
-    // Query core for the live cursor grid (avoids stale app.last_cursor_grid;
-    // see updateMiniWindows for the race rationale).
-    const cursor_grid: i64 = if (app.corep) |cp|
-        app_mod.zonvie_core_get_cursor_position(cp, null, null)
-    else
-        app.last_cursor_grid;
-
-    // Get data while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
-    const pos_mode = app.config.messages.msg_pos.ext_float;
-    const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
-    const msg_show_entry = app.external_windows.get(app_mod.MESSAGE_GRID_ID);
-    const msg_history_entry = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
-    const corep = app.corep;
-
-    // Copy window info
-    const msg_show_hwnd: ?c.HWND = if (msg_show_entry) |e| e.hwnd else null;
-    const msg_show_rows: u32 = if (msg_show_entry) |e| e.surface.rows else 0;
-    const msg_show_cols: u32 = if (msg_show_entry) |e| e.surface.cols else 0;
-    const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
-    const msg_history_rows: u32 = if (msg_history_entry) |e| e.surface.rows else 0;
-    const msg_history_cols: u32 = if (msg_history_entry) |e| e.surface.cols else 0;
-    // When using DWM custom titlebar, client area extends into the titlebar.
-    // Compute offset to position floats below the custom titlebar area.
-    const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
-    else
-        0;
+    const msg_show_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |e| e.hwnd else null;
+    const msg_history_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID)) |e| e.hwnd else null;
     app.mu.unlock(core.clock.io());
 
-    // Calculate target rect based on position mode (mutex unlocked, safe to call core functions)
-    var target_rect: c.RECT = undefined;
-    switch (pos_mode) {
-        .display => {
-            target_rect = .{
-                .left = 0,
-                .top = 0,
-                .right = c.GetSystemMetrics(c.SM_CXSCREEN),
-                .bottom = c.GetSystemMetrics(c.SM_CYSCREEN),
-            };
-        },
-        .window => {
-            // Window-based: use cursor's window
-            if (cursor_ext_hwnd) |hwnd| {
-                if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
-                }
-            } else {
-                var client_rect: c.RECT = undefined;
-                if (c.GetClientRect(main_hwnd, &client_rect) != 0) {
-                    var pt: c.POINT = .{ .x = 0, .y = 0 };
-                    _ = c.ClientToScreen(main_hwnd, &pt);
-                    target_rect = .{
-                        .left = pt.x,
-                        .top = pt.y + titlebar_offset,
-                        .right = pt.x + client_rect.right,
-                        .bottom = pt.y + client_rect.bottom,
-                    };
-                } else {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
-                }
+    // The toast is placed like msg_show; a confirm dialog is centred instead.
+    if (app.message_window) |mw| {
+        if (!isConfirmKind(mw.kind[0..mw.kind_len])) {
+            if (windowSize(mw.hwnd)) |size| {
+                const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, null);
+                _ = c.SetWindowPos(mw.hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
             }
-        },
-        .grid => {
-            // Grid-based: use cursor grid's bounds
-            if (cursor_ext_hwnd) |hwnd| {
-                // Cursor is in external window
-                if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
-                }
-            } else {
-                // Get grid bounds from core (safe now, outside of callback)
-                var client_rect: c.RECT = undefined;
-                _ = c.GetClientRect(main_hwnd, &client_rect);
-
-                var client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                _ = c.ClientToScreen(main_hwnd, &client_origin);
-
-                var grid_right_px: c_int = client_rect.right;
-                var grid_bottom_px: c_int = client_rect.bottom;
-
-                if (corep) |cp| {
-                    const cached = app.getVisibleGridsCached(cp);
-                    if (cached.len > 0) {
-                        for (cached) |grid| {
-                            if (grid.grid_id == cursor_grid) {
-                                const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
-                                const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
-                                grid_right_px = @intCast(end_col * cell_w);
-                                // cell_h already includes linespace; do NOT add linespace again.
-                                grid_bottom_px = @intCast(end_row * cell_h);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                target_rect = .{
-                    .left = client_origin.x,
-                    .top = client_origin.y + titlebar_offset,
-                    .right = client_origin.x + grid_right_px,
-                    .bottom = client_origin.y + grid_bottom_px,
-                };
-            }
-        },
+        }
     }
 
-    // Update msg_history position first (if exists)
-    const float_margin = app.scalePx(10);
-    var history_bottom: c_int = target_rect.top + float_margin;
+    // msg_history first: msg_show stacks below it.
+    var history_bottom: ?i32 = null;
     if (msg_history_hwnd) |hwnd| {
-        const content_w: c_int = @intCast(msg_history_cols * cell_w);
-        const content_h: c_int = @intCast(msg_history_rows * cell_h);
-        const scaled_msg_padding = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
-        const client_w: c_int = content_w + scaled_msg_padding * 2;
-        const client_h: c_int = content_h + scaled_msg_padding * 2;
+        const size = windowSize(hwnd) orelse return;
+        const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, null);
+        history_bottom = pos.y + size.h;
 
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-        _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-        const window_w: c_int = rect.right - rect.left;
-        const window_h: c_int = rect.bottom - rect.top;
-
-        const pos_x = target_rect.right - window_w - float_margin;
-        const pos_y: c_int = target_rect.top + float_margin;
-        history_bottom = pos_y + window_h;
-
-        _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
-        _ = c.InvalidateRect(hwnd, null, 0);
-        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_history at ({d},{d}) size=({d},{d})\n", .{ pos_x, pos_y, window_w, window_h });
+        _ = c.SetWindowPos(hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
+        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_history at ({d},{d})\n", .{ pos.x, pos.y });
     }
 
-    // Update msg_show position (if exists)
     if (msg_show_hwnd) |hwnd| {
-        const content_w: c_int = @intCast(msg_show_cols * cell_w);
-        const content_h: c_int = @intCast(msg_show_rows * cell_h);
-        const scaled_msg_padding2 = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
-        const client_w: c_int = content_w + scaled_msg_padding2 * 2;
-        const client_h: c_int = content_h + scaled_msg_padding2 * 2;
+        const size = windowSize(hwnd) orelse return;
+        const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, history_bottom);
 
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-        _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-        const window_w: c_int = rect.right - rect.left;
-        const window_h: c_int = rect.bottom - rect.top;
-
-        const pos_x = target_rect.right - window_w - float_margin;
-        // If msg_history exists, position below it; otherwise at top
-        const pos_y: c_int = if (msg_history_hwnd != null) history_bottom + app.scalePx(4) else target_rect.top + float_margin;
-
-        _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
-        _ = c.InvalidateRect(hwnd, null, 0);
-        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_show at ({d},{d}) size=({d},{d})\n", .{ pos_x, pos_y, window_w, window_h });
+        _ = c.SetWindowPos(hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
+        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_show at ({d},{d})\n", .{ pos.x, pos.y });
     }
+}
+
+/// Outer size of a window. Only moves are done from here: the size is the
+/// external-window sizing path's (externalSurfaceInsetsPx), which counts the
+/// copy button this path used to leave out, shrinking the box on every move.
+fn windowSize(hwnd: c.HWND) ?struct { w: c_int, h: c_int } {
+    var rect: c.RECT = undefined;
+    if (c.GetWindowRect(hwnd, &rect) == 0) return null;
+    return .{ .w = rect.right - rect.left, .h = rect.bottom - rect.top };
 }
 
 /// Update or create mini windows (showmode / showcmd / ruler)
 pub fn updateMiniWindows(app: *App) void {
     const main_hwnd = app.hwnd orelse return;
 
-    // Get cell dimensions and config
     app.mu.lockUncancelable(core.clock.io());
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
     const mini_pos_mode = app.config.messages.msg_pos.mini;
+    const font_px = miniFontPx(app);
     app.mu.unlock(core.clock.io());
 
-    // Query the core directly for the current cursor grid instead of reading
-    // the cached app.last_cursor_grid. The cache is updated only via posted
-    // messages, so when updateMiniWindows runs from WM_APP_MSG_SHOW (posted
-    // earlier in the same flush than on_cursor_grid_changed fires), the cache
-    // can still point at the previous grid (e.g. a closing cmdline at -100)
-    // and anchor the mini to the wrong screen rect.
-    const cursor_grid: i64 = if (app.corep) |corep|
-        app_mod.zonvie_core_get_cursor_position(corep, null, null)
-    else
-        app.last_cursor_grid;
-
-    // Mini-specific cell dimensions: ~75% of the editor cell so the popup
-    // looks visibly "mini" (matches macOS, which uses cellHeightPt * 0.75 for
-    // the mini font size). Floors keep the popup legible at small DPI.
-    const mini_cell_h_i: c_int = @max(@as(c_int, 12), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
-    const mini_cell_w_i: c_int = @max(@as(c_int, 6), @as(c_int, @intCast(@divTrunc(cell_w * 3, 4))));
-
-    // Calculate target rect based on position mode
-    var anchor_x: c_int = 0;
-    var anchor_y: c_int = 0;
-
-    switch (mini_pos_mode) {
-        .display => {
-            // Display-based: bottom-right of screen
-            anchor_x = c.GetSystemMetrics(c.SM_CXSCREEN);
-            anchor_y = c.GetSystemMetrics(c.SM_CYSCREEN);
-        },
-        .window => {
-            // Window-based: check if cursor is in external window
-            app.mu.lockUncancelable(core.clock.io());
-            const ext_win = app.external_windows.get(cursor_grid);
-            app.mu.unlock(core.clock.io());
-
-            if (ext_win) |ew| {
-                var rect: c.RECT = undefined;
-                if (c.GetWindowRect(ew.hwnd, &rect) != 0) {
-                    anchor_x = rect.right;
-                    anchor_y = rect.bottom;
-                } else {
-                    // Fallback to main window
-                    var client_rect: c.RECT = undefined;
-                    _ = c.GetClientRect(main_hwnd, &client_rect);
-                    var pt: c.POINT = .{ .x = client_rect.right, .y = client_rect.bottom };
-                    _ = c.ClientToScreen(main_hwnd, &pt);
-                    anchor_x = pt.x;
-                    anchor_y = pt.y;
-                }
-            } else {
-                // Main window
-                var client_rect: c.RECT = undefined;
-                _ = c.GetClientRect(main_hwnd, &client_rect);
-                var pt: c.POINT = .{ .x = client_rect.right, .y = client_rect.bottom };
-                _ = c.ClientToScreen(main_hwnd, &pt);
-                anchor_x = pt.x;
-                anchor_y = pt.y;
-            }
-        },
-        .grid => {
-            // Grid-based: use cursor grid's bounds
-            var client_rect: c.RECT = undefined;
-            _ = c.GetClientRect(main_hwnd, &client_rect);
-
-            var client_origin: c.POINT = .{ .x = 0, .y = 0 };
-            _ = c.ClientToScreen(main_hwnd, &client_origin);
-
-            var grid_right_px: c_int = client_rect.right;
-            var grid_bottom_px: c_int = client_rect.bottom;
-
-            // Check if cursor is in external window first
-            app.mu.lockUncancelable(core.clock.io());
-            const ext_win = app.external_windows.get(cursor_grid);
-            app.mu.unlock(core.clock.io());
-
-            if (ext_win) |ew| {
-                var rect: c.RECT = undefined;
-                if (c.GetWindowRect(ew.hwnd, &rect) != 0) {
-                    anchor_x = rect.right;
-                    anchor_y = rect.bottom;
-                } else {
-                    anchor_x = client_origin.x + grid_right_px;
-                    anchor_y = client_origin.y + grid_bottom_px;
-                }
-            } else {
-                // Try to get grid bounds from core (non-blocking)
-                if (app.corep) |corep| {
-                    const cached = app.getVisibleGridsCached(corep);
-                    if (cached.len > 0) {
-                        for (cached) |grid| {
-                            if (grid.grid_id == cursor_grid) {
-                                const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
-                                const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
-                                grid_right_px = @intCast(end_col * cell_w);
-                                // cell_h already includes linespace; do NOT add linespace again.
-                                grid_bottom_px = @intCast(end_row * cell_h);
-                                break;
-                            }
-                        }
-                    }
-                }
-                anchor_x = client_origin.x + grid_right_px;
-                anchor_y = client_origin.y + grid_bottom_px;
-            }
-        },
-    }
+    // Minis stack upward from the target's bottom-right corner, no wider than
+    // the main window (macOS's miniWindowSize).
+    const target = msgTargetRect(app, mini_pos_mode);
+    var main_rect: c.RECT = undefined;
+    const max_width_px: c_int = if (c.GetWindowRect(main_hwnd, &main_rect) != 0) main_rect.right - main_rect.left else std.math.maxInt(c_int);
+    const anchor_x: c_int = target.right;
+    const anchor_y: c_int = target.bottom;
 
     // Count visible minis and build stack order
     var stacked_height_px: c_int = 0;
-    for (0..3) |idx| {
+    for (0..app.mini_windows.len) |idx| {
         app.mu.lockUncancelable(core.clock.io());
         const text_len = app.mini_windows[idx].text_len;
-        var text_buf: [256]u8 = undefined;
+        var text_buf: [mini_text_capacity]u8 = undefined;
         if (text_len > 0) {
             @memcpy(text_buf[0..text_len], app.mini_windows[idx].text[0..text_len]);
         }
         app.mu.unlock(core.clock.io());
 
         if (text_len == 0) {
-            // Hide this mini window
+            // Hide this mini window. Unpublished under app.mu first: onFlushEnd
+            // invalidates the minis from the core thread.
             if (app.mini_windows[idx].hwnd) |mini_hwnd| {
-                _ = c.DestroyWindow(mini_hwnd);
+                app.mu.lockUncancelable(core.clock.io());
                 app.mini_windows[idx].hwnd = null;
+                app.mu.unlock(core.clock.io());
+                _ = c.DestroyWindow(mini_hwnd);
             }
             continue;
         }
 
         if (applog.isEnabled()) applog.appLog("[win] updateMiniWindows: idx={d} text=\"{s}\"\n", .{ idx, text_buf[0..text_len] });
 
-        // Compute line count and longest-line byte length so multi-line messages
-        // are fully visible. UTF-8 '\n' (0x0A) is a single byte so byte-level counting works.
-        var line_count: usize = 1;
-        var max_line_bytes: usize = 0;
-        var line_start: usize = 0;
-        var i: usize = 0;
-        while (i < text_len) : (i += 1) {
-            if (text_buf[i] == '\n') {
-                const len = i - line_start;
-                if (len > max_line_bytes) max_line_bytes = len;
-                line_count += 1;
-                line_start = i + 1;
-            }
-        }
-        if (text_len - line_start > max_line_bytes) max_line_bytes = text_len - line_start;
-
-        // Width based on longest line, height grows with line count.
-        // Use mini-cell metrics so the popup is visibly smaller than the
-        // editor (and than ext_float windows that use full cell metrics).
-        const max_line_i: c_int = @intCast(max_line_bytes);
-        const text_width: c_int = max_line_i * mini_cell_w_i + app.scalePx(12);
-        const window_width: c_int = @max(app.scalePx(40), text_width);
-        const window_height: c_int = mini_cell_h_i * @as(c_int, @intCast(line_count));
+        // Sized from the text in the font paintMiniWindow draws it in; editor
+        // cell metrics clipped it under a negative linespace or a font
+        // narrower than Consolas. Lines break at '\n' only.
+        var text_utf16: [mini_text_capacity]u16 = undefined;
+        const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
+        const text_size = measureTextPx(main_hwnd, font_px, text_utf16[0..text_utf16_len], 0, mini_draw_flags) orelse
+            TextSizePx{ .w = 0, .h = font_px };
+        const window_width: c_int = @min(max_width_px, @max(app.scalePx(40), text_size.w + 2 * app.scalePx(mini_text_pad_px)));
+        const window_height: c_int = text_size.h;
 
         // Position: right edge of target area, stacking upward from bottom
         const window_x = anchor_x - window_width;
@@ -999,7 +902,9 @@ pub fn updateMiniWindows(app: *App) void {
                 continue;
             }
 
+            app.mu.lockUncancelable(core.clock.io());
             app.mini_windows[idx].hwnd = mini_hwnd;
+            app.mu.unlock(core.clock.io());
             _ = c.SetWindowLongPtrW(mini_hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
 
             if (use_transparency) {
@@ -1036,29 +941,16 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     // which locks grid_mu — calling it during WM_PAINT creates deadlock risk with
     // any core callback that blocks on the UI thread).
     var bg_rgb: c.COLORREF = c.RGB(38, 38, 46); // Default dark background
-    var fg_rgb: c.COLORREF = c.RGB(255, 255, 255); // Default white text
+    var fg_rgb: c.COLORREF = c.RGB(220, 220, 220); // Default light gray text
     {
         app.mu.lockUncancelable(core.clock.io());
         const fg = app.colorscheme_fg;
         const bg = app.colorscheme_bg;
         app.mu.unlock(core.clock.io());
 
-        if (bg != 0xFFFFFFFF and bg != 0) {
-            // Apply brightness adjustment
-            var r = @as(u8, @intCast((bg >> 16) & 0xFF));
-            var g = @as(u8, @intCast((bg >> 8) & 0xFF));
-            var b = @as(u8, @intCast(bg & 0xFF));
-            r = @min(255, @as(u16, r) * 13 / 10 + 12);
-            g = @min(255, @as(u16, g) * 13 / 10 + 12);
-            b = @min(255, @as(u16, b) * 13 / 10 + 12);
-            bg_rgb = c.RGB(r, g, b);
-        }
-        if (fg != 0xFFFFFFFF and fg != 0) {
-            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-            const b = @as(u8, @intCast(fg & 0xFF));
-            fg_rgb = c.RGB(r, g, b);
-        }
+        // 0xFFFFFFFF is the only "unset" value: 0 is a black Normal colour.
+        if (bg != 0xFFFFFFFF) bg_rgb = messageWindowBg(bg);
+        if (fg != 0xFFFFFFFF) fg_rgb = colorrefFromRgb(fg);
     }
 
     // Fill background
@@ -1066,25 +958,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     _ = c.FillRect(hdc, &rect, bg_brush);
     _ = c.DeleteObject(bg_brush);
 
-    // Create font
-    const cell_h = app.cell_h_px;
-    const font_height: c_int = @intCast(cell_h);
-    const hfont = c.CreateFontW(
-        font_height,
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.DEFAULT_QUALITY,
-        c.FIXED_PITCH | c.FF_MODERN,
-        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
-    );
+    const hfont = createPanelFont(@intCast(app.cell_h_px));
     const old_font = c.SelectObject(hdc, hfont);
     defer {
         _ = c.SelectObject(hdc, old_font);
@@ -1092,16 +966,16 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     }
 
     // Set text colors based on message kind
-    const text_color = msg_win.getTextColor();
+    const text_color = msg_win.getTextColor(fg_rgb);
     _ = c.SetTextColor(hdc, text_color);
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
     // Convert text to UTF-16 using proper UTF-8 decoding
-    var text_utf16: [4096]u16 = undefined;
+    var text_utf16: [message_text_capacity]u16 = undefined;
     const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, msg_win.text[0..msg_win.text_len]);
 
     // Draw text with padding
-    const padding: c_int = app.scalePx(12);
+    const padding: c_int = app.scalePx(message_text_pad_px);
     var text_rect = c.RECT{
         .left = rect.left + padding,
         .top = rect.top + padding,
@@ -1111,7 +985,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
 
     // Use different draw flags based on long mode
     const draw_flags: c.UINT = if (msg_win.is_long_mode)
-        c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK
+        wrapped_draw_flags
     else
         c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE;
 
@@ -1133,9 +1007,9 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
 
     // Find which mini window this is
     app.mu.lockUncancelable(core.clock.io());
-    var text_buf: [256]u8 = undefined;
+    var text_buf: [mini_text_capacity]u8 = undefined;
     var text_len: usize = 0;
-    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
         const idx = @intFromEnum(id);
         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
             if (mini_hwnd == hwnd) {
@@ -1159,19 +1033,10 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         const bg = app.colorscheme_bg;
         app.mu.unlock(core.clock.io());
 
-        if (bg != 0xFFFFFFFF and bg != 0) {
-            // Darken background slightly for mini windows
-            const r = @as(u8, @intCast((bg >> 16) & 0xFF)) / 2;
-            const g = @as(u8, @intCast((bg >> 8) & 0xFF)) / 2;
-            const b = @as(u8, @intCast(bg & 0xFF)) / 2;
-            bg_rgb = c.RGB(r, g, b);
-        }
-        if (fg != 0xFFFFFFFF and fg != 0) {
-            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-            const b = @as(u8, @intCast(fg & 0xFF));
-            fg_rgb = c.RGB(r, g, b);
-        }
+        // The Normal pair itself, as macOS's mini: halving the bg left the
+        // Normal fg unreadable on light schemes.
+        if (bg != 0xFFFFFFFF) bg_rgb = colorrefFromRgb(bg);
+        if (fg != 0xFFFFFFFF) fg_rgb = colorrefFromRgb(fg);
     }
 
     // Fill background
@@ -1179,27 +1044,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.FillRect(hdc, &rect, bg_brush);
     _ = c.DeleteObject(bg_brush);
 
-    // Create font at ~75% of the editor cell height so the mini popup is
-    // visibly smaller than the editor and the ext_float window. Matches the
-    // macOS mini font size (cellHeightPt * 0.75). Floor at 11 px for legibility.
-    const cell_h = app.cell_h_px;
-    const font_height: c_int = @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
-    const hfont = c.CreateFontW(
-        font_height,
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.DEFAULT_QUALITY,
-        c.FIXED_PITCH | c.FF_MODERN,
-        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
-    );
+    const hfont = createPanelFont(miniFontPx(app));
     const old_font = c.SelectObject(hdc, hfont);
     defer {
         _ = c.SelectObject(hdc, old_font);
@@ -1213,11 +1058,11 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     // Convert text to UTF-16
     // Decoded, not byte-zero-extended: showmode/showcmd/ruler carry non-ASCII
     // (e.g. "-- 挿入 --"), which zero-extension renders as mojibake.
-    var text_utf16: [256]u16 = undefined;
+    var text_utf16: [mini_text_capacity]u16 = undefined;
     const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
 
     // Draw text centered
-    const mini_pad = app.scalePx(4);
+    const mini_pad = app.scalePx(mini_text_pad_px);
     var text_rect = c.RECT{
         .left = rect.left + mini_pad,
         .top = rect.top,
@@ -1225,9 +1070,65 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         .bottom = rect.bottom,
     };
 
-    // Multi-line: omit DT_SINGLELINE so '\n' breaks lines; DT_VCENTER is unsupported
-    // without DT_SINGLELINE, so use DT_TOP. Keep DT_CENTER for horizontal centering.
-    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, c.DT_CENTER | c.DT_TOP);
+    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, mini_draw_flags);
 
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
+}
+
+test "msg target: a .grid box covers the anchor's cells in surface space" {
+    // The core's anchor for a telescope prompt anchored to the right split.
+    const anchor: app_mod.MsgAnchor = .{
+        .cursor_surface = 1,
+        .anchor_surface = 1,
+        .anchor_grid = 3,
+        .start_row = 0,
+        .start_col = 61,
+        .rows = 40,
+        .cols = 59,
+    };
+
+    // Left sidebar 200px, titlebar-free; client at screen (100, 50), 1400x900.
+    const surface = mainSurfaceRect(.{ .left = 100, .top = 50, .right = 1500, .bottom = 950 }, 200, 0, 0);
+    try std.testing.expectEqual(@as(c_int, 300), surface.left);
+    const r = anchorCellRect(surface, anchor, 10, 20);
+    try std.testing.expectEqual(@as(c_int, 300 + 61 * 10), r.left);
+    try std.testing.expectEqual(@as(c_int, 300 + 120 * 10), r.right);
+    try std.testing.expectEqual(@as(c_int, 50), r.top);
+    try std.testing.expectEqual(@as(c_int, 50 + 40 * 20), r.bottom);
+}
+
+test "msg target: a right sidebar and a titlebar tabline are outside the surface" {
+    const surface = mainSurfaceRect(.{ .left = 0, .top = 0, .right = 1000, .bottom = 800 }, 0, 32, 180);
+    try std.testing.expectEqual(@as(c_int, 820), surface.right);
+    try std.testing.expectEqual(@as(c_int, 32), surface.top);
+    try std.testing.expectEqual(@as(c_int, 800), surface.bottom);
+}
+
+test "message kinds: interactive prompts are dialogs, status kinds are not" {
+    try std.testing.expect(isConfirmKind("confirm"));
+    try std.testing.expect(isConfirmKind("number_prompt"));
+    try std.testing.expect(!isConfirmKind("emsg"));
+    try std.testing.expect(isConfirmKind("confirm_sub"));
+    try std.testing.expect(!isConfirmKind("return_prompt"));
+}
+
+test "message window bg: darker than a light Normal bg, lighter than a dark one" {
+    // #fdf6e3 turned pure white under the old *1.3+12 rule.
+    const light = messageWindowBg(0xfdf6e3);
+    try std.testing.expect(light != c.RGB(255, 255, 255));
+    // COLORREF is 0x00BBGGRR.
+    try std.testing.expect((light & 0xFF) < 0xfd);
+    const dark = messageWindowBg(0x1e1e2e);
+    try std.testing.expect(((dark >> 16) & 0xFF) > 0x2e);
+    // The mini paints the Normal pair itself.
+    try std.testing.expectEqual(c.RGB(0xfa, 0xfa, 0xfa), colorrefFromRgb(0xfafafa));
+}
+
+test "cmdline width: clamped to the work area it is given, other surfaces untouched" {
+    const laptop: c.RECT = .{ .left = 2560, .top = 0, .right = 2560 + 1366, .bottom = 768 };
+    // CMDLINE_SCREEN_MARGIN at 200% DPI.
+    const margin: c_int = 80;
+    try std.testing.expectEqual(1366 - margin, external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 3000, laptop, margin));
+    try std.testing.expectEqual(@as(c_int, 400), external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 400, laptop, margin));
+    try std.testing.expectEqual(@as(c_int, 3000), external_windows.clampCmdlineWidthToWorkArea(app_mod.MESSAGE_GRID_ID, 3000, laptop, margin));
 }

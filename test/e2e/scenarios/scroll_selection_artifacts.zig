@@ -25,6 +25,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.input("5j");
 
     // Verify cursor advanced and content is visible (no crash, grid coherent).
-    const cursor = h.cursor();
-    try std.testing.expect(cursor.row > 0);
+    // Waited for: read at once, the redraw for 5j had not always arrived (CI).
+    try h.waitUntil({}, struct {
+        fn check(_: void, hh: *Harness) bool {
+            return hh.cursor().row == 5;
+        }
+    }.check, h.opts.timeout_ms);
 }

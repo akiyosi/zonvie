@@ -8,9 +8,6 @@ pub const CMDLINE_GRID_ID: i64 = -100;
 /// Reserved grid ID for ext_popupmenu (displayed as external window).
 pub const POPUPMENU_GRID_ID: i64 = -101;
 
-/// Reserved grid ID for ext_tabline (displayed as Chrome-style tabs in titlebar).
-pub const TABLINE_GRID_ID: i64 = -104;
-
 pub const Cell = struct {
     cp: u32,
     hl: u32,
@@ -210,14 +207,12 @@ pub const MAX_TOTAL_GRID_CELLS: usize = 16 * 1024 * 1024;
 // cell and placement budgets.
 pub const MAX_SUBGRIDS: usize = 32 * 1024;
 const MAX_SUBGRID_METADATA_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = 8 * 1024 * 1024;
-const MAIN_SUBGRID_ROW_LAYOUT_BYTES: usize = @sizeOf(i64) + 2 * @sizeOf(u32);
 // Window placements have independent storage even when the peer never creates
 // a backing sub-grid (or creates a zero-cell grid). Bound their maps separately
 // from MAX_TOTAL_GRID_CELLS so hostile win_pos/win_float_pos streams cannot
 // grow placement and external-float scratch state until allocator exhaustion.
-// 64K also keeps every placement-derived scratch list within its share of the
-// core flush path's aggregate 8 MiB external-float budget.
+// flush.zig comptime-asserts this cap against its fixed external-float scratch
+// partitions (3 MiB anchor entries, 2 MiB grid entries).
 pub const MAX_WINDOW_PLACEMENTS: usize = 64 * 1024;
 // Overflow values are inline 15-scalar clusters stored in a hash map. Bound
 // their independent memory footprint even when a hostile peer fills every
@@ -300,6 +295,8 @@ fn utf8TailStart(text: []const u8, requested_start: usize) usize {
     while (start < text.len and text[start] & 0xC0 == 0x80) : (start += 1) {}
     return start;
 }
+
+pub const utf8PrefixLen = @import("frontend_rules.zig").utf8PrefixLen;
 
 fn collectMessageTailRef(
     refs_reversed: *[MAX_MESSAGE_CHUNKS]MessageTailRef,
@@ -446,22 +443,8 @@ pub const Message = struct {
     }
 };
 
-/// State for ext_messages.
-/// Pending message snapshot for sending to frontend (survives msg_clear)
-pub const PendingMessage = struct {
-    kind: [32]u8 = undefined,
-    kind_len: usize = 0,
-    text: [4096]u8 = undefined,
-    text_len: usize = 0,
-    hl_id: u32 = 0,
-    replace_last: bool = false,
-    history: bool = false,
-    append: bool = false,
-    id: i64 = 0,
-};
-
 /// Singleton confirm message (noice.nvim pattern: confirm lifecycle = cmdline lifecycle).
-/// Zero-alloc: fixed-size buffers matching PendingMessage pattern.
+/// Zero-alloc: fixed-size buffers.
 pub const ConfirmMessage = struct {
     kind: [32]u8 = undefined,
     kind_len: usize = 0,
@@ -470,20 +453,25 @@ pub const ConfirmMessage = struct {
     hl_id: u32 = 0,
     id: i64 = 0,
     active: bool = false,
+    /// A character did not fit: later text must not land after the gap.
+    text_full: bool = false,
 
     pub fn clear(self: *ConfirmMessage) void {
         self.active = false;
         self.kind_len = 0;
         self.text_len = 0;
+        self.text_full = false;
         self.hl_id = 0;
         self.id = 0;
     }
 
     /// Append text to existing confirm message (for append semantics).
     pub fn appendText(self: *ConfirmMessage, text: []const u8) void {
-        const copy_len = @min(text.len, self.text.len - self.text_len);
+        if (self.text_full) return;
+        const copy_len = utf8PrefixLen(text, self.text.len - self.text_len);
         @memcpy(self.text[self.text_len..][0..copy_len], text[0..copy_len]);
         self.text_len += copy_len;
+        if (copy_len < text.len) self.text_full = true;
     }
 };
 
@@ -510,13 +498,10 @@ pub const StatusChannel = enum(u2) {
 /// negative moves it down, and a shift at or past the region height blanks the
 /// whole rectangle. Callers pre-clamp the bounds.
 ///
-/// Only the cells are shared between GridBuf.scroll and Grid.scroll. Dirty
-/// marking stays with each caller: the main grid is excluded from the
-/// frontend's row-slot remap (see checkScrollFastPath) so it must repaint the
-/// whole region, while the sub-grid path gets that remap and repaints only the
-/// vacated band -- and, having done so, must shift its vertex-row ledger
-/// itself. Unifying either of those here would silently swap one contract for
-/// the other.
+/// Dirty marking stays with each caller: dispatchGridRowScroll skips grid 1, so
+/// the main grid repaints the whole region, while a sub-grid gets the
+/// frontend's row-slot remap, repaints only the vacated band, and shifts its
+/// own vertex-row ledger.
 fn scrollCells(
     cells: []Cell,
     stride: u32,
@@ -583,7 +568,8 @@ fn scrollCells(
 /// `rows` is negated when negative, except that `minInt(i32)` has no positive
 /// counterpart -- negating it overflows -- so it reports `height`, the
 /// smallest value that still satisfies every caller's `shift >= height` test
-/// and sends them down the clear-the-whole-region path.
+/// and sends them down the clear-the-whole-region path. scrollGrid clamps the
+/// delta to the region height first, so the redraw path never reaches that arm.
 fn scrollShift(rows: i32, height: u32) u32 {
     if (rows == std.math.minInt(i32)) return height;
     const a: i32 = if (rows < 0) -rows else rows;
@@ -594,7 +580,6 @@ pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .empty,
     /// Indexed by StatusChannel.
     status_content: [StatusChannel.all.len]std.ArrayListUnmanaged(MsgChunk) = @splat(.empty),
-    visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
     /// Singleton confirm message (separated from messages list per noice.nvim pattern)
@@ -607,10 +592,6 @@ pub const MessageState = struct {
     msg_cleared_in_batch: bool = false,
     /// Dirty flags for the status channels, indexed by StatusChannel.
     status_dirty: [StatusChannel.all.len]bool = @splat(false),
-    /// Pending msg_show events that need to be sent to frontend.
-    /// These survive msg_clear within the same redraw frame.
-    pending_messages: [8]PendingMessage = undefined,
-    pending_count: usize = 0,
 
     pub fn deinit(self: *MessageState, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*msg| {
@@ -635,7 +616,6 @@ pub const MessageState = struct {
             msg.deinit(alloc);
         }
         self.messages.clearRetainingCapacity();
-        self.visible = false;
     }
 
     fn evictOldestMessages(self: *MessageState, alloc: std.mem.Allocator, requested: usize) void {
@@ -667,7 +647,6 @@ pub const MessageState = struct {
         }
 
         self.confirm_msg.clear();
-        self.visible = false;
         self.msg_dirty = false;
         self.status_dirty = @splat(false);
     }
@@ -725,6 +704,8 @@ pub const PopupmenuItem = struct {
 pub const PopupmenuState = struct {
     items: std.ArrayListUnmanaged(PopupmenuItem) = .empty,
     selected: i32 = -1,
+    /// First item shown; kept across selections like Neovim's pum_first.
+    first: u32 = 0,
     row: i32 = 0,
     col: i32 = 0,
     grid_id: i64 = 1,
@@ -751,6 +732,7 @@ pub const PopupmenuState = struct {
         }
         self.items.clearRetainingCapacity();
         self.selected = -1;
+        self.first = 0;
         self.row = 0;
         self.col = 0;
         self.grid_id = 1;
@@ -833,14 +815,31 @@ pub const GridBuf = struct {
     rows: u32 = 0,
     cols: u32 = 0,
     cells: []Cell = &[_]Cell{},
-    dirty: bool = true, // Dirty flag for external grid vertex updates
+    // Set whenever dirty_all or a dirty_rows bit is set (and also by a
+    // zero-cell resize, which sets no bit); anyDirty() is the row test.
+    dirty: bool = true,
     dirty_rows: std.DynamicBitSetUnmanaged = .{}, // Row-level dirty tracking for partial updates
+    // Dominates dirty_rows: when set, every row in [0, rows) is dirty and the
+    // per-row bits are not maintained. Only clearDirtyContent() clears it.
+    dirty_all: bool = true,
+    // What the open flush consumed from this grid. A refusal hands it back
+    // (returnOwed), a commit drops it (commitOwed). Sized with dirty_rows so
+    // folding it in never allocates.
+    owed_rows: std.DynamicBitSetUnmanaged = .{},
+    owed_all: bool = false,
+    owed: bool = false,
     last_scroll_op: ?ScrollDelta = null, // Per-GridBuf scroll tracking for on_grid_row_scroll
+    /// For a surface root: whether the last flush generated its rows with
+    /// the default-background runs dropped (blur + the surface hosting a
+    /// layer). See regenerateRootsWhoseDefaultBgRuleFlipped.
+    skip_default_bg_last: bool = false,
     scroll_notify_pending: bool = false, // Independent of row-shift provenance; survives a pre-dispatch flush abort
     scroll_notify_rows: i32 = 0, // Signed rows accumulated for the pending notification; one event can cover several scrolls
     row_scroll_notify_pending: bool = false, // Consumed separately from on_grid_scroll notification delivery
     scroll_fast_path_blocked: bool = false, // True when multiple scrolls in same batch
-    prev_cursor_row: ?u32 = null, // Previous cursor row (grid-relative) for erasing old cursor
+    /// The frontend was sent this scroll's row shift (dispatchGridRowScroll),
+    /// so it holds the surviving rows and needs only the vacated ones.
+    row_shift_sent: bool = false,
     // Last submitted main-layer vertex count per row. Rendering uses this to
     // enforce actual-output budgets without rescanning every retained row.
     vertex_row_counts: []usize = &[_]usize{},
@@ -848,9 +847,16 @@ pub const GridBuf = struct {
     vertex_row_ledger_valid: bool = true,
     vertex_budget_touched: bool = false,
     vertex_budget_touched_next: ?i64 = null,
+    /// Reshaped since the open vertex-budget transaction began, and the
+    /// vertex count the frontend's committed frame still holds for it. A
+    /// refusal restores that count; the rows no longer line up, so the ledger
+    /// is invalid and the grid is resent whole.
+    reshaped_in_txn: bool = false,
+    reshaped_from_vertex_count: usize = 0,
 
     fn deinit(self: *GridBuf, alloc: std.mem.Allocator) void {
         self.dirty_rows.deinit(alloc);
+        self.owed_rows.deinit(alloc);
         if (self.cells.len != 0) alloc.free(self.cells);
         if (self.vertex_row_counts.len != 0) alloc.free(self.vertex_row_counts);
         self.cells = &[_]Cell{};
@@ -861,6 +867,7 @@ pub const GridBuf = struct {
         self.vertex_budget_touched_next = null;
         self.rows = 0;
         self.cols = 0;
+        self.dirty_all = true;
     }
 
     fn resize(self: *GridBuf, alloc: std.mem.Allocator, rows: u32, cols: u32) !void {
@@ -886,12 +893,15 @@ pub const GridBuf = struct {
         // previous GridBuf in full.
         //
         // Note this leaves `bit_length` at 0 while `rows` is whatever was
-        // asked for, so `bit_length >= rows` is NOT an invariant here the way
-        // it is on Grid (see Grid.ensureDirtyCapacity). Anything reading
-        // `dirty_rows` off a GridBuf has to check `bit_length` first.
+        // asked for, so `bit_length >= rows` is NOT an invariant. Never index
+        // `dirty_rows` directly: isRowDirty / markDirtyRow / markDirtyRect
+        // bounds-check against `bit_length`.
         var new_dirty_rows: std.DynamicBitSetUnmanaged = .{};
         errdefer new_dirty_rows.deinit(alloc);
         if (new_len != 0) try new_dirty_rows.resize(alloc, rows, true);
+        var new_owed_rows: std.DynamicBitSetUnmanaged = .{};
+        errdefer new_owed_rows.deinit(alloc);
+        if (new_len != 0) try new_owed_rows.resize(alloc, rows, false);
 
         const min_rows = @min(self.rows, rows);
         const min_cols = @min(self.cols, cols);
@@ -906,12 +916,21 @@ pub const GridBuf = struct {
             }
         }
 
+        if (!self.reshaped_in_txn) {
+            self.reshaped_in_txn = true;
+            self.reshaped_from_vertex_count = self.surface_vertex_count;
+        }
         if (self.cells.len != 0) alloc.free(self.cells);
         if (self.vertex_row_counts.len != 0) alloc.free(self.vertex_row_counts);
         self.dirty_rows.deinit(alloc);
+        self.owed_rows.deinit(alloc);
         self.cells = new_cells;
         self.vertex_row_counts = new_vertex_row_counts;
         self.dirty_rows = new_dirty_rows;
+        // Rows owed under the old shape do not line up with the new one; the
+        // whole grid is dirty now, so a refusal owes it whole.
+        self.owed_rows = new_owed_rows;
+        if (self.owed) self.owed_all = true;
         self.surface_vertex_count = 0;
         self.vertex_row_ledger_valid = true;
         self.vertex_budget_touched = false;
@@ -919,76 +938,70 @@ pub const GridBuf = struct {
         self.rows = rows;
         self.cols = cols;
         self.dirty = true;
-
-        const dirty_end = @min(rows, self.dirty_rows.bit_length);
-        self.dirty_rows.setRangeValue(.{ .start = 0, .end = dirty_end }, true);
+        // dirty_all covers rows the fresh bitset may not: a zero-cell shape
+        // allocates none.
+        self.dirty_all = true;
+        // Every row is resent, so a shift in the same batch saves nothing, and
+        // a frontend that has not grown its row slots yet cannot stage it.
+        self.scroll_fast_path_blocked = true;
     }
 
     fn clear(self: *GridBuf) void {
         @memset(self.cells, .{ .cp = ' ', .hl = 0 });
         self.dirty = true;
-        // Mark all rows as dirty
-        if (self.dirty_rows.bit_length > 0) {
-            self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, true);
-        }
+        self.dirty_all = true;
     }
 
-    /// Returns true if the cell was actually changed.
+    /// Returns true if the cell was actually changed. Outside
+    /// [0, rows) x [0, cols) it writes nothing and returns false; never clamps.
     fn putCell(self: *GridBuf, row: u32, col: u32, cp: u32, hl: u32) bool {
         if (row >= self.rows or col >= self.cols) return false;
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
 
-        // Skip if no change (same optimization as global Grid.putCell)
         const old = self.cells[idx];
         if (old.cp == cp and old.hl == hl) return false;
 
         self.cells[idx] = .{ .cp = cp, .hl = hl };
         self.dirty = true;
-        // Mark this row as dirty for partial updates
-        if (self.dirty_rows.bit_length > row) {
-            self.dirty_rows.set(row);
-        }
+        self.markDirtyRow(row);
         return true;
     }
 
-    fn getCellHL(self: *const GridBuf, row: u32, col: u32) u32 {
-        if (row >= self.rows or col >= self.cols) return 0;
+    /// Outside [0, rows) x [0, cols) returns `{cp=0, hl=0}`, which is
+    /// indistinguishable from a stored U+0000; bounds-check first when that
+    /// matters.
+    fn getCell(self: *const GridBuf, row: u32, col: u32) Cell {
+        if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx].hl;
+        return self.cells[idx];
     }
 
     /// Implements the "grid_scroll" UI event for a sub-grid.
     /// Note: 'cols' is reserved (currently always 0 in Nvim) and is ignored.
+    /// Precondition: the region and delta are normalised (scrollGrid), and no
+    /// flush bracket is open, so `owed_rows` need not move with the cells.
     fn scroll(
         self: *GridBuf,
-        top_in: u32,
-        bot_in: u32,
-        left_in: u32,
-        right_in: u32,
+        top: u32,
+        bot: u32,
+        left: u32,
+        right: u32,
         rows: i32,
         cols: i32,
     ) void {
         _ = cols;
-
-        if (self.rows == 0 or self.cols == 0) return;
-        if (rows == 0) return;
-
-        // Safety check: ensure cells buffer is correctly sized
-        const expected_len: usize = @as(usize, self.rows) * @as(usize, self.cols);
-        if (self.cells.len < expected_len) return;
-
-        const top: u32 = if (top_in > self.rows) self.rows else top_in;
-        const bot: u32 = if (bot_in > self.rows) self.rows else bot_in;
-        const left: u32 = if (left_in > self.cols) self.cols else left_in;
-        const right: u32 = if (right_in > self.cols) self.cols else right_in;
-        if (top >= bot or left >= right) return;
+        std.debug.assert(!self.owed);
+        std.debug.assert(rows != 0);
+        std.debug.assert(top < bot and bot <= self.rows);
+        std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(self.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;
         const shift: u32 = scrollShift(rows, height);
 
-        // Keep the last-submitted vertex ledger aligned with the frontend's
-        // row-slot scroll. This is allocation-free and touches only the same
-        // row interval already being moved below.
+        // The ledger follows the core's cells, not the frontend's row slots:
+        // a scroll the frontend does not shift (partial width, more than half
+        // the region) makes the flush regenerate every row, which rewrites it.
         if (self.vertex_row_ledger_valid and self.vertex_row_counts.len >= self.rows) {
             if (shift >= height) {
                 for (top..bot) |row| {
@@ -1024,37 +1037,49 @@ pub const GridBuf = struct {
             // row dirty here too, or these blanked cells never reach the
             // frontend and the GPU-side region keeps its stale pre-scroll
             // content forever (core and GPU permanently disagree).
-            var rr: u32 = top;
-            while (rr < bot) : (rr += 1) {
-                if (rr < self.dirty_rows.bit_length) self.dirty_rows.set(rr);
-            }
+            self.markDirtyRect(top, bot);
             self.dirty = true;
             return;
         }
 
         scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
-        // Mark only vacated rows as dirty — non-vacated rows are just shifted
-        // and the frontend's row slot remapping handles the visual shift.
-        // grid_line events will mark truly-changed rows dirty separately.
-        if (self.dirty_rows.bit_length > 0) {
+        // Move the dirty marks with the cells they describe: a mark left behind
+        // regenerates the wrong row once two scrolls accumulate in one batch.
+        if (!self.dirty_all and self.dirty_rows.bit_length > 0) {
+            const bits = self.dirty_rows.bit_length;
             if (rows > 0) {
-                // Scroll up: vacated band is [bot-shift, bot)
-                var rr: u32 = bot - shift;
-                while (rr < bot) : (rr += 1) {
-                    if (rr < self.dirty_rows.bit_length) {
-                        self.dirty_rows.set(rr);
+                var r: u32 = top;
+                while (r + shift < bot) : (r += 1) {
+                    if (r >= bits) break;
+                    const src = r + shift;
+                    if (src < bits and self.dirty_rows.isSet(src)) {
+                        self.dirty_rows.set(r);
+                    } else {
+                        self.dirty_rows.unset(r);
                     }
                 }
             } else {
-                // Scroll down: vacated band is [top, top+shift)
-                var rr: u32 = top;
-                while (rr < top + shift) : (rr += 1) {
-                    if (rr < self.dirty_rows.bit_length) {
-                        self.dirty_rows.set(rr);
+                var r: u32 = bot;
+                while (r > top + shift) {
+                    r -= 1;
+                    if (r >= bits) continue;
+                    const src = r - shift;
+                    if (src < bits and self.dirty_rows.isSet(src)) {
+                        self.dirty_rows.set(r);
+                    } else {
+                        self.dirty_rows.unset(r);
                     }
                 }
             }
+        }
+
+        // Only the vacated band: the frontend's row-slot remap moves the rest,
+        // and grid_line marks whatever really changed.
+        if (rows > 0) {
+            self.markDirtyRect(bot - shift, bot);
+        } else {
+            self.markDirtyRect(top, top + shift);
         }
         self.dirty = true;
     }
@@ -1063,35 +1088,107 @@ pub const GridBuf = struct {
     /// committed separately after on_flush_end accepts the whole transaction.
     pub fn clearDirtyContent(self: *GridBuf) void {
         self.dirty = false;
+        self.dirty_all = false;
         if (self.dirty_rows.bit_length > 0) {
             self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, false);
         }
+    }
+
+    /// Clear the dirty state a flush is sending, remembering it as owed until
+    /// the bracket commits. `sent_all`: the pass regenerated every row
+    /// regardless of the bits (a scroll it could not shift, an atlas retry).
+    pub fn consumeDirtyForSend(self: *GridBuf, sent_all: bool) void {
+        if (self.dirty) self.owed = true;
+        if (self.dirty_all or sent_all) {
+            self.owed = true;
+            self.owed_all = true;
+        } else {
+            // resize sizes both bitsets together.
+            std.debug.assert(self.owed_rows.bit_length == self.dirty_rows.bit_length);
+            self.owed_rows.setUnion(self.dirty_rows);
+        }
+        self.clearDirtyContent();
+    }
+
+    /// The bracket committed: what it sent is on screen.
+    pub fn commitOwed(self: *GridBuf) void {
+        if (!self.owed) return;
+        self.owed = false;
+        self.owed_all = false;
+        if (self.owed_rows.bit_length > 0) self.owed_rows.unsetAll();
+    }
+
+    /// The bracket was refused: everything it sent is dirty again, on top of
+    /// whatever changed after it was sent.
+    pub fn returnOwed(self: *GridBuf) void {
+        if (!self.owed) return;
+        self.dirty = true;
+        if (self.owed_all) {
+            self.dirty_all = true;
+        } else {
+            std.debug.assert(self.owed_rows.bit_length == self.dirty_rows.bit_length);
+            self.dirty_rows.setUnion(self.owed_rows);
+        }
+        self.commitOwed();
     }
 
     pub fn clearScrollState(self: *GridBuf) void {
         self.last_scroll_op = null;
         self.row_scroll_notify_pending = false;
         self.scroll_fast_path_blocked = false;
-        self.prev_cursor_row = null;
+        self.row_shift_sent = false;
     }
 
     /// Clear all state after a non-transactional caller has consumed it.
+    /// Precondition: no flush bracket is open, or its owed rows would be lost.
     pub fn clearDirty(self: *GridBuf) void {
+        std.debug.assert(!self.owed);
         self.clearDirtyContent();
         self.clearScrollState();
     }
 
-    /// Mark the entire sub-grid dirty: every row must be regenerated.
-    /// Used by atlas-reset recovery paths where per-row UV invalidation
-    /// cannot be attributed to specific rows. Mirrors the dirty-marking
-    /// half of clear() (grid.zig `clear()`), without touching cell contents.
-    /// No allocation: dirty_rows capacity is already sized to `rows` by
-    /// resize(), so this is a pure bit-flip.
+    /// Mark every row dirty without touching cell contents. Used by atlas-reset
+    /// recovery, where per-row UV invalidation cannot be attributed to rows.
+    /// O(1): dirty_all dominates, so the bitset is left alone.
     pub fn markAllDirty(self: *GridBuf) void {
         self.dirty = true;
-        if (self.dirty_rows.bit_length > 0) {
-            self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, true);
-        }
+        self.dirty_all = true;
+    }
+
+    /// True when `row` must be regenerated. This is the ONLY supported way to
+    /// read per-row dirtiness off a GridBuf: dirty_all dominates, and the
+    /// bitset may be shorter than `rows` (or absent) for a zero-cell shape.
+    pub fn isRowDirty(self: *const GridBuf, row: u32) bool {
+        if (row >= self.rows) return false;
+        if (self.dirty_all) return true;
+        const r: usize = @as(usize, row);
+        if (r >= self.dirty_rows.bit_length) return false;
+        return self.dirty_rows.isSet(r);
+    }
+
+    pub fn anyDirty(self: *const GridBuf) bool {
+        if (self.dirty_all) return self.rows != 0;
+        if (self.dirty_rows.bit_length == 0) return false;
+        return self.dirty_rows.count() != 0;
+    }
+
+    pub fn markDirtyRow(self: *GridBuf, row: u32) void {
+        if (row >= self.rows) return;
+        if (self.dirty_all) return;
+        const r: usize = @as(usize, row);
+        if (r >= self.dirty_rows.bit_length) return;
+        self.dirty = true;
+        self.dirty_rows.set(r);
+    }
+
+    /// Mark [top, bot) dirty, clamped to `rows` and to the bitset length.
+    pub fn markDirtyRect(self: *GridBuf, top: u32, bot: u32) void {
+        if (self.dirty_all) return;
+        const start: usize = @as(usize, top);
+        const end: usize = @min(@as(usize, @min(bot, self.rows)), self.dirty_rows.bit_length);
+        if (start >= end) return;
+        self.dirty = true;
+        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
     }
 };
 
@@ -1107,25 +1204,35 @@ comptime {
 }
 
 pub const GridPos = struct {
+    /// In the cells of the surface that places this grid (surfaceForGrid of
+    /// its anchor): grid 1's for the main window, the root's own for an
+    /// external window.
     row: u32,
     col: u32,
     anchor_grid: i64 = 1, // which grid this float is anchored to (1 = global grid)
-    follows_scroll: bool = false, // float has been repositioned (row changed) after creation
+    /// Whether this float tracks the buffer, so a frontend may shift its pixels
+    /// with the parent's smooth scroll: relative='win' with a bufpos, as
+    /// nvim_win_get_config reports it (float_follows). False until the answer
+    /// arrives, which never drags a float that does not follow.
+    follows_scroll: bool = false,
+    /// win_float_pos' mouse_enabled. A float that refuses mouse input must not
+    /// win a frontend hit test: Neovim rejects an event addressed to it and
+    /// does NOT retry against what is behind it, so picking it swallows the
+    /// click instead of passing it through. Splits are always true.
+    mouse_enabled: bool = true,
+    /// Set for a float placed from its anchor in an external window's cells
+    /// (resolveAnchoredFloat). Neovim does not resend win_float_pos when the
+    /// window it is anchored in resizes, so the position is resolved again
+    /// from this against the window's new size.
+    anchor: ?FloatAnchor = null,
 };
 
-const LayoutAccounting = struct {
-    refs: usize = 0,
-    layouts: usize = 0,
-};
-
-const LayoutProspective = struct {
-    target_grid: ?i64 = null,
-    position_set: bool = false,
-    position: ?GridPos = null,
-    external: ?bool = null,
-    rows: ?u32 = null,
-    cols: ?u32 = null,
-    main_rows: ?u32 = null,
+/// win_float_pos' anchor corner and offset, in the anchor grid's cells.
+pub const FloatAnchor = struct {
+    south: bool,
+    east: bool,
+    row: i64,
+    col: i64,
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -1134,6 +1241,8 @@ pub const ExternalGridInfo = struct {
     start_row: i32, // -1 if no position info available
     start_col: i32,
 };
+
+pub const SurfacePlacement = struct { surface: i64, row: i64, col: i64 };
 
 /// Pending grid resize request from ext_windows win_resize event.
 pub const PendingGridResize = struct {
@@ -1168,9 +1277,6 @@ pub const WinLayer = struct {
     // Tie-breaker when zindex/compindex are equal.
     // Larger order means "draw later" (= front).
     order: u64 = 0,
-    // Coverage invalidation is needed once per top-level redraw notification,
-    // while order above still advances for every grid_line tuple.
-    coverage_dirty_epoch: u64 = 0,
 };
 
 /// Viewport margins from win_viewport_margins event.
@@ -1209,60 +1315,15 @@ pub const Viewport = struct {
     scroll_covered: bool = false,
 };
 
-/// Describes a pending grid_scroll operation preserved until flush.
-/// Used by scroll-aware flush to determine whether row cache can be reused
-/// instead of recomposing all dirty rows.
-pub const ScrollOp = struct {
-    grid_id: i64,
-    top: u32,
-    bot: u32,
-    left: u32,
-    right: u32,
-    rows: i32, // positive = scroll up (content moves up), negative = scroll down
-    cols: i32,
-    /// Grid dimensions at scroll time (target grid, not necessarily global grid)
-    target_rows: u32,
-    target_cols: u32,
-    /// Global grid row offset from win_pos (0 if grid_id == 1)
-    win_pos_row: u32,
-};
-
-/// Main-grid dirty state remembered across one flush attempt, so a frontend
-/// rejection can restore exactly what that flush consumed.
-pub const DirtySnapshot = struct {
-    dirty_all: bool = false,
-    rows: std.DynamicBitSetUnmanaged = .{},
-
-    pub fn deinit(self: *DirtySnapshot, alloc: std.mem.Allocator) void {
-        self.rows.deinit(alloc);
-        self.rows = .{};
-    }
-};
-
 pub const Grid = struct {
-    // Capacity of scroll_touched_rows below (declarations cannot be
-    // interspersed between container fields, so this lives at the top of
-    // the struct). flush.zig's regen_rows array has a comptime assertion
-    // tying its size to this constant plus margin for cursor-row appends.
-    pub const SCROLL_TOUCHED_ROWS_CAP: usize = 32;
-
     alloc: std.mem.Allocator,
 
-    content_rev: u64 = 0, // cells / layering / resize / scroll etc
-    // Materialized main row-index semantics: placement coverage and layer
-    // order. Zero is reserved so wrap can reset per-layer epoch stamps.
-    layout_generation: u64 = 1,
     // Completed vertex count across standalone subgrid surfaces. Membership,
     // resize, and row replacement update this incrementally so flush begin
-    // never rescans every external grid after a layout generation change.
+    // never rescans every external grid after a layout change.
     subgrid_surface_vertex_count: usize = 0,
-    main_row_index_ref_count: usize = 0,
-    main_row_index_layout_count: usize = 0,
-    row_index_budget_enabled: bool = false,
-    redraw_epoch: u64 = 1,
-    redraw_epoch_override: ?u64 = null,
     // Monotonic revision of the visible glyph working set across every
-    // surface. Unlike content_rev, this includes external-only grids. It is
+    // surface, external-only grids included. It is
     // used only to retry atlas-capacity negative entries after content or
     // visibility really changes; dirty invalidation itself must not bump it.
     glyph_working_set_rev: u64 = 0,
@@ -1281,11 +1342,16 @@ pub const Grid = struct {
     // cmdline grid, so it derives this from the main window width. 0 = fall
     // back to the main grid's cols.
     cmdline_default_cols: u32 = 0,
-    // Dirty tracking (global grid only)
-    dirty_all: bool = true,
-    dirty_rows: std.DynamicBitSetUnmanaged = .{},
+    /// Grid 1's cells, dirty state and vertex ledger, in the same container
+    /// every sub-grid uses. `rows`/`cols` above mirror it, and Grid.resize is
+    /// the only writer of either.
+    main_buf: GridBuf = .{},
 
-    cells: []Cell = &[_]Cell{},
+    /// Grids Neovim destroyed since the last successful flush, drained into
+    /// on_grid_destroy. Best effort: on allocation failure the id is dropped
+    /// and the frontend just keeps the buffers.
+    destroyed_pending: std.ArrayListUnmanaged(i64) = .empty,
+
     // O(1) aggregate allocation budget accounting for cells plus every
     // sub-grid. Updated only after a resize/destroy transaction commits.
     total_grid_cells: usize = 0,
@@ -1316,6 +1382,12 @@ pub const Grid = struct {
     // grid_id -> Neovim window handle (from win_pos/win_float_pos/win_external_pos events)
     grid_win_ids: std.AutoHashMapUnmanaged(i64, i64) = .{},
 
+    // Window handle -> whether that float follows the buffer (see
+    // GridPos.follows_scroll). The UI protocol does not say; the core asks
+    // Neovim once per window, for the windows queued in float_config_wanted.
+    float_follows: std.AutoHashMapUnmanaged(i64, bool) = .{},
+    float_config_wanted: std.ArrayListUnmanaged(i64) = .empty,
+
     grid_metrics: std.AutoHashMapUnmanaged(i64, CellMetricsPx) = .{},
 
     // Viewport info per grid (from win_viewport / win_viewport_margins)
@@ -1342,6 +1414,9 @@ pub const Grid = struct {
     /// Current mode name (e.g., "normal", "insert", "terminal")
     /// Fixed-size buffer to avoid allocation; null-terminated.
     current_mode_name: [16]u8 = [_]u8{0} ** 16,
+    /// A msg_showmode arrived since the last flush event (mode_change clears
+    /// showmode on leaving insert only when none did).
+    showmode_set_since_flush: bool = false,
 
     win_layer: std.AutoHashMapUnmanaged(i64, WinLayer) = .{},
 
@@ -1372,11 +1447,6 @@ pub const Grid = struct {
     // Only removed on win_close (permanent close).
     ext_windows_grids: std.AutoHashMapUnmanaged(i64, i64) = .{}, // grid_id -> win_id
 
-    // ext_windows: actual grid dimensions for each external grid.
-    // Updated on grid_resize so NDC viewport always matches the grid data.
-    // Also set initially by tryResizeGrid for new windows.
-    external_grid_target_sizes: std.AutoHashMapUnmanaged(i64, GridSize) = .{},
-
     // ext_windows: set during handleRedraw when a composited (non-external,
     // non-float) editor window receives win_close. Used by the promotion
     // logic in rpc_session.zig to detect that Neovim may have re-composited
@@ -1402,42 +1472,11 @@ pub const Grid = struct {
     // Track grid_ids that received grid_scroll events (for frontend pixel offset clearing)
     scrolled_grid_ids: [16]i64 = [_]i64{0} ** 16,
     scrolled_grid_count: u8 = 0,
-    main_scroll_notify_pending: bool = false,
-    main_scroll_notify_rows: i32 = 0,
     // More than 16 distinct grids can scroll in one redraw batch (many
     // external windows/floats). In that case flush derives the complete set
     // from the allocation-free per-grid scroll_notify_pending bits instead of
     // silently dropping callbacks.
     scrolled_grid_overflow: bool = false,
-
-    // Pending scroll operation for scroll-aware flush optimization.
-    // Set by scrollGrid(), consumed by flush, and cleared at transaction end.
-    // When present, flush can potentially reuse row cache instead of recomposing all rows.
-    // A second grid_scroll in the same batch disables fast path for that flush.
-    pending_scroll: ?ScrollOp = null,
-
-    // True when this batch observed multiple grid_scroll events and must not use
-    // the scroll fast path. Cleared after flush via clearScrollState().
-    scroll_fast_path_blocked: bool = false,
-
-    // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
-    // These are global grid coordinates (already offset by win_pos for sub-grids).
-    // Tracked as a fixed-size array to avoid allocation.  Capacity covers
-    // high-speed mouse wheel batches (e.g. 10 grid_scroll × 3 grid_line rows).
-    // Overflow blocks fast path but preserves pending_scroll for delta accumulation.
-    // NOTE: flush.zig's regen_rows array has a comptime assertion tying its size
-    // to SCROLL_TOUCHED_ROWS_CAP (declared above, near the top of this struct)
-    // plus margin for cursor-row appends — if you raise this, that assertion
-    // will fail to compile until regen_rows is resized too.
-    scroll_touched_rows: [SCROLL_TOUCHED_ROWS_CAP]u32 = undefined,
-    scroll_touched_count: u8 = 0,
-
-    // Previous cursor row before grid_cursor_goto update.
-    // Stored as global grid coordinate (offset by win_pos for sub-grid cursors).
-    // Used by scroll-aware flush to know which rows need cursor redraw.
-    // Set by setCursor(), cleared by clearScrollState().
-    prev_cursor_row: ?u32 = null,
-    prev_cursor_grid: ?i64 = null,
 
     // Input trace markers for end-to-end perf logging.
     input_trace_seq: u64 = 0,
@@ -1449,156 +1488,17 @@ pub const Grid = struct {
         return .{ .alloc = alloc };
     }
 
-    pub fn beginRedrawBatch(self: *Grid) u64 {
-        self.redraw_epoch +%= 1;
-        if (self.redraw_epoch == 0) {
-            self.redraw_epoch = 1;
-            var layer_it = self.win_layer.valueIterator();
-            while (layer_it.next()) |layer| layer.coverage_dirty_epoch = 0;
-        }
-        return self.redraw_epoch;
-    }
-
-    fn advanceLayoutGeneration(self: *Grid) void {
-        self.layout_generation +%= 1;
-        if (self.layout_generation == 0) self.layout_generation = 1;
-    }
-
     fn invalidateSubgridVertexSurface(self: *Grid, grid_id: i64) void {
         const sg = self.sub_grids.getPtr(grid_id) orelse return;
         self.subgrid_surface_vertex_count -|= sg.surface_vertex_count;
         sg.surface_vertex_count = 0;
         sg.vertex_row_ledger_valid = false;
-    }
-
-    pub fn setRowIndexBudgetEnabled(self: *Grid, enabled: bool) void {
-        self.row_index_budget_enabled = enabled;
-    }
-
-    fn mainRowIndexByteSize(rows: u32, refs: usize, layouts: usize) ?usize {
-        const row_count: usize = rows;
-        const offset_count = std.math.add(usize, row_count, 1) catch return null;
-        const row_slots = std.math.add(usize, offset_count, row_count) catch return null;
-        const usize_count = std.math.add(usize, row_slots, refs) catch return null;
-        const usize_bytes = std.math.mul(usize, usize_count, @sizeOf(usize)) catch return null;
-        const layout_bytes = std.math.mul(usize, layouts, MAIN_SUBGRID_ROW_LAYOUT_BYTES) catch return null;
-        return std.math.add(usize, usize_bytes, layout_bytes) catch null;
-    }
-
-    fn prospectiveExternal(self: *const Grid, grid_id: i64, prospective: LayoutProspective) bool {
-        if (prospective.target_grid == grid_id) {
-            if (prospective.external) |external| return external;
-        }
-        return self.external_grids.contains(grid_id);
-    }
-
-    fn prospectiveGridSize(self: *const Grid, grid_id: i64, prospective: LayoutProspective) ?GridSize {
-        if (prospective.target_grid == grid_id and (prospective.rows != null or prospective.cols != null)) {
-            const current = self.sub_grids.get(grid_id);
-            return .{
-                .rows = prospective.rows orelse if (current) |sg| sg.rows else 0,
-                .cols = prospective.cols orelse if (current) |sg| sg.cols else 0,
-            };
-        }
-        const sg = self.sub_grids.get(grid_id) orelse return null;
-        return .{ .rows = sg.rows, .cols = sg.cols };
-    }
-
-    fn layoutContribution(
-        self: *const Grid,
-        grid_id: i64,
-        pos: GridPos,
-        prospective: LayoutProspective,
-    ) LayoutAccounting {
-        if (grid_id == 1 or self.prospectiveExternal(grid_id, prospective)) return .{};
-        if (self.prospectiveExternal(pos.anchor_grid, prospective)) return .{};
-        const size = self.prospectiveGridSize(grid_id, prospective) orelse return .{};
-        if (size.rows == 0 or size.cols == 0) return .{};
-        const main_rows = prospective.main_rows orelse self.rows;
-        const start: usize = @min(@as(usize, pos.row), @as(usize, main_rows));
-        const end: usize = @min(@as(usize, pos.row +| size.rows), @as(usize, main_rows));
-        if (start >= end) return .{};
-        return .{ .refs = end - start, .layouts = 1 };
-    }
-
-    fn computeLayoutAccounting(self: *const Grid, prospective: LayoutProspective) !LayoutAccounting {
-        var accounting = LayoutAccounting{};
-        var saw_target = false;
-        var it = self.win_pos.iterator();
-        while (it.next()) |entry| {
-            const grid_id = entry.key_ptr.*;
-            var pos = entry.value_ptr.*;
-            if (prospective.target_grid == grid_id and prospective.position_set) {
-                saw_target = true;
-                pos = prospective.position orelse continue;
-            } else if (prospective.target_grid == grid_id) {
-                saw_target = true;
-            }
-            const contribution = self.layoutContribution(grid_id, pos, prospective);
-            accounting.refs = std.math.add(usize, accounting.refs, contribution.refs) catch
-                return error.LayoutTooComplex;
-            accounting.layouts = std.math.add(usize, accounting.layouts, contribution.layouts) catch
-                return error.LayoutTooComplex;
-        }
-        if (prospective.target_grid) |grid_id| {
-            if (prospective.position_set and !saw_target) {
-                if (prospective.position) |pos| {
-                    const contribution = self.layoutContribution(grid_id, pos, prospective);
-                    accounting.refs = std.math.add(usize, accounting.refs, contribution.refs) catch
-                        return error.LayoutTooComplex;
-                    accounting.layouts = std.math.add(usize, accounting.layouts, contribution.layouts) catch
-                        return error.LayoutTooComplex;
-                }
-            }
-        }
-        return accounting;
-    }
-
-    fn validateLayoutAccounting(self: *const Grid, accounting: LayoutAccounting, main_rows: u32) !void {
-        if (!self.row_index_budget_enabled) return;
-        const bytes = mainRowIndexByteSize(main_rows, accounting.refs, accounting.layouts) orelse
-            return error.LayoutTooComplex;
-        if (bytes > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) return error.LayoutTooComplex;
-    }
-
-    fn prospectiveLayoutAccounting(self: *const Grid, prospective: LayoutProspective) !LayoutAccounting {
-        const accounting = try self.computeLayoutAccounting(prospective);
-        try self.validateLayoutAccounting(accounting, prospective.main_rows orelse self.rows);
-        return accounting;
-    }
-
-    fn layoutAccountingAfterDelta(
-        self: *const Grid,
-        old: LayoutAccounting,
-        new: LayoutAccounting,
-    ) !LayoutAccounting {
-        if (old.refs > self.main_row_index_ref_count or old.layouts > self.main_row_index_layout_count) {
-            return error.LayoutTooComplex;
-        }
-        var accounting = LayoutAccounting{
-            .refs = self.main_row_index_ref_count - old.refs,
-            .layouts = self.main_row_index_layout_count - old.layouts,
-        };
-        accounting.refs = std.math.add(usize, accounting.refs, new.refs) catch
-            return error.LayoutTooComplex;
-        accounting.layouts = std.math.add(usize, accounting.layouts, new.layouts) catch
-            return error.LayoutTooComplex;
-        try self.validateLayoutAccounting(accounting, self.rows);
-        return accounting;
-    }
-
-    fn commitLayoutAccounting(self: *Grid, accounting: LayoutAccounting) void {
-        self.main_row_index_ref_count = accounting.refs;
-        self.main_row_index_layout_count = accounting.layouts;
-        self.advanceLayoutGeneration();
-    }
-
-    pub fn currentMainRowIndexByteSize(self: *const Grid) ?usize {
-        return mainRowIndexByteSize(
-            self.rows,
-            self.main_row_index_ref_count,
-            self.main_row_index_layout_count,
-        );
+        // The rows go to another surface now, generated afresh. A grid that
+        // leaves an external root keeps its GridBuf, and the row loops read
+        // this as the rule: left set, a former root drew as a layer with the
+        // default background dropped. One that becomes a root starts from
+        // false, so the flush-start check sees the flip and regenerates.
+        sg.skip_default_bg_last = false;
     }
 
     fn checkedAggregateCellCount(self: *const Grid, old_len: usize, new_len: usize) !usize {
@@ -1618,15 +1518,12 @@ pub const Grid = struct {
 
     pub fn deinit(self: *Grid) void {
         // global grid
-        if (self.cells.len != 0) self.alloc.free(self.cells);
-        self.cells = &[_]Cell{};
+        self.main_buf.deinit(self.alloc);
+        self.destroyed_pending.deinit(self.alloc);
         self.rows = 0;
         self.cols = 0;
         self.total_grid_cells = 0;
 
-        self.dirty_rows.deinit(self.alloc);
-
-        // sub grids
         var it = self.sub_grids.iterator();
         while (it.next()) |e| {
             e.value_ptr.deinit(self.alloc);
@@ -1634,18 +1531,18 @@ pub const Grid = struct {
         self.sub_grids.deinit(self.alloc);
         self.win_pos.deinit(self.alloc);
         self.grid_win_ids.deinit(self.alloc);
+        self.float_follows.deinit(self.alloc);
+        self.float_config_wanted.deinit(self.alloc);
         self.win_layer.deinit(self.alloc);
         self.external_grids.deinit(self.alloc);
         self.pending_grid_resizes.deinit(self.alloc);
         self.pending_win_ops.deinit(self.alloc);
         self.pending_ext_window_grids.deinit(self.alloc);
         self.ext_windows_grids.deinit(self.alloc);
-        self.external_grid_target_sizes.deinit(self.alloc);
         self.grid_metrics.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
 
-        // cursor
         self.cursor_valid = false;
         self.cursor_grid = 1;
         self.cursor_row = 0;
@@ -1689,8 +1586,8 @@ pub const Grid = struct {
     /// / `msg_clear` for the previous session's UI overlays. Without an
     /// explicit teardown, any leftover entry in `sub_grids` / `win_pos` /
     /// `win_layer` is rendered as a stale composited float by
-    /// flush.zig:rebuildMain and reported as a visible grid by
-    /// nvim_core.zig:getVisibleGridsLocked (hit-testing). The same logic
+    /// flush.zig's main rebuild and reported as a visible grid by
+    /// nvim_core.zig:getVisibleGridsSnapshotLocked (hit-testing). The same logic
     /// applies to ext UI state that survives across the channel close.
     ///
     /// Preserves intentionally:
@@ -1711,15 +1608,17 @@ pub const Grid = struct {
     /// previous session's high-water allocation must not remain resident.
     pub fn resetForNewSession(self: *Grid) void {
         // Composited / multigrid layout: stale entries here would be
-        // emitted as floats by flush.zig:rebuildMain (iterating win_pos)
-        // and counted as visible by getVisibleGridsLocked.
+        // emitted as floats by flush.zig's main rebuild (iterating win_pos)
+        // and counted as visible by getVisibleGridsSnapshotLocked.
         var sg_it = self.sub_grids.iterator();
         while (sg_it.next()) |e| {
             e.value_ptr.deinit(self.alloc);
         }
         self.sub_grids.deinit(self.alloc);
         self.sub_grids = .{};
-        self.total_grid_cells = self.cells.len;
+        self.total_grid_cells = self.main_buf.cells.len;
+        // A destroy owed to the old attachment can name a grid the new one has live.
+        self.destroyed_pending.clearRetainingCapacity();
         self.win_pos.deinit(self.alloc);
         self.win_pos = .{};
         self.grid_win_ids.deinit(self.alloc);
@@ -1731,12 +1630,7 @@ pub const Grid = struct {
         self.grid_metrics.clearRetainingCapacity();
         self.clearAllOverflow();
         self.layer_order_counter = 0;
-        self.layout_generation = 1;
         self.subgrid_surface_vertex_count = 0;
-        self.main_row_index_ref_count = 0;
-        self.main_row_index_layout_count = 0;
-        self.redraw_epoch = 1;
-        self.redraw_epoch_override = null;
         self.composited_win_closed = false;
 
         // Cursor: a stale `cursor_grid` pointing at a now-deleted sub_grid
@@ -1746,8 +1640,10 @@ pub const Grid = struct {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.cursor_valid = false;
-        self.prev_cursor_row = null;
-        self.prev_cursor_grid = null;
+        // busy_start/busy_stop are its only writers, and a fresh attach
+        // never sends busy_stop: a busy_stop lost with the old session would
+        // hide the cursor until the next unrelated busy pair.
+        self.cursor_visible = true;
 
         // ext_cmdline: the new server has no notion of these levels.
         // Mark dirty so the next flush re-emits hide based on absence
@@ -1769,24 +1665,14 @@ pub const Grid = struct {
         // Scroll bookkeeping: a pending op refers to the old session's
         // grid_id and would apply to an unrelated grid in the new
         // session if grid_ids overlap.
-        self.pending_scroll = null;
-        self.scroll_fast_path_blocked = false;
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
-        self.main_scroll_notify_pending = false;
-        self.main_scroll_notify_rows = 0;
-        var scroll_it = self.sub_grids.valueIterator();
-        while (scroll_it.next()) |sg| {
-            sg.scroll_notify_pending = false;
-            sg.scroll_notify_rows = 0;
-            sg.row_scroll_notify_pending = false;
-        }
-        self.scroll_touched_count = 0;
+        self.main_buf.scroll_notify_pending = false;
+        self.main_buf.scroll_notify_rows = 0;
 
         // Bump revs so any rev-equality short-circuit (e.g. last_sent_*
         // tracking on the Core side) cannot match the new session's
         // first frame against the old session's last frame.
-        self.content_rev +%= 1;
         self.glyph_working_set_rev +%= 1;
         self.cursor_rev +%= 1;
 
@@ -1794,7 +1680,7 @@ pub const Grid = struct {
         // grid_resize will markAllDirty too, but this is the no-op-resize
         // case (same dimensions) where redraw_handler doesn't reach
         // resizeGrid.
-        self.dirty_all = true;
+        self.main_buf.markAllDirty();
     }
 
     // ── Cell overflow helpers ────────────────────────────────────────
@@ -1818,6 +1704,7 @@ pub const Grid = struct {
     fn ensureOverflowGridIndexCapacity(self: *Grid, key: OverflowKey) !void {
         const gop = try self.overflow_by_grid.getOrPut(self.alloc, key.grid_id);
         if (!gop.found_existing) gop.value_ptr.* = .{};
+        errdefer if (!gop.found_existing) self.releaseOverflowIndexForGrid(key.grid_id);
         try gop.value_ptr.keys.ensureUnusedCapacity(self.alloc, 1);
         try gop.value_ptr.positions.ensureUnusedCapacity(self.alloc, 1);
     }
@@ -1927,6 +1814,11 @@ pub const Grid = struct {
     /// Move overflow entries during a scroll operation.
     /// Entries in the scroll region are shifted by `shift_rows`, entries in the
     /// vacated band are removed.
+    ///
+    /// Relies on the Grid invariant that both overflow scratch buffers hold
+    /// at least `cell_overflow.count()` entries, which putCellGridCluster
+    /// upholds via ensureOverflowScratchCapacity before every insert; callers
+    /// owe nothing, and no allocation happens after the base cells moved.
     pub fn scrollOverflow(self: *Grid, grid_id: i64, top: u32, bot: u32, left: u32, right: u32, rows_delta: i32) void {
         const grid_overflow_count = self.overflowCountForGrid(grid_id);
         if (grid_overflow_count == 0) return;
@@ -1940,8 +1832,7 @@ pub const Grid = struct {
         }
 
         // Collect only sparse overflow entries, not every cell in the scroll
-        // rectangle. Scratch capacity is guaranteed at insertion time, so no
-        // allocation or OOM branch exists after base cells have moved.
+        // rectangle.
         std.debug.assert(self.overflow_key_scratch.capacity >= grid_overflow_count);
         std.debug.assert(self.overflow_moved_scratch.capacity >= grid_overflow_count);
         self.overflow_key_scratch.clearRetainingCapacity();
@@ -2013,9 +1904,9 @@ pub const Grid = struct {
     };
 
     pub fn setGridMetricsPx(self: *Grid, grid_id: i64, cell_w_px: u32, cell_h_px: u32) !void {
-        const cw = if (cell_w_px == 0) 1 else cell_w_px;
-        const ch = if (cell_h_px == 0) 1 else cell_h_px;
-        try self.grid_metrics.put(self.alloc, grid_id, .{ .cell_w_px = cw, .cell_h_px = ch });
+        // Placement divides by the cell size; the layout path maps 0 to 1 px.
+        std.debug.assert(cell_w_px != 0 and cell_h_px != 0);
+        try self.grid_metrics.put(self.alloc, grid_id, .{ .cell_w_px = cell_w_px, .cell_h_px = cell_h_px });
     }
 
     pub fn getGridMetricsPx(self: *const Grid, grid_id: i64) CellMetricsPx {
@@ -2025,308 +1916,145 @@ pub const Grid = struct {
         return .{ .cell_w_px = 1, .cell_h_px = 1 };
     }
 
-    pub fn ensureGridMetricsPx(self: *Grid, grid_id: i64) !void {
-        if (self.grid_metrics.contains(grid_id)) return;
-        const base = self.getGridMetricsPx(1);
-        try self.grid_metrics.put(self.alloc, grid_id, base);
-    }
-
     pub fn getCellHL(self: *const Grid, row: u32, col: u32) u32 {
-        if (row >= self.rows or col >= self.cols) return 0;
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx].hl;
+        return self.main_buf.getCell(row, col).hl;
     }
 
     pub fn getCellHLGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) u32 {
-        if (grid_id == 1) return self.getCellHL(row, col);
-
-        // sub grid
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            return sg.getCellHL(row, col);
-        }
-        return 0;
+        return self.getCellGrid(grid_id, row, col).hl;
     }
 
     /// Get cell at (row, col) for global grid
     pub fn getCell(self: *const Grid, row: u32, col: u32) Cell {
-        if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx];
+        return self.main_buf.getCell(row, col);
     }
 
     /// Get cell at (row, col) for any grid
     pub fn getCellGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) Cell {
-        if (grid_id == 1) return self.getCell(row, col);
-
-        // sub grid
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            if (row >= sg.rows or col >= sg.cols) return .{ .cp = 0, .hl = 0 };
-            const idx: usize = @as(usize, row) * @as(usize, sg.cols) + @as(usize, col);
-            return sg.cells[idx];
-        }
-        return .{ .cp = 0, .hl = 0 };
+        const buf = self.bufForConst(grid_id) orelse return .{ .cp = 0, .hl = 0 };
+        return buf.getCell(row, col);
     }
 
-    /// Grow `dirty_rows` to cover `rows`, leaving new bits clean.
-    ///
-    /// `Grid.resize` calls this unconditionally, which is what lets readers
-    /// index `dirty_rows` by row without a length check first:
-    /// `bit_length >= rows` holds for the global grid at all times. `GridBuf`
-    /// gives no such guarantee — it skips the bitset entirely for a zero-cell
-    /// shape while still updating `rows` — so its readers do have to test
-    /// `bit_length` before `isSet`.
-    pub fn ensureDirtyCapacity(self: *Grid, rows: u32) !void {
-        // Grow only: a shrink leaves the bitset longer than `rows`, which the
-        // `>=` invariant above allows. Initialize new bits as "clean" (false).
-        const r: usize = @as(usize, rows);
-        if (self.dirty_rows.bit_length >= r) return;
-        try self.dirty_rows.resize(self.alloc, r, false);
+    pub fn isRowDirty(self: *const Grid, row: u32) bool {
+        return self.main_buf.isRowDirty(row);
     }
 
     pub fn markDirtyRow(self: *Grid, row: u32) void {
-        if (row >= self.rows) return;
-        // When dirty_all is true, per-row bits are not necessary.
-        if (self.dirty_all) return;
-        self.dirty_rows.set(@as(usize, row));
+        self.main_buf.markDirtyRow(row);
     }
 
     pub fn markDirtyRect(self: *Grid, top: u32, bot: u32) void {
-        if (self.dirty_all) return;
-        const start: usize = @as(usize, top);
-        // Clamping to `rows` is enough: `bit_length >= rows` holds for the
-        // global grid at all times (see Grid.ensureDirtyCapacity), which is
-        // the same invariant markDirtyRow relies on to set a bit unguarded.
-        const end: usize = @as(usize, @min(bot, self.rows));
-        if (start >= end) return;
-        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
+        self.main_buf.markDirtyRect(top, bot);
     }
 
     pub fn markAllDirty(self: *Grid) void {
-        // Fast path: avoid setting all bits; dirty_all dominates.
-        self.dirty_all = true;
+        self.main_buf.markAllDirty();
     }
 
-    /// Shift previously-recorded touched rows by a new scroll delta.
-    /// Rows that scroll out of the [top, bot) region are removed.
-    /// Coordinates are in global grid space (win_pos_row already applied).
-    fn shiftTouchedRows(self: *Grid, scroll_rows: i32, top: u32, bot: u32, win_pos_row: u32) void {
-        // i64 covers every u32 grid coordinate plus an i32 scroll delta.
-        // Keeping the comparison wide avoids both the old u32->i32 cast trap
-        // and signed subtraction overflow for a hostile stored position.
-        const main_top = @as(i64, top) + @as(i64, win_pos_row);
-        const main_bot = @as(i64, bot) + @as(i64, win_pos_row);
-        var write: u8 = 0;
-        for (self.scroll_touched_rows[0..self.scroll_touched_count]) |tr| {
-            const shifted = @as(i64, tr) - @as(i64, scroll_rows);
-            if (shifted >= main_top and shifted < main_bot) {
-                self.scroll_touched_rows[write] = @intCast(shifted);
-                write += 1;
-            }
-        }
-        self.scroll_touched_count = write;
-    }
-
-    /// Record a row touched by grid_line while a pending_scroll is active.
-    /// Uses global grid coordinates. Deduplicates entries.
-    /// On overflow, blocks fast path but preserves pending_scroll for delta accumulation.
-    ///
-    /// Overflow fallback behaviour per frontend:
-    ///   macOS  – applyMainRowScrollRaw (MetalTerminalRenderer.swift) is NOT called;
-    ///            fallback clears back texture and redraws all dirty rows from scratch.
-    ///   Windows – onMainRowScroll (callbacks.zig) is NOT called;
-    ///            fallback regenerates all dirty rows via on_vertices_row.
-    /// Both paths produce correct output because the full dirty set covers
-    /// every row affected by the accumulated scroll.
-    fn recordScrollTouchedRow(self: *Grid, row: u32) void {
-        if (self.pending_scroll == null) return;
-
-        // Deduplicate: check if already recorded
-        for (self.scroll_touched_rows[0..self.scroll_touched_count]) |r| {
-            if (r == row) return;
-        }
-
-        // Overflow: too many distinct touched rows for fast path tracking.
-        // Block fast path but KEEP pending_scroll so the accumulated delta
-        // is preserved for subsequent grid_scroll events in the same batch.
-        // Setting pending_scroll = null here would lose the accumulated rows
-        // delta; the next grid_scroll would create a fresh pending_scroll
-        // with only its own partial delta, causing the scroll cache fast
-        // path to shift by the wrong amount.
-        if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
-            self.scroll_fast_path_blocked = true;
-            return;
-        }
-
-        self.scroll_touched_rows[self.scroll_touched_count] = row;
-        self.scroll_touched_count += 1;
+    /// Grid 1 and every sub-grid: the whole display is owed again.
+    pub fn markEverySurfaceDirty(self: *Grid) void {
+        self.main_buf.markAllDirty();
+        var sg_it = self.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.markAllDirty();
     }
 
     pub fn clearDirty(self: *Grid) void {
-        self.dirty_all = false;
-        // Make all bits clean.
-        if (self.dirty_rows.bit_length != 0) {
-            self.dirty_rows.unsetAll();
-        }
+        self.main_buf.clearDirtyContent();
     }
 
-    /// Copy the current main-grid dirty state into `out`, growing it only when
-    /// the row count changed. Used to remember what a flush consumed so a
-    /// frontend rejection can restore exactly that instead of resending every
-    /// row. Allocation happens on layout change only, never per flush.
-    pub fn snapshotDirty(self: *const Grid, alloc: std.mem.Allocator, out: *DirtySnapshot) !void {
-        out.dirty_all = self.dirty_all;
-        const len = self.dirty_rows.bit_length;
-        if (out.rows.bit_length != len) {
-            out.rows.deinit(alloc);
-            out.rows = .{};
-            out.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
-        } else if (len != 0) {
-            out.rows.unsetAll();
-        }
-        if (len == 0) return;
-        var it = self.dirty_rows.iterator(.{});
-        while (it.next()) |bit| out.rows.set(bit);
+    /// The bracket committed: drop what every grid owed for it.
+    pub fn commitOwed(self: *Grid) void {
+        self.main_buf.commitOwed();
+        var sg_it = self.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.commitOwed();
     }
 
-    /// Re-apply a snapshot on top of the current state. Bits set since the
-    /// snapshot stay set: a rejected flush must resend what it consumed plus
-    /// anything that changed afterwards.
-    pub fn restoreDirty(self: *Grid, snapshot: *const DirtySnapshot) void {
-        if (snapshot.dirty_all) self.dirty_all = true;
-        if (snapshot.rows.bit_length == 0 or self.dirty_rows.bit_length == 0) return;
-        const len = @min(snapshot.rows.bit_length, self.dirty_rows.bit_length);
-        var it = snapshot.rows.iterator(.{});
-        while (it.next()) |bit| {
-            if (bit >= len) break;
-            self.dirty_rows.set(bit);
-        }
+    /// The bracket was refused: every grid owes again what it sent. A grid
+    /// created inside the flush owes its rows like any other.
+    pub fn returnOwed(self: *Grid) void {
+        self.main_buf.returnOwed();
+        var sg_it = self.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.returnOwed();
     }
 
-    /// Clear scroll-aware flush provenance (pending_scroll, touched rows, prev cursor).
-    /// Called by flush after success, and on abort after forcing a full redraw.
-    /// Notification provenance is separate and may survive a begin rejection.
-    pub fn clearScrollState(self: *Grid) void {
-        self.pending_scroll = null;
-        self.scroll_fast_path_blocked = false;
-        self.scroll_touched_count = 0;
-        self.prev_cursor_row = null;
-        self.prev_cursor_grid = null;
-    }
-
-    pub fn clear(self: *Grid) void {
-        @memset(self.cells, .{ .cp = ' ', .hl = 0 });
+    /// Debug check of the `rows`/`cols` mirror of `main_buf`; for flush entry.
+    pub fn assertMainShapeMirrored(self: *const Grid) void {
+        std.debug.assert(self.rows == self.main_buf.rows and self.cols == self.main_buf.cols);
     }
 
     pub fn resize(self: *Grid, rows: u32, cols: u32) !void {
         const new_len = try checkedGridCellCount(rows, cols);
-        const new_total = try self.checkedAggregateCellCount(self.cells.len, new_len);
-        const new_cells = try self.alloc.alloc(Cell, new_len);
-        errdefer self.alloc.free(new_cells);
-
-        // Fill new buffer with spaces using vectorized memset.
-        @memset(new_cells, .{ .cp = ' ', .hl = 0 });
-
-        const min_rows = @min(self.rows, rows);
-        const min_cols = @min(self.cols, cols);
-
-        if (self.cells.len != 0) {
-            // Row-level @memcpy instead of per-cell copy
-            var r: u32 = 0;
-            while (r < min_rows) : (r += 1) {
-                const old_start: usize = @as(usize, r) * @as(usize, self.cols);
-                const new_start: usize = @as(usize, r) * @as(usize, cols);
-                @memcpy(new_cells[new_start .. new_start + min_cols], self.cells[old_start .. old_start + min_cols]);
-            }
-        }
-
-        // The dirty bitset is part of the published grid shape. Grow it
-        // before releasing the old cells so OOM leaves rows/cols/cells and
-        // dirty metadata describing the same old grid.
-        try self.ensureDirtyCapacity(rows);
-
-        if (self.cells.len != 0) self.alloc.free(self.cells);
-        self.cells = new_cells;
+        const new_total = try self.checkedAggregateCellCount(self.main_buf.cells.len, new_len);
+        // GridBuf.resize is transactional: on OOM the previous buffer is left
+        // intact and rows/cols/total below still describe the old shape.
+        try self.main_buf.resize(self.alloc, rows, cols);
         self.rows = rows;
         self.cols = cols;
         self.total_grid_cells = new_total;
-        self.clearDirty(); // reset bitset
-        self.markAllDirty(); // everything needs redraw after resize
+        // GridBuf.resize already marked everything dirty via dirty_all.
+    }
+
+    /// The render buffer for `grid_id`. Grid 1 lives in `main_buf`, never in
+    /// `sub_grids`.
+    pub fn bufFor(self: *Grid, grid_id: i64) ?*GridBuf {
+        if (grid_id == 1) return &self.main_buf;
+        return self.sub_grids.getPtr(grid_id);
+    }
+
+    pub fn bufForConst(self: *const Grid, grid_id: i64) ?*const GridBuf {
+        if (grid_id == 1) return &self.main_buf;
+        return self.sub_grids.getPtr(grid_id);
+    }
+
+    /// Whether a grid's cells reach a surface: grid 1 always, a sub-grid once
+    /// placed or made an external root. Grid 1 short-circuits so grid_line on
+    /// it does no hash lookup.
+    fn gridShown(self: *const Grid, grid_id: i64) bool {
+        return grid_id == 1 or self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
     }
 
     pub fn putCell(self: *Grid, row: u32, col: u32, cp: u32, hl: u32) void {
-        if (row >= self.rows or col >= self.cols) return;
-
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-
-        // If no actual change, do nothing (avoid increasing dirty state)
-        const old = self.cells[idx];
-        if (old.cp == cp and old.hl == hl) return;
-
-        // Apply the change only when it actually differs
-        self.cells[idx] = .{ .cp = cp, .hl = hl };
-
-        // Treat only actual changes as dirty
-        self.markDirtyRow(row);
-
-        // Record touched row for scroll-aware flush (global grid coordinate)
-        self.recordScrollTouchedRow(row);
-
-        // Advance content_rev only on cell changes (defined in Grid)
-        self.content_rev +%= 1;
-        self.glyph_working_set_rev +%= 1;
-
-        // Advance cursor_rev if cursor is on this cell (to update cursor text)
-        if (self.cursor_grid == 1 and self.cursor_row == row and self.cursor_col == col) {
-            self.cursor_rev +%= 1;
-        }
+        self.putCellBuf(&self.main_buf, 1, row, col, cp, hl);
     }
 
     /// Implements the "grid_scroll" UI event by copying a rectangular region.
     /// Note: 'cols' is reserved (currently always 0 in Nvim); checked for no-op detection but not used in scroll logic.
+    /// Precondition: the region and delta are normalised (scrollGrid), and no
+    /// flush bracket is open, so `owed_rows` need not move with the cells.
     pub fn scroll(
         self: *Grid,
-        top_in: u32,
-        bot_in: u32,
-        left_in: u32,
-        right_in: u32,
+        top: u32,
+        bot: u32,
+        left: u32,
+        right: u32,
         rows: i32,
         cols: i32,
     ) void {
-        if (self.rows == 0 or self.cols == 0) return;
-        if (rows == 0 and cols == 0) return;
-
-        const top: u32 = if (top_in > self.rows) self.rows else top_in;
-        const bot: u32 = if (bot_in > self.rows) self.rows else bot_in;
-        const left: u32 = if (left_in > self.cols) self.cols else left_in;
-        const right: u32 = if (right_in > self.cols) self.cols else right_in;
-
-        if (top >= bot or left >= right) return;
+        _ = cols;
+        std.debug.assert(!self.main_buf.owed);
+        std.debug.assert(rows != 0);
+        std.debug.assert(top < bot and bot <= self.rows);
+        std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(self.main_buf.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;
-
-        if (rows == 0) return;
 
         const shift: u32 = scrollShift(rows, height);
 
         // If the shift exceeds region height, everything is scrolled out.
         if (shift >= height) {
-            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+            scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
             // Clear overflow for the entire scrolled-out region
             self.clearOverflowRect(1, top, bot, left, right);
-            // Mark every row in the region dirty. The caller (scrollGrid)
-            // already bumps content_rev unconditionally, but need_main
-            // alone is not enough: the row-mode flush's per-row loop skips
-            // any row whose dirty_rows bit isn't set (checkScrollFastPath
-            // already makes the fast path ineligible here — abs_rows >
-            // region_height/2 — so it falls to the plain per-row dirty
-            // check, not a full-region regen). Without this, the just-
-            // cleared cells never get resent and the pre-scroll glyph
-            // vertices stay on screen.
+            // The row-mode flush skips any row whose dirty_rows bit isn't set, and gridScrollFastPathRegion
+            // already rejects this case (abs_rows > region_height/2), so there
+            // is no full-region regen to fall back on. Without this the cleared
+            // cells never get resent and the pre-scroll glyphs stay on screen.
             self.markDirtyRect(top, bot);
             return;
         }
 
-        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+        scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         self.markDirtyRect(top, bot);
 
@@ -2335,20 +2063,18 @@ pub const Grid = struct {
     }
 
     pub fn resizeGrid(self: *Grid, grid_id: i64, rows: u32, cols: u32) !void {
-        // Validate before getOrCreateSub so an invalid request cannot leave a
-        // phantom empty sub-grid behind.
+        // Validate before creating the sub-grid so an invalid request cannot
+        // leave a phantom empty sub-grid behind.
         _ = try checkedGridCellCount(rows, cols);
         if (grid_id == 1) {
             const shape_changed = self.rows != rows or self.cols != cols;
-            const row_shape_changed = self.rows != rows;
-            const new_accounting = if (row_shape_changed)
-                try self.prospectiveLayoutAccounting(.{ .main_rows = rows })
-            else
-                LayoutAccounting{};
             try self.resize(rows, cols);
-            if (row_shape_changed) self.commitLayoutAccounting(new_accounting);
             if (shape_changed) self.glyph_working_set_rev +%= 1;
-            self.content_rev +%= 1;
+            // Grid 1's cursor layer is gated on cursor_rev alone (the main
+            // pass has already cleared the rows by then), so a shrink under
+            // the cursor must bump it to reach the out-of-grid empty set.
+            if (shape_changed and self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
+            self.invalidateCursorOutside(grid_id, rows, cols);
             // Remove overflow entries that fall outside the new dimensions.
             // Entries within [0, rows) x [0, cols) are preserved (matching
             // the cell copy behavior of resize()).
@@ -2357,66 +2083,29 @@ pub const Grid = struct {
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
-            const old_rows = sg.rows;
             const shape_changed = sg.rows != rows or sg.cols != cols;
-            const old_contribution = if (self.win_pos.get(grid_id)) |pos|
-                self.layoutContribution(grid_id, pos, .{})
-            else
-                LayoutAccounting{};
-            const size_prospective = LayoutProspective{
-                .target_grid = grid_id,
-                .rows = rows,
-                .cols = cols,
-            };
-            const new_contribution = if (self.win_pos.get(grid_id)) |pos|
-                self.layoutContribution(grid_id, pos, size_prospective)
-            else
-                LayoutAccounting{};
-            const new_accounting = try self.layoutAccountingAfterDelta(old_contribution, new_contribution);
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
             const old_surface_vertex_count = sg.surface_vertex_count;
             try sg.resize(self.alloc, rows, cols);
             self.subgrid_surface_vertex_count -|= old_surface_vertex_count;
-            if (old_contribution.refs != new_contribution.refs or
-                old_contribution.layouts != new_contribution.layouts)
-            {
-                self.commitLayoutAccounting(new_accounting);
-            }
-            if (shape_changed and (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id))) {
-                self.glyph_working_set_rev +%= 1;
-            }
+            if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
+            self.invalidateCursorOutside(grid_id, rows, cols);
 
-            // Only affect global grid state for composited grids (in win_pos).
-            // External grids (not in win_pos) are rendered independently.
-            if (self.win_pos.get(grid_id)) |p| {
-                if (self.external_grids.contains(p.anchor_grid)) {
-                    const h = @max(old_rows, rows);
-                    var r: u32 = 0;
-                    while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
-                } else {
-                    self.content_rev +%= 1;
-                    self.markAllDirty();
-                }
-            }
+            // The pixels the resize exposes are the frontend's, from the
+            // layout it publishes. A resize to or from a zero dimension also
+            // changes whether the grid counts as a layer, and with it every
+            // root row's `skip_default_bg`; the flush regenerates those
+            // (regenerateRootsWhoseDefaultBgRuleFlipped).
+            if (shape_changed and self.external_grids.contains(grid_id)) self.reresolveAnchoredFloats(grid_id);
             return;
         }
 
         const new_len = try checkedGridCellCount(rows, cols);
         const new_total = try self.checkedAggregateCellCount(0, new_len);
         if (!subgridInsertFits(self.sub_grids.count(), true)) return error.TooManySubgrids;
-        const size_prospective = LayoutProspective{
-            .target_grid = grid_id,
-            .rows = rows,
-            .cols = cols,
-        };
-        const new_contribution = if (self.win_pos.get(grid_id)) |pos|
-            self.layoutContribution(grid_id, pos, size_prospective)
-        else
-            LayoutAccounting{};
-        const new_accounting = try self.layoutAccountingAfterDelta(.{}, new_contribution);
         const sg = blk: {
             var new_grid: GridBuf = .{};
             errdefer new_grid.deinit(self.alloc);
@@ -2425,149 +2114,199 @@ pub const Grid = struct {
             break :blk self.sub_grids.getPtr(grid_id).?;
         };
         _ = sg;
-        if (new_contribution.layouts != 0) self.commitLayoutAccounting(new_accounting);
         self.total_grid_cells = new_total;
-        if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-            self.glyph_working_set_rev +%= 1;
-        }
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
         self.trimOverflowForGrid(grid_id, rows, cols);
-        if (self.win_pos.get(grid_id)) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
-                var r: u32 = 0;
-                while (r < rows) : (r += 1) self.dirtyCompositedRow(p, r);
-            } else {
-                self.content_rev +%= 1;
-                self.markAllDirty();
-            }
-        }
+        // A grid appearing as grid 1's FIRST layer flips `skip_default_bg`
+        // for every root row; the flush regenerates those
+        // (regenerateRootsWhoseDefaultBgRuleFlipped).
+    }
+
+    /// Keeps `cursor_valid => cursor inside cursor_grid` across a shrink.
+    /// Neovim's own cursor never leaves its grid, so a shrink past it is
+    /// followed by a grid_cursor_goto to a different cell; until then nothing
+    /// is drawn, as the consumers' bounds checks already did. Clamping instead
+    /// would draw a cursor on a cell Neovim never named.
+    fn invalidateCursorOutside(self: *Grid, grid_id: i64, rows: u32, cols: u32) void {
+        if (!self.cursor_valid or self.cursor_grid != grid_id) return;
+        if (self.cursor_row < rows and self.cursor_col < cols) return;
+        self.cursor_valid = false;
+        self.cursor_rev +%= 1;
     }
 
     pub fn clearGrid(self: *Grid, grid_id: i64) void {
         if (grid_id == 1) {
             self.glyph_working_set_rev +%= 1;
-            self.content_rev +%= 1;
-            self.clear();
+            self.main_buf.clear();
             self.clearOverflowForGrid(1);
-            self.markAllDirty();
+            // The cursor cell's glyph is gone; see resizeGrid.
+            if (self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.clear();
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
+            if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
         }
         self.clearOverflowForGrid(grid_id);
 
-        // Only affect global grid state for composited grids. A float anchored
-        // to an external grid composites into that grid's window instead: dirty
-        // the anchor's rows covered by the float (anchor-local translation is
-        // handled by dirtyCompositedRow), not the main grid.
-        if (self.win_pos.get(grid_id)) |p| {
-            const h: u32 = if (self.sub_grids.get(grid_id)) |fsg| fsg.rows else 1;
-            var r: u32 = 0;
-            while (r < h) : (r += 1) {
-                self.dirtyCompositedRow(p, r);
+        // Only a placed grid has a band, on the surface that composites it.
+        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, self.layerRows(grid_id));
+    }
+
+    /// Resolve the owning surface through the complete anchor chain without
+    /// allocating or guessing a main surface for missing/cyclic placement.
+    pub fn surfaceForGrid(self: *const Grid, grid_id: i64) ?i64 {
+        var id = grid_id;
+        var remaining = self.win_pos.count() + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            if (id == 1 or self.external_grids.contains(id)) return id;
+            const pos = self.win_pos.get(id) orelse return null;
+            id = pos.anchor_grid;
+        }
+        return null;
+    }
+
+    /// Where a placed grid sits on the surface that composites it, in that
+    /// surface's cells (GridPos is stored in them). Null when the anchor chain
+    /// does not resolve.
+    pub fn surfacePlacement(self: *const Grid, p: GridPos) ?SurfacePlacement {
+        const surface = self.surfaceForGrid(p.anchor_grid) orelse return null;
+        return .{ .surface = surface, .row = p.row, .col = p.col };
+    }
+
+    /// Place float `grid_id` from its anchor, in the cells of the surface that
+    /// places `anchor_grid`, clamped to that surface the way Neovim clamps to
+    /// the main grid (window.c win_float_pos). Null when a step overflows.
+    pub fn resolveAnchoredFloat(self: *const Grid, grid_id: i64, anchor_grid: i64, a: FloatAnchor) ?struct { row: u32, col: u32 } {
+        // The anchor's position in the surface that places it; an external
+        // root is that surface's origin.
+        var base_row: i64 = 0;
+        var base_col: i64 = 0;
+        if (anchor_grid != 1) {
+            if (self.win_pos.get(anchor_grid)) |p| {
+                base_row = p.row;
+                base_col = p.col;
             }
+        }
+
+        // Cells of the anchor and of the float, in cells of grid 1.
+        const main_m = self.getGridMetricsPx(1);
+        const anchor_m = self.getGridMetricsPx(anchor_grid);
+        const float_m = self.getGridMetricsPx(grid_id);
+        const scale = struct {
+            fn cells(n: i64, from_px: u32, to_px: u32, round_up: bool) ?i64 {
+                const v = @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(from_px)) / @as(f64, @floatFromInt(to_px));
+                const r = if (round_up) @ceil(v) else v;
+                if (!std.math.isFinite(r) or @abs(r) > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return null;
+                return @intFromFloat(r);
+            }
+        };
+        var row = std.math.add(i64, base_row, scale.cells(a.row, anchor_m.cell_h_px, main_m.cell_h_px, false) orelse return null) catch return null;
+        var col = std.math.add(i64, base_col, scale.cells(a.col, anchor_m.cell_w_px, main_m.cell_w_px, false) orelse return null) catch return null;
+
+        if (self.sub_grids.get(grid_id)) |sg| {
+            const rows_main = scale.cells(sg.rows, float_m.cell_h_px, main_m.cell_h_px, true) orelse return null;
+            const cols_main = scale.cells(sg.cols, float_m.cell_w_px, main_m.cell_w_px, false) orelse return null;
+            if (a.south) row -= rows_main;
+            if (a.east) col -= cols_main;
+            const surface = self.surfaceForGrid(anchor_grid);
+            if (surface != null and surface.? != 1) {
+                if (self.sub_grids.get(surface.?)) |root| {
+                    row = @min(row, @as(i64, root.rows) - rows_main);
+                    col = @min(col, @as(i64, root.cols) - cols_main);
+                }
+            }
+        }
+        return .{ .row = std.math.lossyCast(u32, @max(row, 0)), .col = std.math.lossyCast(u32, @max(col, 0)) };
+    }
+
+    /// Keep the anchor a float on an external window was placed from
+    /// (resolveAnchoredFloat), after setWinFloatPos stored its position.
+    pub fn setWinFloatAnchor(self: *Grid, grid_id: i64, anchor: FloatAnchor) void {
+        if (self.win_pos.getPtr(grid_id)) |p| p.anchor = anchor;
+    }
+
+    /// Resolve again every anchored float an external root places, after
+    /// that root resized: Neovim does not resend their positions for it.
+    fn reresolveAnchoredFloats(self: *Grid, surface_grid: i64) void {
+        var it = self.win_pos.iterator();
+        while (it.next()) |e| {
+            const p = e.value_ptr;
+            const a = p.anchor orelse continue;
+            if (self.surfaceForGrid(p.anchor_grid) != surface_grid) continue;
+            const at = self.resolveAnchoredFloat(e.key_ptr.*, p.anchor_grid, a) orelse continue;
+            p.row = at.row;
+            p.col = at.col;
         }
     }
 
-    /// Route a composited grid's cell-change dirty state to the correct target.
-    /// A win_pos grid normally composites into the MAIN grid: dirty the main
-    /// row at p.row + row and bump content_rev. A float anchored to an
-    /// EXTERNAL grid is instead composited into that anchor grid's own window
-    /// (flush.zig ext composite path), so the ANCHOR subgrid must be dirtied —
-    /// dirtying the main grid there would rebuild it spuriously at rows
-    /// translated into the wrong coordinate space, while the float's real
-    /// renderer keeps showing stale content.
+    /// Rows a placed grid covers: its buffer's, or one for a grid with none.
+    fn layerRows(self: *const Grid, grid_id: i64) u32 {
+        return if (self.sub_grids.getPtr(grid_id)) |sg| sg.rows else 1;
+    }
+
+    /// Dirty the band a layer at `p`, `h` rows tall, covers on the surface
+    /// that composites it: grid 1's rows, or the external root's own rows. An anchor chain that
+    /// does not resolve dirties nothing: the layer is on no surface, and
+    /// dirtying grid 1 for it rebuilt a surface that never held it.
+    fn dirtyLayerBand(self: *Grid, p: GridPos, h: u32) void {
+        if (self.surfaceForGrid(p.anchor_grid) == 1) {
+            self.markDirtyRect(p.row, p.row +| h);
+            return;
+        }
+        var r: u32 = 0;
+        while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
+    }
+
+    /// Dirty the owning root's old pixel coverage, not an intermediate float
+    /// or an unrelated main-surface row. Grid-local contents remain separate.
     fn dirtyCompositedRow(self: *Grid, p: GridPos, row: u32) void {
-        if (self.external_grids.get(p.anchor_grid)) |ext| {
-            // win_pos.row for ext-anchored floats is stored in GLOBAL grid
-            // units (redraw_handler adds ext start_row before setWinFloatPos),
-            // while the ext composite recomposes anchor-LOCAL rows via
-            // `float_pos.row - start_row` (flush.zig ext overlay). Translate
-            // the same way here: marking the global row would dirty rows
-            // offset by start_row (or nothing at all) and leave the truly
-            // composited rows stale.
-            if (ext.start_row < 0) return; // no position info: composite disabled
-            if (self.sub_grids.getPtr(p.anchor_grid)) |asg| {
-                asg.dirty = true;
-                const local: i64 = @as(i64, p.row) + @as(i64, row) - @as(i64, ext.start_row);
-                if (local >= 0 and local < @as(i64, @intCast(asg.dirty_rows.bit_length))) {
-                    asg.dirty_rows.set(@intCast(local));
-                }
+        const placed = self.surfacePlacement(p) orelse return;
+        if (placed.surface != 1) {
+            // The root's damage is in its own rows (surfacePlacement).
+            if (self.sub_grids.getPtr(placed.surface)) |asg| {
+                const local: i64 = placed.row + @as(i64, row);
+                if (local >= 0 and local <= std.math.maxInt(u32)) asg.markDirtyRow(@intCast(local));
             }
             return;
         }
-        self.content_rev +%= 1;
-        // Saturating: see shiftTouchedRows' guard above — markDirtyRow
-        // clamps against self.rows, so a saturated value is simply ignored
-        // instead of overflow-panicking or wrapping into an in-range row.
-        const tr = p.row +| row;
-        self.markDirtyRow(tr);
-        self.recordScrollTouchedRow(tr);
+        // Saturating: markDirtyRow clamps against self.rows, so a saturated
+        // value is simply ignored instead of overflow-panicking or wrapping
+        // into an in-range row.
+        //
+        // A main-surface window grid is its own layer, so grid 1 holds none of
+        // its cells. The root row is dirtied anyway because a layer that
+        // shrinks, clears or closes leaves its old pixels in the frontend's
+        // back buffer, and grid 1 is what repaints underneath.
+        self.markDirtyRow(p.row +| row);
     }
 
     /// Force-mark a cell's row dirty (for overflow-only changes where putCellGrid
     /// would no-op because cp+hl are unchanged).
     /// Also advances cursor_rev when the cursor is on this cell.
+    /// A layer repaints its own band on both frontends and its root holds
+    /// none of its cells, so a cell change dirties nothing under it; shrink,
+    /// clear and close dirty the band themselves.
     pub fn markDirtyCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32) void {
-        if (grid_id == 1) {
-            self.glyph_working_set_rev +%= 1;
-            self.content_rev +%= 1;
-            self.markDirtyRow(row);
-            self.recordScrollTouchedRow(row);
-            if (self.cursor_grid == 1 and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
-            return;
-        }
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-            sg.dirty = true;
-            if (sg.dirty_rows.bit_length > row) {
-                sg.dirty_rows.set(row);
-            }
-            if (self.win_pos.get(grid_id)) |p| {
-                self.dirtyCompositedRow(p, row);
-            }
-            if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
+        const buf = self.bufFor(grid_id) orelse return;
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
+        buf.markDirtyRow(row);
+        if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
+            self.cursor_rev +%= 1;
         }
     }
 
     pub fn putCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
-        if (grid_id == 1) {
-            self.putCell(row, col, cp, hl);
-            // Note: putCell already updates content_rev when cell changes
-            return;
-        }
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            self.putCellSubGrid(sg, grid_id, row, col, cp, hl);
-        }
+        const buf = self.bufFor(grid_id) orelse return;
+        self.putCellBuf(buf, grid_id, row, col, cp, hl);
     }
 
-    fn putCellSubGrid(self: *Grid, sg: *GridBuf, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
-        const changed = sg.putCell(row, col, cp, hl);
-        if (changed) {
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-            if (self.win_pos.get(grid_id)) |p| {
-                // Composited grid: dirty the main grid, or the anchor
-                // external grid for ext-anchored floats.
-                self.dirtyCompositedRow(p, row);
-            }
-            // External grids (not in win_pos) do not affect global grid
-            // content_rev or dirty state.
-
-            // Advance cursor_rev if cursor is on this cell (to update cursor text)
-            if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
+    fn putCellBuf(self: *Grid, buf: *GridBuf, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
+        if (!buf.putCell(row, col, cp, hl)) return;
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
+        // The cursor cell's text changed.
+        if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
+            self.cursor_rev +%= 1;
         }
     }
 
@@ -2576,6 +2315,7 @@ pub const Grid = struct {
     /// pair a new base scalar with stale/missing variation selectors, combining
     /// marks, or ZWJ components. At the bounded overflow limit, a new cluster
     /// degrades visibly to U+FFFD without aborting the surrounding redraw batch.
+    /// An unknown grid or a cell outside it is ignored; never clamps.
     pub fn putCellGridCluster(
         self: *Grid,
         grid_id: i64,
@@ -2585,13 +2325,8 @@ pub const Grid = struct {
         hl: u32,
         extras: []const u32,
     ) !void {
-        const sub_grid: ?*GridBuf = if (grid_id == 1)
-            null
-        else
-            self.sub_grids.getPtr(grid_id) orelse return;
-        if (grid_id == 1) {
-            if (row >= self.rows or col >= self.cols) return;
-        } else if (row >= sub_grid.?.rows or col >= sub_grid.?.cols) return;
+        const buf = self.bufFor(grid_id) orelse return;
+        if (row >= buf.rows or col >= buf.cols) return;
 
         const key = OverflowKey{ .grid_id = grid_id, .row = row, .col = col };
         var overflow_changed = false;
@@ -2599,11 +2334,7 @@ pub const Grid = struct {
             const old = self.cell_overflow.getPtr(key);
             const is_new = old == null;
             if (!cellOverflowInsertFits(self.cell_overflow.count(), is_new)) {
-                if (grid_id == 1) {
-                    self.putCell(row, col, 0xFFFD, hl);
-                } else {
-                    self.putCellSubGrid(sub_grid.?, grid_id, row, col, 0xFFFD, hl);
-                }
+                self.putCellBuf(buf, grid_id, row, col, 0xFFFD, hl);
                 return;
             }
             // Reject at the storage boundary too: callers other than redraw
@@ -2616,10 +2347,13 @@ pub const Grid = struct {
             // scrollOverflow must stay allocation-free after cells move. Grow
             // its bounded sparse scratch before publishing a new map entry.
             try self.ensureOverflowScratchCapacity(self.cell_overflow.count() + @intFromBool(is_new));
-            if (is_new) try self.ensureOverflowGridIndexCapacity(key);
-            // Publish overflow before the infallible base-cell mutation.
-            // AutoHashMap.put leaves an old entry intact on OOM.
-            try self.cell_overflow.put(self.alloc, key, value);
+            // Every fallible step precedes the first publish, so OOM leaves
+            // neither a map entry nor an empty per-grid index behind.
+            if (is_new) {
+                try self.cell_overflow.ensureUnusedCapacity(self.alloc, 1);
+                try self.ensureOverflowGridIndexCapacity(key);
+            }
+            self.cell_overflow.putAssumeCapacity(key, value);
             if (is_new) self.addOverflowIndexAssumeCapacity(key);
         } else if (self.overflowCountForGrid(grid_id) != 0) {
             // Single-scalar cells dominate grid_line. Preserve the empty-map
@@ -2627,11 +2361,7 @@ pub const Grid = struct {
             overflow_changed = self.removeOverflowKey(key);
         }
 
-        if (grid_id == 1) {
-            self.putCell(row, col, cp, hl);
-        } else {
-            self.putCellSubGrid(sub_grid.?, grid_id, row, col, cp, hl);
-        }
+        self.putCellBuf(buf, grid_id, row, col, cp, hl);
         if (overflow_changed) self.markDirtyCellGrid(grid_id, row, col);
     }
 
@@ -2645,13 +2375,9 @@ pub const Grid = struct {
         rows_in: i32,
         cols: i32,
     ) void {
-        var target_rows = self.rows;
-        var target_cols = self.cols;
-        if (grid_id != 1) {
-            const target = self.sub_grids.get(grid_id) orelse return;
-            target_rows = target.rows;
-            target_cols = target.cols;
-        }
+        const target = self.bufForConst(grid_id) orelse return;
+        const target_rows = target.rows;
+        const target_cols = target.cols;
         if (target_rows == 0 or target_cols == 0 or rows_in == 0) return;
 
         // Establish one normalized region/delta used by cells, overflow
@@ -2669,16 +2395,8 @@ pub const Grid = struct {
         if (rows > height_i32) rows = height_i32;
         if (rows < -height_i32) rows = -height_i32;
 
-        if (grid_id == 1) {
-            if (scrollChangesCells(self.rows, self.cols, top, bot, left, right, rows)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-        } else if (self.sub_grids.get(grid_id)) |sg| {
-            if ((self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) and
-                scrollChangesCells(sg.rows, sg.cols, top, bot, left, right, rows))
-            {
-                self.glyph_working_set_rev +%= 1;
-            }
+        if (self.gridShown(grid_id) and scrollChangesCells(target_rows, target_cols, top, bot, left, right, rows)) {
+            self.glyph_working_set_rev +%= 1;
         }
 
         // Advance cursor_rev if cursor is in scroll region (cursor text may change)
@@ -2690,42 +2408,8 @@ pub const Grid = struct {
         }
 
         if (grid_id == 1) {
-            self.content_rev +%= 1;
-            if (self.pending_scroll) |*ps| {
-                if (ps.grid_id == grid_id and ps.top == top and ps.bot == bot and
-                    ps.left == left and ps.right == right and cols == 0)
-                {
-                    // Same grid, same region: accumulate scroll delta.
-                    // Shift previously-recorded touched rows by the new scroll amount.
-                    self.shiftTouchedRows(rows, top, bot, 0);
-                    self.scroll(top, bot, left, right, rows, cols);
-                    self.recordScrolledGrid(grid_id, rows);
-                    ps.rows = std.math.add(i32, ps.rows, rows) catch {
-                        self.scroll_fast_path_blocked = true;
-                        self.scroll_touched_count = 0;
-                        return;
-                    };
-                    return;
-                }
-                // Different grid or region: block fast path.
-                self.scroll_fast_path_blocked = true;
-                self.scroll_touched_count = 0;
-            }
             self.scroll(top, bot, left, right, rows, cols);
             self.recordScrolledGrid(grid_id, rows);
-            self.pending_scroll = .{
-                .grid_id = grid_id,
-                .top = top,
-                .bot = bot,
-                .left = left,
-                .right = right,
-                .rows = rows,
-                .cols = cols,
-                .target_rows = self.rows,
-                .target_cols = self.cols,
-                .win_pos_row = 0,
-            };
-            self.scroll_touched_count = 0;
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
@@ -2734,75 +2418,58 @@ pub const Grid = struct {
             self.subgrid_surface_vertex_count -|=
                 old_surface_vertex_count -| sg.surface_vertex_count;
             self.scrollOverflow(grid_id, top, bot, left, right, rows);
-            // Multiple scrolls in same batch block the fast path (same as global grid)
-            if (sg.last_scroll_op != null) {
-                sg.scroll_fast_path_blocked = true;
+            // A second scroll of the SAME region in one batch accumulates: the
+            // frontend shifts once by the total. Only a different region
+            // blocks, since one shift cannot describe two. Composition used to
+            // make blocking free; now it regenerates the whole grid.
+            var accumulated = false;
+            if (sg.last_scroll_op) |*prev| {
+                if (prev.top == top and prev.bot == bot and
+                    prev.left == left and prev.right == right and cols == 0)
+                {
+                    if (std.math.add(i32, prev.rows, rows)) |sum| {
+                        prev.rows = sum;
+                        accumulated = true;
+                    } else |_| {
+                        sg.scroll_fast_path_blocked = true;
+                        accumulated = true;
+                    }
+                } else {
+                    sg.scroll_fast_path_blocked = true;
+                }
             }
-            sg.last_scroll_op = .{
-                .top = top,
-                .bot = bot,
-                .left = left,
-                .right = right,
-                .rows = rows,
-                .cols = cols,
-            };
-            if (self.win_pos.get(grid_id)) |p| {
-                if (self.external_grids.contains(p.anchor_grid)) {
-                    // Float anchored to an EXTERNAL grid: it composites into
-                    // that grid's own window, not the main grid. Dirty the
-                    // scrolled region on the anchor (anchor-local rows via
-                    // dirtyCompositedRow) instead of spuriously rebuilding
-                    // the main grid at mistranslated rows and installing a
-                    // main-grid pending_scroll for a float it never draws.
-                    var r: u32 = top;
-                    while (r < bot) : (r += 1) {
-                        self.dirtyCompositedRow(p, r);
-                    }
-                    self.recordScrolledGrid(grid_id, rows);
-                    return;
-                }
-                self.content_rev +%= 1;
-                if (self.pending_scroll) |*ps| {
-                    if (ps.grid_id == grid_id and ps.top == top and ps.bot == bot and
-                        ps.left == left and ps.right == right and cols == 0)
-                    {
-                        // Same grid, same region: accumulate scroll delta.
-                        self.shiftTouchedRows(rows, top, bot, p.row);
-                        // Saturating: see shiftTouchedRows' guard above.
-                        self.markDirtyRect(p.row +| top, p.row +| bot);
-                        // Record here as well as on the fallthrough below: the
-                        // notification carries the distance the content moved,
-                        // and every accumulated scroll of this region moves it.
-                        self.recordScrolledGrid(grid_id, rows);
-                        ps.rows = std.math.add(i32, ps.rows, rows) catch {
-                            self.scroll_fast_path_blocked = true;
-                            self.scroll_touched_count = 0;
-                            return;
-                        };
-                        return;
-                    }
-                    // Different grid or region: block fast path.
-                    self.scroll_fast_path_blocked = true;
-                    self.scroll_touched_count = 0;
-                }
-                // Saturating: see shiftTouchedRows' guard above.
-                self.markDirtyRect(p.row +| top, p.row +| bot);
-                self.pending_scroll = .{
-                    .grid_id = grid_id,
+            if (!accumulated) {
+                sg.last_scroll_op = .{
                     .top = top,
                     .bot = bot,
                     .left = left,
                     .right = right,
                     .rows = rows,
                     .cols = cols,
-                    .target_rows = sg.rows,
-                    .target_cols = sg.cols,
-                    .win_pos_row = p.row,
                 };
-                self.scroll_touched_count = 0;
             }
-            // External grids (not in win_pos) do not affect global grid
-            // content_rev, dirty state, or pending_scroll.
+            // A window grid is its own layer on either surface: its root's
+            // cells under it are untouched, so nothing on the root is dirtied
+            // or scheduled for a shift here.
+
+            // A float anchored to an EXTERNAL grid lives in that grid's own
+            // rows, and sg.scroll just moved this grid's dirty marks with the
+            // content — unsetting every band row whose source was clean. The
+            // band must be re-marked AFTER the shift, or the frontend drags
+            // the float's pixels along and nothing repaints them. Neovim
+            // usually re-announces the float after the grid_scroll, but not on
+            // the first shift of a gesture, so the core cannot depend on it.
+            // Bitset sets only; the scan is over composited windows, of which
+            // the ones anchored here are the floats this grid carries.
+            if (self.external_grids.contains(grid_id)) {
+                var float_it = self.win_pos.iterator();
+                while (float_it.next()) |fe| {
+                    const fp = fe.value_ptr.*;
+                    if (fp.anchor_grid != grid_id) continue;
+                    const fsg = self.sub_grids.get(fe.key_ptr.*) orelse continue;
+                    self.dirtyLayerBand(fp, fsg.rows);
+                }
+            }
 
             self.recordScrolledGrid(grid_id, rows);
         }
@@ -2815,13 +2482,11 @@ pub const Grid = struct {
     /// exactly the distance the content travelled, which the notification alone
     /// could not tell it.
     fn recordScrolledGrid(self: *Grid, grid_id: i64, rows_delta: i32) void {
-        if (grid_id == 1) {
-            self.main_scroll_notify_pending = true;
-            self.main_scroll_notify_rows +|= rows_delta;
-        } else if (self.sub_grids.getPtr(grid_id)) |sg| {
-            sg.scroll_notify_pending = true;
-            sg.scroll_notify_rows +|= rows_delta;
-            sg.row_scroll_notify_pending = true;
+        if (self.bufFor(grid_id)) |buf| {
+            buf.scroll_notify_pending = true;
+            buf.scroll_notify_rows +|= rows_delta;
+            // Grid 1 has no row-shift path.
+            if (grid_id != 1) buf.row_scroll_notify_pending = true;
         }
 
         // Check if already recorded
@@ -2843,17 +2508,43 @@ pub const Grid = struct {
     /// Zero for a grid with nothing pending, which is also what a caller that
     /// asks about an unknown grid gets.
     pub fn scrolledGridNotifyRows(self: *const Grid, grid_id: i64) i32 {
-        if (grid_id == 1) return self.main_scroll_notify_rows;
-        if (self.sub_grids.get(grid_id)) |sg| return sg.scroll_notify_rows;
-        return 0;
+        const buf = self.bufForConst(grid_id) orelse return 0;
+        return buf.scroll_notify_rows;
+    }
+
+    /// Whether this redraw batch carried a scroll on any grid.
+    pub fn batchScrolled(self: *const Grid) bool {
+        return self.main_buf.scroll_notify_pending or
+            self.scrolled_grid_count != 0 or
+            self.scrolled_grid_overflow;
+    }
+
+    /// Record Neovim's answer for window `win_id` and apply it to the float
+    /// that shows it.
+    pub fn setFloatFollows(self: *Grid, win_id: i64, follows: bool) void {
+        self.float_follows.put(self.alloc, win_id, follows) catch return;
+        var it = self.grid_win_ids.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != win_id) continue;
+            if (!self.win_layer.contains(e.key_ptr.*)) continue;
+            if (self.win_pos.getPtr(e.key_ptr.*)) |pos| pos.follows_scroll = follows;
+        }
+    }
+
+    /// Queue `win_id` for a follows-scroll query unless it is answered or
+    /// already queued. OOM leaves it unasked, which reads as not following.
+    fn wantFloatConfig(self: *Grid, win_id: i64) void {
+        if (win_id <= 0 or self.float_follows.contains(win_id)) return;
+        for (self.float_config_wanted.items) |w| if (w == win_id) return;
+        self.float_config_wanted.append(self.alloc, win_id) catch {};
     }
 
     /// Clear scrolled grid tracking (called after flush notification).
     pub fn clearScrolledGrids(self: *Grid) void {
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
-        self.main_scroll_notify_pending = false;
-        self.main_scroll_notify_rows = 0;
+        self.main_buf.scroll_notify_pending = false;
+        self.main_buf.scroll_notify_rows = 0;
         var sg_it = self.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
             sg.scroll_notify_pending = false;
@@ -2867,12 +2558,9 @@ pub const Grid = struct {
     /// was not reached. In overflow mode the authoritative per-grid bits remain
     /// the source of truth; compacting still keeps diagnostics consistent.
     pub fn consumeScrolledGridNotification(self: *Grid, grid_id: i64) void {
-        if (grid_id == 1) {
-            self.main_scroll_notify_pending = false;
-            self.main_scroll_notify_rows = 0;
-        } else if (self.sub_grids.getPtr(grid_id)) |sg| {
-            sg.scroll_notify_pending = false;
-            sg.scroll_notify_rows = 0;
+        if (self.bufFor(grid_id)) |buf| {
+            buf.scroll_notify_pending = false;
+            buf.scroll_notify_rows = 0;
         }
 
         var index: usize = 0;
@@ -2887,51 +2575,26 @@ pub const Grid = struct {
         }
     }
 
-    pub fn noteGridLine(self: *Grid, grid_id: i64, redraw_epoch: u64) void {
-        // Only advance content_rev for grids composited on the main window.
-        // grid_id==1 is the global grid (always composited).
-        // Other grids are composited when they have a win_pos entry — except
-        // floats anchored to an external grid, which composite into that
-        // grid's own window: mark the anchor dirty instead of forcing a
-        // spurious main rebuild.
-        // External grids (not in win_pos) don't affect main window rendering.
-        if (grid_id == 1) {
-            self.content_rev +%= 1;
-        } else if (self.win_pos.get(grid_id)) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
-                if (self.sub_grids.getPtr(p.anchor_grid)) |asg| asg.dirty = true;
-            } else {
-                self.content_rev +%= 1;
-            }
-        }
-
+    pub fn noteGridLine(self: *Grid, grid_id: i64) void {
         if (grid_id == 1) return;
 
         if (self.win_layer.getPtr(grid_id)) |layer| {
             self.layer_order_counter +%= 1;
             layer.order = self.layer_order_counter;
             self.glyph_working_set_rev +%= 1;
-            self.advanceLayoutGeneration();
-
-            if (layer.coverage_dirty_epoch == redraw_epoch) return;
-            layer.coverage_dirty_epoch = redraw_epoch;
-
-            // Changing the tie-break order can change overlap results across
-            // the float's entire coverage, not only the grid_line row that
-            // triggered this update. Recompose every covered row in the
-            // actual target surface (main or an external anchor).
-            if (self.win_pos.get(grid_id)) |p| {
-                const h: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-                if (self.external_grids.contains(p.anchor_grid)) {
-                    var r: u32 = 0;
-                    while (r < h) : (r += 1) {
-                        self.dirtyCompositedRow(p, r);
-                    }
-                } else {
-                    self.markDirtyRect(p.row, p.row +| h);
-                }
-            }
+            // A tie-break order that changes the paint order changes the
+            // published layout, and the frontend repaints what that exposes.
         }
+    }
+
+    /// Record a destroyed grid for the next flush's on_grid_destroy. The
+    /// caller reserved the slot: there is no other path that tells the
+    /// frontend to release the grid's rows.
+    fn recordDestroyedGrid(self: *Grid, grid_id: i64) void {
+        for (self.destroyed_pending.items) |id| {
+            if (id == grid_id) return;
+        }
+        self.destroyed_pending.appendAssumeCapacity(grid_id);
     }
 
     pub fn destroyGrid(self: *Grid, grid_id: i64) !void {
@@ -2945,29 +2608,38 @@ pub const Grid = struct {
             // metadata. Reject instead of destroying.
             return;
         }
-        const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
-        const new_accounting = if (was_visible)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = null,
-                .external = false,
-            })
-        else
-            LayoutAccounting{};
+        // Before anything is removed, so a failure keeps the grid whole.
+        try self.destroyed_pending.ensureUnusedCapacity(self.alloc, 1);
+        const was_external = self.external_grids.contains(grid_id);
+        const was_visible = self.win_pos.contains(grid_id) or was_external;
 
-        // Capture before removal below: needed to dirty the right target
-        // (main grid vs. an external anchor) once grid_id's own state is gone.
-        const old_pos = self.win_pos.get(grid_id);
-        const old_rows: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
+        // Neovim never reuses a window handle.
+        if (self.grid_win_ids.get(grid_id)) |win_id| _ = self.float_follows.remove(win_id);
 
         if (self.sub_grids.fetchRemove(grid_id)) |kv| {
             var buf = kv.value;
+            std.debug.assert(self.total_grid_cells >= buf.cells.len);
             self.total_grid_cells -= buf.cells.len;
             self.subgrid_surface_vertex_count -|= buf.surface_vertex_count;
             buf.deinit(self.alloc);
         }
+        self.recordDestroyedGrid(grid_id);
+        // A scroll earlier in this batch must not reach the frontend as an
+        // on_grid_scroll for a grid that no longer exists.
+        self.consumeScrolledGridNotification(grid_id);
         self.clearOverflowForGrid(grid_id);
+        // Neovim sends no win_float_pos for a float anchored to a closed
+        // float (window.c win_close skips win_comp_pos for it) and keeps it
+        // where it was. GridPos is already in the surface's cells, so naming
+        // the surface keeps the float in place; it follows no parent scroll.
+        if (self.surfaceForGrid(grid_id)) |surface| {
+            var it = self.win_pos.valueIterator();
+            while (it.next()) |p| {
+                if (p.anchor_grid != grid_id) continue;
+                p.anchor_grid = surface;
+                p.follows_scroll = false;
+            }
+        }
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
@@ -2979,32 +2651,17 @@ pub const Grid = struct {
         _ = self.external_grids.remove(grid_id);
         _ = self.pending_ext_window_grids.remove(grid_id);
         _ = self.ext_windows_grids.remove(grid_id);
-        _ = self.external_grid_target_sizes.remove(grid_id);
 
-        if (old_pos) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
-                // Float anchored to an external grid: composites into that
-                // grid's own window (same reasoning as clearGrid/hideWin/
-                // resizeGrid above). markAllDirty() only touches the MAIN
-                // grid and would do nothing for this float's actual
-                // container, leaving its last-drawn pixels on screen forever.
-                var r: u32 = 0;
-                while (r < old_rows) : (r += 1) {
-                    self.dirtyCompositedRow(p, r);
-                }
-            } else {
-                self.markAllDirty();
-            }
-        } else {
-            self.markAllDirty();
-        }
+        // The pixels the layer covered are the frontend's to repaint, from the
+        // layout it publishes. The last layer going away also flips every root
+        // row's `skip_default_bg`; the flush regenerates those
+        // (regenerateRootsWhoseDefaultBgRuleFlipped).
 
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
             self.cursor_rev +%= 1;
         }
         if (was_visible) self.glyph_working_set_rev +%= 1;
-        if (was_visible) self.commitLayoutAccounting(new_accounting);
     }
 
     pub fn setWinPos(self: *Grid, grid_id: i64, win_id: i64, row: u32, col: u32) !void {
@@ -3037,19 +2694,7 @@ pub const Grid = struct {
         // (redraw_handler.zig) stop treating this grid as a float.
         const was_float = self.win_layer.contains(grid_id);
         const old_pos_before = self.win_pos.get(grid_id);
-        const old_contribution = if (old_pos_before) |old_pos|
-            self.layoutContribution(grid_id, old_pos, .{})
-        else
-            LayoutAccounting{};
         const new_pos = GridPos{ .row = row, .col = col };
-        const new_contribution = if (!is_external)
-            self.layoutContribution(grid_id, new_pos, .{})
-        else
-            LayoutAccounting{};
-        const new_accounting = if (!is_external)
-            try self.layoutAccountingAfterDelta(old_contribution, new_contribution)
-        else
-            LayoutAccounting{};
 
         // Store grid_id -> winid mapping
         if (grid_win_is_new) {
@@ -3071,31 +2716,14 @@ pub const Grid = struct {
             if (old_pos.row == row and old_pos.col == col and !was_float) return;
         }
 
-        // First dirty the old range (position changed, so exposed area needs recomposition)
-        if (old_pos_opt) |old_pos| {
-            const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-            self.markDirtyRect(old_pos.row, old_pos.row +| h_old);
-        }
-
+        // The pixels the move exposes and covers are the frontend's to
+        // repaint, from the layout it publishes.
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
-
-        // Dirty the new range
-        const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-        self.markDirtyRect(row, row +| h_new);
-
-        // Bump content_rev so the next flush's need_main is true and actually
-        // recomposes the window at its new position. markDirtyRect alone is
-        // insufficient: need_main gates the whole main rebuild on content_rev,
-        // so a win_pos-only batch (layout reshuffle with unchanged content)
-        // would otherwise be dropped by the flush, which also clears the dirty
-        // rows just marked above. Mirrors the setWinFloatPos fix below.
-        self.content_rev +%= 1;
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
 
         // Only advance cursor_rev if cursor is on this grid
         if (self.cursor_grid == grid_id and self.cursor_valid) {
@@ -3114,14 +2742,6 @@ pub const Grid = struct {
             return self.setWinPos(grid_id, win_id, row, col);
         }
 
-        const new_pos = GridPos{ .row = row, .col = col };
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .position_set = true,
-            .position = new_pos,
-            .external = false,
-        });
-
         // setWinPos becomes infallible once both possible insertions have
         // capacity. Reserve before removing external visibility so OOM leaves
         // the old surface and all placement metadata untouched.
@@ -3138,14 +2758,24 @@ pub const Grid = struct {
             try self.win_pos.ensureUnusedCapacity(self.alloc, 1);
         }
 
+        // Floats it carries move from its own cells into main cells.
+        self.rebaseFloatsOnSurface(grid_id, row, col);
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
         try self.setWinPos(grid_id, win_id, row, col);
-        // setWinPos accounts for this grid's new placement. Removing the
-        // external classification can also move floats anchored to this grid
-        // into the main composite, so publish the exact prevalidated totals.
-        self.main_row_index_ref_count = new_accounting.refs;
-        self.main_row_index_layout_count = new_accounting.layouts;
+    }
+
+    /// Shift every float the surface rooted at `surface_grid` places by
+    /// (`d_row`, `d_col`), for a root whose cells change meaning.
+    fn rebaseFloatsOnSurface(self: *Grid, surface_grid: i64, d_row: i64, d_col: i64) void {
+        var it = self.win_pos.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.* == surface_grid or !self.win_layer.contains(e.key_ptr.*)) continue;
+            if (self.surfaceForGrid(e.value_ptr.anchor_grid) != surface_grid) continue;
+            const p = e.value_ptr;
+            p.row = std.math.lossyCast(u32, std.math.clamp(@as(i64, p.row) + d_row, 0, std.math.maxInt(i32)));
+            p.col = std.math.lossyCast(u32, std.math.clamp(@as(i64, p.col) + d_col, 0, std.math.maxInt(i32)));
+        }
     }
 
     pub fn setWinFloatPos(
@@ -3157,6 +2787,7 @@ pub const Grid = struct {
         zindex: i64,
         compindex: i64,
         anchor_grid: i64,
+        mouse_enabled: bool,
     ) !void {
         if (grid_id == 1) return;
         if (!gridCoordFitsFrontend(row) or !gridCoordFitsFrontend(col)) return;
@@ -3169,30 +2800,14 @@ pub const Grid = struct {
             old_pos_before.?.anchor_grid != anchor_grid or old_layer_before == null or
             old_layer_before.?.zindex != zindex or old_layer_before.?.compindex != compindex;
 
-        const follows_scroll = if (old_pos_before) |old_pos|
-            old_pos.follows_scroll or (old_pos.row != row)
-        else
-            false;
+        const follows_scroll = if (win_id > 0) self.float_follows.get(win_id) orelse false else false;
+        if (win_id > 0) self.wantFloatConfig(win_id);
         const prospective_pos = GridPos{
             .row = row,
             .col = col,
             .anchor_grid = anchor_grid,
             .follows_scroll = follows_scroll,
-        };
-        const old_contribution = if (old_pos_before) |old_pos|
-            self.layoutContribution(grid_id, old_pos, .{})
-        else
-            LayoutAccounting{};
-        const new_accounting = if (was_external)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = prospective_pos,
-                .external = false,
-            })
-        else blk: {
-            const new_contribution = self.layoutContribution(grid_id, prospective_pos, .{});
-            break :blk try self.layoutAccountingAfterDelta(old_contribution, new_contribution);
+            .mouse_enabled = mouse_enabled,
         };
 
         const grid_win_is_new = win_id > 0 and !self.grid_win_ids.contains(grid_id);
@@ -3224,37 +2839,19 @@ pub const Grid = struct {
 
         // If this grid was external, remove it from external_grids.
         // This allows a grid to transition from external back to float.
-        self.invalidateSubgridVertexSurface(grid_id);
+        // Only that transition drops the ledger: a float repositioned on its
+        // surface keeps its rows on the frontend, as a moved split does
+        // (setWinPos), and a surface change resends every row anyway.
+        if (was_external) self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
 
-        // Mark old position dirty if this float is moving
-        var affects_main = false;
         // Sticky "buffer-tracking" flag: a float that is repositioned to a new
         // row after creation (e.g. to track a buffer line as the window scrolls)
         // may pixel-follow smooth scroll. A truly fixed float never changes row
         // and so must not pixel-shift. Only set on an actual reposition (old_pos
         // exists), never on the initial placement.
-        const old_pos_opt = self.win_pos.get(grid_id);
-        if (old_pos_opt) |old_pos| {
-            const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-            // Affects the main composite unless anchored to an external grid
-            // (those float over a separate top-level window, not the main grid).
-            if (!self.external_grids.contains(old_pos.anchor_grid)) {
-                self.markDirtyRect(old_pos.row, old_pos.row +| h_old);
-                affects_main = true;
-            } else {
-                // Dirty the OLD coverage on the anchor's own sub_grid — a
-                // move/hide-then-show with no accompanying cell change would
-                // otherwise leave the vacated overlay area on that external
-                // window showing stale float pixels forever (only cell
-                // updates dirty the anchor today, via dirtyCompositedRow).
-                var r: u32 = 0;
-                while (r < h_old) : (r += 1) {
-                    self.dirtyCompositedRow(old_pos, r);
-                }
-            }
-        }
-
+        // The old coverage and the new one are the frontend's to repaint, from
+        // the layout it publishes.
         const new_pos = prospective_pos;
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
@@ -3262,36 +2859,11 @@ pub const Grid = struct {
             pos_ptr.* = new_pos;
         }
 
-        // Mark new position dirty so row-mode recomposes with float overlay.
-        // Covers editor-anchored (anchor_grid==1) and window-anchored floats
-        // (e.g. bufpos, anchor_grid>1) alike — both are composited into the main
-        // grid, so creating/moving them must trigger a recompose.
-        const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-        if (!self.external_grids.contains(anchor_grid)) {
-            self.markDirtyRect(row, row +| h_new);
-            affects_main = true;
-        } else {
-            // Same reasoning as the old-position branch above, for the NEW
-            // coverage on an external anchor.
-            var r: u32 = 0;
-            while (r < h_new) : (r += 1) {
-                self.dirtyCompositedRow(new_pos, r);
-            }
-        }
-
-        // Bump content_rev so the next flush's need_main is true and actually
-        // recomposes the float overlay at its new position. markDirtyRect alone
-        // is insufficient: need_main gates the whole main rebuild on content_rev,
-        // so a win_float_pos arriving without any accompanying content change
-        // would otherwise leave the float composited at its stale row.
-        if (affects_main) self.content_rev +%= 1;
-
         // Preserve existing order if present.
         const new_layer = WinLayer{
             .zindex = zindex,
             .compindex = compindex,
             .order = if (old_layer_before) |old| old.order else 0,
-            .coverage_dirty_epoch = if (old_layer_before) |old| old.coverage_dirty_epoch else 0,
         };
         if (win_layer_is_new) {
             self.win_layer.putAssumeCapacityNoClobber(grid_id, new_layer);
@@ -3299,50 +2871,25 @@ pub const Grid = struct {
             layer_ptr.* = new_layer;
         }
         if (working_set_changed) self.glyph_working_set_rev +%= 1;
-        if (working_set_changed) self.commitLayoutAccounting(new_accounting);
         if (self.cursor_grid == grid_id and self.cursor_valid) {
             self.cursor_rev +%= 1;
         }
     }
 
     pub fn hideWin(self: *Grid, grid_id: i64) !void {
+        // Placement is only meaningful for sub-grids, as every sibling mutator
+        // states (setWinPos, setWinFloatPos, setWinExternalPos, destroyGrid).
+        // This one lacked the guard, and a malformed `win_hide [1]` fell all
+        // the way through to the cursor invalidation at the end, blanking the
+        // main cursor until the next grid_cursor_goto.
+        if (grid_id == 1) return;
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
-        const new_accounting = if (was_visible)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = null,
-                .external = false,
-            })
-        else
-            LayoutAccounting{};
-        // Mark the rows this grid was covering as dirty before removal,
-        // so they get recomposed with the underlying grid=1 content
-        // (e.g., window separators that were previously overlaid).
-        // Only bump content_rev when win_pos existed (grid was composited);
-        // external-only grids don't affect global grid composition.
-        if (self.win_pos.get(grid_id)) |pos| {
-            if (self.external_grids.contains(pos.anchor_grid)) {
-                // Float anchored to an external grid: it composites into
-                // that grid's own window, not the main grid (same reasoning
-                // as dirtyCompositedRow/setWinFloatPos). Dirtying the main
-                // grid here would rebuild it spuriously at the wrong rows
-                // while leaving the anchor's real overlay stale.
-                const h: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-                var r: u32 = 0;
-                while (r < h) : (r += 1) {
-                    self.dirtyCompositedRow(pos, r);
-                }
-            } else {
-                if (self.sub_grids.get(grid_id)) |sg| {
-                    self.markDirtyRect(pos.row, pos.row +| sg.rows);
-                } else {
-                    self.markAllDirty();
-                }
-                self.content_rev +%= 1;
-            }
-        }
+        // The rows this grid covered are the frontend's to repaint, from the
+        // layout it publishes.
         _ = self.win_pos.remove(grid_id);
+        // The window id is unreachable once grid_win_ids drops it, so a later
+        // win_close could no longer release the answer; a re-show asks again.
+        if (self.grid_win_ids.get(grid_id)) |win_id| _ = self.float_follows.remove(win_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
@@ -3352,7 +2899,6 @@ pub const Grid = struct {
             self.cursor_rev +%= 1;
         }
         if (was_visible) self.glyph_working_set_rev +%= 1;
-        if (was_visible) self.commitLayoutAccounting(new_accounting);
     }
 
     /// Mark a grid as external (displayed in a separate top-level window).
@@ -3384,12 +2930,6 @@ pub const Grid = struct {
             }
             return false;
         }
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .position_set = true,
-            .position = null,
-            .external = true,
-        });
         try self.external_grids.ensureUnusedCapacity(self.alloc, 1);
 
         if (grid_win_is_new) {
@@ -3398,19 +2938,13 @@ pub const Grid = struct {
             win_ptr.* = win;
         }
 
-        // Save position and mark covered rows dirty before removal.
-        // Only bump content_rev when win_pos existed (grid was composited).
+        // Save position before removal. The rows it covered are the
+        // frontend's to repaint, from the layout it publishes.
         var start_row: i32 = -1;
         var start_col: i32 = -1;
         if (self.win_pos.get(grid_id)) |pos| {
             start_row = saturatingI32FromU32(pos.row);
             start_col = saturatingI32FromU32(pos.col);
-            if (self.sub_grids.get(grid_id)) |sg| {
-                self.markDirtyRect(pos.row, pos.row +| sg.rows);
-            } else {
-                self.markAllDirty();
-            }
-            self.content_rev +%= 1;
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)
@@ -3425,7 +2959,8 @@ pub const Grid = struct {
             .start_col = start_col,
         });
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
+        // Floats it carries were placed in main cells; they are in its own now.
+        self.rebaseFloatsOnSurface(grid_id, -@as(i64, @max(start_row, 0)), -@as(i64, @max(start_col, 0)));
 
         // A newly registered frontend surface has no reusable vertex state,
         // even when the GridBuf stayed clean across win_hide (tab switch).
@@ -3458,18 +2993,10 @@ pub const Grid = struct {
         if (!windowPlacementInsertFits(self.external_grids.count(), is_new)) {
             return error.TooManyWindowPlacements;
         }
-        const new_accounting = if (is_new)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .external = true,
-            })
-        else
-            LayoutAccounting{};
         if (is_new) self.invalidateSubgridVertexSurface(grid_id);
         try self.external_grids.put(self.alloc, grid_id, info);
         if (is_new) {
             self.glyph_working_set_rev +%= 1;
-            self.commitLayoutAccounting(new_accounting);
         }
     }
 
@@ -3477,14 +3004,9 @@ pub const Grid = struct {
     /// visible, and advances the atlas-recovery input only on a real removal.
     pub fn removeSyntheticExternal(self: *Grid, grid_id: i64) !bool {
         if (!self.external_grids.contains(grid_id)) return false;
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .external = false,
-        });
         self.invalidateSubgridVertexSurface(grid_id);
         if (self.external_grids.fetchRemove(grid_id) == null) return false;
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
         return true;
     }
 
@@ -3498,18 +3020,15 @@ pub const Grid = struct {
         }
     }
 
-    /// Check if a grid is external.
     pub fn isExternalGrid(self: *const Grid, grid_id: i64) bool {
         return self.external_grids.contains(grid_id);
     }
 
+    /// Ignores an unknown grid or a cell outside it, leaving the previous
+    /// cursor in place; never clamps.
     pub fn setCursor(self: *Grid, grid_id: i64, row: u32, col: u32) void {
-        if (grid_id == 1) {
-            if (row >= self.rows or col >= self.cols) return;
-        } else {
-            const sub_grid = self.sub_grids.get(grid_id) orelse return;
-            if (row >= sub_grid.rows or col >= sub_grid.cols) return;
-        }
+        const buf = self.bufForConst(grid_id) orelse return;
+        if (row >= buf.rows or col >= buf.cols) return;
 
         const changed =
             (!self.cursor_valid) or
@@ -3517,57 +3036,12 @@ pub const Grid = struct {
             (self.cursor_row != row) or
             (self.cursor_col != col);
 
-        // Record previous cursor row for scroll-aware flush (only first move per batch).
-        // Stored as global grid coordinate (offset by win_pos for sub-grids).
-        if (changed and self.prev_cursor_row == null and self.cursor_valid) {
-            const win_offset: u32 = if (self.cursor_grid != 1)
-                if (self.win_pos.get(self.cursor_grid)) |p| p.row else 0
-            else
-                0;
-            self.prev_cursor_row = win_offset +| self.cursor_row;
-            self.prev_cursor_grid = self.cursor_grid;
-
-            // Note: sub_grid prev_cursor_row is NOT set here because external
-            // grids render cursor as a separate layer (not inline in row vertices),
-            // so no row regeneration is needed when cursor moves.
-        }
-
         self.cursor_grid = grid_id;
         self.cursor_row = row;
         self.cursor_col = col;
         self.cursor_valid = true;
 
         if (changed) self.cursor_rev +%= 1;
-    }
-
-    /// Return the current cursor row in global-grid coordinates when the cursor is
-    /// on the specified grid. Returns null if the cursor is hidden or on another grid.
-    pub fn currentCursorMainRow(self: *const Grid, grid_id: i64) ?u32 {
-        if (!self.cursor_valid or self.cursor_grid != grid_id) return null;
-
-        const win_offset: u32 = if (grid_id != 1)
-            if (self.win_pos.get(grid_id)) |p| p.row else 0
-        else
-            0;
-
-        return win_offset +| self.cursor_row;
-    }
-
-    /// Return the previous cursor row after applying the active scroll operation.
-    /// This converts the pre-scroll screen row into the post-scroll screen row,
-    /// which is the row that must be regenerated to clear old cursor text.
-    pub fn prevCursorMainRowAfterScroll(self: *const Grid, scroll_op: ScrollOp) ?u32 {
-        const prev_row = self.prev_cursor_row orelse return null;
-        const prev_grid = self.prev_cursor_grid orelse return null;
-        if (prev_grid != scroll_op.grid_id) return prev_row;
-
-        const shifted = @as(i64, prev_row) - @as(i64, scroll_op.rows);
-        if (shifted < 0) return null;
-
-        const max_rows = @as(i64, scroll_op.win_pos_row) + @as(i64, scroll_op.target_rows);
-        if (shifted >= max_rows) return null;
-
-        return @intCast(shifted);
     }
 
     /// Set viewport info from win_viewport event.
@@ -3585,16 +3059,14 @@ pub const Grid = struct {
         // Neovim emits viewport metadata for a live grid. Ignore malformed
         // unknown IDs instead of creating an independently unbounded map that
         // bypasses the subgrid count and metadata budgets.
-        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) return;
+        const buf = self.bufForConst(grid_id) orelse return;
         // A movement larger than the window is a jump (gg, G, a tag jump), not
         // a scroll: Neovim documents scroll_delta as approximate past a screen,
         // nothing scrolled off the edge to retain, and a sub-cell offset cannot
         // smooth it anyway. Such a jump also invalidates any remainder still
         // waiting, so the running total restarts from it rather than carrying
         // a stale one that would later be reported as movement.
-        const window_rows: i64 = if (grid_id == 1)
-            @intCast(self.rows)
-        else if (self.sub_grids.get(grid_id)) |sg| @intCast(sg.rows) else 0;
+        const window_rows: i64 = buf.rows;
         const is_jump = window_rows > 0 and (scroll_delta > window_rows or scroll_delta < -window_rows);
         const previous = self.viewport.get(grid_id);
         const carried: i64 = if (is_jump)
@@ -3656,7 +3128,7 @@ pub const Grid = struct {
         // them here left that window's winbar row inside the scrollable area
         // for the rest of the session. Bounded by the same budget as the
         // sub-grid metadata it accompanies.
-        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) {
+        if (self.bufForConst(grid_id) == null) {
             const inserts_new = !self.viewport_margins.contains(grid_id);
             if (!subgridInsertFits(self.viewport_margins.count(), inserts_new)) return;
             try self.viewport_margins.put(self.alloc, grid_id, .{
@@ -3686,7 +3158,6 @@ pub const Grid = struct {
         try self.viewport_margins.put(self.alloc, grid_id, new_margins);
 
         if (grid_id == 1) {
-            self.content_rev +%= 1;
             self.markAllDirty();
             return;
         }
@@ -3696,12 +3167,7 @@ pub const Grid = struct {
         // harmless for composited grids, whose containing rows are dirtied
         // below so retained main/external-anchor row buffers are replaced.
         sg.markAllDirty();
-        if (self.win_pos.get(grid_id)) |p| {
-            var row: u32 = 0;
-            while (row < sg.rows) : (row += 1) {
-                self.dirtyCompositedRow(p, row);
-            }
-        }
+        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, sg.rows);
     }
 
     /// Get viewport margins for a grid. Returns default (all zeros) if not set.
@@ -3710,18 +3176,12 @@ pub const Grid = struct {
         // Clamped on the way out, not on the way in: margins can be kept for a
         // grid whose size has not arrived yet, and clamping them against a size
         // of zero would erase them permanently.
-        var rows = self.rows;
-        var cols = self.cols;
-        if (grid_id != 1) {
-            const sg = self.sub_grids.get(grid_id) orelse return .{};
-            rows = sg.rows;
-            cols = sg.cols;
-        }
+        const buf = self.bufForConst(grid_id) orelse return .{};
         return .{
-            .top = @min(stored.top, rows),
-            .bottom = @min(stored.bottom, rows),
-            .left = @min(stored.left, cols),
-            .right = @min(stored.right, cols),
+            .top = @min(stored.top, buf.rows),
+            .bottom = @min(stored.bottom, buf.rows),
+            .left = @min(stored.left, buf.cols),
+            .right = @min(stored.right, buf.cols),
         };
     }
 
@@ -3743,6 +3203,12 @@ pub const Grid = struct {
     // =========================================================================
     // ext_cmdline methods
     // =========================================================================
+
+    /// Widest the cmdline may grow: screen_cols, else the main grid's cols;
+    /// 0 while neither is known.
+    pub fn cmdlineMaxCols(self: *const Grid) u32 {
+        return if (self.screen_cols != 0) self.screen_cols else self.cols;
+    }
 
     /// Handle cmdline_show event.
     pub fn setCmdlineShow(
@@ -3801,12 +3267,8 @@ pub const Grid = struct {
         }
         state.prompt = new_prompt;
 
-        const indent_limit = if (self.screen_cols != 0)
-            @min(self.screen_cols, MAX_GRID_COLS)
-        else if (self.cols != 0)
-            @min(self.cols, MAX_GRID_COLS)
-        else
-            MAX_GRID_COLS;
+        const max_cols = self.cmdlineMaxCols();
+        const indent_limit = if (max_cols != 0) @min(max_cols, MAX_GRID_COLS) else MAX_GRID_COLS;
         state.indent = @min(indent, indent_limit);
         state.level = level;
         state.prompt_hl_id = prompt_hl_id;
@@ -3860,27 +3322,14 @@ pub const Grid = struct {
     }
 
     /// Handle cmdline_block_show event.
+    /// Replace the block with `lines`. Each line goes through
+    /// `appendCmdlineBlock`, whose body this used to repeat: the same dup of
+    /// every chunk's text out of arena memory, under the same errdefer that
+    /// frees the line being built and leaves the lines already appended — a
+    /// partial block, which is what the caller saw on failure either way.
     pub fn setCmdlineBlockShow(self: *Grid, lines: []const []const CmdlineChunk) !void {
         self.cmdline_block.clear(self.alloc);
-        for (lines) |line| {
-            var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-            errdefer {
-                for (line_chunks.items) |chunk| {
-                    if (chunk.text.len > 0) self.alloc.free(chunk.text);
-                }
-                line_chunks.deinit(self.alloc);
-            }
-            // Dup each chunk's text (arena memory may be freed later)
-            for (line) |chunk| {
-                const duped_text = try self.alloc.dupe(u8, chunk.text);
-                errdefer self.alloc.free(duped_text);
-                try line_chunks.append(self.alloc, CmdlineChunk{
-                    .hl_id = chunk.hl_id,
-                    .text = duped_text,
-                });
-            }
-            try self.cmdline_block.lines.append(self.alloc, line_chunks);
-        }
+        for (lines) |line| try self.appendCmdlineBlock(line);
         self.cmdline_block.visible = true;
         self.cmdline_dirty = true;
     }
@@ -3913,21 +3362,11 @@ pub const Grid = struct {
         self.cmdline_dirty = true;
     }
 
-    /// Get cmdline state for a level.
     pub fn getCmdlineState(self: *const Grid, level: u32) ?*const CmdlineState {
         return self.cmdline_states.getPtr(level);
     }
 
-    /// Check if any cmdline is visible.
-    pub fn isCmdlineVisible(self: *const Grid) bool {
-        var it = self.cmdline_states.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.visible) return true;
-        }
-        return false;
-    }
 
-    /// Clear cmdline dirty flag.
     pub fn clearCmdlineDirty(self: *Grid) void {
         self.cmdline_dirty = false;
     }
@@ -3984,7 +3423,6 @@ pub const Grid = struct {
         self.popupmenu.changed = true;
     }
 
-    /// Clear popupmenu changed flag.
     pub fn clearPopupmenuChanged(self: *Grid) void {
         self.popupmenu.changed = false;
     }
@@ -4058,7 +3496,6 @@ pub const Grid = struct {
         self.tabline_state.dirty = true;
     }
 
-    /// Clear tabline dirty flag.
     pub fn clearTablineDirty(self: *Grid) void {
         self.tabline_state.dirty = false;
     }
@@ -4101,14 +3538,15 @@ pub const Grid = struct {
                 @memcpy(cm.kind[0..klen], kind[0..klen]);
                 cm.kind_len = klen;
                 // Copy text from chunks
-                if (replace_last) cm.text_len = 0; // Reset text for replace
+                if (replace_last) {
+                    cm.text_len = 0; // Reset text for replace
+                    cm.text_full = false;
+                }
                 var primary_hl: u32 = cm.hl_id;
                 for (content) |chunk| {
                     if (primary_hl == 0) primary_hl = chunk.hl_id;
-                    const clen = @min(chunk.text.len, cm.text.len - cm.text_len);
-                    @memcpy(cm.text[cm.text_len..][0..clen], chunk.text[0..clen]);
-                    cm.text_len += clen;
-                    if (cm.text_len >= cm.text.len) break;
+                    cm.appendText(chunk.text);
+                    if (cm.text_full) break;
                 }
                 cm.hl_id = primary_hl;
                 cm.id = msg_id;
@@ -4148,10 +3586,20 @@ pub const Grid = struct {
             }
 
             if (msg_to_replace) |msg| {
+                // The replacement is routed by its own kind: a search_count
+                // replacing its search_cmd went to the search_cmd's view.
+                const new_kind: ?[]const u8 = if (std.mem.eql(u8, msg.kind, kind))
+                    null
+                else if (kind.len > 0) try self.alloc.dupe(u8, kind) else "";
+                errdefer if (new_kind) |k| if (k.len > 0) self.alloc.free(k);
                 try setMessageContentBounded(msg, self.alloc, content, false);
+                if (new_kind) |k| {
+                    if (msg.kind.len > 0) self.alloc.free(msg.kind);
+                    msg.kind = k;
+                }
+                msg.replace_last = replace_last;
                 msg.history = history;
                 msg.append = append;
-                self.message_state.visible = true;
                 self.message_state.msg_dirty = true;
                 return;
             }
@@ -4161,7 +3609,6 @@ pub const Grid = struct {
         if (append and self.message_state.messages.items.len > 0) {
             const last_msg = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
             try setMessageContentBounded(last_msg, self.alloc, content, true);
-            self.message_state.visible = true;
             self.message_state.msg_dirty = true;
             return;
         }
@@ -4179,7 +3626,6 @@ pub const Grid = struct {
             );
         } else 0;
 
-        // Create new message
         var new_msg = Message{
             .id = msg_id,
             .kind = if (kind.len > 0) try self.alloc.dupe(u8, kind) else "",
@@ -4205,35 +3651,7 @@ pub const Grid = struct {
             self.message_state.evictOldestMessages(self.alloc, eviction_count);
         }
         self.message_state.messages.appendAssumeCapacity(new_msg);
-        self.message_state.visible = true;
         self.message_state.msg_dirty = true;
-
-        // Save snapshot for pending messages (survives msg_clear)
-        if (self.message_state.pending_count < self.message_state.pending_messages.len) {
-            var pm = &self.message_state.pending_messages[self.message_state.pending_count];
-            pm.* = .{}; // Reset
-            const kind_copy_len = @min(kind.len, pm.kind.len);
-            @memcpy(pm.kind[0..kind_copy_len], kind[0..kind_copy_len]);
-            pm.kind_len = kind_copy_len;
-
-            // Build text from chunks
-            var text_len: usize = 0;
-            var primary_hl_id: u32 = 0;
-            for (content) |chunk| {
-                if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-                const copy_len = @min(chunk.text.len, pm.text.len - text_len);
-                @memcpy(pm.text[text_len..][0..copy_len], chunk.text[0..copy_len]);
-                text_len += copy_len;
-                if (text_len >= pm.text.len) break;
-            }
-            pm.text_len = text_len;
-            pm.hl_id = primary_hl_id;
-            pm.replace_last = replace_last;
-            pm.history = history;
-            pm.append = append;
-            pm.id = msg_id;
-            self.message_state.pending_count += 1;
-        }
     }
 
     /// Handle msg_clear event.
@@ -4246,7 +3664,6 @@ pub const Grid = struct {
             self.message_state.confirm_msg.clear();
             self.message_state.confirm_dirty = true;
         }
-        // Note: Do NOT clear pending_show here - it should survive msg_clear
     }
 
     /// Replace a status channel's content. Showmode, showcmd and ruler are
@@ -4275,7 +3692,6 @@ pub const Grid = struct {
 
     /// Handle msg_history_show event.
     pub fn setMsgHistoryShow(self: *Grid, entries: []const MsgHistoryEntry, prev_cmd: bool) !void {
-        // Clear existing state
         self.msg_history_state.clear(self.alloc);
 
         // Copy entries
@@ -4300,7 +3716,6 @@ pub const Grid = struct {
         self.msg_history_state.dirty = true;
     }
 
-    /// Clear msg_history_show dirty flag.
     pub fn clearMsgHistoryDirty(self: *Grid) void {
         self.msg_history_state.dirty = false;
     }
@@ -4310,45 +3725,49 @@ pub const Grid = struct {
         self.msg_history_state.clear(self.alloc);
         self.msg_history_state.dirty = true; // Mark dirty so sendMsgHistoryShow gets called
     }
-
-    /// Clear message dirty flags.
-    pub fn clearMessageDirty(self: *Grid) void {
-        self.message_state.msg_dirty = false;
-        self.message_state.confirm_dirty = false;
-        self.message_state.status_dirty = @splat(false);
-    }
 };
 
-test "the global grid always has a dirty bit per row, a sub-grid may not" {
+test "the global grid and a sub-grid answer dirtiness identically" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
 
-    // Grid.resize goes through ensureDirtyCapacity every time, so readers can
-    // index dirty_rows by row with no length check. Callers in flush.zig rely
-    // on this; if it ever stops holding they index past the bitset.
+    // Guards the indexing hazard the old bit_length invariant used to cover,
+    // now that only isRowDirty / markDirtyRow / markDirtyRect bounds-check.
     try grid.resize(24, 80);
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
-    try grid.resize(50, 80); // grow
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
-    try grid.resize(10, 80); // shrink: the bitset is allowed to stay long
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    grid.clearDirty();
+    grid.markDirtyRow(23);
+    try std.testing.expect(grid.isRowDirty(23));
+    try std.testing.expect(!grid.isRowDirty(0));
+    try std.testing.expect(!grid.isRowDirty(24));
 
-    // The zero-cell shape needs its own grid. Reaching it after a larger
-    // resize proves nothing: the bitset only ever grows, so a stale length
-    // from an earlier shape would satisfy the assertion on its own.
+    try grid.resize(50, 80); // grow: resize marks everything dirty again
+    try std.testing.expect(grid.isRowDirty(49));
+    try std.testing.expect(!grid.isRowDirty(50));
+
+    try grid.resize(10, 80); // shrink
+    try std.testing.expect(grid.isRowDirty(9));
+    try std.testing.expect(!grid.isRowDirty(10));
+
+    // The zero-cell shape needs its own grid: reached after a larger resize, a
+    // stale bitset would satisfy the assertions on its own.
     var zero_cols = Grid.init(std.testing.allocator);
     defer zero_cols.deinit();
     try zero_cols.resize(30, 0);
     try std.testing.expectEqual(@as(u32, 30), zero_cols.rows);
-    try std.testing.expect(zero_cols.dirty_rows.bit_length >= zero_cols.rows);
+    try std.testing.expectEqual(@as(usize, 0), zero_cols.main_buf.dirty_rows.bit_length);
+    try std.testing.expect(zero_cols.isRowDirty(0)); // via dirty_all
+    zero_cols.clearDirty();
+    zero_cols.markDirtyRow(0); // must not index the empty bitset
+    try std.testing.expect(!zero_cols.isRowDirty(0));
 
-    // GridBuf makes no such promise: a zero-cell shape skips the bitset while
-    // rows keeps the requested value. This is why the sub-grid paths in
-    // flush.zig test bit_length before isSet.
     try grid.resizeGrid(2, 8, 0);
     const sub = grid.sub_grids.getPtr(2).?;
     try std.testing.expectEqual(@as(u32, 8), sub.rows);
     try std.testing.expectEqual(@as(usize, 0), sub.dirty_rows.bit_length);
+    try std.testing.expect(sub.isRowDirty(0));
+    sub.clearDirtyContent();
+    sub.markDirtyRow(0);
+    try std.testing.expect(!sub.isRowDirty(0));
 }
 
 test "reopening a clean external grid regenerates every row" {
@@ -4365,10 +3784,13 @@ test "reopening a clean external grid regenerates every row" {
     try grid.hideWin(2);
     try std.testing.expect(try grid.setWinExternalPos(2, 42));
     try std.testing.expect(sub_grid.dirty);
-    var dirty_rows = sub_grid.dirty_rows.iterator(.{});
-    var dirty_count: usize = 0;
-    while (dirty_rows.next()) |_| dirty_count += 1;
-    try std.testing.expectEqual(@as(usize, 4), dirty_count);
+    // markAllDirty is O(1) via dirty_all, so assert isRowDirty, not the bits.
+    try std.testing.expect(sub_grid.anyDirty());
+    var r: u32 = 0;
+    while (r < sub_grid.rows) : (r += 1) {
+        try std.testing.expect(sub_grid.isRowDirty(r));
+    }
+    try std.testing.expectEqual(@as(u32, 4), sub_grid.rows);
 }
 
 fn checkExternalRegistrationAllocationFailure(alloc: std.mem.Allocator) !void {
@@ -4382,13 +3804,13 @@ fn checkExternalRegistrationAllocationFailure(alloc: std.mem.Allocator) !void {
     // composited position whose transactional removal is under test.
     _ = grid.grid_win_ids.remove(2);
     const old_pos = grid.win_pos.get(2).?;
-    const old_rev = grid.content_rev;
+    grid.clearDirty();
 
     _ = grid.setWinExternalPos(2, 42) catch |err| {
         try std.testing.expect(!grid.external_grids.contains(2));
         try std.testing.expect(!grid.grid_win_ids.contains(2));
         try std.testing.expectEqual(old_pos, grid.win_pos.get(2).?);
-        try std.testing.expectEqual(old_rev, grid.content_rev);
+        try std.testing.expect(!grid.main_buf.anyDirty());
         return err;
     };
 }
@@ -4415,6 +3837,27 @@ fn checkExternalPromotionAllocationFailure(alloc: std.mem.Allocator) !void {
         try std.testing.expectEqual(old_rev, grid.glyph_working_set_rev);
         return err;
     };
+}
+
+test "a grid that stops being an external root forgets its default-background rule" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(8, 16);
+    try grid.resizeGrid(2, 3, 5);
+    try grid.resizeGrid(3, 2, 4);
+
+    // Under blur, an external root hosting a float had its rows generated
+    // with the default background dropped. As a layer on the main surface it
+    // must paint it again; the row loop reads this flag as the rule.
+    try std.testing.expect(try grid.setWinExternalPos(2, 42));
+    grid.sub_grids.getPtr(2).?.skip_default_bg_last = true;
+    try grid.promoteExternalToWinPos(2, 42, 1, 2);
+    try std.testing.expect(!grid.sub_grids.get(2).?.skip_default_bg_last);
+
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    grid.sub_grids.getPtr(3).?.skip_default_bg_last = true;
+    try grid.setWinFloatPos(3, 43, 0, 0, 50, 0, 1, true);
+    try std.testing.expect(!grid.sub_grids.get(3).?.skip_default_bg_last);
 }
 
 test "external promotion OOM preserves external state" {
@@ -4516,7 +3959,6 @@ fn checkMessageSingletonReplacementAllocationFailure(alloc: std.mem.Allocator) !
     try grid.setMsgShow("echo", &initial, false, false, false, 11);
     grid.message_state.msg_dirty = false;
     const before = grid.message_state.messages.items[0].content.items[0];
-    const pending_count = grid.message_state.pending_count;
     const replacement = [_]MsgChunk{.{ .hl_id = 2, .text = "new-visible" }};
 
     grid.setMsgShow("echo", &replacement, false, false, false, 12) catch |err| {
@@ -4527,9 +3969,7 @@ fn checkMessageSingletonReplacementAllocationFailure(alloc: std.mem.Allocator) !
         try std.testing.expectEqual(@as(usize, 1), msg.content.items.len);
         try std.testing.expectEqual(before.text.ptr, msg.content.items[0].text.ptr);
         try std.testing.expectEqualSlices(u8, "old-visible", msg.content.items[0].text);
-        try std.testing.expect(grid.message_state.visible);
         try std.testing.expect(!grid.message_state.msg_dirty);
-        try std.testing.expectEqual(pending_count, grid.message_state.pending_count);
         return err;
     };
 
@@ -4546,6 +3986,22 @@ test "message singleton replacement OOM preserves the previous visible message" 
     );
 }
 
+fn checkReplaceLastTakesItsKind(alloc: std.mem.Allocator) !void {
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.setMsgShow("search_cmd", &.{.{ .hl_id = 0, .text = "/zonvie" }}, false, false, false, 1);
+    grid.setMsgShow("search_count", &.{.{ .hl_id = 0, .text = "[1/2]" }}, true, false, false, 2) catch |err| {
+        try std.testing.expectEqualStrings("search_cmd", grid.message_state.messages.items[0].kind);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
+    try std.testing.expectEqualStrings("search_count", grid.message_state.messages.items[0].kind);
+}
+
+test "a replace_last message is routed by its own kind, and OOM keeps the old one" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReplaceLastTakesItsKind, .{});
+}
+
 fn checkMessageEvictionAllocationFailure(alloc: std.mem.Allocator) !void {
     var grid = Grid.init(alloc);
     defer grid.deinit();
@@ -4554,14 +4010,12 @@ fn checkMessageEvictionAllocationFailure(alloc: std.mem.Allocator) !void {
     for (0..1000) |id| {
         grid.message_state.messages.appendAssumeCapacity(.{ .id = @intCast(id) });
     }
-    grid.message_state.visible = true;
     const incoming = [_]MsgChunk{.{ .hl_id = 3, .text = "new-tail" }};
 
     grid.setMsgShow("shell_out", &incoming, false, false, false, 1000) catch |err| {
         try std.testing.expectEqual(@as(usize, 1000), grid.message_state.messages.items.len);
         try std.testing.expectEqual(@as(i64, 0), grid.message_state.messages.items[0].id);
         try std.testing.expectEqual(@as(i64, 999), grid.message_state.messages.items[999].id);
-        try std.testing.expect(grid.message_state.visible);
         return err;
     };
 
@@ -4587,105 +4041,34 @@ test "subgrid clear dirties every covered main row" {
     try grid.setWinPos(2, 42, 2, 1);
     grid.clearDirty();
     grid.sub_grids.getPtr(2).?.clearDirty();
-    const old_rev = grid.content_rev;
 
     grid.clearGrid(2);
 
-    try std.testing.expect(grid.content_rev != old_rev);
-    try std.testing.expect(!grid.dirty_rows.isSet(0));
-    try std.testing.expect(!grid.dirty_rows.isSet(1));
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
-    try std.testing.expect(!grid.dirty_rows.isSet(4));
-    try std.testing.expect(!grid.dirty_rows.isSet(5));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(0));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(1));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(4));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(5));
 }
 
-test "grid line coverage is dirtied once per redraw epoch while order advances" {
+test "a grid line advances the float's paint order and leaves the root rows alone" {
+    // A new paint order changes the published layout, and the frontend
+    // repaints what that exposes; regenerating the root rows under the float
+    // would only rebuild vertices that did not change.
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
 
     try grid.resizeGrid(1, 6, 8);
     try grid.resizeGrid(2, 2, 3);
-    try grid.setWinFloatPos(2, 42, 2, 1, 10, 0, 1);
+    try grid.setWinFloatPos(2, 42, 2, 1, 10, 0, 1, true);
     grid.clearDirty();
 
-    const epoch = grid.beginRedrawBatch();
     const order_before = grid.win_layer.get(2).?.order;
-    const generation_before = grid.layout_generation;
-    grid.noteGridLine(2, epoch);
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
-    const first_order = grid.win_layer.get(2).?.order;
-    try std.testing.expect(first_order != order_before);
-
-    grid.clearDirty();
-    grid.noteGridLine(2, epoch);
-    try std.testing.expect(!grid.dirty_rows.isSet(2));
-    try std.testing.expect(!grid.dirty_rows.isSet(3));
-    try std.testing.expect(grid.win_layer.get(2).?.order != first_order);
-    try std.testing.expect(grid.layout_generation != generation_before);
-
-    grid.noteGridLine(2, grid.beginRedrawBatch());
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
-}
-
-test "main row index accounting follows placement and external anchor visibility" {
-    var grid = Grid.init(std.testing.allocator);
-    defer grid.deinit();
-    grid.setRowIndexBudgetEnabled(true);
-
-    try grid.resizeGrid(1, 4, 1);
-    try grid.resizeGrid(2, 2, 1);
-    try grid.resizeGrid(3, 1, 1);
-    try grid.setWinPos(2, 42, 1, 0);
-    try grid.setWinFloatPos(3, 43, 2, 0, 10, 0, 2);
-    try std.testing.expectEqual(@as(usize, 3), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 2), grid.main_row_index_layout_count);
-
-    _ = try grid.setWinExternalPos(2, 42);
-    try std.testing.expectEqual(@as(usize, 0), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 0), grid.main_row_index_layout_count);
-
-    try grid.promoteExternalToWinPos(2, 42, 1, 0);
-    try std.testing.expectEqual(@as(usize, 3), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 2), grid.main_row_index_layout_count);
-}
-
-test "row index budget rejects a placement without changing the accepted layout" {
-    var grid = Grid.init(std.testing.allocator);
-    defer grid.deinit();
-    grid.setRowIndexBudgetEnabled(true);
-
-    const main_rows = MAX_GRID_ROWS;
-    try grid.resizeGrid(1, main_rows, 1);
-    const base_bytes = Grid.mainRowIndexByteSize(main_rows, 0, 0).?;
-    const one_layout_bytes = Grid.mainRowIndexByteSize(main_rows, main_rows, 1).? - base_bytes;
-    const fitting_layouts = (MAX_MAIN_SUBGRID_ROW_INDEX_BYTES - base_bytes) / one_layout_bytes;
-    try std.testing.expect(fitting_layouts > 0);
-
-    for (0..fitting_layouts) |index| {
-        const grid_id: i64 = @intCast(index + 2);
-        try grid.resizeGrid(grid_id, main_rows, 1);
-        try grid.setWinPos(grid_id, grid_id, 0, 0);
-    }
-    try std.testing.expectEqual(fitting_layouts, grid.main_row_index_layout_count);
-    try std.testing.expectEqual(fitting_layouts * @as(usize, main_rows), grid.main_row_index_ref_count);
-
-    const rejected_grid_id: i64 = @intCast(fitting_layouts + 2);
-    try grid.resizeGrid(rejected_grid_id, main_rows, 1);
-    const accepted_refs = grid.main_row_index_ref_count;
-    const accepted_layouts = grid.main_row_index_layout_count;
-    const accepted_generation = grid.layout_generation;
-    try std.testing.expectError(
-        error.LayoutTooComplex,
-        grid.setWinPos(rejected_grid_id, rejected_grid_id, 0, 0),
-    );
-    try std.testing.expect(!grid.win_pos.contains(rejected_grid_id));
-    try std.testing.expect(!grid.grid_win_ids.contains(rejected_grid_id));
-    try std.testing.expectEqual(accepted_refs, grid.main_row_index_ref_count);
-    try std.testing.expectEqual(accepted_layouts, grid.main_row_index_layout_count);
-    try std.testing.expectEqual(accepted_generation, grid.layout_generation);
+    grid.noteGridLine(2);
+    try std.testing.expect(grid.win_layer.get(2).?.order != order_before);
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
 }
 
 test "viewport margin changes invalidate their vertex consumers" {
@@ -4694,24 +4077,20 @@ test "viewport margin changes invalidate their vertex consumers" {
 
     try grid.resizeGrid(1, 6, 8);
     grid.clearDirty();
-    const main_rev = grid.content_rev;
     try grid.setViewportMargins(1, 1, 1, 1, 1);
-    try std.testing.expect(grid.content_rev != main_rev);
-    try std.testing.expect(grid.dirty_all);
+    try std.testing.expect(grid.main_buf.dirty_all);
 
     grid.clearDirty();
-    const unchanged_rev = grid.content_rev;
     try grid.setViewportMargins(1, 1, 1, 1, 1);
-    try std.testing.expectEqual(unchanged_rev, grid.content_rev);
-    try std.testing.expect(!grid.dirty_all);
+    try std.testing.expect(!grid.main_buf.dirty_all);
 
     try grid.resizeGrid(2, 2, 3);
     try grid.setWinPos(2, 42, 2, 1);
     grid.clearDirty();
     grid.sub_grids.getPtr(2).?.clearDirty();
     try grid.setViewportMargins(2, 0, 0, 1, 1);
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
     try std.testing.expect(grid.sub_grids.get(2).?.dirty);
 }
 
@@ -4720,12 +4099,12 @@ test "grid resize rejects oversized and aggregate dimensions transactionally" {
     defer grid.deinit();
 
     try grid.resizeGrid(1, 2, 3);
-    const old_cells = grid.cells.ptr;
+    const old_cells = grid.main_buf.cells.ptr;
     const old_total = grid.total_grid_cells;
     try std.testing.expectError(error.GridTooLarge, grid.resizeGrid(1, MAX_GRID_ROWS + 1, 1));
     try std.testing.expectEqual(@as(u32, 2), grid.rows);
     try std.testing.expectEqual(@as(u32, 3), grid.cols);
-    try std.testing.expectEqual(old_cells, grid.cells.ptr);
+    try std.testing.expectEqual(old_cells, grid.main_buf.cells.ptr);
     try std.testing.expectEqual(old_total, grid.total_grid_cells);
     try std.testing.expectError(error.GridTooLarge, grid.checkedAggregateCellCount(0, MAX_TOTAL_GRID_CELLS + 1));
 }
@@ -4740,7 +4119,7 @@ test "window placements are bounded independently of grid cells" {
     try grid.resizeGrid(1, 1, 1);
     // A placement with no corresponding sub-grid still consumes the bounded
     // placement maps; it must not be coupled to aggregate cell accounting.
-    try grid.setWinFloatPos(2, 0, 0, 0, 10, 0, 1);
+    try grid.setWinFloatPos(2, 0, 0, 0, 10, 0, 1, true);
     try std.testing.expectEqual(@as(usize, 1), grid.win_pos.count());
     try std.testing.expectEqual(@as(usize, 1), grid.win_layer.count());
     try std.testing.expectEqual(@as(usize, 1), grid.total_grid_cells);
@@ -4757,13 +4136,13 @@ fn checkResizeAllocationFailure(alloc: std.mem.Allocator) !void {
     var grid = Grid.init(alloc);
     defer grid.deinit();
     try grid.resizeGrid(1, 2, 3);
-    const old_cells = grid.cells.ptr;
+    const old_cells = grid.main_buf.cells.ptr;
     const old_total = grid.total_grid_cells;
 
     grid.resizeGrid(1, 100, 100) catch |err| {
         try std.testing.expectEqual(@as(u32, 2), grid.rows);
         try std.testing.expectEqual(@as(u32, 3), grid.cols);
-        try std.testing.expectEqual(old_cells, grid.cells.ptr);
+        try std.testing.expectEqual(old_cells, grid.main_buf.cells.ptr);
         try std.testing.expectEqual(old_total, grid.total_grid_cells);
         return err;
     };
@@ -4807,7 +4186,7 @@ test "grid position setters reject frontend-unrepresentable coordinates" {
 
     try grid.setWinPos(2, 42, 1, 1);
     const old_pos = grid.win_pos.get(2).?;
-    try grid.setWinFloatPos(2, 42, std.math.maxInt(u32), 1, 10, 0, 1);
+    try grid.setWinFloatPos(2, 42, std.math.maxInt(u32), 1, 10, 0, 1, true);
     try std.testing.expectEqual(old_pos, grid.win_pos.get(2).?);
     try std.testing.expect(!grid.win_layer.contains(2));
 }
@@ -4858,6 +4237,7 @@ fn checkClusterAllocationFailure(alloc: std.mem.Allocator) !void {
         // side may publish if hash-map growth fails.
         try std.testing.expectEqual(Cell{ .cp = 'A', .hl = 7 }, grid.getCellGrid(1, 0, 0));
         try std.testing.expect(grid.getOverflow(1, 0, 0) == null);
+        try std.testing.expect(!grid.overflow_by_grid.contains(1));
         return err;
     };
 
@@ -4954,6 +4334,84 @@ test "subgrid scroll keeps submitted vertex counts aligned with row slots" {
     grid_buf.scroll(0, 4, 0, 1, -1, 0);
     try std.testing.expectEqualSlices(usize, &.{ 0, 20, 30, 40 }, grid_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
+}
+
+test "partial-width subgrid scroll shifts the ledger with the core's cells" {
+    // The ledger follows the cells even though the frontend will not shift a
+    // partial-width region; the flush then regenerates every row and rewrites
+    // it, so the sum invariant still holds.
+    var grid_buf: GridBuf = .{};
+    defer grid_buf.deinit(std.testing.allocator);
+    try grid_buf.resize(std.testing.allocator, 4, 4);
+    @memcpy(grid_buf.vertex_row_counts, &[_]usize{ 10, 20, 30, 40 });
+    grid_buf.surface_vertex_count = 100;
+
+    grid_buf.scroll(0, 4, 1, 3, 1, 0);
+    try std.testing.expectEqualSlices(usize, &.{ 20, 30, 40, 0 }, grid_buf.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
+}
+
+fn overflowScrollFixture(grid: *Grid) !void {
+    try grid.resizeGrid(1, 4, 4);
+    try grid.putCellGridCluster(1, 1, 0, 'a', 0, &.{0x0301});
+    try grid.putCellGridCluster(1, 2, 3, 'b', 0, &.{0x0302});
+}
+
+test "scrollOverflow moves clusters down on a negative delta" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 4, -1);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 2, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 3, 3).?);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+}
+
+test "scrollOverflow leaves clusters outside the column range in place" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 2, 1);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 0, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 2, 3).?);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+}
+
+test "scrollOverflow by the region height clears every cluster in it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+
+    grid.scrollOverflow(1, 0, 4, 0, 4, 4);
+    try std.testing.expectEqual(@as(usize, 0), grid.overflowCountForGrid(1));
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_overflow.count());
+}
+
+test "shrinking a grid under the cursor invalidates it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 4, 4);
+    try grid.resizeGrid(2, 4, 4);
+
+    // In bounds after the shrink: the cursor stays valid where it was.
+    grid.setCursor(2, 1, 1);
+    try grid.resizeGrid(2, 2, 2);
+    try std.testing.expect(grid.cursor_valid);
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_row);
+
+    // Outside the new shape: Neovim keeps its cursor inside the grid, so a
+    // grid_cursor_goto to a different cell follows; until then there is none.
+    grid.setCursor(2, 1, 1);
+    const rev = grid.cursor_rev;
+    try grid.resizeGrid(2, 1, 2);
+    try std.testing.expect(!grid.cursor_valid);
+    try std.testing.expect(grid.cursor_rev != rev);
+
+    grid.setCursor(1, 3, 3);
+    try grid.resizeGrid(1, 4, 3);
+    try std.testing.expect(!grid.cursor_valid);
 }
 
 test "viewport metadata ignores unknown grids, except margins" {
@@ -5058,21 +4516,149 @@ test "scroll notification overflow retains main provenance across pending overwr
     grid.scrollGrid(1, 0, 3, 0, 3, 1, 0);
     grid.scrollGrid(18, 0, 3, 0, 3, 1, 0);
     try std.testing.expect(grid.scrolled_grid_overflow);
-    try std.testing.expect(grid.main_scroll_notify_pending);
+    try std.testing.expect(grid.main_buf.scroll_notify_pending);
     try std.testing.expect(grid.sub_grids.get(18).?.scroll_notify_pending);
-    try std.testing.expectEqual(@as(i64, 18), grid.pending_scroll.?.grid_id);
 
     // A pre-dispatch retry discards row-shift state but must retain offset
     // notification provenance independently.
-    grid.clearScrollState();
     var sg_it = grid.sub_grids.valueIterator();
     while (sg_it.next()) |sg| sg.clearScrollState();
-    try std.testing.expect(grid.main_scroll_notify_pending);
+    try std.testing.expect(grid.main_buf.scroll_notify_pending);
     try std.testing.expect(grid.sub_grids.get(18).?.scroll_notify_pending);
 
     grid.clearScrolledGrids();
-    try std.testing.expect(!grid.main_scroll_notify_pending);
+    try std.testing.expect(!grid.main_buf.scroll_notify_pending);
     try std.testing.expect(!grid.sub_grids.get(18).?.scroll_notify_pending);
+}
+
+test "a grid destroyed after its scroll leaves no scroll notification" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    try grid.resizeGrid(1, 3, 3);
+    try grid.resizeGrid(2, 3, 3);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.resizeGrid(3, 3, 3);
+    try grid.setWinPos(3, 1001, 0, 0);
+    grid.scrollGrid(2, 0, 3, 0, 3, 1, 0);
+    grid.scrollGrid(3, 0, 3, 0, 3, 1, 0);
+
+    try grid.destroyGrid(2);
+    try std.testing.expectEqual(@as(u8, 1), grid.scrolled_grid_count);
+    try std.testing.expectEqual(@as(i64, 3), grid.scrolled_grid_ids[0]);
+}
+
+test "a destroy that cannot queue its notification keeps the grid" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var grid = Grid.init(failing.allocator());
+    defer grid.deinit();
+    try grid.resizeGrid(1, 2, 2);
+    try grid.resizeGrid(2, 2, 2);
+    try grid.setWinPos(2, 1000, 0, 0);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, grid.destroyGrid(2));
+    try std.testing.expect(grid.sub_grids.contains(2));
+    try std.testing.expect(grid.win_pos.contains(2));
+
+    failing.fail_index = std.math.maxInt(usize);
+    try grid.destroyGrid(2);
+    try std.testing.expect(!grid.sub_grids.contains(2));
+    try std.testing.expectEqualSlices(i64, &.{2}, grid.destroyed_pending.items);
+}
+
+test "a refused send owes its rows back on top of later changes, a commit drops them" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 4, 3);
+    try grid.resizeGrid(2, 4, 3);
+    grid.main_buf.clearDirtyContent();
+    const sg = grid.sub_grids.getPtr(2).?;
+    sg.clearDirtyContent();
+
+    sg.markDirtyRow(1);
+    sg.consumeDirtyForSend(false);
+    try std.testing.expect(!sg.anyDirty());
+    sg.markDirtyRow(3);
+    grid.returnOwed();
+    try std.testing.expect(sg.dirty);
+    try std.testing.expect(sg.isRowDirty(1));
+    try std.testing.expect(sg.isRowDirty(3));
+    try std.testing.expect(!sg.isRowDirty(0));
+    try std.testing.expect(!sg.dirty_all);
+
+    sg.consumeDirtyForSend(false);
+    grid.commitOwed();
+    grid.returnOwed();
+    try std.testing.expect(!sg.anyDirty());
+    try std.testing.expect(!sg.dirty);
+
+    // A pass that regenerated every row owes every row.
+    sg.markDirtyRow(2);
+    sg.consumeDirtyForSend(true);
+    grid.returnOwed();
+    try std.testing.expect(sg.dirty);
+    try std.testing.expect(sg.dirty_all);
+
+    // A resize inside the bracket: the owed rows no longer line up with the
+    // new shape, so a refusal owes the whole grid, not the rebuilt-empty bits.
+    sg.clearDirtyContent();
+    sg.markDirtyRow(1);
+    sg.consumeDirtyForSend(false);
+    try grid.resizeGrid(2, 5, 3);
+    try std.testing.expect(sg.owed_all);
+    sg.clearDirtyContent();
+    grid.returnOwed();
+    try std.testing.expect(sg.dirty);
+    try std.testing.expect(sg.dirty_all);
+    sg.consumeDirtyForSend(false);
+    try std.testing.expect(sg.owed_all);
+    grid.commitOwed();
+}
+
+test "scrollOverflow drops the cluster a partial shift scrolls off the region" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try overflowScrollFixture(&grid);
+    try grid.putCellGridCluster(1, 3, 2, 'c', 0, &.{0x0303});
+    try std.testing.expectEqual(@as(usize, 3), grid.overflowCountForGrid(1));
+
+    // Shift 1 of a 4-row region: row 3 leaves through the bottom edge.
+    grid.scrollOverflow(1, 0, 4, 0, 4, -1);
+    try std.testing.expectEqual(@as(usize, 2), grid.overflowCountForGrid(1));
+    try std.testing.expect(grid.getOverflow(1, 3, 2) == null);
+    try std.testing.expect(grid.getOverflow(1, 4, 2) == null);
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 2, 0).?);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 3, 3).?);
+
+    // Shift 3 on the opposite delta: row 2 leaves through the top edge.
+    grid.scrollOverflow(1, 0, 4, 0, 4, 3);
+    try std.testing.expectEqual(@as(usize, 1), grid.overflowCountForGrid(1));
+    try std.testing.expect(grid.getOverflow(1, 2, 0) == null);
+    try std.testing.expectEqualSlices(u32, &.{0x0302}, grid.getOverflow(1, 0, 3).?);
+}
+
+test "win_viewport: a delta of exactly the window height is a scroll, one more is a jump" {
+    // :help ui-events, win_viewport: scroll_delta "contains how much the top
+    // line of a window moved since win_viewport was last emitted ... When
+    // scrolling more than a full screen it is an approximate value." Exactly
+    // one screen is still an exact movement to smooth; past it is a jump that
+    // restarts the running total.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 8);
+
+    try grid.setViewport(1, 1000, 0, 10, 0, 0, 100, 3);
+    try grid.setViewport(1, 1000, 10, 20, 10, 0, 100, 10);
+    try std.testing.expectEqual(@as(i64, 13), grid.viewport.get(1).?.uncovered_scroll_rows);
+
+    try grid.setViewport(1, 1000, 21, 31, 21, 0, 100, 11);
+    try std.testing.expectEqual(@as(i64, 0), grid.viewport.get(1).?.uncovered_scroll_rows);
+
+    try grid.setViewport(1, 1000, 11, 21, 11, 0, 100, -10);
+    try std.testing.expectEqual(@as(i64, -10), grid.takeUncoveredScrollRows(1));
+    try grid.setViewport(1, 1000, 0, 10, 0, 0, 100, -11);
+    try std.testing.expectEqual(@as(i64, 0), grid.takeUncoveredScrollRows(1));
 }
 
 test "every status channel stores, replaces and dirties independently" {
@@ -5214,4 +4800,600 @@ test "scrollCells shifts a rect and blanks what it vacates" {
     seed(&cells);
     scrollCells(&cells, cols, 0, rows, 0, cols, std.math.minInt(i32), blank);
     for (cells) |cell| try std.testing.expectEqual(blank, cell);
+}
+
+test "GridBuf markAllDirty reports every row dirty without setting bits" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 4, 8);
+
+    buf.clearDirtyContent();
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(!buf.anyDirty());
+
+    buf.markAllDirty();
+    try std.testing.expect(buf.dirty_all);
+    // O(1): the bitset itself is not touched by markAllDirty.
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.count());
+    var r: u32 = 0;
+    while (r < buf.rows) : (r += 1) try std.testing.expect(buf.isRowDirty(r));
+    try std.testing.expect(buf.anyDirty());
+    try std.testing.expect(!buf.isRowDirty(buf.rows));
+}
+
+test "GridBuf markDirtyRow is a no-op while dirty_all dominates" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 3, 3);
+
+    buf.clearDirtyContent();
+    buf.markAllDirty();
+    buf.markDirtyRow(1);
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.count());
+
+    buf.clearDirtyContent();
+    buf.markDirtyRow(1);
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(buf.isRowDirty(1));
+    try std.testing.expect(!buf.isRowDirty(2));
+    try std.testing.expect(buf.anyDirty());
+}
+
+test "GridBuf markDirtyRect clamps to rows and respects dirty_all" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 4, 4);
+
+    buf.clearDirtyContent();
+    buf.markDirtyRect(1, 99);
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(buf.isRowDirty(1));
+    try std.testing.expect(buf.isRowDirty(3));
+
+    buf.clearDirtyContent();
+    buf.markDirtyRect(2, 2); // empty range
+    try std.testing.expect(!buf.anyDirty());
+}
+
+test "GridBuf zero-cell shape has no bitset but still answers isRowDirty" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    // cols == 0 keeps the bitset unallocated (see GridBuf.resize).
+    try buf.resize(alloc, 5, 0);
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.bit_length);
+    // resize() marks it dirty; with no bitset that can only be dirty_all.
+    try std.testing.expect(buf.isRowDirty(0));
+    buf.clearDirtyContent();
+    try std.testing.expect(!buf.isRowDirty(0));
+    buf.markDirtyRow(0); // must not crash on the empty bitset
+    try std.testing.expect(!buf.isRowDirty(0));
+}
+
+test "bufFor returns the main buffer for grid 1 and the sub-grid otherwise" {
+    const alloc = std.testing.allocator;
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.resize(4, 8);
+    try grid.resizeGrid(2, 3, 5);
+
+    const main = grid.bufFor(1).?;
+    try std.testing.expectEqual(&grid.main_buf, main);
+    try std.testing.expectEqual(@as(u32, 4), main.rows);
+    try std.testing.expectEqual(@as(u32, 8), main.cols);
+    try std.testing.expectEqual(grid.rows, main.rows);
+    try std.testing.expectEqual(grid.cols, main.cols);
+
+    const sub = grid.bufFor(2).?;
+    try std.testing.expectEqual(@as(u32, 3), sub.rows);
+    try std.testing.expectEqual(@as(u32, 5), sub.cols);
+    try std.testing.expect(sub != main);
+
+    try std.testing.expect(grid.sub_grids.getPtr(1) == null);
+    try std.testing.expect(grid.bufFor(999) == null);
+}
+
+test "main grid cells and dirty state live in main_buf" {
+    const alloc = std.testing.allocator;
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.resize(3, 3);
+
+    grid.clearDirty();
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expect(!grid.main_buf.isRowDirty(1));
+
+    grid.putCell(1, 2, 'X', 7);
+    try std.testing.expect(grid.main_buf.isRowDirty(1));
+    try std.testing.expect(!grid.main_buf.isRowDirty(0));
+    try std.testing.expectEqual(@as(u32, 'X'), grid.getCell(1, 2).cp);
+    try std.testing.expectEqual(@as(u32, 7), grid.getCell(1, 2).hl);
+    try std.testing.expectEqual(@as(u32, 'X'), grid.main_buf.cells[1 * 3 + 2].cp);
+
+    grid.markAllDirty();
+    try std.testing.expect(grid.main_buf.dirty_all);
+}
+
+test "a sub-grid accumulates same-region scrolls in one batch instead of blocking" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 20, 40);
+    try grid.setWinPos(2, 100, 0, 0);
+    // Committed: a grid resized in the scrolling batch gets no shift.
+    grid.sub_grids.getPtr(2).?.clearScrollState();
+
+    // Two scrolls of the same region in one batch: the frontend shifts once by
+    // the total, so blocking here would regenerate the whole grid — dozens of
+    // times a second under a held key.
+    grid.scrollGrid(2, 0, 20, 0, 40, 1, 0);
+    grid.scrollGrid(2, 0, 20, 0, 40, 1, 0);
+    const sg = grid.sub_grids.getPtr(2).?;
+    try std.testing.expect(!sg.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(i32, 2), sg.last_scroll_op.?.rows);
+    try std.testing.expectEqual(@as(u32, 0), sg.last_scroll_op.?.top);
+    try std.testing.expectEqual(@as(u32, 20), sg.last_scroll_op.?.bot);
+
+    // Opposite directions cancel the same way the frontend's shift would.
+    grid.scrollGrid(2, 0, 20, 0, 40, -1, 0);
+    try std.testing.expect(!sg.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(i32, 1), sg.last_scroll_op.?.rows);
+
+    // A different region cannot be described by one shift, so it still blocks.
+    grid.scrollGrid(2, 2, 10, 0, 40, 1, 0);
+    try std.testing.expect(sg.scroll_fast_path_blocked);
+}
+
+test "an accumulated sub-grid scroll carries its dirty marks with the content" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 10, 8);
+    try grid.setWinPos(2, 100, 0, 0);
+    const sg = grid.sub_grids.getPtr(2).?;
+    sg.clearDirtyContent();
+
+    // One row off the top: row 9 is vacated and owed a regeneration.
+    grid.scrollGrid(2, 0, 10, 0, 8, 1, 0);
+    try std.testing.expect(sg.isRowDirty(9));
+
+    // A second scroll accumulates, and the first one's vacated mark has to move
+    // up with the content or the now-blank row is never regenerated.
+    grid.scrollGrid(2, 0, 10, 0, 8, 1, 0);
+    try std.testing.expectEqual(@as(i32, 2), sg.last_scroll_op.?.rows);
+    try std.testing.expect(sg.isRowDirty(8));
+    try std.testing.expect(sg.isRowDirty(9));
+    try std.testing.expect(!sg.isRowDirty(0));
+    try std.testing.expect(!sg.isRowDirty(7));
+}
+
+test "a session reset drops the destroys owed to the old session" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 4, 8);
+
+    // Still owed, because the flush carrying it never committed.
+    try grid.destroyGrid(2);
+    try std.testing.expectEqualSlices(i64, &.{2}, grid.destroyed_pending.items);
+
+    grid.resetForNewSession();
+    try std.testing.expectEqual(@as(usize, 0), grid.destroyed_pending.items.len);
+}
+
+test "repositioning a float keeps its vertex ledger; leaving an external window drops it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 2, 4);
+    try grid.setWinFloatPos(2, 1002, 0, 0, 50, 0, 1, true);
+    const sg = grid.sub_grids.getPtr(2).?;
+    sg.vertex_row_ledger_valid = true;
+    sg.surface_vertex_count = 6;
+    grid.subgrid_surface_vertex_count = 6;
+
+    // Same surface: the frontend keeps the rows, so the ledger still counts them.
+    try grid.setWinFloatPos(2, 1002, 3, 2, 50, 0, 1, true);
+    try std.testing.expect(sg.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 6), sg.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), grid.subgrid_surface_vertex_count);
+
+    try grid.putSyntheticExternal(2, .{ .win = 1002, .start_row = 0, .start_col = 0 });
+    // As the external window's own rows would have re-validated it.
+    sg.vertex_row_ledger_valid = true;
+    sg.surface_vertex_count = 6;
+    grid.subgrid_surface_vertex_count = 6;
+    try grid.setWinFloatPos(2, 1002, 3, 2, 50, 0, 1, true);
+    try std.testing.expect(!sg.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 0), grid.subgrid_surface_vertex_count);
+}
+
+test "a session reset shows a cursor the old session's busy_start hid" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    // What busy_start writes; its busy_stop was lost with the old session.
+    grid.cursor_visible = false;
+    try grid.resize(4, 4);
+    grid.main_buf.clearDirtyContent();
+
+    grid.resetForNewSession();
+    try std.testing.expect(grid.cursor_visible);
+    // dirty_all implies dirty: the first flush must see grid 1 as owing rows
+    // through either predicate.
+    try std.testing.expect(grid.main_buf.dirty_all);
+    try std.testing.expect(grid.main_buf.dirty);
+}
+
+test "destroying an external grid owes the main viewport no repaint" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+
+    // A split the MAIN window places: the pixels its removal exposes are the
+    // frontend's, from the layout it publishes, so the root rows stay clean.
+    // (It was the last layer, which also flips every main row's
+    // skip_default_bg; the flush regenerates those, see
+    // regenerateRootsWhoseDefaultBgRuleFlipped.)
+    try grid.resizeGrid(2, 4, 8);
+    try grid.setWinPos(2, 101, 0, 0);
+    grid.main_buf.dirty_all = false;
+    if (grid.main_buf.dirty_rows.bit_length != 0) grid.main_buf.dirty_rows.unsetAll();
+    try grid.destroyGrid(2);
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(0));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
+
+    // An external grid is its own surface and was never placed in the main
+    // viewport, so closing it owes nothing there.
+    try grid.resizeGrid(3, 4, 8);
+    try std.testing.expect(try grid.setWinExternalPos(3, 42));
+    try std.testing.expect(!grid.win_pos.contains(3));
+    grid.main_buf.dirty_all = false;
+    try grid.destroyGrid(3);
+    try std.testing.expect(!grid.main_buf.dirty_all);
+}
+
+test "a float whose float anchor closes stays where it was on the anchor's surface" {
+    // Closing a floating window skips win_comp_pos (window.c win_close,
+    // `if (!was_floating)`), so Neovim sends no win_float_pos for a float
+    // anchored to it and keeps drawing it where it was. Its anchor_grid must
+    // not keep naming the destroyed grid, or the chain stops resolving.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 6, 20);
+    try grid.setWinFloatPos(2, 42, 3, 4, 50, 0, 1, true);
+    try grid.resizeGrid(5, 2, 8);
+    try grid.setWinFloatPos(5, 45, 4, 6, 60, 0, 2, true);
+
+    try grid.destroyGrid(2);
+
+    try std.testing.expectEqual(@as(?i64, 1), grid.surfaceForGrid(5));
+    const p = grid.win_pos.get(5).?;
+    try std.testing.expectEqual(@as(i64, 1), p.anchor_grid);
+    try std.testing.expectEqual(@as(u32, 4), p.row);
+    try std.testing.expectEqual(@as(u32, 6), p.col);
+}
+
+test "a float in an external window turned split owes no root rows anywhere" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    // External window 3 (never placed, origin row 0) hosting float 4 on rows 2..4.
+    try grid.resizeGrid(3, 10, 40);
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    try grid.resizeGrid(4, 3, 10);
+    try grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
+
+    grid.main_buf.dirty_all = false;
+    grid.main_buf.dirty_rows.unsetAll();
+    const ext = grid.sub_grids.getPtr(3).?;
+    ext.dirty_all = false;
+    ext.dirty_rows.unsetAll();
+
+    // `:wincmd J` on the float: Neovim sends win_pos for it with no close.
+    try grid.setWinPos(4, 44, 12, 0);
+
+    // The pixels it left are on window 3, which repaints them from the
+    // layout it publishes; window 3's rows did not change.
+    try std.testing.expect(!ext.isRowDirty(2));
+    try std.testing.expect(!ext.isRowDirty(4));
+    // Grid 1's rows 2..4 never held it.
+    try std.testing.expect(!grid.main_buf.isRowDirty(2));
+}
+
+test "typing in a main-surface split leaves the root rows alone" {
+    // A split is its own layer and repaints its own band on both frontends;
+    // grid 1 holds none of its cells. Dirtying the root row under every
+    // changed cell regenerated that row, and every layer crossing it, on each
+    // keystroke. A clear still dirties the band itself.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 10, 40);
+    try grid.setWinPos(2, 102, 0, 0);
+    grid.main_buf.dirty_all = false;
+    grid.main_buf.dirty_rows.unsetAll();
+
+    grid.putCellGrid(2, 3, 5, 'x', 0);
+    grid.markDirtyCellGrid(2, 4, 5);
+
+    try std.testing.expect(!grid.main_buf.isRowDirty(3));
+    try std.testing.expect(!grid.main_buf.isRowDirty(4));
+    const sg = grid.sub_grids.get(2).?;
+    try std.testing.expect(sg.isRowDirty(3));
+    try std.testing.expect(sg.isRowDirty(4));
+}
+
+test "typing or scrolling in a float an external window hosts leaves its root rows alone" {
+    // The external root is a surface like grid 1: the float is its own layer
+    // there too, so its edits and scrolls owe the root's rows nothing.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(3, 10, 40);
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    try grid.resizeGrid(4, 3, 10);
+    try grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
+    const ext = grid.sub_grids.getPtr(3).?;
+    ext.dirty = false;
+    ext.dirty_all = false;
+    ext.dirty_rows.unsetAll();
+
+    grid.putCellGrid(4, 1, 2, 'x', 0);
+    grid.markDirtyCellGrid(4, 2, 2);
+    grid.scrollGrid(4, 0, 3, 0, 10, 1, 0);
+
+    try std.testing.expect(!ext.dirty);
+    var r: u32 = 0;
+    while (r < 10) : (r += 1) try std.testing.expect(!ext.isRowDirty(r));
+    try std.testing.expect(grid.sub_grids.get(4).?.isRowDirty(1));
+}
+
+test "closing, resizing or placing a main-surface layer owes no root rows" {
+    // The pixels a layer's placement change exposes are the frontend's: it
+    // compares the layouts it publishes. Regenerating the root rows under the
+    // layer would rebuild vertices that did not change.
+    const ROWS: u32 = 20;
+    const COLS: u32 = 40;
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(ROWS, COLS);
+
+    const owed = struct {
+        fn count(g: *Grid) u32 {
+            if (g.main_buf.dirty_all) return ROWS;
+            var n: u32 = 0;
+            var it = g.main_buf.dirty_rows.iterator(.{});
+            while (it.next()) |_| n += 1;
+            return n;
+        }
+        fn settle(g: *Grid) void {
+            g.main_buf.dirty_all = false;
+            if (g.main_buf.dirty_rows.bit_length != 0) g.main_buf.dirty_rows.unsetAll();
+        }
+    };
+
+    // Two splits, so removing one still leaves the surface with a layer.
+    try grid.resizeGrid(2, 5, COLS);
+    try grid.setWinPos(2, 102, 3, 0);
+    try grid.resizeGrid(3, 5, COLS);
+    try grid.setWinPos(3, 103, 10, 0);
+
+    owed.settle(&grid);
+    try grid.resizeGrid(2, 7, COLS);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+
+    try grid.setWinPos(2, 102, 4, 0);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+
+    try grid.destroyGrid(2);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+
+    // Closing the LAST layer, and the first layer appearing again, flip every
+    // main row's skip_default_bg. That whole-root regeneration is the flush's,
+    // for every surface alike (flush.zig tests "... regenerates every row
+    // when ..."); the mutators owe nothing.
+    try grid.destroyGrid(3);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+
+    try grid.resizeGrid(4, 5, COLS);
+    try grid.setWinPos(4, 104, 2, 0);
+    try std.testing.expectEqual(@as(u32, 0), owed.count(&grid));
+}
+
+test "grid 1 and a sub-grid take the same cell-write path" {
+    // Grid 1 and a placed sub-grid write cells identically; an unplaced
+    // sub-grid changes the same state minus the glyph working-set bump.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(4, 4);
+    try grid.resizeGrid(2, 4, 4);
+    try grid.setWinPos(2, 102, 0, 0);
+    try grid.resizeGrid(3, 4, 4);
+
+    const Expect = struct {
+        fn run(g: *Grid, gid: i64, shown: bool) !void {
+            const buf = g.bufFor(gid).?;
+            buf.clearDirtyContent();
+            g.setCursor(gid, 1, 1);
+            const rev0 = g.glyph_working_set_rev;
+            const cur0 = g.cursor_rev;
+
+            // A changed cell under the cursor: row dirty, both revs advance.
+            g.putCellGrid(gid, 1, 1, 'A', 3);
+            try std.testing.expectEqual(Cell{ .cp = 'A', .hl = 3 }, g.getCellGrid(gid, 1, 1));
+            try std.testing.expect(buf.dirty);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expect(!buf.isRowDirty(2));
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // The same cell again: nothing moves.
+            buf.clearDirtyContent();
+            g.putCellGrid(gid, 1, 1, 'A', 3);
+            try std.testing.expect(!buf.dirty);
+            try std.testing.expect(!buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // Out of range: rejected silently.
+            g.putCellGrid(gid, 4, 0, 'Z', 1);
+            g.putCellGrid(gid, 0, 4, 'Z', 1);
+            try std.testing.expect(!buf.dirty);
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+
+            // Away from the cursor: no cursor_rev.
+            g.putCellGrid(gid, 2, 0, 'B', 0);
+            try std.testing.expect(buf.isRowDirty(2));
+            try std.testing.expectEqual(rev0 +% (2 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // Overflow-only change under the cursor: row forced dirty, both revs.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'A', 3, &.{0xFE0F});
+            try std.testing.expectEqualSlices(u32, &.{0xFE0F}, g.getOverflow(gid, 1, 1).?);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% (3 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 2, g.cursor_rev);
+
+            // Cluster with a changed base and the same extras: one bump each.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'C', 3, &.{0xFE0F});
+            try std.testing.expectEqual(Cell{ .cp = 'C', .hl = 3 }, g.getCellGrid(gid, 1, 1));
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% (4 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 3, g.cursor_rev);
+
+            // Cluster out of range: nothing stored.
+            try g.putCellGridCluster(gid, 4, 4, 'D', 3, &.{0xFE0F});
+            try std.testing.expect(g.getOverflow(gid, 4, 4) == null);
+            try std.testing.expectEqual(rev0 +% (4 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+
+            // Dropping the extras dirties the row even with the base unchanged.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'C', 3, &.{});
+            try std.testing.expect(g.getOverflow(gid, 1, 1) == null);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(cur0 +% 4, g.cursor_rev);
+        }
+    };
+    try Expect.run(&grid, 1, true);
+    try Expect.run(&grid, 2, true);
+    try Expect.run(&grid, 3, false);
+}
+
+test "a float follows the scroll only once Neovim says it is placed at a buffer position" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 20, 40);
+    try grid.resizeGrid(2, 20, 40);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.resizeGrid(5, 3, 10);
+
+    // Unknown window: not following, and queued once for the question.
+    try grid.setWinFloatPos(5, 1005, 4, 2, 50, 0, 2, true);
+    try std.testing.expect(!grid.win_pos.get(5).?.follows_scroll);
+    try grid.setWinFloatPos(5, 1005, 5, 2, 50, 0, 2, true);
+    try std.testing.expectEqualSlices(i64, &.{1005}, grid.float_config_wanted.items);
+    // Moving with a scroll is not evidence any more.
+    try std.testing.expect(!grid.win_pos.get(5).?.follows_scroll);
+
+    grid.float_config_wanted.clearRetainingCapacity();
+    grid.setFloatFollows(1005, true);
+    try std.testing.expect(grid.win_pos.get(5).?.follows_scroll);
+    // Answered: a later placement keeps the answer and asks nothing.
+    try grid.setWinFloatPos(5, 1005, 9, 2, 50, 0, 2, true);
+    try std.testing.expect(grid.win_pos.get(5).?.follows_scroll);
+    try std.testing.expectEqual(@as(usize, 0), grid.float_config_wanted.items.len);
+
+    try grid.destroyGrid(5);
+    try std.testing.expect(!grid.float_follows.contains(1005));
+}
+
+test "a hidden float's follows answer is dropped and asked again when it is shown" {
+    // Neovim sends win_hide for every window of a tab that is left
+    // (window.c win_ui_flush), then win_close/grid_destroy when the tab closes,
+    // and re-sends win_float_pos when a hidden float is shown again.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 20, 40);
+    try grid.resizeGrid(2, 20, 40);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.resizeGrid(5, 3, 10);
+    try grid.setWinFloatPos(5, 1005, 4, 2, 50, 0, 2, true);
+    grid.float_config_wanted.clearRetainingCapacity();
+    grid.setFloatFollows(1005, true);
+    try std.testing.expect(grid.float_follows.contains(1005));
+
+    try grid.hideWin(5);
+    try std.testing.expect(!grid.float_follows.contains(1005));
+
+    try grid.setWinFloatPos(5, 1005, 4, 2, 50, 0, 2, true);
+    try std.testing.expectEqualSlices(i64, &.{1005}, grid.float_config_wanted.items);
+    try std.testing.expect(!grid.win_pos.get(5).?.follows_scroll);
+    grid.setFloatFollows(1005, true);
+    try std.testing.expect(grid.win_pos.get(5).?.follows_scroll);
+
+    try grid.hideWin(5);
+    try grid.destroyGrid(5);
+    try std.testing.expectEqual(@as(usize, 0), grid.float_follows.count());
+}
+
+test "floats keep their place inside a window that is detached and brought back" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 30, 80);
+    try grid.resizeGrid(2, 10, 40);
+    try grid.setWinPos(2, 1002, 5, 7);
+    // A float anchored to the split, placed in main cells: (5+2, 7+3).
+    try grid.resizeGrid(3, 2, 4);
+    try grid.setWinFloatPos(3, 1003, 7, 10, 50, 0, 2, true);
+
+    _ = try grid.setWinExternalPos(2, 1002);
+    const local = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 2), local.surface);
+    try std.testing.expectEqual(@as(i64, 2), local.row);
+    try std.testing.expectEqual(@as(i64, 3), local.col);
+
+    try grid.promoteExternalToWinPos(2, 1002, 1, 1);
+    const back = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 1), back.surface);
+    try std.testing.expectEqual(@as(i64, 3), back.row);
+    try std.testing.expectEqual(@as(i64, 4), back.col);
+}
+
+test "a float anchored in an external window is clamped again when the window resizes" {
+    // Neovim clamps a float to the main grid, and does not resend its
+    // position when the window it is anchored in resizes: only move.c flags
+    // anchored floats (winfloat.c win_check_anchored_floats). Placed from its
+    // anchor in that window's own cells, the float has to follow the
+    // window's new size here.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 40);
+    // An external window taller than the main grid.
+    try grid.resizeGrid(2, 30, 40);
+    _ = try grid.setWinExternalPos(2, 1002);
+    try grid.resizeGrid(3, 4, 10);
+
+    const anchor: FloatAnchor = .{ .south = false, .east = false, .row = 25, .col = 3 };
+    const first = grid.resolveAnchoredFloat(3, 2, anchor).?;
+    // Control: inside the 30-row window the float is not clamped.
+    try std.testing.expectEqual(@as(u32, 25), first.row);
+    try grid.setWinFloatPos(3, 1003, first.row, first.col, 50, 0, 2, true);
+    grid.setWinFloatAnchor(3, anchor);
+
+    try grid.resizeGrid(2, 20, 40);
+    // Neovim's clamp, against the window: 20 rows less the float's 4.
+    try std.testing.expectEqual(@as(u32, 16), grid.win_pos.get(3).?.row);
+    try std.testing.expectEqual(@as(u32, 3), grid.win_pos.get(3).?.col);
+
+    // A placement without an anchor is Neovim's own and stays where it is.
+    try grid.setWinFloatPos(3, 1003, 25, 3, 50, 0, 2, true);
+    try grid.resizeGrid(2, 18, 40);
+    try std.testing.expectEqual(@as(u32, 25), grid.win_pos.get(3).?.row);
 }

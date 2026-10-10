@@ -523,6 +523,14 @@ fn failRedrawRecovery(self: *Core, reason: anyerror) void {
 
 const max_redraw_recovery_attempts: u8 = 2;
 
+/// The redraw branch's one failure exit. grid_mu is released before the
+/// detach is enqueued: sendRaw takes the writer lock and session
+/// teardown/reset has its own lock ordering.
+fn abandonRedrawBatch(self: *Core, reason: anyerror) void {
+    self.unlockGridAsRedrawOwner();
+    handleRedrawFailure(self, reason);
+}
+
 fn handleRedrawFailure(self: *Core, reason: anyerror) void {
     // Reattaching replays the same authoritative Neovim state. A local hard
     // resource limit therefore cannot be healed by an epoch reset and would
@@ -650,32 +658,14 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
 
     if (handleRedrawRecoveryResponse(self, id, has_err)) return;
 
-    if (has_err) {
-        self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
-        // Clear quit_request_msgid if this was a failed quit request
-        const pending_quit_id = self.quit_request_msgid.load(.acquire);
-        if (pending_quit_id != 0 and id == pending_quit_id) {
-            self.quit_request_msgid.store(0, .release);
-            // On error, still try to quit (fallback)
-            if (self.cb.on_quit_requested) |cb| {
-                cb(self.ctx, 0); // Assume no unsaved on error
-            }
-        }
-        // Glow config request error — decrement retry (next redraw will re-request)
-        const pending_glow_id = self.glow_request_msgid.load(.acquire);
-        if (pending_glow_id != 0 and id == pending_glow_id) {
-            self.glow_request_msgid.store(0, .release);
-            if (self.glow_startup_retries > 0) {
-                self.glow_startup_retries -= 1;
-            }
-        }
-        return;
-    }
+    if (has_err) self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
 
-    // Check if this is quit request response
-    const pending_quit_id = self.quit_request_msgid.load(.acquire);
-    if (pending_quit_id != 0 and id == pending_quit_id) {
-        self.quit_request_msgid.store(0, .release);
+    if (takeTrackedRequest(&self.quit_request_msgid, id)) {
+        if (has_err) {
+            // On error, still try to quit (fallback): assume no unsaved buffers.
+            if (self.cb.on_quit_requested) |cb| cb(self.ctx, 0);
+            return;
+        }
 
         // Log the response type for debugging
         self.log.write("quit request response: result type={s}\n", .{@tagName(top[3])});
@@ -699,37 +689,65 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
-    // Check if this is glow config response
-    const pending_glow_id = self.glow_request_msgid.load(.acquire);
-    if (pending_glow_id != 0 and id == pending_glow_id) {
-        self.glow_request_msgid.store(0, .release);
+    if (self.float_config_requests.fetchRemove(id)) |kv| {
+        // An error is a window closed before the answer; nothing to apply.
+        if (has_err) return;
+        const follows = floatConfigFollowsScroll(top[3]);
+        self.grid_mu.lockUncancelable(clock.io());
+        self.grid.setFloatFollows(kv.value, follows);
+        self.grid_mu.unlock(clock.io());
+        return;
+    }
+
+    if (takeTrackedRequest(&self.glow_request_msgid, id)) {
+        if (has_err) {
+            // The next redraw re-requests it.
+            if (self.glow_startup_retries > 0) self.glow_startup_retries -= 1;
+            return;
+        }
         self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
         applyGlowConfig(self, top[3]);
-        return;
     }
 }
 
-/// Force full vertex regeneration (content_rev bump + dirty_all + onFlush).
+/// Whether an nvim_win_get_config result describes a float that tracks the
+/// buffer: relative to a window, at a buffer position. Neovim moves exactly
+/// those with their window's scroll (win_float_pos follows it in the same
+/// batch); every other float stays put while the window scrolls under it.
+pub fn floatConfigFollowsScroll(result: mp.Value) bool {
+    if (result != .map) return false;
+    var relative_win = false;
+    var has_bufpos = false;
+    for (result.map) |entry| {
+        if (entry.key != .str) continue;
+        if (std.mem.eql(u8, entry.key.str, "relative")) {
+            relative_win = entry.val == .str and std.mem.eql(u8, entry.val.str, "win");
+        } else if (std.mem.eql(u8, entry.key.str, "bufpos")) {
+            has_bufpos = entry.val == .arr and entry.val.arr.len == 2;
+        }
+    }
+    return relative_win and has_bufpos;
+}
+
+/// Whether `id` answers the request tracked in `slot`, clearing the slot if so.
+fn takeTrackedRequest(slot: *std.atomic.Value(i64), id: i64) bool {
+    const pending = slot.load(.acquire);
+    if (pending == 0 or pending != id) return false;
+    slot.store(0, .release);
+    return true;
+}
+
+/// Force full vertex regeneration (dirty_all + onFlush).
 /// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
 fn forceGlowFlush(self: *Core) void {
-    // Owner id is set/cleared strictly inside the locked section — see the
-    // matching comment in handleRpcNotification's "redraw" branch for why
-    // (a store before lock or a clear after unlock opens a window where a
-    // different thread, e.g. zonvie_core_retry_flush, can observe/clobber
-    // this id while this thread's critical section is still in progress).
-    self.grid_mu.lockUncancelable(clock.io());
-    self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
-    self.grid.content_rev +%= 1;
-    self.grid.markAllDirty();
-    var sg_it = self.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| sg.markAllDirty();
+    self.lockGridAsRedrawOwner();
+    defer self.unlockGridAsRedrawOwner();
+    self.grid.markEverySurfaceDirty();
     self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
         if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
     };
-    self.redraw_thread_id.store(0, .seq_cst);
-    self.grid_mu.unlock(clock.io());
 }
 
 /// Disable glow and flush if it was previously enabled (clears DECO_GLOW from vertices).
@@ -743,28 +761,39 @@ fn disableGlow(self: *Core) void {
 
 /// Parse vim.g.zonvie_glow response and apply configuration.
 /// Expected format: { groups = {"Keyword", "String", ...}, radius = 6, intensity = 0.6 }
+///
+/// The group set is replaced under grid_mu: this runs on the RPC thread, and a
+/// UI-thread retry flush holding grid_mu reads `glow_hl_ids` through a pointer,
+/// so a `put` that grew the map freed what it was reading. The flush that
+/// applies the result takes the lock itself, so it runs after the unlock.
 fn applyGlowConfig(self: *Core, result: mp.Value) void {
+    self.grid_mu.lockUncancelable(clock.io());
+    const enabled = applyGlowConfigLocked(self, result);
+    self.grid_mu.unlock(clock.io());
+    if (enabled) forceGlowFlush(self) else disableGlow(self);
+}
+
+/// Returns whether glow ends up enabled. Caller holds grid_mu.
+fn applyGlowConfigLocked(self: *Core, result: mp.Value) bool {
     // Free old group names and reset glow_all
     self.freeGlowGroupNames();
     self.glow_all = false;
 
     // nil means variable is not set
     if (result == .nil) {
-        disableGlow(self);
         if (self.glow_startup_retries > 0) {
             self.glow_startup_retries -= 1;
         }
-        return;
+        return false;
     }
 
     // Must be a map/dict
     if (result != .map) {
-        disableGlow(self);
         if (self.glow_startup_retries > 0) {
             self.glow_startup_retries -= 1;
         }
         self.log.write("glow config: unexpected type: {s}\n", .{@tagName(result)});
-        return;
+        return false;
     }
 
     const map = result.map;
@@ -793,9 +822,9 @@ fn applyGlowConfig(self: *Core, result: mp.Value) void {
         } else if (std.mem.eql(u8, key, "radius")) {
             if (entry.val == .int) {
                 const r: f32 = @floatFromInt(entry.val.int);
-                self.glow_radius_px = std.math.clamp(r, 2.0, 16.0);
+                self.setGlowRadiusPx(std.math.clamp(r, 2.0, 16.0));
             } else if (entry.val == .float) {
-                self.glow_radius_px = std.math.clamp(@as(f32, @floatCast(entry.val.float)), 2.0, 16.0);
+                self.setGlowRadiusPx(std.math.clamp(@as(f32, @floatCast(entry.val.float)), 2.0, 16.0));
             }
         } else if (std.mem.eql(u8, key, "intensity")) {
             if (entry.val == .int) {
@@ -811,13 +840,12 @@ fn applyGlowConfig(self: *Core, result: mp.Value) void {
         self.resolveGlowGroups();
         self.glow_startup_retries = 0;
         self.log.write("glow config: enabled, {d} groups, radius={d:.1}, intensity={d:.1}\n", .{
-            self.glow_group_names.items.len, self.glow_radius_px, self.getGlowIntensity(),
+            self.glow_group_names.items.len, self.getGlowRadiusPx(), self.getGlowIntensity(),
         });
-        forceGlowFlush(self);
-    } else {
-        disableGlow(self);
-        self.log.write("glow config: disabled (no groups)\n", .{});
+        return true;
     }
+    self.log.write("glow config: disabled (no groups)\n", .{});
+    return false;
 }
 
 pub fn handleRpcRequest(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
@@ -1114,25 +1142,31 @@ pub fn setupClipboard(self: *Core) void {
         \\end
         \\if not ch then return end
         \\vim.g.zonvie_channel = ch
+        \\-- The system clipboard holds text only. Like Neovim's own providers,
+        \\-- keep the regtype of the last copy and return it while the clipboard
+        \\-- still holds that copy, so a blockwise yank pastes back as a block.
+        \\local last = {}
+        \\local function copy(reg)
+        \\  return function(lines, regtype)
+        \\    last[reg] = { lines, regtype }
+        \\    return vim.rpcrequest(ch, 'zonvie.set_clipboard', reg, lines)
+        \\  end
+        \\end
+        \\local function paste(reg)
+        \\  return function()
+        \\    local got = vim.rpcrequest(ch, 'zonvie.get_clipboard', reg)
+        \\    local c = last[reg]
+        \\    if c and type(got) == 'table' and vim.deep_equal(got[1], c[1]) then
+        \\      return { got[1], c[2] }
+        \\    end
+        \\    return got
+        \\  end
+        \\end
         \\vim.schedule(function()
         \\  vim.g.clipboard = {
         \\    name = 'zonvie',
-        \\    copy = {
-        \\      ['+'] = function(lines, regtype)
-        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '+', lines)
-        \\      end,
-        \\      ['*'] = function(lines, regtype)
-        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '*', lines)
-        \\      end,
-        \\    },
-        \\    paste = {
-        \\      ['+'] = function()
-        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '+')
-        \\      end,
-        \\      ['*'] = function()
-        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '*')
-        \\      end,
-        \\    },
+        \\    copy = { ['+'] = copy('+'), ['*'] = copy('*') },
+        \\    paste = { ['+'] = paste('+'), ['*'] = paste('*') },
         \\  }
         \\end)
     ;
@@ -1418,16 +1452,16 @@ pub fn setupAgentStatus(self: *Core) void {
 /// Lua fallback is for a missing component, never for an explicit 0.
 /// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 ///
-/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
-/// the Windows frontend scrolls by whole rows, so injecting the reporter
-/// there would cost an exec_lua and an autocmd for a value nothing reads.
+/// Every platform: the message float's wheel (shared core code) reads it too,
+/// and without the reporter Windows scrolled it 3 lines whatever 'mousescroll'
+/// said, 'ver:0' included.
 pub fn setupMouseScrollReporter(self: *Core) void {
-    if (comptime builtin.os.tag != .macos) return;
     const lua_code =
         \\local function report()
         \\  local ms = vim.o.mousescroll or ''
         \\  local n = tonumber(ms:match('ver:(%d+)'))
-        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3)
+        \\  local h = tonumber(ms:match('hor:(%d+)'))
+        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3, h or 6)
         \\end
         \\report()
         \\local grp = vim.api.nvim_create_augroup('zonvie_mousescroll', { clear = true })
@@ -1539,9 +1573,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
         self.hl.groups_changed = false;
         self.resolveGlowGroups();
         if (self.glow_enabled.load(.acquire)) {
-            self.grid.markAllDirty();
-            var sg_it = self.grid.sub_grids.valueIterator();
-            while (sg_it.next()) |sg| sg.markAllDirty();
+            self.grid.markEverySurfaceDirty();
             self.force_ext_cursor_recheck = true;
         }
     }
@@ -1602,7 +1634,6 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
             if (promote_target) |p| {
                 try self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col);
                 _ = self.grid.ext_windows_grids.remove(p.grid_id);
-                _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
                 _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
                 try self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols);
                 try self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols);
@@ -1658,20 +1689,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // on_linespace, on_external_window*, on_ime_off, on_cursor_grid_changed)
         // execute while grid_mu is held. Callbacks MUST NOT call
         // zonvie_core_get_* or other APIs that acquire grid_mu.
-        self.grid_mu.lockUncancelable(clock.io());
-
-        // Store current thread ID (to detect re-entrant updateLayoutPx calls
-        // from this thread) only AFTER acquiring grid_mu, and clear it
-        // before unlocking below — the owner id must never be visible to
-        // another thread except while grid_mu is actually held by the
-        // thread that set it. Setting it before the lock (or clearing it
-        // after unlocking) opens a window where a different thread — e.g.
-        // zonvie_core_retry_flush on the UI thread — can read/write this
-        // same atomic while this thread is mid-callback (or vice versa),
-        // clobbering the id a re-entrant updateLayoutPx call on the OTHER
-        // thread depends on and causing it to self-deadlock on grid_mu it
-        // already holds.
-        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        self.lockGridAsRedrawOwner();
 
         var fctx = flush.FlushCtx{ .core = self };
         var redraw_error: ?anyerror = null;
@@ -1699,12 +1717,8 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
 
         if (redraw_error) |reason| {
             // Do not run UI-extension post-processing and do not present this
-            // partial batch. Release grid_mu before enqueueing detach: sendRaw
-            // takes the writer lock and session teardown/reset has its own
-            // lock ordering.
-            self.redraw_thread_id.store(0, .seq_cst);
-            self.grid_mu.unlock(clock.io());
-            handleRedrawFailure(self, reason);
+            // partial batch.
+            abandonRedrawBatch(self, reason);
             return;
         }
 
@@ -1724,115 +1738,121 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
 
-        // Handle tabline changes (ext_tabline)
-        const t_notify_tabline: i128 = if (log_on_notify) clock.nowNs() else 0;
-        self.notifyTablineChanges();
-        if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_tabline), 1000));
-            self.log.write("[perf] notify_tabline us={d}\n", .{dt});
-        }
-
-        var postprocess_error: ?anyerror = null;
-        postprocess: {
-            // Process pending ext_windows grid resizes (from win_resize events).
-            // win_resize is Neovim's request to the UI. The UI decides the actual
-            // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
-            for (self.grid.pending_grid_resizes.items) |resize| {
-                if (!self.known_external_grids.contains(resize.grid_id)) {
-                    // NEW grid: Use a reasonable initial size for new external windows.
-                    // Neovim's proposed size is based on terminal layout (e.g. height=2)
-                    // which is too small for an OS window. Use half the main window.
-                    const init_rows = @max(resize.height, self.grid.rows / 2);
-                    const init_cols = @max(resize.width, self.grid.cols / 2);
-                    self.requestTryResizeGridInternal(resize.grid_id, init_rows, init_cols) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-
-                    // Mark grid as pending initial resize. Window creation will be
-                    // deferred in notifyExternalWindowChanges until Neovim responds
-                    // with grid_resize matching the requested dimensions.
-                    self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
-                        .grid_id = resize.grid_id,
-                        .width = init_cols,
-                        .height = init_rows,
-                    }) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-                } else {
-                    // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
-                    // Honor the request by calling try_resize_grid with Neovim's values.
-                    self.requestTryResizeGridInternal(resize.grid_id, resize.height, resize.width) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-                }
+        // A batch may span notifications and only the one ending in flush is
+        // a state the UI may act on. Pending state stays queued until then.
+        if (fctx.saw_flush) {
+            // Handle tabline changes (ext_tabline)
+            const t_notify_tabline: i128 = if (log_on_notify) clock.nowNs() else 0;
+            self.notifyTablineChanges();
+            if (log_on_notify) {
+                const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_tabline), 1000));
+                self.log.write("[perf] notify_tabline us={d}\n", .{dt});
             }
-            self.grid.pending_grid_resizes.clearRetainingCapacity();
 
-            // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
-            // Grid 1 normally echoes the size the frontend asked for through
-            // updateLayoutPx; a different size means Neovim changed it itself, so
-            // ask the frontend to resize its window to match.
-            if (self.grid.pending_main_grid_size) |sz| {
-                self.grid.pending_main_grid_size = null;
-                if (self.last_layout_rows != 0 and self.last_layout_cols != 0 and
-                    (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
-                {
-                    if (self.cb.on_main_grid_size) |cb| {
-                        // last_layout_* is deliberately NOT updated here. The main
-                        // grid's NDC viewport is derived from the drawable, so the
-                        // vertices Neovim just triggered cover only the cells that
-                        // fit the OLD window. Letting the post-resize
-                        // updateLayoutPx run its normal try_resize round trip makes
-                        // Neovim repaint once the drawable actually matches.
-                        self.log.write(
-                            "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
-                            .{ sz.rows, sz.cols },
-                        );
-                        cb(self.ctx, sz.rows, sz.cols);
+            var postprocess_error: ?anyerror = null;
+            postprocess: {
+                // Process pending ext_windows grid resizes (from win_resize events).
+                // win_resize is Neovim's request to the UI. The UI decides the actual
+                // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
+                for (self.grid.pending_grid_resizes.items) |resize| {
+                    if (!self.known_external_grids.contains(resize.grid_id)) {
+                        // NEW grid: Use a reasonable initial size for new external windows.
+                        // Neovim's proposed size is based on terminal layout (e.g. height=2)
+                        // which is too small for an OS window. Use half the main window.
+                        const init_rows = @max(resize.height, self.grid.rows / 2);
+                        const init_cols = @max(resize.width, self.grid.cols / 2);
+                        self.requestTryResizeGridInternal(resize.grid_id, init_rows, init_cols) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+
+                        // Mark grid as pending initial resize. Window creation will be
+                        // deferred in notifyExternalWindowChanges until Neovim responds
+                        // with grid_resize matching the requested dimensions.
+                        self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
+                            .grid_id = resize.grid_id,
+                            .width = init_cols,
+                            .height = init_rows,
+                        }) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                    } else {
+                        // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
+                        // Honor the request by calling try_resize_grid with Neovim's values.
+                        self.requestTryResizeGridInternal(resize.grid_id, resize.height, resize.width) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
                     }
                 }
-            }
+                self.grid.pending_grid_resizes.clearRetainingCapacity();
 
-            // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
-            // These are deferred to the end of the redraw batch (not immediate) because they
-            // depend on grid state that may be updated earlier in the same batch.
-            // The frontend callbacks run synchronously here on the core thread.
-            for (self.grid.pending_win_ops.items) |op| {
-                switch (op.op) {
-                    .move => {
-                        if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
-                    },
-                    .exchange => {
-                        if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
-                    },
-                    .rotate => {
-                        if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
-                    },
-                    .resize_equal => {
-                        if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
-                    },
+                // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+                // Grid 1 normally echoes a size the frontend asked for through
+                // updateLayoutPx. Any requested size still awaiting its answer
+                // counts, not only the latest: a late answer to an older request
+                // is not Neovim's own resize. Anything else is, so ask the frontend
+                // to resize its window to match.
+                if (self.grid.pending_main_grid_size) |sz| {
+                    self.grid.pending_main_grid_size = null;
+                    const answers_request = self.requested_main_sizes.consumeAnswer(sz.rows, sz.cols);
+                    if (!answers_request and
+                        self.last_layout_rows != 0 and self.last_layout_cols != 0 and
+                        (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
+                    {
+                        if (self.cb.on_main_grid_size) |cb| {
+                            // last_layout_* is deliberately NOT updated here. The main
+                            // grid's NDC viewport is derived from the drawable, so the
+                            // vertices Neovim just triggered cover only the cells that
+                            // fit the OLD window. Letting the post-resize
+                            // updateLayoutPx run its normal try_resize round trip makes
+                            // Neovim repaint once the drawable actually matches.
+                            self.log.write(
+                                "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
+                                .{ sz.rows, sz.cols },
+                            );
+                            cb(self.ctx, sz.rows, sz.cols);
+                        }
+                    }
                 }
+
+                // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
+                // These are deferred to the end of the redraw batch (not immediate) because they
+                // depend on grid state that may be updated earlier in the same batch.
+                // The frontend callbacks run synchronously here on the core thread.
+                for (self.grid.pending_win_ops.items) |op| {
+                    switch (op.op) {
+                        .move => {
+                            if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
+                        },
+                        .exchange => {
+                            if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
+                        },
+                        .rotate => {
+                            if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
+                        },
+                        .resize_equal => {
+                            if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
+                        },
+                    }
+                }
+                self.grid.pending_win_ops.clearRetainingCapacity();
             }
-            self.grid.pending_win_ops.clearRetainingCapacity();
-        }
 
-        if (postprocess_error) |reason| {
-            self.log.write("redraw post-processing err: {any}\n", .{reason});
-            self.redraw_thread_id.store(0, .seq_cst);
-            self.grid_mu.unlock(clock.io());
-            handleRedrawFailure(self, reason);
-            return;
-        }
+            if (postprocess_error) |reason| {
+                self.log.write("redraw post-processing err: {any}\n", .{reason});
+                abandonRedrawBatch(self, reason);
+                return;
+            }
 
-        // Check IME off request (from mode_change event)
-        if (self.grid.ime_off_requested) {
-            self.grid.ime_off_requested = false;
-            if (self.msg_config.input.ime_disable_on_modechange) {
-                if (self.cb.on_ime_off) |cb| {
-                    cb(self.ctx);
+            // Check IME off request (from mode_change event)
+            if (self.grid.ime_off_requested) {
+                self.grid.ime_off_requested = false;
+                if (self.msg_config.input.ime_disable_on_modechange) {
+                    if (self.cb.on_ime_off) |cb| {
+                        cb(self.ctx);
+                    }
                 }
             }
         }
@@ -1847,12 +1867,9 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
-        // Clear the owner id while STILL holding grid_mu (see the store
-        // above): only then unlock, so no other thread can ever observe a
-        // stale or cleared owner id while this thread's critical section
-        // is still technically in progress.
-        self.redraw_thread_id.store(0, .seq_cst);
-        self.grid_mu.unlock(clock.io());
+        self.takeFloatConfigQueriesLocked();
+        self.unlockGridAsRedrawOwner();
+        self.sendFloatConfigQueries();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -1883,6 +1900,11 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             const clamped: u32 = if (v <= 0) 0 else if (v > 32) 32 else @intCast(v);
             self.mousescroll_ver.store(clamped, .release);
             self.log.write("mousescroll ver={d}\n", .{clamped});
+        }
+        if (params.len > 1 and params[1] == .int) {
+            const v = params[1].int;
+            const clamped: u32 = if (v <= 0) 0 else if (v > 256) 256 else @intCast(v);
+            self.mousescroll_hor.store(clamped, .release);
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
@@ -1979,7 +2001,9 @@ pub fn runLoop(self: *Core) void {
         is_cmd or is_shell or is_devcontainer;
 
     // Buffer for parsed arguments
-    var argv_buf: [16][]const u8 = undefined;
+    // Sized for a shell glob of file arguments (`zonvie src/*.c`): a 16-slot
+    // buffer silently opened only the first 13 files.
+    var argv_buf: [256][]const u8 = undefined;
     var argc: usize = 0;
 
     if (is_wsl or is_ssh or is_ssh_askpass or is_cmd or is_devcontainer or is_shell) {
@@ -2015,9 +2039,12 @@ pub fn runLoop(self: *Core) void {
         // e.g., "nvim -u /tmp/init.lua +10 file.txt" → ["nvim", "--embed", "-u", "/tmp/init.lua", "+10", "file.txt"]
         // Reserve the last slot for --embed, which is inserted after the
         // executable below. Passing the shortened slice is what caps the user
-        // tokens at 14; today's argc counts the injected --embed, so the
+        // tokens at 254; today's argc counts the injected --embed, so the
         // budget is one less than it looks.
         argc = tokenizeCommand(nvim_path, argv_buf[0 .. argv_buf.len - 2]);
+        if (argc == argv_buf.len - 2) {
+            self.log.write("Native mode: argument list reached the {d}-token cap; the rest is dropped\n", .{argc});
+        }
         if (argc > 0) {
             // Open a hole at index 1 for --embed.
             var k: usize = argc;
@@ -2477,8 +2504,8 @@ pub fn runLoop(self: *Core) void {
         // Install the AI-agent tab-status reporter (zero user-side config).
         setupAgentStatus(self);
 
-        // Report 'mousescroll' so the trackpad path knows how many rows one
-        // wheel event is worth. No-op off macOS (see the function).
+        // Report 'mousescroll' so the trackpad path and the message float's
+        // wheel know how many rows one wheel event is worth.
         setupMouseScrollReporter(self);
 
         if (self.stdout_file == null) {
@@ -3042,11 +3069,11 @@ test "pre-flush grid 2 fallback is present in the same committed vertices" {
             _ = row_count;
             _ = total_rows;
             _ = total_cols;
-            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
+            // Every grid emits its own rows now, so grid 2's content arrives
+            // under grid 2 rather than inside grid 1's composited rows.
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (verts.?[0..vert_count]) |vertex| {
-                if (vertex.grid_id == 2) self.saw_grid_2 = true;
-            }
+            if (vert_count != 0) self.saw_grid_2 = true;
         }
     };
 
@@ -3173,6 +3200,245 @@ test "pre-flush glow resolution affects the same committed vertices" {
     try std.testing.expect(state.saw_glow);
 }
 
+/// Run one redraw batch exactly as `handleRpcNotification` does, so a test can
+/// reach the flush through the real event handlers instead of poking core state.
+const RedrawDriver = struct {
+    fn run(fctx: *flush.FlushCtx, arena: std.mem.Allocator, events: []mp.Value) !void {
+        const core = fctx.core;
+        try redraw.handleRedraw(
+            &core.grid,
+            &core.hl,
+            arena,
+            events,
+            &core.log,
+            fctx,
+            prepareRenderStateForFlush,
+            flush.FlushCtx.onFlush,
+            fctx,
+            flush.FlushCtx.onGuifont,
+            fctx,
+            flush.FlushCtx.onLinespace,
+            flush.FlushCtx.onSetTitle,
+            flush.FlushCtx.onDefaultColors,
+            flush.FlushCtx.onRestart,
+            flush.FlushCtx.onConnect,
+        );
+    }
+};
+
+test "a grid that stops being external publishes its real row count" {
+    // Drives the transition through the core's own redraw handling: an
+    // external window is resized, converted back to a float by
+    // `win_float_pos` (which drops it from `external_grids`), then resized
+    // again. The surface size the row callback publishes must follow the grid
+    // across the transition, or the window renders truncated to a size it
+    // last had while external.
+    const FLOAT_GRID: i64 = 5;
+    const FLOAT_WIN: i64 = 500;
+    const FLOAT_COLS: i64 = 10;
+    const FLOAT_ROWS_BEFORE: i64 = 20;
+    const FLOAT_ROWS_AFTER: i64 = 40;
+
+    const State = struct {
+        published_rows: u32 = 0,
+        published_cols: u32 = 0,
+        row_calls: u32 = 0,
+        max_row: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            if (grid_id != FLOAT_GRID) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.published_rows = total_rows;
+            self.published_cols = total_cols;
+            self.row_calls += 1;
+            self.max_row = @max(self.max_row, row_start);
+        }
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 40;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var fctx = flush.FlushCtx{ .core = &core };
+
+    // 1. The float grid is created and promoted to its own top-level window.
+    var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
+    var resize_new = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = 5 } };
+    var ext_pos = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_WIN } };
+    var ev_resize_main = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_main } };
+    var ev_resize_new = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_new } };
+    var ev_ext_pos = [_]mp.Value{ .{ .str = "win_external_pos" }, .{ .arr = &ext_pos } };
+    var batch1 = [_]mp.Value{
+        .{ .arr = &ev_resize_main },
+        .{ .arr = &ev_resize_new },
+        .{ .arr = &ev_ext_pos },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch1);
+    try std.testing.expect(core.grid.external_grids.contains(FLOAT_GRID));
+
+    // 2. Resizing the external window stores the entry.
+    var resize_ext = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = FLOAT_ROWS_BEFORE } };
+    var ev_resize_ext = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_ext } };
+    var batch2 = [_]mp.Value{.{ .arr = &ev_resize_ext }};
+    try RedrawDriver.run(&fctx, arena, &batch2);
+
+    // 3. `nvim_win_set_config(w, {relative='editor'})` turns it back into a
+    //    float, which drops it from `external_grids`.
+    var float_pos = [_]mp.Value{
+        .{ .int = FLOAT_GRID }, .{ .int = FLOAT_WIN }, .{ .str = "NW" }, .{ .int = 1 },
+        .{ .int = 0 },          .{ .int = 0 },         .{ .bool = true }, .{ .int = 50 },
+    };
+    var ev_float_pos = [_]mp.Value{ .{ .str = "win_float_pos" }, .{ .arr = &float_pos } };
+    var batch3 = [_]mp.Value{.{ .arr = &ev_float_pos }};
+    try RedrawDriver.run(&fctx, arena, &batch3);
+    try std.testing.expect(!core.grid.external_grids.contains(FLOAT_GRID));
+    try std.testing.expect(!core.grid.ext_windows_grids.contains(FLOAT_GRID));
+
+    // 4. `nvim_win_set_height(w, 40)` grows the grid while it is in neither
+    //    set, then the batch is presented.
+    var resize_float = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = FLOAT_ROWS_AFTER } };
+    var ev_resize_float = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_float } };
+    var ev_flush = [_]mp.Value{.{ .str = "flush" }};
+    var batch4 = [_]mp.Value{ .{ .arr = &ev_resize_float }, .{ .arr = &ev_flush } };
+    try RedrawDriver.run(&fctx, arena, &batch4);
+
+    const sg = core.grid.sub_grids.get(FLOAT_GRID).?;
+    try std.testing.expectEqual(@as(u32, FLOAT_ROWS_AFTER), sg.rows);
+    try std.testing.expect(state.row_calls > 0);
+    // The surface size published to the frontend must be the grid's real size.
+    try std.testing.expectEqual(sg.rows, state.published_rows);
+    try std.testing.expectEqual(sg.cols, state.published_cols);
+    // ...and every row of the grid must actually be submitted.
+    try std.testing.expectEqual(sg.rows - 1, state.max_row);
+}
+
+test "a grid resized while hidden publishes its real row count when shown again" {
+    // The other exit from external tracking: `win_hide` (sent for every window
+    // of a non-current tab) drops the grid from `external_grids` too, so the
+    // `grid_resize` that lands while it is hidden arrives while the grid is
+    // in neither tracking set.
+    const HIDDEN_GRID: i64 = 6;
+    const HIDDEN_WIN: i64 = 600;
+    const HIDDEN_COLS: i64 = 10;
+    const ROWS_BEFORE_HIDE: i64 = 20;
+    const ROWS_WHILE_HIDDEN: i64 = 40;
+
+    const State = struct {
+        published_rows: u32 = 0,
+        published_cols: u32 = 0,
+        row_calls: u32 = 0,
+        max_row: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            if (grid_id != HIDDEN_GRID) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.published_rows = total_rows;
+            self.published_cols = total_cols;
+            self.row_calls += 1;
+            self.max_row = @max(self.max_row, row_start);
+        }
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 40;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var fctx = flush.FlushCtx{ .core = &core };
+
+    var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
+    var resize_new = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_COLS }, .{ .int = ROWS_BEFORE_HIDE } };
+    var ext_pos = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_WIN } };
+    var ev_resize_main = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_main } };
+    var ev_resize_new = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_new } };
+    var ev_ext_pos = [_]mp.Value{ .{ .str = "win_external_pos" }, .{ .arr = &ext_pos } };
+    var batch1 = [_]mp.Value{
+        .{ .arr = &ev_resize_main },
+        .{ .arr = &ev_resize_new },
+        .{ .arr = &ev_ext_pos },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch1);
+
+    // Resize while external.
+    var batch2 = [_]mp.Value{.{ .arr = &ev_resize_new }};
+    try RedrawDriver.run(&fctx, arena, &batch2);
+
+    // Switch away: every window of the leaving tab is hidden.
+    var hide = [_]mp.Value{.{ .int = HIDDEN_GRID }};
+    var ev_hide = [_]mp.Value{ .{ .str = "win_hide" }, .{ .arr = &hide } };
+    var batch3 = [_]mp.Value{.{ .arr = &ev_hide }};
+    try RedrawDriver.run(&fctx, arena, &batch3);
+    try std.testing.expect(!core.grid.external_grids.contains(HIDDEN_GRID));
+    try std.testing.expect(!core.grid.ext_windows_grids.contains(HIDDEN_GRID));
+
+    // The window grows while hidden, then the tab is switched back.
+    var resize_hidden = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_COLS }, .{ .int = ROWS_WHILE_HIDDEN } };
+    var ev_resize_hidden = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_hidden } };
+    var ev_flush = [_]mp.Value{.{ .str = "flush" }};
+    var batch4 = [_]mp.Value{
+        .{ .arr = &ev_resize_hidden },
+        .{ .arr = &ev_ext_pos },
+        .{ .arr = &ev_flush },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch4);
+
+    const sg = core.grid.sub_grids.get(HIDDEN_GRID).?;
+    try std.testing.expectEqual(@as(u32, ROWS_WHILE_HIDDEN), sg.rows);
+    try std.testing.expect(state.row_calls > 0);
+    try std.testing.expectEqual(sg.rows, state.published_rows);
+    try std.testing.expectEqual(sg.cols, state.published_cols);
+    try std.testing.expectEqual(sg.rows - 1, state.max_row);
+}
+
 test "child reaper does not wait for inherited stderr EOF" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     clock.init();
@@ -3231,6 +3497,25 @@ test "child reaper does not wait for inherited stderr EOF" {
     reaper_joined = true;
 }
 
+extern "kernel32" fn CreatePipe(
+    read_pipe: *std.os.windows.HANDLE,
+    write_pipe: *std.os.windows.HANDLE,
+    attributes: ?*anyopaque,
+    size: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+
+/// Returns a blocking anonymous pipe as { read end, write end }. Windows has
+/// no POSIX pipe(), so it gets the kernel32 equivalent.
+fn testPipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(CreatePipe(&fds[0], &fds[1], null, 0) != .FALSE);
+    } else {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    }
+    return fds;
+}
+
 /// Drives the real handleClipboardSet over a real writer thread and pipe, so
 /// both the bytes handed to the frontend and the RPC response Neovim receives
 /// are observed rather than inferred.
@@ -3255,8 +3540,7 @@ const ClipboardSetProbe = struct {
         const alloc = std.testing.allocator;
         clock.init();
 
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
@@ -3439,8 +3723,7 @@ test "every RPC response carries the same four-element type-1 header" {
     };
 
     for (cases) |case| {
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
@@ -3612,8 +3895,7 @@ fn fetchClipboard(
 ) ![]u8 {
     clock.init();
 
-    var fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const fds = try testPipe();
     const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
     var core = Core.initForTest(alloc);
@@ -3730,8 +4012,7 @@ test "yank and put round-trip a register larger than the staging buffers" {
     {
         clock.init();
 
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
@@ -3764,4 +4045,25 @@ test "yank and put round-trip a register larger than the staging buffers" {
     try std.testing.expectEqual(want.len, board.bytes.items.len);
     try std.testing.expectEqual(want.len, pasted.len);
     try std.testing.expectEqualSlices(u8, want, pasted);
+}
+
+test "only a window-relative float at a buffer position follows the scroll" {
+    const Entry = mp.Pair;
+    var pos = [_]mp.Value{ .{ .int = 10 }, .{ .int = 2 } };
+    var win_bufpos = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "win" } },
+        .{ .key = .{ .str = "bufpos" }, .val = .{ .arr = &pos } },
+    };
+    var win_rowcol = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "win" } },
+        .{ .key = .{ .str = "row" }, .val = .{ .int = 3 } },
+    };
+    var editor = [_]Entry{
+        .{ .key = .{ .str = "relative" }, .val = .{ .str = "editor" } },
+        .{ .key = .{ .str = "bufpos" }, .val = .{ .arr = &pos } },
+    };
+    try std.testing.expect(floatConfigFollowsScroll(.{ .map = &win_bufpos }));
+    try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &win_rowcol }));
+    try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &editor }));
+    try std.testing.expect(!floatConfigFollowsScroll(.nil));
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import simd
 
 // Minimal collaborators required when MetalTypes.swift is compiled as a
 // standalone test executable.
@@ -8,13 +9,15 @@ final class ZonvieConfig {
     var backgroundAlpha: Float = 1.0
 }
 
-final class MetalTerminalRenderer {
+final class GridSurfaceRenderer {
     struct ScrollOffset {
         var grid_id: Int32
         var offset_y: Float
         var content_top_y: Float
         var content_bottom_y: Float
         var move_all: Int32 = 0
+        var pin_edges: Int32 = 1
+        var zindex: Int32 = 0
     }
 
     struct FixedFloatRect: Equatable {
@@ -162,85 +165,6 @@ private enum SurfaceRowProvisionTests {
         )
     }
 
-    private static func verifyFlatMainZeroRetirement(device: MTLDevice) {
-        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
-        let flatBytes = max(surfaceSafeNeededBytes(vertexCount: 256) ?? 0, 256)
-        guard let oldMain = device.makeBuffer(length: flatBytes, options: []) else {
-            require(false, "flat main seed allocation failed")
-            return
-        }
-        guard let oldDetach = device.makeBuffer(length: flatBytes, options: []) else {
-            require(false, "flat detach seed allocation failed")
-            return
-        }
-        sets[0].mainVertexBuffer = oldMain
-        sets[0].mainVertexBufferCap = flatBytes
-        sets[0].mainVertexCount = 256
-        sets[0].detachPoolMainBuffer = oldDetach
-        sets[0].detachPoolMainCap = flatBytes
-        sets[0].knownTotalRows = 1
-        sets[0].knownTotalCols = 1_000
-        copySurfaceMainVertexState(from: sets[0], to: sets[1])
-        copySurfaceMainVertexState(from: sets[1], to: sets[2])
-
-        var gpuInFlightCount = [1, 0, 0]
-        var retirement = SurfaceRowStorageRetirementState()
-        sets[1].knownTotalRows = 0
-        sets[1].knownTotalCols = 0
-        serviceSurfaceRowStorageRetirement(
-            bufferSets: sets,
-            gpuInFlightCount: gpuInFlightCount,
-            committedSetIndex: 1,
-            layoutContracted: true,
-            state: &retirement,
-            retireMainBuffers: true
-        )
-        require(sets[0].mainVertexBuffer === oldMain, "in-flight flat main buffer was released")
-        require(sets[0].detachPoolMainBuffer === oldDetach,
-                "in-flight flat detach buffer was released")
-        require(sets[1].mainVertexBuffer == nil && sets[2].mainVertexBuffer == nil,
-                "idle flat main buffers survived zero layout")
-        require(sets[1].detachPoolMainBuffer == nil && sets[2].detachPoolMainBuffer == nil,
-                "idle flat detach buffers survived zero layout")
-
-        guard let narrowBeforeCompletion = device.makeBuffer(length: max(surfaceSafeNeededBytes(vertexCount: 1) ?? 0, 1), options: []) else {
-            require(false, "pre-completion narrow allocation failed")
-            return
-        }
-        sets[1].mainVertexBuffer = narrowBeforeCompletion
-        sets[1].mainVertexBufferCap = narrowBeforeCompletion.length
-        sets[1].mainVertexCount = 1
-
-        gpuInFlightCount[0] = 0
-        serviceSurfaceRowStorageRetirement(
-            bufferSets: sets,
-            gpuInFlightCount: gpuInFlightCount,
-            committedSetIndex: 1,
-            layoutContracted: false,
-            state: &retirement,
-            retireMainBuffers: true
-        )
-        require(sets[1].mainVertexBuffer === narrowBeforeCompletion,
-                "old completion retired the newer narrow main buffer")
-        for (index, set) in sets.enumerated() where index != 1 {
-            require(set.mainVertexBuffer == nil && set.mainVertexBufferCap == 0
-                        && set.mainVertexCount == 0,
-                    "flat main storage survived GPU completion")
-            require(set.detachPoolMainBuffer == nil && set.detachPoolMainCap == 0,
-                    "flat detach storage survived GPU completion")
-        }
-
-        guard let narrow = device.makeBuffer(length: max(surfaceSafeNeededBytes(vertexCount: 1) ?? 0, 1), options: []) else {
-            require(false, "narrow main allocation failed")
-            return
-        }
-        sets[2].mainVertexBuffer = narrow
-        sets[2].mainVertexBufferCap = narrow.length
-        sets[2].mainVertexCount = 1
-        require(narrow !== oldMain, "narrow layout reused retired flat main buffer")
-        require(sets[2].mainVertexCount == 1, "narrow main count was not published")
-    }
-
     private static func verifyOversizedRowReuseAvoidsAllocation(device: MTLDevice) {
         // Row bytes track ink length, so a single slot cycles wide -> medium ->
         // narrow as source lines scroll past it. Once the slot has been warmed
@@ -341,24 +265,75 @@ private enum SurfaceRowProvisionTests {
 
         // The detach candidate is now wide enough for this narrow row and is no
         // longer oversize-rejected, so only the in-flight guard can exclude it.
-        guard let detached = ensureSurfaceRowBuffer(
+        // Either in-flight position has to reject it: the pool path compares
+        // against both tuple members.
+        for (label, inflight) in [("first", (ownBuffer, nil)), ("second", (nil, ownBuffer))] as [(String, (MTLBuffer?, MTLBuffer?))] {
+            target.detachPoolRowBuffers[0] = ownBuffer
+            target.rowState.buffers[0] = committed
+            target.rowState.capacities[0] = source.rowState.capacities[0]
+            guard let detached = ensureSurfaceRowBuffer(
+                bufferSet: target,
+                sourceSet: source,
+                device: device,
+                row: 0,
+                vertexCount: 1,
+                maxRowBuffers: 16,
+                inflightRowBuffers: inflight
+            ) else {
+                require(false, "alias-guarded detach failed to produce a writable row (\(label) in-flight slot)")
+                return
+            }
+            require(detached !== committed, "detach wrote into the committed row buffer (\(label) in-flight slot)")
+            require(detached !== ownBuffer, "detach wrote into a GPU in-flight row buffer (\(label) in-flight slot)")
+            require(
+                target.rowState.buffers[0] === detached,
+                "detached row buffer was not published to the write set (\(label) in-flight slot)"
+            )
+        }
+
+        // A set that already shared the committed buffer stages THAT buffer as
+        // its detach candidate on the next copy. With nothing in flight, only
+        // the src clause keeps the write out of the committed row.
+        target.rowState.buffers[0] = committed
+        target.rowState.capacities[0] = source.rowState.capacities[0]
+        copySurfaceBufferSetRowState(from: source, to: target)
+        require(
+            target.detachPoolRowBuffers[0] === committed,
+            "second shallow copy did not stage the committed buffer as the detach candidate"
+        )
+        guard let detachedFromSrcPool = ensureSurfaceRowBuffer(
             bufferSet: target,
             sourceSet: source,
             device: device,
             row: 0,
             vertexCount: 1,
             maxRowBuffers: 16,
-            inflightRowBuffers: (ownBuffer, nil)
+            inflightRowBuffers: (nil, nil)
         ) else {
-            require(false, "alias-guarded detach failed to produce a writable row")
+            require(false, "detach with a src-aliased pool candidate failed to produce a writable row")
             return
         }
-        require(detached !== committed, "detach wrote into the committed row buffer")
-        require(detached !== ownBuffer, "detach wrote into a GPU in-flight row buffer")
         require(
-            target.rowState.buffers[0] === detached,
-            "detached row buffer was not published to the write set"
+            detachedFromSrcPool !== committed,
+            "detach reused a pool candidate that aliases the committed row buffer"
         )
+    }
+
+    private static func verifyGpuReadCompletionReleasesMarkedSet(device: MTLDevice) {
+        // A completion gives back exactly the mark draw() took: one release
+        // per mark, and the set is free again afterwards.
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+        var gpuInFlightCount = [0, 1, 0]
+        var retirement = SurfaceRowStorageRetirementState()
+        completeSurfaceGpuRead(
+            setIndex: 1,
+            gpuInFlightCount: &gpuInFlightCount,
+            bufferSets: sets,
+            committedSetIndex: 1,
+            retirement: &retirement
+        )
+        require(gpuInFlightCount == [0, 0, 0], "completion did not release the marked set")
+        _ = device
     }
 
     private static func verifyPrivateSlotReuseHonoursAliasGuards(device: MTLDevice) {
@@ -414,8 +389,8 @@ private enum SurfaceRowProvisionTests {
     // fine here): true when (x, y) lies inside a mask segment whose z is
     // strictly greater than scrollZ.
     private static func maskCoversAbove(
-        bands: [MetalTerminalRenderer.FixedFloatBand],
-        intervals: [MetalTerminalRenderer.FixedFloatInterval],
+        bands: [GridSurfaceRenderer.FixedFloatBand],
+        intervals: [GridSurfaceRenderer.FixedFloatInterval],
         x: Float,
         y: Float,
         scrollZ: Float
@@ -432,13 +407,13 @@ private enum SurfaceRowProvisionTests {
     }
 
     private static func buildMask(
-        _ rects: [MetalTerminalRenderer.FixedFloatRect]
-    ) -> (bands: [MetalTerminalRenderer.FixedFloatBand], intervals: [MetalTerminalRenderer.FixedFloatInterval]) {
-        var bands: [MetalTerminalRenderer.FixedFloatBand] = []
-        var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+        _ rects: [GridSurfaceRenderer.FixedFloatRect]
+    ) -> (bands: [GridSurfaceRenderer.FixedFloatBand], intervals: [GridSurfaceRenderer.FixedFloatInterval]) {
+        var bands: [GridSurfaceRenderer.FixedFloatBand] = []
+        var intervals: [GridSurfaceRenderer.FixedFloatInterval] = []
         var yEdges: [Float] = []
         var xEdges: [Float] = []
-        var covering: [MetalTerminalRenderer.FixedFloatRect] = []
+        var covering: [GridSurfaceRenderer.FixedFloatRect] = []
         buildSurfaceFixedFloatMask(
             rects: rects,
             bands: &bands,
@@ -450,10 +425,39 @@ private enum SurfaceRowProvisionTests {
         return (bands, intervals)
     }
 
+    // The main mask is built from committed layers, ranked by paint order; a
+    // fixed float whose Neovim zindex is below its rank must not mask itself
+    // while it scrolls, and a split under it must still be masked.
+    private static func verifyMaskAndOffsetsShareOneScale() {
+        let split = SurfaceLayer(gridId: 2, anchorGrid: 1, originPx: .zero, rows: 30, cols: 100, z: 1, followsScroll: false)
+        var float = SurfaceLayer(gridId: 5, anchorGrid: 2, originPx: simd_float2(100, 100), rows: 10, cols: 40, z: 2, followsScroll: false)
+        float.isFloat = true
+        let layers = [split, float].map { SurfaceLayerFrame(layer: $0, set: nil, state: nil) }
+
+        let mask = SurfaceFixedFloatMask()
+        var scratch: [GridSurfaceRenderer.FixedFloatRect] = []
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true,
+                     cellW: 10, cellH: 20, scratch: &scratch)
+
+        // Offsets as the view fills them: Neovim zindex (the float's is 1).
+        var offsets = [
+            GridSurfaceRenderer.ScrollOffset(grid_id: 2, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 0),
+            GridSurfaceRenderer.ScrollOffset(grid_id: 5, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 1),
+            GridSurfaceRenderer.ScrollOffset(grid_id: 1, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 7),
+        ]
+        SurfaceFixedFloatMask.rankOffsets(&offsets, layers: [split, float])
+        require(offsets.map { $0.zindex } == [1, 2, 0], "offsets must carry the layers' paint ranks, got \(offsets.map { $0.zindex })")
+
+        require(!maskCoversAbove(bands: mask.bands, intervals: mask.intervals, x: 300, y: 200, scrollZ: Float(offsets[1].zindex)),
+                "a scrolled fixed float must not be masked inside its own rect")
+        require(maskCoversAbove(bands: mask.bands, intervals: mask.intervals, x: 300, y: 200, scrollZ: Float(offsets[0].zindex)),
+                "the split under the fixed float must be masked")
+    }
+
     private static func verifyFixedFloatMaskZOrder() {
         // Lazy layout: full-screen backdrop (z49) under an inner float (z50).
-        let backdrop = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
-        let lazy = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
+        let backdrop = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
+        let lazy = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
         let (bands, intervals) = buildMask([backdrop, lazy])
 
         require(bands.count == 3, "lazy mask should split into 3 bands, got \(bands.count)")
@@ -479,7 +483,7 @@ private enum SurfaceRowProvisionTests {
                 "the scrolled float must not be masked over the backdrop alone")
 
         // A higher-z fixed float stacked over the scrolled one must win.
-        let popup = MetalTerminalRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
+        let popup = GridSurfaceRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
         let stacked = buildMask([backdrop, lazy, popup])
         require(maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 400, y: 300, scrollZ: 50),
                 "a z50 scrolled float must be masked under a z60 fixed float")
@@ -489,29 +493,29 @@ private enum SurfaceRowProvisionTests {
                 "the z60 popup must not mask the scrolled float outside its own rect")
 
         // Contiguous equal-z rects merge into one interval; differing z stays split.
-        let leftSame = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let rightSame = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
+        let leftSame = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let rightSame = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
         let mergedMask = buildMask([leftSame, rightSame])
         require(mergedMask.bands.count == 1 && mergedMask.intervals.count == 1,
                 "touching equal-z rects must merge into one interval")
         require(mergedMask.intervals[0].x0 == 0 && mergedMask.intervals[0].x1 == 200,
                 "merged interval must span both rects")
-        let rightHigher = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
+        let rightHigher = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
         let splitMask = buildMask([leftSame, rightHigher])
         require(splitMask.intervals.count == 2, "touching rects with differing z must stay split")
         require(splitMask.intervals[0].z == 50 && splitMask.intervals[1].z == 60,
                 "split segments must keep their own z")
 
         // Vertically disjoint rects: no band is emitted for the gap between them.
-        let upper = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let lower = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
+        let upper = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let lower = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
         let disjoint = buildMask([upper, lower])
         require(disjoint.bands.count == 2, "vertically disjoint rects must produce exactly 2 bands")
         require(!maskCoversAbove(bands: disjoint.bands, intervals: disjoint.intervals, x: 50, y: 200, scrollZ: 0),
                 "the vertical gap between rects must not be masked")
 
         // Degenerate rects are ignored; an empty input clears the outputs.
-        let degenerate = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let degenerate = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
         let degenerateMask = buildMask([degenerate])
         require(degenerateMask.bands.isEmpty && degenerateMask.intervals.isEmpty,
                 "a zero-width rect must produce an empty mask")
@@ -616,23 +620,161 @@ private enum SurfaceRowProvisionTests {
         )
     }
 
+    private static func verifyLayerGrowthWithoutRetry(device: MTLDevice) {
+        let registry = GridBufferRegistry()
+        let vertex = Vertex(position: .zero, texCoord: .zero, color: .zero,
+            grid_id: 7, deco_flags: 0, deco_phase: 0)
+        let vertices = Array(repeating: vertex, count: 1024)
+        // New grids and changing content sizes must succeed in the submitting
+        // flush, without an asynchronous provision/retry round trip.
+        for gridId in [Int64(7), 8, 9] {
+            let sets = registry.sets(for: gridId)
+            var source = 0
+            for count in [6, 48, 282, 1024, 6, 282] {
+                let target = (source + 1) % 3
+                copySurfaceBufferSetRowState(from: sets[source], to: sets[target])
+                for row in 0..<4 {
+                    let accepted = vertices.withUnsafeBufferPointer { buffer in
+                        submitSurfaceRowVertices(target: sets[target], sourceSet: sets[source],
+                            device: device, rowStart: row, ptr: UnsafeRawPointer(buffer.baseAddress!),
+                            count: count, maxRowBuffers: 16, totalRows: 4, totalCols: 80)
+                    }
+                    require(accepted, "ordinary layer growth must not require a retry")
+                }
+                source = target
+            }
+        }
+    }
+
+    /// The row-capacity gate is one rule both surfaces ask, so the physical-row
+    /// mapping has to be an argument rather than a second implementation. The
+    /// main surface can be asked about a row that is already physical; an
+    /// external one never is, and passes `rowIsPhysical: false`.
+    private static func verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: MTLDevice) {
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+
+        // Nothing is provisioned yet, so a legal row owes provisioning, and the
+        // ledger values it names are what both callers fold in.
+        let needs = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 3,
+            vertexCount: 120,
+            totalRows: 8,
+            maxRowBuffers: 16,
+            mappingSetIndex: -1,
+            rowIsPhysical: true
+        )
+        guard case .needsProvisioning(let capacityRow, let requiredRows, let vc) = needs else {
+            require(false, "unprovisioned row did not ask for provisioning")
+            return
+        }
+        require(capacityRow == 3, "physical row was remapped when it should not be")
+        require(requiredRows == 8, "required rows must cover the whole grid")
+        require(vc == 120, "vertex demand was not carried to the ledger")
+
+        // A row past the buffer ceiling is an argument error, never a
+        // provisioning request: latching a hard failure on it would stop the
+        // surface presenting forever.
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 99,
+                vertexCount: 1,
+                totalRows: 8,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range row was not rejected as invalid"
+        )
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 0,
+                vertexCount: 1,
+                totalRows: 99,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range total rows was not rejected as invalid"
+        )
+
+        // The logical row is mapped through the naming set's slot table, which
+        // is what makes a scrolled row ask about the slot it actually occupies.
+        sets[0].rowLogicalToSlot = [4, 5, 6, 7]
+        let mapped = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: false
+        )
+        guard case .needsProvisioning(let mappedRow, let mappedRequired, _) = mapped else {
+            require(false, "mapped row did not ask for provisioning")
+            return
+        }
+        require(mappedRow == 5, "logical row was not mapped through the slot table")
+        require(mappedRequired == 6, "required rows must reach past the mapped slot")
+
+        // Same row, declared physical: the mapping is skipped.
+        guard case .needsProvisioning(let unmappedRow, _, _) = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: true
+        ) else {
+            require(false, "physical row did not ask for provisioning")
+            return
+        }
+        require(unmappedRow == 1, "physical row must skip the slot mapping")
+
+        _ = device
+    }
+
+    /// The write set a flush fills must be neither the committed set nor one
+    /// the GPU is reading; with none such, the flush must be refused (-1).
+    private static func verifyFreeSetPickAvoidsCommittedAndInFlight() {
+        for committed in -1..<3 {
+            for mask in 0..<8 {
+                let inFlight = (0..<3).map { (mask >> $0) & 1 == 1 ? 1 : 0 }
+                let free = (0..<3).filter { $0 != committed && inFlight[$0] == 0 }
+                let picked = pickFreeBufferSetIndex(count: 3, committedIndex: committed, gpuInFlightCount: inFlight)
+                if free.isEmpty {
+                    require(picked == -1, "pick with no free set committed=\(committed) inFlight=\(inFlight) gave \(picked)")
+                } else {
+                    require(free.contains(picked), "pick committed=\(committed) inFlight=\(inFlight) gave \(picked)")
+                }
+            }
+        }
+    }
+
     static func main() {
+        verifyFreeSetPickAvoidsCommittedAndInFlight()
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
             exit(1)
         }
 
+        verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
+        verifyMaskAndOffsetsShareOneScale()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
+        verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: device)
 
         // Both production owners call the same durable state transition from
         // commit and from every GPU completion path.
         verifyInFlightZeroRetirement(device: device, owner: "main")
         verifyInFlightZeroRetirement(device: device, owner: "external")
-        verifyFlatMainZeroRetirement(device: device)
         verifyOversizedRowReuseAvoidsAllocation(device: device)
         verifyRowReuseHonoursAliasGuards(device: device)
         verifyPrivateSlotReuseHonoursAliasGuards(device: device)
+        verifyGpuReadCompletionReleasesMarkedSet(device: device)
         for shape in [(3, 0), (0, 4), (0, 0)] {
             let layoutSet = SurfaceBufferSet()
             require(

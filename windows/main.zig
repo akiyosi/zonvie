@@ -1,5 +1,7 @@
 const std = @import("std");
 const clock = @import("zonvie_core").clock;
+const frontend_rules = @import("zonvie_core").frontend_rules;
+const core_config = @import("zonvie_core").config;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
@@ -7,6 +9,7 @@ const applog = app_mod.applog;
 const config_mod = app_mod.config_mod;
 const dialogs = @import("ui/dialogs.zig");
 const window = @import("window.zig");
+const render_helpers = @import("render_pipeline_helpers.zig");
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -24,6 +27,11 @@ pub const std_options = std.Options{
 /// an align-2 pointer.
 fn makeIntResource(id: u16) ?*const anyopaque {
     return @ptrFromInt(@as(usize, id));
+}
+
+/// Whether the bare flag at args[i] takes args[i + 1] as its value.
+fn nextIsValue(args: []const []const u8, i: usize) bool {
+    return frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null);
 }
 
 /// user32 LoadIconW redeclared with an align-agnostic resource-name pointer
@@ -122,13 +130,12 @@ fn getCwdUtf8(alloc: std.mem.Allocator) ?[]u8 {
 }
 
 /// Single-instance mode: forward file arguments to an already-running instance
-/// via WM_COPYDATA, then let the caller exit. Builds a bare Ex command (no
-/// leading ':') of the form "tab drop <abs1> <abs2> ..." — or "drop <abs>" for
-/// a single file when [server] open_mode == "current" — and posts it to the
-/// existing window. Paths are made absolute (the running instance may have a
-/// different working directory) and escaped for Neovim's command line, mirroring
-/// the WM_DROPFILES handler in window.zig. An empty path list sends an empty
-/// payload, which just brings the existing window to the front.
+/// via WM_COPYDATA, then let the caller exit. The payload is a tab-per-file
+/// flag -- '0' only for a single file when [server] open_mode == "current",
+/// the macOS rule -- then the paths (already absolute, see absoluteFileArg),
+/// NUL-separated and unescaped: the receiver hands them to
+/// zonvie_core_drop_paths. An empty path list sends an empty payload, which
+/// just brings the existing window to the front.
 fn forwardFilesToInstance(
     alloc: std.mem.Allocator,
     target: c.HWND,
@@ -140,29 +147,10 @@ fn forwardFilesToInstance(
 
     if (paths.len > 0) {
         const use_current = paths.len == 1 and std.mem.eql(u8, cfg.server.open_mode, "current");
-        buf.appendSlice(alloc, if (use_current) "drop" else "tab drop") catch return;
-
-        const cwd = getCwdUtf8(alloc);
-        defer if (cwd) |w| alloc.free(w);
-
-        for (paths) |p| {
-            buf.append(alloc, ' ') catch return;
-
-            // Resolve to an absolute path against this process's cwd so the
-            // running instance opens the file the user meant. Does not require
-            // the file to exist (supports opening a new file).
-            const abs: []const u8 = blk: {
-                if (std.fs.path.isAbsolute(p)) break :blk p;
-                if (cwd) |w| {
-                    if (std.fs.path.join(alloc, &.{ w, p })) |joined| break :blk joined else |_| {}
-                }
-                break :blk p;
-            };
-            defer if (abs.ptr != p.ptr) alloc.free(abs);
-
-            for (abs) |ch| {
-                if (window.escapeNeovimByte(ch)) |e| buf.appendSlice(alloc, e) catch return else buf.append(alloc, ch) catch return;
-            }
+        buf.append(alloc, if (use_current) '0' else '1') catch return;
+        for (paths, 0..) |p, i| {
+            if (i > 0) buf.append(alloc, 0) catch return;
+            buf.appendSlice(alloc, p) catch return;
         }
     }
 
@@ -184,6 +172,35 @@ fn forwardFilesToInstance(
     _ = c.SendMessageW(target, c.WM_COPYDATA, 0, @bitCast(@intFromPtr(&cds)));
 }
 
+/// A file argument (frontend_rules.nvimArgIsFile) made absolute against
+/// `cwd`. Drive-relative (`C:foo`) and already-absolute paths pass through;
+/// with no cwd so does the rest.
+fn absoluteFileArg(alloc: std.mem.Allocator, cwd: ?[]const u8, arg: []const u8) []const u8 {
+    if (std.fs.path.isAbsolute(arg) or (arg.len >= 2 and arg[1] == ':')) return arg;
+    const base = cwd orelse return arg;
+    return std.fs.path.join(alloc, &.{ base, arg }) catch arg;
+}
+
+/// Append one nvim argument; a file argument goes in absolute and is also
+/// recorded in `files`, the list single-instance mode forwards.
+fn appendNvimArg(
+    alloc: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    files: *std.ArrayListUnmanaged([]const u8),
+    cwd: ?[]const u8,
+    prev: ?[]const u8,
+    arg: []const u8,
+    after_dash_dash: bool,
+) void {
+    if (!frontend_rules.nvimArgIsFile(prev, arg, after_dash_dash)) {
+        args.append(alloc, arg) catch {};
+        return;
+    }
+    const abs = absoluteFileArg(alloc, cwd, arg);
+    args.append(alloc, abs) catch {};
+    files.append(alloc, abs) catch {};
+}
+
 pub fn main() u8 {
     clock.init();
     defer applog.deinit();
@@ -201,18 +218,23 @@ pub fn main() u8 {
     if (askpass_mode_len > 0) {
         // Askpass mode: output password to stdout and exit
         // First check if password is pre-set in environment
-        var pwd_buf: [256]u8 = undefined;
-        const pwd_len = c.GetEnvironmentVariableA("ZONVIE_SSH_PASSWORD", &pwd_buf, pwd_buf.len);
+        var pwd_w: [256]u16 = undefined;
+        defer std.crypto.secureZero(u16, &pwd_w);
+        // Every UTF-16 unit takes at most 3 UTF-8 bytes.
+        var pwd_utf8: [pwd_w.len * 3]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pwd_utf8);
+        const pwd_len = c.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_SSH_PASSWORD"), &pwd_w, pwd_w.len);
 
         // Attach to parent console for stdout output
         _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
         const stdout = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
 
-        if (pwd_len > 0 and pwd_len < pwd_buf.len) {
+        if (pwd_len > 0 and pwd_len < pwd_w.len) {
             // Use pre-set password
+            const utf8_len = std.unicode.utf16LeToUtf8(&pwd_utf8, pwd_w[0..pwd_len]) catch 0;
             if (stdout != c.INVALID_HANDLE_VALUE) {
                 var written: c.DWORD = 0;
-                _ = c.WriteFile(stdout, &pwd_buf, pwd_len, &written, null);
+                _ = c.WriteFile(stdout, &pwd_utf8, @intCast(utf8_len), &written, null);
                 _ = c.WriteFile(stdout, "\n", 1, &written, null);
             }
         } else {
@@ -261,24 +283,15 @@ pub fn main() u8 {
             // Use GetSaveFileNameW trick or simple MessageBox + clipboard workaround
             // For now, use a simple approach: create a tiny window with password field
             var password: [256]u16 = undefined;
+            defer std.crypto.secureZero(u16, &password);
             password[0] = 0;
             const dialog_result = dialogs.showPasswordInputDialog(&prompt_buf, &password);
 
             if (dialog_result and stdout != c.INVALID_HANDLE_VALUE) {
-                // Convert UTF-16 password to UTF-8 and write to stdout
-                var utf8_pwd: [512]u8 = undefined;
-                var utf8_len: usize = 0;
-                for (password) |wch| {
-                    if (wch == 0) break;
-                    if (wch < 0x80) {
-                        if (utf8_len < utf8_pwd.len) {
-                            utf8_pwd[utf8_len] = @truncate(wch);
-                            utf8_len += 1;
-                        }
-                    }
-                }
+                const wlen = std.mem.indexOfScalar(u16, &password, 0) orelse password.len;
+                const utf8_len = std.unicode.utf16LeToUtf8(&pwd_utf8, password[0..wlen]) catch 0;
                 var written: c.DWORD = 0;
-                _ = c.WriteFile(stdout, &utf8_pwd, @intCast(utf8_len), &written, null);
+                _ = c.WriteFile(stdout, &pwd_utf8, @intCast(utf8_len), &written, null);
                 _ = c.WriteFile(stdout, "\n", 1, &written, null);
             }
         }
@@ -314,17 +327,14 @@ pub fn main() u8 {
     var ext_popup_enabled = config.popup.external;
     var ext_messages_enabled = config.messages.external;
     var ext_tabline_enabled = config.tabline.external;
-    var tabline_style: app_mod.TablineStyle = .titlebar;
-    var sidebar_position_right: bool = false;
-    var sidebar_width_px: u32 = 200;
-    if (ext_tabline_enabled) {
-        if (std.mem.eql(u8, config.tabline.style, "sidebar")) {
-            tabline_style = .sidebar;
-        }
-        // "menu" is not supported on Windows, falls through to titlebar
-        sidebar_position_right = std.mem.eql(u8, config.tabline.sidebar_position, "right");
-        sidebar_width_px = config.tabline.sidebar_width;
-    }
+    // Resolved whether or not [tabline] external is set: --exttabline and the
+    // connection dialog turn ext_tabline on later and take this style (as
+    // macOS's effectiveTablineStyle does). Every reader also checks
+    // ext_tabline_enabled.
+    // "menu" is not supported on Windows, falls through to titlebar
+    const tabline_style: app_mod.TablineStyle = if (std.mem.eql(u8, config.tabline.style, "sidebar")) .sidebar else .titlebar;
+    const sidebar_position_right = std.mem.eql(u8, config.tabline.sidebar_position, "right");
+    const sidebar_width_px: u32 = config.tabline.sidebar_width;
     var ext_windows_enabled = config.windows.external;
     var cli_log_path: ?[]const u8 = null;
     var cli_nvim_path: ?[]const u8 = null;
@@ -412,42 +422,8 @@ pub fn main() u8 {
                     \\    Configuration file: %APPDATA%\zonvie\config.toml
                     \\    (or %USERPROFILE%\.config\zonvie\config.toml)
                     \\
-                    \\    [neovim]
-                    \\        path            Path to Neovim executable
-                    \\        wsl             Enable WSL mode (true/false)
-                    \\        wsl_distro      WSL distribution name
-                    \\        ssh             Enable SSH mode (true/false)
-                    \\        ssh_host        SSH host (user@host format)
-                    \\        ssh_port        SSH port number
-                    \\        ssh_identity    Path to SSH private key
                     \\
-                    \\    [font]
-                    \\        family          Font family name
-                    \\        size            Font size in points
-                    \\        linespace       Extra line spacing in pixels
-                    \\
-                    \\    [cmdline]
-                    \\        external        Enable external command line UI
-                    \\
-                    \\    [popup]
-                    \\        external        Enable external popup menu UI
-                    \\
-                    \\    [messages]
-                    \\        external        Enable external messages UI
-                    \\
-                    \\    [tabline]
-                    \\        external        Enable external tabline UI
-                    \\
-                    \\    [log]
-                    \\        enabled         Enable logging (true/false)
-                    \\        path            Log file path
-                    \\
-                    \\    [performance]
-                    \\        glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
-                    \\        glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                    \\        hl_cache_size               Highlight cache size (64-2048, default: 512)
-                    \\        shape_cache_size            Shape cache size (512-65536, default: 4096)
-                    \\        atlas_size                  Glyph atlas texture size (1024-4096, default: 2048)
+                ++ core_config.config_help ++
                     \\
                     \\For more information, visit: https://github.com/akiyosi/zonvie
                     \\
@@ -460,7 +436,9 @@ pub fn main() u8 {
         if (std.mem.eql(u8, arg, "--install")) {
             const file_assoc = @import("file_assoc.zig");
             const icon_ok = file_assoc.registerAppIcon();
-            const config_result2 = createDefaultConfig(alloc);
+            // A config at any load location counts: an APPDATA template
+            // would shadow one under %USERPROFILE%\.config.
+            const config_result2: ConfigCreateResult = if (config_result.path != null) .already_exists else createDefaultConfig(alloc);
             const has_error = !icon_ok or config_result2 == .err;
 
             _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
@@ -516,9 +494,14 @@ pub fn main() u8 {
     }
 
     // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
-    // After "--", all remaining arguments are passed to nvim
+    // After "--", all remaining arguments are passed to nvim. A relative file
+    // argument is made absolute against the shell's cwd here: nvim is spawned
+    // in HOME when that variable is set, so `zonvie foo.txt` opened
+    // %HOME%\foo.txt (macOS resolves the same way before its fork).
     var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    var nvim_file_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
+    const shell_cwd: ?[]const u8 = getCwdUtf8(alloc);
 
     var i: usize = 1; // Skip argv[0] (executable path)
     while (i < args.len) : (i += 1) {
@@ -531,7 +514,7 @@ pub fn main() u8 {
         }
 
         if (pass_all_to_nvim) {
-            nvim_extra_args.append(alloc, arg) catch {};
+            appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, null, arg, true);
             continue;
         }
 
@@ -574,45 +557,24 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --wsl={s} flag detected\n", .{wsl_distro.?});
         } else if (std.mem.startsWith(u8, arg, "--ssh=")) {
             ssh_mode = true;
-            const value = arg[6..]; // after "--ssh="
-            // Parse user@host:port format (port is after last colon, only if numeric)
-            if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
-                const port_str = value[colon_idx + 1 ..];
-                if (std.fmt.parseInt(u16, port_str, 10)) |port| {
-                    ssh_host = value[0..colon_idx];
-                    ssh_port = port;
-                } else |_| {
-                    ssh_host = value;
-                }
-            } else {
-                ssh_host = value;
-            }
+            const target = frontend_rules.sshTarget(arg[6..]); // after "--ssh="
+            ssh_host = target.host;
+            if (target.port) |port| ssh_port = port;
             if (applog.isEnabled()) applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
         } else if (std.mem.eql(u8, arg, "--ssh")) {
             ssh_mode = true;
-            // Only consume the next token as the host when it is a value, not
-            // another flag — otherwise `--ssh --dialog` grabs "--dialog".
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                const value = args[i + 1];
+            if (nextIsValue(args, i)) {
+                const target = frontend_rules.sshTarget(args[i + 1]);
                 i += 1;
-                if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
-                    const port_str = value[colon_idx + 1 ..];
-                    if (std.fmt.parseInt(u16, port_str, 10)) |port| {
-                        ssh_host = value[0..colon_idx];
-                        ssh_port = port;
-                    } else |_| {
-                        ssh_host = value;
-                    }
-                } else {
-                    ssh_host = value;
-                }
+                ssh_host = target.host;
+                if (target.port) |port| ssh_port = port;
             }
             if (applog.isEnabled()) applog.appLog("[win] --ssh flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg[15..]; // after "--ssh-identity="
             if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 ssh_identity = args[i + 1];
                 i += 1;
             }
@@ -623,7 +585,7 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
         } else if (std.mem.eql(u8, arg, "--devcontainer")) {
             devcontainer_mode = true;
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 devcontainer_workspace = args[i + 1];
                 i += 1;
             }
@@ -632,7 +594,7 @@ pub fn main() u8 {
             devcontainer_config = arg[22..]; // after "--devcontainer-config="
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--devcontainer-config")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 devcontainer_config = args[i + 1];
                 i += 1;
             }
@@ -675,7 +637,7 @@ pub fn main() u8 {
             // Already handled above, skip
         } else {
             // Not a zonvie argument - pass to nvim
-            nvim_extra_args.append(alloc, arg) catch {};
+            appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, if (i > 1) args[i - 1] else null, arg, false);
         }
     }
 
@@ -685,8 +647,7 @@ pub fn main() u8 {
 
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
-        applog.setLogPath(path);
-        applog.setEnabled(true);
+        applog.forceEnabled(path);
     } else if (config.log.enabled) {
         applog.setLogPath(config.log.path);
         applog.setEnabled(true);
@@ -782,7 +743,7 @@ pub fn main() u8 {
                 }
             }
             if (existing != null) {
-                forwardFilesToInstance(alloc, existing.?, &config, nvim_extra_args.items);
+                forwardFilesToInstance(alloc, existing.?, &config, nvim_file_args.items);
                 return 0;
             }
             // Still no window (owning instance headless or stuck). Fall through
@@ -915,6 +876,10 @@ pub fn main() u8 {
         _ = c.MessageBoxW(null, &wide_msg, &wide_title, c.MB_OK | c.MB_ICONERROR);
         return 1;
     }
+
+    // ext_popupmenu is read from config.popup.external (the dialog overrides
+    // it the same way), so --extpopup lands there.
+    config.popup.external = ext_popup_enabled;
 
     const app = alloc.create(App) catch return 1;
     // errdefer alloc.destroy(app); // ← Remove this (causes double-free)
@@ -1061,28 +1026,7 @@ fn createDefaultConfig(alloc: std.mem.Allocator) ConfigCreateResult {
     // Write default config
     const file = std.Io.Dir.createFileAbsolute(clock.io(), file_path, .{}) catch return .err;
     defer file.close(clock.io());
-    file.writeStreamingAll(clock.io(), default_config_toml) catch return .err;
+    file.writeStreamingAll(clock.io(), core_config.default_config_toml) catch return .err;
     return .created;
 }
 
-const default_config_toml =
-    \\# Zonvie configuration file
-    \\# See `zonvie.exe --help` for all available options.
-    \\
-    \\[font]
-    \\# family = "Consolas"
-    \\# size = 18.0
-    \\# linespace = 0
-    \\
-    \\[neovim]
-    \\# path = "nvim"
-    \\
-    \\[window]
-    \\# opacity = 1.0
-    \\
-    \\[server]
-    \\# single_instance = false   # route `zonvie <file>` to a running instance (Windows only)
-    \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
-    \\# close_to_tray = false     # close button hides to the notification area instead of quitting (Windows only)
-    \\
-;

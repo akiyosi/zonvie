@@ -3,6 +3,13 @@ const builtin = @import("builtin");
 const clock = @import("zonvie_core").clock;
 
 var g_enabled: std.atomic.Value(bool) = .init(false);
+// `--log` enables logging before the config is read, and the config load then
+// re-applies its own (default false) setting. Callers consult this so the CLI
+// flag wins, which is what its help text promises.
+var g_forced_on: std.atomic.Value(bool) = .init(false);
+// Reference for the line timestamps, taken when logging is first enabled.
+// i64 nanoseconds: atomics cap at 64 bits, and the range is ~292 years.
+var g_start_ns: std.atomic.Value(i64) = .init(0);
 var g_log_file: ?std.Io.File = null;
 var g_perf_only: std.atomic.Value(bool) = .init(false);
 var g_scroll_only: std.atomic.Value(bool) = .init(false);
@@ -18,7 +25,6 @@ var g_queue_stop: bool = false;
 var g_queue_mu: std.Io.Mutex = .init;
 var g_queue_cond: std.Io.Condition = .init;
 var g_log_thread: ?std.Thread = null;
-var g_queue_busy_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_full_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_stopped_drops: std.atomic.Value(u64) = .init(0);
 var g_queue_shutdown_drop_bytes: std.atomic.Value(u64) = .init(0);
@@ -38,17 +44,16 @@ fn enqueueLocked(bytes: []const u8) bool {
 }
 
 fn enqueueDropSummaryLocked(required_after: usize) void {
-    const busy = g_queue_busy_drops.load(.acquire);
     const full = g_queue_full_drops.load(.acquire);
     const stopped = g_queue_stopped_drops.load(.acquire);
     const format = g_format_drops.load(.acquire);
-    if (busy == 0 and full == 0 and stopped == 0 and format == 0) return;
+    if (full == 0 and stopped == 0 and format == 0) return;
 
     var buf: [192]u8 = undefined;
     const summary = std.fmt.bufPrint(
         &buf,
-        "[log] dropped messages: busy={d} full={d} stopped={d} format={d}\n",
-        .{ busy, full, stopped, format },
+        "[log] dropped messages: full={d} stopped={d} format={d}\n",
+        .{ full, stopped, format },
     ) catch return;
     if (summary.len > queue_capacity - g_queue_len or
         required_after > queue_capacity - g_queue_len - summary.len)
@@ -56,7 +61,6 @@ fn enqueueDropSummaryLocked(required_after: usize) void {
         return;
     }
 
-    _ = g_queue_busy_drops.fetchSub(busy, .acq_rel);
     _ = g_queue_full_drops.fetchSub(full, .acq_rel);
     _ = g_queue_stopped_drops.fetchSub(stopped, .acq_rel);
     _ = g_format_drops.fetchSub(format, .acq_rel);
@@ -64,10 +68,10 @@ fn enqueueDropSummaryLocked(required_after: usize) void {
 }
 
 fn enqueue(bytes: []const u8) void {
-    if (!g_queue_mu.tryLock()) {
-        _ = g_queue_busy_drops.fetchAdd(1, .monotonic);
-        return;
-    }
+    // Waits rather than drops: the lock guards only ring copies of at most
+    // 8 KiB, never the sink I/O, so the wait is bounded and a line is lost
+    // only when the ring is full.
+    g_queue_mu.lockUncancelable(clock.io());
     defer g_queue_mu.unlock(clock.io());
 
     if (g_queue_stop) {
@@ -83,13 +87,12 @@ fn enqueue(bytes: []const u8) void {
     g_queue_cond.signal(clock.io());
 }
 
-fn enqueueParts(prefix: []const u8, bytes: []const u8, suffix: []const u8) void {
-    const total = std.math.add(usize, prefix.len, bytes.len) catch return;
-    const required = std.math.add(usize, total, suffix.len) catch return;
-    if (!g_queue_mu.tryLock()) {
-        _ = g_queue_busy_drops.fetchAdd(1, .monotonic);
-        return;
+fn enqueueParts(parts: []const []const u8) void {
+    var required: usize = 0;
+    for (parts) |part| {
+        required = std.math.add(usize, required, part.len) catch return;
     }
+    g_queue_mu.lockUncancelable(clock.io());
     defer g_queue_mu.unlock(clock.io());
 
     if (g_queue_stop) {
@@ -101,10 +104,18 @@ fn enqueueParts(prefix: []const u8, bytes: []const u8, suffix: []const u8) void 
         return;
     }
     enqueueDropSummaryLocked(required);
-    _ = enqueueLocked(prefix);
-    _ = enqueueLocked(bytes);
-    _ = enqueueLocked(suffix);
+    for (parts) |part| _ = enqueueLocked(part);
     g_queue_cond.signal(clock.io());
+}
+
+/// `[zonvie] [   12.345ms] `, the prefix the macOS frontend writes and the GUI
+/// harness parses (test/gui/app_log.zig lineTimestampMs). Without it every
+/// timestamp-filtered helper there discards the line.
+fn stampInto(buf: []u8) []const u8 {
+    const start = g_start_ns.load(.acquire);
+    const elapsed_ns: i64 = if (start == 0) 0 else @truncate(clock.nowNs() - start);
+    const ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    return std.fmt.bufPrint(buf, "[zonvie] [{d:>9.3}ms] ", .{ms}) catch "[zonvie] [    0.000ms] ";
 }
 
 fn writeChunk(chunk: []const u8) void {
@@ -130,17 +141,16 @@ fn outputDebug(bytes: []const u8) void {
 
 fn logThreadMain() void {
     defer {
-        const busy = g_queue_busy_drops.load(.acquire);
         const full = g_queue_full_drops.load(.acquire);
         const stopped = g_queue_stopped_drops.load(.acquire);
         const format = g_format_drops.load(.acquire);
         const shutdown_bytes = g_queue_shutdown_drop_bytes.load(.acquire);
-        if (busy != 0 or full != 0 or stopped != 0 or format != 0 or shutdown_bytes != 0) {
+        if (full != 0 or stopped != 0 or format != 0 or shutdown_bytes != 0) {
             var summary_buf: [224]u8 = undefined;
             if (std.fmt.bufPrint(
                 &summary_buf,
-                "[log] final drops: busy={d} full={d} stopped={d} format={d} shutdown_bytes={d}\n",
-                .{ busy, full, stopped, format, shutdown_bytes },
+                "[log] final drops: full={d} stopped={d} format={d} shutdown_bytes={d}\n",
+                .{ full, stopped, format, shutdown_bytes },
             )) |summary| {
                 writeChunk(summary);
             } else |_| {}
@@ -186,6 +196,9 @@ fn logThreadMain() void {
 /// App-root log switch (Windows side).
 /// This is the single source of truth for "frontend logging enabled".
 pub fn setEnabled(enabled: bool) void {
+    if (enabled and g_start_ns.load(.acquire) == 0) {
+        g_start_ns.store(@truncate(clock.nowNs()), .release);
+    }
     if (enabled and g_log_thread == null) {
         g_queue_stop = false;
         g_log_thread = std.Thread.spawn(.{}, logThreadMain, .{}) catch {
@@ -199,6 +212,17 @@ pub fn setEnabled(enabled: bool) void {
 
 pub fn isEnabled() bool {
     return g_enabled.load(.acquire);
+}
+
+/// Turn logging on from the command line, and record that it must stay on.
+pub fn forceEnabled(path: []const u8) void {
+    setLogPath(path);
+    g_forced_on.store(true, .release);
+    setEnabled(true);
+}
+
+pub fn isForced() bool {
+    return g_forced_on.load(.acquire);
 }
 
 pub fn setFilters(perf_only: bool, scroll_only: bool, verbose: bool) void {
@@ -236,7 +260,6 @@ fn shouldEmitBytes(prefix: []const u8, bytes: []const u8) bool {
 }
 
 pub const DropStats = struct {
-    busy: u64,
     full: u64,
     stopped: u64,
     format: u64,
@@ -247,7 +270,6 @@ pub const DropStats = struct {
 /// on the asynchronous writer reaching a final summary during process exit.
 pub fn dropStats() DropStats {
     return .{
-        .busy = g_queue_busy_drops.load(.acquire),
         .full = g_queue_full_drops.load(.acquire),
         .stopped = g_queue_stopped_drops.load(.acquire),
         .format = g_format_drops.load(.acquire),
@@ -265,7 +287,11 @@ pub fn setLogPath(path: ?[]const u8) void {
 
     if (path) |p| {
         if (p.len > 0) {
-            g_log_file = std.Io.Dir.createFileAbsolute(clock.io(), p, .{ .truncate = true }) catch null;
+            // Append, as macOS does, so a restart keeps the previous session's log.
+            const io = clock.io();
+            const f = std.Io.Dir.createFileAbsolute(io, p, .{ .truncate = false }) catch return;
+            if (f.length(io)) |len| io.vtable.fileSeekTo(io.userdata, f, len) catch {} else |_| {}
+            g_log_file = f;
         }
     }
 }
@@ -285,14 +311,16 @@ pub fn appLog(comptime fmt: []const u8, args: anytype) void {
             return;
         },
     };
-    enqueue(msg);
+    var stamp_buf: [40]u8 = undefined;
+    enqueueParts(&.{ stampInto(&stamp_buf), msg });
 }
 
 /// Used by core on_log callback: bytes already contain newline sometimes; caller decides.
 pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
     if (!isEnabled() or !shouldEmitBytes(prefix, bytes)) return;
 
-    enqueueParts(prefix, bytes, "\n");
+    var stamp_buf: [40]u8 = undefined;
+    enqueueParts(&.{ stampInto(&stamp_buf), prefix, bytes, "\n" });
 }
 
 /// Panic-only best-effort path. Never wait on the configured sink: it may be a
@@ -325,14 +353,14 @@ pub fn deinit() void {
 
     const drops = dropStats();
     const sink_inflight = g_sink_inflight_bytes.load(.acquire);
-    if (drops.busy != 0 or drops.full != 0 or drops.stopped != 0 or
+    if (drops.full != 0 or drops.stopped != 0 or
         drops.format != 0 or drops.shutdown_bytes != 0 or queued_at_shutdown != 0 or sink_inflight != 0)
     {
         var summary_buf: [256]u8 = undefined;
         const summary = std.fmt.bufPrint(
             &summary_buf,
-            "[log] final drops: busy={d} full={d} stopped={d} format={d} shutdown_bytes={d}\n",
-            .{ drops.busy, drops.full, drops.stopped, drops.format, drops.shutdown_bytes +| @as(u64, @intCast(queued_at_shutdown)) +| sink_inflight },
+            "[log] final drops: full={d} stopped={d} format={d} shutdown_bytes={d}\n",
+            .{ drops.full, drops.stopped, drops.format, drops.shutdown_bytes +| @as(u64, @intCast(queued_at_shutdown)) +| sink_inflight },
         ) catch "[log] final drop summary formatting failed\n";
         // The consumer may be permanently blocked in its configured sink.
         // Emit the summary synchronously only to the debugger channel before
@@ -351,17 +379,23 @@ pub fn deinit() void {
     }
 }
 
-test "logging producer drops instead of waiting for the queue mutex" {
+test "logging producer waits for the queue mutex instead of dropping" {
     clock.init();
-    g_queue_busy_drops.store(0, .release);
     g_queue_stop = false;
+    g_queue_head = 0;
+    g_queue_len = 0;
 
     g_queue_mu.lockUncancelable(clock.io());
-    enqueue("contended");
+    const producer = try std.Thread.spawn(.{}, enqueue, .{"contended"});
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    const len_while_held = g_queue_len;
     g_queue_mu.unlock(clock.io());
+    producer.join();
 
-    try std.testing.expectEqual(@as(u64, 1), g_queue_busy_drops.load(.acquire));
-    g_queue_busy_drops.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 0), len_while_held);
+    try std.testing.expectEqualStrings("contended", g_queue[0..g_queue_len]);
+    g_queue_head = 0;
+    g_queue_len = 0;
 }
 
 test "multipart logging drops atomically when the ring is full" {
@@ -371,7 +405,7 @@ test "multipart logging drops atomically when the ring is full" {
     g_queue_head = 0;
     g_queue_len = queue_capacity - 1;
 
-    enqueueParts("a", "b", "c");
+    enqueueParts(&.{ "a", "b", "c" });
 
     try std.testing.expectEqual(queue_capacity - 1, g_queue_len);
     try std.testing.expectEqual(@as(u64, 1), g_queue_full_drops.load(.acquire));

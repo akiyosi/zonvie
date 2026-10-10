@@ -95,7 +95,16 @@ pub const Image = struct {
 /// otherwise the whole window.
 pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image {
     const hwnd = win.mainWindowHandleForPid(pid) orelse return error.NoMainWindow;
+    return captureHwnd(alloc, hwnd, crop);
+}
 
+/// Capture any window of the app by the number windowsForPid gave it, so a
+/// scenario can observe an external window rather than the main one.
+pub fn captureWindow(alloc: std.mem.Allocator, window_number: u32) !Image {
+    return captureHwnd(alloc, win.handleOf(window_number), null);
+}
+
+fn captureHwnd(alloc: std.mem.Allocator, hwnd: W.HWND, crop: ?Crop) !Image {
     var rect: RECT = undefined;
     if (GetWindowRect(hwnd, &rect) == 0) return error.WindowRectFailed;
     const win_w: i32 = rect.right - rect.left;

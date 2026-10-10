@@ -42,6 +42,23 @@ let connectDialogEnabled = zonvieArgs.contains("--dialog")
 // After "--", all remaining arguments are passed to nvim
 var cliNvimPath: String? = nil
 var nvimExtraArgs: [String] = []
+/// argv index -> the argument as forwarded to nvim, for the fork parent below.
+var nvimForwardedArgs: [Int: String] = [:]
+/// A file argument for nvim (zonvie_core_nvim_arg_is_file), absolute against
+/// the shell's cwd; anything else and absolute paths pass through. The fork
+/// parent chdirs to $HOME before spawning the child, and nvim then inherits
+/// that cwd, so `zonvie README.md` opened ~/README.md (Windows resolves the
+/// same way).
+func absoluteFileArg(_ arg: String, prev: String?, afterDashDash: Bool = false) -> String {
+    if arg.hasPrefix("/") { return arg }
+    let isFile = arg.withCString { a in
+        (prev ?? "").withCString { p in
+            zonvie_core_nvim_arg_is_file(prev == nil ? nil : p, strlen(p), a, strlen(a), afterDashDash)
+        }
+    }
+    if !isFile { return arg }
+    return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(arg)
+}
 do {
     var i = 1  // Skip argv[0] (executable path)
     var passAllToNvim = false
@@ -56,7 +73,8 @@ do {
         }
 
         if passAllToNvim {
-            nvimExtraArgs.append(arg)
+            nvimExtraArgs.append(absoluteFileArg(arg, prev: nil, afterDashDash: true))
+            nvimForwardedArgs[i] = nvimExtraArgs[nvimExtraArgs.count - 1]
             i += 1
             continue
         }
@@ -83,9 +101,10 @@ do {
             // Skip --log and its value
             i += 2
         } else if arg == "--ssh" || arg == "--ssh-identity" ||
-                  arg == "--devcontainer" || arg == "--devcontainer-config" ||
-                  arg == "--connect-nvim" || arg == "--remote-ui" {
-            // Skip space-separated value arguments (--ssh host, --devcontainer path, etc.)
+                  arg == "--devcontainer" || arg == "--devcontainer-config" {
+            // Optional value: take the next token only when it is one, as ZonvieCore.start does.
+            i += ZonvieCore.cliNextIsValue(args, after: i) ? 2 : 1
+        } else if arg == "--connect-nvim" || arg == "--remote-ui" {
             i += 2
         } else if arg.hasPrefix("--ssh=") || arg.hasPrefix("--ssh-identity=") ||
                   arg.hasPrefix("--devcontainer=") || arg.hasPrefix("--devcontainer-config=") ||
@@ -106,7 +125,8 @@ do {
             }
         } else {
             // Not a zonvie argument - pass to nvim
-            nvimExtraArgs.append(arg)
+            nvimExtraArgs.append(absoluteFileArg(arg, prev: args[i - 1]))
+            nvimForwardedArgs[i] = nvimExtraArgs[nvimExtraArgs.count - 1]
             i += 1
         }
     }
@@ -195,50 +215,7 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
             Configuration file: ~/.config/zonvie/config.toml
             (or $XDG_CONFIG_HOME/zonvie/config.toml)
 
-            [neovim]
-                path            Path to Neovim executable
-                ssh             Enable SSH mode (true/false)
-                ssh_host        SSH host (user@host format)
-                ssh_port        SSH port number
-                ssh_identity    Path to SSH private key
-
-            [font]
-                family          Font family name
-                size            Font size in points
-                linespace       Extra line spacing in pixels
-
-            [window]
-                blur            Enable blur effect (true/false)
-                opacity         Background opacity (0.0-1.0, when blur=true)
-                blur_radius     Blur radius (1-100, when blur=true)
-
-            [cmdline]
-                external        Enable external command line UI
-
-            [popup]
-                external        Enable external popup menu UI
-
-            [messages]
-                external        Enable external messages UI
-
-            [tabline]
-                external            Enable external tabline UI
-                style               Display style: "titlebar", "menu", "sidebar" (default: "titlebar")
-                sidebar_position    Sidebar position: "left" or "right" (default: "left")
-                sidebar_width       Sidebar width in pixels (100-500, default: 200)
-
-            [windows]
-                external        Enable external windows
-
-            [log]
-                enabled         Enable logging (true/false)
-                path            Log file path
-
-            [performance]
-                glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
-                glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                hl_cache_size               Highlight cache size (64-2048, default: 512)
-
+        \(String(cString: zonvie_core_config_help()))
         For more information, visit: https://github.com/akiyosi/zonvie
         """
     print(help)
@@ -272,28 +249,7 @@ if zonvieArgs.contains("--install") {
             exit(1)
         }
 
-        let defaultConfig = """
-            # Zonvie configuration file
-            # See `zonvie --help` for all available options.
-
-            [font]
-            # family = "SF Mono"
-            # size = 14.0
-            # linespace = 0
-
-            [neovim]
-            # path = "nvim"
-
-            [window]
-            # opacity = 1.0
-            # blur = false
-            # blur_radius = 20
-
-            [server]
-            # open_mode = "tab"   # "tab" (new tab) or "current" (replace current window)
-            # single_instance is Windows-only (macOS routes file opens via the OS).
-
-            """
+        let defaultConfig = String(cString: zonvie_core_default_config_toml())
         do {
             try defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
             print("Default config.toml created: \(configPath)")
@@ -444,16 +400,12 @@ if connectDialogEnabled {
         // when it is a value, not another flag — otherwise `--ssh --dialog`
         // would grab "--dialog" as the host.
         for (idx, arg) in zonvieArgs.enumerated() {
-            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            let nextIsValue = ZonvieCore.cliNextIsValue(zonvieArgs, after: idx)
             if arg.hasPrefix("--ssh=") || (arg == "--ssh" && nextIsValue) {
                 let value = arg.hasPrefix("--ssh=") ? String(arg.dropFirst("--ssh=".count)) : zonvieArgs[idx + 1]
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    dialogSeedConfig.sshHost = String(value[..<lastColon])
-                    dialogSeedConfig.sshPort = String(portPart)
-                } else {
-                    dialogSeedConfig.sshHost = value
-                }
+                let target = ZonvieCore.sshTarget(value)
+                dialogSeedConfig.sshHost = target.host
+                if let port = target.port { dialogSeedConfig.sshPort = String(port) }
             } else if arg.hasPrefix("--ssh-identity=") {
                 dialogSeedConfig.sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
             } else if arg == "--ssh-identity" && nextIsValue {
@@ -473,7 +425,7 @@ if connectDialogEnabled {
     } else if devcontainerModeEnabled {
         dialogInitialTab = "devcontainer"
         for (idx, arg) in zonvieArgs.enumerated() {
-            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            let nextIsValue = ZonvieCore.cliNextIsValue(zonvieArgs, after: idx)
             if arg.hasPrefix("--devcontainer=") {
                 dialogSeedConfig.devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
             } else if arg == "--devcontainer" && nextIsValue {
@@ -561,7 +513,9 @@ if !noforkMode && !launchedFromFinder {
         var newArgs = ["--nofork"]
         for i in 1..<args.count {
             if args[i] != "--nofork" {  // Don't duplicate --nofork
-                newArgs.append(args[i])
+                // File arguments absolute: the child parses them after this
+                // parent's chdir($HOME).
+                newArgs.append(nvimForwardedArgs[i] ?? args[i])
             }
         }
 

@@ -74,8 +74,8 @@ final class ViewController: NSViewController {
 
         case .menu:
             // Menu mode: no tab UI in the window, full-size terminal.
-            // Notification observers are set up for currentTabs tracking.
-            setupTablineNotificationObservers()
+            // Notification observers (set up below, once the core exists)
+            // keep currentTabs tracking.
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -95,6 +95,14 @@ final class ViewController: NSViewController {
 
         // Create core (init takes no args)
         core = ZonvieCore()
+
+        // Observers filter on this session's core, so they register only
+        // once it exists: registered earlier, `object: core` was nil and
+        // every session's tabline reached this window.
+        if tablineStyle != nil {
+            setupTablineNotificationObservers()
+        }
+        sidebarView?.observeColorschemeChanges(of: core)
 
         // Wire both directions
         core.terminalView = terminalView
@@ -138,25 +146,28 @@ final class ViewController: NSViewController {
         // the post-layout drawable size, so nvim_ui_attach is sent with the
         // correct dimensions on the first try.
         let nvimPath = cliNvimPath ?? config.neovim.path
-        let sshEnabled = sshModeEnabled || config.neovim.ssh
-        if sshEnabled || devcontainerModeEnabled {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "ssh/devcontainer") }
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "native") }
-            }
+        let remote = sshModeEnabled || config.neovim.ssh || devcontainerModeEnabled
+        dispatchStart(nvimPath: nvimPath, remote: remote, context: remote ? "ssh/devcontainer" : "native")
+    }
+
+    /// Start the core: a remote session on main (its auth dialogs need the
+    /// RunLoop), a local one off it.
+    private func dispatchStart(nvimPath: String, remote: Bool, context: String) {
+        core.startRequested = true
+        let queue = remote ? DispatchQueue.main : DispatchQueue.global(qos: .userInitiated)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            // A closed session's ViewController and core must deinit on main.
+            defer { DispatchQueue.main.async { withExtendedLifetime(self) {} } }
+            guard !self.core.startCancelled else { return }
+            let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            if rc != 0 { self.handleCoreStartFailure(rc: rc, context: context) }
         }
     }
 
     /// Present the interactive connection chooser (`--dialog`). On Connect the
-    /// chosen ConnectionConfig drives `core.start()`; on Cancel the app quits
-    /// (the user launched the picker deliberately and declined to connect).
+    /// chosen ConnectionConfig drives `core.start()`; on Cancel the session
+    /// ends (the app quits if it was the last one).
     private func presentConnectionDialog() {
         let menu = ConnectionMenuViewController()
         // `--ssh --dialog` / `--devcontainer --dialog`: seed the CLI startup
@@ -169,16 +180,10 @@ final class ViewController: NSViewController {
             self?.startWithConnection(cfg)
         }
         menu.onCancel = { [weak self] in
-            guard let self = self else { return }
-            if self.forceConnectDialog {
-                // New Session window cancelled: close just this window.
-                ZonvieCore.appLog("[ViewController] New Session cancelled: closing window")
-                self.view.window?.close()
-            } else {
-                // The user launched the picker deliberately and declined: quit.
-                ZonvieCore.appLog("[ViewController] --dialog: dialog cancelled, terminating")
-                NSApp.terminate(nil)
-            }
+            // Other sessions may have started meanwhile (Cmd+N is not blocked
+            // by the sheet): end only this one unless it is the last.
+            ZonvieCore.appLog("[ViewController] connection dialog cancelled: ending session")
+            self?.core.endSession()
         }
         presentAsSheet(menu)
     }
@@ -187,7 +192,27 @@ final class ViewController: NSViewController {
     /// ConnectionConfig chosen in the `--dialog` dialog. Mirrors viewDidLoad's
     /// start dispatch, but feeds the connection through `core.connectionConfig`
     /// (which takes priority over CLI flags / config.toml inside start()).
-    private func startWithConnection(_ cfg: ConnectionConfig) {
+    private func startWithConnection(_ dialogCfg: ConnectionConfig) {
+        var cfg = dialogCfg
+        // The spawn command's quoting cannot carry a quote inside a path (the
+        // --nvim rule in main.swift, and the Windows dialog): one pair around
+        // the whole path is dropped, and a path still holding one is ignored.
+        var path = cfg.nvimPath
+        if path.count >= 2, let first = path.first, first == "\"" || first == "'", path.last == first {
+            path = String(path.dropFirst().dropLast())
+        }
+        if path.contains("'") || path.contains("\"") {
+            ZonvieCore.appLog("[ViewController] --dialog: nvim path contains quote characters; ignoring it")
+            if let window = view.window {
+                let alert = NSAlert()
+                alert.messageText = "The Neovim path contains a quote character and was ignored."
+                alert.alertStyle = .warning
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+            path = ""
+        }
+        cfg.nvimPath = path
+
         // Apply per-connection environment variables (KEY=VALUE per line) before
         // the core spawns nvim, so the child inherits them.
         for line in cfg.envVars.components(separatedBy: "\n") {
@@ -210,21 +235,9 @@ final class ViewController: NSViewController {
 
         ZonvieCore.appLog("[ViewController] --dialog: starting core name=\(cfg.name) isSSH=\(cfg.isSSH) isDevcontainer=\(cfg.isDevcontainer)")
 
-        // SSH/devcontainer modes need the main RunLoop for their auth dialogs
-        // (same rationale as viewDidLoad); local connections start off-main.
-        if cfg.isSSH || cfg.isDevcontainer {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog ssh/devcontainer") }
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog native") }
-            }
-        }
+        let remote = cfg.isSSH || cfg.isDevcontainer
+        dispatchStart(nvimPath: nvimPath, remote: remote,
+                      context: remote ? "connect-dialog ssh/devcontainer" : "connect-dialog native")
     }
 
     /// Menu-bar label for a session's connection config.
@@ -236,14 +249,16 @@ final class ViewController: NSViewController {
     }
 
     /// Surface a synchronous start() / start_connect() failure to the user
-    /// and terminate. The C ABI returns 0 on success, -1 invalid handle,
-    /// -2 thread spawn failed, -3 invalid/unsupported listen address. In
+    /// and end the session (exit(1) if it is the only one). The C ABI returns
+    /// 0 on success, -1 invalid handle, -2 thread spawn failed,
+    /// -3 invalid/unsupported listen address. In
     /// every failure case the core thread did NOT start and on_exit will
     /// not fire, so without explicit handling the window would remain
     /// open with no backing nvim — the user sees an empty zombie window.
     private func handleCoreStartFailure(rc: Int32, context: String) {
-        ZonvieCore.appLog("[start] core start failed rc=\(rc) context=\(context); terminating")
+        ZonvieCore.appLog("[start] core start failed rc=\(rc) context=\(context)")
         DispatchQueue.main.async {
+            let lastSession = SessionManager.shared.sessions.count <= 1
             let alert = NSAlert()
             alert.messageText = "Zonvie failed to start"
             let reason: String
@@ -255,19 +270,9 @@ final class ViewController: NSViewController {
             }
             alert.informativeText = "\(reason)\nContext: \(context)."
             alert.alertStyle = .critical
-            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: lastSession ? "Quit" : "Close")
             _ = alert.runModal()
-            // Use Darwin.exit(1) instead of NSApp.terminate(nil) so the
-            // shell sees a non-zero exit code for fatal startup failures.
-            // NSApp.terminate(nil) runs the normal AppKit teardown and
-            // returns 0, which would mask the failure for callers
-            // scripting around `zonvie --connect-nvim=...`. The specific
-            // failure reason (rc value, context) is surfaced via the
-            // NSAlert text above, not via the exit code — exit codes are
-            // a binary success/failure signal, matching the rest of
-            // zonvie's CLI validation paths.
-            ZonvieCore.appLog("[start] handleCoreStartFailure: exit(1)")
-            Darwin.exit(1)
+            self.core.endFailedStart()
         }
     }
 
@@ -290,7 +295,7 @@ final class ViewController: NSViewController {
         // core.stop() is unnecessary for all termination paths:
         //   - Normal close: windowShouldClose → requestQuit → Neovim exits
         //     → onExitFromNvim → Darwin.exit() (process terminates).
-        //   - Timeout: showNotRespondingDialog → confirmQuit → Darwin.exit().
+        //   - Timeout: showNotRespondingDialog → Force Quit ends this session.
         //   - No core: windowShouldClose returns true, nothing to stop.
         //
         // ASSUMPTION: The current UI uses a single main window with one
@@ -299,24 +304,20 @@ final class ViewController: NSViewController {
         // tab-based ViewController swapping, or view detachment, a new
         // explicit stop point (e.g. windowWillClose or a dedicated cleanup
         // method) must be added for the detached ViewController's core.
+        //
+        // Observers stay registered: this also runs on minimize, and the
+        // tabline and agent notifications are sent only on change, so one
+        // posted while minimized was lost for good.
+    }
 
-        // Remove notification observers and nil tokens so viewDidAppear can re-register
-        if let observer = tablineUpdateObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineUpdateObserver = nil
-        }
-        if let observer = tablineHideObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineHideObserver = nil
+    deinit {
+        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver] {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
-        if tablineUpdateObserver == nil {
-            setupTablineNotificationObservers()
-        }
         // Present the `--dialog` dialog once, after the window exists so it can
         // host the sheet.
         if pendingConnectDialog && !connectDialogShown {
@@ -328,13 +329,14 @@ final class ViewController: NSViewController {
     // MARK: - Tabline Notification Observers (shared across modes)
 
     private func setupTablineNotificationObservers() {
+        // Only this session's core: every session posts the same names.
         tablineUpdateObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineUpdateNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.TablineUpdateInfo else {
-                ZonvieCore.appLog("[Tabline] WARNING: notification object cast failed: \(String(describing: notification.object))")
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.TablineUpdateInfo else {
+                ZonvieCore.appLog("[Tabline] WARNING: notification payload cast failed: \(String(describing: notification.userInfo))")
                 return
             }
             self?.handleTablineUpdate(tabs: info.tabs, currentTab: info.currentTab)
@@ -342,7 +344,7 @@ final class ViewController: NSViewController {
 
         tablineHideObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineHideNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] _ in
             self?.handleTablineHide()
@@ -350,10 +352,10 @@ final class ViewController: NSViewController {
 
         agentStatusObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.agentStatusNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.AgentStatusInfo else { return }
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.AgentStatusInfo else { return }
             self?.tabBarView?.setAgentState(handle: info.tabHandle, state: info.state)
             self?.sidebarView?.setAgentState(handle: info.tabHandle, state: info.state)
         }
@@ -408,8 +410,6 @@ final class ViewController: NSViewController {
         }
 
         self.tabBarView = tabBar
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Sidebar (sidebar mode)
@@ -465,8 +465,6 @@ final class ViewController: NSViewController {
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Public Tab Bar Control
@@ -501,16 +499,10 @@ final class ViewController: NSViewController {
         core?.sendCommand("tabnew")
     }
 
-    /// `toIndex` is the drop insertion index in the pre-move tab list.
+    /// `toIndex` is the drop insertion index in the pre-move tab list. The
+    /// command is the core's, shared with Windows.
     private func moveTab(from fromIndex: Int, to toIndex: Int) {
-        guard fromIndex >= 0 && fromIndex < currentTabs.count else { return }
-        // `:tabmove N` moves the current tab to after tab page N, where N is
-        // counted in the list *before* the move (1-based, 0 = very front).
-        // That is exactly the insertion index, so no adjustment is needed.
-        let newPos = min(max(toIndex, 0), currentTabs.count)
-        // `:tabmove` acts on the current tab, so make the dragged tab current first.
-        // Use nvim_command API so it works even in terminal mode
-        core?.sendCommand("\(fromIndex + 1)tabnext | tabmove \(newPos)")
+        core?.moveTab(from: fromIndex, toDropIndex: toIndex, tabCount: currentTabs.count)
     }
 
     private func externalizeTab(handle: Int64, dropPoint: NSPoint) {
@@ -529,18 +521,8 @@ final class ViewController: NSViewController {
         // Set the pending external window position so it appears at the drop point
         core.setPendingExternalWindowPosition(dropPoint)
 
-        // Execute single Lua script that does both tab switch and externalization atomically.
-        // Uses nvim_open_win to create a new external window instead of vnew + nvim_win_set_config.
-        // In ext_windows mode, vnew would trigger win_split which creates another external window.
-        // The Lua script:
-        // 1. Switch to the target tab
-        // 2. Check if tab has multiple windows (split) - abort if so
-        // 3. Get the window's buffer, cursor position, and dimensions
-        // 4. Create a new external window with nvim_open_win showing the same buffer
-        // 5. Replace the original window's buffer with a scratch buffer
-        let tabNumber = index + 1
-        let luaScript = "lua vim.cmd('\(tabNumber)tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local buf=vim.api.nvim_win_get_buf(w); local cur=vim.api.nvim_win_get_cursor(w); local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); local ew=vim.api.nvim_open_win(buf,true,{external=true,width=W,height=H}); vim.api.nvim_win_set_cursor(ew,cur); vim.api.nvim_win_set_buf(w,vim.api.nvim_create_buf(true,true))"
-        ZonvieCore.appLog("[EXTERNALIZE] sending Lua script to nvim: \(luaScript)")
-        core.sendCommand(luaScript)
+        // The core's command, shared with Windows: it switches to the tab and
+        // opens its only window externally in one go.
+        core.externalizeTab(index: index)
     }
 }

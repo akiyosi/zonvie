@@ -10,11 +10,15 @@ const TabEntry = grid_mod.TabEntry;
 const BufferEntry = grid_mod.BufferEntry;
 const hlmod = @import("highlight.zig");
 const Highlights = hlmod.Highlights;
-const Styles = hlmod.Styles;
 const Logger = @import("log.zig").Logger;
 const clock = @import("clock.zig");
 
-/// All redraw events handled by `handleRedraw`. Order is not significant;
+/// All redraw events handled by `handleRedraw`. Most events are order-independent,
+/// but the following ordering MUST be preserved:
+///   - mode_info_set MUST come before grid_line in the same batch
+///     (Neovim may omit mode_change; mode_info_set updates the mode table)
+///   - hl_attr_define MUST come before grid_line (grid_line references highlight IDs)
+///
 /// `std.meta.stringToEnum` is used for perfect-hash-style dispatch.
 /// Unknown event names (e.g., future Neovim additions) return null and are skipped.
 pub const RedrawEvent = enum {
@@ -72,6 +76,13 @@ pub const RedrawEvent = enum {
 
 /// Parse Neovim ext type handle (tab, buffer, window handles).
 /// Neovim sends handles as ext types with data containing big-endian integer.
+/// Parse a Neovim handle (window/tab/buffer ID) from MessagePack EXT.
+/// Returns 0 if EXT is empty, malformed, or decode fails.
+/// NOTE: Handle 0 is invalid in Neovim's RPC protocol. Caller must treat 0 as:
+/// - "parse error" in guard conditions (e.g., grid creation fallback to main window)
+/// - "unknown handle" in UI state update (e.g., skip if handle unrecognized)
+/// Returning 0 on all error paths ensures caller has a safe default; do not silently
+/// accept 0 as a valid grid ID without explicit handle validation.
 fn parseExtHandle(ext: mp.Ext) i64 {
     // Neovim encodes window/tab/buffer handles as MessagePack EXT with the
     // payload itself a nested MessagePack integer (e.g. handle 128 is the
@@ -81,10 +92,10 @@ fn parseExtHandle(ext: mp.Ext) i64 {
     // branch already pre-unwraps well-formed integer payloads into `.int`
     // before this function ever sees a `.ext` Value, so this only runs on
     // malformed/edge-case payloads mp.decode itself failed to unwrap.
-    if (ext.data.len == 0) return 0;
+    if (ext.data.len == 0) return 0;  // Empty EXT → invalid handle
     var sr = mp.SliceReader{ .data = ext.data };
-    const ib0 = sr.readByte() catch return 0;
-    const v = mp.decodeInt(&sr, ib0) catch return 0;
+    const ib0 = sr.readByte() catch return 0;  // Read error → invalid handle
+    const v = mp.decodeInt(&sr, ib0) catch return 0;  // Decode error → invalid handle
     return v;
 }
 
@@ -92,6 +103,7 @@ fn parseExtHandle(ext: mp.Ext) i64 {
 /// Returns the number of codepoints written (including the first).
 /// If the string exceeds the lossless inline cell representation, fail before
 /// mutating the grid instead of silently publishing a truncated cluster.
+/// Extract codepoints: caller-side check — buf must be [16]u32
 fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
     if (utf8.len == 0) {
         buf[0] = 0;
@@ -150,6 +162,7 @@ const ExtractedCellCodepoints = struct {
 /// the wire handler substitutes one visible replacement glyph instead of
 /// truncating the cluster or aborting the rest of the redraw batch (including
 /// its flush event).
+/// Tier A2: caller-side buf pointer validation
 fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoints {
     const count = extractAllCodepoints(utf8, buf) catch {
         buf[0] = 0xFFFD;
@@ -158,6 +171,9 @@ fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoint
     return .{ .count = count, .replaced_oversized = false };
 }
 
+/// Map lookup: return i64 value iff key exists and value is int.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns i64 iff key matches and value is int, else null.
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .int) {
@@ -167,6 +183,9 @@ fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
     return null;
 }
 
+/// Map lookup: return string value iff key exists and value is string.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns string iff key matches and value is string, else null.
 fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .str) {
@@ -176,7 +195,34 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Upper bound on the mode_info_set table, well above Neovim's 18 modes so a
+/// later Neovim's extra modes still fit. A mode_change past it keeps the
+/// current style, as for any index the table lacks.
+const max_mode_infos = 256;
+
+/// Decode one mode_info map. Absent or ill-typed keys keep the ModeInfo
+/// default. A cell_percentage of 0 is what Neovim sends for a block entry
+/// (cursor_shape.c never sets it), so it, and anything outside (0,100], means
+/// a full cell.
+fn decodeModeInfo(m: []mp.Pair) ModeInfo {
+    var mi: ModeInfo = .{};
+    if (mapGetStr(m, "cursor_shape")) |s| {
+        if (std.mem.eql(u8, s, "block")) mi.shape = .block else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
+    }
+    if (mapGetInt(m, "cell_percentage")) |p| {
+        if (p > 0 and p <= 100) mi.cell_percentage = @intCast(p);
+    }
+    if (mapGetInt(m, "attr_id")) |a| mi.attr_id = checkedU32(a) orelse 0;
+    if (mapGetInt(m, "blinkwait")) |v| mi.blink_wait_ms = checkedU32(v) orelse 0;
+    if (mapGetInt(m, "blinkon")) |v| mi.blink_on_ms = checkedU32(v) orelse 0;
+    if (mapGetInt(m, "blinkoff")) |v| mi.blink_off_ms = checkedU32(v) orelse 0;
+    return mi;
+}
+
 /// Apply mode_infos[idx] to the grid's live cursor style fields.
+/// Postcondition: with cursor_style_enabled false, the UI default style is
+/// applied whatever idx is; otherwise an idx inside the table applies that
+/// entry, and one past it leaves every field untouched.
 ///
 /// Both mode_info_set and mode_change need this. The live fields are a
 /// snapshot of a table entry, so a table rebuilt by `:set guicursor` must be
@@ -184,10 +230,17 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 /// mode_change after mode_info_set, so resolving the style only on
 /// mode_change leaves the previous shape on screen until the user happens to
 /// switch modes.
+///
+/// With cursor_style_enabled false (`:set guicursor=`) the UI picks the style:
+/// the default block with no blink, not whatever the last mode left.
+/// Tier A2: grid pointer + idx bounds validation
 fn applyModeInfo(grid: *Grid, idx: usize) void {
-    if (!grid.cursor_style_enabled) return;
-    if (idx >= grid.mode_infos.items.len) return;
-    const mi = grid.mode_infos.items[idx];
+    const mi: ModeInfo = if (!grid.cursor_style_enabled)
+        .{}
+    else if (idx < grid.mode_infos.items.len)
+        grid.mode_infos.items[idx]
+    else
+        return;
     grid.cursor_shape = mi.shape;
     grid.cursor_cell_percentage = mi.cell_percentage;
     grid.cursor_attr_id = mi.attr_id;
@@ -196,6 +249,17 @@ fn applyModeInfo(grid: *Grid, idx: usize) void {
     grid.cursor_blink_off_ms = mi.blink_off_ms;
 }
 
+/// Modes whose exit may leave a stale showmode, by the first byte of the
+/// mode_change name ("insert", "replace", "terminal").
+/// Precondition: first is a single u8 byte (invariant: always true).
+/// Postcondition: returns true iff mode name starts with 'i', 'r', or 't'.
+fn showmodeModeKeepsStatus(first: u8) bool {
+    return first == 'i' or first == 'r' or first == 't';
+}
+
+/// Map lookup: return bool value iff key exists and value is bool.
+/// Precondition: m is valid Pair array, key is UTF-8 string.
+/// Postcondition: returns bool iff key matches and value is bool, else null.
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .bool) {
@@ -205,16 +269,22 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     return null;
 }
 
-/// Convert a signed 64-bit msgpack integer to u32, rejecting values that
-/// would require an unsafe `@intCast` (negative, or larger than
-/// `maxInt(u32)`). `@intCast` in Zig is a safety-checked assertion, not a
-/// clamp: an out-of-range value panics in Debug/ReleaseSafe and is UB in
-/// ReleaseFast. Callers treat `null` as "skip this event/tuple", matching
-/// the existing sign-checked call sites in this file (e.g. `grid_resize`,
-/// `grid_cursor_goto`).
+/// Convert signed 64-bit msgpack integer to u32, rejecting out-of-range values.
+/// Precondition: v is signed 64-bit msgpack integer (unbounded).
+/// Postcondition: returns @intCast(v) iff 0 ≤ v ≤ maxInt(u32), else null.
+/// Note: Zig @intCast panics on out-of-range in Debug/ReleaseSafe, UB in ReleaseFast.
+/// Callers treat null as "skip event/tuple" (e.g., grid_resize, grid_cursor_goto).
 fn checkedU32(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(u32)) return null;
     return @as(u32, @intCast(v));
+}
+
+/// Pass a checked* result through, logging the drop when it is null: a value
+/// Neovim sent outside the range the grid can address is the server's fault
+/// and must leave a trace, like the other rejected tuples do.
+fn loggedRange(log: *Logger, comptime event: []const u8, raw: i64, checked: anytype) @TypeOf(checked) {
+    if (checked == null and log.cb != null) log.write("[redraw] " ++ event ++ " tuple dropped: {d} out of range\n", .{raw});
+    return checked;
 }
 
 /// Decode a msgpack `[attr_id, text]` content array, appending one chunk per
@@ -237,6 +307,7 @@ fn checkedU32(v: i64) ?u32 {
 ///
 /// `text` is borrowed from `arena`. The grid dupes it into its own allocator
 /// when it stores it; duping here would put an allocation on a redraw path.
+/// Tier A2: grid pointer validation for chunk append
 fn appendContentChunks(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -257,6 +328,8 @@ fn appendContentChunks(
 /// Neovim allocates grid handles from a positive signed-int domain. Metal's
 /// vertex input and scroll-offset ABI consume the low signed 32 bits, so reject
 /// values outside that producer domain before they can enter shared grid state.
+/// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
+/// Postcondition: returns v iff 0 < v <= i32.max, else null (producer domain enforcement).
 fn checkedGridId(v: i64) ?i64 {
     if (v <= 0 or v > std.math.maxInt(i32)) return null;
     return v;
@@ -266,13 +339,39 @@ fn checkedGridId(v: i64) ?i64 {
 /// the i32 range. Exposed as `pub` because `rpc_session.zig`'s
 /// `handleWinMoveCursor` — a directly reachable RPC *request* handler, not
 /// just a redraw event — needs the identical guard.
+/// Precondition: v is a signed 64-bit integer (always true per Neovim RPC).
+/// Postcondition: returns v as i32 iff i32.min <= v <= i32.max, else null.
 pub fn checkedI32(v: i64) ?i32 {
     if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return null;
     return @as(i32, @intCast(v));
 }
 
+/// An optional integer event argument: `default` unless it is an int in range.
+/// Extract u32 from msgpack value, coercing via checkedU32 with fallback.
+/// Precondition: v is any msgpack value; default is u32 fallback on type mismatch or range error.
+/// Postcondition: returns checkedU32(v.int) iff v is .int and in u32 range, else default.
+fn argU32(v: mp.Value, default: u32) u32 {
+    return if (v == .int) (checkedU32(v.int) orelse default) else default;
+}
+
+/// Extract i32 from msgpack value, coercing via checkedI32 with fallback.
+/// Precondition: v is any msgpack value; default is i32 fallback on type mismatch or range error.
+/// Postcondition: returns checkedI32(v.int) iff v is .int and in i32 range, else default.
+fn argI32(v: mp.Value, default: i32) i32 {
+    return if (v == .int) (checkedI32(v.int) orelse default) else default;
+}
+
+/// Extract cmdline nesting level: 1 unless an int of at least 1.
+/// Precondition: v is any msgpack value.
+/// Postcondition: returns checkedU32(v.int) iff v is .int ≥ 1 and fits u32, else 1 (default level).
+fn cmdlineLevel(v: mp.Value) u32 {
+    return if (v == .int and v.int >= 1) (checkedU32(v.int) orelse 1) else 1;
+}
+
 /// Truncate one finite Msgpack float to i64 without letting @intFromFloat
 /// assert on NaN, infinity, or a value outside the integer domain.
+/// Precondition: v is a MessagePack float value (range unbounded per spec).
+/// Postcondition: returns @intFromFloat(v) iff finite and in i64 range, else null.
 fn checkedFloatToI64(v: f64) ?i64 {
     if (!std.math.isFinite(v)) return null;
     const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
@@ -283,9 +382,36 @@ fn checkedFloatToI64(v: f64) ?i64 {
 
 /// Grid positions cross i32 frontend ABI fields. Reject, rather than wrap or
 /// clamp, an event which cannot be represented consistently by every consumer.
+/// Precondition: v is a signed 64-bit integer representing a grid position.
+/// Postcondition: returns v as u32 iff 0 <= v <= i32.max, else null (ABI safety).
 fn checkedGridCoord(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(i32)) return null;
     return @intCast(v);
+}
+
+test "a disabled cursor style returns the cursor to the UI default" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    grid.cursor_style_enabled = true;
+    try grid.mode_infos.append(grid.alloc, .{
+        .shape = .vertical,
+        .cell_percentage = 25,
+        .attr_id = 7,
+        .blink_wait_ms = 500,
+        .blink_on_ms = 500,
+        .blink_off_ms = 500,
+    });
+    applyModeInfo(&grid, 0);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.cursor_shape);
+
+    // `:set guicursor=`
+    grid.cursor_style_enabled = false;
+    applyModeInfo(&grid, 0);
+    try std.testing.expectEqual(grid_mod.CursorShape.block, grid.cursor_shape);
+    try std.testing.expectEqual(@as(u8, 100), grid.cursor_cell_percentage);
+    try std.testing.expectEqual(@as(u32, 0), grid.cursor_attr_id);
+    try std.testing.expectEqual(@as(u32, 0), grid.cursor_blink_on_ms);
 }
 
 test "checked float and grid coordinates reject hostile numeric bounds" {
@@ -476,6 +602,24 @@ pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
         .tag = .{ tag_str[0], tag_str[1], tag_str[2], tag_str[3] },
         .value = value,
     };
+}
+
+/// Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+/// into `out`; tokens that are not a feature are skipped, whitespace around a
+/// token is ignored. Returns how many were written (at most `out.len`). The
+/// one reading of a candidate line's feature field for every frontend.
+pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        if (n == out.len) break;
+        const tok = std.mem.trim(u8, raw, " \t");
+        if (parseFontFeatureToken(tok)) |f| {
+            out[n] = f;
+            n += 1;
+        }
+    }
+    return n;
 }
 
 pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
@@ -717,6 +861,12 @@ fn testGridLineEvent(
 
 fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, events: []mp.Value) !void {
     var log = Logger{};
+    try runRedrawEventsLogged(grid, hl, arena, events, &log);
+}
+
+/// runRedrawEvents with a caller-owned Logger, for tests that assert on what
+/// the handler logs.
+fn runRedrawEventsLogged(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, events: []mp.Value, log: *Logger) !void {
     const noop = struct {
         fn preFlush(_: *u8) anyerror!void {}
         fn flush(_: *u8, _: u32, _: u32) anyerror!void {}
@@ -729,7 +879,7 @@ fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, event
         hl,
         arena,
         events,
-        &log,
+        log,
         &ctx,
         noop.preFlush,
         noop.flush,
@@ -1294,9 +1444,17 @@ test "cell cluster extraction rejects rather than truncates codepoint 17" {
     try std.testing.expectEqual(@as(u32, 0xFFFD), buf[0]);
 }
 
-/// Supported redraw events:
-/// grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
-/// default_colors_set, option_set, set_title, restart, connect, flush
+/// Apply one Neovim `redraw` notification to grid and hl, called under grid_mu.
+/// params may be empty and comes from the server, so it is untrusted.
+///
+/// Events are applied in order, each seeing the state the previous ones left:
+/// `grid_resize` reshapes a grid mid-batch, and `flush` hands the grid's
+/// current rows/cols to flush_fn. Unknown events are skipped.
+///
+/// A malformed tuple or event is skipped and the rest of the batch still
+/// applies. Resource exhaustion (OOM, a rejected `grid_resize`, too many
+/// window placements) and callback errors return the error at once, leaving
+/// earlier events applied; the caller then abandons the batch.
 pub fn handleRedraw(
     grid: *Grid,
     hl: *Highlights,
@@ -1315,8 +1473,6 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
-    const redraw_epoch = grid.redraw_epoch_override orelse grid.beginRedrawBatch();
-
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
     // grid_line / flush_start lines already mark dispatch latency; this gives
@@ -1425,15 +1581,6 @@ pub fn handleRedraw(
                         return err;
                     };
 
-                    // Update external grid target size so NDC viewport matches the actual grid.
-                    // Only for grids that are actual external windows (ext_windows splits
-                    // or UI-extension grids like popupmenu/messages). Float windows
-                    // (e.g. Telescope) must NOT get entries here — they render on the
-                    // global grid and their NDC uses sg.rows/sg.cols directly.
-                    if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
-                        try grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width });
-                    }
-
                     // Record the global grid size so core can detect a
                     // Neovim-initiated resize (`:set columns=` / `:set lines=`)
                     // after the batch completes.
@@ -1466,8 +1613,8 @@ pub fn handleRedraw(
                     if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
-                    const row = checkedU32(t[1].int) orelse continue;
-                    const col = checkedU32(t[2].int) orelse continue;
+                    const row = loggedRange(log, "grid_cursor_goto", t[1].int, checkedU32(t[1].int)) orelse continue;
+                    const col = loggedRange(log, "grid_cursor_goto", t[2].int, checkedU32(t[2].int)) orelse continue;
                     grid.setCursor(grid_id, row, col);
                 }
             },
@@ -1554,70 +1701,28 @@ pub fn handleRedraw(
                     });
                 }
             },
-            .win_move => {
-                // win_move (ext_windows): [win, grid, flags]
-                // flags: 0=below, 1=above, 2=right, 3=left
-                for (tuples) |tv| {
+            .win_move, .win_exchange, .win_rotate => {
+                // ext_windows:
+                //   win_move     [win, grid, flags]  0=below, 1=above, 2=right, 3=left
+                //   win_exchange [win, grid, count]
+                //   win_rotate   [win, grid, direction, count]  0=downward, 1=upward
+                const arity: usize = if (ev_tag == .win_rotate) 4 else 3;
+                tuple: for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
-                    if (t.len < 3) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+                    if (t.len < arity) continue;
+                    for (t[0..arity]) |arg| if (arg != .int) continue :tuple;
 
                     const win_id = t[0].int;
                     const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const flags = checkedI32(t[2].int) orelse continue;
-                    log.write("[win_move] win={d} grid={d} flags={d}\n", .{ win_id, grid_id, flags });
+                    const arg2 = checkedI32(t[2].int) orelse continue;
+                    const arg3: i32 = if (arity == 4) checkedI32(t[3].int) orelse continue else 0;
+                    log.write("[{s}] win={d} grid={d} args=({d},{d})\n", .{ @tagName(ev_tag), win_id, grid_id, arg2, arg3 });
 
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .move,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .flags_or_direction = flags,
-                    });
-                }
-            },
-            .win_exchange => {
-                // win_exchange (ext_windows): [win, grid, count]
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 3) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
-
-                    const win_id = t[0].int;
-                    const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const count = checkedI32(t[2].int) orelse continue;
-                    log.write("[win_exchange] win={d} grid={d} count={d}\n", .{ win_id, grid_id, count });
-
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .exchange,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .count = count,
-                    });
-                }
-            },
-            .win_rotate => {
-                // win_rotate (ext_windows): [win, grid, direction, count]
-                // direction: 0=downward, 1=upward
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 4) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
-
-                    const win_id = t[0].int;
-                    const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const direction = checkedI32(t[2].int) orelse continue;
-                    const count = checkedI32(t[3].int) orelse continue;
-                    log.write("[win_rotate] win={d} grid={d} direction={d} count={d}\n", .{ win_id, grid_id, direction, count });
-
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .rotate,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .flags_or_direction = direction,
-                        .count = count,
+                    try grid.pending_win_ops.append(grid.alloc, switch (ev_tag) {
+                        .win_move => .{ .op = .move, .win = win_id, .grid_id = grid_id, .flags_or_direction = arg2 },
+                        .win_exchange => .{ .op = .exchange, .win = win_id, .grid_id = grid_id, .count = arg2 },
+                        else => .{ .op = .rotate, .win = win_id, .grid_id = grid_id, .flags_or_direction = arg2, .count = arg3 },
                     });
                 }
             },
@@ -1639,9 +1744,10 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     const win_id = t[1].int;
-                    const startrow = checkedGridCoord(t[2].int) orelse continue;
-                    const startcol = checkedGridCoord(t[3].int) orelse continue;
+                    const startrow = loggedRange(log, "win_pos", t[2].int, checkedGridCoord(t[2].int)) orelse continue;
+                    const startcol = loggedRange(log, "win_pos", t[3].int, checkedGridCoord(t[3].int)) orelse continue;
                     log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
+                    if (log.cb != null and grid.bufForConst(grid_id) == null) log.write("[win_pos] grid {d} before its grid_resize\n", .{grid_id});
 
                     // If this grid is tracked as an ext_windows grid (created by win_split),
                     // re-register it as external instead of compositing. This happens when
@@ -1693,7 +1799,6 @@ pub fn handleRedraw(
                     // On hide (tab switch), keep tracking so win_pos can restore.
                     if (is_close) {
                         _ = grid.ext_windows_grids.remove(grid_id);
-                        _ = grid.external_grid_target_sizes.remove(grid_id);
                     }
                 }
             },
@@ -1703,18 +1808,19 @@ pub fn handleRedraw(
                     if (tv != .arr) continue;
                     const t = tv.arr;
                     if (t.len < 8) continue;
-                    if (t[0] != .int) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or
+                        t[4] != .int or t[5] != .int or t[6] != .int or t[7] != .int) continue;
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     // t[1] is the window handle. Kept so window-local options
                     // can be addressed from a grid id.
-                    const win = if (t[1] == .int) t[1].int else 0;
-                    const topline = if (t[2] == .int) t[2].int else 0;
-                    const botline = if (t[3] == .int) t[3].int else 0;
-                    const curline = if (t[4] == .int) t[4].int else 0;
-                    const curcol = if (t[5] == .int) t[5].int else 0;
-                    const line_count = if (t[6] == .int) t[6].int else 0;
-                    const scroll_delta = if (t[7] == .int) t[7].int else 0;
+                    const win = t[1].int;
+                    const topline = t[2].int;
+                    const botline = t[3].int;
+                    const curline = t[4].int;
+                    const curcol = t[5].int;
+                    const line_count = t[6].int;
+                    const scroll_delta = t[7].int;
 
                     log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
                     try grid.setViewport(grid_id, win, topline, botline, curline, curcol, line_count, scroll_delta);
@@ -1730,10 +1836,10 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     // t[1] is win (window handle), not used here
-                    const top = if (t[2] == .int) (checkedU32(t[2].int) orelse 0) else 0;
-                    const bottom = if (t[3] == .int) (checkedU32(t[3].int) orelse 0) else 0;
-                    const left = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
-                    const right = if (t[5] == .int) (checkedU32(t[5].int) orelse 0) else 0;
+                    const top = argU32(t[2], 0);
+                    const bottom = argU32(t[3], 0);
+                    const left = argU32(t[4], 0);
+                    const right = argU32(t[5], 0);
 
                     log.write("[win_viewport_margins] grid_id={d} top={d} bottom={d} left={d} right={d}\n", .{ grid_id, top, bottom, left, right });
                     try grid.setViewportMargins(grid_id, top, bottom, left, right);
@@ -1778,7 +1884,17 @@ pub fn handleRedraw(
                     // Extract anchor_grid (always at t[3] when present)
                     const anchor_grid = checkedGridId(if (t[3] == .int) t[3].int else 1) orelse continue;
 
-                    if (screen_row_i >= 0 and screen_col_i >= 0) {
+                    // Neovim's screen_row/col is the anchor grid's comp_row plus
+                    // the offset, clamped to the main grid (window.c
+                    // win_float_pos). An external window is never composited,
+                    // so for a float it hosts that number is stale: such a
+                    // float is placed from its anchor instead, in that
+                    // window's own cells.
+                    const placing_surface = grid.surfaceForGrid(anchor_grid);
+                    const on_external_surface = placing_surface != null and placing_surface.? != 1;
+                    var float_anchor: ?grid_mod.FloatAnchor = null;
+
+                    if (screen_row_i >= 0 and screen_col_i >= 0 and !on_external_surface) {
                         // Let nvim take care of positioning.
                         row_i64 = screen_row_i;
                         col_i64 = screen_col_i;
@@ -1811,57 +1927,16 @@ pub fn handleRedraw(
                             continue;
                         }
 
-                        var base_row: i64 = 0;
-                        var base_col: i64 = 0;
-
-                        if (anchor_grid != 1) {
-                            if (grid.win_pos.get(anchor_grid)) |p| {
-                                base_row = @as(i64, p.row);
-                                base_col = @as(i64, p.col);
-                            } else if (grid.external_grids.get(anchor_grid)) |ext| {
-                                // anchor_grid is an external window - use its stored position
-                                if (ext.start_row >= 0 and ext.start_col >= 0) {
-                                    base_row = @as(i64, ext.start_row);
-                                    base_col = @as(i64, ext.start_col);
-                                }
-                            }
-                        }
-
-                        // Adjust by anchor using goneovim-like metrics conversion.
-                        // We compute float window size in "global grid cell units" using per-grid pixel metrics.
-                        const main_m = grid.getGridMetricsPx(1);
-                        const anchor_m = grid.getGridMetricsPx(anchor_grid);
-                        const float_m = grid.getGridMetricsPx(grid_id);
-
-                        // Convert anchor point from anchor_grid units -> global grid units.
-                        // base_row/base_col are already in global grid units (win_pos is relative to grid=1).
-                        const anchor_row_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_row_i)) * @as(f64, @floatFromInt(anchor_m.cell_h_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_h_px))) orelse continue;
-                        const anchor_col_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_col_i)) * @as(f64, @floatFromInt(anchor_m.cell_w_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
-
-                        row_i64 = std.math.add(i64, base_row, anchor_row_main) catch continue;
-                        col_i64 = std.math.add(i64, base_col, anchor_col_main) catch continue;
-
-                        // Compute float window size in global grid units (approx; future-proof for per-grid fonts).
-                        if (grid.sub_grids.get(grid_id)) |sg| {
-                            const float_rows: i64 = @as(i64, sg.rows);
-                            const float_cols: i64 = @as(i64, sg.cols);
-
-                            const wincols_main = checkedFloatToI64(@as(f64, @floatFromInt(float_cols)) * @as(f64, @floatFromInt(float_m.cell_w_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
-
-                            const winrows_main = checkedFloatToI64(@ceil(@as(f64, @floatFromInt(float_rows)) * @as(f64, @floatFromInt(float_m.cell_h_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_h_px)))) orelse continue;
-
-                            // Anchor string: "NW", "NE", "SW", "SE"
-                            if (std.mem.indexOfScalar(u8, anchor, 'S') != null) {
-                                row_i64 = std.math.sub(i64, row_i64, winrows_main) catch std.math.minInt(i64);
-                            }
-                            if (std.mem.indexOfScalar(u8, anchor, 'E') != null) {
-                                col_i64 = std.math.sub(i64, col_i64, wincols_main) catch std.math.minInt(i64);
-                            }
-                        }
+                        const parsed_anchor: grid_mod.FloatAnchor = .{
+                            .south = std.mem.indexOfScalar(u8, anchor, 'S') != null,
+                            .east = std.mem.indexOfScalar(u8, anchor, 'E') != null,
+                            .row = anchor_row_i,
+                            .col = anchor_col_i,
+                        };
+                        const at = grid.resolveAnchoredFloat(grid_id, anchor_grid, parsed_anchor) orelse continue;
+                        row_i64 = at.row;
+                        col_i64 = at.col;
+                        float_anchor = parsed_anchor;
                     }
 
                     if (row_i64 < 0) row_i64 = 0;
@@ -1878,6 +1953,9 @@ pub fn handleRedraw(
                         zindex,
                         compindex,
                         anchor_grid,
+                        // t[6] is mouse_enabled in every observed form. A float
+                        // that refuses the mouse must not win a hit test.
+                        if (t[6] == .bool) t[6].bool else true,
                     ) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("[win_float_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
@@ -1885,6 +1963,9 @@ pub fn handleRedraw(
                         },
                         else => return err,
                     };
+                    if (on_external_surface) {
+                        if (float_anchor) |fa| grid.setWinFloatAnchor(grid_id, fa);
+                    }
                 }
             },
             .win_external_pos => {
@@ -1942,7 +2023,7 @@ pub fn handleRedraw(
                     const row = checkedGridCoord(row_i) orelse continue;
                     const col: u32 = 0;
                     // msg_set_pos has no win handle; pass 0 (no window mapping stored)
-                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1) catch |err| switch (err) {
+                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1, true) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("msg_set_pos rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
                             return error.TooManyWindowPlacements;
@@ -1960,12 +2041,12 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
 
-                    const top = checkedU32(t[1].int) orelse continue;
-                    const bot = checkedU32(t[2].int) orelse continue;
-                    const left = checkedU32(t[3].int) orelse continue;
-                    const right = checkedU32(t[4].int) orelse continue;
-                    const rows = checkedI32(t[5].int) orelse continue;
-                    const cols = checkedI32(t[6].int) orelse continue;
+                    const top = loggedRange(log, "grid_scroll", t[1].int, checkedU32(t[1].int)) orelse continue;
+                    const bot = loggedRange(log, "grid_scroll", t[2].int, checkedU32(t[2].int)) orelse continue;
+                    const left = loggedRange(log, "grid_scroll", t[3].int, checkedU32(t[3].int)) orelse continue;
+                    const right = loggedRange(log, "grid_scroll", t[4].int, checkedU32(t[4].int)) orelse continue;
+                    const rows = loggedRange(log, "grid_scroll", t[5].int, checkedI32(t[5].int)) orelse continue;
+                    const cols = loggedRange(log, "grid_scroll", t[6].int, checkedI32(t[6].int)) orelse continue;
 
                     // No-op scroll: avoid touching dirty state for nothing.
                     // Neovim's spec reserves `cols` for future use (always 0
@@ -1975,16 +2056,10 @@ pub fn handleRedraw(
                     if (rows == 0) continue;
 
                     if (log.cb != null) {
-                        var target_rows: u32 = grid.rows;
-                        var target_cols: u32 = grid.cols;
-                        if (grid_id != 1) {
-                            if (grid.sub_grids.getPtr(grid_id)) |sg| {
-                                target_rows = sg.rows;
-                                target_cols = sg.cols;
-                            }
-                        }
+                        if (grid.bufForConst(grid_id) == null) log.write("grid_scroll to grid {d} before its grid_resize\n", .{grid_id});
+                        const target = grid.bufForConst(grid_id) orelse &grid.main_buf;
                         log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
-                            grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
+                            grid_id, top, bot, left, right, rows, cols, target.rows, target.cols,
                         });
                         if (grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
                             const now_ns = clock.nowNs();
@@ -2010,14 +2085,9 @@ pub fn handleRedraw(
 
                     const id_u32: u32 = checkedU32(t[0].int) orelse continue;
 
+                    var attr: hlmod.Attr = .{};
                     if (t[1] == .map) {
                         const m = t[1].map;
-
-                        const fg = toRgbOpt(mapGetInt(m, "foreground"));
-                        const bg = toRgbOpt(mapGetInt(m, "background"));
-                        const sp = toRgbOpt(mapGetInt(m, "special"));
-
-                        const reverse = mapGetBool(m, "reverse") orelse false;
 
                         var blend_u8: u8 = 0;
                         if (mapGetInt(m, "blend")) |b64| {
@@ -2027,7 +2097,12 @@ pub fn handleRedraw(
                             blend_u8 = @as(u8, @intCast(b));
                         }
 
-                        const styles: Styles = .{
+                        attr = .{
+                            .fg = toRgbOpt(mapGetInt(m, "foreground")),
+                            .bg = toRgbOpt(mapGetInt(m, "background")),
+                            .sp = toRgbOpt(mapGetInt(m, "special")),
+                            .reverse = mapGetBool(m, "reverse") orelse false,
+                            .blend = blend_u8,
                             .italic = mapGetBool(m, "italic") orelse false,
                             .bold = mapGetBool(m, "bold") orelse false,
                             .strikethrough = mapGetBool(m, "strikethrough") orelse false,
@@ -2037,14 +2112,35 @@ pub fn handleRedraw(
                             .underdotted = mapGetBool(m, "underdotted") orelse false,
                             .underdashed = mapGetBool(m, "underdashed") orelse false,
                             .overline = mapGetBool(m, "overline") orelse false,
+                            .has_url = (mapGetStr(m, "url") != null),
                         };
-
-                        const has_url = (mapGetStr(m, "url") != null);
-
-                        try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
-                    } else {
-                        try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
                     }
+
+                    // ext_hlstate's fourth element: the groups this attribute
+                    // id was composed from, innermost last. `hi_name` is the
+                    // syntax group, `ui_name` the builtin the UI knows it by;
+                    // record both, because a user names either one. Decoded
+                    // into the batch arena first so the attribute and its
+                    // names are published as one step.
+                    var names: []const []const u8 = &.{};
+                    if (t.len >= 4 and t[3] == .arr) {
+                        const buf = try arena.alloc([]const u8, 2 * t[3].arr.len);
+                        var n: usize = 0;
+                        for (t[3].arr) |iv| {
+                            if (iv != .map) continue;
+                            if (mapGetStr(iv.map, "hi_name")) |s| {
+                                buf[n] = s;
+                                n += 1;
+                            }
+                            if (mapGetStr(iv.map, "ui_name")) |s| {
+                                buf[n] = s;
+                                n += 1;
+                            }
+                        }
+                        names = buf[0..n];
+                    }
+
+                    try hl.defineWithNames(id_u32, attr, names);
                 }
             },
             .hl_group_set => {
@@ -2170,61 +2266,34 @@ pub fn handleRedraw(
             },
             .mode_info_set => {
                 // ["mode_info_set", cursor_style_enabled, mode_info]
+                var table_applied = false;
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
-                    if (t.len < 2) continue;
-
-                    const enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
-                    grid.cursor_style_enabled = enabled;
-
-                    if (t[1] != .arr) continue;
+                    if (t.len < 2 or t[1] != .arr) continue;
+                    // The spec types cursor_style_enabled as a Boolean; a
+                    // tuple that breaks that is malformed, not "false".
+                    if (t[0] != .bool) {
+                        if (log.cb != null) log.write("mode_info_set: cursor_style_enabled is not a bool, tuple dropped\n", .{});
+                        continue;
+                    }
                     const arr = t[1].arr;
 
+                    // Neovim sends SHAPE_IDX_COUNT (18) entries; the cap only
+                    // keeps a broken server from sizing a long-lived table.
+                    const modes = arr[0..@min(arr.len, max_mode_infos)];
+                    try grid.mode_infos.ensureTotalCapacity(grid.alloc, modes.len);
+
+                    grid.cursor_style_enabled = t[0].bool;
                     grid.mode_infos.clearRetainingCapacity();
-                    try grid.mode_infos.ensureTotalCapacity(grid.alloc, arr.len);
 
-                    for (arr, 0..) |mv, mode_idx| {
-                        var mi: ModeInfo = .{};
-                        if (mv == .map) {
-                            const m = mv.map;
-
-                            if (mapGetStr(m, "cursor_shape")) |s| {
-                                if (std.mem.eql(u8, s, "block")) mi.shape = .block else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
-                                // Debug: log parsed shape
-                                if (log.cb != null) {
-                                    log.write("  parse mode[{d}]: cursor_shape='{s}' -> {s}\n", .{
-                                        mode_idx, s, @tagName(mi.shape),
-                                    });
-                                }
-                            }
-                            if (mapGetInt(m, "cell_percentage")) |p64| {
-                                var p = p64;
-                                if (p <= 0) p = 100;
-                                if (p > 100) p = 100;
-                                mi.cell_percentage = @as(u8, @intCast(p));
-                            }
-                            if (mapGetInt(m, "attr_id")) |a64| {
-                                mi.attr_id = checkedU32(a64) orelse 0;
-                            }
-                            // Parse blink parameters
-                            if (mapGetInt(m, "blinkwait")) |bw| {
-                                mi.blink_wait_ms = checkedU32(bw) orelse 0;
-                            }
-                            if (mapGetInt(m, "blinkon")) |bon| {
-                                mi.blink_on_ms = checkedU32(bon) orelse 0;
-                            }
-                            if (mapGetInt(m, "blinkoff")) |boff| {
-                                mi.blink_off_ms = checkedU32(boff) orelse 0;
-                            }
-                        } else {
-                            // Debug: mv is not a map
-                            if (log.cb != null) {
-                                log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
-                            }
+                    for (modes, 0..) |mv, mode_idx| {
+                        if (mv != .map and log.cb != null) {
+                            log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
                         }
-                        grid.mode_infos.appendAssumeCapacity(mi);
+                        grid.mode_infos.appendAssumeCapacity(if (mv == .map) decodeModeInfo(mv.map) else .{});
                     }
+                    table_applied = true;
 
                     // Debug log: mode_info_set processed
                     if (log.cb != null) {
@@ -2245,11 +2314,14 @@ pub fn handleRedraw(
                 // The table just changed under the current mode (`:set guicursor`).
                 // Neovim sends no mode_change for it, so re-resolve the live style
                 // here or the cursor keeps its old shape until the mode changes.
-                applyModeInfo(grid, grid.current_mode_idx);
-                grid.cursor_rev +%= 1;
+                if (table_applied) {
+                    applyModeInfo(grid, grid.current_mode_idx);
+                    grid.cursor_rev +%= 1;
+                }
             },
             .mode_change => {
                 // ["mode_change", mode, mode_idx]
+                var mode_applied = false;
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
@@ -2261,6 +2333,7 @@ pub fn handleRedraw(
                     const idx = std.math.cast(usize, idx64) orelse continue;
 
                     grid.current_mode_idx = idx;
+                    mode_applied = true;
 
                     applyModeInfo(grid, idx);
 
@@ -2277,6 +2350,10 @@ pub fn handleRedraw(
                         });
                     }
 
+                    // Whether the mode being left is insert-like, read before
+                    // the name is overwritten below.
+                    const was_insert_mode = showmodeModeKeepsStatus(grid.current_mode_name[0]);
+
                     // Store mode name for external queries (e.g., terminal mode detection)
                     if (t[0] == .str) {
                         const mode_str = t[0].str;
@@ -2286,24 +2363,29 @@ pub fn handleRedraw(
                         grid.current_mode_name[copy_len] = 0; // null terminate
                     }
 
-                    // Clear showmode when exiting insert/replace mode
-                    // Neovim doesn't always send empty msg_showmode on mode exit
+                    // Clear showmode when exiting insert/replace mode:
+                    // Neovim doesn't always send an empty msg_showmode then.
+                    // Only on that exit, and only when this batch sent no
+                    // msg_showmode of its own: every other mode change cleared
+                    // it, which wiped "-- VISUAL --" and "recording @q" that
+                    // arrived just before in the same batch.
                     if (t[0] == .str) {
                         const mode_str = t[0].str;
-                        // Check if mode is NOT insert-related (i, R, Rv, etc.)
-                        const is_insert_mode = mode_str.len > 0 and
-                            (mode_str[0] == 'i' or mode_str[0] == 'R');
+                        const is_insert_mode = mode_str.len > 0 and showmodeModeKeepsStatus(mode_str[0]);
                         const showmode = &grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
-                        if (!is_insert_mode and showmode.items.len > 0) {
+                        if (was_insert_mode and !is_insert_mode and !grid.showmode_set_since_flush and showmode.items.len > 0) {
                             // Clear showmode content
                             try grid.setMsgStatus(.showmode, &.{});
                             if (log.cb != null) log.write("mode_change: cleared showmode (mode={s})\n", .{mode_str});
                         }
                     }
                 }
-                // Request IME off on any mode change (config check done by nvim_core)
-                grid.ime_off_requested = true;
-                grid.cursor_rev +%= 1;
+                // Request IME off on any mode change (config check done by nvim_core).
+                // A batch with no well-formed tuple changed no mode.
+                if (mode_applied) {
+                    grid.ime_off_requested = true;
+                    grid.cursor_rev +%= 1;
+                }
             },
             .busy_start => {
                 grid.cursor_visible = false;
@@ -2337,19 +2419,18 @@ pub fn handleRedraw(
                     var col = checkedU32(t[2].int) orelse continue;
 
                     // Update order (existing behavior)
-                    grid.noteGridLine(grid_id, redraw_epoch);
+                    grid.noteGridLine(grid_id);
 
                     const cells = t[3].arr;
 
                     // Resolved once per grid_line tuple (grid_id is constant within
                     // it); used by the repeat clamp below. A per-cell sub_grids
                     // lookup here would be a hash probe on the grid_line hot path.
-                    const grid_cols: u32 = if (grid_id == 1)
-                        grid.cols
-                    else if (grid.sub_grids.get(grid_id)) |sg|
-                        sg.cols
-                    else
-                        0;
+                    const grid_cols: u32 = if (grid.bufForConst(grid_id)) |buf| buf.cols else blk: {
+                        // Neovim always sends grid_resize first; every cell is dropped.
+                        if (log.cb != null) log.write("grid_line to grid {d} before its grid_resize\n", .{grid_id});
+                        break :blk 0;
+                    };
 
                     // "hl" is a state that persists across cell tuples within THIS grid_line event.
                     // - If hl is omitted, keep previous hl value.
@@ -2460,12 +2541,12 @@ pub fn handleRedraw(
                         try appendContentChunks(CmdlineChunk, arena, &chunks, t[0].arr, true);
                     }
 
-                    const pos: u32 = if (t[1] == .int) (checkedU32(t[1].int) orelse 0) else 0;
+                    const pos = argU32(t[1], 0);
                     const firstc: u8 = if (t[2] == .str and t[2].str.len > 0) t[2].str[0] else 0;
                     const prompt: []const u8 = if (t[3] == .str) t[3].str else "";
-                    const indent: u32 = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
-                    const level: u32 = if (t.len > 5 and t[5] == .int and t[5].int >= 1) (checkedU32(t[5].int) orelse 1) else 1;
-                    const prompt_hl_id: u32 = if (t.len > 6 and t[6] == .int) (checkedU32(t[6].int) orelse 0) else 0;
+                    const indent = argU32(t[4], 0);
+                    const level: u32 = if (t.len > 5) cmdlineLevel(t[5]) else 1;
+                    const prompt_hl_id: u32 = if (t.len > 6) argU32(t[6], 0) else 0;
 
                     try grid.setCmdlineShow(chunks.items, pos, firstc, prompt, indent, level, prompt_hl_id);
                     if (log.cb != null) log.write("cmdline_show pos={d} firstc={c} level={d}\n", .{ pos, firstc, level });
@@ -2477,7 +2558,7 @@ pub fn handleRedraw(
                     if (tv != .arr) continue;
                     const t = tv.arr;
 
-                    const level: u32 = if (t.len >= 1 and t[0] == .int and t[0].int >= 1) (checkedU32(t[0].int) orelse 1) else 1;
+                    const level: u32 = if (t.len >= 1) cmdlineLevel(t[0]) else 1;
 
                     grid.setCmdlineHide(level);
                     if (log.cb != null) log.write("cmdline_hide level={d}\n", .{level});
@@ -2492,7 +2573,7 @@ pub fn handleRedraw(
                     if (t[0] != .int or t[1] != .int) continue;
 
                     const pos: u32 = checkedU32(t[0].int) orelse 0;
-                    const level: u32 = if (t[1].int >= 1) (checkedU32(t[1].int) orelse 1) else 1;
+                    const level = cmdlineLevel(t[1]);
 
                     grid.setCmdlinePos(pos, level);
                     if (log.cb != null) log.write("cmdline_pos pos={d} level={d}\n", .{ pos, level });
@@ -2507,7 +2588,7 @@ pub fn handleRedraw(
 
                     const c: []const u8 = if (t[0] == .str) t[0].str else "";
                     const shift: bool = if (t[1] == .bool) t[1].bool else false;
-                    const level: u32 = if (t[2] == .int and t[2].int >= 1) (checkedU32(t[2].int) orelse 1) else 1;
+                    const level = cmdlineLevel(t[2]);
 
                     grid.setCmdlineSpecialChar(c, shift, level);
                     if (log.cb != null) {
@@ -2597,9 +2678,9 @@ pub fn handleRedraw(
                         }
                     }
 
-                    const selected: i32 = if (t[1] == .int) (checkedI32(t[1].int) orelse -1) else -1;
-                    const row: i32 = if (t[2] == .int) (checkedI32(t[2].int) orelse 0) else 0;
-                    const col: i32 = if (t[3] == .int) (checkedI32(t[3].int) orelse 0) else 0;
+                    const selected = argI32(t[1], -1);
+                    const row = argI32(t[2], 0);
+                    const col = argI32(t[3], 0);
                     const raw_grid_id: i64 = if (t[4] == .int) t[4].int else 1;
                     // -1 is the documented ext_cmdline anchor sentinel. All
                     // real Neovim grid handles must fit the Metal i32 domain.
@@ -2624,7 +2705,7 @@ pub fn handleRedraw(
                     const t = tv.arr;
                     if (t.len < 1) continue;
 
-                    const selected: i32 = if (t[0] == .int) (checkedI32(t[0].int) orelse -1) else -1;
+                    const selected = argI32(t[0], -1);
                     grid.setPopupmenuSelect(selected);
                     if (log.cb != null) log.write("popupmenu_select selected={d}\n", .{selected});
                 }
@@ -2746,6 +2827,7 @@ pub fn handleRedraw(
                         try appendContentChunks(MsgChunk, arena, &chunks, t[0].arr, false);
                     }
                     try grid.setMsgStatus(channel, chunks.items);
+                    if (channel == .showmode) grid.showmode_set_since_flush = true;
                     if (log.cb != null) log.write("{s} chunks={d}\n", .{ @tagName(ev_tag), chunks.items.len });
                 }
             },
@@ -2862,6 +2944,7 @@ pub fn handleRedraw(
                 }
             },
             .flush => {
+                grid.showmode_set_since_flush = false;
                 if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
                 if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
                     const now_ns = clock.nowNs();
@@ -3074,7 +3157,6 @@ test "a one-element content chunk is dropped by the cmdline sites and kept by th
     const messages = grid.message_state.messages.items;
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(@as(usize, 0), messages[0].content.items.len);
-    try std.testing.expect(grid.message_state.visible);
     try std.testing.expect(grid.message_state.msg_dirty);
 
     // E: kept
@@ -3107,7 +3189,6 @@ test "a zero-element content chunk follows the same split" {
 
     try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, empty))));
     try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
-    try std.testing.expect(grid.message_state.visible);
 
     // B and C drop it too.
     {
@@ -3510,4 +3591,577 @@ test "each status event decodes into its own channel slot" {
         try std.testing.expectEqualStrings(case.text, slot.items[0].text);
         try std.testing.expect(grid.message_state.status_dirty[case.channel.index()]);
     }
+}
+
+fn testModeChange(arena: std.mem.Allocator, mode: []const u8) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .str = mode };
+    t[1] = .{ .int = 0 };
+    return testEvent(arena, "mode_change", t);
+}
+
+test "a mode_change with no well-formed tuple neither requests IME off nor bumps the cursor" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const bad = try arena.alloc(mp.Value, 2);
+    bad[0] = .{ .str = "insert" };
+    bad[1] = .{ .str = "not an index" };
+    const rev = grid.cursor_rev;
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_change", bad));
+    try std.testing.expect(!grid.ime_off_requested);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "insert"));
+    try std.testing.expect(grid.ime_off_requested);
+    try std.testing.expect(grid.cursor_rev != rev);
+}
+
+test "a mode_info_set with no well-formed tuple changes neither the flag, the table nor the cursor" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+    const rev = grid.cursor_rev;
+
+    const junk = try arena.alloc(mp.Value, 2);
+    junk[0] = .{ .bool = true };
+    junk[1] = .{ .str = "junk" };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", junk));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.mode_infos.items[0].shape);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+
+    const short = try arena.alloc(mp.Value, 1);
+    short[0] = .{ .bool = true };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", short));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+}
+
+test "a mode_info_set that cannot size its table changes neither the flag nor the table" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var grid = Grid.init(failing.allocator());
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+    const rev = grid.cursor_rev;
+
+    const modes = try arena.alloc(mp.Value, 18);
+    for (modes) |*m| m.* = .{ .int = 0 };
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t)));
+    try std.testing.expect(!grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.mode_infos.items[0].shape);
+    try std.testing.expectEqual(rev, grid.cursor_rev);
+}
+
+test "a mode_change to an index past the table keeps the current style" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = true;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25, .blink_on_ms = 400 });
+    applyModeInfo(&grid, 0);
+
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .str = "insert" };
+    t[1] = .{ .int = 5 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_change", t));
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.cursor_shape);
+    try std.testing.expectEqual(@as(u8, 25), grid.cursor_cell_percentage);
+    try std.testing.expectEqual(@as(u32, 400), grid.cursor_blink_on_ms);
+}
+
+test "decodeModeInfo follows the guicursor table Neovim sends" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const pair = struct {
+        fn int(k: []const u8, v: i64) mp.Pair {
+            return .{ .key = .{ .str = k }, .val = .{ .int = v } };
+        }
+        fn str(k: []const u8, v: []const u8) mp.Pair {
+            return .{ .key = .{ .str = k }, .val = .{ .str = v } };
+        }
+    };
+    const Case = struct { pairs: []const mp.Pair, want: ModeInfo };
+    // cursor_shape.c: a block entry keeps the table's initial percentage 0, so
+    // 0 means a full cell. `ver150` passes Neovim's parser; a cursor cannot
+    // exceed its cell. Neovim's parser never yields a negative.
+    const cases = [_]Case{
+        .{ .pairs = &.{ pair.str("cursor_shape", "block"), pair.int("cell_percentage", 0) }, .want = .{ .shape = .block, .cell_percentage = 100 } },
+        .{ .pairs = &.{ pair.str("cursor_shape", "vertical"), pair.int("cell_percentage", 25) }, .want = .{ .shape = .vertical, .cell_percentage = 25 } },
+        .{ .pairs = &.{ pair.str("cursor_shape", "horizontal"), pair.int("cell_percentage", 150) }, .want = .{ .shape = .horizontal, .cell_percentage = 100 } },
+        .{ .pairs = &.{pair.int("cell_percentage", -3)}, .want = .{ .cell_percentage = 100 } },
+        .{ .pairs = &.{pair.str("cursor_shape", "bogus")}, .want = .{} },
+        .{ .pairs = &.{ pair.int("blinkwait", 700), pair.int("blinkon", 400), pair.int("blinkoff", 250), pair.int("attr_id", 9) }, .want = .{ .blink_wait_ms = 700, .blink_on_ms = 400, .blink_off_ms = 250, .attr_id = 9 } },
+        .{ .pairs = &.{ pair.int("blinkon", -1), pair.int("attr_id", -1) }, .want = .{} },
+    };
+    for (cases) |c| {
+        const m = try arena.dupe(mp.Pair, c.pairs);
+        try std.testing.expectEqual(c.want, decodeModeInfo(m));
+    }
+}
+
+test "mode_info_set keeps at most max_mode_infos entries of an oversized table" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const modes = try arena.alloc(mp.Value, max_mode_infos + 50);
+    for (modes) |*m| m.* = .{ .int = 0 };
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+    try std.testing.expectEqual(@as(usize, max_mode_infos), grid.mode_infos.items.len);
+
+    // Neovim's own 18-entry table is kept whole.
+    const t18 = try arena.alloc(mp.Value, 2);
+    t18[0] = .{ .bool = true };
+    t18[1] = .{ .arr = modes[0..18] };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t18));
+    try std.testing.expectEqual(@as(usize, 18), grid.mode_infos.items.len);
+}
+
+test "win_move, win_exchange and win_rotate queue their own fields and drop a short tuple" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const Case = struct { name: []const u8, args: []const i64 };
+    const cases = [_]Case{
+        .{ .name = "win_move", .args = &.{ 1000, 2, 3 } },
+        .{ .name = "win_exchange", .args = &.{ 1001, 3, 2 } },
+        .{ .name = "win_rotate", .args = &.{ 1002, 4, 1, 5 } },
+        // win_rotate needs four arguments.
+        .{ .name = "win_rotate", .args = &.{ 1003, 5, 1 } },
+    };
+    for (cases) |case| {
+        const t = try arena.alloc(mp.Value, case.args.len);
+        for (case.args, 0..) |a, i| t[i] = .{ .int = a };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, case.name, t));
+    }
+
+    const ops = grid.pending_win_ops.items;
+    try std.testing.expectEqual(@as(usize, 3), ops.len);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .move, .win = 1000, .grid_id = 2, .flags_or_direction = 3 }, ops[0]);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .exchange, .win = 1001, .grid_id = 3, .count = 2 }, ops[1]);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .rotate, .win = 1002, .grid_id = 4, .flags_or_direction = 1, .count = 5 }, ops[2]);
+}
+
+fn testShowmode(arena: std.mem.Allocator, text: []const u8) ![]mp.Value {
+    const content = try arena.alloc(mp.Value, 1);
+    content[0] = try testChunk(arena, 0, text, 2);
+    const t = try arena.alloc(mp.Value, 1);
+    t[0] = .{ .arr = content };
+    return testEvent(arena, "msg_showmode", t);
+}
+
+test "mode_change keeps a showmode the same batch sent, and clears a stale one on leaving insert" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    const slot = &grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+
+    // Entering visual: "-- VISUAL --" then mode_change in one batch.
+    try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- VISUAL --"));
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "visual"));
+    try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+
+    // Insert with its showmode, flushed; then leaving insert with no new
+    // msg_showmode clears the stale "-- INSERT --".
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "insert"));
+    try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- INSERT --"));
+    grid.showmode_set_since_flush = false; // the batch's flush event
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "normal"));
+    try std.testing.expectEqual(@as(usize, 0), slot.items.len);
+
+    // Replace and terminal leave the same way (mode names are lowercase).
+    for ([_][]const u8{ "replace", "terminal" }) |mode| {
+        try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, mode));
+        try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- MODE --"));
+        grid.showmode_set_since_flush = false;
+        try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "normal"));
+        try std.testing.expectEqual(@as(usize, 0), slot.items.len);
+    }
+}
+
+test "a float anchored in an external window taller than the main grid is placed from its anchor" {
+    // Neovim clamps screen_row against the main grid (window.c
+    // win_float_pos); an external window is not composited, so that number
+    // is wrong for a float it hosts near its bottom edge.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 40);
+    try grid.resizeGrid(2, 30, 40);
+    _ = try grid.setWinExternalPos(2, 1002);
+    try grid.resizeGrid(3, 3, 10);
+
+    const place = struct {
+        fn run(g: *Grid, h: *Highlights, a: std.mem.Allocator, anchor: []const u8, row: i64, col: i64, screen_row: i64) !void {
+            const t = try a.alloc(mp.Value, 11);
+            t[0] = .{ .int = 3 };
+            t[1] = .{ .int = 1003 };
+            t[2] = .{ .str = anchor };
+            t[3] = .{ .int = 2 };
+            t[4] = .{ .int = row };
+            t[5] = .{ .int = col };
+            t[6] = .{ .bool = true };
+            t[7] = .{ .int = 50 };
+            t[8] = .{ .int = 1 };
+            t[9] = .{ .int = screen_row };
+            t[10] = .{ .int = col };
+            try runRedrawEvents(g, h, a, try testEvent(a, "win_float_pos", t));
+        }
+    }.run;
+
+    // Neovim reports screen_row 7: clamped to the 10-row main grid.
+    try place(&grid, &hl, arena, "NW", 25, 5, 7);
+    var p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 2), p.surface);
+    try std.testing.expectEqual(@as(i64, 25), p.row);
+    try std.testing.expectEqual(@as(i64, 5), p.col);
+
+    // Past the window's bottom: clamped to the window, as Neovim clamps to
+    // the main grid.
+    try place(&grid, &hl, arena, "NW", 29, 5, 7);
+    p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 27), p.row);
+
+    // A south anchor hangs above its anchor row.
+    try place(&grid, &hl, arena, "SW", 20, 5, 7);
+    p = grid.surfacePlacement(grid.win_pos.get(3).?).?;
+    try std.testing.expectEqual(@as(i64, 17), p.row);
+}
+
+/// One grid_scroll event, fields in the order :help ui-events gives them:
+/// `["grid_scroll", grid, top, bot, left, right, rows, cols]`.
+fn testGridScrollEvent(arena: std.mem.Allocator, top: i64, bot: i64, left: i64, right: i64, rows: i64, cols: i64) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 7);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = top };
+    t[2] = .{ .int = bot };
+    t[3] = .{ .int = left };
+    t[4] = .{ .int = right };
+    t[5] = .{ .int = rows };
+    t[6] = .{ .int = cols };
+    return testEvent(arena, "grid_scroll", t);
+}
+
+/// Resize grid 1 to 4x4 through the handler and fill row r with four copies
+/// of `"abcd"[r]`, so each row is distinguishable after a scroll.
+fn testFillGrid4x4(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator) !void {
+    const t = try arena.alloc(mp.Value, 3);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = 4 }; // width
+    t[2] = .{ .int = 4 }; // height
+    try runRedrawEvents(grid, hl, arena, try testEvent(arena, "grid_resize", t));
+    const text = [_][]const u8{ "a", "b", "c", "d" };
+    for (text, 0..) |s, r| {
+        const cells = [_]mp.Value{try testCell(arena, s, 0, 4)};
+        var ev = [_]mp.Value{try testGridLineEvent(arena, 1, @intCast(r), 0, &cells)};
+        try runRedrawEvents(grid, hl, arena, &ev);
+    }
+}
+
+fn expectRow(grid: *const Grid, row: u32, cp: u32) !void {
+    for (0..4) |c| try std.testing.expectEqual(cp, grid.getCell(row, @intCast(c)).cp);
+}
+
+test "grid_scroll through the handler moves rows by the spec's sign, within its region, whatever cols says" {
+    // :help ui-events grid_scroll: "Scroll a region of grid. ... The
+    // region is [top, bot) x [left, right); rows > 0 moves the content up
+    // (row r receives what was at r + rows), rows < 0 moves it down; the
+    // rows that content moved away from are filled by later grid_line
+    // events and may be cleared meanwhile; `cols` is reserved for future
+    // use and always zero" -- a UI must accept the field, not reject on it.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    // Whole grid, rows = +1: every row takes the one below; the last is blank.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 0));
+    try expectRow(&grid, 0, 'b');
+    try expectRow(&grid, 1, 'c');
+    try expectRow(&grid, 2, 'd');
+    try expectRow(&grid, 3, ' ');
+
+    // Whole grid, rows = -1: the mirror image.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, -1, 0));
+    try expectRow(&grid, 0, ' ');
+    try expectRow(&grid, 1, 'a');
+    try expectRow(&grid, 2, 'b');
+    try expectRow(&grid, 3, 'c');
+
+    // Region [1, 3): rows 0 and 3 are outside it and keep their content.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 1, 3, 0, 4, 1, 0));
+    try expectRow(&grid, 0, 'a');
+    try expectRow(&grid, 1, 'c');
+    try expectRow(&grid, 2, ' ');
+    try expectRow(&grid, 3, 'd');
+
+    // cols = 7 is still a scroll of rows; it must not be dropped.
+    try testFillGrid4x4(&grid, &hl, arena);
+    try runRedrawEvents(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 7));
+    try expectRow(&grid, 0, 'b');
+    try expectRow(&grid, 3, ' ');
+}
+
+test "win_float_pos places each spec anchor corner at anchor_row/anchor_col" {
+    // :help ui-events win_float_pos: "anchor" is one of NW, NE, SW, SE --
+    // "which corner of the float to place at (anchor_row, anchor_col)"
+    // (nvim_open_win `anchor`). So an E anchor puts the float's right edge
+    // at anchor_col (top-left col = anchor_col - width) and an S anchor puts
+    // its bottom edge at anchor_row (top-left row = anchor_row - height).
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(3, 2, 3); // float: 2 rows x 3 cols
+
+    const cases = [_]struct { anchor: []const u8, row: u32, col: u32 }{
+        .{ .anchor = "NW", .row = 5, .col = 6 },
+        .{ .anchor = "NE", .row = 5, .col = 6 - 3 },
+        .{ .anchor = "SW", .row = 5 - 2, .col = 6 },
+        .{ .anchor = "SE", .row = 5 - 2, .col = 6 - 3 },
+    };
+    for (cases) |case| {
+        // 8-field form: no screen_row/screen_col, so the UI resolves the anchor.
+        const t = try arena.alloc(mp.Value, 8);
+        t[0] = .{ .int = 3 }; // grid
+        t[1] = .{ .int = 1003 }; // win
+        t[2] = .{ .str = case.anchor };
+        t[3] = .{ .int = 1 }; // anchor_grid
+        t[4] = .{ .int = 5 }; // anchor_row
+        t[5] = .{ .int = 6 }; // anchor_col
+        t[6] = .{ .bool = true }; // mouse_enabled
+        t[7] = .{ .int = 50 }; // zindex
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        const p = grid.win_pos.get(3).?;
+        try std.testing.expectEqual(case.row, p.row);
+        try std.testing.expectEqual(case.col, p.col);
+    }
+}
+
+fn checkHlAttrDefineAllocationFailure(alloc: std.mem.Allocator) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(alloc);
+    defer hl.deinit();
+
+    // ext_hlstate form: [id, rgb_attrs, cterm_attrs, info]
+    const attrs = try arena.alloc(mp.Pair, 1);
+    attrs[0] = .{ .key = .{ .str = "bold" }, .val = .{ .bool = true } };
+    const info_fields = try arena.alloc(mp.Pair, 2);
+    info_fields[0] = .{ .key = .{ .str = "hi_name" }, .val = .{ .str = "String" } };
+    info_fields[1] = .{ .key = .{ .str = "ui_name" }, .val = .{ .str = "Normal" } };
+    const info = try arena.alloc(mp.Value, 1);
+    info[0] = .{ .map = info_fields };
+    const t = try arena.alloc(mp.Value, 4);
+    t[0] = .{ .int = 42 };
+    t[1] = .{ .map = attrs };
+    t[2] = .{ .map = &[_]mp.Pair{} };
+    t[3] = .{ .arr = info };
+
+    runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "hl_attr_define", t)) catch |err| {
+        // The attribute and its names are one event: neither may be visible.
+        try std.testing.expect(!hl.map.contains(42));
+        try std.testing.expect(!hl.attr_names.contains(42));
+        return err;
+    };
+    try std.testing.expect(hl.map.get(42).?.bold);
+    const names = hl.attr_names.get(42).?;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("String", names[0]);
+    try std.testing.expectEqualStrings("Normal", names[1]);
+}
+
+test "hl_attr_define publishes the attribute and its names together or not at all" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHlAttrDefineAllocationFailure, .{});
+}
+
+test "win_viewport with a non-integer field is skipped, not applied with zeros" {
+    // :help ui-events win_viewport: every field after the grid is an
+    // Integer (win is a Window handle). A tuple that breaks that is
+    // malformed and must leave the viewport as it was.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const t = try arena.alloc(mp.Value, 8);
+    t[0] = .{ .int = 1 };
+    t[1] = .{ .int = 1000 };
+    t[2] = .{ .int = 10 }; // topline
+    t[3] = .{ .int = 14 }; // botline
+    t[4] = .{ .int = 12 }; // curline
+    t[5] = .{ .int = 0 }; // curcol
+    t[6] = .{ .int = 100 }; // line_count
+    t[7] = .{ .int = 0 }; // scroll_delta
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport", t));
+    try std.testing.expectEqual(@as(i64, 10), grid.viewport.get(1).?.topline);
+
+    // Each field in turn replaced by a string: none may apply.
+    for (1..8) |i| {
+        const bad = try arena.dupe(mp.Value, t);
+        bad[2] = .{ .int = 20 }; // would show up as topline if the tuple applied
+        bad[i] = .{ .str = "junk" };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport", bad));
+        try std.testing.expectEqual(@as(i64, 10), grid.viewport.get(1).?.topline);
+    }
+}
+
+test "a mode_info_set whose cursor_style_enabled is not a Boolean is skipped" {
+    // :help ui-events mode_info_set: "cursor_style_enabled is a boolean".
+    // Anything else is a malformed tuple: neither the flag nor the table
+    // may change, including an int that a lenient decoder would read as
+    // true.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    grid.cursor_style_enabled = false;
+    try grid.mode_infos.append(grid.alloc, .{ .shape = .vertical, .cell_percentage = 25 });
+
+    const modes = try arena.alloc(mp.Value, 2);
+    for (modes) |*m| m.* = .{ .map = &[_]mp.Pair{} };
+    const first = [_]mp.Value{ .{ .int = 1 }, .{ .str = "true" }, .nil };
+    for (first) |f| {
+        const t = try arena.alloc(mp.Value, 2);
+        t[0] = f;
+        t[1] = .{ .arr = modes };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+        try std.testing.expect(!grid.cursor_style_enabled);
+        try std.testing.expectEqual(@as(usize, 1), grid.mode_infos.items.len);
+    }
+
+    // Control: the Boolean form applies.
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .bool = true };
+    t[1] = .{ .arr = modes };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "mode_info_set", t));
+    try std.testing.expect(grid.cursor_style_enabled);
+    try std.testing.expectEqual(@as(usize, 2), grid.mode_infos.items.len);
+}
+
+test "an out-of-range coordinate in grid_cursor_goto, win_pos or grid_scroll is logged when it is dropped" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const Count = struct {
+        n: u32 = 0,
+        fn cb(ctx: ?*anyopaque, p: [*]const u8, len: usize) callconv(.c) void {
+            if (std.mem.startsWith(u8, p[0..len], "[redraw] ")) @as(*@This(), @ptrCast(@alignCast(ctx.?))).n += 1;
+        }
+    };
+    var count = Count{};
+    var log = Logger{ .cb = Count.cb, .ctx = &count };
+    const beyond_u32: i64 = @as(i64, std.math.maxInt(u32)) + 1;
+
+    const goto = try arena.alloc(mp.Value, 3);
+    goto[0] = .{ .int = 1 };
+    goto[1] = .{ .int = beyond_u32 };
+    goto[2] = .{ .int = 0 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "grid_cursor_goto", goto), &log);
+    try std.testing.expectEqual(@as(u32, 1), count.n);
+
+    const pos = try arena.alloc(mp.Value, 6);
+    pos[0] = .{ .int = 1 };
+    pos[1] = .{ .int = 1000 };
+    pos[2] = .{ .int = 0 };
+    pos[3] = .{ .int = -1 };
+    pos[4] = .{ .int = 4 };
+    pos[5] = .{ .int = 4 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "win_pos", pos), &log);
+    try std.testing.expectEqual(@as(u32, 2), count.n);
+
+    const scroll = try arena.alloc(mp.Value, 7);
+    scroll[0] = .{ .int = 1 };
+    scroll[1] = .{ .int = 0 };
+    scroll[2] = .{ .int = 4 };
+    scroll[3] = .{ .int = 0 };
+    scroll[4] = .{ .int = 4 };
+    scroll[5] = .{ .int = beyond_u32 };
+    scroll[6] = .{ .int = 0 };
+    try runRedrawEventsLogged(&grid, &hl, arena, try testEvent(arena, "grid_scroll", scroll), &log);
+    try std.testing.expectEqual(@as(u32, 3), count.n);
+
+    // Control: a well-formed scroll logs no drop.
+    try runRedrawEventsLogged(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 0), &log);
+    try std.testing.expectEqual(@as(u32, 3), count.n);
 }

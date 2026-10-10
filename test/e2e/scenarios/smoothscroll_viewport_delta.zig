@@ -144,12 +144,12 @@ fn waitToplineAdvance(h: *Harness, g: i64, from: u32) !void {
 }
 
 fn scrollOneRow(h: *Harness) !void {
-    const before_rev = h.contentRev();
+    const before = h.flush_seq.load(.seq_cst);
     try h.input("\x05"); // <C-e>
-    const Ctx = struct { rev: u64 };
-    try h.waitUntil(Ctx{ .rev = before_rev }, struct {
+    const Ctx = struct { from: u64 };
+    try h.waitUntil(Ctx{ .from = before }, struct {
         fn check(c: Ctx, hh: *Harness) bool {
-            return hh.contentRev() > c.rev;
+            return hh.flush_seq.load(.seq_cst) > c.from;
         }
     }.check, h.opts.timeout_ms);
 }

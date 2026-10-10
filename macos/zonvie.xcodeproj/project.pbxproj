@@ -16,15 +16,18 @@
 		AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9AB2EF1B8320072639A /* ViewController.swift */; };
 		AB9AE9AF2EF1B8320072639A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9A82EF1B8320072639A /* Assets.xcassets */; };
 		AB9AE9B42EF1BBED0072639A /* libzonvie_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */; };
-		AB9AE9BD2EF22AED0072639A /* MetalTerminalRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */; };
+		AB9AE9BD2EF22AED0072639A /* GridSurfaceRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B82EF22AED0072639A /* GridSurfaceRenderer.swift */; };
 		AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */; };
 		AB9AE9D12EF5BE3A0072639A /* FontCellFit.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */; };
+		ACF001622F2000010072639A /* FontInstanceAxes.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001612F2000010072639A /* FontInstanceAxes.swift */; };
 		AB9AE9C12EF22AED0072639A /* MetalTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */; };
 		AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9BA2EF22AED0072639A /* Shaders.metal */; };
 		AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C42EF236FC0072639A /* MetalTypes.swift */; };
 		AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C72EF23C170072639A /* ZonvieCore.swift */; };
 		AB9AE9CA2EF2A2130072639A /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C92EF2A2130072639A /* main.swift */; };
 		AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */; };
+		ACF001512F2000010072639A /* SessionScrollModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001502F2000010072639A /* SessionScrollModel.swift */; };
+		ACF001532F2000010072639A /* SessionKeyInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001522F2000010072639A /* SessionKeyInput.swift */; };
 		AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */; };
 		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
 		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
@@ -34,6 +37,9 @@
 		ABCC10062F10000000000006 /* SessionMenuController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10052F10000000000005 /* SessionMenuController.swift */; };
 		ACF001012F2000010072639A /* ExternalFontResetState.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001002F2000010072639A /* ExternalFontResetState.swift */; };
 		ACF001212F2000010072639A /* RowScrollBlitPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001202F2000010072639A /* RowScrollBlitPlan.swift */; };
+		ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001302F2000010072639A /* SharedRenderResources.swift */; };
+		ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001322F2000010072639A /* SurfaceDrawGate.swift */; };
+		ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001412F2000010072639A /* SurfaceDrawLoop.swift */; };
 		ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF002002F2000020072639A /* FlushRetryBackoff.swift */; };
 		ACF00A022F3000010072639A /* KeyCharacterSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF00A012F3000010072639A /* KeyCharacterSelection.swift */; };
 		ACF003012F2000030072639A /* FrameTracer.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF003002F2000030072639A /* FrameTracer.swift */; };
@@ -54,13 +60,16 @@
 		AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzonvie_core.a; path = ../zig-out/lib/libzonvie_core.a; sourceTree = SOURCE_ROOT; };
 		AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlas.swift; sourceTree = "<group>"; };
 		AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontCellFit.swift; sourceTree = "<group>"; };
-		AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalRenderer.swift; sourceTree = "<group>"; };
+		ACF001612F2000010072639A /* FontInstanceAxes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontInstanceAxes.swift; sourceTree = "<group>"; };
+		AB9AE9B82EF22AED0072639A /* GridSurfaceRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GridSurfaceRenderer.swift; sourceTree = "<group>"; };
 		AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalView.swift; sourceTree = "<group>"; };
 		AB9AE9BA2EF22AED0072639A /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		AB9AE9C42EF236FC0072639A /* MetalTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTypes.swift; sourceTree = "<group>"; };
 		AB9AE9C72EF23C170072639A /* ZonvieCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZonvieCore.swift; sourceTree = "<group>"; };
 		AB9AE9C92EF2A2130072639A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = HBFTBridge.c; sourceTree = "<group>"; };
+		ACF001502F2000010072639A /* SessionScrollModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionScrollModel.swift; sourceTree = "<group>"; };
+		ACF001522F2000010072639A /* SessionKeyInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionKeyInput.swift; sourceTree = "<group>"; };
 		AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlasCApi.swift; sourceTree = "<group>"; };
 		AB9AE9D02EF900000072639A /* ExternalGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalGridView.swift; sourceTree = "<group>"; };
 		AB9AE9D22F0000010072639A /* zonvie.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = zonvie.icns; sourceTree = "<group>"; };
@@ -70,6 +79,9 @@
 		ABCC10052F10000000000005 /* SessionMenuController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionMenuController.swift; sourceTree = "<group>"; };
 		ACF001002F2000010072639A /* ExternalFontResetState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalFontResetState.swift; sourceTree = "<group>"; };
 		ACF001202F2000010072639A /* RowScrollBlitPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RowScrollBlitPlan.swift; sourceTree = "<group>"; };
+		ACF001302F2000010072639A /* SharedRenderResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedRenderResources.swift; sourceTree = "<group>"; };
+		ACF001322F2000010072639A /* SurfaceDrawGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawGate.swift; sourceTree = "<group>"; };
+		ACF001412F2000010072639A /* SurfaceDrawLoop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawLoop.swift; sourceTree = "<group>"; };
 		ACF002002F2000020072639A /* FlushRetryBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlushRetryBackoff.swift; sourceTree = "<group>"; };
 		ACF00A012F3000010072639A /* KeyCharacterSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyCharacterSelection.swift; sourceTree = "<group>"; };
 		ACF003002F2000030072639A /* FrameTracer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameTracer.swift; sourceTree = "<group>"; };
@@ -140,6 +152,8 @@
 				ACF002002F2000020072639A /* FlushRetryBackoff.swift */,
 				ACF00A012F3000010072639A /* KeyCharacterSelection.swift */,
 				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
+				ACF001522F2000010072639A /* SessionKeyInput.swift */,
+				ACF001502F2000010072639A /* SessionScrollModel.swift */,
 			);
 			path = Core;
 			sourceTree = "<group>";
@@ -149,6 +163,7 @@
 			children = (
 				AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */,
 				AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */,
+				ACF001612F2000010072639A /* FontInstanceAxes.swift */,
 				AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */,
 			);
 			path = Font;
@@ -158,12 +173,15 @@
 			isa = PBXGroup;
 			children = (
 				AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */,
-				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
+				AB9AE9B82EF22AED0072639A /* GridSurfaceRenderer.swift */,
 				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
 				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
 				ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */,
 				ACF001002F2000010072639A /* ExternalFontResetState.swift */,
 				ACF001202F2000010072639A /* RowScrollBlitPlan.swift */,
+				ACF001302F2000010072639A /* SharedRenderResources.swift */,
+				ACF001322F2000010072639A /* SurfaceDrawGate.swift */,
+				ACF001412F2000010072639A /* SurfaceDrawLoop.swift */,
 				ACF003002F2000030072639A /* FrameTracer.swift */,
 			);
 			path = Rendering;
@@ -282,14 +300,20 @@
 			files = (
 				AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */,
 				AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */,
-				AB9AE9BD2EF22AED0072639A /* MetalTerminalRenderer.swift in Sources */,
+				ACF001532F2000010072639A /* SessionKeyInput.swift in Sources */,
+				ACF001512F2000010072639A /* SessionScrollModel.swift in Sources */,
+				AB9AE9BD2EF22AED0072639A /* GridSurfaceRenderer.swift in Sources */,
 				ABCA11BA2EFB01020072639A /* CustomShaderPipeline.swift in Sources */,
 				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
 				AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */,
 				AB9AE9D12EF5BE3A0072639A /* FontCellFit.swift in Sources */,
+				ACF001622F2000010072639A /* FontInstanceAxes.swift in Sources */,
 				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
 				ACF001012F2000010072639A /* ExternalFontResetState.swift in Sources */,
 				ACF001212F2000010072639A /* RowScrollBlitPlan.swift in Sources */,
+				ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */,
+				ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */,
+				ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */,
 				ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */,
 				ACF00A022F3000010072639A /* KeyCharacterSelection.swift in Sources */,
 				ACF003012F2000030072639A /* FrameTracer.swift in Sources */,

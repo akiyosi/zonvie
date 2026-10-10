@@ -102,6 +102,17 @@ pub const Highlights = struct {
     // For "hl_group_set"
     groups: std.StringHashMap(u32),
 
+    /// Every source group name an attribute id was composed from, from
+    /// `hl_attr_define`'s `info` under ext_hlstate.
+    ///
+    /// `groups` cannot answer this. Neovim announces a name through
+    /// `hl_group_set` only for the handful of groups the UI styles its own
+    /// chrome with, and a cell's `hl_id` is an *attribute* id -- one entry of
+    /// the table `hl_attr_define` builds, composed from however many groups
+    /// applied to that cell. Matching a syntax group by name therefore needs
+    /// the other direction: attribute id -> the names it came from.
+    attr_names: std.AutoHashMap(u32, [][]u8),
+
     default_fg: u32 = 0x00FFFFFF,
     default_bg: u32 = 0x00000000,
     default_sp: u32 = 0x00000000,
@@ -115,6 +126,7 @@ pub const Highlights = struct {
             .alloc = alloc,
             .map = std.AutoHashMap(u32, Attr).init(alloc),
             .groups = std.StringHashMap(u32).init(alloc),
+            .attr_names = std.AutoHashMap(u32, [][]u8).init(alloc),
         };
     }
 
@@ -126,7 +138,18 @@ pub const Highlights = struct {
         }
         self.groups.deinit();
 
+        self.freeAttrNames();
+        self.attr_names.deinit();
+
         self.map.deinit();
+    }
+
+    fn freeAttrNames(self: *Highlights) void {
+        var it = self.attr_names.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.*) |n| self.alloc.free(n);
+            self.alloc.free(e.value_ptr.*);
+        }
     }
 
     /// Drop all state owned by one Neovim UI attachment while retaining map
@@ -137,6 +160,8 @@ pub const Highlights = struct {
             self.alloc.free(@constCast(e.key_ptr.*));
         }
         self.groups.clearRetainingCapacity();
+        self.freeAttrNames();
+        self.attr_names.clearRetainingCapacity();
         self.map.clearRetainingCapacity();
         self.glyph_style_rev +%= 1;
         self.default_fg = 0x00FFFFFF;
@@ -163,6 +188,63 @@ pub const Highlights = struct {
         errdefer self.alloc.free(k);
         try self.groups.put(k, hl_id);
         self.groups_changed = true;
+    }
+
+    /// One hl_attr_define: the attribute plus the ext_hlstate group names it
+    /// was composed from. Every allocation happens before either becomes
+    /// visible, so an OOM leaves both at their prior state (absent for a new
+    /// id) and the abandoned batch replays cleanly.
+    ///
+    /// Names repeat across ids and ids repeat across redraws, so a name
+    /// already recorded for `id` is not stored twice. A new name sets
+    /// `groups_changed`, which is what makes the glow set re-resolve.
+    pub fn defineWithNames(self: *Highlights, id: u32, a: Attr, names: []const []const u8) !void {
+        try self.map.ensureUnusedCapacity(1);
+        const gop = try self.attr_names.getOrPut(id);
+        if (!gop.found_existing) gop.value_ptr.* = &.{};
+        errdefer if (!gop.found_existing) {
+            _ = self.attr_names.remove(id);
+        };
+        const old = gop.value_ptr.*;
+
+        var added: usize = 0;
+        for (names, 0..) |name, i| {
+            if (isNewName(old, names[0..i], name)) added += 1;
+        }
+        if (added != 0) {
+            const grown = try self.alloc.alloc([]u8, old.len + added);
+            var n: usize = old.len;
+            errdefer {
+                for (grown[old.len..n]) |s| self.alloc.free(s);
+                self.alloc.free(grown);
+            }
+            @memcpy(grown[0..old.len], old);
+            for (names, 0..) |name, i| {
+                if (!isNewName(old, names[0..i], name)) continue;
+                grown[n] = try self.alloc.dupe(u8, name);
+                n += 1;
+            }
+            self.alloc.free(old);
+            gop.value_ptr.* = grown;
+            self.groups_changed = true;
+        }
+
+        self.publish(id, a);
+    }
+
+    fn isNewName(old: []const []u8, earlier: []const []const u8, name: []const u8) bool {
+        for (old) |s| if (std.mem.eql(u8, s, name)) return false;
+        for (earlier) |s| if (std.mem.eql(u8, s, name)) return false;
+        return true;
+    }
+
+    /// Requires `map` to have capacity for one more entry.
+    fn publish(self: *Highlights, id: u32, a: Attr) void {
+        const old = self.map.get(id);
+        self.map.putAssumeCapacity(id, a);
+        if (old == null or old.?.bold != a.bold or old.?.italic != a.italic) {
+            self.glyph_style_rev +%= 1;
+        }
     }
 
     pub fn define(
@@ -194,11 +276,8 @@ pub const Highlights = struct {
             .overline = styles.overline,
             .has_url = has_url,
         };
-        const old = self.map.get(id);
-        try self.map.put(id, a);
-        if (old == null or old.?.bold != a.bold or old.?.italic != a.italic) {
-            self.glyph_style_rev +%= 1;
-        }
+        try self.map.ensureUnusedCapacity(1);
+        self.publish(id, a);
     }
 
     /// Resolve a raw attribute's foreground and background.

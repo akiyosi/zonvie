@@ -31,11 +31,60 @@ pub fn requireScreenAccess() !void {
     }
 }
 
+/// The app log a scenario gets when it does not ask for one of its own.
+pub const default_log_path = "tmp/gui_app.log";
+
 /// Launch the app ready for visual capture, or skip when screen capture is
 /// unavailable. Caller owns the returned Gui (defer g.deinit()).
 pub fn open(alloc: std.mem.Allocator) !*Gui {
+    return openWithLog(alloc, default_log_path);
+}
+
+/// open(), with the app's `--log` pointed at `log_path`.
+///
+/// A scenario whose oracle READS that log needs its own path: the app opens
+/// the file for append and stamps every line with its own start-relative
+/// clock, so a log shared with other scenarios carries earlier processes'
+/// lines at overlapping timestamps and any count taken from it spans more
+/// than the run being measured.
+pub fn openWithLog(alloc: std.mem.Allocator, log_path: []const u8) !*Gui {
+    return openWithLogAndConfig(alloc, log_path, "test/gui/fixtures/config");
+}
+
+pub fn openWithLogAndConfig(alloc: std.mem.Allocator, log_path: []const u8, config_dir: []const u8) !*Gui {
+    return openWithLogConfigAndEnv(alloc, log_path, config_dir, &.{});
+}
+
+/// Initialize GUI with custom environment. Ensures:
+///  - Screen capture permission available (macOS Screen Recording, Windows)
+///  - Window pinned to fixed position (80, 80) for pixel-determinism
+///  - Cursor blinker disabled (guicursor=a:blinkon0)
+///  - Font set to OS-stable monospace (Menlo/h13 on macOS, Consolas/h13 Windows)
+///  - Grid stable (waitStableGrid)
+/// Precondition for Phase 6a tests: cursor-only callback and callback order determinism.
+///
+/// Precondition assertions (Tier 1 verification):
+///  - alloc != null (allocator must be valid)
+///  - log_path != null && log_path.len > 0 (log file path required)
+///  - config_dir != null && config_dir.len > 0 (config directory required)
+///  - app_env is well-formed environment array
+pub fn openWithLogConfigAndEnv(
+    alloc: std.mem.Allocator,
+    log_path: []const u8,
+    config_dir: []const u8,
+    app_env: []const [2][]const u8,
+) !*Gui {
+    // Precondition assertion: validate inputs (Tier 1 mutation boundary guard)
+    std.debug.assert(log_path.len > 0);  // log path required
+    std.debug.assert(config_dir.len > 0);  // config dir required
+    // app_env array is checked by Gui.init (deferred to lower layer)
+
     try requireScreenAccess();
-    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", "tmp/gui_app.log" } });
+    var g = try Gui.init(alloc, .{
+        .app_args = &.{ "--log", log_path },
+        .config_dir = config_dir,
+        .app_env = app_env,
+    });
     errdefer g.deinit();
     // Pin the window to a fixed screen position so subpixel (ClearType)
     // rendering is identical run-to-run; the OS otherwise places the window

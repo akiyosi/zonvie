@@ -45,43 +45,12 @@ const observe_ms: u64 = 3000;
 /// produced in the field report.
 const resize_steps: u32 = 26;
 
-const max_windows = 16;
 
 fn measure(alloc: std.mem.Allocator, since_ms: f64, label: []const u8) !app_log.Cadence {
     gui_io.sleepNs(observe_ms * std.time.ns_per_ms);
     const c = try app_log.cadence(alloc, log_path, app_log.main_draw_marker, since_ms);
     c.report(label);
     return c;
-}
-
-/// The app window that is NOT in `before` and is at least
-/// `min_side` points on both axes — the external float that just opened.
-/// The size floor skips the small decorated overlays (tabline strip, mini
-/// message popups) the ext UI options also bring on screen.
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-/// Poll until the external float shows up as a real OS window.
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.FloatWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -129,15 +98,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
 
     // Open an external float at the size the field report used.
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
     try g.exec(
         "luaeval('(function() _G.e2e_main = vim.api.nvim_get_current_win() " ++
             "_G.e2e_float = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, " ++
             "{external=true, width=60, height=29}) return 1 end)()')",
     );
     // Let the float settle at its opening size before measuring it.
-    const opened = try waitNewWindow(g.app_pid, before, 200);
+    const opened = try driver.waitNewWindow(g.app_pid, before, 200);
     gui_io.sleepNs(500 * std.time.ns_per_ms);
 
     // Park it near the top-left. The float opens wherever Neovim's
@@ -147,7 +116,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.MoveFailed;
     }
     gui_io.sleepNs(300 * std.time.ns_per_ms);
-    const float_win = try waitNewWindow(g.app_pid, before, 200);
+    const float_win = try driver.waitNewWindow(g.app_pid, before, 200);
     const float_b = float_win.bounds;
 
     // Hand key status to the float's own NSWindow and back, the way the
@@ -178,7 +147,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Everything after this must use the size the float ACTUALLY settled at,
     // not the size the drag asked for: the frontend snaps external windows to
     // whole cells, and AX looks windows up by size.
-    const resized = try waitNewWindow(g.app_pid, before, 50);
+    const resized = try driver.waitNewWindow(g.app_pid, before, 50);
     std.debug.print("[gui] float after drag: ({d:.0}x{d:.0})\n", .{ resized.bounds.w, resized.bounds.h });
 
     // Without this the test is hollow: it would idle for three seconds and
