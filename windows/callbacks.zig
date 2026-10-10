@@ -651,6 +651,12 @@ pub fn onVerticesRow(
             .route = routeKind(row_route),
             .live_window = live_ext_win != null,
         });
+        switch (disposition) {
+            .live_cursor, .live_row, .pending_cursor, .pending_row => {},
+            // Handled above; reaching the row writes below would replace rows
+            // a callback with neither flag must retain.
+            .retain_rows, .layer_row => return,
+        }
 
         // Try to find an existing external window with no pending seed.
         if (live_ext_win) |ext_win| {

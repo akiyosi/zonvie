@@ -205,3 +205,11 @@ test "header constants match their c_api twins" {
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
 }
+
+test "mouse modifier letters follow the header MOD_* bits" {
+    var buf: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("C", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_CTRL));
+    try std.testing.expectEqualStrings("A", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_ALT));
+    try std.testing.expectEqualStrings("S", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_SHIFT));
+    try std.testing.expectEqualStrings("D", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_SUPER));
+}

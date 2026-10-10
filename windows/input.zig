@@ -42,10 +42,10 @@ fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
 // Keyboard constants and input helpers
 // =========================================================================
 
-pub const MOD_CTRL = 1 << 0; // same bit layout as header comment
-pub const MOD_ALT = 1 << 1;
-pub const MOD_SHIFT = 1 << 2;
-pub const MOD_SUPER = 1 << 3;
+pub const MOD_CTRL = core.MOD_CTRL;
+pub const MOD_ALT = core.MOD_ALT;
+pub const MOD_SHIFT = core.MOD_SHIFT;
+pub const MOD_SUPER = core.MOD_SUPER;
 // Windows has no "Command", leave it unused.
 
 /// Non-blocking cursor position query with cache fallback (mirrors macOS's

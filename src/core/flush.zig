@@ -3418,16 +3418,6 @@ pub const FlushCtx = struct {
             }
         }
 
-        // A composition step below (vertex buffer growth, glyph push, etc.)
-        // can fail with an internal Zig error (OOM) rather than an explicit
-        // frontend-signaled zonvie_core_abort_flush() call. Such an error
-        // propagates straight out of onFlush and is swallowed by callers
-        // (`catch {}` / logged and dropped) while the two defers above still
-        // run — frontends would commit a partial write-set as a complete
-        // frame. Registered AFTER those defers so it runs FIRST during unwind
-        // (LIFO), setting flush_aborted before they see it.
-        errdefer ctx.core.flush_aborted = true;
-
         // Grid scroll events are NOT dispatched or cleared — they are preserved
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
         if (ctx.core.flush_aborted) {
@@ -3955,8 +3945,8 @@ pub const FlushCtx = struct {
                 }
             }
 
-            // A reset still pending here (e.g. from the cursor pass) leaves
-            // the rows already published with stale UVs.
+            // A reset still pending here leaves the rows already published
+            // with stale UVs.
             if (ctx.core.atlas_reset_during_flush) cancelFlushForAtlasReset(ctx.core);
             return;
         }
@@ -15908,6 +15898,45 @@ test "grid 1's cursor layer is resent when grid 1 is cleared or shrinks under it
     try core.grid.resizeGrid(1, 5, 40);
     try flush_ctx.onFlush(5, 40);
     try std.testing.expectEqual(@as(u32, 1), state.root_clear);
+}
+
+test "default_colors_set recolours an attr-0 grid 1 cursor that did not move" {
+    // Neovim sends default_colors_set with no cursor event when only Normal
+    // changes; an attr-0 cursor swaps the defaults, so it must be resent.
+    const State = struct {
+        sends: u32 = 0,
+        color: [4]f32 = .{ 0, 0, 0, 0 },
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, _: u32, _: u32, verts: ?[*]const c_api.Vertex, count: usize, flags: u32, _: u32, _: u32) callconv(.c) void {
+            if (flags & c_api.VERT_UPDATE_CURSOR == 0 or grid_id != 1 or count == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.sends += 1;
+            self.color = verts.?[0].color;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    try core.grid.resize(10, 40);
+    core.grid.setCursor(1, 2, 3);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 1), state.sends);
+    try std.testing.expectEqual(@as(f32, 1.0), state.color[1]);
+
+    // The production redraw path: setDefaults, then the default_colors_fn
+    // handleRedraw is wired to (rpc_session.zig), then the batch's flush.
+    state = .{};
+    core.hl.setDefaults(0x00FF0000, 0x00000000, null);
+    try flush_ctx.onDefaultColors(0x00FF0000, 0x00000000);
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 1), state.sends);
+    try std.testing.expectEqual(@as(f32, 1.0), state.color[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), state.color[1]);
 }
 
 test "a vertical split's scroll publishes a shift instead of regenerating the band" {
