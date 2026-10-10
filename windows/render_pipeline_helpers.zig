@@ -906,20 +906,23 @@ pub fn atlasUploadOwesFullPaint(atlas_uploaded: bool, drew_root_rows: bool) bool
 /// repainted from the root's own vertices, which is what removes the previous
 /// cursor. Only for a cursor on the root: a layer's cursor rows are that
 /// grid's, and its layer repaints whole. Rows past `row_limit` are skipped.
-/// Both drivers collected the same pair.
+/// Both drivers collected the same pair. Returns false on allocation failure:
+/// a skipped row leaves the previous cursor baked into the back texture, so
+/// the caller must abort the paint.
 pub fn insertCursorEraseRows(
     alloc: std.mem.Allocator,
     rows: *std.ArrayListUnmanaged(u32),
     erase_rows: [2]?u32,
     row_limit: u32,
     cursor_on_root: bool,
-) void {
-    if (!cursor_on_root) return;
+) bool {
+    if (!cursor_on_root) return true;
     for (erase_rows) |maybe_row| {
         const r = maybe_row orelse continue;
         if (r >= row_limit) continue;
-        _ = insertSortedRow(alloc, rows, r);
+        if (!insertSortedRow(alloc, rows, r)) return false;
     }
+    return true;
 }
 
 /// Return the in-bounds logical rows that must be redrawn when replacing a

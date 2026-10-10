@@ -6197,8 +6197,10 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     if (!msg_dirty and !confirm_dirty and !any_status_dirty and !history_dirty and !has_pending_throttle) return;
 
-    // Guard: at most one on_msg_clear per flush cycle
-    var sent_msg_clear = false;
+    // At most one on_msg_clear per cycle, including the dispatch arms below.
+    std.debug.assert(self.msg_clear_sent_in_cycle == null);
+    self.msg_clear_sent_in_cycle = false;
+    defer self.msg_clear_sent_in_cycle = null;
     var msg_retry_needed = false;
 
     // Handle confirm message changes (noice.nvim pattern: separate from regular messages)
@@ -6209,7 +6211,6 @@ pub fn notifyMessageChanges(self: *Core) void {
             // Confirm dismissed -> notify frontend to hide prompt window
             self.log.write("[msg] confirm dismissed -> on_msg_clear\n", .{});
             sendMsgClear(self);
-            sent_msg_clear = true;
         }
     }
 
@@ -6223,11 +6224,10 @@ pub fn notifyMessageChanges(self: *Core) void {
 
         // If msg_clear was received in this batch, notify frontend to clear old state
         // BEFORE processing new messages. This handles msg_clear -> msg_show same-batch.
-        if (cleared_in_batch and !sent_msg_clear) {
+        if (cleared_in_batch and !self.msg_clear_sent_in_cycle.?) {
             hideChannelView(self, .show, .ext_float);
             self.msg_show_pending_since = null;
             sendMsgClear(self);
-            sent_msg_clear = true;
         }
 
         const messages = self.grid.message_state.messages.items;
@@ -6236,10 +6236,7 @@ pub fn notifyMessageChanges(self: *Core) void {
                 // Pure empty (not from same-batch clear which was already handled above)
                 hideChannelView(self, .show, .ext_float);
                 self.msg_show_pending_since = null;
-                if (!sent_msg_clear) {
-                    sendMsgClear(self);
-                    sent_msg_clear = true;
-                }
+                sendMsgClear(self);
             }
         } else {
             // Check message types
@@ -7043,8 +7040,13 @@ pub fn handleMsgHistoryScroll(self: *Core, direction: []const u8) void {
     } else if (std.mem.eql(u8, direction, "up")) {
         self.msg_history_scroll_offset -|= amount;
     }
-    if (!renderMsgHistoryGrid(self, self.grid.msg_history_state.entries.items)) return;
-    if (self.msg_history_scroll_offset == prev) return;
+    if (!renderMsgHistoryGrid(self, self.grid.msg_history_state.entries.items)) {
+        // The render cleared the panel and may have stopped part way, outside
+        // any flush bracket. Re-render it whole in the flush below, where a
+        // failure aborts and the history retry deadline drives the next try.
+        self.msg_history_scroll_offset = prev;
+        self.grid.msg_history_state.dirty = true;
+    } else if (self.msg_history_scroll_offset == prev) return;
     var fctx = FlushCtx{ .core = self };
     FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
         if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
@@ -7292,6 +7294,10 @@ fn statusEvent(channel: grid_mod.StatusChannel) config.MsgEvent {
 /// status routed to ext_float. msg_clear does not clear showmode, and nothing
 /// marks the status dirty, so a status still showing is sent again.
 fn sendMsgClear(self: *Core) void {
+    if (self.msg_clear_sent_in_cycle) |sent| {
+        if (sent) return;
+        self.msg_clear_sent_in_cycle = true;
+    }
     const cb = self.cb.on_msg_clear orelse return;
     cb(self.ctx);
     for (grid_mod.StatusChannel.all) |channel| {
@@ -12602,6 +12608,55 @@ test "the history float opens at the oldest line and scrolls to the newest" {
     try std.testing.expectEqual([2]u32{ '0', '7' }, TopLine.of(&core));
 }
 
+test "a history scroll whose render fails re-renders the panel whole inside a flush" {
+    // The render clears the panel before writing rows, outside any flush
+    // bracket; left as is, the next flush would publish it half written.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.ext_messages_enabled = true;
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_history_show }, .view = .ext_float, .opts = .{ .timeout = 0 } },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var entries: [30]grid_mod.MsgHistoryEntry = @splat(.{});
+    var texts: [30][3]u8 = undefined;
+    defer for (&entries) |*e| e.content.deinit(std.testing.allocator);
+    for (&entries, &texts, 0..) |*e, *t, i| {
+        t.* = .{ 'l', '0' + @as(u8, @intCast(i / 10)), '0' + @as(u8, @intCast(i % 10)) };
+        try e.content.append(std.testing.allocator, .{ .hl_id = 0, .text = t });
+    }
+    try core.grid.setMsgHistoryShow(&entries, false);
+    try std.testing.expect(sendMsgHistoryShow(&core));
+    core.grid.msg_history_state.dirty = false;
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    core.mousescroll_ver.store(3, .release);
+    core.sendMouseScroll(grid_mod.MSG_HISTORY_GRID_ID, 0, 0, "down", "");
+    // Non-vacuous: the injected failure reached the render.
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u32, 0), core.msg_history_scroll_offset);
+    try std.testing.expect(core.grid.msg_history_state.dirty);
+
+    // Healthy again: the next cycle redraws every row from the history.
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    core.flush_aborted = false;
+    notifyMessageChanges(&core);
+    try std.testing.expect(!core.grid.msg_history_state.dirty);
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var col: u32 = 0;
+    while (core.grid.getCellGrid(hgid, 0, col).cp != 'l') col += 1;
+    try std.testing.expectEqual(@as(u32, '0'), core.grid.getCellGrid(hgid, 0, col + 2).cp);
+    const last = panelRows(&core, hgid) - 1;
+    col = 0;
+    while (core.grid.getCellGrid(hgid, last, col).cp != 'l') col += 1;
+    try std.testing.expectEqual(@as(u32, '9'), core.grid.getCellGrid(hgid, last, col + 2).cp);
+}
+
 test "auto-hide expiry clears the visible flag through the hide funnel" {
     // Out-of-band hides (auto-hide timeout, msg_clear) used to bypass the
     // ViewSet, leaving `visible` stale so the next empty cycle issued a
@@ -13192,6 +13247,46 @@ test "the split payload budget drops only what the write queue cannot carry" {
         try std.testing.expect(!showChannelView(&core, .show, .split, .{ .show = messages }));
         try std.testing.expectEqual(@as(usize, 0), clear_calls);
     }
+}
+
+test "a msg_clear batch whose content goes to a split sends one on_msg_clear" {
+    // The same-batch clear fires before dispatch, and the split arm clears
+    // again once its content is settled; one cycle must not do both.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    var clear_calls: usize = 0;
+    const Probe = struct {
+        var calls: *usize = undefined;
+        fn onClear(_: ?*anyopaque) callconv(.c) void {
+            calls.* += 1;
+        }
+    };
+    Probe.calls = &clear_calls;
+    core.cb.on_msg_clear = Probe.onClear;
+
+    var split_routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .split },
+    };
+    core.msg_config.messages.routes = &split_routes;
+
+    // Over the write-queue budget: the split arm's settled exit without a
+    // transport, which is the one a test core can reach.
+    const filler = try std.testing.allocator.alloc(u8, Core.MAX_WRITE_QUEUE_SIZE - Core.split_lua_buf_len + 1);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 'x');
+    try appendTestMessage(&core, 1, "echo", filler);
+    core.grid.message_state.msg_cleared_in_batch = true;
+
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(usize, 1), clear_calls);
+
+    // Outside a cycle the guard does not linger: the next cycle clears again.
+    try appendTestMessage(&core, 2, "echo", filler);
+    core.grid.message_state.msg_cleared_in_batch = true;
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(usize, 2), clear_calls);
 }
 
 test "a pending retry deadline suppresses the next immediate attempt" {

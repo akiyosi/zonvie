@@ -693,14 +693,27 @@ test "cursor erase rows are claimed only for a root cursor and only in range" {
     try rows.append(std.testing.allocator, 5);
 
     // A layer's cursor claims nothing from the root.
-    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 1, 2 }, 10, false);
+    try std.testing.expect(helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 1, 2 }, 10, false));
     try std.testing.expectEqualSlices(u32, &.{5}, rows.items);
 
     // A root cursor claims where it was and where it lands, in order, and a
     // row past the limit or absent is skipped.
-    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 7, null }, 10, true);
-    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 2, 10 }, 10, true);
+    try std.testing.expect(helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 7, null }, 10, true));
+    try std.testing.expect(helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 2, 10 }, 10, true));
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7 }, rows.items);
+}
+
+test "a cursor erase row that cannot be claimed fails the paint" {
+    // A dropped row would leave the previous cursor baked into the back
+    // texture, so allocation failure must reach the caller.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var rows: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows.deinit(failing.allocator());
+
+    try std.testing.expect(!helpers.insertCursorEraseRows(failing.allocator(), &rows, .{ 3, null }, 10, true));
+    try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    // Nothing to claim needs no memory.
+    try std.testing.expect(helpers.insertCursorEraseRows(failing.allocator(), &rows, .{ 3, null }, 10, false));
 }
 
 test "cursor replacement dirties old and new rows" {

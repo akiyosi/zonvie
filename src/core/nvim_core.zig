@@ -956,6 +956,9 @@ pub const Core = struct {
     // Throttle for msg_show (noice.nvim-style): delay display to accumulate messages
     // noice.nvim uses 1000/30 = ~33ms throttle by default
     msg_show_pending_since: ?i128 = null, // nanos timestamp when first msg_dirty was set
+    /// Whether this notifyMessageChanges cycle has sent on_msg_clear; null
+    /// outside a cycle. sendMsgClear sends at most once per cycle.
+    msg_clear_sent_in_cycle: ?bool = null,
     msg_show_throttle_ns: i128 = 33 * std.time.ns_per_ms, // 33ms default throttle (matches noice.nvim)
     // Allocation/render failures are retried by the frontend timer. Keep a
     // separate deadline so an already-expired throttle does not spin a full

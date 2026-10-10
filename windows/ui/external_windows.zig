@@ -753,13 +753,13 @@ fn drawNormalExternalSurfaceRowMode(
     if (!ext_win.paint_drew_root_rows and !force_full_rows and applog.isVerbose()) {
         applog.appLog("[render_trace] side=windows event=retained_content_reuse surface={d} root_row_draws=0\n", .{grid_id});
     }
-    render_pipeline_helpers.insertCursorEraseRows(
+    if (!render_pipeline_helpers.insertCursorEraseRows(
         app.alloc,
         rows_to_draw,
         cursor_erase_rows,
         ext_rows,
         cursor_on_root,
-    );
+    )) return error.OutOfMemory;
 
     const has_cursor = tbs_cursor.verts.items.len > 0;
     const has_scrollbar_work = scrollbar_alpha > 0.001 or

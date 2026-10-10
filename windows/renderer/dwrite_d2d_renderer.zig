@@ -1749,31 +1749,54 @@ pub const Renderer = struct {
         if (new_dpi == self.dpi) return;
 
         const old_dpi = self.dpi;
-        self.dpi = new_dpi;
         if (applog.isEnabled()) applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
 
         // Assign the em size exactly as setFontUtf8WithStyle computes it, so its
         // unchanged-font early return still matches after a DPI round trip.
         const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
         const scale: f32 = if (self.font_em_size > 0) new_font_size / self.font_em_size else 1.0;
-        self.font_em_size = new_font_size;
-        self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
-        safeRelease(self.emoji_text_format);
-        self.emoji_text_format = null;
-        self.ascent_px *= scale;
-        self.descent_px *= scale;
+
+        // Cell size, ascent and descent must all describe one DPI: a failure
+        // keeps the old DPI's metrics whole, and self.dpi stays old so the next
+        // WM_DPICHANGED retries.
+        const saved = .{
+            .font_em_size = self.font_em_size,
+            .ascent_px = self.ascent_px,
+            .descent_px = self.descent_px,
+            .cell_w_px = self.cell_w_px,
+            .cell_h_px = self.cell_h_px,
+            .text_format = self.text_format,
+        };
 
         // Re-create TextFormat with new scaled size (needed for cell metrics)
         if (self.dwrite_factory != null and self.font_name[0] != 0) {
-            safeRelease(self.text_format);
-            self.text_format = null;
-
             // The picked base style, as setFontUtf8WithStyle measures it.
-            self.text_format = createTextFormat(self.dwrite_factory.?, @ptrCast(&self.font_name), self.base_bold, self.base_italic, new_font_size);
+            self.text_format = createTextFormat(self.dwrite_factory.?, @ptrCast(&self.font_name), self.base_bold, self.base_italic, new_font_size) orelse {
+                if (applog.isEnabled()) applog.appLog("[d2d] DPI change: TextFormat creation failed; keeping DPI {d}\n", .{old_dpi});
+                return;
+            };
         }
+        self.font_em_size = new_font_size;
+        self.ascent_px *= scale;
+        self.descent_px *= scale;
 
         // Re-compute cell metrics with new TextFormat
-        self.recomputeCellMetrics() catch {};
+        self.recomputeCellMetrics() catch |e| {
+            if (applog.isEnabled()) applog.appLog("[d2d] DPI change: cell metrics failed ({any}); keeping DPI {d}\n", .{ e, old_dpi });
+            if (self.text_format != saved.text_format) safeRelease(self.text_format);
+            self.text_format = saved.text_format;
+            self.font_em_size = saved.font_em_size;
+            self.ascent_px = saved.ascent_px;
+            self.descent_px = saved.descent_px;
+            self.cell_w_px = saved.cell_w_px;
+            self.cell_h_px = saved.cell_h_px;
+            return;
+        };
+        if (self.text_format != saved.text_format) safeRelease(saved.text_format);
+        self.dpi = new_dpi;
+        self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
+        safeRelease(self.emoji_text_format);
+        self.emoji_text_format = null;
 
         // Reset styled font faces (will be lazy-reloaded)
         safeRelease(self.bold_font_face);

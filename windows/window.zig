@@ -1353,7 +1353,8 @@ fn applyMainDpiState(app: *App, new_dpi: u32) void {
         a.updateDpi(new_dpi);
         const current_metrics = a.cellMetrics();
         metrics = .{ .w_px = current_metrics.w_px, .h_px = current_metrics.h_px };
-        if (new_dpi != old_dpi) {
+        // updateDpi keeps the old DPI when its metrics fail.
+        if (a.dpiValue() != old_dpi) {
             app.pending_core_glyph_invalidate.store(true, .release);
         }
     }
@@ -2386,13 +2387,16 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
                 app.surf.paint.last_painted_cursor_row,
                 committed_cursor.last_cursor_row,
             };
-            render_helpers.insertCursorEraseRows(
+            if (!render_helpers.insertCursorEraseRows(
                 app.alloc,
                 rows_to_draw,
                 cursor_erase_rows,
                 max_valid_row,
                 cursor_grid == 1,
-            );
+            )) {
+                recoverMainPaintFailure(hwnd, app);
+                return;
+            }
 
             // Reserve every rect this paint can add: one span per
             // dirty row, the copied paint damage, one per layer,
