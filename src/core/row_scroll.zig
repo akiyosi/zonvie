@@ -110,6 +110,14 @@ pub fn make(
         dirty_start = start;
         dirty_end = @min(clamped_row_end, start + 2 * shift);
     }
+    // The copy stays inside the texture and the rectangle's clamped rows.
+    std.debug.assert(@max(src_y, dst_y) + safe_copy_h <= tex_h_px);
+    std.debug.assert(@max(src_y, dst_y) + safe_copy_h <= region_bottom);
+    std.debug.assert(@as(i64, origin_x_px) + copy_w <= tex_w_px);
+    std.debug.assert(clear_top < clear_bottom);
+    std.debug.assert(start <= dirty_start);
+    std.debug.assert(dirty_start < dirty_end);
+    std.debug.assert(dirty_end <= clamped_row_end);
 
     return .{
         .origin_x_px = origin_x_px,

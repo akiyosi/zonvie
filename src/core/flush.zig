@@ -3136,8 +3136,10 @@ fn dispatchGridRowScroll(
 
 pub const FlushCtx = struct {
     core: *Core,
+    saw_flush: bool = false,
 
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
+        ctx.saw_flush = true;
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
         // Precondition: grid_mu must be held by the caller (production contract; test harness may not hold lock)

@@ -157,6 +157,14 @@ pub const MsgFilter = struct {
     }
 };
 
+test "height bounds are inclusive, as noice's message/filter.lua compares them" {
+    const f: MsgFilter = .{ .min_height = 3, .max_height = 5 };
+    try std.testing.expect(f.matches(.msg_show, "", 3));
+    try std.testing.expect(f.matches(.msg_show, "", 5));
+    try std.testing.expect(!f.matches(.msg_show, "", 2));
+    try std.testing.expect(!f.matches(.msg_show, "", 6));
+}
+
 pub const RouteOpts = struct {
     /// Explicitly do not display. Distinct from "no route matched", which
     /// cannot occur.

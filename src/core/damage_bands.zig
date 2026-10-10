@@ -72,6 +72,13 @@ pub fn bands(spans: []const Band, row_h_px: i32, surface_h_px: i32, out: []Band)
             n += 1;
         }
     }
+    // Disjoint, ascending, non-empty and on the surface.
+    std.debug.assert(n <= out.len);
+    for (out[0..n], 0..) |b, i| {
+        std.debug.assert(b.top_px < b.bottom_px);
+        std.debug.assert(b.bottom_px <= surface_h_px);
+        if (i > 0) std.debug.assert(out[i - 1].bottom_px < b.top_px);
+    }
     return n;
 }
 
@@ -99,6 +106,8 @@ pub fn layerRowsForBand(band: Band, origin_y_px: i32, layer_rows: u32, row_h_px:
     const first = @max(0, @divFloor(top - oy, h));
     const last = @min(@as(i64, layer_rows) - 1, @divFloor(bottom - 1 - oy, h));
     if (last < first) return null;
+    std.debug.assert(first >= 0);
+    std.debug.assert(last < layer_rows);
     return .{ @intCast(first), @intCast(last) };
 }
 

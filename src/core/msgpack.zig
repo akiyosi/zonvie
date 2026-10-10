@@ -262,6 +262,13 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32, budget: *Decode
         b0 == 0xcc or b0 == 0xcd or b0 == 0xce or b0 == 0xcf or
         b0 == 0xd0 or b0 == 0xd1 or b0 == 0xd2 or b0 == 0xd3)
     {
+        // A uint64 above i64 max has no Value.int form. Its bytes are already
+        // consumed, so yielding nil keeps the stream framed and leaves the
+        // mistyped field to the consumer's own type check.
+        if (b0 == 0xcf) {
+            const uv = try readIntBig(r, u64);
+            return if (uv > std.math.maxInt(i64)) .nil else .{ .int = @intCast(uv) };
+        }
         return .{ .int = try decodeInt(r, b0) };
     }
 
@@ -295,6 +302,23 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32, budget: *Decode
     }
 
     return error.UnsupportedType;
+}
+
+test "uint64 above i64 max decodes as nil and keeps the stream in sync" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // [2, "x", [0xffffffffffffffff]] followed by [2, "y", []].
+    const bytes = [_]u8{
+        0x93, 0x02, 0xa1, 'x', 0x91, 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x93, 0x02, 0xa1, 'y', 0x90,
+    };
+    var sr = SliceReader{ .data = &bytes };
+    const first = try decode(arena, &sr);
+    try std.testing.expect(first.arr[2].arr[0] == .nil);
+    const second = try decode(arena, &sr);
+    try std.testing.expectEqualStrings("y", second.arr[1].str);
+    try std.testing.expectEqual(bytes.len, sr.i);
 }
 
 pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {

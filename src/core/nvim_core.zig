@@ -7251,6 +7251,40 @@ test "redraw recovery rejects old epoch and admits fresh attach replay" {
     try std.testing.expectEqual(@as(u8, 1), core.redraw_recovery_attempts);
 }
 
+test "redraw post-processing waits for the notification that carries flush" {
+    // api-ui-events: Neovim may split one batch across notifications and the
+    // UI must not act on intermediate state; only a batch ending in flush counts.
+    const TestCtx = struct {
+        moves: u32 = 0,
+        last_win: i64 = 0,
+        fn onWinMove(opaque_ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
+            _ = grid_id;
+            _ = flags;
+            const ctx: *@This() = @ptrCast(@alignCast(opaque_ctx.?));
+            ctx.moves += 1;
+            ctx.last_win = win;
+        }
+    };
+    var test_ctx: TestCtx = .{};
+    var core = Core.init(std.testing.allocator, .{ .on_win_move = TestCtx.onWinMove }, &test_ctx);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 2);
+
+    var move_tuple = [_]mp.Value{ .{ .int = 1000 }, .{ .int = 2 }, .{ .int = 0 } };
+    var move_event = [_]mp.Value{ .{ .str = "win_move" }, .{ .arr = &move_tuple } };
+    var first_params = [_]mp.Value{.{ .arr = &move_event }};
+    var first = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &first_params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &first);
+    try std.testing.expectEqual(@as(u32, 0), test_ctx.moves);
+
+    var flush_event = [_]mp.Value{.{ .str = "flush" }};
+    var second_params = [_]mp.Value{.{ .arr = &flush_event }};
+    var second = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &second_params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &second);
+    try std.testing.expectEqual(@as(u32, 1), test_ctx.moves);
+    try std.testing.expectEqual(@as(i64, 1000), test_ctx.last_win);
+}
+
 test "dropped paths reach the server unescaped, for its own fnameescape" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -7354,7 +7388,8 @@ test "redraw post-processing failure poisons the attachment" {
         .height = 12,
     });
 
-    var params = [_]mp.Value{};
+    var flush_event = [_]mp.Value{.{ .str = "flush" }};
+    var params = [_]mp.Value{.{ .arr = &flush_event }};
     var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
     rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
 

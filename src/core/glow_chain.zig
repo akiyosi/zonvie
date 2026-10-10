@@ -110,6 +110,12 @@ pub fn plan(surface_w_px: u32, surface_h_px: u32, radius_scale: f32) Chain {
         };
     }
 
+    // A caller encodes down[0..levels] then up[0..levels]: the run must start
+    // and end in the extract texture.
+    std.debug.assert(levels >= 1);
+    std.debug.assert(levels <= mip_count);
+    std.debug.assert(down[0].src == extract_target);
+    std.debug.assert(up[levels - 1].dst == extract_target);
     return .{
         .half_w_px = half_w,
         .half_h_px = half_h,

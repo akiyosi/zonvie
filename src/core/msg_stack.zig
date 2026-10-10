@@ -35,6 +35,12 @@ test "replace_last replaces only the last message and keeps the rest" {
     try std.testing.expectEqual(Plan{ .action = .replace_last, .evict_oldest = 0 }, plan(3, true, false));
 }
 
+test "replace_last wins over append when both are set" {
+    // The UI spec does not order the two flags. noice.nvim (ui/msg.lua
+    // on_show) reads only replace_last, so a message with both replaces.
+    try std.testing.expectEqual(Plan{ .action = .replace_last, .evict_oldest = 0 }, plan(3, true, true));
+}
+
 test "replace_last on an empty stack pushes" {
     try std.testing.expectEqual(Plan{ .action = .push, .evict_oldest = 0 }, plan(0, true, false));
 }

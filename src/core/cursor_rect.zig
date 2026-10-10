@@ -75,6 +75,10 @@ pub fn inflateClip(r: Rect, clip_w: i32, clip_h: i32) ?IntRect {
     if (rt > clip_w) rt = clip_w;
     if (b > clip_h) b = clip_h;
     if (rt <= l or b <= t) return null;
+    std.debug.assert(l >= 0);
+    std.debug.assert(t >= 0);
+    std.debug.assert(rt <= clip_w);
+    std.debug.assert(b <= clip_h);
     return .{ .left = l, .top = t, .right = rt, .bottom = b };
 }
 

@@ -1738,117 +1738,121 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
 
-        // Handle tabline changes (ext_tabline)
-        const t_notify_tabline: i128 = if (log_on_notify) clock.nowNs() else 0;
-        self.notifyTablineChanges();
-        if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_tabline), 1000));
-            self.log.write("[perf] notify_tabline us={d}\n", .{dt});
-        }
-
-        var postprocess_error: ?anyerror = null;
-        postprocess: {
-            // Process pending ext_windows grid resizes (from win_resize events).
-            // win_resize is Neovim's request to the UI. The UI decides the actual
-            // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
-            for (self.grid.pending_grid_resizes.items) |resize| {
-                if (!self.known_external_grids.contains(resize.grid_id)) {
-                    // NEW grid: Use a reasonable initial size for new external windows.
-                    // Neovim's proposed size is based on terminal layout (e.g. height=2)
-                    // which is too small for an OS window. Use half the main window.
-                    const init_rows = @max(resize.height, self.grid.rows / 2);
-                    const init_cols = @max(resize.width, self.grid.cols / 2);
-                    self.requestTryResizeGridInternal(resize.grid_id, init_rows, init_cols) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-
-                    // Mark grid as pending initial resize. Window creation will be
-                    // deferred in notifyExternalWindowChanges until Neovim responds
-                    // with grid_resize matching the requested dimensions.
-                    self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
-                        .grid_id = resize.grid_id,
-                        .width = init_cols,
-                        .height = init_rows,
-                    }) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-                } else {
-                    // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
-                    // Honor the request by calling try_resize_grid with Neovim's values.
-                    self.requestTryResizeGridInternal(resize.grid_id, resize.height, resize.width) catch |err| {
-                        postprocess_error = err;
-                        break :postprocess;
-                    };
-                }
+        // A batch may span notifications and only the one ending in flush is
+        // a state the UI may act on. Pending state stays queued until then.
+        if (fctx.saw_flush) {
+            // Handle tabline changes (ext_tabline)
+            const t_notify_tabline: i128 = if (log_on_notify) clock.nowNs() else 0;
+            self.notifyTablineChanges();
+            if (log_on_notify) {
+                const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_tabline), 1000));
+                self.log.write("[perf] notify_tabline us={d}\n", .{dt});
             }
-            self.grid.pending_grid_resizes.clearRetainingCapacity();
 
-            // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
-            // Grid 1 normally echoes a size the frontend asked for through
-            // updateLayoutPx. Any requested size still awaiting its answer
-            // counts, not only the latest: a late answer to an older request
-            // is not Neovim's own resize. Anything else is, so ask the frontend
-            // to resize its window to match.
-            if (self.grid.pending_main_grid_size) |sz| {
-                self.grid.pending_main_grid_size = null;
-                const answers_request = self.requested_main_sizes.consumeAnswer(sz.rows, sz.cols);
-                if (!answers_request and
-                    self.last_layout_rows != 0 and self.last_layout_cols != 0 and
-                    (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
-                {
-                    if (self.cb.on_main_grid_size) |cb| {
-                        // last_layout_* is deliberately NOT updated here. The main
-                        // grid's NDC viewport is derived from the drawable, so the
-                        // vertices Neovim just triggered cover only the cells that
-                        // fit the OLD window. Letting the post-resize
-                        // updateLayoutPx run its normal try_resize round trip makes
-                        // Neovim repaint once the drawable actually matches.
-                        self.log.write(
-                            "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
-                            .{ sz.rows, sz.cols },
-                        );
-                        cb(self.ctx, sz.rows, sz.cols);
+            var postprocess_error: ?anyerror = null;
+            postprocess: {
+                // Process pending ext_windows grid resizes (from win_resize events).
+                // win_resize is Neovim's request to the UI. The UI decides the actual
+                // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
+                for (self.grid.pending_grid_resizes.items) |resize| {
+                    if (!self.known_external_grids.contains(resize.grid_id)) {
+                        // NEW grid: Use a reasonable initial size for new external windows.
+                        // Neovim's proposed size is based on terminal layout (e.g. height=2)
+                        // which is too small for an OS window. Use half the main window.
+                        const init_rows = @max(resize.height, self.grid.rows / 2);
+                        const init_cols = @max(resize.width, self.grid.cols / 2);
+                        self.requestTryResizeGridInternal(resize.grid_id, init_rows, init_cols) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+
+                        // Mark grid as pending initial resize. Window creation will be
+                        // deferred in notifyExternalWindowChanges until Neovim responds
+                        // with grid_resize matching the requested dimensions.
+                        self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
+                            .grid_id = resize.grid_id,
+                            .width = init_cols,
+                            .height = init_rows,
+                        }) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                    } else {
+                        // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
+                        // Honor the request by calling try_resize_grid with Neovim's values.
+                        self.requestTryResizeGridInternal(resize.grid_id, resize.height, resize.width) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
                     }
                 }
-            }
+                self.grid.pending_grid_resizes.clearRetainingCapacity();
 
-            // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
-            // These are deferred to the end of the redraw batch (not immediate) because they
-            // depend on grid state that may be updated earlier in the same batch.
-            // The frontend callbacks run synchronously here on the core thread.
-            for (self.grid.pending_win_ops.items) |op| {
-                switch (op.op) {
-                    .move => {
-                        if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
-                    },
-                    .exchange => {
-                        if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
-                    },
-                    .rotate => {
-                        if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
-                    },
-                    .resize_equal => {
-                        if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
-                    },
+                // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+                // Grid 1 normally echoes a size the frontend asked for through
+                // updateLayoutPx. Any requested size still awaiting its answer
+                // counts, not only the latest: a late answer to an older request
+                // is not Neovim's own resize. Anything else is, so ask the frontend
+                // to resize its window to match.
+                if (self.grid.pending_main_grid_size) |sz| {
+                    self.grid.pending_main_grid_size = null;
+                    const answers_request = self.requested_main_sizes.consumeAnswer(sz.rows, sz.cols);
+                    if (!answers_request and
+                        self.last_layout_rows != 0 and self.last_layout_cols != 0 and
+                        (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
+                    {
+                        if (self.cb.on_main_grid_size) |cb| {
+                            // last_layout_* is deliberately NOT updated here. The main
+                            // grid's NDC viewport is derived from the drawable, so the
+                            // vertices Neovim just triggered cover only the cells that
+                            // fit the OLD window. Letting the post-resize
+                            // updateLayoutPx run its normal try_resize round trip makes
+                            // Neovim repaint once the drawable actually matches.
+                            self.log.write(
+                                "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
+                                .{ sz.rows, sz.cols },
+                            );
+                            cb(self.ctx, sz.rows, sz.cols);
+                        }
+                    }
                 }
+
+                // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
+                // These are deferred to the end of the redraw batch (not immediate) because they
+                // depend on grid state that may be updated earlier in the same batch.
+                // The frontend callbacks run synchronously here on the core thread.
+                for (self.grid.pending_win_ops.items) |op| {
+                    switch (op.op) {
+                        .move => {
+                            if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
+                        },
+                        .exchange => {
+                            if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
+                        },
+                        .rotate => {
+                            if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
+                        },
+                        .resize_equal => {
+                            if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
+                        },
+                    }
+                }
+                self.grid.pending_win_ops.clearRetainingCapacity();
             }
-            self.grid.pending_win_ops.clearRetainingCapacity();
-        }
 
-        if (postprocess_error) |reason| {
-            self.log.write("redraw post-processing err: {any}\n", .{reason});
-            abandonRedrawBatch(self, reason);
-            return;
-        }
+            if (postprocess_error) |reason| {
+                self.log.write("redraw post-processing err: {any}\n", .{reason});
+                abandonRedrawBatch(self, reason);
+                return;
+            }
 
-        // Check IME off request (from mode_change event)
-        if (self.grid.ime_off_requested) {
-            self.grid.ime_off_requested = false;
-            if (self.msg_config.input.ime_disable_on_modechange) {
-                if (self.cb.on_ime_off) |cb| {
-                    cb(self.ctx);
+            // Check IME off request (from mode_change event)
+            if (self.grid.ime_off_requested) {
+                self.grid.ime_off_requested = false;
+                if (self.msg_config.input.ime_disable_on_modechange) {
+                    if (self.cb.on_ime_off) |cb| {
+                        cb(self.ctx);
+                    }
                 }
             }
         }

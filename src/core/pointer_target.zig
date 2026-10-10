@@ -177,6 +177,14 @@ test "the container grid loses to an actual window at the same zindex" {
     try testing.expectEqual(@as(i64, 2), resolve(Candidate, &grids, 1, 5, 5, false).?.grid_id);
 }
 
+test "the row and column just past a window's end are outside it" {
+    // Grid 2 covers rows 10..19 and columns 20..49.
+    const grids = [_]Candidate{ win(1, 0, 0, 40, 100), win(2, 10, 20, 10, 30) };
+    try testing.expectEqual(@as(i64, 1), resolve(Candidate, &grids, 1, 20, 25, false).?.grid_id);
+    try testing.expectEqual(@as(i64, 1), resolve(Candidate, &grids, 1, 15, 50, false).?.grid_id);
+    try testing.expectEqual(@as(i64, 2), resolve(Candidate, &grids, 1, 19, 49, false).?.grid_id);
+}
+
 test "a float that refuses the mouse is skipped, and does not shadow what is under it" {
     var f = float(5, 10, 20, 10, 30, 400);
     f.mouse_enabled = 0;

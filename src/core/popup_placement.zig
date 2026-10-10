@@ -102,6 +102,10 @@ test "flips above when the window has no room below, whatever the screen has" {
     try std.testing.expectEqual(@as(i32, -200), top(100, 20, 300, 400, -1000));
 }
 
+test "flips above when the popup's top lands exactly on the screen top" {
+    try std.testing.expectEqual(@as(i32, 0), top(200, 20, 200, 300, 0));
+}
+
 test "stays below when neither side fits" {
     // Above would start at -200, off the top of the screen at 0.
     try std.testing.expectEqual(@as(i32, 120), top(100, 20, 300, 400, 0));
