@@ -5879,10 +5879,6 @@ pub const Core = struct {
 
     // --- Forwarding stubs for flush.zig ---
 
-    pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
-        flush.sendExternalGridVertices(self, force_render);
-    }
-
     pub fn notifyCmdlineChanges(self: *Core) void {
         flush.notifyCmdlineChanges(self);
     }

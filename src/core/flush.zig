@@ -3401,7 +3401,7 @@ pub const FlushCtx = struct {
 
                 const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
                 if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
-                    sendExternalGridVertices(ctx.core, false);
+                    sendExternalGridVertices(ctx.core);
                 }
                 if (perf_enabled) {
                     const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
@@ -4788,7 +4788,6 @@ fn sendGridCursor(
 }
 
 /// Generate and send vertices for external grids.
-/// force_render: if true, render regardless of dirty flags
 ///
 /// WARNING: This function invokes frontend callbacks (on_vertices_row,
 /// on_cursor_grid_changed) while grid_mu is held. Frontend callbacks
@@ -4796,8 +4795,8 @@ fn sendGridCursor(
 /// this would cause deadlock. Use PostMessage (Windows) or
 /// DispatchQueue.main.async (macOS) to defer any work that requires
 /// grid state access.
-pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
-    self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d} force={}\n", .{ self.known_external_grids.count(), force_render });
+fn sendExternalGridVertices(self: *Core) void {
+    self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d}\n", .{self.known_external_grids.count()});
 
     // Cache glow state once — doesn't change while grid_mu is held.
     const ext_glow_enabled = self.glow_enabled.load(.acquire);
@@ -4881,26 +4880,8 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
     // The collector keeps the glyph of the cursor being drawn; whichever grid
     // draws it now refills this below.
     if (cursor_changed or self.force_ext_cursor_recheck) self.cursor_verts.clearRetainingCapacity();
-    const owns_vertex_budget_transaction = !self.vertex_budget_transaction_active;
-    if (owns_vertex_budget_transaction) {
-        beginVertexBudgetTransaction(self) catch |err| {
-            self.flush_aborted = true;
-            self.failHardRender(err);
-            return;
-        };
-    }
-    defer if (owns_vertex_budget_transaction) {
-        var commit = !self.flush_aborted and !self.flush_atlas_corrupted;
-        if (commit) {
-            validateCompletedVertexBudget(self) catch |err| {
-                self.flush_aborted = true;
-                self.failHardRender(err);
-                commit = false;
-            };
-        }
-        finishVertexBudgetTransaction(self, commit);
-        if (commit) self.grid.commitOwed() else self.grid.returnOwed();
-    };
+    // Called only inside onFlush's bracket, which settles the budget.
+    std.debug.assert(self.vertex_budget_transaction_active);
 
     // Reuse row_verts buffer for external grid vertices (per-row)
     var ext_verts = &self.row_verts;
@@ -4961,13 +4942,13 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         // Check if this grid needs forced redraw because cursor left closed cmdline
         const force_redraw_this = need_force_redraw_last and (grid_id == self.last_ext_cursor_grid);
 
-        self.log.write("[ext_cursor_check] grid_id={d} dirty={} cursor_on={} cursor_was={} affected={} moved_within={} force={} force_closed={} cursor_grid={d} last_grid={d} rev={d} last_rev={d}\n", .{
-            grid_id,     sg.dirty,                  cursor_on_this_grid, cursor_was_on_this_grid,  cursor_affected, cursor_moved_within, force_render, force_redraw_this,
+        self.log.write("[ext_cursor_check] grid_id={d} dirty={} cursor_on={} cursor_was={} affected={} moved_within={} force_closed={} cursor_grid={d} last_grid={d} rev={d} last_rev={d}\n", .{
+            grid_id,     sg.dirty,                  cursor_on_this_grid, cursor_was_on_this_grid,  cursor_affected, cursor_moved_within, force_redraw_this,
             cursor_grid, self.last_ext_cursor_grid, cursor_rev,          self.last_ext_cursor_rev,
         });
 
         // cursor_moved_within is a subset of cursor_affected.
-        if (!force_render and !force_redraw_this and !sg.dirty and !cursor_affected) continue;
+        if (!force_redraw_this and !sg.dirty and !cursor_affected) continue;
 
         // Counters only: the hl validity table is this whole pass's.
         var hl_cache_hits: u32 = 0;
@@ -4975,7 +4956,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
 
         // Full redraw only for forced operations, not cursor-only changes.
         // Cursor rows are handled via dirty_rows marking below.
-        const need_full_redraw = force_render or force_redraw_this;
+        const need_full_redraw = force_redraw_this;
 
         const viewport_cols = sg.cols;
         const viewport_rows = sg.rows;
@@ -10015,6 +9996,7 @@ test "external anchored float keeps its own viewport margin flags" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 5);
     try core.grid.resizeGrid(2, 1, 5);
     try core.grid.putSyntheticExternal(2, .{
         .win = 42,
@@ -10024,6 +10006,8 @@ test "external anchored float keeps its own viewport margin flags" {
     try core.grid.resizeGrid(3, 1, 3);
     try core.grid.setWinFloatPos(3, 43, 0, 1, 10, 0, 2, true);
     try core.grid.setViewportMargins(3, 0, 0, 1, 1);
+    core.drawable_w_px = 5;
+    core.drawable_h_px = 1;
     core.cell_w_px = 1;
     core.cell_h_px = 1;
     core.grid.cursor_visible = false;
@@ -10031,7 +10015,8 @@ test "external anchored float keeps its own viewport margin flags" {
     var state = State{};
     core.ctx = &state;
     core.cb.on_vertices_row = State.onRow;
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 5);
 
     try std.testing.expectEqual(@as(usize, 12), state.fixed_vertices);
     try std.testing.expectEqual(@as(usize, 6), state.scrollable_vertices);
@@ -10164,12 +10149,13 @@ test "external scroll without row-shift callback regenerates every retained row"
     try std.testing.expect(core.cb.on_grid_row_scroll == null);
 
     // Seed the retained external surface, then isolate the scroll update.
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 2);
     try std.testing.expectEqual(@as(u32, 4), state.row_calls);
     state = .{};
 
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
-    core.sendExternalGridVertices(false);
+    try flush_ctx.onFlush(4, 2);
     try std.testing.expectEqual(@as(u32, 4), state.row_calls);
     try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
 
@@ -10180,7 +10166,7 @@ test "external scroll without row-shift callback regenerates every retained row"
     try core.grid.resizeGrid(3, 1, 1);
     try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2, true);
     core.cb.on_grid_row_scroll = State.onRowScroll;
-    core.sendExternalGridVertices(true);
+    try flush_ctx.onFlush(4, 2);
     state = .{};
 
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
@@ -10203,14 +10189,13 @@ test "an external scroll whose shift was never sent regenerates every row" {
             total_rows: u32,
             total_cols: u32,
         ) callconv(.c) void {
-            _ = grid_id;
             _ = row_start;
             _ = row_count;
             _ = verts;
             _ = vert_count;
-            _ = flags;
             _ = total_rows;
             _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.row_calls += 1;
         }
@@ -10254,15 +10239,19 @@ test "an external scroll whose shift was never sent regenerates every row" {
     core.ctx = &state;
     core.cb.on_vertices_row = State.onRow;
     core.cb.on_grid_row_scroll = State.onRowScroll;
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 2);
     state = .{};
 
     // A scroll the frontend was never told about (no dispatchGridRowScroll):
     // its retained rows are where they were, so sending only the vacated row
     // would leave the rest a row out. The pass decided eligibility by
     // re-deriving the dispatch's conditions, not by whether it ran.
+    // Clearing the pending bit keeps the flush's dispatch from running while
+    // every condition it checks still holds.
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
-    core.sendExternalGridVertices(false);
+    core.grid.sub_grids.getPtr(2).?.row_scroll_notify_pending = false;
+    try flush_ctx.onFlush(4, 2);
     try std.testing.expectEqual(@as(u32, 4), state.row_calls);
 }
 
@@ -11704,7 +11693,8 @@ test "an atlas reset in the external pass stops sending rows the cancelled commi
     core.cb.on_atlas_upload = State.upload;
     core.cb.on_atlas_create = State.create;
 
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 1);
 
     // The commit is cancelled either way; everything the grid sends after the
     // reset — a restarted row loop, rows cleared to empty — is discarded.
@@ -14021,6 +14011,7 @@ test "an external grid and its anchored float glow per cell" {
 
             // Four columns so the float can sit beside the grid's own cells
             // rather than covering them.
+            try core.grid.resizeGrid(1, 1, 4);
             try core.grid.resizeGrid(2, 1, 4);
             try core.grid.putSyntheticExternal(2, .{ .win = 42, .start_row = 0, .start_col = 0 });
             core.grid.putCellGrid(2, 0, 0, 'G', 42);
@@ -14033,6 +14024,8 @@ test "an external grid and its anchored float glow per cell" {
             core.grid.putCellGrid(3, 0, 1, 'N', 7);
 
             core.grid.cursor_visible = false;
+            core.drawable_w_px = 4;
+            core.drawable_h_px = 1;
             core.cell_w_px = 1;
             core.cell_h_px = 1;
             try armGlowForTest(&core, glow_all);
@@ -14042,7 +14035,8 @@ test "an external grid and its anchored float glow per cell" {
             core.cb.on_vertices_row = GlowCounter.onRow;
             StubGlyphCallbacks.install(&core);
 
-            core.sendExternalGridVertices(true);
+            var flush_ctx = FlushCtx{ .core = &core };
+            try flush_ctx.onFlush(1, 4);
             return counter;
         }
     };
@@ -14252,19 +14246,23 @@ test "the external-grid cursor background uses the same corner order" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
     try core.grid.resizeGrid(2, 2, 2);
     core.grid.putCell(0, 0, 'B', 0);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
     core.grid.setCursor(2, 0, 0);
     // Non-square cell, as in the main-grid test: the corner pattern alone
     // cannot tell a transposed width/height argument from the right one.
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 4;
     core.cell_w_px = 4;
     core.cell_h_px = 2;
     var state = State{};
     core.ctx = &state;
     core.cb.on_vertices_row = State.onRow;
 
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
     try std.testing.expect(state.count >= 6);
 
     try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(&state.cursor));
@@ -14317,12 +14315,15 @@ test "the external-grid cursor glyph uses the same corner order as every other q
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
     try core.grid.resizeGrid(2, 2, 2);
     // The cell under the cursor must be in grid 2, not the main grid, or there
     // is no glyph to draw and only the background quad is emitted.
     core.grid.putCellGrid(2, 0, 0, 'B', 0);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
     core.grid.setCursor(2, 0, 0);
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 4;
     core.cell_w_px = 4;
     core.cell_h_px = 2;
 
@@ -14332,7 +14333,8 @@ test "the external-grid cursor glyph uses the same corner order as every other q
     // The glyph quad is only emitted once a glyph entry exists for the cell.
     StubGlyphCallbacks.install(&core);
 
-    core.sendExternalGridVertices(true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
 
     // Background quad first, then the glyph quad on top of it.
     try std.testing.expect(state.count >= 12);
@@ -16728,6 +16730,8 @@ test "a layer's cursor glyph is mirrored into cursor_verts for the atlas collect
     defer core.deinitForTest();
     core.cell_w_px = 8;
     core.cell_h_px = 16;
+    core.drawable_w_px = 64;
+    core.drawable_h_px = 64;
     try core.grid.resize(4, 8);
     try core.grid.resizeGrid(2, 2, 4);
     try core.grid.setWinPos(2, 101, 1, 1);
@@ -16742,13 +16746,15 @@ test "a layer's cursor glyph is mirrored into cursor_verts for the atlas collect
     core.grid.cursor_valid = true;
     core.grid.cursor_visible = true;
     core.grid.cursor_shape = .block;
+    core.grid.cursor_rev +%= 1;
 
     var state = State{};
     core.ctx = &state;
     core.cb.on_vertices_row = State.onRow;
     core.cb.on_atlas_ensure_glyph = State.onEnsureGlyph;
 
-    sendExternalGridVertices(&core, true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 8);
 
     try std.testing.expectEqual(@as(u32, 1), state.cursor_sends);
     // The glyph really made it into the dispatched cursor payload.
@@ -16827,6 +16833,8 @@ test "a layer's combining tail is read at the cell that owns it, not at the wind
     defer core.deinitForTest();
     core.cell_w_px = 8;
     core.cell_h_px = 16;
+    core.drawable_w_px = 160;
+    core.drawable_h_px = 160;
     try core.grid.resize(10, 20);
     try core.grid.resizeGrid(2, 4, 8);
     // Both offsets non-zero: the old screen-position subtraction moved the
@@ -16846,7 +16854,8 @@ test "a layer's combining tail is read at the cell that owns it, not at the wind
     core.cb.on_atlas_create = State.create;
     try core.initGlyphCache();
 
-    sendExternalGridVertices(&core, true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
 
     // Only the row holding the cluster has ink, so it is the only shaped run.
     try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
