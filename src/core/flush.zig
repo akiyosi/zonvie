@@ -17763,6 +17763,82 @@ test "a grid resized in the batch it scrolls gets no row shift" {
     try std.testing.expectEqual(@as(u32, 30), probe.rowsFor(2));
 }
 
+/// Forwards to `backing` and counts every call that can obtain heap memory.
+const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    allocs: u32 = 0,
+    grows: u32 = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.backing.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > mem.len) self.grows += 1;
+        return self.backing.rawResize(mem, a, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > mem.len) self.grows += 1;
+        return self.backing.rawRemap(mem, a, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(mem, a, ra);
+    }
+
+    fn heapCalls(self: *const CountingAllocator) u32 {
+        return self.allocs + self.grows;
+    }
+};
+
+// CLAUDE.md: no heap work on per-frame or per-cell paths. Once a shape has been
+// flushed, redrawing rows of that shape (content edits, cursor moves, row
+// scrolls) must reuse retained capacity.
+test "a steady-state flush performs no heap allocation" {
+    var counting = CountingAllocator{ .backing = std.testing.allocator };
+    var core = Core.initForTest(counting.allocator());
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    core.grid.cursor_visible = true;
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    const Edit = struct {
+        fn apply(c: *Core, i: u32) void {
+            for (2..4) |gid| {
+                for (0..24) |r| c.grid.putCellGrid(@intCast(gid), @intCast(r), i % 8, 'a' + (i + @as(u32, @intCast(r))) % 26, 0);
+            }
+            c.grid.putCellGrid(1, i % 24, i % 80, 'm', 0);
+            c.grid.setCursor(2 + @as(i64, i % 2), i % 24, i % 40);
+            c.grid.scrollGrid(2 + @as(i64, i % 2), 0, 24, 0, 40, if (i % 2 == 0) 1 else -1, 0);
+        }
+    };
+
+    // Warm-up: every glyph, row and scroll shape is seen at least once.
+    var i: u32 = 0;
+    while (i < 64) : (i += 1) {
+        Edit.apply(&core, i);
+        try flush_ctx.onFlush(24, 80);
+    }
+
+    const before = counting.heapCalls();
+    while (i < 128) : (i += 1) {
+        Edit.apply(&core, i);
+        probe.reset();
+        try flush_ctx.onFlush(24, 80);
+        // Non-vacuous: each measured flush sent row content.
+        try std.testing.expect(probe.totalRows() > 0);
+    }
+    try std.testing.expectEqual(before, counting.heapCalls());
+}
+
 /// A frontend that keeps per-row content (a hash of each row's vertices) and
 /// applies a flush's transactional callbacks only when its on_flush_end is
 /// accepted, the way both frontends stage a write set and promote it at commit.

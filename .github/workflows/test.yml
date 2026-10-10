@@ -66,6 +66,20 @@ jobs:
         run: zig build test
         timeout-minutes: 20
 
+  # Releases ship ReleaseFast, where a failed assert is undefined behaviour
+  # rather than a panic. ReleaseSafe keeps the asserts and runs the optimized
+  # code paths.
+  unit-tests-release-safe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Unit Tests (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+        timeout-minutes: 30
+
   # The font tests exercise each platform's real shaper: HarfBuzz/FreeType and
   # the Swift font helpers on macOS, DirectWrite on Windows. The ligature
   # fonts are installed at pinned versions, and ZONVIE_REQUIRE_TEST_FONTS turns
