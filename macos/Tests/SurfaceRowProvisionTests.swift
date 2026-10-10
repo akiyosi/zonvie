@@ -737,7 +737,25 @@ private enum SurfaceRowProvisionTests {
         _ = device
     }
 
+    /// The write set a flush fills must be neither the committed set nor one
+    /// the GPU is reading; with none such, the flush must be refused (-1).
+    private static func verifyFreeSetPickAvoidsCommittedAndInFlight() {
+        for committed in -1..<3 {
+            for mask in 0..<8 {
+                let inFlight = (0..<3).map { (mask >> $0) & 1 == 1 ? 1 : 0 }
+                let free = (0..<3).filter { $0 != committed && inFlight[$0] == 0 }
+                let picked = pickFreeBufferSetIndex(count: 3, committedIndex: committed, gpuInFlightCount: inFlight)
+                if free.isEmpty {
+                    require(picked == -1, "pick with no free set committed=\(committed) inFlight=\(inFlight) gave \(picked)")
+                } else {
+                    require(free.contains(picked), "pick committed=\(committed) inFlight=\(inFlight) gave \(picked)")
+                }
+            }
+        }
+    }
+
     static func main() {
+        verifyFreeSetPickAvoidsCommittedAndInFlight()
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
             exit(1)

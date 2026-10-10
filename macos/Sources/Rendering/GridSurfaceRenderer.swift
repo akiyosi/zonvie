@@ -2743,6 +2743,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             committedSetIndex = writeSetIndex
         }
         if didCursorWrite {
+            assert(cursorWriteSetIndex != committedCursorSetIndex, "flush wrote into the committed cursor slot")
+            assert(cursorGpuInFlightCount[cursorWriteSetIndex] == 0, "flush wrote into a cursor slot the GPU is reading")
             committedCursorSetIndex = cursorWriteSetIndex
         }
         // Layers and the vertices they place become visible together.

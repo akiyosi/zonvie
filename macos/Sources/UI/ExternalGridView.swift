@@ -1193,6 +1193,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // belongs to. A bracket that wrote none leaves the published slot
             // where it is — nothing about a row rotation ages the cursor.
             if cursorWriteSetIndex != -1 {
+                assert(cursorWriteSetIndex != committedCursorSetIndex, "flush wrote into the committed cursor slot")
+                assert(cursorGpuInFlightCount[cursorWriteSetIndex] == 0, "flush wrote into a cursor slot the GPU is reading")
                 committedCursorSetIndex = cursorWriteSetIndex
                 cursorWriteSetIndex = -1
             }

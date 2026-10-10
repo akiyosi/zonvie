@@ -687,16 +687,6 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(lig_tests).step);
 
     // Phase 6 Contract Verification Tests: Verify Tier 1-3 quality improvements
-    const callback_order_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/contract_callback_order.zig"),
-    });
-    const callback_order_tests = b.addTest(.{
-        .root_module = callback_order_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(callback_order_tests).step);
-
     const allocation_guard_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,

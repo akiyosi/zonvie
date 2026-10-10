@@ -181,6 +181,12 @@ pub const GetAsciiTableFn = *const fn (
 pub const VERT_UPDATE_MAIN: u32 = 1 << 0;
 pub const VERT_UPDATE_CURSOR: u32 = 1 << 1;
 
+/// zonvie_core_send_key_event mods bits.
+pub const MOD_CTRL: u32 = 1 << 0;
+pub const MOD_ALT: u32 = 1 << 1;
+pub const MOD_SHIFT: u32 = 1 << 2;
+pub const MOD_SUPER: u32 = 1 << 3;
+
 pub const OnVerticesRowFn = *const fn (
     ctx: ?*anyopaque,
     grid_id: i64,
@@ -3421,9 +3427,9 @@ pub export fn zonvie_core_retry_flush(p: ?*zonvie_core) callconv(.c) void {
 // normal redraw, and only then execute the retry without an unlock/relock race.
 //
 // MUST NOT be called from inside a flush bracket (on_flush_begin/on_flush_end)
-// even though those also run with grid_mu held: the nested onFlush trips
-// beginVertexBudgetTransaction's already-active guard, which is classified as a
-// hard render failure and terminates the nvim child with unsaved buffers.
+// even though those also run with grid_mu held: the nested onFlush trips the
+// debug assert that no budget transaction is active, and in ReleaseFast it
+// closes the outer transaction, leaving the outer ledgers unsettled.
 pub export fn zonvie_core_retry_flush_locked(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

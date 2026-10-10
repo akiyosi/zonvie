@@ -205,7 +205,8 @@ typedef void (*zonvie_on_vertices_row_fn)(
    on_vertices_row, so the consumer MUST apply the shift: rows_delta may be any
    value up to half the region's height (same-region scrolls in one batch are
    summed), and a consumer that cannot apply it must request a full resend
-   (zonvie_core_force_resend) rather than ignore the call.
+   (zonvie_core_force_resend_locked: this callback runs with grid_mu held)
+   rather than ignore the call.
    The region is always full width; a partial-width scroll, two different
    regions in one batch, or a shift past half the region is refused here and
    the grid is regenerated instead.
@@ -1924,7 +1925,9 @@ ZONVIE_API void zonvie_core_retry_flush(zonvie_core *core);
    grid_mu via zonvie_core_lock_grid. This allows a frontend retry timer to
    acquire grid_mu, revalidate that its retry generation is still current,
    and execute the flush without reopening a race against a normal redraw.
-   The caller must release grid_mu with zonvie_core_unlock_grid afterward. */
+   The caller must release grid_mu with zonvie_core_unlock_grid afterward.
+   MUST NOT be called from any callback inside on_flush_begin/on_flush_end:
+   the nested flush would close the outer one's vertex budget transaction. */
 ZONVIE_API void zonvie_core_retry_flush_locked(zonvie_core *core);
 
 /* Force every grid to be treated as dirty on the next flush attempt.

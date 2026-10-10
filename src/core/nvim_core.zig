@@ -4069,12 +4069,17 @@ pub const Core = struct {
             return true;
         }
 
-        /// The "C-M-S-D-" prefix of the mods bitmask:
-        /// 1<<0 Ctrl, 1<<1 Alt/Meta, 1<<2 Shift, 1<<3 Super(Command).
+        /// The "C-M-S-D-" prefix of the mods bitmask.
         fn mods(self: *KeyOut, m: u32) bool {
-            for ("CMSD", 0..) |letter, bit| {
-                if (m & (@as(u32, 1) << @intCast(bit)) == 0) continue;
-                if (!self.byte(letter) or !self.byte('-')) return false;
+            const order = [_]struct { bit: u32, letter: u8 }{
+                .{ .bit = c_api.MOD_CTRL, .letter = 'C' },
+                .{ .bit = c_api.MOD_ALT, .letter = 'M' },
+                .{ .bit = c_api.MOD_SHIFT, .letter = 'S' },
+                .{ .bit = c_api.MOD_SUPER, .letter = 'D' },
+            };
+            for (order) |o| {
+                if (m & o.bit == 0) continue;
+                if (!self.byte(o.letter) or !self.byte('-')) return false;
             }
             return true;
         }
@@ -4219,7 +4224,7 @@ pub const Core = struct {
         }
 
         // 2) For modified keys (Ctrl/Alt/Super), use charsIgnoringModifiers when it is a single codepoint.
-        const has_mod = (mods & ((1 << 0) | (1 << 1) | (1 << 3))) != 0;
+        const has_mod = (mods & (c_api.MOD_CTRL | c_api.MOD_ALT | c_api.MOD_SUPER)) != 0;
         if (has_mod) {
             const base_cp = firstCodepointUtf8(ign) orelse firstCodepointUtf8(chars) orelse return null;
 
@@ -7911,6 +7916,50 @@ test "atlas reclamation counts a frontend-owned surface like any other grid" {
     // The shelf the surface draws from survives; the other goes.
     try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
     try std.testing.expect(core.atlas_packer.?.shelves[1].recycled);
+}
+
+test "atlas reclamation drops every cached glyph on a reclaimed shelf and keeps the rest" {
+    // A reclaimed shelf is about to hold other glyphs; a cache entry still
+    // naming it would be a permanent hit drawing whatever lands there next.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, true);
+
+    const onShelf = struct {
+        fn entry(c: *Core, shelf: u32) c_api.GlyphEntry {
+            const uv = shelfUvY(c, shelf);
+            return .{
+                .uv_min = .{ 0, uv },
+                .uv_max = .{ 0.5, uv },
+                .bbox_origin_px = .{ 0, 0 },
+                .bbox_size_px = .{ 4, 1 },
+                .advance_px = 4,
+                .ascent_px = 1,
+                .descent_px = 0,
+            };
+        }
+    };
+    // Slot 0 of each cache on the live shelf, slot 1 on a dead one.
+    for ([_]u32{ 0, 1 }) |slot| {
+        core.glyph_cache_ascii.?[slot] = onShelf.entry(&core, slot);
+        core.glyph_valid_ascii.?[slot] = true;
+        core.glyph_cache_non_ascii.?[slot] = onShelf.entry(&core, slot);
+        core.glyph_keys_non_ascii.?[slot] = 0x1000 + slot;
+        core.glyph_cache_by_id.?[slot] = onShelf.entry(&core, slot);
+        core.glyph_keys_by_id.?[slot] = 0x2000 + slot;
+    }
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+
+    try std.testing.expect(core.glyph_valid_ascii.?[0]);
+    try std.testing.expect(!core.glyph_valid_ascii.?[1]);
+    try std.testing.expectEqual(@as(u64, 0x1000), core.glyph_keys_non_ascii.?[0]);
+    try std.testing.expectEqual(GLYPH_CACHE_INVALID_KEY, core.glyph_keys_non_ascii.?[1]);
+    try std.testing.expectEqual(@as(u64, 0x2000), core.glyph_keys_by_id.?[0]);
+    try std.testing.expectEqual(GLYPH_CACHE_INVALID_KEY, core.glyph_keys_by_id.?[1]);
 }
 
 test "atlas reclamation stands down for a surface row it cannot read" {
