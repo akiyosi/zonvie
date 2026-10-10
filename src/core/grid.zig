@@ -2628,6 +2628,18 @@ pub const Grid = struct {
         // on_grid_scroll for a grid that no longer exists.
         self.consumeScrolledGridNotification(grid_id);
         self.clearOverflowForGrid(grid_id);
+        // Neovim sends no win_float_pos for a float anchored to a closed
+        // float (window.c win_close skips win_comp_pos for it) and keeps it
+        // where it was. GridPos is already in the surface's cells, so naming
+        // the surface keeps the float in place; it follows no parent scroll.
+        if (self.surfaceForGrid(grid_id)) |surface| {
+            var it = self.win_pos.valueIterator();
+            while (it.next()) |p| {
+                if (p.anchor_grid != grid_id) continue;
+                p.anchor_grid = surface;
+                p.follows_scroll = false;
+            }
+        }
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
@@ -5042,6 +5054,28 @@ test "destroying an external grid owes the main viewport no repaint" {
     grid.main_buf.dirty_all = false;
     try grid.destroyGrid(3);
     try std.testing.expect(!grid.main_buf.dirty_all);
+}
+
+test "a float whose float anchor closes stays where it was on the anchor's surface" {
+    // Closing a floating window skips win_comp_pos (window.c win_close,
+    // `if (!was_floating)`), so Neovim sends no win_float_pos for a float
+    // anchored to it and keeps drawing it where it was. Its anchor_grid must
+    // not keep naming the destroyed grid, or the chain stops resolving.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 6, 20);
+    try grid.setWinFloatPos(2, 42, 3, 4, 50, 0, 1, true);
+    try grid.resizeGrid(5, 2, 8);
+    try grid.setWinFloatPos(5, 45, 4, 6, 60, 0, 2, true);
+
+    try grid.destroyGrid(2);
+
+    try std.testing.expectEqual(@as(?i64, 1), grid.surfaceForGrid(5));
+    const p = grid.win_pos.get(5).?;
+    try std.testing.expectEqual(@as(i64, 1), p.anchor_grid);
+    try std.testing.expectEqual(@as(u32, 4), p.row);
+    try std.testing.expectEqual(@as(u32, 6), p.col);
 }
 
 test "a float in an external window turned split owes no root rows anywhere" {

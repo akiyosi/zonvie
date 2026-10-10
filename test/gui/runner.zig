@@ -436,6 +436,10 @@ test "gui:extwin_float_follows_externalized_anchor" {
     try gated(true, @import("scenarios/common/extwin_float_follows_externalized_anchor.zig"));
 }
 
+test "gui:float_survives_closed_float_anchor" {
+    try gated(true, @import("scenarios/common/float_survives_closed_float_anchor.zig"));
+}
+
 test "gui:extwin_float_wheel_scroll" {
     // Windows only: the external-window wheel path and the HWND-addressed
     // notch this uses live in the Windows frontend and windows_window.zig.
