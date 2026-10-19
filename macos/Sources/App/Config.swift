@@ -11,6 +11,7 @@ struct ZonvieConfig {
     var messages: MessagesConfig = MessagesConfig()
     var tabline: TablineConfig = TablineConfig()
     var windows: WindowsConfig = WindowsConfig()
+    var floats: FloatsConfig = FloatsConfig()
     var log: LogConfig = LogConfig()
     var performance: PerformanceConfig = PerformanceConfig()
     var ime: IMEConfig = IMEConfig()
@@ -198,6 +199,11 @@ struct ZonvieConfig {
         var preserveAlpha: Bool = false
     }
 
+    struct FloatsConfig {
+        /// Curl a float back around the cursor when it hides the cursor.
+        var peel: Bool = false
+    }
+
     struct InputConfig {
         /// Swap the `:` and `;` keys on single keypresses (paste/IME unaffected).
         var swapColonSemicolon: Bool = false
@@ -329,6 +335,7 @@ struct ZonvieConfig {
         config.shaders.enabled = v.shader_enabled
         config.shaders.postProcess = ShaderPostProcess(rawValue: v.shader_post_process) ?? .afterBloom
         config.shaders.preserveAlpha = v.shader_preserve_alpha
+        config.floats.peel = v.float_peel
         let shaderCount = zonvie_config_get_shader_count(handle)
         if shaderCount > 0 {
             config.shaders.paths.reserveCapacity(Int(shaderCount))

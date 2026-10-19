@@ -2906,6 +2906,10 @@ fn drawMainRowFrame(
             .cursor_rows = cursor.erase_rows,
         },
         .ease = app_mod.LayerEaseInput.of(app),
+        .float_peel = if (app.config.floats.peel) .{
+            .cursor_box = core.cursor_rect.bounds(core.Vertex, cursor.verts, cursor.layer_origin[0], cursor.layer_origin[1]),
+            .cell_h_px = @intCast(@max(1, row_draw_params.row_h_px)),
+        } else null,
         .frame = .{
             .root_grid_id = 1,
             .layers = &.{},
@@ -5097,6 +5101,7 @@ pub export fn WndProc(
                     // pipelines, current client size, and current atlas size
                     // must all belong to the same renderer generation.
                     r.loadCustomShaderPipelines(&app.config);
+                    if (app.config.floats.peel) _ = r.prepareFloatPeel();
                     if (carried_shader) |s| {
                         r.custom_shader_start_qpc = s.start_qpc;
                         r.custom_shader_last_qpc = s.last_qpc;
@@ -5646,6 +5651,7 @@ pub export fn WndProc(
                 if (app.renderer) |*r| {
                     r.loadCustomShaderPipelines(&app.config);
                     syncShaderInputsEnabled(app);
+                    if (app.config.floats.peel) _ = r.prepareFloatPeel();
                     if (r.any_custom_shader_needs_animation) {
                         // Kick continuous-redraw ticker. Runs ~60Hz until
                         // the renderer (or a future config reload) tells
@@ -5853,6 +5859,7 @@ pub export fn WndProc(
                 // is the follow-up deferred when the external path was fixed --
                 // and that fix measured the cost on 0.12.2, a middle press
                 // over a float pasting destructively into the buffer behind it.
+                if (app.config.floats.peel) input.noteFloatPeelPress(app, hwnd, &app.surf, true, @as(i32, x), @as(i32, y));
                 const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
                 input.pressEditorButton(app, hwnd, msg, wParam, target);
                 return input.mouseButtonResult(msg);

@@ -477,6 +477,16 @@ pub fn resolveSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root
     );
 }
 
+/// Hand a press to a surface's float peel: one on the curled float puts it
+/// back. The press itself still goes to whatever it landed on.
+pub fn noteFloatPeelPress(app: *App, hwnd: c.HWND, surf: *app_mod.WindowSurface, is_main_window: bool, x: i32, y: i32) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const origin = surfaceOriginPx(app, is_main_window);
+    app.mu.unlock(core.clock.io());
+    surf.paint.float_peel_press = .{ @floatFromInt(x - origin.x), @floatFromInt(y - origin.y) };
+    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+}
+
 /// The drag/release counterpart: pin to the grid the press chose rather than
 /// hit-testing again, so a selection dragged out of a float does not retarget
 /// the moment the pointer leaves it.

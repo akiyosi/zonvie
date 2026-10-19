@@ -2170,6 +2170,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Per-frame snapshot taken under `lock`, reused across frames. Entry 0 is
     /// this surface's root grid, which every draw loop below skips.
     private var layerSnapshot: [SurfaceLayerFrame] = []
+
+    private let floatPeel = SurfaceFloatPeel()
+
+    /// Hand a mouse press to the float peel: one on the peeled float puts it
+    /// back. Main thread.
+    func noteFloatPeelPress(atPx p: CGPoint) {
+        lock.lock()
+        floatPeel.press = [Float(p.x), Float(p.y)]
+        lock.unlock()
+    }
     /// This frame's damage bands. Draw thread only.
     private let damageBands = SurfaceDamageBands()
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
@@ -3653,6 +3663,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
+            if plan.encodesSurfacePass && f.peel.grid_id != 0 {
+                encodeFloatPeel(&f, cmd: cmd, backTex: backTex)
+            }
+
             // --- Post-process bloom (neon glow) ---
             // Shared with ExternalGridView; only where the intensity and the
             // radius are read from differs.
@@ -3921,19 +3935,23 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 state: state
             ))
         }
+        if ZonvieConfig.shared.floats.peel {
+            updateFloatPeel(&f, cursor: cursorShaderRawSnapshot)
+        }
         // Taken under `lock` with the layer list and per-layer buffer sets:
         // the core thread replaces both while this frame is being encoded.
         f.cursorLayerOrigin = committedCursorPlacement.originPx
         f.bgRGB = surfaceBgRGB
         f.committedExtent = committedExtent
         lock.unlock()
+        if f.peel.moving { host?.activateSurfaceDrawLoop() }
 
         // The union scrolled content must not bleed over, from the same
         // layer snapshot this frame draws, so placement and mask cannot
         // skew by a commit.
         fixedFloatMask.rebuild(
             layers: layerSnapshot, rootGridId: Self.rootGridId, smoothScrolling: f.smoothScrolling,
-            offsets: f.scrollOffsets,
+            offsets: f.scrollOffsets, peelGridId: f.peel.grid_id,
             cellW: cellWidthPx, cellH: cellHeightPx, scratch: &fixedFloatRectsScratch
         )
         f.fixedFloatBands = fixedFloatMask.bands  // Value-type copies (safe across frames)
@@ -4202,6 +4220,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let rootOriginYPx = Int(f.rootLayerOrigin.y.rounded(.down))
         damageBands.addPlacementChanges(layerSnapshot, rowHeightPx: bandRowHeightPx)
         damageBands.addRows(f.dirtyRows, originYPx: rootOriginYPx, rowHeightPx: bandRowHeightPx)
+        if f.peel.redraw_bottom_px > f.peel.redraw_top_px {
+            damageBands.addSpan(topPx: Int(f.peel.redraw_top_px), bottomPx: Int(f.peel.redraw_bottom_px))
+        }
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
             let rowCount = f.layerResolvableRowCount(entry)
@@ -4375,6 +4396,42 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         )
     }
 
+    /// Advance the float peel against this frame's layers and cursor. Called
+    /// under `lock`, after `layerSnapshot` is built. A frame that changes the
+    /// peel, or encodes while one is up, redraws the curled float's rows: the
+    /// peel pass blends into backTex, so those rows hold last frame's curl.
+    private func updateFloatPeel(_ f: inout MainSurfaceFrame, cursor: SurfaceShaderCursor.Raw) {
+        // Raw rect is (x, bottom, width, height): Ghostty's convention.
+        let onSurface = layerSnapshot.contains { $0.layer.gridId == cursor.gridId }
+        f.peel = floatPeel.advance(
+            layers: layerSnapshot.lazy.map(\.layer), cursorGrid: cursor.gridId,
+            cursorBox: onSurface ? zonvie_cursor_rect(
+                left: cursor.rect.0, top: cursor.rect.1 - cursor.rect.3,
+                right: cursor.rect.0 + cursor.rect.2, bottom: cursor.rect.1) : nil,
+            cellWidthPx: max(1, UInt32(shared.cellWidthPx.rounded(.up))),
+            cellHeightPx: max(1, UInt32(shared.cellHeightPx.rounded(.up))))
+        if f.peel.changed && f.peel.redraw_bottom_px > f.peel.redraw_top_px { f.anyLayerWork = true }
+    }
+
+    /// The curled float, folded over backTex after the back-buffer pass and
+    /// before bloom and the custom shader chain, so both see the curled frame.
+    private func encodeFloatPeel(_ f: inout MainSurfaceFrame, cmd: MTLCommandBuffer, backTex: MTLTexture) {
+        floatPeel.encode(f.peel, originPx: .zero, cmd: cmd, backTex: backTex, shared: shared) { enc, peelTex in
+            beginSurfaceRowPass(
+                encoder: enc,
+                viewportMetrics: f.viewportMetrics,
+                pipeline: shared.pipeline!,
+                atlasTexture: f.atlasTex,
+                sampler: shared.sampler!,
+                backgroundAlpha: f.backgroundAlpha,
+                fixedFloatBands: f.fixedFloatBands,
+                fixedFloatIntervals: f.fixedFloatIntervals,
+                bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: f.scrollOffsets) }
+            )
+            encodeLayerPass(&f, enc: enc, backTex: peelTex, loadActionIsClear: true, only: f.peel.grid_id)
+        }
+    }
+
     /// Non-root layers, back-to-front, on top of the root grid. Each
     /// gets its own pixel space and is clipped to its own rect. A layer
     /// whose grid has no rows yet draws nothing, which is what the
@@ -4383,13 +4440,21 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         _ f: inout MainSurfaceFrame,
         enc: MTLRenderCommandEncoder,
         backTex: MTLTexture,
-        loadActionIsClear: Bool
+        loadActionIsClear: Bool,
+        /// Draw this grid alone (the peel texture); otherwise every layer
+        /// but the curled float.
+        only: Int64? = nil
     ) {
         let cellHi = Int(f.cellHi)
         let use2Pass = f.use2Pass
         enc.setRenderPipelineState(shared.pipeline!)
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
+            if let only {
+                if layer.gridId != only { continue }
+            } else if layer.gridId == f.peel.grid_id {
+                continue
+            }
             guard let set = entry.set else { continue }
             let rowCount = f.layerResolvableRowCount(entry)
             guard rowCount > 0 else { continue }
@@ -5346,6 +5411,9 @@ fileprivate struct MainSurfaceFrame {
     /// shift, or a full redraw. The root grid's dirty rows do not stand in
     /// for that.
     var anyLayerWork = false
+    /// The float peel's frame: the float its pass draws instead of the layer
+    /// pass (grid_id 0 for none), and the rows it redraws.
+    var peel = zonvie_float_peel_frame()
     var bgClear = false
     var rowLogicalToSlot: [Int] = []
     var rowSlotSourceRows: [Int] = []
@@ -5469,5 +5537,130 @@ fileprivate struct MainSurfaceFrame {
         )
         bindSingleSurfaceScrollOffset(encoder: enc, offset: bodilyMoved ? nil : layerOffset)
         return (drawOriginPx, bodilyMoved)
+    }
+}
+
+/// [floats] peel for one surface: the core's curl state, the layer list
+/// handed to it, and the texture the curled float is drawn into alone.
+/// Every surface with hosted floats owns one; the policy is the core's.
+final class SurfaceFloatPeel {
+    private var state = zonvie_float_peel()
+    private var layers: [zonvie_layer] = []
+    private var tex: MTLTexture?
+    /// A mouse press on the surface since the last frame, in layer px.
+    /// Protected by the owner's lock.
+    var press: [Float]?
+
+    /// Advance against this frame's layers. Called under the owner's lock.
+    /// `cursorBox` is in the layers' px space, nil when the cursor is not on
+    /// this surface.
+    func advance<Layers: Sequence>(
+        layers frameLayers: Layers, cursorGrid: Int64, cursorBox: zonvie_cursor_rect?,
+        cellWidthPx: UInt32, cellHeightPx: UInt32
+    ) -> zonvie_float_peel_frame where Layers.Element == SurfaceLayer {
+        layers.removeAll(keepingCapacity: true)
+        for l in frameLayers {
+            layers.append(zonvie_layer(
+                grid_id: l.gridId,
+                anchor_grid: l.anchorGrid,
+                x_px: Int32(l.originPx.x.rounded(.down)),
+                y_px: Int32(l.originPx.y.rounded(.down)),
+                rows: UInt32(l.rows),
+                cols: UInt32(l.cols),
+                z: Int32(l.z),
+                flags: l.isFloat ? UInt32(ZONVIE_LAYER_FLOAT) : 0
+            ))
+        }
+        var box = cursorBox ?? zonvie_cursor_rect()
+        var out = zonvie_float_peel_frame()
+        let nowNs = Int64(DispatchTime.now().uptimeNanoseconds)
+        let pressed = press
+        press = nil
+        layers.withUnsafeBufferPointer { ls in
+            withUnsafePointer(to: &box) { boxPtr in
+                let cursor = cursorBox != nil ? boxPtr : nil
+                if let pressed {
+                    zonvie_float_peel_advance(&state, ls.baseAddress, ls.count, cursorGrid, cursor, pressed,
+                                              cellWidthPx, cellHeightPx, nowNs, &out)
+                } else {
+                    zonvie_float_peel_advance(&state, ls.baseAddress, ls.count, cursorGrid, cursor, nil,
+                                              cellWidthPx, cellHeightPx, nowNs, &out)
+                }
+            }
+        }
+        return out
+    }
+
+    /// Draw the curled float alone (`drawFloat`, into a cleared pass on the
+    /// peel texture), then fold it over `backTex` within the frame's bounds.
+    /// `originPx` maps the frame's layer px into backTex px.
+    func encode(
+        _ frame: zonvie_float_peel_frame, originPx: simd_float2, cmd: MTLCommandBuffer, backTex: MTLTexture,
+        shared: SharedRenderResources, drawFloat: (MTLRenderCommandEncoder, MTLTexture) -> Void
+    ) {
+        guard let pipe = shared.floatPeelPipeline,
+              let copyVB = shared.copyVertexBuffer,
+              let samp = shared.bilinearSampler else { return }
+        if tex == nil || tex!.width != backTex.width
+            || tex!.height != backTex.height || tex!.pixelFormat != backTex.pixelFormat {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: backTex.pixelFormat, width: backTex.width, height: backTex.height, mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            tex = shared.device.makeTexture(descriptor: desc)
+        }
+        guard let peelTex = tex else { return }
+
+        let layerRpd = MTLRenderPassDescriptor()
+        layerRpd.colorAttachments[0].texture = peelTex
+        layerRpd.colorAttachments[0].loadAction = .clear
+        layerRpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        layerRpd.colorAttachments[0].storeAction = .store
+        guard let layerEnc = cmd.makeRenderCommandEncoder(descriptor: layerRpd) else { return }
+        drawFloat(layerEnc, peelTex)
+        layerEnc.endEncoding()
+
+        let rect = frame.float_px
+        let bounds = frame.bounds_px
+        let bx0 = Int((bounds.left + originPx.x).rounded(.down))
+        let by0 = Int((bounds.top + originPx.y).rounded(.down))
+        guard let sr = clampScissor(
+            x: bx0, y: by0,
+            width: Int((bounds.right + originPx.x).rounded(.up)) - bx0,
+            height: Int((bounds.bottom + originPx.y).rounded(.up)) - by0,
+            targetWidth: backTex.width, targetHeight: backTex.height
+        ) else { return }
+        var u = FloatPeelUniforms(
+            sizePx: simd_float2(Float(backTex.width), Float(backTex.height)),
+            cornerPx: simd_float2(frame.corner_x_px, frame.corner_y_px) + originPx,
+            dir: simd_float2(frame.dir_x, frame.dir_y),
+            foldPx: frame.fold_px,
+            pad: 0,
+            rectPx: simd_float4(rect.left + originPx.x, rect.top + originPx.y,
+                                rect.right + originPx.x, rect.bottom + originPx.y))
+
+        let curlRpd = MTLRenderPassDescriptor()
+        curlRpd.colorAttachments[0].texture = backTex
+        curlRpd.colorAttachments[0].loadAction = .load
+        curlRpd.colorAttachments[0].storeAction = .store
+        guard let curlEnc = cmd.makeRenderCommandEncoder(descriptor: curlRpd) else { return }
+        curlEnc.setRenderPipelineState(pipe)
+        curlEnc.setScissorRect(sr)
+        curlEnc.setVertexBuffer(copyVB, offset: 0, index: 0)
+        curlEnc.setFragmentTexture(peelTex, index: 0)
+        curlEnc.setFragmentSamplerState(samp, index: 0)
+        curlEnc.setFragmentBytes(&u, length: MemoryLayout<FloatPeelUniforms>.stride, index: 0)
+        curlEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        curlEnc.endEncoding()
+    }
+
+    /// Matches `FloatPeelUniforms` in Shaders.metal.
+    private struct FloatPeelUniforms {
+        var sizePx: simd_float2
+        var cornerPx: simd_float2
+        var dir: simd_float2
+        var foldPx: Float
+        var pad: Float
+        var rectPx: simd_float4
     }
 }

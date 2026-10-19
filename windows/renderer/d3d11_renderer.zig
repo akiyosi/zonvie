@@ -367,6 +367,16 @@ pub const Renderer = struct {
     additive_blend: ?*c.ID3D11BlendState = null,
     bilinear_sampler: ?*c.ID3D11SamplerState = null,
     glow_cb: ?*c.ID3D11Buffer = null,
+    /// [floats] peel: the curled float drawn alone, sized like back_tex, and
+    /// the fold that composites it (PSFloatPeel). Built by prepareFloatPeel.
+    float_peel_tex: ?*c.ID3D11Texture2D = null,
+    float_peel_rtv: ?*c.ID3D11RenderTargetView = null,
+    float_peel_srv: ?*c.ID3D11ShaderResourceView = null,
+    float_peel_w: u32 = 0,
+    float_peel_h: u32 = 0,
+    ps_float_peel: ?*c.ID3D11PixelShader = null,
+    float_peel_cb: ?*c.ID3D11Buffer = null,
+    float_peel_prepare_attempted: bool = false,
     /// Vertex-stage b0: maps a layer's vertex space to clip space. See
     /// LayerTransform in windows/shaders/main.hlsl.
     layer_cb: ?*c.ID3D11Buffer = null,
@@ -748,6 +758,9 @@ pub const Renderer = struct {
         safeRelease(&self.bilinear_sampler);
         safeRelease(&self.glow_cb);
         safeRelease(&self.layer_cb);
+        self.releaseFloatPeelTex();
+        safeRelease(&self.ps_float_peel);
+        safeRelease(&self.float_peel_cb);
 
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
@@ -976,6 +989,7 @@ pub const Renderer = struct {
         // Scratch + ping-pong textures belong to the old back buffer's
         // size/format; drop them and let the shader pass rebuild on
         // the next draw.
+        self.releaseFloatPeelTex();
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
         self.custom_shader_scratch_w = 0;
@@ -2819,6 +2833,175 @@ pub const Renderer = struct {
         return ready;
     }
 
+    /// Compile the float peel's fold before the first paint that curls. No-op
+    /// once built; attempted once per renderer. D3DCompile may pump messages,
+    /// so it runs where prepareBloomShaders does, never from a paint.
+    pub fn prepareFloatPeel(self: *Renderer) bool {
+        if (self.ps_float_peel != null and self.vs_fullscreen != null and self.float_peel_cb != null) return true;
+        if (self.float_peel_prepare_attempted) return false;
+        self.float_peel_prepare_attempted = true;
+        const dev = self.device orelse return false;
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return false;
+        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return false;
+        const create_buf = dev_vtbl.*.CreateBuffer orelse return false;
+        const hlsl = @embedFile("../shaders/main.hlsl");
+
+        const entries = [_]struct { entry: [*:0]const u8, target: [*:0]const u8 }{
+            .{ .entry = "VSFullscreen", .target = "vs_5_0" },
+            .{ .entry = "PSFloatPeel", .target = "ps_5_0" },
+        };
+        var blobs: [entries.len]?*ID3DBlob = .{null} ** entries.len;
+        defer for (&blobs) |*b| blobRelease(b.*);
+        for (entries, 0..) |e, i| {
+            if (i == 0 and self.vs_fullscreen != null) continue;
+            var err_b: ?*ID3DBlob = null;
+            defer blobRelease(err_b);
+            const hr = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, e.entry, e.target, 0, 0, &blobs[i], &err_b);
+            if (hr != 0 or blobs[i] == null) {
+                dumpBlobAsText("[D3DCompile float peel] ", err_b);
+                applog.appLog("[d3d] float peel unavailable: '{s}' compile failed hr=0x{x}\n", .{ e.entry, @as(u32, @bitCast(hr)) });
+                return false;
+            }
+        }
+        if (self.vs_fullscreen == null) {
+            var vs: ?*c.ID3D11VertexShader = null;
+            const bp = blobPtr(blobs[0]) orelse return false;
+            if (c.FAILED(create_vs_fn(dev, bp, blobSize(blobs[0]), null, &vs)) or vs == null) return false;
+            self.vs_fullscreen = vs;
+        }
+        var ps: ?*c.ID3D11PixelShader = null;
+        const pp = blobPtr(blobs[1]) orelse return false;
+        if (c.FAILED(create_ps_fn(dev, pp, blobSize(blobs[1]), null, &ps)) or ps == null) return false;
+        self.ps_float_peel = ps;
+
+        var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+        cbd.ByteWidth = @sizeOf(FloatPeelParams);
+        cbd.Usage = c.D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+        var cb: ?*c.ID3D11Buffer = null;
+        if (c.FAILED(create_buf(dev, &cbd, null, &cb)) or cb == null) return false;
+        self.float_peel_cb = cb;
+        return true;
+    }
+
+    /// Matches `FloatPeelParams` in main.hlsl.
+    pub const FloatPeelParams = extern struct {
+        corner_px: [2]f32,
+        dir: [2]f32,
+        rect_px: [4]f32,
+        fold_px: f32,
+        _pad: [3]f32 = .{ 0, 0, 0 },
+    };
+
+    fn releaseFloatPeelTex(self: *Renderer) void {
+        safeRelease(&self.float_peel_srv);
+        safeRelease(&self.float_peel_rtv);
+        safeRelease(&self.float_peel_tex);
+        self.float_peel_w = 0;
+        self.float_peel_h = 0;
+    }
+
+    /// Bind the peel texture, cleared, as the render target: the curled float
+    /// draws into it alone, in back_tex's pixel space. False leaves back_rtv
+    /// bound and the float undrawn.
+    pub fn beginFloatPeel(self: *Renderer) bool {
+        if (self.ps_float_peel == null or self.float_peel_cb == null or self.vs_fullscreen == null) return false;
+        const ctx = self.ctx orelse return false;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        if (self.float_peel_tex == null or self.float_peel_w != self.width or self.float_peel_h != self.height) {
+            self.releaseFloatPeelTex();
+            const dev = self.device orelse return false;
+            const back = self.back_tex orelse return false;
+            var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+            const get_desc = back.*.lpVtbl.*.GetDesc orelse return false;
+            get_desc(back, &back_desc);
+            const t = createTex2D(dev, back_desc.Width, back_desc.Height, back_desc.Format, c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE) orelse return false;
+            self.float_peel_tex = t.tex;
+            self.float_peel_rtv = t.rtv;
+            self.float_peel_srv = t.srv;
+            self.float_peel_w = self.width;
+            self.float_peel_h = self.height;
+        }
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return false;
+        const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return false;
+        const clear: [4]f32 = .{ 0, 0, 0, 0 };
+        clear_rtv(ctx, self.float_peel_rtv.?, &clear);
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.float_peel_rtv.?};
+        om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+        return true;
+    }
+
+    /// Rebind back_rtv and fold the peel texture over it within `scissor`
+    /// (premultiplied over). Restores the row pipeline, viewport and
+    /// scissor for the layers drawn after it. False when the fold was not
+    /// drawn; back_rtv is bound either way.
+    pub fn endFloatPeel(self: *Renderer, params: FloatPeelParams, scissor: c.D3D11_RECT) bool {
+        const ctx = self.ctx orelse return false;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return false;
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.back_rtv};
+        om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+
+        const ps_set_fn = ctx_vtbl.*.PSSetShader orelse return false;
+        const vs_set_fn = ctx_vtbl.*.VSSetShader orelse return false;
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return false;
+        const ps_set_samp = ctx_vtbl.*.PSSetSamplers orelse return false;
+        const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return false;
+        const ia_set_il = ctx_vtbl.*.IASetInputLayout orelse return false;
+        const ia_set_top = ctx_vtbl.*.IASetPrimitiveTopology orelse return false;
+        const rs_get_vp = ctx_vtbl.*.RSGetViewports orelse return false;
+        const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return false;
+        const rs_get_sc = ctx_vtbl.*.RSGetScissorRects orelse return false;
+        const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return false;
+        const draw_fn = ctx_vtbl.*.Draw orelse return false;
+        const sampler = self.bilinear_sampler orelse return false;
+        const cb = self.float_peel_cb orelse return false;
+
+        const cb_res: *c.ID3D11Resource = @ptrCast(cb);
+        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+        if (c.FAILED(mapDiscard(ctx, cb_res, &mapped))) return false;
+        const dst: *FloatPeelParams = @ptrCast(@alignCast(mapped.pData));
+        dst.* = params;
+        unmap0(ctx, cb_res);
+
+        var saved_vp: c.D3D11_VIEWPORT = undefined;
+        var vp_n: c.UINT = 1;
+        rs_get_vp(ctx, &vp_n, &saved_vp);
+        var saved_sc: c.D3D11_RECT = undefined;
+        var sc_n: c.UINT = 1;
+        rs_get_sc(ctx, &sc_n, &saved_sc);
+
+        self.setFullViewport();
+        var sc = scissor;
+        rs_set_sc(ctx, 1, &sc);
+        vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
+        ps_set_fn(ctx, self.ps_float_peel.?, null, 0);
+        ia_set_il(ctx, null);
+        ia_set_top(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        var samps: [1]?*c.ID3D11SamplerState = .{sampler};
+        ps_set_samp(ctx, 1, 1, @ptrCast(&samps));
+        var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.float_peel_srv};
+        ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
+        var cbs: [1]?*c.ID3D11Buffer = .{cb};
+        ps_set_cb(ctx, 1, 1, @ptrCast(&cbs));
+        draw_fn(ctx, 3, 0);
+
+        // The texture is this pass's input; the next paint binds it as a
+        // target, so it must not stay bound here.
+        var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
+        ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+        var null_cbs: [1]?*c.ID3D11Buffer = .{null};
+        ps_set_cb(ctx, 1, 1, @ptrCast(&null_cbs));
+        vs_set_fn(ctx, self.vs.?, null, 0);
+        ps_set_fn(ctx, self.ps.?, null, 0);
+        ia_set_il(ctx, self.il.?);
+        if (vp_n == 1) rs_set_vp(ctx, 1, &saved_vp);
+        if (sc_n == 1) rs_set_sc(ctx, 1, &saved_sc);
+        return true;
+    }
+
     /// Compile `VSCustomPost` from main.hlsl the first time it's needed.
     /// No-op when already built. Deferred to
     /// `loadCustomShaderPipelines` to skip the ~20 ms D3DCompile when
@@ -4303,7 +4486,7 @@ fn isDeviceLost(hr: c.HRESULT) bool {
 /// this build (LF-normalized SHA-256). Stale bytecode is never used; every
 /// entry point then compiles at runtime instead.
 const main_hlsl_bytecode_current = blk: {
-    @setEvalBranchQuota(1_000_000);
+    @setEvalBranchQuota(2_000_000);
     if (compiled_shaders.hlsl_sha256.len == 0) break :blk true; // no hash recorded — trust the bytecode
     const hlsl = @embedFile("../shaders/main.hlsl");
     var normalized: [hlsl.len]u8 = undefined;

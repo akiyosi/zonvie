@@ -86,6 +86,7 @@ pub const Config = struct {
     messages: MessagesConfig = .{},
     tabline: TablineConfig = .{},
     windows: WindowsConfig = .{},
+    floats: FloatsConfig = .{},
     log: LogConfig = .{},
     performance: PerformanceConfig = .{},
     shaders: ShaderConfig = .{},
@@ -246,6 +247,11 @@ pub const Config = struct {
     pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
 
     pub const LargeJumpBehavior = @import("scroll_ease.zig").LargeJumpBehavior;
+
+    pub const FloatsConfig = struct {
+        /// Curl a float back around the cursor when it hides the cursor.
+        peel: bool = false,
+    };
 
     pub const ScrollConfig = struct {
         large_jump_behavior: LargeJumpBehavior = .snap,
@@ -537,6 +543,10 @@ pub const Config = struct {
 
         if (cfg.windows) |w| {
             if (w.external) |e| self.windows.external = e;
+        }
+
+        if (cfg.floats) |f| {
+            if (f.peel) |p| self.floats.peel = p;
         }
 
         if (cfg.log) |l| {
@@ -831,6 +841,7 @@ const TomlConfig = struct {
     messages: ?TomlMessages = null,
     tabline: ?TomlTabline = null,
     windows: ?TomlWindows = null,
+    floats: ?TomlFloats = null,
     log: ?TomlLog = null,
     performance: ?TomlPerformance = null,
     shaders: ?TomlShaders = null,
@@ -921,6 +932,10 @@ const TomlTabline = struct {
 
 const TomlWindows = struct {
     external: ?bool = null,
+};
+
+const TomlFloats = struct {
+    peel: ?bool = null,
 };
 
 const TomlLog = struct {
@@ -1035,6 +1050,9 @@ else
     \\
     \\    [windows]
     \\        external        Each Neovim window as its own OS window
+    \\
+    \\    [floats]
+    \\        peel            Curl a float back where it hides the cursor
     \\
     \\    [input]
     \\        swap_colon_semicolon        Swap the : and ; keys

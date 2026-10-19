@@ -823,3 +823,47 @@ fragment float4 ps_glow_composite(CopyVSOut in [[stage_in]],
                                    constant float& intensity [[buffer(0)]]) {
     return src.sample(samp, in.uv) * intensity;
 }
+
+// Float peel: the float, drawn alone into a surface-sized texture, folded
+// back along a line (zonvie_float_peel in zonvie_frontend.h); the flap may
+// land outside the float's rect, so this is drawn over the peel's bounds. Blended
+// premultiplied over the back texture, which already holds what the float
+// covers. Matches FloatPeelUniforms in GridSurfaceRenderer.swift.
+struct FloatPeelUniforms {
+    float2 size_px;
+    float2 corner_px;
+    float2 dir;
+    float fold_px;
+    float _pad;
+    float4 rect_px; // x0, y0, x1, y1
+};
+
+fragment float4 ps_float_peel(CopyVSOut in [[stage_in]],
+                              texture2d<float> src [[texture(0)]],
+                              sampler samp [[sampler(0)]],
+                              constant FloatPeelUniforms& u [[buffer(0)]]) {
+    float2 p = in.uv * u.size_px;
+    float s = dot(p - u.corner_px, u.dir);
+    bool inFloat = all(p >= u.rect_px.xy) && all(p < u.rect_px.zw);
+    if (s < u.fold_px) {
+        if (!inFloat) return float4(0.0);
+        // Uncovered: only the shadow the flap casts along the fold.
+        float shade = 0.28 * (1.0 - smoothstep(0.0, 14.0, u.fold_px - s));
+        return float4(0.0, 0.0, 0.0, shade);
+    }
+    // The flap's back, where the folded part lands.
+    float2 q = p - 2.0 * (s - u.fold_px) * u.dir;
+    if (all(q >= u.rect_px.xy) && all(q < u.rect_px.zw)) {
+        float4 c = src.sample(samp, q / u.size_px);
+        float luma = dot(c.rgb, float3(0.299, 0.587, 0.114));
+        float3 back = mix(c.rgb, float3(luma), 0.6) * 0.8 + 0.12 * c.a;
+        // Brighter toward the crease, as a bent sheet catches the light.
+        float crease = 1.0 - smoothstep(0.0, 24.0, s - u.fold_px);
+        return float4(back + 0.08 * crease * c.a, c.a);
+    }
+    if (!inFloat) return float4(0.0);
+    float4 c = src.sample(samp, in.uv);
+    // The flap's own shadow on the float just past its edge.
+    float shade = 1.0 - 0.25 * (1.0 - smoothstep(0.0, 10.0, s - u.fold_px));
+    return float4(c.rgb * shade, c.a);
+}

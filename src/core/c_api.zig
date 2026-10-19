@@ -22,6 +22,7 @@ pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const damage_bands = @import("damage_bands.zig");
 pub const scroll_ease = @import("scroll_ease.zig");
+pub const float_peel = @import("float_peel.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
 const msg_stack = @import("msg_stack.zig");
@@ -41,6 +42,7 @@ test {
     _ = damage_bands;
     _ = scroll_ease;
     _ = cell_age_store;
+    _ = float_peel;
 }
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -2190,6 +2192,22 @@ pub export fn zonvie_scroll_spring_seed(
     return s.seed(now_ns, rows_delta, row_h_px, mousescroll_ver, largeJump(large_jump));
 }
 
+pub export fn zonvie_float_peel_advance(
+    p: *float_peel.Peel,
+    layers: ?[*]const Layer,
+    count: usize,
+    cursor_grid: i64,
+    cursor: ?*const cursor_rect.Rect,
+    click_px: ?*const [2]f32,
+    cell_w_px: u32,
+    cell_h_px: u32,
+    now_ns: i64,
+    out: *float_peel.Frame,
+) callconv(.c) void {
+    const ls: []const Layer = if (layers) |l| l[0..count] else &.{};
+    out.* = float_peel.frame(p, ls, cursor_grid, if (cursor) |c| c.* else null, if (click_px) |c| c.* else null, cell_w_px, cell_h_px, now_ns);
+}
+
 pub export fn zonvie_scroll_ease_admits(rows_delta: i32, mousescroll_ver: i32, large_jump: u8) callconv(.c) bool {
     return scroll_ease.admitsSeed(rows_delta, mousescroll_ver, largeJump(large_jump));
 }
@@ -3031,6 +3049,8 @@ pub const zonvie_config_values = extern struct {
     // read directly from config.Config by the Windows frontend, so it is not
     // mirrored here.
     server_open_mode: [*:0]const u8 = "tab", // "tab" or "current"
+    // floats
+    float_peel: bool = false, // curl a float back where it hides the cursor
 };
 
 const ConfigHandle = struct {
@@ -3149,6 +3169,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .input_swap_colon_semicolon = cfg.input.swap_colon_semicolon,
         // server
         .server_open_mode = dupeZForC(alloc, cfg.server.open_mode, "tab"),
+        // floats
+        .float_peel = cfg.floats.peel,
     };
 }
 
