@@ -10,6 +10,7 @@ const App = @import("app.zig").App;
 const atlas_pixels = @import("atlas_pixels.zig");
 const gtk = @import("gtk_bindings.zig");
 const applog = @import("app_log.zig");
+const input = @import("input.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -193,6 +194,7 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     app.render_idle_queued.store(false, .release);
     if (app.gl_area) |area| gtk.gtk_gl_area_queue_render(area);
+    input.updateImeCursor(app);
     return 0;
 }
 
@@ -271,9 +273,12 @@ fn onGetAsciiTable(ctx: ?*anyopaque, style_flags: u32, out_glyph_ids: [*]u32, ou
 const default_family = "monospace";
 const default_pt: f32 = 12.0;
 
-fn pixelSize(app: *const App, pt: f32) u32 {
+fn pixelSize(app: *App, pt: f32) u32 {
+    lock(app);
+    const scale = app.scale;
+    unlock(app);
     // GTK's logical 96 dpi, times the surface scale.
-    return @intFromFloat(@max(1.0, @round(pt * 96.0 / 72.0 * app.scale)));
+    return @intFromFloat(@max(1.0, @round(pt * 96.0 / 72.0 * scale)));
 }
 
 /// Loads `monospace 12` when no guifont has been applied yet. Core thread,
@@ -294,9 +299,15 @@ fn updateMetrics(app: *App) void {
 }
 
 fn sendLayout(app: *App) void {
-    if (app.drawable_w_px == 0 or app.drawable_h_px == 0 or app.cell_w_px == 0) return;
+    lock(app);
+    const w = app.drawable_w_px;
+    const h = app.drawable_h_px;
+    const cw = app.cell_w_px;
+    const ch = app.cell_h_px;
+    unlock(app);
+    if (w == 0 or h == 0 or cw == 0) return;
     // On the redraw thread the core applies this without taking grid_mu.
-    core.zonvie_core_update_layout_px(app.corep, app.drawable_w_px, app.drawable_h_px, app.cell_w_px, app.cell_h_px);
+    core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
 }
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
@@ -374,17 +385,33 @@ fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
 
 fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
     const app = appFrom(ctx);
-    // M1 has no confirmation dialog: quit only when nothing is unsaved.
-    if (has_unsaved != 0) {
-        applog.appLog("[linux] quit requested with unsaved buffers; ignored\n", .{});
-        return;
-    }
-    _ = gtk.g_idle_add(&idleQuitConfirmed, app);
+    app.quit_has_unsaved.store(has_unsaved != 0, .release);
+    _ = gtk.g_idle_add(&idleQuitRequested, app);
 }
 
-fn idleQuitConfirmed(data: ?*anyopaque) callconv(.c) c_int {
-    core.zonvie_core_quit_confirmed(appFrom(data).corep, 0);
+fn idleQuitRequested(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    if (!app.quit_has_unsaved.load(.acquire)) {
+        core.zonvie_core_quit_confirmed(app.corep, 0);
+        return 0;
+    }
+    const dialog = gtk.gtk_alert_dialog_new("%s", "Quit with unsaved changes?") orelse return 0;
+    gtk.gtk_alert_dialog_set_detail(dialog, "Some buffers have unsaved changes. They will be lost.");
+    const labels = [_:null]?[*:0]const u8{ "Cancel", "Discard and Quit" };
+    gtk.gtk_alert_dialog_set_buttons(dialog, &labels);
+    gtk.gtk_alert_dialog_set_cancel_button(dialog, 0);
+    gtk.gtk_alert_dialog_set_default_button(dialog, 0);
+    gtk.gtk_alert_dialog_choose(dialog, app.window, null, &onQuitDialogDone, app);
     return 0;
+}
+
+fn onQuitDialogDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const app = appFrom(data);
+    var err: ?*anyopaque = null;
+    const choice = gtk.gtk_alert_dialog_choose_finish(source.?, result, &err);
+    if (err) |e| gtk.g_error_free(e);
+    gtk.g_object_unref(source.?);
+    if (choice == 1) core.zonvie_core_quit_confirmed(app.corep, 1);
 }
 
 fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
@@ -402,6 +429,30 @@ fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void {
     app.requested_rows = rows;
     app.requested_cols = cols;
     unlock(app);
+    _ = gtk.g_idle_add(&idleResizeToGrid, app);
+}
+
+/// Sizes the window so the GLArea holds the requested cells; the GLArea
+/// resize that follows reports the layout to the core.
+fn idleResizeToGrid(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    const window = app.window orelse return 0;
+    const area = app.gl_area orelse return 0;
+    lock(app);
+    const rows = app.requested_rows;
+    const cols = app.requested_cols;
+    const cw = app.cell_w_px;
+    const ch = app.cell_h_px;
+    const scale = app.scale;
+    unlock(app);
+    if (rows == 0 or cols == 0 or cw == 0 or ch == 0) return 0;
+    // Window chrome (a CSD titlebar) is the window/area size difference.
+    const chrome_w = @max(0, gtk.gtk_widget_get_width(window) - gtk.gtk_widget_get_width(area));
+    const chrome_h = @max(0, gtk.gtk_widget_get_height(window) - gtk.gtk_widget_get_height(area));
+    const w_logical: c_int = @intFromFloat(@ceil(@as(f32, @floatFromInt(cols * cw)) / scale));
+    const h_logical: c_int = @intFromFloat(@ceil(@as(f32, @floatFromInt(rows * ch)) / scale));
+    gtk.gtk_window_set_default_size(window, w_logical + chrome_w, h_logical + chrome_h);
+    return 0;
 }
 
 fn onLog(ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
