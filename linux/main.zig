@@ -19,6 +19,7 @@ const input = @import("input.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
 const ft_renderer = @import("renderer/ft_renderer.zig");
 const core = @import("zonvie_core");
+const clock = core.clock;
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -147,13 +148,12 @@ pub fn panic(
         std.debug.print("Return address: 0x{x}\n", .{addr});
     }
     // Print stack trace
-    const trace = @returnAddress();
-    var it = std.debug.StackIterator.init(trace, null);
-    var i: usize = 0;
-    while (it.next()) |addr| {
+    var addr_buf: [20]usize = undefined;
+    const trace = std.debug.captureCurrentStackTrace(.{
+        .first_address = @returnAddress(),
+    }, &addr_buf);
+    for (trace.return_addresses, 0..) |addr, i| {
         std.debug.print("  [{d}] 0x{x}\n", .{ i, addr });
-        i += 1;
-        if (i >= 20) break;
     }
 
     if (applog.isEnabled()) {
@@ -566,8 +566,9 @@ fn startCore(app: *App) void {
 // Entry point
 // =========================================================================
 
-pub fn main() u8 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) u8 {
+    clock.init();
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -593,10 +594,12 @@ pub fn main() u8 {
     var devcontainer_workspace: ?[]const u8 = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild: bool = false;
-    var nvim_extra_args = std.ArrayListUnmanaged([]const u8){};
+    var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
 
-    const args = std.process.argsAlloc(alloc) catch return 1;
-    defer std.process.argsFree(alloc, args);
+    // The arena owns every arg slice, so it must outlive all uses below.
+    var args_arena = std.heap.ArenaAllocator.init(alloc);
+    defer args_arena.deinit();
+    const args = init.args.toSlice(args_arena.allocator()) catch return 1;
 
     // Check for --help
     for (args) |arg| {

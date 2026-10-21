@@ -6,6 +6,7 @@
 // Uses hand-written OpenGL bindings from linux/gl.zig (no @cImport).
 
 const std = @import("std");
+const clock = @import("zonvie_core").clock;
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const Vertex = app_mod.Vertex;
@@ -314,12 +315,12 @@ pub fn destroyGlowResources(app: *App) void {
 /// Flush pending atlas operations queued from the core thread.
 /// Must be called on the GL thread (during render signal).
 pub fn flushPendingAtlasOps(app: *App) void {
-    app.atlas_mu.lock();
+    app.atlas_mu.lockUncancelable(clock.io());
     const ops = app.pending_atlas_ops.items;
     // Move ownership: take the current list and replace with empty
     var pending = app.pending_atlas_ops;
-    app.pending_atlas_ops = .{};
-    app.atlas_mu.unlock();
+    app.pending_atlas_ops = .empty;
+    app.atlas_mu.unlock(clock.io());
 
     if (applog.isEnabled() and ops.len > 0) {
         applog.appLog("[gl] flushPendingAtlasOps: {d} ops\n", .{ops.len});
@@ -485,11 +486,11 @@ pub fn render(app: *App, width: i32, height: i32) bool {
 /// The cmdline grid vertices are stored in external_windows[CMDLINE_GRID_ID]
 /// using row_mode (per-row slots in the TripleBufferedSurface pool).
 fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     const visible = app.cmdline_visible;
     const ext_ptr = app.external_windows.getPtr(app_mod.CMDLINE_GRID_ID);
     if (!visible or ext_ptr == null) {
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
     const ext = ext_ptr.?;
@@ -511,7 +512,7 @@ fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
 
     if (total_vert_count == 0) {
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -522,21 +523,21 @@ fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     const firstc = app.cmdline_firstc;
     const border_color = app.cmdline_border_color;
     const icon_color = app.cmdline_icon_color;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (content_rows == 0 or content_cols == 0) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
     const vp_w: f32 = @floatFromInt(viewport_w);
     const vp_h: f32 = @floatFromInt(viewport_h);
     if (!(vp_w > 0 and vp_h > 0)) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -585,9 +586,9 @@ fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     const extra_count: usize = 6 + 24 + 12;
     const total_alloc = total_vert_count + extra_count;
     var cmdline_verts = app.alloc.alloc(Vertex, total_alloc) catch {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     };
     defer app.alloc.free(cmdline_verts);
@@ -711,21 +712,21 @@ fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     gl.glDeleteBuffers(1, &vbo);
 
     // Release the paint snapshot
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     if (app.external_windows.getPtr(app_mod.CMDLINE_GRID_ID)) |ext2| {
         _ = ext2.tbs.releaseFromPaint(snapshot.committed_index);
     }
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 }
 
 /// Render ext_popupmenu overlay on the main GLArea.
 /// Position is calculated from anchor (row, col, grid_id) saved from onPopupmenuShow.
 fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     const visible = app.popupmenu_visible;
     const ext_ptr = app.external_windows.getPtr(app_mod.POPUPMENU_GRID_ID);
     if (!visible or ext_ptr == null) {
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
     const ext = ext_ptr.?;
@@ -745,7 +746,7 @@ fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
 
     if (total_vert_count == 0) {
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -756,21 +757,21 @@ fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     const anchor_row = app.popupmenu_anchor_row;
     const anchor_col = app.popupmenu_anchor_col;
     const border_color = app.popupmenu_border_color;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (content_rows == 0 or content_cols == 0) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
     const vp_w: f32 = @floatFromInt(viewport_w);
     const vp_h: f32 = @floatFromInt(viewport_h);
     if (!(vp_w > 0 and vp_h > 0)) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -837,9 +838,9 @@ fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     const extra_count: usize = 24;
     const total_alloc = total_vert_count + extra_count;
     var pum_verts = app.alloc.alloc(Vertex, total_alloc) catch {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     };
     defer app.alloc.free(pum_verts);
@@ -900,11 +901,11 @@ fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     gl.glDeleteBuffers(1, &vbo);
 
     // Release paint snapshot
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     if (app.external_windows.getPtr(app_mod.POPUPMENU_GRID_ID)) |ext2| {
         _ = ext2.tbs.releaseFromPaint(snapshot.committed_index);
     }
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 }
 
 /// Render using row-mode vertex buffers (per-row VBOs with scroll optimization).
@@ -989,10 +990,10 @@ fn renderMessageOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
 }
 
 fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id: i64) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     const ext_ptr = app.external_windows.getPtr(grid_id);
     if (ext_ptr == null) {
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
     const ext = ext_ptr.?;
@@ -1011,7 +1012,7 @@ fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id:
 
     if (total_vert_count == 0) {
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -1021,21 +1022,21 @@ fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id:
     const cell_h = app.cell_h_px + app.linespace_px;
     const start_row = ext.start_row;
     const start_col = ext.start_col;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (content_rows == 0 or content_cols == 0) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
     const vp_w: f32 = @floatFromInt(viewport_w);
     const vp_h: f32 = @floatFromInt(viewport_h);
     if (!(vp_w > 0 and vp_h > 0)) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -1077,9 +1078,9 @@ fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id:
     const extra_count: usize = 6 + 24;
     const total_alloc = total_vert_count + extra_count;
     var msg_verts = app.alloc.alloc(Vertex, total_alloc) catch {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     };
     defer app.alloc.free(msg_verts);
@@ -1124,9 +1125,9 @@ fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id:
         idx += 1;
     }
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (idx == 0) return;
 

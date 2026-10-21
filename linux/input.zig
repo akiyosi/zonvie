@@ -9,6 +9,7 @@ const App = app_mod.App;
 const gtk_mod = app_mod.gtk_mod;
 const applog = app_mod.applog;
 const core = @import("zonvie_core");
+const clock = core.clock;
 
 // =========================================================================
 // Modifier constants (match zonvie_core.h)
@@ -307,7 +308,7 @@ fn updateScrollbarDrag(app: *App, y: f64) void {
     const scroll_ratio = std.math.clamp(app.scrollbar.drag_start_knob_top + dy / track_h, 0.0, 1.0);
 
     // Throttle RPC calls (100ms)
-    const now = std.time.milliTimestamp();
+    const now: i64 = @intCast(@divTrunc(clock.nowNs(), std.time.ns_per_ms));
     if (now - app.scrollbar_last_scroll_time < 100) return;
     app.scrollbar_last_scroll_time = now;
 

@@ -3,6 +3,7 @@
 // Uses the shared HarfBuzz/FreeType C bridge from zonvie_hbft.h.
 
 const std = @import("std");
+const clock = @import("zonvie_core").clock;
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const applog = app_mod.applog;
@@ -161,21 +162,9 @@ pub fn computeCellMetrics(app: *App) void {
 /// Load a font from a file path, returning an opaque font handle.
 fn loadFontFromPath(alloc: std.mem.Allocator, path: []const u8, pixel_size: u32) ?*anyopaque {
     // Read font file into memory
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-
-    const stat = file.stat() catch return null;
-    const font_bytes = alloc.alloc(u8, stat.size) catch return null;
     // Note: font_bytes must remain valid for the lifetime of the font handle.
     // The hbft bridge does NOT copy the data.
-    const bytes_read = file.readAll(font_bytes) catch {
-        alloc.free(font_bytes);
-        return null;
-    };
-    if (bytes_read != font_bytes.len) {
-        alloc.free(font_bytes);
-        return null;
-    }
+    const font_bytes = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, alloc, .unlimited) catch return null;
 
     const font = hbft.zonvie_ft_hb_font_create(
         font_bytes.ptr,

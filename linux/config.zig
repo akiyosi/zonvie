@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const shared_config = @import("zonvie_core").config;
+const clock = @import("zonvie_core").clock;
 
 // Re-export types from shared config
 pub const Config = shared_config.Config;
@@ -31,29 +32,29 @@ pub fn loadWithPath(alloc: std.mem.Allocator) struct { config: Config, path: ?[]
 /// Get config file path: $XDG_CONFIG_HOME/zonvie/config.toml or ~/.config/zonvie/config.toml
 pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
     // Try $XDG_CONFIG_HOME/zonvie/config.toml first
-    if (std.process.getEnvVarOwned(alloc, "XDG_CONFIG_HOME")) |xdg| {
-        defer alloc.free(xdg);
-        const path = try std.fs.path.join(alloc, &.{ xdg, "zonvie", "config.toml" });
+    // std.process.Environ needs the block handed to main on POSIX; libc's
+    // getenv reads the same environment without threading it through.
+    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
+        const path = try std.fs.path.join(alloc, &.{ std.mem.span(xdg), "zonvie", "config.toml" });
 
         // Check if file exists
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
             return path;
         } else |_| {
             alloc.free(path);
         }
-    } else |_| {}
+    }
 
     // Fallback to ~/.config/zonvie/config.toml
-    if (std.process.getEnvVarOwned(alloc, "HOME")) |home| {
-        defer alloc.free(home);
-        const path = try std.fs.path.join(alloc, &.{ home, ".config", "zonvie", "config.toml" });
+    if (std.c.getenv("HOME")) |home| {
+        const path = try std.fs.path.join(alloc, &.{ std.mem.span(home), ".config", "zonvie", "config.toml" });
 
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
             return path;
         } else |_| {
             alloc.free(path);
         }
-    } else |_| {}
+    }
 
     return error.NoConfigPath;
 }

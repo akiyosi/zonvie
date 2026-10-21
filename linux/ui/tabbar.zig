@@ -9,7 +9,7 @@ const app_mod = @import("../app.zig");
 pub const TAB_BAR_HEIGHT: u32 = 36;
 
 pub const TablineState = struct {
-    tabs: std.ArrayListUnmanaged(TabInfo) = .{},
+    tabs: std.ArrayListUnmanaged(TabInfo) = .empty,
     current_tab: i64 = 0,
     visible: bool = false,
 
