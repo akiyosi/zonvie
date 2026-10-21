@@ -299,7 +299,6 @@ pub fn build(b: *std.Build) !void {
             .flags = &.{},
         });
         linux_mod.linkSystemLibrary("gtk-4", .{});
-        linux_mod.linkSystemLibrary("epoxy", .{});
         linux_mod.linkSystemLibrary("GL", .{});
         linux_mod.linkSystemLibrary("freetype2", .{});
         linux_mod.linkSystemLibrary("harfbuzz", .{});

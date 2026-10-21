@@ -535,6 +535,23 @@ fn signalClipboardDone(app: *App, seq: u64, result: c_int, text: []const u8) voi
     app.clipboard_ready = true;
 }
 
+/// Releases a core thread waiting on the clipboard with an empty failure,
+/// as its timeout would; the bumped seq makes the pending task stale.
+pub fn abandonClipboardWait(app: *App) void {
+    app.clipboard_mu.lockUncancelable(clock.io());
+    defer app.clipboard_mu.unlock(clock.io());
+    app.clipboard_seq +%= 1;
+    app.clipboard_text.clearRetainingCapacity();
+    app.clipboard_result = 0;
+    app.clipboard_ready = true;
+}
+
+fn isStale(task: *ClipboardTask) bool {
+    task.app.clipboard_mu.lockUncancelable(clock.io());
+    defer task.app.clipboard_mu.unlock(clock.io());
+    return task.app.clipboard_seq != task.seq;
+}
+
 fn freeTask(task: *ClipboardTask) void {
     const alloc = task.app.alloc;
     alloc.free(task.buf);
@@ -571,6 +588,10 @@ fn onClipboardGet(ctx: ?*anyopaque, register: [*]const u8, out_buf: [*]u8, out_l
 
 fn idleClipboardGet(data: ?*anyopaque) callconv(.c) c_int {
     const task: *ClipboardTask = @ptrCast(@alignCast(data.?));
+    if (isStale(task)) {
+        freeTask(task);
+        return 0;
+    }
     const clipboard = defaultClipboard() orelse {
         signalClipboardDone(task.app, task.seq, 0, "");
         freeTask(task);
