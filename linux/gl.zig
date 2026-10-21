@@ -104,6 +104,9 @@ pub extern "c" fn glGetProgramiv(program: GLuint, pname: GLenum, params: *GLint)
 pub extern "c" fn glGetProgramInfoLog(program: GLuint, maxLength: GLsizei, length: *GLsizei, infoLog: [*c]GLchar) void;
 pub extern "c" fn glDeleteProgram(program: GLuint) void;
 pub extern "c" fn glUseProgram(program: GLuint) void;
+pub extern "c" fn glGetUniformLocation(program: GLuint, name: [*:0]const GLchar) GLint;
+pub extern "c" fn glUniform1i(location: GLint, v0: GLint) void;
+pub extern "c" fn glUniform2f(location: GLint, v0: GLfloat, v1: GLfloat) void;
 
 // VAO
 pub extern "c" fn glGenVertexArrays(n: GLsizei, arrays: *GLuint) void;
