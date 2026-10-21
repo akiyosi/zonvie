@@ -1,0 +1,66 @@
+const std = @import("std");
+const core = @import("zonvie_core");
+const testing = std.testing;
+
+/// `out` is width*height*4 bytes. HBFT emits only bytes_per_pixel 1 (gray coverage) or
+/// 4 (BGRA, FT_PIXEL_MODE_BGRA; HBFTBridge.c:424-430); anything else becomes transparent.
+pub fn toRgba8(bm: *const core.GlyphBitmap, out: []u8) void {
+    const w: usize = bm.width;
+    const h: usize = bm.height;
+    const src = bm.pixels orelse {
+        @memset(out[0 .. w * h * 4], 0);
+        return;
+    };
+    const pitch: usize = @intCast(bm.pitch);
+    for (0..h) |y| {
+        const dst = out[y * w * 4 ..][0 .. w * 4];
+        switch (bm.bytes_per_pixel) {
+            1 => for (0..w) |x| {
+                const c = src[y * pitch + x];
+                dst[x * 4 ..][0..4].* = .{ c, c, c, c };
+            },
+            4 => for (0..w) |x| {
+                const p = src[y * pitch + x * 4 ..][0..4];
+                dst[x * 4 ..][0..4].* = .{ p[2], p[1], p[0], p[3] };
+            },
+            else => @memset(dst, 0),
+        }
+    }
+}
+
+test "1-byte coverage expands to RGBA with coverage in every channel" {
+    const px = [_]u8{ 0, 128, 255, 7 };
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 2, .height = 2, .pitch = 2, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 1 };
+    var out: [16]u8 = undefined;
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &.{ 128, 128, 128, 128 }, out[4..8]);
+}
+
+test "pitch padding is skipped" {
+    const px = [_]u8{ 1, 9, 2, 9 }; // width 1, pitch 2
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 1, .height = 2, .pitch = 2, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 1 };
+    var out: [8]u8 = undefined;
+    toRgba8(&bm, &out);
+    try testing.expectEqual(@as(u8, 2), out[4]);
+}
+
+test "4-byte BGRA is swizzled to RGBA" {
+    const px = [_]u8{ 10, 20, 30, 40 }; // B G R A
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 1, .height = 1, .pitch = 4, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 4 };
+    var out: [4]u8 = undefined;
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &.{ 30, 20, 10, 40 }, &out);
+}
+
+test "unsupported bytes_per_pixel and null pixels yield zeros" {
+    const px = [_]u8{ 1, 2, 3 };
+    var bm = core.GlyphBitmap{ .pixels = &px, .width = 1, .height = 1, .pitch = 3, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 3 };
+    var out: [4]u8 = .{ 9, 9, 9, 9 };
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &out);
+    bm.bytes_per_pixel = 1;
+    bm.pixels = null;
+    out = .{ 9, 9, 9, 9 };
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &out);
+}
