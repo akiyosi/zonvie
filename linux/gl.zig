@@ -1,7 +1,8 @@
 // gl.zig — Hand-written OpenGL function declarations for Linux frontend.
 //
-// Replaces @cImport of epoxy/gl.h. Functions are resolved at link time
-// via libepoxy. This enables cross-compilation from macOS (no C headers needed).
+// Hand-written OpenGL declarations instead of @cImport, so the frontend
+// cross-compiles from macOS. The gl* symbols resolve from libGL (glvnd
+// dispatches them to the current context); libepoxy is not used.
 
 // =========================================================================
 // Types
@@ -85,7 +86,7 @@ pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const GL_UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
 
 // =========================================================================
-// Functions (resolved at link time via libepoxy)
+// Functions (resolved at link time from libGL)
 // =========================================================================
 
 // Shader

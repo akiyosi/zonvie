@@ -273,14 +273,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     app.* = .{ .alloc = alloc, .startup = @constCast(@ptrCast(&startup)) };
     defer app.deinit();
 
-    const gapp = gtk.gtk_application_new("io.github.akiyosi.zonvie", 0) orelse return 1;
+    // Each process owns its own nvim, so a second launch must not forward
+    // to the first instance.
+    const gapp = gtk.gtk_application_new("io.github.akiyosi.zonvie", gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
     app.gtk_app = gapp;
     _ = gtk.g_signal_connect(gapp, "activate", @ptrCast(&onActivate), app);
     _ = gtk.g_application_run(gapp, 0, null);
 
+    // The loop no longer serves clipboard idles; release a core thread
+    // waiting on one so destroy does not sit out its timeout.
+    callbacks.abandonClipboardWait(app);
     // Lifecycle thread, outside any callback.
     if (app.corep) |cp| core.zonvie_core_destroy(cp);
     app.corep = null;
+    // Run idles still queued, so stale clipboard tasks free themselves.
+    while (gtk.g_main_context_iteration(null, 0) != 0) {}
     // Destroys the window; unrealize still needs `app`.
     gtk.g_object_unref(gapp);
     app.gtk_app = null;

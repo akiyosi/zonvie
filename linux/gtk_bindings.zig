@@ -101,6 +101,9 @@ pub const GDK_GL_API_GL: c_uint = 1 << 0;
 pub const GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES: c_uint = (1 << 0) | (1 << 1);
 pub const GTK_EVENT_CONTROLLER_SCROLL_DISCRETE: c_uint = 1 << 2;
 
+/// gio/gioenums.h: G_APPLICATION_NON_UNIQUE = (1 << 5).
+pub const G_APPLICATION_NON_UNIQUE: c_uint = 1 << 5;
+pub extern "c" fn g_main_context_iteration(context: ?*anyopaque, may_block: c_int) c_int;
 pub extern "c" fn gtk_application_new(application_id: [*:0]const u8, flags: c_uint) ?*anyopaque;
 pub extern "c" fn g_application_run(application: *anyopaque, argc: c_int, argv: ?*anyopaque) c_int;
 pub extern "c" fn g_object_unref(object: *anyopaque) void;
