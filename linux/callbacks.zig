@@ -207,10 +207,19 @@ fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void
     lock(app);
     defer unlock(app);
     // The new texture starts zeroed; anything queued for the old one is moot.
-    app.atlas_pending.clearQueued();
-    app.atlas_pending.recreate = true;
-    app.atlas_pending.w = atlas_w;
-    app.atlas_pending.h = atlas_h;
+    const ops = &app.atlas_pending;
+    ops.clearQueued();
+    // Allocates only on create; the texture is recreated from this mirror.
+    ops.mirror.resize(app.alloc, @as(usize, atlas_w) * atlas_h * 4) catch {
+        ops.mirror.clearRetainingCapacity();
+        ops.w = 0;
+        ops.h = 0;
+        return core.zonvie_core_abort_flush(app.corep);
+    };
+    @memset(ops.mirror.items, 0);
+    ops.recreate = true;
+    ops.w = atlas_w;
+    ops.h = atlas_h;
 }
 
 fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const core.GlyphBitmap) callconv(.c) void {
@@ -227,7 +236,15 @@ fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height:
     const len = @as(usize, width) * height * 4;
     ops.uploads.ensureUnusedCapacity(app.alloc, 1) catch return core.zonvie_core_abort_flush(app.corep);
     ops.pixels.resize(app.alloc, offset + len) catch return core.zonvie_core_abort_flush(app.corep);
-    atlas_pixels.toRgba8(bitmap, ops.pixels.items[offset..][0..len]);
+    const src = ops.pixels.items[offset..][0..len];
+    atlas_pixels.toRgba8(bitmap, src);
+    const row_bytes = @as(usize, width) * 4;
+    const stride = @as(usize, ops.w) * 4;
+    var r: usize = 0;
+    while (r < height) : (r += 1) {
+        const dst_off = (@as(usize, dest_y) + r) * stride + @as(usize, dest_x) * 4;
+        @memcpy(ops.mirror.items[dst_off..][0..row_bytes], src[r * row_bytes ..][0..row_bytes]);
+    }
     ops.uploads.appendAssumeCapacity(.{ .x = dest_x, .y = dest_y, .w = width, .h = height, .offset = offset });
 }
 
@@ -391,8 +408,9 @@ fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
 
 fn idleQuitRequested(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
+    const cp = app.corep orelse return 0;
     if (!app.quit_has_unsaved.load(.acquire)) {
-        core.zonvie_core_quit_confirmed(app.corep, 0);
+        core.zonvie_core_quit_confirmed(cp, 0);
         return 0;
     }
     const dialog = gtk.gtk_alert_dialog_new("%s", "Quit with unsaved changes?") orelse return 0;
@@ -411,7 +429,8 @@ fn onQuitDialogDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque)
     const choice = gtk.gtk_alert_dialog_choose_finish(source.?, result, &err);
     if (err) |e| gtk.g_error_free(e);
     gtk.g_object_unref(source.?);
-    if (choice == 1) core.zonvie_core_quit_confirmed(app.corep, 1);
+    if (choice != 1) return;
+    if (app.corep) |cp| core.zonvie_core_quit_confirmed(cp, 1);
 }
 
 fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
