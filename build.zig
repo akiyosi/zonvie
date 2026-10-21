@@ -684,6 +684,22 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
 
+    // Pure-logic tests for the Linux frontend. They import only std and
+    // zonvie_core, so they run on every host.
+    const linux_pure_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("linux/tests.zig"),
+        .imports = &.{.{ .name = "zonvie_core", .module = core_mod }},
+    });
+    linux_pure_test_mod.linkLibrary(core_lib);
+    const linux_pure_tests = b.addTest(.{
+        .name = "zonvie-linux-pure-test",
+        .root_module = linux_pure_test_mod,
+        .filters = test_filters,
+    });
+    test_step.dependOn(&b.addRunArtifact(linux_pure_tests).step);
+
     // Platform-independent coverage for the Windows frontend's lossy,
     // non-blocking logging queue.
     const windows_app_log_test_mod = b.createModule(.{
