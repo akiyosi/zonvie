@@ -107,6 +107,121 @@ pub const GridRows = struct {
     }
 };
 
+pub const SurfaceStore = struct {
+    grids: std.AutoHashMapUnmanaged(i64, *GridRows) = .empty,
+    layers_front: std.ArrayListUnmanaged(core.Layer) = .empty,
+    layers_back: std.ArrayListUnmanaged(core.Layer) = .empty,
+    layers_staged: bool = false,
+    cursor_front: std.ArrayListUnmanaged(Vertex) = .empty,
+    cursor_back: std.ArrayListUnmanaged(Vertex) = .empty,
+    cursor_front_grid: i64 = 0,
+    cursor_back_grid: i64 = 0,
+    cursor_staged: bool = false,
+    destroyed: std.ArrayListUnmanaged(i64) = .empty,
+
+    pub fn deinit(self: *SurfaceStore, alloc: std.mem.Allocator) void {
+        var it = self.grids.valueIterator();
+        while (it.next()) |g| {
+            g.*.deinit(alloc);
+            alloc.destroy(g.*);
+        }
+        self.grids.deinit(alloc);
+        self.layers_front.deinit(alloc);
+        self.layers_back.deinit(alloc);
+        self.cursor_front.deinit(alloc);
+        self.cursor_back.deinit(alloc);
+        self.destroyed.deinit(alloc);
+    }
+
+    /// Core thread only. The map grows only on a grid's first row, so App.mu
+    /// must be held around this call (paint iterates the same map).
+    pub fn rowsFor(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64) !*GridRows {
+        const gop = try self.grids.getOrPut(alloc, grid_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = alloc.create(GridRows) catch |e| {
+                _ = self.grids.remove(grid_id);
+                return e;
+            };
+            gop.value_ptr.*.* = .{};
+        }
+        return gop.value_ptr.*;
+    }
+
+    pub fn stageLayers(self: *SurfaceStore, alloc: std.mem.Allocator, layers: []const core.Layer, rows: u32, cols: u32) !void {
+        _ = rows;
+        _ = cols;
+        self.layers_back.clearRetainingCapacity();
+        try self.layers_back.appendSlice(alloc, layers);
+        self.layers_staged = true;
+    }
+
+    pub fn stageCursor(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64, verts: []const Vertex) !void {
+        self.cursor_back.clearRetainingCapacity();
+        try self.cursor_back.appendSlice(alloc, verts);
+        self.cursor_back_grid = grid_id;
+        self.cursor_staged = true;
+    }
+
+    pub fn stageDestroy(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64) !void {
+        // Bounded by live grid count; capacity is reused across flushes.
+        try self.destroyed.append(alloc, grid_id);
+    }
+
+    pub fn cancel(self: *SurfaceStore) void {
+        var it = self.grids.valueIterator();
+        while (it.next()) |g| g.*.cancel();
+        self.layers_staged = false;
+        self.cursor_staged = false;
+        self.destroyed.clearRetainingCapacity();
+    }
+
+    /// Caller holds App.mu. The only fallible step of a commit; on error the caller cancels.
+    pub fn prepareCommit(self: *SurfaceStore, alloc: std.mem.Allocator) !void {
+        var it = self.grids.valueIterator();
+        while (it.next()) |g| try g.*.prepareCommit(alloc);
+    }
+
+    /// Caller holds App.mu; prepareCommit must have succeeded since the last stage.
+    pub fn commit(self: *SurfaceStore, alloc: std.mem.Allocator) void {
+        var it = self.grids.valueIterator();
+        while (it.next()) |g| g.*.commit(alloc);
+        if (self.layers_staged) {
+            std.mem.swap(std.ArrayListUnmanaged(core.Layer), &self.layers_front, &self.layers_back);
+            self.layers_staged = false;
+        }
+        if (self.cursor_staged) {
+            std.mem.swap(std.ArrayListUnmanaged(Vertex), &self.cursor_front, &self.cursor_back);
+            self.cursor_front_grid = self.cursor_back_grid;
+            self.cursor_staged = false;
+        }
+        // A cursor whose grid left the layout must stop displaying (zonvie_core.h).
+        if (!self.hasLayer(self.cursor_front_grid)) self.cursor_front.clearRetainingCapacity();
+        for (self.destroyed.items) |id| {
+            if (self.grids.fetchRemove(id)) |kv| {
+                kv.value.deinit(alloc);
+                alloc.destroy(kv.value);
+            }
+        }
+        self.destroyed.clearRetainingCapacity();
+    }
+
+    fn hasLayer(self: *const SurfaceStore, grid_id: i64) bool {
+        for (self.layers_front.items) |l| if (l.grid_id == grid_id) return true;
+        return false;
+    }
+
+    pub fn committedLayers(self: *const SurfaceStore) []const core.Layer {
+        return self.layers_front.items;
+    }
+
+    pub fn committedGrid(self: *const SurfaceStore, grid_id: i64) ?*const GridRows {
+        return self.grids.get(grid_id);
+    }
+
+    pub fn committedCursor(self: *const SurfaceStore) struct { grid_id: i64, verts: []const Vertex } {
+        return .{ .grid_id = self.cursor_front_grid, .verts = self.cursor_front.items };
+    }
+};
 
 const testing = std.testing;
 
@@ -237,4 +352,96 @@ test "failed prepareCommit then cancel keeps the committed frame, even with a sh
     try testing.expectEqual(@as(usize, 2), g.committedRows().len);
     try testing.expectEqual(@as(?f32, 0), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 1));
+}
+
+fn layer(grid: i64, z: i32) core.Layer {
+    return .{ .grid_id = grid, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 2, .cols = 2, .z = z, .flags = 0 };
+}
+
+test "layers publish at commit only" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try testing.expectEqual(@as(usize, 0), s.committedLayers().len);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), s.committedLayers().len);
+}
+
+test "cursor-only update never touches rows" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try (try s.rowsFor(testing.allocator, 2)).stageRow(testing.allocator, 0, &.{v(5)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{layer(2, 0)}, 10, 10);
+    try s.stageCursor(testing.allocator, 2, &.{v(77)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(?f32, 5), firstY(s.committedGrid(2).?, 0));
+    try testing.expectEqual(@as(f32, 77), s.committedCursor().verts[0].position[1]);
+}
+
+test "layout drop hides a grid's rows and its cursor" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(3, 1) }, 10, 10);
+    try s.stageCursor(testing.allocator, 3, &.{v(1)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
+    try testing.expectEqual(@as(usize, 0), s.committedCursor().verts.len);
+}
+
+test "cancel keeps committed layers and cursor" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.stageCursor(testing.allocator, 1, &.{v(1)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageCursor(testing.allocator, 2, &.{v(2)});
+    s.cancel();
+    try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
+    try testing.expectEqual(@as(i64, 1), s.committedCursor().grid_id);
+}
+
+test "destroy frees the grid at commit, not before" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try (try s.rowsFor(testing.allocator, 4)).stageRow(testing.allocator, 0, &.{v(1)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageDestroy(testing.allocator, 4);
+    try testing.expect(s.committedGrid(4) != null);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expect(s.committedGrid(4) == null);
+}
+
+test "failed prepareCommit then cancel keeps committed layers, cursor and rows" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.stageCursor(testing.allocator, 1, &.{v(1)});
+    try (try s.rowsFor(testing.allocator, 1)).stageRow(testing.allocator, 0, &.{v(9)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+
+    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageCursor(testing.allocator, 2, &.{v(2)});
+    try (try s.rowsFor(testing.allocator, 1)).stageRow(testing.allocator, 0, &.{v(50)}, 64);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, s.prepareCommit(failing.allocator()));
+    s.cancel();
+
+    try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
+    try testing.expectEqual(@as(i64, 1), s.committedCursor().grid_id);
+    try testing.expectEqual(@as(f32, 1), s.committedCursor().verts[0].position[1]);
+    try testing.expectEqual(@as(usize, 1), s.committedGrid(1).?.committedRows().len);
+    try testing.expectEqual(@as(?f32, 9), firstY(s.committedGrid(1).?, 0));
 }
