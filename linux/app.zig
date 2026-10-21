@@ -57,6 +57,20 @@ pub const App = struct {
 
     atlas_pending: AtlasOps = .{},
 
+    // GL objects; GTK main thread only, valid between realize and unrealize.
+    gl_program: u32 = 0,
+    gl_vao: u32 = 0,
+    gl_vbo: u32 = 0,
+    gl_vbo_cap_bytes: usize = 0,
+    gl_atlas_tex: u32 = 0,
+    /// Size the GL texture was allocated at; 0 until the first atlas create lands.
+    gl_atlas_w: u32 = 0,
+    gl_atlas_h: u32 = 0,
+    gl_u_scale: i32 = -1,
+    gl_u_offset: i32 = -1,
+    /// One layer's rows concatenated for a single upload; capacity reused across frames.
+    gl_scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
+
     // GTK objects; written and read only on the GTK main thread.
     gl_area: ?*anyopaque = null,
     window: ?*anyopaque = null,
@@ -82,6 +96,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         self.surface.deinit(self.alloc);
         self.atlas_pending.deinit(self.alloc);
+        self.gl_scratch.deinit(self.alloc);
         self.fonts.deinit(self.alloc);
         self.clipboard_text.deinit(self.alloc);
     }
