@@ -20,6 +20,9 @@ pub const AtlasOps = struct {
     uploads: std.ArrayListUnmanaged(AtlasUpload) = .empty,
     /// RGBA8 pixels of `uploads`, back to back.
     pixels: std.ArrayListUnmanaged(u8) = .empty,
+    /// The whole atlas as RGBA8, w*h*4. A GL context realized again starts
+    /// with an empty texture; uploading this restores what the core caches.
+    mirror: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn clearQueued(self: *AtlasOps) void {
         self.uploads.clearRetainingCapacity();
@@ -29,6 +32,7 @@ pub const AtlasOps = struct {
     pub fn deinit(self: *AtlasOps, alloc: std.mem.Allocator) void {
         self.uploads.deinit(alloc);
         self.pixels.deinit(alloc);
+        self.mirror.deinit(alloc);
     }
 };
 

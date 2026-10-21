@@ -105,17 +105,15 @@ fn drainAtlas(app: *App) void {
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, app.gl_atlas_tex);
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-    // A context realized after the atlas was created has no storage yet.
+    // On atlas create, or a context realized again (gl_atlas_w reset to 0),
+    // the texture is rebuilt from the full mirror, which already holds every
+    // queued upload.
     if (ops.recreate or (ops.w != 0 and (app.gl_atlas_w != ops.w or app.gl_atlas_h != ops.h))) {
         if (ops.w != 0 and ops.h != 0) {
-            // Zeroed contents; runs only on atlas create, never per frame.
-            const bytes = @as(usize, ops.w) * ops.h * 4;
-            const zeros = app.alloc.alloc(u8, bytes) catch null;
-            defer if (zeros) |z| app.alloc.free(z);
-            if (zeros) |z| @memset(z, 0);
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, if (zeros) |z| z.ptr else null);
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items.ptr);
             app.gl_atlas_w = ops.w;
             app.gl_atlas_h = ops.h;
+            ops.clearQueued();
         }
         ops.recreate = false;
     }

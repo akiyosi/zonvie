@@ -42,26 +42,12 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
         applog.appLog("[linux] GLArea realize error\n", .{});
         return;
     }
+    // A realize after an unrealize leaves the texture empty; the next render
+    // rebuilds it from the CPU atlas mirror (gl_renderer.drainAtlas).
     if (!gl_renderer.realize(app)) return;
-    if (app.gl_realized_once) {
-        // The new context's atlas is empty while the core still caches glyphs.
-        _ = gtk.g_idle_add(&idleRebuildAtlas, app);
-        return;
-    }
+    if (app.gl_realized_once) return;
     app.gl_realized_once = true;
     startCore(app, area);
-}
-
-fn idleRebuildAtlas(data: ?*anyopaque) callconv(.c) c_int {
-    const cp = appFrom(data).corep orelse return 0;
-    // invalidate_glyph_cache requires grid_mu; held via lock_grid. The flush
-    // runs on this thread, and its callbacks take App.mu, which is not held.
-    core.zonvie_core_lock_grid(cp);
-    core.zonvie_core_invalidate_glyph_cache(cp);
-    core.zonvie_core_force_resend_locked(cp);
-    core.zonvie_core_retry_flush_locked(cp);
-    core.zonvie_core_unlock_grid(cp);
-    return 0;
 }
 
 fn onUnrealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
