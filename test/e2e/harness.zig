@@ -126,6 +126,11 @@ pub const Harness = struct {
     exit_code: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     verbose: bool = false,
 
+    // In-memory stand-in for the system clipboard: text only, like the real
+    // one, so the provider's regtype handling is what gets exercised.
+    clipboard_mu: std.Io.Mutex = .init,
+    clipboard: std.ArrayListUnmanaged(u8) = .empty,
+
     // External window callback recording (frontend-contract observation).
     ext_win_shows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     ext_win_closes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -220,6 +225,8 @@ pub const Harness = struct {
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
+            .on_clipboard_get = onClipboardGet,
+            .on_clipboard_set = onClipboardSet,
         };
         h.core = try alloc.create(Core);
         errdefer alloc.destroy(h.core);
@@ -269,7 +276,68 @@ pub const Harness = struct {
             h.alloc.free(e.content);
         }
         h.msg_showmodes.deinit(h.alloc);
+        h.clipboard.deinit(h.alloc);
         h.alloc.destroy(h);
+    }
+
+    // ── Clipboard (callbacks on the RPC thread; helpers on the test thread) ──
+
+    /// Replace the clipboard as another application would.
+    pub fn setClipboard(h: *Harness, text: []const u8) !void {
+        h.clipboard_mu.lockUncancelable(zc.clock.io());
+        defer h.clipboard_mu.unlock(zc.clock.io());
+        h.clipboard.clearRetainingCapacity();
+        try h.clipboard.appendSlice(h.alloc, text);
+    }
+
+    /// Wait until zonvie's provider has written `expected` to the clipboard.
+    pub fn waitClipboard(h: *Harness, expected: []const u8, timeout_ms: u64) !void {
+        h.waitUntil(expected, struct {
+            fn check(want: []const u8, hh: *Harness) bool {
+                hh.clipboard_mu.lockUncancelable(zc.clock.io());
+                defer hh.clipboard_mu.unlock(zc.clock.io());
+                return std.mem.eql(u8, hh.clipboard.items, want);
+            }
+        }.check, timeout_ms) catch |e| {
+            h.clipboard_mu.lockUncancelable(zc.clock.io());
+            defer h.clipboard_mu.unlock(zc.clock.io());
+            std.debug.print("[e2e] waitClipboard failed: expected=\"{s}\" actual=\"{s}\"\n", .{ expected, h.clipboard.items });
+            return e;
+        };
+    }
+
+    fn onClipboardGet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        out_buf: [*]u8,
+        out_len: *usize,
+        max_len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.clipboard_mu.lockUncancelable(zc.clock.io());
+        defer h.clipboard_mu.unlock(zc.clock.io());
+        // Report the full size, unclamped, so the core can detect truncation
+        // and retry with a buffer that fits.
+        out_len.* = h.clipboard.items.len;
+        const n = @min(h.clipboard.items.len, max_len);
+        @memcpy(out_buf[0..n], h.clipboard.items[0..n]);
+        return 1;
+    }
+
+    fn onClipboardSet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.clipboard_mu.lockUncancelable(zc.clock.io());
+        defer h.clipboard_mu.unlock(zc.clock.io());
+        h.clipboard.clearRetainingCapacity();
+        h.clipboard.appendSlice(h.alloc, data[0..len]) catch return 0;
+        return 1;
     }
 
     // ── Callbacks (RPC thread, grid_mu held — must not touch grid_mu) ──

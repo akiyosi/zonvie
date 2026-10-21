@@ -150,6 +150,11 @@ test "e2e:copy_paste_yank" {
     try @import("scenarios/copy_paste_yank.zig").run(testing.allocator);
 }
 
+test "e2e:clipboard_block_paste" {
+    try requireNvim();
+    try @import("scenarios/clipboard_block_paste.zig").run(testing.allocator);
+}
+
 test "e2e:marks_navigate" {
     try requireNvim();
     try @import("scenarios/marks_navigate.zig").run(testing.allocator);

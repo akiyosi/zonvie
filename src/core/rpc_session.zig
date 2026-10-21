@@ -3897,6 +3897,17 @@ test "clipboard get takes no heap path when the register already fits" {
     try std.testing.expectEqualSlices(u8, content, got);
 }
 
+test "clipboard get strips the CR of CRLF line endings" {
+    const alloc = std.testing.allocator;
+
+    // A bare CR inside a line is content, not a line ending, and must survive.
+    var probe = ClipboardGetProbe{ .content = "one\r\nt\rwo\r\n" };
+    const got = try probe.run(alloc);
+    defer alloc.free(got);
+
+    try std.testing.expectEqualSlices(u8, "one\nt\rwo\n", got);
+}
+
 /// Runs handleClipboardGet against the given frontend callback and returns the
 /// register content Neovim would receive, rejoined with '\n'. Caller frees.
 fn fetchClipboard(
