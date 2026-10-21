@@ -37,9 +37,12 @@ pub const GridRows = struct {
     }
 
     pub fn stageRow(self: *GridRows, alloc: std.mem.Allocator, row: u32, verts: []const Vertex, total_rows: u32) !void {
-        self.staged_len = total_rows;
-        if (row >= total_rows) return;
-        try self.ensureBack(alloc, total_rows);
+        // total_rows == 0 carries no row count (frontend_rules.zig:116, :151-152):
+        // the row is still content, and the length only grows to hold it.
+        const len: u32 = if (total_rows != 0) total_rows else @max(self.staged_len orelse @as(u32, @intCast(self.front.items.len)), row + 1);
+        self.staged_len = len;
+        if (row >= len) return;
+        try self.ensureBack(alloc, len);
         const dst = &self.back.items[row].verts;
         dst.clearRetainingCapacity();
         try dst.appendSlice(alloc, verts);
@@ -156,6 +159,10 @@ pub const SurfaceStore = struct {
     }
 
     pub fn stageCursor(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64, verts: []const Vertex) !void {
+        // Clearing another grid must not clear the owner's cursor (zonvie_core.h
+        // on_vertices_row; windows/render_pipeline_helpers.zig:318 ignoresCursorClear).
+        const owner = if (self.cursor_staged) self.cursor_back_grid else self.cursor_front_grid;
+        if (verts.len == 0 and grid_id != owner) return;
         self.cursor_back.clearRetainingCapacity();
         try self.cursor_back.appendSlice(alloc, verts);
         self.cursor_back_grid = grid_id;
@@ -444,4 +451,69 @@ test "failed prepareCommit then cancel keeps committed layers, cursor and rows" 
     try testing.expectEqual(@as(f32, 1), s.committedCursor().verts[0].position[1]);
     try testing.expectEqual(@as(usize, 1), s.committedGrid(1).?.committedRows().len);
     try testing.expectEqual(@as(?f32, 9), firstY(s.committedGrid(1).?, 0));
+}
+
+fn twoGridStore(s: *SurfaceStore) !void {
+    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+}
+
+test "cursor clear from a non-owner in the same flush keeps the owner's cursor" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try twoGridStore(&s);
+    try s.stageCursor(testing.allocator, 2, &.{v(7)});
+    try s.stageCursor(testing.allocator, 1, &.{});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(i64, 2), s.committedCursor().grid_id);
+    try testing.expectEqual(@as(usize, 1), s.committedCursor().verts.len);
+}
+
+test "cursor clear from a non-owner in a later flush keeps the committed cursor" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try twoGridStore(&s);
+    try s.stageCursor(testing.allocator, 2, &.{v(7)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageCursor(testing.allocator, 1, &.{});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(i64, 2), s.committedCursor().grid_id);
+    try testing.expectEqual(@as(usize, 1), s.committedCursor().verts.len);
+}
+
+test "cursor clear from the owner empties the cursor" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try twoGridStore(&s);
+    try s.stageCursor(testing.allocator, 2, &.{v(7)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try s.stageCursor(testing.allocator, 2, &.{});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), s.committedCursor().verts.len);
+}
+
+test "a row with no total_rows is content and never shrinks the grid" {
+    var g: GridRows = .{};
+    defer g.deinit(testing.allocator);
+    try g.stageRow(testing.allocator, 0, &.{v(1)}, 3);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator);
+    try g.stageRow(testing.allocator, 1, &.{v(2)}, 0);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), g.committedRows().len);
+    try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
+    try testing.expectEqual(@as(?f32, 2), firstY(&g, 1));
+    // First seed with no row count grows to hold the row.
+    var h: GridRows = .{};
+    defer h.deinit(testing.allocator);
+    try h.stageRow(testing.allocator, 2, &.{v(5)}, 0);
+    try h.prepareCommit(testing.allocator);
+    h.commit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), h.committedRows().len);
+    try testing.expectEqual(@as(?f32, 5), firstY(&h, 2));
 }
