@@ -11,6 +11,10 @@ pub fn toRgba8(bm: *const core.GlyphBitmap, out: []u8) void {
         @memset(out[0 .. w * h * 4], 0);
         return;
     };
+    if (bm.pitch < 0 or @as(usize, @intCast(bm.pitch)) < w * bm.bytes_per_pixel) {
+        @memset(out[0 .. w * h * 4], 0);
+        return;
+    }
     const pitch: usize = @intCast(bm.pitch);
     for (0..h) |y| {
         const dst = out[y * w * 4 ..][0 .. w * 4];
@@ -50,6 +54,22 @@ test "4-byte BGRA is swizzled to RGBA" {
     var out: [4]u8 = undefined;
     toRgba8(&bm, &out);
     try testing.expectEqualSlices(u8, &.{ 30, 20, 10, 40 }, &out);
+}
+
+test "negative pitch yields zeros" {
+    const px = [_]u8{ 1, 2, 3, 4 };
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 2, .height = 2, .pitch = -2, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 1 };
+    var out: [16]u8 = .{9} ** 16;
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &(.{0} ** 16), &out);
+}
+
+test "pitch smaller than a row yields zeros" {
+    const px = [_]u8{ 1, 2, 3, 4 };
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 2, .height = 2, .pitch = 1, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 1 };
+    var out: [16]u8 = .{9} ** 16;
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &(.{0} ** 16), &out);
 }
 
 test "unsupported bytes_per_pixel and null pixels yield zeros" {
