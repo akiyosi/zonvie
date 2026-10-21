@@ -95,6 +95,58 @@ pub extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const
 pub extern "c" fn g_free(ptr: ?*anyopaque) void;
 pub extern "c" fn g_error_free(err: *anyopaque) void;
 
+pub const GdkRectangle = extern struct { x: c_int, y: c_int, width: c_int, height: c_int };
+
+pub const GDK_GL_API_GL: c_uint = 1 << 0;
+pub const GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES: c_uint = (1 << 0) | (1 << 1);
+pub const GTK_EVENT_CONTROLLER_SCROLL_DISCRETE: c_uint = 1 << 2;
+
+pub extern "c" fn gtk_application_new(application_id: [*:0]const u8, flags: c_uint) ?*anyopaque;
+pub extern "c" fn g_application_run(application: *anyopaque, argc: c_int, argv: ?*anyopaque) c_int;
+pub extern "c" fn g_object_unref(object: *anyopaque) void;
+pub extern "c" fn gtk_application_window_new(application: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_window_set_default_size(window: *anyopaque, width: c_int, height: c_int) void;
+pub extern "c" fn gtk_window_set_child(window: *anyopaque, child: ?*anyopaque) void;
+pub extern "c" fn gtk_window_present(window: *anyopaque) void;
+pub extern "c" fn gtk_window_destroy(window: *anyopaque) void;
+pub extern "c" fn gtk_gl_area_new() ?*anyopaque;
+pub extern "c" fn gtk_gl_area_set_required_version(area: *anyopaque, major: c_int, minor: c_int) void;
+pub extern "c" fn gtk_gl_area_set_has_depth_buffer(area: *anyopaque, has_depth_buffer: c_int) void;
+pub extern "c" fn gtk_gl_area_set_allowed_apis(area: *anyopaque, apis: c_uint) void;
+pub extern "c" fn gtk_gl_area_make_current(area: *anyopaque) void;
+pub extern "c" fn gtk_gl_area_get_error(area: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_widget_get_width(widget: *anyopaque) c_int;
+pub extern "c" fn gtk_widget_get_height(widget: *anyopaque) c_int;
+pub extern "c" fn gtk_widget_get_scale_factor(widget: *anyopaque) c_int;
+pub extern "c" fn gtk_widget_set_focusable(widget: *anyopaque, focusable: c_int) void;
+pub extern "c" fn gtk_widget_grab_focus(widget: *anyopaque) c_int;
+pub extern "c" fn gtk_widget_add_controller(widget: *anyopaque, controller: *anyopaque) void;
+
+pub extern "c" fn gtk_event_controller_key_new() ?*anyopaque;
+pub extern "c" fn gtk_event_controller_key_set_im_context(controller: *anyopaque, im_context: *anyopaque) void;
+pub extern "c" fn gtk_event_controller_focus_new() ?*anyopaque;
+pub extern "c" fn gtk_event_controller_motion_new() ?*anyopaque;
+pub extern "c" fn gtk_event_controller_scroll_new(flags: c_uint) ?*anyopaque;
+pub extern "c" fn gtk_event_controller_get_current_event_state(controller: *anyopaque) c_uint;
+pub extern "c" fn gtk_gesture_click_new() ?*anyopaque;
+pub extern "c" fn gtk_gesture_single_set_button(gesture: *anyopaque, button: c_uint) void;
+pub extern "c" fn gtk_gesture_single_get_current_button(gesture: *anyopaque) c_uint;
+
+pub extern "c" fn gtk_im_multicontext_new() ?*anyopaque;
+pub extern "c" fn gtk_im_context_set_client_widget(context: *anyopaque, widget: ?*anyopaque) void;
+pub extern "c" fn gtk_im_context_focus_in(context: *anyopaque) void;
+pub extern "c" fn gtk_im_context_focus_out(context: *anyopaque) void;
+pub extern "c" fn gtk_im_context_set_cursor_location(context: *anyopaque, area: *const GdkRectangle) void;
+pub extern "c" fn gtk_im_context_get_preedit_string(context: *anyopaque, str: *?[*:0]u8, attrs: ?*?*anyopaque, cursor_pos: ?*c_int) void;
+
+pub extern "c" fn gtk_alert_dialog_new(format: [*:0]const u8, ...) ?*anyopaque;
+pub extern "c" fn gtk_alert_dialog_set_detail(dialog: *anyopaque, detail: [*:0]const u8) void;
+pub extern "c" fn gtk_alert_dialog_set_buttons(dialog: *anyopaque, labels: [*:null]const ?[*:0]const u8) void;
+pub extern "c" fn gtk_alert_dialog_set_cancel_button(dialog: *anyopaque, button: c_int) void;
+pub extern "c" fn gtk_alert_dialog_set_default_button(dialog: *anyopaque, button: c_int) void;
+pub extern "c" fn gtk_alert_dialog_choose(dialog: *anyopaque, parent: ?*anyopaque, cancellable: ?*anyopaque, callback: GAsyncReadyCallback, user_data: ?*anyopaque) void;
+pub extern "c" fn gtk_alert_dialog_choose_finish(dialog: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) c_int;
+
 extern "c" fn g_signal_connect_data(
     instance: *anyopaque,
     detailed_signal: [*:0]const u8,

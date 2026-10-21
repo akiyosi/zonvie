@@ -42,7 +42,8 @@ pub const App = struct {
     /// Font cell height plus linespace, as sent to the core.
     cell_h_px: u32 = 0,
     linespace_px: i32 = 0,
-    /// GLArea size in device pixels and its scale; set by the window (Task 8).
+    /// GLArea size in device pixels and its integer scale factor; written by
+    /// the GTK thread, read by the core thread, both under `mu`.
     drawable_w_px: u32 = 0,
     drawable_h_px: u32 = 0,
     scale: f32 = 1.0,
@@ -78,6 +79,29 @@ pub const App = struct {
     im_context: ?*anyopaque = null,
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
+    /// on_quit_requested's argument, read by its idle.
+    quit_has_unsaved: std.atomic.Value(bool) = .init(false),
+
+    // Window and input state; GTK main thread only.
+    /// main.zig's Startup, alive for the whole GTK run.
+    startup: ?*anyopaque = null,
+    gl_realized_once: bool = false,
+    layout_ready_sent: bool = false,
+    layout_retry_queued: bool = false,
+    start_failed: bool = false,
+    preedit_active: bool = false,
+    /// Logical widget px of the last pointer motion; the wheel has no position.
+    pointer_x: f64 = 0,
+    pointer_y: f64 = 0,
+    /// Button held since a press, and the grid that press chose.
+    held_button: ?[*:0]const u8 = null,
+    press_grid_id: i64 = 1,
+    drag_row: i32 = -1,
+    drag_col: i32 = -1,
+    /// Last complete visible-grid snapshot for pointer hit tests; kept when
+    /// the non-blocking query finds grid_mu busy.
+    pointer_grids: [32]core.GridInfo = undefined,
+    pointer_grids_len: usize = 0,
 
     // Core thread only.
     flush_failed: bool = false,
