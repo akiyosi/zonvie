@@ -288,27 +288,27 @@ pub fn build(b: *std.Build) !void {
         .name = "zonvie",
         .root_module = linux_mod,
     });
-    linux_exe.linkLibrary(core_lib);
-
-    // HarfBuzz/FreeType bridge (shared C implementation used by all frontends).
-    linux_exe.addCSourceFile(.{
-        .file = b.path("macos/Sources/Font/HBFTBridge.c"),
-        .flags = &.{},
-    });
+    linux_mod.linkLibrary(core_lib);
 
     // System libraries (linked at link time only, no C header processing).
     if (target.result.os.tag == .linux and !is_cross) {
-        linux_exe.linkSystemLibrary("gtk-4");
-        linux_exe.linkSystemLibrary("epoxy");
-        linux_exe.linkSystemLibrary("GL");
-        linux_exe.linkSystemLibrary("freetype2");
-        linux_exe.linkSystemLibrary("harfbuzz");
-        linux_exe.linkSystemLibrary("fontconfig");
+        // HarfBuzz/FreeType bridge (shared C implementation used by all
+        // frontends). It needs FreeType headers, so a cross build omits it.
+        linux_mod.addCSourceFile(.{
+            .file = b.path("macos/Sources/Font/HBFTBridge.c"),
+            .flags = &.{},
+        });
+        linux_mod.linkSystemLibrary("gtk-4", .{});
+        linux_mod.linkSystemLibrary("epoxy", .{});
+        linux_mod.linkSystemLibrary("GL", .{});
+        linux_mod.linkSystemLibrary("freetype2", .{});
+        linux_mod.linkSystemLibrary("harfbuzz", .{});
+        linux_mod.linkSystemLibrary("fontconfig", .{});
         // GLib/GObject/GIO (needed explicitly when pkg-config transitive deps
         // are not propagated by the Zig build system linker).
-        linux_exe.linkSystemLibrary("glib-2.0");
-        linux_exe.linkSystemLibrary("gobject-2.0");
-        linux_exe.linkSystemLibrary("gio-2.0");
+        linux_mod.linkSystemLibrary("glib-2.0", .{});
+        linux_mod.linkSystemLibrary("gobject-2.0", .{});
+        linux_mod.linkSystemLibrary("gio-2.0", .{});
     }
 
     const linux_step = b.step("linux", "Build Linux frontend");
@@ -321,7 +321,6 @@ pub fn build(b: *std.Build) !void {
             .name = "zonvie",
             .root_module = linux_mod,
         });
-        linux_obj.linkLibrary(core_lib);
         linux_step.dependOn(&linux_obj.step);
     } else {
         const install_linux = b.addInstallArtifact(linux_exe, .{

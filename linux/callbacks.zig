@@ -11,6 +11,7 @@ const applog = app_mod.applog;
 const gl_renderer = @import("renderer/gl_renderer.zig");
 const ft_renderer = @import("renderer/ft_renderer.zig");
 const core = @import("zonvie_core");
+const clock = core.clock;
 const main_mod = @import("main.zig");
 
 // =========================================================================
@@ -171,7 +172,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
 
     var can_flush = app.tbs.hasFreeSet();
     if (can_flush) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         var it = app.external_windows.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.tbs.hasFreeSet()) {
@@ -179,7 +180,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
                 break;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
     }
 
     if (!can_flush) {
@@ -189,7 +190,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
 
     var ok = app.tbs.beginFlush(app.alloc);
     if (ok) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         var it = app.external_windows.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.tbs.beginFlush(app.alloc)) {
@@ -197,17 +198,17 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
                 break;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
     }
 
     if (!ok) {
         app.tbs.cancelFlush();
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         var it2 = app.external_windows.iterator();
         while (it2.next()) |entry| {
             entry.value_ptr.tbs.cancelFlush();
         }
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         if (app.corep) |corep| app_mod.zonvie_core_abort_flush(corep);
         return;
     }
@@ -235,7 +236,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     app.last_flush_w = app.drawable_w_px;
     app.last_flush_h = app.drawable_h_px;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         var ext_it = app.external_windows.iterator();
         while (ext_it.next()) |entry| {
             // Overlay grids (cmdline, popupmenu) may be created mid-flush
@@ -251,7 +252,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             }
             entry.value_ptr.tbs.commitFlush(app.alloc);
         }
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
     }
 
     // Queue redraw + cursor blink update on GTK main thread
@@ -472,7 +473,7 @@ pub fn onVerticesRow(
     // External grids include both regular ext_windows (grid_id > 1) and
     // special grids like cmdline (CMDLINE_GRID_ID = -100)
     if (grid_id != 1) {
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         if (app.external_windows.getPtr(grid_id)) |ext| {
             storeExternalRowVerts(app, ext, row_start, row_count, verts, vert_count, flags, total_rows, total_cols);
 
@@ -492,12 +493,12 @@ pub fn onVerticesRow(
                     ext.tbs.is_in_flush = true;
                 }
                 ext.tbs.commitFlush(app.alloc);
-                app.mu.unlock();
+                app.mu.unlock(clock.io());
                 _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
                 return;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         return;
     }
 
@@ -660,8 +661,8 @@ pub fn onGridRowScroll(
     _ = col_end;
     const app = getApp(ctx) orelse return;
 
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
 
     if (app.external_windows.getPtr(grid_id)) |ext| {
         const vs = ext.tbs.writeSet();
@@ -733,8 +734,8 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
     const src: [*]const u8 = @ptrCast(bitmap.pixels.?);
     @memcpy(pixel_copy, src[0..total_bytes]);
 
-    app.atlas_mu.lock();
-    defer app.atlas_mu.unlock();
+    app.atlas_mu.lockUncancelable(clock.io());
+    defer app.atlas_mu.unlock(clock.io());
     app.pending_atlas_ops.append(app.alloc, .{ .upload = .{
         .dest_x = dest_x,
         .dest_y = dest_y,
@@ -751,8 +752,8 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
 pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
-    app.atlas_mu.lock();
-    defer app.atlas_mu.unlock();
+    app.atlas_mu.lockUncancelable(clock.io());
+    defer app.atlas_mu.unlock(clock.io());
     app.pending_atlas_ops.append(app.alloc, .{ .create = .{
         .w = atlas_w,
         .h = atlas_h,
@@ -1125,20 +1126,18 @@ pub fn onClipboardGet(
     if (applog.isEnabled()) applog.appLog("[linux] clipboard_get: called\n", .{});
 
     // Reset state and post to GTK main thread
-    app.clipboard_mu.lock();
+    app.clipboard_mu.lockUncancelable(clock.io());
     app.clipboard_ready = false;
     app.clipboard_len = 0;
     app.clipboard_result = 1;
-    app.clipboard_mu.unlock();
+    app.clipboard_mu.unlock(clock.io());
 
     _ = gtk_mod.g_idle_add(&idleClipboardGet, @ptrCast(app));
 
     // Wait for GTK main thread to complete (timeout 5s)
-    app.clipboard_mu.lock();
-    defer app.clipboard_mu.unlock();
-    if (!app.clipboard_ready) {
-        app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
-    }
+    app.clipboard_mu.lockUncancelable(clock.io());
+    defer app.clipboard_mu.unlock(clock.io());
+    waitClipboardReadyLocked(app);
 
     if (!app.clipboard_ready) {
         if (applog.isEnabled()) applog.appLog("[linux] clipboard_get: timeout\n", .{});
@@ -1196,13 +1195,25 @@ fn onClipboardReadFinish(source: ?*anyopaque, result: ?*anyopaque, user_data: ?*
     signalClipboardDone(app, 0, copy_len);
 }
 
+/// Waits up to 5s for the GTK main thread to set clipboard_ready. Called and
+/// returns with clipboard_mu held. std.Io.Condition has no timed wait, so this
+/// polls; the mutex is released while sleeping so the GTK side can finish.
+fn waitClipboardReadyLocked(app: *App) void {
+    const io = clock.io();
+    const deadline_ns = clock.nowNs() + 5 * std.time.ns_per_s;
+    while (!app.clipboard_ready and clock.nowNs() < deadline_ns) {
+        app.clipboard_mu.unlock(io);
+        std.Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+        app.clipboard_mu.lockUncancelable(io);
+    }
+}
+
 fn signalClipboardDone(app: *App, result: c_int, len: usize) void {
-    app.clipboard_mu.lock();
-    defer app.clipboard_mu.unlock();
+    app.clipboard_mu.lockUncancelable(clock.io());
+    defer app.clipboard_mu.unlock(clock.io());
     app.clipboard_result = result;
     app.clipboard_len = len;
     app.clipboard_ready = true;
-    app.clipboard_cond.signal();
 }
 
 /// Heap-allocated payload for the GTK idle source created by onClipboardSet.
@@ -1251,8 +1262,8 @@ pub fn onClipboardSet(
     // ready/result fields the waiter is about to read.
     var my_seq: u64 = 0;
     {
-        app.clipboard_mu.lock();
-        defer app.clipboard_mu.unlock();
+        app.clipboard_mu.lockUncancelable(clock.io());
+        defer app.clipboard_mu.unlock(clock.io());
         app.clipboard_ready = false;
         app.clipboard_set_seq +%= 1;
         my_seq = app.clipboard_set_seq;
@@ -1269,11 +1280,9 @@ pub fn onClipboardSet(
 
     // Wait for GTK main thread to complete
     {
-        app.clipboard_mu.lock();
-        defer app.clipboard_mu.unlock();
-        if (!app.clipboard_ready) {
-            app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
-        }
+        app.clipboard_mu.lockUncancelable(clock.io());
+        defer app.clipboard_mu.unlock(clock.io());
+        waitClipboardReadyLocked(app);
 
         if (!app.clipboard_ready) {
             // Invalidate any in-flight idle by bumping seq. The idle will
@@ -1303,8 +1312,8 @@ fn idleClipboardSet(user_data: ?*anyopaque) callconv(.c) c_int {
     // touch the system clipboard and do not signal the waiter (which now
     // belongs to a different operation).
     {
-        app.clipboard_mu.lock();
-        defer app.clipboard_mu.unlock();
+        app.clipboard_mu.lockUncancelable(clock.io());
+        defer app.clipboard_mu.unlock(clock.io());
         if (app.clipboard_set_seq != my_seq) {
             if (applog.isEnabled()) applog.appLog("[linux] clipboard_set idle: stale (mine={d} cur={d}) — skipped\n", .{ my_seq, app.clipboard_set_seq });
             return 0;
@@ -1335,13 +1344,12 @@ fn idleClipboardSet(user_data: ?*anyopaque) callconv(.c) c_int {
 /// matches. Prevents an out-of-band signal from waking a *different* caller
 /// after the original has timed out.
 fn signalClipboardDoneIfCurrent(app: *App, seq: u64, result: c_int, len: usize) void {
-    app.clipboard_mu.lock();
-    defer app.clipboard_mu.unlock();
+    app.clipboard_mu.lockUncancelable(clock.io());
+    defer app.clipboard_mu.unlock(clock.io());
     if (app.clipboard_set_seq != seq) return;
     app.clipboard_result = result;
     app.clipboard_len = len;
     app.clipboard_ready = true;
-    app.clipboard_cond.signal();
 }
 
 // GDK clipboard extern declarations
@@ -1411,10 +1419,10 @@ pub fn onCmdlineShow(
     const app = getApp(ctx) orelse return;
     if (applog.isEnabled()) applog.appLog("[linux] on_cmdline_show: firstc={c}({d})\n", .{ firstc, firstc });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.cmdline_firstc = firstc;
     app.cmdline_visible = true;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     // Schedule cmdline color update on GTK main thread
     // (cannot call core hl lookup from callback context — core lock is held)
@@ -1425,10 +1433,10 @@ pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
     const app = getApp(ctx) orelse return;
     if (applog.isEnabled()) applog.appLog("[linux] on_cmdline_hide\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.cmdline_firstc = 0;
     app.cmdline_visible = false;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     // Request redraw to clear the overlay
     if (app.gl_area) |area| {
@@ -1476,10 +1484,10 @@ fn idleUpdateCmdlineColors(user_data: ?*anyopaque) callconv(.c) c_int {
         icon_b = @as(f32, @floatFromInt(fg_rgb & 0xFF)) / 255.0;
     }
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     // Trigger redraw
     if (app.gl_area) |area| {
@@ -1530,12 +1538,12 @@ pub fn onPopupmenuShow(
     const app = getApp(ctx) orelse return;
     if (applog.isEnabled()) applog.appLog("[linux] on_popupmenu_show: row={d} col={d} grid={d}\n", .{ row, col, grid_id });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.popupmenu_visible = true;
     app.popupmenu_anchor_row = row;
     app.popupmenu_anchor_col = col;
     app.popupmenu_anchor_grid = grid_id;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     // Refresh the popup border color from the Pmenu / PmenuSel highlights
     // so it matches the colorscheme. Must be deferred — core holds grid_mu
@@ -1551,9 +1559,9 @@ pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
     const app = getApp(ctx) orelse return;
     if (applog.isEnabled()) applog.appLog("[linux] on_popupmenu_hide\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.popupmenu_visible = false;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
 }
@@ -1596,9 +1604,9 @@ fn idleUpdatePopupmenuColors(user_data: ?*anyopaque) callconv(.c) c_int {
         border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
     }
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.popupmenu_border_color = .{ border_r, border_g, border_b };
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (app.gl_area) |area| {
         main_mod.gtk_externs.widget_queue_draw(area);
@@ -1752,10 +1760,10 @@ fn handleMsgMini(
     }
 
     const idx = @intFromEnum(mini_id);
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
     app.mini_windows[idx].text_len = text_len;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     _ = gtk_mod.g_idle_add(&idleUpdateMiniLabel, @ptrCast(app));
 }
@@ -1768,7 +1776,7 @@ fn idleUpdateMiniLabel(user_data: ?*anyopaque) callconv(.c) c_int {
     var combined: [768]u8 = undefined;
     var combined_len: usize = 0;
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     for (app.mini_windows) |mw| {
         if (mw.text_len > 0) {
             if (combined_len > 0 and combined_len < combined.len - 2) {
@@ -1781,7 +1789,7 @@ fn idleUpdateMiniLabel(user_data: ?*anyopaque) callconv(.c) c_int {
             combined_len += copy_len;
         }
     }
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     if (combined_len > 0 and combined_len < combined.len) {
         combined[combined_len] = 0;
@@ -1831,8 +1839,8 @@ pub fn onTablineUpdate(
 
     if (applog.isEnabled()) applog.appLog("[linux] onTablineUpdate: curtab={d} tab_count={d}\n", .{ curtab, tab_count });
 
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
 
     app.tabline.clear(app.alloc);
     app.tabline.current_tab = curtab;
@@ -1859,9 +1867,9 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 
     if (applog.isEnabled()) applog.appLog("[linux] onTablineHide\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
     app.tabline.visible = false;
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     _ = gtk_mod.g_idle_add(&idleUpdateTabBar, @ptrCast(app));
 }
@@ -1883,8 +1891,8 @@ fn idleUpdateTabBar(user_data: ?*anyopaque) callconv(.c) c_int {
     var visible: bool = false;
 
     {
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(clock.io());
+        defer app.mu.unlock(clock.io());
         visible = app.tabline.visible;
         current_tab = app.tabline.current_tab;
         copy_count = @min(app.tabline.tabs.items.len, MAX_TABS);
@@ -1974,8 +1982,8 @@ pub fn onExternalWindow(
         // Register in external_windows without creating a GtkWindow.
         if (applog.isEnabled()) applog.appLog("[linux] onExternalWindow: overlay grid_id={d} rows={d} cols={d} start=({d},{d})\n", .{ grid_id, rows, cols, start_row, start_col });
 
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(clock.io());
+        defer app.mu.unlock(clock.io());
 
         if (app.external_windows.getPtr(grid_id)) |ext| {
             ext.rows = rows;
@@ -2002,8 +2010,8 @@ pub fn onExternalWindow(
         return;
     }
 
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
 
     app.pending_external_windows.append(app.alloc, .{
         .grid_id = grid_id,
@@ -2035,14 +2043,14 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
 
     if (is_overlay) {
         if (applog.isEnabled()) applog.appLog("[linux] onExternalWindowClose: overlay grid_id={d}\n", .{grid_id});
-        app.mu.lock();
+        app.mu.lockUncancelable(clock.io());
         if (app.external_windows.fetchRemove(grid_id)) |kv| {
             var ext = kv.value;
             ext.deinit(app.alloc);
         }
         if (grid_id == app_mod.CMDLINE_GRID_ID) app.cmdline_visible = false;
         if (grid_id == app_mod.POPUPMENU_GRID_ID) app.popupmenu_visible = false;
-        app.mu.unlock();
+        app.mu.unlock(clock.io());
         _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
         return;
     }
@@ -2060,7 +2068,7 @@ pub fn onExternalVertices(
 ) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
-    app.mu.lock();
+    app.mu.lockUncancelable(clock.io());
 
     if (app.external_windows.getPtr(grid_id)) |ext| {
         ext.rows = rows;
@@ -2073,7 +2081,7 @@ pub fn onExternalVertices(
         ext.needs_redraw = true;
     }
 
-    app.mu.unlock();
+    app.mu.unlock(clock.io());
 
     // For overlay grids, queue a redraw of the main GLArea
     if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID or

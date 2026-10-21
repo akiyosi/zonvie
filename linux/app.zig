@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const core = @import("zonvie_core");
+const clock = core.clock;
 pub const gtk_mod = @import("gtk_bindings.zig");
 pub const gl = @import("gl.zig");
 pub const applog = @import("app_log.zig");
@@ -208,9 +209,9 @@ pub const Rect = struct {
 /// external vertices. Holds vertex storage, grid dimensions, dirty
 /// tracking, and cursor row info.
 pub const SurfaceState = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
-    row_verts: std.ArrayListUnmanaged(RowVerts) = .{},
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    row_verts: std.ArrayListUnmanaged(RowVerts) = .empty,
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     dirty_rows: std.AutoHashMapUnmanaged(u32, void) = .{},
     paint_full: bool = true,
@@ -266,7 +267,7 @@ pub const SLOT_NONE: u16 = std.math.maxInt(u16);
 
 /// Physical row slot. Ref-counted vertex buffer shared across VertexSets.
 pub const RowSlot = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
     ref_count: u16 = 0,
     origin_row: u32 = 0,
     ver: u64 = 0,
@@ -279,8 +280,8 @@ pub const RowMapping = struct {
 
 /// Pool of physical row slots shared across all VertexSets in a TBS.
 pub const SlotPool = struct {
-    slots: std.ArrayListUnmanaged(RowSlot) = .{},
-    free_list: std.ArrayListUnmanaged(u16) = .{},
+    slots: std.ArrayListUnmanaged(RowSlot) = .empty,
+    free_list: std.ArrayListUnmanaged(u16) = .empty,
 
     pub fn acquireSlot(self: *SlotPool, alloc: std.mem.Allocator) ?u16 {
         if (self.free_list.items.len > 0) {
@@ -319,9 +320,9 @@ pub const SlotPool = struct {
 /// One frame's worth of CPU-side vertex data.
 /// Three of these rotate inside TripleBufferedSurface.
 pub const VertexSet = struct {
-    row_map: std.ArrayListUnmanaged(RowMapping) = .{},
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
-    flat_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_map: std.ArrayListUnmanaged(RowMapping) = .empty,
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    flat_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     rows: u32 = 0,
     cols: u32 = 0,
@@ -379,7 +380,7 @@ pub const TripleBufferedSurface = struct {
     sets: [SET_COUNT]VertexSet = .{ .{}, .{}, .{} },
     pool: SlotPool = .{},
 
-    rotation_mu: std.Thread.Mutex = .{},
+    rotation_mu: std.Io.Mutex = .init,
     write_index: u8 = 0,
     committed_index: u8 = 1,
     flush_source_index: u8 = 1,
@@ -406,8 +407,8 @@ pub const TripleBufferedSurface = struct {
     paint_nesting: u32 = 0,
 
     pub fn hasFreeSet(self: *TripleBufferedSurface) bool {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(clock.io());
+        defer self.rotation_mu.unlock(clock.io());
         const ci = self.committed_index;
         for (0..SET_COUNT) |i| {
             const idx: u8 = @intCast(i);
@@ -421,8 +422,8 @@ pub const TripleBufferedSurface = struct {
     /// rotation_mu — commitFlush / acquireForPaint manipulate this field
     /// under that lock, so cross-thread bare writes would race with them.
     pub fn requestFullRepaint(self: *TripleBufferedSurface) void {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(clock.io());
+        defer self.rotation_mu.unlock(clock.io());
         self.pending_paint_full = true;
     }
 
@@ -431,8 +432,8 @@ pub const TripleBufferedSurface = struct {
         var ci: u8 = undefined;
 
         {
-            self.rotation_mu.lock();
-            defer self.rotation_mu.unlock();
+            self.rotation_mu.lockUncancelable(clock.io());
+            defer self.rotation_mu.unlock(clock.io());
             ci = self.committed_index;
             for (0..SET_COUNT) |i| {
                 const idx: u8 = @intCast(i);
@@ -468,8 +469,8 @@ pub const TripleBufferedSurface = struct {
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
         if (!self.is_in_flush) return;
 
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(clock.io());
+        defer self.rotation_mu.unlock(clock.io());
 
         if (self.flush_dirty.bit_length > 0) {
             if (self.pending_dirty.bit_length != self.flush_dirty.bit_length) {
@@ -530,8 +531,8 @@ pub const TripleBufferedSurface = struct {
     }
 
     pub fn acquireForPaint(self: *TripleBufferedSurface) PaintSnapshot {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(clock.io());
+        defer self.rotation_mu.unlock(clock.io());
 
         const ci = self.committed_index;
         self.ui_read_refcount[ci] += 1;
@@ -573,8 +574,8 @@ pub const TripleBufferedSurface = struct {
     }
 
     pub fn releaseFromPaint(self: *TripleBufferedSurface, index: u8) bool {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(clock.io());
+        defer self.rotation_mu.unlock(clock.io());
         self.ui_read_refcount[index] -= 1;
         self.paint_nesting -= 1;
         const needs_reinvalidate = (self.paint_nesting == 0) and
@@ -689,7 +690,7 @@ pub const PendingExternalVertices = struct {
 
 /// Legacy combined struct for backward compatibility.
 pub const RowVerts = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // GL VBO handle (owned by renderer, set to 0 when not created)
     gl_vbo: u32 = 0,
@@ -717,7 +718,7 @@ pub const ExternalWindow = struct {
 
     surface: SurfaceState = .{},
     tbs: TripleBufferedSurface = .{},
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
 
     needs_redraw: bool = false,
     rows: u32 = 0,
@@ -745,7 +746,7 @@ pub const ExternalWindow = struct {
 pub const App = struct {
     alloc: std.mem.Allocator,
     config: config_mod.Config = .{},
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     // GTK handles (stored as opaque pointers, cast to zig-gobject types at use site)
     gtk_app: ?*anyopaque = null,
@@ -763,15 +764,15 @@ pub const App = struct {
     // Rendering state
     surface: SurfaceState = .{},
     tbs: TripleBufferedSurface = .{},
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
     row_valid: std.DynamicBitSetUnmanaged = .{},
     row_valid_count: u32 = 0,
     flush_needs_invalidate: bool = false,
 
     // External windows
     external_windows: std.AutoHashMapUnmanaged(i64, ExternalWindow) = .{},
-    pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
-    pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .{},
+    pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .empty,
+    pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .empty,
 
     // ext_cmdline state
     cmdline_firstc: u8 = 0,
@@ -846,7 +847,7 @@ pub const App = struct {
     devcontainer_rebuild: bool = false,
 
     // Extra nvim args
-    nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .{},
+    nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty,
     cli_nvim_path: ?[]const u8 = null,
 
     // Deferred GL resize flag (set from onResize, processed in render with GL context current)
@@ -859,8 +860,8 @@ pub const App = struct {
     last_flush_h: u32 = 0,
 
     // Pending atlas operations (queued from core thread, flushed on GL thread)
-    pending_atlas_ops: std.ArrayListUnmanaged(PendingAtlasOp) = .{},
-    atlas_mu: std.Thread.Mutex = .{},
+    pending_atlas_ops: std.ArrayListUnmanaged(PendingAtlasOp) = .empty,
+    atlas_mu: std.Io.Mutex = .init,
 
     // GL state
     gl_program_main: u32 = 0,
@@ -900,8 +901,7 @@ pub const App = struct {
     pending_title_len: usize = 0,
 
     // Clipboard (async GTK ↔ sync core bridge)
-    clipboard_mu: std.Thread.Mutex = .{},
-    clipboard_cond: std.Thread.Condition = .{},
+    clipboard_mu: std.Io.Mutex = .init,
     clipboard_buf: [65536]u8 = undefined,
     clipboard_len: usize = 0,
     clipboard_result: c_int = 0,
