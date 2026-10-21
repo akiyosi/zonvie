@@ -1,0 +1,88 @@
+//! All Linux frontend state. Core callbacks write it on the core thread;
+//! the GTK main thread reads it. `mu` guards everything both threads touch.
+
+const std = @import("std");
+const core = @import("zonvie_core");
+const SurfaceStore = @import("surface_store.zig").SurfaceStore;
+const Fonts = @import("renderer/font.zig").Fonts;
+
+pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
+
+/// Atlas work for the GL thread. Not transactional: an upload that returned
+/// normally is cached by the core (zonvie_core.h on_atlas_upload), so a failed
+/// flush must never drop it. Guarded by App.mu.
+pub const AtlasOps = struct {
+    /// Set by on_atlas_create; the GL side recreates a zeroed w x h texture
+    /// before applying `uploads`.
+    recreate: bool = false,
+    w: u32 = 0,
+    h: u32 = 0,
+    uploads: std.ArrayListUnmanaged(AtlasUpload) = .empty,
+    /// RGBA8 pixels of `uploads`, back to back.
+    pixels: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn clearQueued(self: *AtlasOps) void {
+        self.uploads.clearRetainingCapacity();
+        self.pixels.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *AtlasOps, alloc: std.mem.Allocator) void {
+        self.uploads.deinit(alloc);
+        self.pixels.deinit(alloc);
+    }
+};
+
+pub const App = struct {
+    alloc: std.mem.Allocator,
+    mu: std.Io.Mutex = .init,
+    surface: SurfaceStore = .{},
+    corep: ?*core.zonvie_core = null,
+
+    cell_w_px: u32 = 0,
+    /// Font cell height plus linespace, as sent to the core.
+    cell_h_px: u32 = 0,
+    linespace_px: i32 = 0,
+    /// GLArea size in device pixels and its scale; set by the window (Task 8).
+    drawable_w_px: u32 = 0,
+    drawable_h_px: u32 = 0,
+    scale: f32 = 1.0,
+    default_fg: u32 = 0xffffff,
+    default_bg: u32 = 0,
+    /// Neovim-requested grid size, consumed by the window.
+    requested_rows: u32 = 0,
+    requested_cols: u32 = 0,
+    title: [256]u8 = undefined,
+    title_len: usize = 0,
+    exit_code: ?i32 = null,
+
+    atlas_pending: AtlasOps = .{},
+
+    // GTK objects; written and read only on the GTK main thread.
+    gl_area: ?*anyopaque = null,
+    window: ?*anyopaque = null,
+    gtk_app: ?*anyopaque = null,
+    im_context: ?*anyopaque = null,
+    /// Coalesces queue-render idles to at most one outstanding.
+    render_idle_queued: std.atomic.Value(bool) = .init(false),
+
+    // Core thread only.
+    flush_failed: bool = false,
+    fonts: Fonts = .{},
+    foreign_surface_logged: bool = false,
+
+    clipboard_mu: std.Io.Mutex = .init,
+    /// A get's whole text; out_len reports its full size (zonvie_core.h).
+    clipboard_text: std.ArrayListUnmanaged(u8) = .empty,
+    clipboard_result: c_int = 0,
+    clipboard_ready: bool = false,
+    /// Bumped per clipboard operation; a GTK completion whose seq is stale
+    /// belongs to a caller that timed out and must not signal.
+    clipboard_seq: u64 = 0,
+
+    pub fn deinit(self: *App) void {
+        self.surface.deinit(self.alloc);
+        self.atlas_pending.deinit(self.alloc);
+        self.fonts.deinit(self.alloc);
+        self.clipboard_text.deinit(self.alloc);
+    }
+};

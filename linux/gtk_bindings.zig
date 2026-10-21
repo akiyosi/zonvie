@@ -81,6 +81,20 @@ pub fn g_signal_connect(
     return g_signal_connect_data(instance, detailed_signal, c_handler, data, null, 0);
 }
 
+pub extern "c" fn gtk_gl_area_queue_render(area: *anyopaque) void;
+pub extern "c" fn gtk_window_set_title(window: *anyopaque, title: [*:0]const u8) void;
+pub extern "c" fn gtk_im_context_reset(context: *anyopaque) void;
+pub extern "c" fn g_application_quit(application: *anyopaque) void;
+
+pub const GAsyncReadyCallback = *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) void;
+pub extern "c" fn gdk_display_get_default() ?*anyopaque;
+pub extern "c" fn gdk_display_get_clipboard(display: *anyopaque) ?*anyopaque;
+pub extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellable: ?*anyopaque, callback: GAsyncReadyCallback, user_data: ?*anyopaque) void;
+pub extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]u8;
+pub extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const u8) void;
+pub extern "c" fn g_free(ptr: ?*anyopaque) void;
+pub extern "c" fn g_error_free(err: *anyopaque) void;
+
 extern "c" fn g_signal_connect_data(
     instance: *anyopaque,
     detailed_signal: [*:0]const u8,
