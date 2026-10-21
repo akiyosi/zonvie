@@ -471,6 +471,15 @@ final class MetalTerminalView: GridInputView {
         hitTestGrid(at: convert(event.locationInWindow, from: nil))
     }
 
+    override func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
+        if action == "press", ZonvieConfig.shared.floats.peel,
+           let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) {
+            renderer.noteFloatPeelPress(atPx: g.pointPx)
+            activateSurfaceDrawLoop()
+        }
+        super.sendGridMouseEvent(button: button, action: action, event: event)
+    }
+
     override func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64) -> (gridId: Int64, row: Int32, col: Int32)? {
         guard let core, let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
         // The pinned grid closed mid-drag: the surface's root grid in

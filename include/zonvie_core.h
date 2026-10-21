@@ -1909,6 +1909,8 @@ typedef struct zonvie_config_values {
     // read directly from the parsed config by the Windows frontend, so it is
     // not exposed here.
     const char* server_open_mode;  // "tab" or "current"
+    // floats
+    bool float_peel;  // curl a float back where it hides the cursor
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

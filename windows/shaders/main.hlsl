@@ -438,3 +438,46 @@ float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
 float4 PSGlowComposite(FSQuadVSOut i) : SV_Target {
     return glowTex.Sample(glowSamp, i.uv) * glowIntensity;
 }
+
+// Float peel: the float, drawn alone into a surface-sized texture (glowTex),
+// folded back along a line (zonvie_float_peel in zonvie_frontend.h); the flap
+// may land outside the float's rect, so this is drawn over the peel's bounds.
+// Blended premultiplied over the back texture, which already holds what the
+// float covers. Mirrors ps_float_peel in Shaders.metal.
+cbuffer FloatPeelParams : register(b1) {
+    float2 peelCornerPx;
+    float2 peelDir;
+    float4 peelRectPx; // x0, y0, x1, y1
+    float peelFoldPx;
+    float3 _peelPad;
+};
+
+float4 PSFloatPeel(FSQuadVSOut i) : SV_Target {
+    uint w, h;
+    glowTex.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    float2 p = i.pos.xy;
+    float s = dot(p - peelCornerPx, peelDir);
+    bool inFloat = all(p >= peelRectPx.xy) && all(p < peelRectPx.zw);
+    if (s < peelFoldPx) {
+        if (!inFloat) return float4(0.0, 0.0, 0.0, 0.0);
+        // Uncovered: only the shadow the flap casts along the fold.
+        float shade = 0.28 * (1.0 - smoothstep(0.0, 14.0, peelFoldPx - s));
+        return float4(0.0, 0.0, 0.0, shade);
+    }
+    // The flap's back, where the folded part lands.
+    float2 q = p - 2.0 * (s - peelFoldPx) * peelDir;
+    if (all(q >= peelRectPx.xy) && all(q < peelRectPx.zw)) {
+        float4 c = glowTex.Sample(glowSamp, q / size);
+        float luma = dot(c.rgb, float3(0.299, 0.587, 0.114));
+        float3 back = lerp(c.rgb, luma.xxx, 0.6) * 0.8 + 0.12 * c.a;
+        // Brighter toward the crease, as a bent sheet catches the light.
+        float crease = 1.0 - smoothstep(0.0, 24.0, s - peelFoldPx);
+        return float4(back + 0.08 * crease * c.a, c.a);
+    }
+    if (!inFloat) return float4(0.0, 0.0, 0.0, 0.0);
+    float4 c = glowTex.Sample(glowSamp, p / size);
+    // The flap's own shadow on the float just past its edge.
+    float shade = 1.0 - 0.25 * (1.0 - smoothstep(0.0, 10.0, s - peelFoldPx));
+    return float4(c.rgb * shade, c.a);
+}

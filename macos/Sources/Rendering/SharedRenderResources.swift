@@ -125,6 +125,7 @@ final class SharedRenderResources {
     var kawaseDownPipeline: MTLRenderPipelineState?
     var kawaseUpPipeline: MTLRenderPipelineState?
     var glowCompositePipeline: MTLRenderPipelineState?
+    var floatPeelPipeline: MTLRenderPipelineState?
     var glowOccludePipeline: MTLRenderPipelineState?
     var bilinearSampler: MTLSamplerState?
 
@@ -1347,6 +1348,27 @@ extension SharedRenderResources {
             a.destinationRGBBlendFactor = .one
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .one
+        }
+
+        // Float peel: premultiplied `over` onto the back texture. Built with the
+        // bloom set because it is the same full-screen-quad shape; it does not
+        // depend on bloom being on.
+        let peelDesc = MTLRenderPipelineDescriptor()
+        peelDesc.vertexFunction = vsCopy
+        peelDesc.fragmentFunction = lib.makeFunction(name: "ps_float_peel")
+        peelDesc.vertexDescriptor = copyVertexDesc
+        peelDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = peelDesc.colorAttachments[0] {
+            a.isBlendingEnabled = true
+            a.rgbBlendOperation = .add
+            a.alphaBlendOperation = .add
+            a.sourceRGBBlendFactor = .one
+            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.sourceAlphaBlendFactor = .one
+            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+        if peelDesc.fragmentFunction != nil {
+            floatPeelPipeline = try? device.makeRenderPipelineState(descriptor: peelDesc)
         }
 
         do {

@@ -49,6 +49,8 @@ const pairs = .{
     .{ c.zonvie_placement_memory, frontend_rules.PlacementMemory },
     .{ c.zonvie_blink, frontend_rules.Blink },
     .{ c.zonvie_scroll_spring, scroll_ease.Spring },
+    .{ c.zonvie_float_peel, c_api.float_peel.Peel },
+    .{ c.zonvie_float_peel_frame, c_api.float_peel.Frame },
     .{ c.zonvie_viewport_info, c_api.ViewportInfo },
     .{ c.zonvie_glow_pass, glow_chain.Pass },
     .{ c.zonvie_glow_chain, glow_chain.Chain },

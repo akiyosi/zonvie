@@ -769,7 +769,7 @@ fn drawNormalExternalSurfaceRowMode(
     // it, so returning here would lose the back_tex and row-VB shift for good.
     const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
     // The root eases without layers too, and only the row pass ticks it.
-    const has_ease_work = ext_win.surf.paint.easeMoving();
+    const has_ease_work = ext_win.surf.paint.easeMoving() or ext_win.surf.paint.float_peel_press != null;
     if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
         !has_scrollbar_work and !any_layer_dirty and !has_scroll_work and !has_ease_work)
     {
@@ -816,6 +816,10 @@ fn drawNormalExternalSurfaceRowMode(
             .cursor_rows = cursor_erase_rows,
         },
         .ease = app_mod.LayerEaseInput.of(app),
+        .float_peel = if (app.config.floats.peel) .{
+            .cursor_box = core.cursor_rect.bounds(core.Vertex, tbs_cursor.verts.items, @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px)),
+            .cell_h_px = @intCast(@max(1, row_h_px)),
+        } else null,
         .frame = .{
             .root_grid_id = grid_id,
             .layers = &.{},
@@ -2564,6 +2568,8 @@ pub export fn ExternalWndProc(
                     // returning here also keeps the press from capturing.
                     if (classifyExternalSurface(grid_id.?) != .normal) return 0;
 
+                    if (app.config.floats.peel) input.noteFloatPeelPress(app, hwnd, &ext_window.?.surf, false, x, y);
+
                     // A float anchored inside this window is one of its layers,
                     // not a window of its own, so the press has to say which
                     // grid it landed on -- Neovim trusts the id it is given.
@@ -3069,6 +3075,7 @@ pub fn newExternalRenderer(app: *App, hwnd: c.HWND, grid_id: i64) ?d3d11.Rendere
     // The core stamps an external window under its own grid id.
     renderer.cell_age = &app.cell_age;
     renderer.cell_age_grid = grid_id;
+    if (app.config.floats.peel) _ = renderer.prepareFloatPeel();
     if (app.corep) |corep| {
         if (core.zonvie_core_get_glow_enabled(corep)) _ = renderer.prepareBloomShaders();
     }

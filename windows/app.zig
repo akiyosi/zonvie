@@ -497,6 +497,9 @@ pub const SurfaceLayer = struct {
     /// it -- Neovim refuses an event addressed to such a window rather than
     /// passing it to what is behind.
     mouse_enabled: bool = true,
+    /// A floating window (ZONVIE_LAYER_FLOAT): the only kind the float peel
+    /// curls.
+    float: bool = false,
 };
 
 /// Immutable while retained by a paint; capacity is reused after retirement.
@@ -2590,6 +2593,13 @@ pub const SurfacePaintState = struct {
     /// The root grid's smooth scroll; its buffers count toward the root's.
     /// Only an external window's root ever eases (GridEase.plan).
     root_ease: GridEase = .{},
+    /// [floats] peel: the core's curl state, the layer list handed to it,
+    /// this paint's frame of it, and a mouse press (surface px) since the
+    /// last paint. UI thread only.
+    float_peel: core.float_peel.Peel = .{},
+    float_peel_layers: std.ArrayListUnmanaged(core.Layer) = .empty,
+    float_peel_frame: core.float_peel.Frame = .{},
+    float_peel_press: ?[2]f32 = null,
 
     pub fn layerState(self: *SurfacePaintState, grid_id: i64) ?*LayerPaintState {
         for (self.layers.items) |*s| {
@@ -2601,7 +2611,7 @@ pub const SurfacePaintState = struct {
     /// Some layer's smooth scroll has not come to rest: the surface owes
     /// another frame even with nothing else to draw.
     pub fn easeMoving(self: *const SurfacePaintState) bool {
-        if (self.root_ease.moving()) return true;
+        if (self.root_ease.moving() or self.float_peel_frame.moving) return true;
         for (self.layers.items) |*s| {
             if (s.grid_id != 0 and s.ease.moving()) return true;
         }
@@ -2646,6 +2656,7 @@ pub const SurfacePaintState = struct {
         self.layers.deinit(alloc);
         self.damage_spans.deinit(alloc);
         self.bands.deinit(alloc);
+        self.float_peel_layers.deinit(alloc);
         self.root_ease.release(row_vb_budget, &self.row_vb_retained_bytes);
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
@@ -3933,6 +3944,9 @@ pub const LayerFramePlanParams = struct {
     root_scroll_rect: ?c.RECT = null,
     /// Smooth scrolling for this frame; null draws every layer at rest.
     ease: ?LayerEaseInput = null,
+    /// The float the peel curls, 0 for none: drawn whole into the peel
+    /// texture, so its pixels in back_tex are not its own to copy.
+    peel_grid: i64 = 0,
     log_enabled: bool,
 };
 
@@ -4056,7 +4070,7 @@ pub fn planLayerFrame(
         }
         // An eased frame moves every row of the layer, which no copy of the
         // previous frame's pixels can serve.
-        if (state.ease.easing) state.draw_all = true;
+        if (state.ease.easing or layer.grid_id == p.peel_grid) state.draw_all = true;
         // The row buffers follow the slots through the shift, so the rows
         // that only moved are not uploaded again.
         if (state.draw_scroll) |s| shiftRowVBs(state.row_vbs.items, s.rows_delta, s.row_start, s.row_end);
@@ -4456,6 +4470,11 @@ pub fn drawSurfaceLayers(
             .rs_set_sc_fn = rs_set_sc_fn,
         };
 
+        // The curled float draws alone into the peel texture, then is folded
+        // over back_tex in its place in the stack.
+        const peel = src.paint.float_peel_frame;
+        const peeling = peel.grid_id == layer.grid_id and g.beginFloatPeel();
+
         var encoded: u32 = 0;
         var band_drawn = false;
         if (state.ease.easing and rs_set_sc_fn != null) {
@@ -4510,6 +4529,26 @@ pub fn drawSurfaceLayers(
                 if (out.failed) failed_rows += 1;
                 if (out.budget_exceeded) budget_exceeded = true;
             }
+        }
+        if (peeling) {
+            const ox: f32 = @floatFromInt(x_offset);
+            const oy: f32 = @floatFromInt(y_offset);
+            const b = peel.bounds_px;
+            var sc: c.D3D11_RECT = .{
+                .left = @max(x_offset, x_offset + @as(i32, @intFromFloat(@floor(b.left)))),
+                .top = @max(y_offset, y_offset + @as(i32, @intFromFloat(@floor(b.top)))),
+                .right = @min(content_right, x_offset + @as(i32, @intFromFloat(@ceil(b.right)))),
+                .bottom = @min(@as(i32, @intFromFloat(base_vp.y + base_vp.h)), y_offset + @as(i32, @intFromFloat(@ceil(b.bottom)))),
+            };
+            sc.right = @max(sc.left, sc.right);
+            sc.bottom = @max(sc.top, sc.bottom);
+            const r = peel.float_px;
+            if (!g.endFloatPeel(.{
+                .corner_px = .{ peel.corner_x_px + ox, peel.corner_y_px + oy },
+                .dir = .{ peel.dir_x, peel.dir_y },
+                .rect_px = .{ r.left + ox, r.top + oy, r.right + ox, r.bottom + oy },
+                .fold_px = peel.fold_px,
+            }, sc)) failed_rows += 1;
         }
         if (log_enabled) applog.appLog(
             "[layer_draw] gridId={d} rows={d} of={d} blit={d} failed={d}\n",
@@ -5313,8 +5352,16 @@ pub const RowPassInput = struct {
     cell_w_px: i32,
     layer_present: ?RowPassLayerPresent = null,
     ease: ?LayerEaseInput = null,
+    /// [floats] peel on: curl the float over the cursor.
+    float_peel: ?FloatPeelInput = null,
     /// The frame, minus what this pass settles: the redraw set and the layers.
     frame: RowFrameInput,
+};
+
+pub const FloatPeelInput = struct {
+    /// The cursor's box in surface px, null when it is not on this surface.
+    cursor_box: ?core.cursor_rect.Rect,
+    cell_h_px: u32,
 };
 
 pub const RowPassOutcome = struct {
@@ -5325,6 +5372,42 @@ pub const RowPassOutcome = struct {
     /// another frame after this one.
     ease_moving: bool = false,
 };
+
+/// Advance `paint.float_peel` for this paint into `paint.float_peel_frame`,
+/// taking the press noted since the last one.
+fn advanceFloatPeel(
+    alloc: std.mem.Allocator,
+    paint: *SurfacePaintState,
+    layers: []const SurfaceLayer,
+    cursor_grid: i64,
+    in: FloatPeelInput,
+    cell_w_px: i32,
+) error{OutOfMemory}!void {
+    paint.float_peel_layers.clearRetainingCapacity();
+    try paint.float_peel_layers.ensureTotalCapacity(alloc, layers.len);
+    for (layers) |l| paint.float_peel_layers.appendAssumeCapacity(.{
+        .grid_id = l.grid_id,
+        .anchor_grid = l.anchor_grid,
+        .x_px = l.x_px,
+        .y_px = l.y_px,
+        .rows = l.rows,
+        .cols = l.cols,
+        .z = l.z,
+        .flags = if (l.float) core.LAYER_FLOAT else 0,
+    });
+    const press = paint.float_peel_press;
+    paint.float_peel_press = null;
+    paint.float_peel_frame = core.float_peel.frame(
+        &paint.float_peel,
+        paint.float_peel_layers.items,
+        cursor_grid,
+        in.cursor_box,
+        press,
+        @intCast(@max(1, cell_w_px)),
+        in.cell_h_px,
+        @intCast(core.clock.nowNs()),
+    );
+}
 
 /// The row pass both paint drivers run, in one order: size the row VBs, shift
 /// the root's retained pixels for a committed scroll, plan the layers, then
@@ -5428,6 +5511,22 @@ pub fn drawSurfaceRowPass(
         }
     }
 
+    // The curl is blended into back_tex, so every row under it is redrawn,
+    // and the rows the last one covered on the frame it moves.
+    paint.float_peel_frame = .{};
+    if (in.float_peel) |fp| {
+        try advanceFloatPeel(app.alloc, paint, layers, in.snapshot.cursor_layer_grid_id, fp, in.cell_w_px);
+        const pf = paint.float_peel_frame;
+        if (pf.redraw_bottom_px > pf.redraw_top_px and p.row_h_px > 0 and layers.len > 0) {
+            const top = @max(0, pf.redraw_top_px - layers[0].y_px);
+            const bottom = pf.redraw_bottom_px - layers[0].y_px;
+            const first: u32 = @intCast(@divFloor(top, p.row_h_px));
+            const end: u32 = @min(in.total_rows, @as(u32, @intCast(@max(0, @divFloor(bottom + p.row_h_px - 1, p.row_h_px)))));
+            if (end > first and !render_pipeline_helpers.mergeSortedRowsWithRange(app.alloc, rows_to_draw, &paint.scroll_rows_merge_scratch, first, end))
+                return error.OutOfMemory;
+        }
+    }
+
     // The copy has to land before the rows below paint over the band it
     // moves, and the plan before the draw.
     var layer_src: ?LayerFrameSource = null;
@@ -5457,6 +5556,7 @@ pub fn drawSurfaceRowPass(
             .root_rows = in.total_rows,
             .root_scroll_rect = scroll_damage,
             .ease = in.ease,
+            .peel_grid = paint.float_peel_frame.grid_id,
             .log_enabled = in.frame.log_enabled,
         });
         if (in.layer_present) |lp| appendBandPresentRects(
@@ -5471,7 +5571,8 @@ pub fn drawSurfaceRowPass(
 
     // An eased frame presents on vblank, so the paints that drive the ease
     // run at the display rate.
-    var ease_moving = paint.root_ease.moving();
+    var ease_moving = paint.root_ease.moving() or paint.float_peel_frame.moving;
+    if (paint.float_peel_frame.moving) g.vsync_next_present = true;
     if (root_easing) {
         g.vsync_next_present = true;
         in.frame.draw_params.root_ease = &paint.root_ease;
