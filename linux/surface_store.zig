@@ -62,7 +62,14 @@ pub const GridRows = struct {
         self.staged_shift = null;
     }
 
-    /// Caller holds App.mu. Allocation happens only when a grid grows.
+    /// Caller holds App.mu. The only fallible step of a commit; on error the caller cancels and `front` is untouched.
+    pub fn prepareCommit(self: *GridRows, alloc: std.mem.Allocator) !void {
+        if (self.staged_clear) return;
+        const len: usize = self.staged_len orelse self.front.items.len;
+        try self.front.ensureTotalCapacity(alloc, len);
+    }
+
+    /// Caller holds App.mu; prepareCommit must have succeeded since the last stage.
     pub fn commit(self: *GridRows, alloc: std.mem.Allocator) void {
         defer self.cancel();
         if (self.staged_clear) {
@@ -72,7 +79,7 @@ pub const GridRows = struct {
         }
         if (self.staged_shift) |s| self.applyShift(s);
         const len: usize = self.staged_len orelse self.front.items.len;
-        while (self.front.items.len < len) self.front.append(alloc, .{}) catch return;
+        while (self.front.items.len < len) self.front.appendAssumeCapacity(.{});
         while (self.front.items.len > len) {
             var r = self.front.pop().?;
             r.verts.deinit(alloc);
@@ -118,6 +125,7 @@ test "staged row is invisible until commit" {
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(10)}, 3);
     try testing.expectEqual(@as(?f32, null), firstY(&g, 0));
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(?f32, 10), firstY(&g, 0));
 }
@@ -127,8 +135,10 @@ test "rows not resent keep previous contents" {
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 2);
     try g.stageRow(testing.allocator, 1, &.{v(2)}, 2);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try g.stageRow(testing.allocator, 1, &.{v(20)}, 2);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 20), firstY(&g, 1));
@@ -138,9 +148,11 @@ test "cancel keeps committed rows" {
     var g: GridRows = .{};
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 1);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(99)}, 1);
     g.cancel();
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator); // a later empty commit must not resurrect the cancelled row
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
 }
@@ -149,11 +161,14 @@ test "resize shrink then grow" {
     var g: GridRows = .{};
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(0)}, 2);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), g.committedRows().len);
     try g.stageRow(testing.allocator, 0, &.{v(0)}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(usize, 4), g.committedRows().len);
     try testing.expectEqual(@as(?f32, null), firstY(&g, 3)); // new row is empty, not stale
@@ -165,9 +180,11 @@ test "shift then vacated rows" {
     var g: GridRows = .{};
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     g.stageShift(0, 4, 1);
     try g.stageRow(testing.allocator, 3, &.{v(40)}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 3), firstY(&g, 2));
@@ -179,9 +196,11 @@ test "shift down by 1 with region" {
     var g: GridRows = .{};
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     g.stageShift(1, 4, -1);
     try g.stageRow(testing.allocator, 1, &.{v(10)}, 4);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(?f32, 0), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 10), firstY(&g, 1));
@@ -193,8 +212,29 @@ test "stageClear empties every row at commit" {
     var g: GridRows = .{};
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 1);
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     g.stageClear();
+    try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), g.committedRows().len);
+}
+
+test "failed prepareCommit then cancel keeps the committed frame, even with a shift staged" {
+    var g: GridRows = .{};
+    defer g.deinit(testing.allocator);
+    for (0..2) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 2);
+    try g.prepareCommit(testing.allocator);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator);
+
+    g.stageShift(0, 2, 1);
+    try g.stageRow(testing.allocator, 1, &.{v(50)}, 64);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, g.prepareCommit(failing.allocator()));
+    g.cancel();
+
+    try testing.expectEqual(@as(usize, 2), g.committedRows().len);
+    try testing.expectEqual(@as(?f32, 0), firstY(&g, 0));
+    try testing.expectEqual(@as(?f32, 1), firstY(&g, 1));
 }
