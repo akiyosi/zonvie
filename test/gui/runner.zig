@@ -66,8 +66,6 @@ const is_linux = builtin.os.tag == .linux;
 /// no row reuse, blit, scroll fast path or per-row gating, so the scenarios
 /// that assert those paths ran have nothing to observe there.
 const redraws_partially = !is_linux;
-/// Not yet on Linux: custom shaders and glow.
-const linux_has_feature = !is_linux;
 /// The cmdline is an overlay in the main window on Linux, not a window of its
 /// own, and a tiling compositor sizes the window, not :set columns/lines.
 const places_own_windows = !is_linux;
@@ -336,7 +334,7 @@ test "gui:visual_proportional_font_support" {
 }
 
 test "gui:visual_shader_covers_all_grids" {
-    try gated(can_capture and linux_has_feature, @import("scenarios/visual/shader_covers_all_grids.zig"));
+    try gated(can_capture, @import("scenarios/visual/shader_covers_all_grids.zig"));
 }
 
 test "gui:cmdline_cursor_shader_rect" {
@@ -421,7 +419,7 @@ test "gui:visual_hosted_float_scroll_band" {
 }
 
 test "gui:visual_extwin_hosted_layer_glow" {
-    try gated(can_capture and linux_has_feature, @import("scenarios/visual/extwin_hosted_layer_glow.zig"));
+    try gated(can_capture, @import("scenarios/visual/extwin_hosted_layer_glow.zig"));
 }
 
 test "gui:main_float_mouse_disabled_scroll" {

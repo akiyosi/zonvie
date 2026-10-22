@@ -84,6 +84,12 @@ pub const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
 pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 pub const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
+pub const GL_FRAMEBUFFER_BINDING: GLenum = 0x8CA6;
+pub const GL_UNIFORM_BUFFER: GLenum = 0x8A11;
+pub const GL_INVALID_INDEX: GLuint = 0xFFFFFFFF;
+pub const GL_TEXTURE1: GLenum = 0x84C1;
+pub const GL_TEXTURE2: GLenum = 0x84C2;
+pub const GL_TEXTURE3: GLenum = 0x84C3;
 
 // Pixel store
 pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
@@ -112,6 +118,10 @@ pub extern "c" fn glUseProgram(program: GLuint) void;
 pub extern "c" fn glGetUniformLocation(program: GLuint, name: [*:0]const GLchar) GLint;
 pub extern "c" fn glUniform1i(location: GLint, v0: GLint) void;
 pub extern "c" fn glUniform1f(location: GLint, v0: GLfloat) void;
+pub extern "c" fn glGetUniformBlockIndex(program: GLuint, name: [*:0]const GLchar) GLuint;
+pub extern "c" fn glUniformBlockBinding(program: GLuint, block_index: GLuint, binding: GLuint) void;
+pub extern "c" fn glBindBufferBase(target: GLenum, index: GLuint, buffer: GLuint) void;
+pub extern "c" fn glGetIntegerv(pname: GLenum, data: *GLint) void;
 pub extern "c" fn glUniform2f(location: GLint, v0: GLfloat, v1: GLfloat) void;
 
 // VAO

@@ -14,6 +14,7 @@ const input = @import("input.zig");
 const ext_window = @import("ext_window.zig");
 const gtk = @import("gtk_bindings.zig");
 const render_thread = @import("render_thread.zig");
+const postfx = @import("renderer/postfx.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -85,6 +86,11 @@ pub const App = struct {
 
     /// The main GLArea's GL objects; GTK main thread only.
     gl: gl_renderer.Target = .{},
+    /// The main GLArea's bloom and custom shader chain; GTK main thread only.
+    postfx: postfx.PostFx = .{},
+    /// config.toml [shaders] paths when enabled; borrowed from the config,
+    /// which outlives the App.
+    shader_paths: []const []const u8 = &.{},
     /// Bumped by every committed flush (under `mu`), so a frame can say
     /// which commit it shows.
     flush_seq: u64 = 0,

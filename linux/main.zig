@@ -4,6 +4,7 @@ const clock = core.clock;
 const callbacks = @import("callbacks.zig");
 const App = @import("app.zig").App;
 const gl_renderer = @import("renderer/gl_renderer.zig");
+const postfx = @import("renderer/postfx.zig");
 const gtk = @import("gtk_bindings.zig");
 const input = @import("input.zig");
 const applog = @import("app_log.zig");
@@ -68,7 +69,9 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
 fn onUnrealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     gtk.gtk_gl_area_make_current(widget.?);
-    gl_renderer.unrealize(&appFrom(data).gl);
+    const app = appFrom(data);
+    postfx.unrealize(&app.postfx);
+    gl_renderer.unrealize(&app.gl);
 }
 
 fn onRender(area: ?*anyopaque, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
@@ -402,6 +405,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .alloc = alloc,
         .startup = @constCast(@ptrCast(&startup)),
         .large_jump = config.scroll.large_jump_behavior,
+        .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
     };
     defer app.deinit();
     ui_widgets.the_app = app;
