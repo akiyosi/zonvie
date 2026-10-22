@@ -12,6 +12,7 @@ const gtk = @import("gtk_bindings.zig");
 const applog = @import("app_log.zig");
 const input = @import("input.zig");
 const overlay_layout = @import("overlay_layout.zig");
+const ui_widgets = @import("ui_widgets.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -25,6 +26,13 @@ pub fn makeCallbacks() core.Callbacks {
         .on_external_window = onExternalWindow,
         .on_external_window_close = onExternalWindowClose,
         .on_popupmenu_show = onPopupmenuShow,
+        .on_msg_show = onMsgShow,
+        .on_msg_clear = onMsgClear,
+        .on_msg_showmode = onMsgShowmode,
+        .on_msg_showcmd = onMsgShowcmd,
+        .on_msg_ruler = onMsgRuler,
+        .on_tabline_update = onTablineUpdate,
+        .on_tabline_hide = onTablineHide,
         .on_atlas_create = onAtlasCreate,
         .on_atlas_upload = onAtlasUpload,
         .on_rasterize_glyph = onRasterizeGlyph,
@@ -211,6 +219,87 @@ fn onPopupmenuShow(
     lock(app);
     defer unlock(app);
     app.pmenu_bg = c.pmenu_bg;
+}
+
+// The frontend-drawn ext UI (ui_state.zig). Immediate callbacks: state is
+// written under App.mu and the GTK thread is asked to refresh.
+
+fn onMsgShow(
+    ctx: ?*anyopaque,
+    view: core.zonvie_msg_view_type,
+    kind: [*]const u8,
+    kind_len: usize,
+    chunks: [*]const core.MsgChunk,
+    chunk_count: usize,
+    replace_last: c_int,
+    history: c_int,
+    append: c_int,
+    msg_id: i64,
+    timeout_ms: u32,
+) callconv(.c) void {
+    _ = replace_last;
+    _ = history;
+    _ = msg_id;
+    const app = appFrom(ctx);
+    lock(app);
+    app.ui.msgShow(view, kind[0..kind_len], chunks[0..chunk_count], append != 0, timeout_ms);
+    unlock(app);
+    ui_widgets.queueRefresh(app);
+}
+
+fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
+    const app = appFrom(ctx);
+    lock(app);
+    app.ui.msgClear();
+    unlock(app);
+    ui_widgets.queueRefresh(app);
+}
+
+fn msgStatus(ctx: ?*anyopaque, which: @import("ui_state.zig").Mini, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) void {
+    const app = appFrom(ctx);
+    lock(app);
+    app.ui.status(which, view, chunks[0..chunk_count]);
+    unlock(app);
+    ui_widgets.queueRefresh(app);
+}
+
+fn onMsgShowmode(ctx: ?*anyopaque, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) callconv(.c) void {
+    msgStatus(ctx, .showmode, view, chunks, chunk_count);
+}
+
+fn onMsgShowcmd(ctx: ?*anyopaque, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) callconv(.c) void {
+    msgStatus(ctx, .showcmd, view, chunks, chunk_count);
+}
+
+fn onMsgRuler(ctx: ?*anyopaque, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) callconv(.c) void {
+    msgStatus(ctx, .ruler, view, chunks, chunk_count);
+}
+
+fn onTablineUpdate(
+    ctx: ?*anyopaque,
+    curtab: i64,
+    tabs: [*]const core.TabEntry,
+    tab_count: usize,
+    curbuf: i64,
+    buffers: [*]const core.BufferEntry,
+    buffer_count: usize,
+) callconv(.c) void {
+    _ = curbuf;
+    _ = buffers;
+    _ = buffer_count;
+    const app = appFrom(ctx);
+    lock(app);
+    app.ui.tabline(curtab, tabs[0..tab_count]);
+    unlock(app);
+    ui_widgets.queueRefresh(app);
+}
+
+fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
+    const app = appFrom(ctx);
+    lock(app);
+    app.ui.tabline_visible = false;
+    unlock(app);
+    ui_widgets.queueRefresh(app);
 }
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
@@ -446,6 +535,8 @@ fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void {
     app.default_fg = fg;
     app.default_bg = bg;
     unlock(app);
+    // The widget stylesheet follows Normal.
+    ui_widgets.queueRefresh(app);
 }
 
 fn onSetTitle(ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.c) void {
