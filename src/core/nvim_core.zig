@@ -1211,6 +1211,13 @@ pub const Core = struct {
     font_resize_requests: u64 = 0,
     last_font_resize_rows: u32 = 0,
     last_font_resize_cols: u32 = 0,
+    // try_resize_grid requests decided under grid_mu, sent after it is released.
+    font_resize_outbox: std.ArrayListUnmanaged(FontResize) = .empty,
+    // External-window OS resizes recorded on the UI thread without grid_mu;
+    // drainOsResizesLocked moves them into the font state on the RPC thread.
+    os_resize_mu: std.Io.Mutex = .init,
+    os_resize_pending: [8]FontResize = undefined,
+    os_resize_pending_len: u8 = 0,
 
     clipboard_setup_done: bool = false,
 
@@ -1384,6 +1391,7 @@ pub const Core = struct {
         self.font_query_outbox.deinit(self.alloc);
         self.font_query_forced.deinit(self.alloc);
         self.font_query_last_ns.deinit(self.alloc);
+        self.font_resize_outbox.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.flush_replaced_uvs.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
@@ -4966,20 +4974,22 @@ pub const Core = struct {
     /// here would mismatch the NDC baked into existing row vertices (e.g. the
     /// frontend requests 44 rows but Neovim keeps 45 including winbar).
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
-        // An external window's OS resize, in its grid's cells: record it as
-        // the font request so the answering grid_resize is not taken for a
-        // frame change, and the frame for a later clear.
+        // An external window's OS resize, in its grid's cells. Recorded here
+        // without grid_mu (held for whole redraw batches) and drained by the
+        // RPC thread before the batch that can carry the answer. When full,
+        // the newest entry overwrites the last slot; a lost one only costs a
+        // font re-read.
         if (self.perGridFontsEnabled()) {
-            self.grid_mu.lockUncancelable(clock.io());
-            defer self.grid_mu.unlock(clock.io());
-            if (self.grid.grid_fonts.getPtr(grid_id)) |gf| if (gf.mode == .resize) {
-                gf.req_rows = rows;
-                gf.req_cols = cols;
-                gf.frame_rows = font_slots.footprintCells(rows, gf.cell_h_px, @max(1, self.cell_h_px));
-                gf.frame_cols = font_slots.footprintCells(cols, gf.cell_w_px, @max(1, self.cell_w_px));
-                gf.extent_w_px = cols * gf.cell_w_px;
-                gf.extent_h_px = rows * gf.cell_h_px;
-            };
+            self.os_resize_mu.lockUncancelable(clock.io());
+            defer self.os_resize_mu.unlock(clock.io());
+            const pending = self.os_resize_pending[0..self.os_resize_pending_len];
+            const idx = for (pending, 0..) |r, i| {
+                if (r.grid_id == grid_id) break i;
+            } else if (pending.len < self.os_resize_pending.len) blk: {
+                self.os_resize_pending_len += 1;
+                break :blk pending.len;
+            } else self.os_resize_pending.len - 1;
+            self.os_resize_pending[idx] = .{ .grid_id = grid_id, .rows = rows, .cols = cols };
         }
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
@@ -5386,6 +5396,10 @@ pub const Core = struct {
         self.font_query_outbox.clearRetainingCapacity();
         self.font_query_forced.clearRetainingCapacity();
         self.font_query_last_ns.clearRetainingCapacity();
+        self.font_resize_outbox.clearRetainingCapacity();
+        self.os_resize_mu.lockUncancelable(clock.io());
+        self.os_resize_pending_len = 0;
+        self.os_resize_mu.unlock(clock.io());
     }
 
     pub const GridRender = struct {
@@ -5406,12 +5420,47 @@ pub const Core = struct {
         return .{ .cell_w_px = gf.cell_w_px, .cell_h_px = gf.cell_h_px, .font_id = gf.font_id, .extent_w_px = gf.extent_w_px, .extent_h_px = gf.extent_h_px, .mode = gf.mode };
     }
 
+    pub const FontResize = struct { grid_id: i64, rows: u32, cols: u32 };
+
+    /// Apply the external-window OS resizes the UI thread recorded, so the
+    /// answering grid_resize is not taken for a frame change and a later
+    /// clear gives back the OS window's frame. Caller holds grid_mu.
+    pub fn drainOsResizesLocked(self: *Core) void {
+        var pending: [8]FontResize = undefined;
+        self.os_resize_mu.lockUncancelable(clock.io());
+        const n = self.os_resize_pending_len;
+        @memcpy(pending[0..n], self.os_resize_pending[0..n]);
+        self.os_resize_pending_len = 0;
+        self.os_resize_mu.unlock(clock.io());
+        for (pending[0..n]) |r| {
+            const gf = self.grid.grid_fonts.getPtr(r.grid_id) orelse continue;
+            if (gf.mode != .resize) continue;
+            gf.req_rows = r.rows;
+            gf.req_cols = r.cols;
+            gf.frame_rows = font_slots.footprintCells(r.rows, gf.cell_h_px, @max(1, self.cell_h_px));
+            gf.frame_cols = font_slots.footprintCells(r.cols, gf.cell_w_px, @max(1, self.cell_w_px));
+            gf.extent_w_px = r.cols * gf.cell_w_px;
+            gf.extent_h_px = r.rows * gf.cell_h_px;
+        }
+    }
+
+    /// Send the try_resize_grid requests decided under grid_mu. Call after
+    /// grid_mu is released: sendRaw blocks on the pipe.
+    pub fn sendFontResizes(self: *Core) void {
+        for (self.font_resize_outbox.items) |r| {
+            self.requestTryResizeGridInternal(r.grid_id, r.rows, r.cols) catch |e| {
+                self.log.write("per-grid font: try_resize_grid failed: {any}\n", .{e});
+            };
+        }
+        self.font_resize_outbox.clearRetainingCapacity();
+    }
+
     fn sendFontResize(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
         self.font_resize_requests += 1;
         self.last_font_resize_rows = rows;
         self.last_font_resize_cols = cols;
-        self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
-            self.log.write("per-grid font: try_resize_grid failed: {any}\n", .{e});
+        self.font_resize_outbox.append(self.alloc, .{ .grid_id = grid_id, .rows = rows, .cols = cols }) catch |e| {
+            self.log.write("per-grid font: try_resize_grid dropped: {any}\n", .{e});
         };
     }
 
@@ -5490,6 +5539,9 @@ pub const Core = struct {
             return;
         };
         if (acq.needs_load) {
+            // Queries are sent only when perGridFontsEnabled(), which requires
+            // both slot callbacks; the unwraps below rely on it.
+            std.debug.assert(self.perGridFontsEnabled());
             var w: u32 = 0;
             var h: u32 = 0;
             const ok = self.cb.on_font_slot_load.?(self.ctx, acq.font_id, guifont_key.ptr, guifont_key.len, scale, &w, &h);
@@ -9002,7 +9054,12 @@ test "an external window OS resize in grid cells is not taken for a frame change
     try core.grid.resizeGrid(4, 20, 80);
     core.grid.font_query_wanted.clearRetainingCapacity();
     // The frontend divides the new OS window by the grid's 5x10 px cell.
+    // The UI thread records it without grid_mu; the font state changes
+    // only when the RPC thread drains it before the next batch.
+    const before = core.grid.grid_fonts.get(4).?;
     core.requestTryResizeGrid(4, 30, 100);
+    try std.testing.expectEqual(before.req_rows, core.grid.grid_fonts.get(4).?.req_rows);
+    core.drainOsResizesLocked();
     try core.grid.resizeGrid(4, 30, 100);
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
     const gf = core.grid.grid_fonts.get(4).?;
@@ -9078,4 +9135,40 @@ test "the frame reported for a font grid is its footprint in global cells" {
     const info = core.gridInfoLocked(2, 20, 80, core.grid.win_pos.get(2), false);
     try std.testing.expectEqual(@as(i32, 10), info.rows);
     try std.testing.expectEqual(@as(i32, 40), info.cols);
+}
+
+test "font resizes are queued under the lock and sent after it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try splitWithFrame(&core);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    try std.testing.expectEqual(@as(usize, 1), core.font_resize_outbox.items.len);
+    try std.testing.expectEqual(@as(u32, 20), core.font_resize_outbox.items[0].rows);
+    core.sendFontResizes();
+    try std.testing.expectEqual(@as(usize, 0), core.font_resize_outbox.items.len);
+}
+
+test "a split grid_resize missing the last request re-reads the font, a matching echo does not" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try splitWithFrame(&core);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    core.grid.font_query_wanted.clearRetainingCapacity();
+    try core.grid.resizeGrid(2, 20, 80);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
+    try core.grid.resizeGrid(2, 18, 80);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.grid.font_query_wanted.items);
+    // The re-read recomputes from the frame and asks again.
+    const sent = core.font_resize_requests;
+    core.takeFontQueriesLocked(0);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    try std.testing.expectEqual(sent, core.font_resize_requests);
+    core.grid.noteWinFrame(2, 1000, 9, 40);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    try std.testing.expectEqual(sent + 1, core.font_resize_requests);
+    try std.testing.expectEqual(@as(u32, 18), core.last_font_resize_rows);
 }

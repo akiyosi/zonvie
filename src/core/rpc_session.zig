@@ -706,6 +706,7 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         var answers: [max_font_answers]WindowFontAnswer = undefined;
         const n = parseWindowFontAnswers(top[3], &answers);
         self.grid_mu.lockUncancelable(clock.io());
+        self.drainOsResizesLocked();
         for (answers[0..n]) |a| {
             if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
             self.applyWindowFontLocked(a);
@@ -713,6 +714,7 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         // Windows queued while this query was in flight go out now.
         self.takeFontQueriesLocked(clock.nowNs());
         self.grid_mu.unlock(clock.io());
+        self.sendFontResizes();
         self.sendFontQueries();
         return;
     }
@@ -1782,6 +1784,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // execute while grid_mu is held. Callbacks MUST NOT call
         // zonvie_core_get_* or other APIs that acquire grid_mu.
         self.lockGridAsRedrawOwner();
+        self.drainOsResizesLocked();
 
         var fctx = flush.FlushCtx{ .core = self };
         var redraw_error: ?anyerror = null;
@@ -1967,6 +1970,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         if (self.perGridFontsEnabled()) self.takeFontQueriesLocked(clock.nowNs()) else self.grid.font_query_wanted.clearRetainingCapacity();
         self.unlockGridAsRedrawOwner();
         self.sendFloatConfigQueries();
+        self.sendFontResizes();
         self.sendFontQueries();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
