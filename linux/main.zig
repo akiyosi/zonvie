@@ -10,6 +10,8 @@ const applog = @import("app_log.zig");
 const config_mod = @import("config.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
+const latency_bench = @import("latency_bench.zig");
+const render_thread = @import("render_thread.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -24,6 +26,9 @@ const Startup = struct {
     ext_messages: bool = false,
     ext_tabline: bool = false,
     ext_windows: bool = false,
+    /// --renderer=thread: draw the main window on a render thread into
+    /// dmabufs; the GLArea otherwise, and when that is unavailable.
+    threaded: bool = false,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -80,6 +85,58 @@ fn onResize(area: ?*anyopaque, w_px: c_int, h_px: c_int, data: ?*anyopaque) call
     app.scale = @floatFromInt(@max(1, gtk.gtk_widget_get_scale_factor(area.?)));
     unlock(app);
     pushLayout(app);
+}
+
+// =========================================================================
+// Render-thread mode: a drawing area takes size and input, a picture shows
+// the thread's frames over it.
+// =========================================================================
+
+fn onAreaRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const app = appFrom(data);
+    if (app.gl_realized_once) return;
+    app.gl_realized_once = true;
+    startCore(app, widget.?);
+}
+
+/// GtkDrawingArea reports logical px.
+fn onAreaResize(area: ?*anyopaque, w: c_int, h: c_int, data: ?*anyopaque) callconv(.c) void {
+    const app = appFrom(data);
+    if (w <= 0 or h <= 0) return;
+    const scale = @max(1, gtk.gtk_widget_get_scale_factor(area.?));
+    const w_px: u32 = @intCast(w * scale);
+    const h_px: u32 = @intCast(h * scale);
+    lock(app);
+    app.drawable_w_px = w_px;
+    app.drawable_h_px = h_px;
+    app.scale = @floatFromInt(scale);
+    unlock(app);
+    if (app.render_thread) |rt| rt.resize(w_px, h_px);
+    pushLayout(app);
+}
+
+/// The editor widget and the picture over it, with the render thread
+/// started; null (nothing built) when this system cannot run it.
+fn buildThreaded(app: *App) ?[2]*anyopaque {
+    const picture = gtk.gtk_picture_new() orelse return null;
+    gtk.gtk_picture_set_can_shrink(picture, 1);
+    gtk.gtk_picture_set_content_fit(picture, gtk.GTK_CONTENT_FIT_FILL);
+    gtk.gtk_widget_set_can_target(picture, 0);
+    const rt = render_thread.create(app, picture) orelse {
+        gtk.g_object_unref(gtk.g_object_ref_sink(picture));
+        return null;
+    };
+    app.render_thread = rt;
+    const area = gtk.gtk_drawing_area_new() orelse return null;
+    gtk.gtk_widget_set_focusable(area, 1);
+    _ = gtk.g_signal_connect(area, "realize", @ptrCast(&onAreaRealize), app);
+    _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onAreaResize), app);
+    app.frame_widget = picture;
+    // Not in a GtkGraphicsOffload: GTK hands the dmabuf to the compositor
+    // with the modifier GBM reports (LINEAR for an implicit-modifier buffer),
+    // which a compositor may reject as a protocol error that kills the
+    // client. GTK's own renderer imports it instead.
+    return .{ area, picture };
 }
 
 /// Non-blocking: grid_mu can be held for seconds (clipboard), so a busy core
@@ -204,20 +261,32 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     gtk.gtk_window_set_title(win, "zonvie");
     gtk.gtk_window_set_default_size(win, default_w_logical, default_h_logical);
 
-    const area = gtk.gtk_gl_area_new() orelse return;
-    app.gl_area = area;
-    gtk.gtk_gl_area_set_required_version(area, 3, 3);
-    gtk.gtk_gl_area_set_has_depth_buffer(area, 0);
-    gtk.gtk_gl_area_set_allowed_apis(area, gtk.GDK_GL_API_GL);
-    gtk.gtk_widget_set_focusable(area, 1);
-    _ = gtk.g_signal_connect(area, "realize", @ptrCast(&onRealize), app);
-    _ = gtk.g_signal_connect(area, "unrealize", @ptrCast(&onUnrealize), app);
-    _ = gtk.g_signal_connect(area, "render", @ptrCast(&onRender), app);
-    _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onResize), app);
+    const startup: *const Startup = @ptrCast(@alignCast(app.startup.?));
+    var area: *anyopaque = undefined;
+    var frames: ?*anyopaque = null;
+    const threaded = if (startup.threaded) buildThreaded(app) else null;
+    if (threaded) |t| {
+        area = t[0];
+        frames = t[1];
+    } else {
+        if (startup.threaded) applog.appLog("[linux] render thread unavailable; using the GLArea\n", .{});
+        area = gtk.gtk_gl_area_new() orelse return;
+        app.gl_area = area;
+        app.frame_widget = area;
+        gtk.gtk_gl_area_set_required_version(area, 3, 3);
+        gtk.gtk_gl_area_set_has_depth_buffer(area, 0);
+        gtk.gtk_gl_area_set_allowed_apis(area, gtk.GDK_GL_API_GL);
+        gtk.gtk_widget_set_focusable(area, 1);
+        _ = gtk.g_signal_connect(area, "realize", @ptrCast(&onRealize), app);
+        _ = gtk.g_signal_connect(area, "unrealize", @ptrCast(&onUnrealize), app);
+        _ = gtk.g_signal_connect(area, "render", @ptrCast(&onRender), app);
+        _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onResize), app);
+    }
+    latency_bench.init(app, if (app.render_thread != null) "thread" else "glarea");
     app.pointer = .{ .app = app };
     input.attach(&app.pointer, area);
 
-    gtk.gtk_window_set_child(win, ui_widgets.build(app, area));
+    gtk.gtk_window_set_child(win, ui_widgets.build(app, area, frames));
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
     gtk.gtk_window_present(win);
     _ = gtk.gtk_widget_grab_focus(area);
@@ -257,6 +326,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ext_messages = config.messages.external;
     var ext_tabline = config.tabline.external;
     var ext_windows = config.windows.external;
+    var threaded = false;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -277,6 +347,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             ext_messages = true;
         } else if (std.mem.eql(u8, arg, "--exttabline")) {
             ext_tabline = true;
+        } else if (std.mem.eql(u8, arg, "--renderer=thread")) {
+            threaded = true;
+        } else if (std.mem.eql(u8, arg, "--renderer=glarea")) {
+            threaded = false;
         } else if (std.mem.eql(u8, arg, "--extwindows")) {
             ext_windows = true;
         } else if (std.mem.eql(u8, arg, "--log") and i + 1 < args.len) {
@@ -302,6 +376,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .ext_messages = ext_messages,
         .ext_tabline = ext_tabline,
         .ext_windows = ext_windows,
+        .threaded = threaded,
     };
 
     const app = alloc.create(App) catch return 1;
@@ -313,6 +388,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
     defer app.deinit();
     ui_widgets.the_app = app;
+    defer latency_bench.deinit(app);
 
     // Each process owns its own nvim, so a second launch must not forward
     // to the first instance.
@@ -333,6 +409,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Destroys the window; unrealize still needs `app`.
     gtk.g_object_unref(gapp);
     app.gtk_app = null;
+    // After the window: its textures' destroy notifies reach the thread's
+    // buffers, so they must all have run.
+    while (gtk.g_main_context_iteration(null, 0) != 0) {}
+    if (app.render_thread) |rt| render_thread.destroy(rt);
+    app.render_thread = null;
 
     if (app.start_failed) return 1;
     const code = app.exit_code orelse 0;

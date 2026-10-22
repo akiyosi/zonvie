@@ -120,6 +120,7 @@ fn close(app: *App, grid_id: i64) void {
     const w = kv.value;
     // Destroying unrealizes the area, which still reads `w`.
     if (w.window) |win| gtk.gtk_window_destroy(win);
+    w.gl.deinit(app.alloc);
     app.alloc.destroy(w);
     applog.appLog("[linux] ext window closed grid={d}\n", .{grid_id});
 }

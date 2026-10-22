@@ -83,6 +83,7 @@ pub const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 // Framebuffer
 pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
 pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+pub const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 
 // Pixel store
 pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
@@ -158,4 +159,6 @@ pub extern "c" fn glScissor(x: GLint, y: GLint, width: GLsizei, height: GLsizei)
 pub extern "c" fn glPixelStorei(pname: GLenum, param: GLint) void;
 
 // Draw
+pub extern "c" fn glFinish() void;
+pub extern "c" fn glCheckFramebufferStatus(target: GLenum) GLenum;
 pub extern "c" fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) void;

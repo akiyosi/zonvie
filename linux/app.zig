@@ -13,6 +13,7 @@ const gl_renderer = @import("renderer/gl_renderer.zig");
 const input = @import("input.zig");
 const ext_window = @import("ext_window.zig");
 const gtk = @import("gtk_bindings.zig");
+const render_thread = @import("render_thread.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -84,12 +85,22 @@ pub const App = struct {
 
     /// The main GLArea's GL objects; GTK main thread only.
     gl: gl_renderer.Target = .{},
-    /// One layer's rows concatenated for a single upload; capacity reused
-    /// across frames and windows.
-    gl_scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
+    /// Bumped by every committed flush (under `mu`), so a frame can say
+    /// which commit it shows.
+    flush_seq: u64 = 0,
+    /// flush_seq of the frame the main window last handed to GTK; GTK main
+    /// thread only.
+    presented_seq: u64 = 0,
+    /// When presented_seq last moved, for the latency bench's breakdown.
+    presented_ns: i128 = 0,
 
     // GTK objects; written and read only on the GTK main thread.
     gl_area: ?*anyopaque = null,
+    /// Set when the render thread draws the main window instead of a GLArea.
+    render_thread: ?*render_thread.RenderThread = null,
+    /// The widget whose frame clock paces the main window: the GLArea, or
+    /// the picture the render thread's frames are shown in.
+    frame_widget: ?*anyopaque = null,
     window: ?*anyopaque = null,
     gtk_app: ?*anyopaque = null,
     /// The main window's input; set up with the window.
@@ -146,7 +157,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         self.surface.deinit(self.alloc);
         self.atlas_pending.deinit(self.alloc);
-        self.gl_scratch.deinit(self.alloc);
+        self.gl.deinit(self.alloc);
         self.fonts.deinit(self.alloc);
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
@@ -155,6 +166,7 @@ pub const App = struct {
 
     /// GTK main thread: every window draws the committed frame.
     pub fn queueRenderAll(self: *App) void {
+        if (self.render_thread) |rt| rt.request();
         if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);
         var it = self.ext_windows.valueIterator();
         while (it.next()) |w| if (w.*.area) |a| gtk.gtk_gl_area_queue_render(a);

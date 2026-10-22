@@ -39,6 +39,17 @@ pub const Target = struct {
     u_layer_origin_x: i32 = -1,
     w_px: u32 = 0,
     h_px: u32 = 0,
+    /// Row 0 of the framebuffer is the image's top: an FBO over a dmabuf
+    /// that GTK reads top-down, unlike a GLArea's.
+    flip_y: bool = false,
+    /// One layer's rows concatenated for a single upload; capacity reused
+    /// across frames. Per target, so the render thread and the GTK thread
+    /// never share one.
+    scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
+
+    pub fn deinit(self: *Target, alloc: std.mem.Allocator) void {
+        self.scratch.deinit(alloc);
+    }
 };
 
 fn compile(kind: gl.GLenum, prefix: [:0]const u8) ?gl.GLuint {
@@ -125,7 +136,9 @@ pub fn unrealize(t: *Target) void {
     if (t.program != 0) gl.glDeleteProgram(t.program);
     const w = t.w_px;
     const h = t.h_px;
-    t.* = .{ .w_px = w, .h_px = h };
+    const flip = t.flip_y;
+    const scratch = t.scratch;
+    t.* = .{ .w_px = w, .h_px = h, .flip_y = flip, .scratch = scratch };
 }
 
 /// The main window's atlas: queued uploads applied as they come. Caller
@@ -186,30 +199,32 @@ fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Laye
     }
     gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, @intCast(bytes), verts.ptr);
     const x = transform.layerXform(layer, app.cell_w_px, app.cell_h_px, t.w_px, t.h_px);
-    gl.glUniform2f(t.u_scale, x.scale[0], x.scale[1]);
-    gl.glUniform2f(t.u_offset, x.offset[0], x.offset[1]);
+    const fy: f32 = if (t.flip_y) -1 else 1;
+    gl.glUniform2f(t.u_scale, x.scale[0], fy * x.scale[1]);
+    gl.glUniform2f(t.u_offset, x.offset[0], fy * x.offset[1]);
     gl.glUniform1f(t.u_scroll_offset, scroll_offset_px);
     gl.glUniform1f(t.u_layer_origin_x, @floatFromInt(layer.x_px));
     gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(verts.len));
 }
 
-/// Clips to rows [row_start, row_end) of `layer`, in GL's bottom-left origin.
+/// Clips to a rect given top-down in surface px.
+fn scissor(t: *const Target, x: i32, top: i32, w: i32, h: i32) void {
+    const y = if (t.flip_y) top else @as(i32, @intCast(t.h_px)) - top - h;
+    gl.glScissor(x, y, w, @max(0, h));
+}
+
+/// Clips to rows [row_start, row_end) of `layer`.
 fn scissorRows(app: *const App, t: *const Target, layer: core.Layer, row_start: u32, row_end: u32) void {
     const h: i32 = @intCast(app.cell_h_px);
     const top = layer.y_px + @as(i32, @intCast(row_start)) * h;
     const bottom = layer.y_px + @as(i32, @intCast(row_end)) * h;
-    gl.glScissor(
-        layer.x_px,
-        @as(i32, @intCast(t.h_px)) - bottom,
-        @intCast(layer.cols * app.cell_w_px),
-        @max(0, bottom - top),
-    );
+    scissor(t, layer.x_px, top, @intCast(layer.cols * app.cell_w_px), bottom - top);
 }
 
-/// Appends rows [start, end) to the scratch buffer.
-fn gatherRows(app: *App, rows: []const Row, start: usize, end: usize) void {
+/// Appends rows [start, end) to the target's scratch buffer.
+fn gatherRows(app: *App, t: *Target, rows: []const Row, start: usize, end: usize) void {
     for (rows[start..end]) |row| {
-        app.gl_scratch.appendSlice(app.alloc, row.verts.items) catch break;
+        t.scratch.appendSlice(app.alloc, row.verts.items) catch break;
     }
 }
 
@@ -223,23 +238,23 @@ fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, re
     const r1: usize = @min(region[1], rows.len);
     var total: usize = 0;
 
-    app.gl_scratch.clearRetainingCapacity();
-    gatherRows(app, rows, 0, r0);
-    gatherRows(app, rows, r1, rows.len);
-    total += app.gl_scratch.items.len;
-    drawVerts(app, t, app.gl_scratch.items, layer, 0);
+    t.scratch.clearRetainingCapacity();
+    gatherRows(app, t, rows, 0, r0);
+    gatherRows(app, t, rows, r1, rows.len);
+    total += t.scratch.items.len;
+    drawVerts(app, t, t.scratch.items, layer, 0);
     if (r0 == r1) return total;
 
-    app.gl_scratch.clearRetainingCapacity();
-    gatherRows(app, rows, r0, r1);
+    t.scratch.clearRetainingCapacity();
+    gatherRows(app, t, rows, r0, r1);
     for (grid.retainedRows()) |r| {
         if (!r.live) continue;
-        app.gl_scratch.appendSlice(app.alloc, r.verts.items) catch break;
+        t.scratch.appendSlice(app.alloc, r.verts.items) catch break;
     }
-    total += app.gl_scratch.items.len;
+    total += t.scratch.items.len;
     gl.glEnable(gl.GL_SCISSOR_TEST);
     scissorRows(app, t, layer, @intCast(r0), @intCast(r1));
-    drawVerts(app, t, app.gl_scratch.items, layer, offset_px);
+    drawVerts(app, t, t.scratch.items, layer, offset_px);
     gl.glDisable(gl.GL_SCISSOR_TEST);
     return total;
 }
@@ -298,27 +313,44 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
     return out;
 }
 
-pub fn render(app: *App) void {
-    const t = &app.gl;
-    if (t.program == 0) return;
+pub const Frame = struct {
+    /// Some grid eases: the caller keeps frames coming (startEaseTick).
+    moving: bool = false,
+    /// App.flush_seq of the committed frame drawn.
+    flush_seq: u64 = 0,
+};
+
+/// The main surface and its overlays into `t`, sized `t.w_px` x `t.h_px`.
+/// Takes App.mu. Any thread with `t`'s context current: the GLArea's render
+/// signal, or the render thread.
+pub fn renderMain(app: *App, t: *Target) Frame {
+    if (t.program == 0) return .{};
     const t0 = clock.nowNs();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
 
-    t.w_px = app.drawable_w_px;
-    t.h_px = app.drawable_h_px;
     drainAtlas(app, t);
-    if (!begin(app, t)) return;
+    const seq = app.flush_seq;
+    if (!begin(app, t)) return .{ .flush_seq = seq };
 
     const layers = app.surface.committedLayers();
     const d = drawSurface(app, t, layers, @intCast(t0));
     const overlay_verts = drawOverlays(app, t);
-    if (d.moving) startEaseTick(app);
 
     if (applog.isEnabled()) {
         const us = @divTrunc(clock.nowNs() - t0, 1000);
         applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, d.verts + overlay_verts, d.moving });
     }
+    return .{ .moving = d.moving, .flush_seq = seq };
+}
+
+/// The main GLArea's render signal.
+pub fn render(app: *App) void {
+    app.gl.w_px = app.drawable_w_px;
+    app.gl.h_px = app.drawable_h_px;
+    const f = renderMain(app, &app.gl);
+    app.presented_seq = f.flush_seq;
+    if (f.moving) startEaseTick(app);
 }
 
 /// An external window: the surface rooted at `surface_id`.
@@ -344,14 +376,14 @@ fn rgba(rgb: u32, a: f32) [4]f32 {
 }
 
 /// A solid quad in surface px, for the overlay panels.
-fn pushRect(app: *App, x: i32, y: i32, w: i32, h: i32, color: [4]f32) void {
+fn pushRect(app: *App, t: *Target, x: i32, y: i32, w: i32, h: i32, color: [4]f32) void {
     const x0: f32 = @floatFromInt(x);
     const y0: f32 = @floatFromInt(y);
     const x1: f32 = @floatFromInt(x + w);
     const y1: f32 = @floatFromInt(y + h);
     const corners = [_][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x0, y1 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
     for (corners) |p| {
-        app.gl_scratch.append(app.alloc, .{
+        t.scratch.append(app.alloc, .{
             .position = p,
             .texCoord = .{ -1, -1 },
             .color = color,
@@ -388,14 +420,14 @@ fn drawOverlays(app: *App, t: *Target) usize {
         if (applog.isEnabled()) applog.appLog("[overlay] {s} x={d} y={d} w={d} h={d} layers={d}\n", .{ @tagName(kind), r.x, r.y, r.w, r.h, layers.len });
 
         const fill: [4]f32 = if (kind == .popupmenu) rgba(app.pmenu_bg, 1) else .{ panel[0], panel[1], panel[2], 1 };
-        app.gl_scratch.clearRetainingCapacity();
-        pushRect(app, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
-        pushRect(app, r.x, r.y, r.w, r.h, fill);
-        drawVerts(app, t, app.gl_scratch.items, surface_layer, 0);
+        t.scratch.clearRetainingCapacity();
+        pushRect(app, t, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
+        pushRect(app, t, r.x, r.y, r.w, r.h, fill);
+        drawVerts(app, t, t.scratch.items, surface_layer, 0);
 
         // A cmdline wider than the window is clipped to its panel.
         gl.glEnable(gl.GL_SCISSOR_TEST);
-        gl.glScissor(r.x, @as(i32, @intCast(t.h_px)) - r.y - r.h, r.w, r.h);
+        scissor(t, r.x, r.y, r.w, r.h);
         const pad = overlay_layout.paddingPx(kind, scale);
         for (layers) |layer| {
             var placed = layer;
@@ -413,12 +445,12 @@ fn drawOverlays(app: *App, t: *Target) usize {
 }
 
 /// Redraws every window on each frame-clock tick while some grid eases; the
-/// tick that finds every ease at rest removes itself.
-fn startEaseTick(app: *App) void {
+/// tick that finds every ease at rest removes itself. GTK main thread.
+pub fn startEaseTick(app: *App) void {
     if (app.ease_tick_active) return;
-    const area = app.gl_area orelse return;
+    const widget = app.frame_widget orelse return;
     app.ease_tick_active = true;
-    _ = gtk.gtk_widget_add_tick_callback(area, &onEaseTick, app, null);
+    _ = gtk.gtk_widget_add_tick_callback(widget, &onEaseTick, app, null);
 }
 
 fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {

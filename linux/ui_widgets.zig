@@ -39,8 +39,10 @@ fn label(classes: []const [*:0]const u8) *anyopaque {
 }
 
 /// Builds the window content around `area`: a vertical box holding the tab
-/// strip and an overlay whose child is the GLArea. Returns the box.
-pub fn build(app: *App, area: *anyopaque) *anyopaque {
+/// strip and an overlay whose child is the editor widget. `frames`, when the
+/// render thread draws, is the picture showing its frames, layered over
+/// `area` and under the message widgets. Returns the box.
+pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     const w = &app.widgets;
     const root = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
     const tabbar = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
@@ -52,6 +54,7 @@ pub fn build(app: *App, area: *anyopaque) *anyopaque {
     const overlay = gtk.gtk_overlay_new().?;
     gtk.gtk_widget_set_vexpand(overlay, 1);
     gtk.gtk_overlay_set_child(overlay, area);
+    if (frames) |f| gtk.gtk_overlay_add_overlay(overlay, f);
     gtk.gtk_box_append(root, overlay);
 
     const m: c_int = margin_pt;
