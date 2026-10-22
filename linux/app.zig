@@ -7,6 +7,8 @@ const SurfaceStore = @import("surface_store.zig").SurfaceStore;
 const Fonts = @import("renderer/font.zig").Fonts;
 const scroll_ease = core.scroll_ease;
 const overlay_layout = @import("overlay_layout.zig");
+const ui_state = @import("ui_state.zig");
+const ui_widgets = @import("ui_widgets.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -61,6 +63,8 @@ pub const App = struct {
     /// The core-owned ext UI surfaces, by overlay_layout.Kind; written by
     /// on_external_window and its close, read by the paint.
     overlays: [4]overlay_layout.Surface = @splat(.{}),
+    /// The frontend-drawn ext UI: messages, minis, the tabline.
+    ui: ui_state.UiState = .{},
     /// Pmenu's background from on_popupmenu_show; the popupmenu panel's fill.
     pmenu_bg: u32 = 0,
     /// config.scroll.large_jump_behavior; set before the core starts.
@@ -95,6 +99,14 @@ pub const App = struct {
     /// A frame-clock tick callback is installed and redraws every frame
     /// while some grid eases.
     ease_tick_active: bool = false,
+    widgets: ui_widgets.Widgets = .{},
+    /// ui_widgets' copy of `ui`, taken under `mu` and applied without it.
+    ui_snapshot: ui_widgets.SnapshotStorage = undefined,
+    /// NUL-terminated label text, sized for the largest ui_state buffer.
+    ui_text_scratch: [4097]u8 = undefined,
+    /// The toast_seq a hide timer is pending for.
+    toast_timer_seq: u32 = 0,
+    ui_idle_queued: std.atomic.Value(bool) = .init(false),
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
     /// on_quit_requested's argument, read by its idle.

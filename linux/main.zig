@@ -8,6 +8,7 @@ const gtk = @import("gtk_bindings.zig");
 const input = @import("input.zig");
 const applog = @import("app_log.zig");
 const config_mod = @import("config.zig");
+const ui_widgets = @import("ui_widgets.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -20,6 +21,7 @@ const Startup = struct {
     ext_cmdline: bool = false,
     ext_popupmenu: bool = false,
     ext_messages: bool = false,
+    ext_tabline: bool = false,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -137,6 +139,7 @@ fn startCore(app: *App, area: *anyopaque) void {
     if (startup.ext_cmdline) core.zonvie_core_set_ext_cmdline(cp, 1);
     if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
+    if (startup.ext_tabline) core.zonvie_core_set_ext_tabline(cp, 1);
 
     lock(app);
     const cw = app.cell_w_px;
@@ -210,7 +213,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onResize), app);
     input.attach(app, area);
 
-    gtk.gtk_window_set_child(win, area);
+    gtk.gtk_window_set_child(win, ui_widgets.build(app, area));
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
     gtk.gtk_window_present(win);
     _ = gtk.gtk_widget_grab_focus(area);
@@ -248,6 +251,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ext_cmdline = config.cmdline.external;
     var ext_popupmenu = config.popup.external;
     var ext_messages = config.messages.external;
+    var ext_tabline = config.tabline.external;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -266,6 +270,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             ext_popupmenu = true;
         } else if (std.mem.eql(u8, arg, "--extmessages")) {
             ext_messages = true;
+        } else if (std.mem.eql(u8, arg, "--exttabline")) {
+            ext_tabline = true;
         } else if (std.mem.eql(u8, arg, "--log") and i + 1 < args.len) {
             i += 1;
             log_path = args[i];
@@ -287,6 +293,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .ext_cmdline = ext_cmdline,
         .ext_popupmenu = ext_popupmenu,
         .ext_messages = ext_messages,
+        .ext_tabline = ext_tabline,
     };
 
     const app = alloc.create(App) catch return 1;
@@ -297,6 +304,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .large_jump = config.scroll.large_jump_behavior,
     };
     defer app.deinit();
+    ui_widgets.the_app = app;
 
     // Each process owns its own nvim, so a second launch must not forward
     // to the first instance.

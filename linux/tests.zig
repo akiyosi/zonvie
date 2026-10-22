@@ -7,4 +7,5 @@ test {
     _ = @import("fc.zig");
     _ = @import("grid_ease.zig");
     _ = @import("overlay_layout.zig");
+    _ = @import("ui_state.zig");
 }
