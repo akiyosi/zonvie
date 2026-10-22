@@ -88,6 +88,9 @@ pub const Options = struct {
     /// Plain external floats (nvim_open_win external=true) already work via
     /// ext_multigrid + win_external_pos and do NOT need this.
     ext_windows: bool = false,
+    /// Install deterministic per-grid font callbacks: the global cell is
+    /// 10x20 px, a slot is 10x20 x scale, doubled when its size field is 28.
+    font_slots: bool = false,
     /// Default per-wait timeout. Generous: CI machines are slow.
     timeout_ms: u64 = 5000,
 };
@@ -227,6 +230,12 @@ pub const Harness = struct {
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
             .on_clipboard_get = onClipboardGet,
             .on_clipboard_set = onClipboardSet,
+            .on_font_slot_load = if (opts.font_slots) onFontSlotLoad else null,
+            .on_font_slot_release = if (opts.font_slots) onFontSlotRelease else null,
+            .on_grid_font = if (opts.font_slots) onGridFont else null,
+            .on_shape_text_run_ex = if (opts.font_slots) onShapeEx else null,
+            .on_rasterize_glyph_ex = if (opts.font_slots) onRasterEx else null,
+            .on_rasterize_glyph_by_id_ex = if (opts.font_slots) onRasterEx else null,
         };
         h.core = try alloc.create(Core);
         errdefer alloc.destroy(h.core);
@@ -242,6 +251,8 @@ pub const Harness = struct {
         // No renderer in this harness: layout is "ready" immediately, which
         // unblocks the RPC thread's nvim_ui_attach.
         h.core.notifyLayoutReady(opts.rows, opts.cols);
+        // A real cell size: per-grid font arithmetic divides by it.
+        if (opts.font_slots) _ = h.core.updateLayoutPx(opts.cols * 10, opts.rows * 20, 10, 20);
 
         // Wait for the first complete redraw batch so scenarios start from a
         // settled screen. Keyed on attach side effects (grid sized + at least
@@ -433,6 +444,21 @@ pub const Harness = struct {
             .last_rows_delta = rows_delta,
         };
         h.row_scroll_count += 1;
+    }
+
+    fn onFontSlotLoad(_: ?*anyopaque, _: u32, utf8: [*]const u8, len: usize, scale: f32, w: *u32, h: *u32) callconv(.c) c_int {
+        const big: f32 = if (std.mem.indexOf(u8, utf8[0..len], "\t28") != null) 2.0 else 1.0;
+        w.* = @max(1, @as(u32, @intFromFloat(@round(10.0 * big * scale))));
+        h.* = @max(1, @as(u32, @intFromFloat(@round(20.0 * big * scale))));
+        return 1;
+    }
+    fn onFontSlotRelease(_: ?*anyopaque, _: u32) callconv(.c) void {}
+    fn onGridFont(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+    fn onShapeEx(_: ?*anyopaque, _: u32, _: [*]const u32, _: usize, _: u32, _: [*]u32, _: [*]u32, _: [*]i32, _: [*]i32, _: [*]i32, _: usize) callconv(.c) usize {
+        return 0;
+    }
+    fn onRasterEx(_: ?*anyopaque, _: u32, _: u32, _: u32, _: *zc.GlyphBitmap) callconv(.c) c_int {
+        return 0;
     }
 
     fn onLog(_: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
@@ -961,6 +987,37 @@ pub const Harness = struct {
             return .{ .rows = sg.rows, .cols = sg.cols };
         }
         return null;
+    }
+
+    /// Per-grid font state of `grid_id`, or null when it uses the global font.
+    pub fn gridFont(h: *Harness, grid_id: i64) ?zc.grid_mod.GridFont {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.grid.grid_fonts.get(grid_id);
+    }
+
+    /// A grid whose font runs in `mode`, if any.
+    pub fn findFontGrid(h: *Harness, mode: zc.grid_mod.FontMode) ?i64 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        var it = h.core.grid.grid_fonts.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.mode == mode) return e.key_ptr.*;
+        }
+        return null;
+    }
+
+    pub const FontResizeStats = struct { requests: u64, last_rows: u32, last_cols: u32 };
+
+    /// try_resize_grid requests the per-grid font logic has decided to send.
+    pub fn fontResizeStats(h: *Harness) FontResizeStats {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return .{
+            .requests = h.core.font_resize_requests,
+            .last_rows = h.core.last_font_resize_rows,
+            .last_cols = h.core.last_font_resize_cols,
+        };
     }
 
     /// True if `grid_id` is currently tracked as an external grid

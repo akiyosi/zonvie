@@ -75,6 +75,31 @@ test "e2e:multigrid_resize" {
     try @import("scenarios/multigrid_resize.zig").run(testing.allocator);
 }
 
+test "e2e:per_grid_font_split" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runSplit(testing.allocator);
+}
+
+test "e2e:per_grid_font_split_resize" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runSplitResize(testing.allocator);
+}
+
+test "e2e:per_grid_font_clear" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runClear(testing.allocator);
+}
+
+test "e2e:per_grid_font_scale_view_float" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runScaleViewFloat(testing.allocator);
+}
+
+test "e2e:per_grid_font_font_view_float" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runFontViewFloat(testing.allocator);
+}
+
 test "e2e:wide_chars" {
     try requireNvim();
     try @import("scenarios/wide_chars.zig").run(testing.allocator);
