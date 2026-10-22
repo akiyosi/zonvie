@@ -66,8 +66,7 @@ const is_linux = builtin.os.tag == .linux;
 /// no row reuse, blit, scroll fast path or per-row gating, so the scenarios
 /// that assert those paths ran have nothing to observe there.
 const redraws_partially = !is_linux;
-/// Not yet on Linux: custom shaders, glow, and a fallback face for glyphs the
-/// primary font lacks (emoji).
+/// Not yet on Linux: custom shaders and glow.
 const linux_has_feature = !is_linux;
 /// The cmdline is an overlay in the main window on Linux, not a window of its
 /// own, and a tiling compositor sizes the window, not :set columns/lines.
@@ -270,7 +269,7 @@ test "gui:visual_emoji_cursor_width" {
 }
 
 test "gui:visual_emoji_cluster_cache" {
-    try gated(can_capture and linux_has_feature, @import("scenarios/visual/emoji_cluster_cache.zig"));
+    try gated(can_capture, @import("scenarios/visual/emoji_cluster_cache.zig"));
 }
 
 test "gui:visual_float_border_continuity" {

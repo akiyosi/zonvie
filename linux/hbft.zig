@@ -22,6 +22,7 @@ pub extern "c" fn zonvie_ft_hb_font_create(
 ) ?*zonvie_ft_hb_font;
 
 pub extern "c" fn zonvie_ft_hb_font_destroy(f: *zonvie_ft_hb_font) void;
+pub extern "c" fn zonvie_ft_hb_font_strike_px(f: *const zonvie_ft_hb_font) u32;
 
 // =========================================================================
 // Text shaping
