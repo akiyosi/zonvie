@@ -456,9 +456,14 @@ pub const ConfirmMessage = struct {
     active: bool = false,
     /// A character did not fit: later text must not land after the gap.
     text_full: bool = false,
+    /// A cmdline_hide arrived while this confirm was showing, so the flush
+    /// that sends the hide dismisses it. A confirm shown after the hide, in
+    /// the same batch, is the next prompt's and must survive that flush.
+    hide_seen: bool = false,
 
     pub fn clear(self: *ConfirmMessage) void {
         self.active = false;
+        self.hide_seen = false;
         self.kind_len = 0;
         self.text_len = 0;
         self.text_full = false;
@@ -3477,6 +3482,7 @@ pub const Grid = struct {
                 state.prompt = "";
             }
         }
+        if (self.message_state.confirm_msg.active) self.message_state.confirm_msg.hide_seen = true;
         self.cmdline_dirty = true;
     }
 
@@ -3733,6 +3739,7 @@ pub const Grid = struct {
                 cm.hl_id = primary_hl;
                 cm.id = msg_id;
                 cm.active = true;
+                cm.hide_seen = false;
             }
 
             self.message_state.confirm_dirty = true;
