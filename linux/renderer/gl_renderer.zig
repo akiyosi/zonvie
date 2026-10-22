@@ -12,6 +12,8 @@ const gtk = @import("../gtk_bindings.zig");
 const surface_store = @import("../surface_store.zig");
 const GridRows = surface_store.GridRows;
 const Row = surface_store.Row;
+const overlay_layout = @import("../overlay_layout.zig");
+const rules = core.frontend_rules;
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -258,12 +260,91 @@ pub fn render(app: *App) void {
             break;
         }
     }
+    verts_total += drawOverlays(app);
     if (any_moving) startEaseTick(app);
 
     if (applog.isEnabled()) {
         const us = @divTrunc(clock.nowNs() - t0, 1000);
         applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, verts_total, any_moving });
     }
+}
+
+fn rgba(rgb: u32, a: f32) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt((rgb >> 16) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt((rgb >> 8) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt(rgb & 0xff)) / 255.0,
+        a,
+    };
+}
+
+/// A solid quad in surface px, for the overlay panels.
+fn pushRect(app: *App, x: i32, y: i32, w: i32, h: i32, color: [4]f32) void {
+    const x0: f32 = @floatFromInt(x);
+    const y0: f32 = @floatFromInt(y);
+    const x1: f32 = @floatFromInt(x + w);
+    const y1: f32 = @floatFromInt(y + h);
+    const corners = [_][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x0, y1 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+    for (corners) |p| {
+        app.gl_scratch.append(app.alloc, .{
+            .position = p,
+            .texCoord = .{ -1, -1 },
+            .color = color,
+            .grid_id = 0,
+            .deco_flags = 0,
+            .deco_phase = 0,
+        }) catch return;
+    }
+}
+
+const surface_layer: core.Layer = .{ .grid_id = 0, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 0, .cols = 0, .z = 0, .flags = 0 };
+
+/// The core-owned ext UI surfaces, over everything else on the main
+/// surface: a panel, then the surface's layers inside its padding.
+fn drawOverlays(app: *App) usize {
+    const scale: i32 = @intFromFloat(app.scale);
+    const rects = overlay_layout.place(&app.overlays, .{
+        .main_w_px = @intCast(app.drawable_w_px),
+        .main_h_px = @intCast(app.drawable_h_px),
+        .cell_w_px = @intCast(app.cell_w_px),
+        .cell_h_px = @intCast(app.cell_h_px),
+        .scale = scale,
+    });
+    const bg = rgba(app.default_bg, 1);
+    const panel = rules.panelBg(bg[0], bg[1], bg[2]);
+    const border = rgba(app.default_fg, 0.25);
+    const cur = app.surface.committedCursor();
+    var total: usize = 0;
+    for (overlay_layout.draw_order) |kind| {
+        const r = rects[@intFromEnum(kind)] orelse continue;
+        const gid = overlay_layout.gridId(kind);
+        const layers = app.surface.committedSurfaceLayers(gid);
+        if (layers.len == 0) continue;
+        if (applog.isEnabled()) applog.appLog("[overlay] {s} x={d} y={d} w={d} h={d} layers={d}\n", .{ @tagName(kind), r.x, r.y, r.w, r.h, layers.len });
+
+        const fill: [4]f32 = if (kind == .popupmenu) rgba(app.pmenu_bg, 1) else .{ panel[0], panel[1], panel[2], 1 };
+        app.gl_scratch.clearRetainingCapacity();
+        pushRect(app, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
+        pushRect(app, r.x, r.y, r.w, r.h, fill);
+        drawVerts(app, app.gl_scratch.items, surface_layer, 0);
+
+        // A cmdline wider than the window is clipped to its panel.
+        gl.glEnable(gl.GL_SCISSOR_TEST);
+        gl.glScissor(r.x, @as(i32, @intCast(app.drawable_h_px)) - r.y - r.h, r.w, r.h);
+        const pad = overlay_layout.paddingPx(kind, scale);
+        for (layers) |layer| {
+            var placed = layer;
+            placed.x_px += r.x + pad;
+            placed.y_px += r.y + pad;
+            if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, placed, grid, .{ 0, 0 }, 0);
+            if (cur.verts.len != 0 and cur.grid_id == layer.grid_id) {
+                total += cur.verts.len;
+                drawVerts(app, cur.verts, placed, 0);
+            }
+        }
+        gl.glDisable(gl.GL_SCISSOR_TEST);
+    }
+    return total;
 }
 
 /// Redraws on every frame-clock tick while some grid eases; the render that

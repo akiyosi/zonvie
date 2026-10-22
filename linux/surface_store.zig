@@ -139,11 +139,42 @@ pub const GridRows = struct {
     }
 };
 
+/// One surface's layer list, staged like the rows.
+pub const Layers = struct {
+    front: std.ArrayListUnmanaged(core.Layer) = .empty,
+    back: std.ArrayListUnmanaged(core.Layer) = .empty,
+    staged: bool = false,
+
+    fn deinit(self: *Layers, alloc: std.mem.Allocator) void {
+        self.front.deinit(alloc);
+        self.back.deinit(alloc);
+    }
+
+    fn stage(self: *Layers, alloc: std.mem.Allocator, layers: []const core.Layer) !void {
+        self.back.clearRetainingCapacity();
+        try self.back.appendSlice(alloc, layers);
+        self.staged = true;
+    }
+
+    fn commit(self: *Layers) void {
+        if (!self.staged) return;
+        std.mem.swap(std.ArrayListUnmanaged(core.Layer), &self.front, &self.back);
+        self.staged = false;
+    }
+
+    fn has(self: *const Layers, grid_id: i64) bool {
+        for (self.front.items) |l| if (l.grid_id == grid_id) return true;
+        return false;
+    }
+};
+
 pub const SurfaceStore = struct {
     grids: std.AutoHashMapUnmanaged(i64, *GridRows) = .empty,
-    layers_front: std.ArrayListUnmanaged(core.Layer) = .empty,
-    layers_back: std.ArrayListUnmanaged(core.Layer) = .empty,
-    layers_staged: bool = false,
+    /// Surface 1, the main window.
+    main: Layers = .{},
+    /// External surfaces by root grid id. Opened and closed immediately
+    /// (on_external_window is not transactional); their layers are staged.
+    others: std.AutoHashMapUnmanaged(i64, *Layers) = .empty,
     cursor_front: std.ArrayListUnmanaged(Vertex) = .empty,
     cursor_back: std.ArrayListUnmanaged(Vertex) = .empty,
     cursor_front_grid: i64 = 0,
@@ -158,8 +189,13 @@ pub const SurfaceStore = struct {
             alloc.destroy(g.*);
         }
         self.grids.deinit(alloc);
-        self.layers_front.deinit(alloc);
-        self.layers_back.deinit(alloc);
+        self.main.deinit(alloc);
+        var oit = self.others.valueIterator();
+        while (oit.next()) |l| {
+            l.*.deinit(alloc);
+            alloc.destroy(l.*);
+        }
+        self.others.deinit(alloc);
         self.cursor_front.deinit(alloc);
         self.cursor_back.deinit(alloc);
         self.destroyed.deinit(alloc);
@@ -179,12 +215,35 @@ pub const SurfaceStore = struct {
         return gop.value_ptr.*;
     }
 
-    pub fn stageLayers(self: *SurfaceStore, alloc: std.mem.Allocator, layers: []const core.Layer, rows: u32, cols: u32) !void {
-        _ = rows;
-        _ = cols;
-        self.layers_back.clearRetainingCapacity();
-        try self.layers_back.appendSlice(alloc, layers);
-        self.layers_staged = true;
+    /// A surface not opened is ignored: the core opens one before its first
+    /// layout (zonvie_core.h on_surface_layout).
+    pub fn stageLayers(self: *SurfaceStore, alloc: std.mem.Allocator, surface_id: i64, layers: []const core.Layer) !void {
+        const l = self.surfaceLayers(surface_id) orelse return;
+        try l.stage(alloc, layers);
+    }
+
+    /// Caller holds App.mu. Repeated opens of one id are the same surface.
+    pub fn openSurface(self: *SurfaceStore, alloc: std.mem.Allocator, surface_id: i64) !void {
+        const gop = try self.others.getOrPut(alloc, surface_id);
+        if (gop.found_existing) return;
+        gop.value_ptr.* = alloc.create(Layers) catch |e| {
+            _ = self.others.remove(surface_id);
+            return e;
+        };
+        gop.value_ptr.*.* = .{};
+    }
+
+    /// Caller holds App.mu. Its grids keep their rows until on_grid_destroy.
+    pub fn closeSurface(self: *SurfaceStore, alloc: std.mem.Allocator, surface_id: i64) void {
+        const kv = self.others.fetchRemove(surface_id) orelse return;
+        kv.value.deinit(alloc);
+        alloc.destroy(kv.value);
+        if (!self.hasLayer(self.cursor_front_grid)) self.cursor_front.clearRetainingCapacity();
+    }
+
+    fn surfaceLayers(self: *SurfaceStore, surface_id: i64) ?*Layers {
+        if (surface_id == 1) return &self.main;
+        return self.others.get(surface_id);
     }
 
     pub fn stageCursor(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64, verts: []const Vertex) !void {
@@ -206,7 +265,9 @@ pub const SurfaceStore = struct {
     pub fn cancel(self: *SurfaceStore) void {
         var it = self.grids.valueIterator();
         while (it.next()) |g| g.*.cancel();
-        self.layers_staged = false;
+        self.main.staged = false;
+        var oit = self.others.valueIterator();
+        while (oit.next()) |l| l.*.staged = false;
         self.cursor_staged = false;
         self.destroyed.clearRetainingCapacity();
     }
@@ -223,10 +284,9 @@ pub const SurfaceStore = struct {
         // Grid 1 is the root, holding chrome and messages, and negative ids
         // are UI the core owns: neither eases.
         while (it.next()) |kv| kv.value_ptr.*.commit(alloc, kv.key_ptr.* >= 2, in);
-        if (self.layers_staged) {
-            std.mem.swap(std.ArrayListUnmanaged(core.Layer), &self.layers_front, &self.layers_back);
-            self.layers_staged = false;
-        }
+        self.main.commit();
+        var oit = self.others.valueIterator();
+        while (oit.next()) |l| l.*.commit();
         if (self.cursor_staged) {
             std.mem.swap(std.ArrayListUnmanaged(Vertex), &self.cursor_front, &self.cursor_back);
             self.cursor_front_grid = self.cursor_back_grid;
@@ -244,12 +304,22 @@ pub const SurfaceStore = struct {
     }
 
     fn hasLayer(self: *const SurfaceStore, grid_id: i64) bool {
-        for (self.layers_front.items) |l| if (l.grid_id == grid_id) return true;
+        if (self.main.has(grid_id)) return true;
+        var it = self.others.valueIterator();
+        while (it.next()) |l| if (l.*.has(grid_id)) return true;
         return false;
     }
 
+    /// The main surface's layers.
     pub fn committedLayers(self: *const SurfaceStore) []const core.Layer {
-        return self.layers_front.items;
+        return self.main.front.items;
+    }
+
+    /// An external surface's layers; empty when it is not open.
+    pub fn committedSurfaceLayers(self: *const SurfaceStore, surface_id: i64) []const core.Layer {
+        if (surface_id == 1) return self.main.front.items;
+        const l = self.others.get(surface_id) orelse return &.{};
+        return l.front.items;
     }
 
     pub fn committedGrid(self: *const SurfaceStore, grid_id: i64) ?*const GridRows {
@@ -408,7 +478,7 @@ fn layer(grid: i64, z: i32) core.Layer {
 test "layers publish at commit only" {
     var s: SurfaceStore = .{};
     defer s.deinit(testing.allocator);
-    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{ layer(1, 0), layer(2, 1) });
     try testing.expectEqual(@as(usize, 0), s.committedLayers().len);
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
@@ -421,7 +491,7 @@ test "cursor-only update never touches rows" {
     try (try s.rowsFor(testing.allocator, 2)).stageRow(testing.allocator, 0, &.{v(5)}, 1);
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
-    try s.stageLayers(testing.allocator, &.{layer(2, 0)}, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{layer(2, 0)});
     try s.stageCursor(testing.allocator, 2, &.{v(77)});
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
@@ -432,11 +502,11 @@ test "cursor-only update never touches rows" {
 test "layout drop hides a grid's rows and its cursor" {
     var s: SurfaceStore = .{};
     defer s.deinit(testing.allocator);
-    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(3, 1) }, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{ layer(1, 0), layer(3, 1) });
     try s.stageCursor(testing.allocator, 3, &.{v(1)});
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
-    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{layer(1, 0)});
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
@@ -446,11 +516,11 @@ test "layout drop hides a grid's rows and its cursor" {
 test "cancel keeps committed layers and cursor" {
     var s: SurfaceStore = .{};
     defer s.deinit(testing.allocator);
-    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{layer(1, 0)});
     try s.stageCursor(testing.allocator, 1, &.{v(1)});
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
-    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{ layer(1, 0), layer(2, 1) });
     try s.stageCursor(testing.allocator, 2, &.{v(2)});
     s.cancel();
     try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
@@ -473,13 +543,13 @@ test "destroy frees the grid at commit, not before" {
 test "failed prepareCommit then cancel keeps committed layers, cursor and rows" {
     var s: SurfaceStore = .{};
     defer s.deinit(testing.allocator);
-    try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{layer(1, 0)});
     try s.stageCursor(testing.allocator, 1, &.{v(1)});
     try (try s.rowsFor(testing.allocator, 1)).stageRow(testing.allocator, 0, &.{v(9)}, 1);
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
 
-    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{ layer(1, 0), layer(2, 1) });
     try s.stageCursor(testing.allocator, 2, &.{v(2)});
     try (try s.rowsFor(testing.allocator, 1)).stageRow(testing.allocator, 0, &.{v(50)}, 64);
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
@@ -494,7 +564,7 @@ test "failed prepareCommit then cancel keeps committed layers, cursor and rows" 
 }
 
 fn twoGridStore(s: *SurfaceStore) !void {
-    try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
+    try s.stageLayers(testing.allocator, 1, &.{ layer(1, 0), layer(2, 1) });
 }
 
 test "cursor clear from a non-owner in the same flush keeps the owner's cursor" {
@@ -604,4 +674,30 @@ test "the root grid never eases" {
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, in);
     try testing.expect(!g.ease.moving());
+}
+
+test "an external surface publishes its layers at commit and keeps the cursor on it" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.openSurface(testing.allocator, -100);
+    try s.openSurface(testing.allocator, -100);
+    try s.stageLayers(testing.allocator, -100, &.{layer(-100, 0)});
+    try s.stageCursor(testing.allocator, -100, &.{v(3)});
+    try testing.expectEqual(@as(usize, 0), s.committedSurfaceLayers(-100).len);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    try testing.expectEqual(@as(usize, 1), s.committedSurfaceLayers(-100).len);
+    try testing.expectEqual(@as(usize, 1), s.committedCursor().verts.len);
+    s.closeSurface(testing.allocator, -100);
+    try testing.expectEqual(@as(usize, 0), s.committedSurfaceLayers(-100).len);
+    try testing.expectEqual(@as(usize, 0), s.committedCursor().verts.len);
+}
+
+test "layers for a surface never opened are dropped" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try s.stageLayers(testing.allocator, -101, &.{layer(-101, 0)});
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    try testing.expectEqual(@as(usize, 0), s.committedSurfaceLayers(-101).len);
 }
