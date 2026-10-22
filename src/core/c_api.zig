@@ -38,6 +38,7 @@ test {
     _ = @import("abi_header_test.zig");
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");
+    _ = @import("font_slots.zig");
     _ = damage_bands;
     _ = scroll_ease;
     _ = cell_age_store;
