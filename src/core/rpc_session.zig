@@ -699,6 +699,18 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
+    if (id != 0 and id == self.font_query_msgid) {
+        self.font_query_msgid = 0;
+        // An error keeps the current state; the next trigger asks again.
+        if (has_err) return;
+        var answers: [64]WindowFontAnswer = undefined;
+        const n = parseWindowFontAnswers(top[3], &answers);
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
+        for (answers[0..n]) |a| self.applyWindowFontLocked(a);
+        return;
+    }
+
     if (takeTrackedRequest(&self.glow_request_msgid, id)) {
         if (has_err) {
             // The next redraw re-requests it.
@@ -708,6 +720,49 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
         applyGlowConfig(self, top[3]);
     }
+}
+
+pub const WindowFontAnswer = struct {
+    win: i64,
+    valid: bool,
+    guifont: ?[]const u8 = null,
+    zonvie_scale: ?f64 = null,
+    neovide_scale: ?f64 = null,
+};
+
+fn numberOf(v: mp.Value) ?f64 {
+    return switch (v) {
+        .int => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+/// Rows of font_query_lua's result. A malformed row is skipped.
+pub fn parseWindowFontAnswers(result: mp.Value, out: []WindowFontAnswer) usize {
+    if (result != .arr) return 0;
+    var n: usize = 0;
+    for (result.arr) |row| {
+        if (n == out.len) break;
+        if (row != .arr or row.arr.len < 2 or row.arr[0] != .int or row.arr[1] != .bool) continue;
+        const r = row.arr;
+        if (!r[1].bool) {
+            out[n] = .{ .win = r[0].int, .valid = false };
+            n += 1;
+            continue;
+        }
+        if (r.len < 5) continue;
+        out[n] = .{
+            .win = r[0].int,
+            .valid = true,
+            .guifont = if (r[2] == .str and r[2].str.len > 0) r[2].str else null,
+            // NaN would defeat slot dedup; a non-finite or non-positive scale is unset.
+            .zonvie_scale = if (numberOf(r[3])) |s| (if (std.math.isFinite(s) and s > 0) s else null) else null,
+            .neovide_scale = numberOf(r[4]),
+        };
+        n += 1;
+    }
+    return n;
 }
 
 /// Whether an nvim_win_get_config result describes a float that tracks the
@@ -1460,6 +1515,26 @@ pub fn setupAgentStatus(self: *Core) void {
 /// Every platform: the message float's wheel (shared core code) reads it too,
 /// and without the reporter Windows scrolled it 3 lines whatever 'mousescroll'
 /// said, 'ver:0' included.
+/// zonvie.set_window_font(winid, { guifont = ?, scale = ? }): write the
+/// window variables and ask the core to read them now. Writing the variables
+/// directly also works; they are picked up on the next trigger.
+pub fn setupWindowFontHelper(self: *Core) void {
+    const lua_code =
+        \\_G.zonvie = _G.zonvie or {}
+        \\function _G.zonvie.set_window_font(win, spec)
+        \\  if win == nil or win == 0 then win = vim.api.nvim_get_current_win() end
+        \\  spec = spec or {}
+        \\  vim.w[win].zonvie_guifont = spec.guifont
+        \\  vim.w[win].zonvie_font_scale = spec.scale
+        \\  pcall(vim.rpcnotify, vim.g.zonvie_channel or 0, 'zonvie_window_font', win)
+        \\end
+    ;
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupWindowFontHelper: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+}
+
 pub fn setupMouseScrollReporter(self: *Core) void {
     const lua_code =
         \\local function report()
@@ -1879,8 +1954,10 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
 
         self.takeFloatConfigQueriesLocked();
+        if (self.perGridFontsEnabled()) self.takeFontQueriesLocked(clock.nowNs()) else self.grid.font_query_wanted.clearRetainingCapacity();
         self.unlockGridAsRedrawOwner();
         self.sendFloatConfigQueries();
+        self.sendFontQueries();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -1889,6 +1966,18 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         {
             // Only send if no request already pending (avoid burning retries)
             self.requestGlowConfig();
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_window_font")) {
+        // The helper wrote the variables; read them now, past the throttle.
+        if (!self.perGridFontsEnabled()) return;
+        if (params.len > 0 and params[0] == .int and params[0].int > 0) {
+            const win = params[0].int;
+            self.grid_mu.lockUncancelable(clock.io());
+            self.grid.wantFontQuery(win);
+            self.font_query_forced.append(self.alloc, win) catch {};
+            self.takeFontQueriesLocked(clock.nowNs());
+            self.grid_mu.unlock(clock.io());
+            self.sendFontQueries();
         }
     } else if (std.mem.eql(u8, method, "zonvie_ime_off")) {
         // Custom RPC notification for IME off (user-invokable)
@@ -2518,6 +2607,7 @@ pub fn runLoop(self: *Core) void {
         // Report 'mousescroll' so the trackpad path and the message float's
         // wheel know how many rows one wheel event is worth.
         setupMouseScrollReporter(self);
+        if (self.perGridFontsEnabled()) setupWindowFontHelper(self);
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
@@ -4088,4 +4178,89 @@ test "only a window-relative float at a buffer position follows the scroll" {
     try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &win_rowcol }));
     try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &editor }));
     try std.testing.expect(!floatConfigFollowsScroll(.nil));
+}
+
+test "a font answer parses the three variables and an invalid window" {
+    var row_ok = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .{ .str = "Menlo:h18" }, .{ .float = 0.5 }, .nil };
+    var row_gone = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = false } };
+    var rows = [_]mp.Value{ .{ .arr = &row_ok }, .{ .arr = &row_gone } };
+    var out: [4]WindowFontAnswer = undefined;
+    const n = parseWindowFontAnswers(.{ .arr = &rows }, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(out[0].valid);
+    try std.testing.expectEqualStrings("Menlo:h18", out[0].guifont.?);
+    try std.testing.expectEqual(@as(f64, 0.5), out[0].zonvie_scale.?);
+    try std.testing.expect(out[0].neovide_scale == null);
+    try std.testing.expect(!out[1].valid);
+}
+
+// A NaN scale would never compare equal in slot dedup.
+test "a font answer treats a non-finite or non-positive zonvie_font_scale as unset" {
+    const bad = [_]f64{ std.math.nan(f64), std.math.inf(f64), 0, -1 };
+    for (bad) |s| {
+        var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .nil, .{ .float = s }, .nil };
+        var rows = [_]mp.Value{.{ .arr = &row }};
+        var out: [1]WindowFontAnswer = undefined;
+        try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+        try std.testing.expect(out[0].zonvie_scale == null);
+    }
+}
+
+test "a font answer for a window no longer mapped is dropped, and a session reset forgets the in-flight query" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 77;
+    try core.grid.resizeGrid(1, 10, 40);
+    try core.grid.resizeGrid(2, 5, 20);
+    try core.grid.setWinPos(2, 2000, 0, 0); // grid 2 now shows a different window
+    const seeded: @import("grid.zig").GridFont = .{ .win_id = 2000, .font_id = 3, .mode = .resize, .cell_w_px = 9, .cell_h_px = 18, .frame_rows = 5, .frame_cols = 20 };
+    try core.grid.grid_fonts.put(core.alloc, 2, seeded);
+    var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .{ .str = "X:h30" }, .nil, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 77 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expectEqual(seeded, core.grid.grid_fonts.get(2).?);
+    try std.testing.expectEqual(@as(i64, 0), core.font_query_msgid);
+    core.font_query_msgid = 78;
+    try core.font_query_last_ns.put(core.alloc, 2000, 5);
+    core.resetFontSlotsForNewSession();
+    try std.testing.expectEqual(@as(i64, 0), core.font_query_msgid);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_last_ns.count());
+}
+
+test "a session reset releases loaded font slots only" {
+    const S = struct {
+        var released: [4]u32 = undefined;
+        var n: usize = 0;
+        fn release(_: ?*anyopaque, id: u32) callconv(.c) void {
+            released[n] = id;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cb.on_font_slot_release = S.release;
+    const loaded = try core.font_slots.acquire("A:h10", 1.0);
+    core.font_slots.markLoaded(loaded.font_id, 8, 16);
+    _ = try core.font_slots.acquire("B:h10", 1.0); // load never succeeded
+    core.resetFontSlotsForNewSession();
+    try std.testing.expectEqualSlices(u32, &.{loaded.font_id}, S.released[0..S.n]);
+    try std.testing.expect(!core.font_slots.slot(loaded.font_id).loaded);
+}
+
+test "an unset window is re-queried at most once a second unless forced" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+    core.font_query_outbox.clearRetainingCapacity();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_outbox.items.len);
+    core.grid.wantFontQuery(1000);
+    try core.font_query_forced.append(core.alloc, 1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + 600 * std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
 }

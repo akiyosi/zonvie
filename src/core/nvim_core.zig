@@ -1198,6 +1198,16 @@ pub const Core = struct {
     float_config_requests: std.AutoHashMapUnmanaged(i64, i64) = .{},
     float_config_outbox: std.ArrayListUnmanaged(i64) = .empty,
 
+    // Per-grid fonts. RPC thread only, under grid_mu except the outbox,
+    // which sendFontQueries drains after grid_mu is released.
+    font_slots: font_slots.Table = .{},
+    font_query_msgid: i64 = 0,
+    font_query_outbox: std.ArrayListUnmanaged(i64) = .empty,
+    // Handles the helper notification named; they skip the throttle once.
+    font_query_forced: std.ArrayListUnmanaged(i64) = .empty,
+    // Last query time per window (1 s throttle for windows without a font).
+    font_query_last_ns: std.AutoHashMapUnmanaged(i64, i128) = .{},
+
     clipboard_setup_done: bool = false,
 
     // Neon glow configuration (read from vim.g.zonvie_glow)
@@ -1367,6 +1377,9 @@ pub const Core = struct {
         self.flush_subgrid_ledgers.deinit(self.alloc);
         self.float_config_requests.deinit(self.alloc);
         self.float_config_outbox.deinit(self.alloc);
+        self.font_query_outbox.deinit(self.alloc);
+        self.font_query_forced.deinit(self.alloc);
+        self.font_query_last_ns.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.flush_replaced_uvs.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
@@ -1582,6 +1595,7 @@ pub const Core = struct {
             self.quit_request_msgid.store(0, .release);
             self.glow_request_msgid.store(0, .release);
             self.float_config_requests.clearRetainingCapacity();
+            self.font_query_msgid = 0;
 
             self.glow_startup_retries = 30;
             self.ssh_auth_pending.store(false, .seq_cst);
@@ -1713,6 +1727,7 @@ pub const Core = struct {
 
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
+        self.resetFontSlotsForNewSession();
         self.grid.resetForNewSession();
         // The old session's windows are gone; its anchor with them.
         self.msg_anchor_mu.lockUncancelable(clock.io());
@@ -5253,6 +5268,101 @@ pub const Core = struct {
             if (!ok) _ = self.float_config_requests.remove(id);
         }
         self.float_config_outbox.clearRetainingCapacity();
+    }
+
+    /// Move the windows the batch queued into the outbox, skipping a window
+    /// with no font state asked less than 1 s ago unless the helper forced it.
+    /// Caller holds grid_mu.
+    pub fn takeFontQueriesLocked(self: *Core, now_ns: i128) void {
+        self.font_query_outbox.clearRetainingCapacity();
+        for (self.grid.font_query_wanted.items) |win_id| {
+            const forced = for (self.font_query_forced.items) |f| {
+                if (f == win_id) break true;
+            } else false;
+            const has_font = blk: {
+                var it = self.grid.grid_fonts.valueIterator();
+                while (it.next()) |gf| if (gf.win_id == win_id) break :blk true;
+                break :blk false;
+            };
+            if (!forced and !has_font) {
+                if (self.font_query_last_ns.get(win_id)) |last| {
+                    if (now_ns - last < std.time.ns_per_s) continue;
+                }
+            }
+            self.font_query_last_ns.put(self.alloc, win_id, now_ns) catch {};
+            self.font_query_outbox.append(self.alloc, win_id) catch {};
+        }
+        self.grid.font_query_wanted.clearRetainingCapacity();
+        self.font_query_forced.clearRetainingCapacity();
+    }
+
+    const font_query_lua =
+        \\local out = {}
+        \\for _, w in ipairs(...) do
+        \\  if vim.api.nvim_win_is_valid(w) then
+        \\    local v = vim.w[w]
+        \\    out[#out + 1] = { w, true, v.zonvie_guifont or vim.NIL, v.zonvie_font_scale or vim.NIL,
+        \\      v.neovide_font_scale or vim.NIL }
+        \\  else
+        \\    out[#out + 1] = { w, false }
+        \\  end
+        \\end
+        \\return out
+    ;
+
+    /// One tracked nvim_exec_lua for the outbox. While a query is in flight
+    /// the outbox goes back to the wanted list for the next batch.
+    pub fn sendFontQueries(self: *Core) void {
+        if (self.font_query_outbox.items.len == 0) return;
+        if (self.font_query_msgid != 0) {
+            self.grid_mu.lockUncancelable(clock.io());
+            for (self.font_query_outbox.items) |w| self.grid.wantFontQuery(w);
+            self.grid_mu.unlock(clock.io());
+            self.font_query_outbox.clearRetainingCapacity();
+            return;
+        }
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        const ok = blk: {
+            self.sendRequestHeader(&buf, id, "nvim_exec_lua") catch break :blk false;
+            rpc.packArray(&buf, self.alloc, 2) catch break :blk false;
+            rpc.packStr(&buf, self.alloc, font_query_lua) catch break :blk false;
+            rpc.packArray(&buf, self.alloc, 1) catch break :blk false;
+            rpc.packArray(&buf, self.alloc, @intCast(self.font_query_outbox.items.len)) catch break :blk false;
+            for (self.font_query_outbox.items) |w| rpc.packInt(&buf, self.alloc, w) catch break :blk false;
+            self.sendRaw(buf.items) catch break :blk false;
+            break :blk true;
+        };
+        if (ok) self.font_query_msgid = id;
+        self.font_query_outbox.clearRetainingCapacity();
+    }
+
+    /// Drop every slot and the query state of the old session. The frontend
+    /// releases each face it loaded; a slot whose load failed holds none.
+    pub fn resetFontSlotsForNewSession(self: *Core) void {
+        var id: u32 = 1;
+        while (id < font_slots.max_slots) : (id += 1) {
+            if (self.font_slots.slot(id).loaded) {
+                if (self.cb.on_font_slot_release) |f| f(self.ctx, id);
+            }
+        }
+        self.font_slots.reset();
+        self.font_query_msgid = 0;
+        self.font_query_outbox.clearRetainingCapacity();
+        self.font_query_forced.clearRetainingCapacity();
+        self.font_query_last_ns.clearRetainingCapacity();
+    }
+
+    /// Task 6 applies the answer; until then only the mapping check exists.
+    pub fn applyWindowFontLocked(self: *Core, a: rpc_session.WindowFontAnswer) void {
+        _ = self.gridForWin(a.win) orelse return;
+    }
+
+    fn gridForWin(self: *const Core, win: i64) ?i64 {
+        var it = self.grid.grid_win_ids.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == win) return e.key_ptr.*;
+        return null;
     }
 
     /// Set a global option value in Neovim via nvim_set_option_value.
