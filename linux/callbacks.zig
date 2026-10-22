@@ -55,6 +55,13 @@ pub fn makeCallbacks() core.Callbacks {
     };
 }
 
+/// One structured render-trace line, stamped with the flush it belongs to
+/// (windows/callbacks.zig traceRender). Core thread.
+fn traceRender(app: *App, comptime fmt: []const u8, args: anytype) void {
+    if (!applog.isVerbose()) return;
+    applog.appLog("[render_trace] side=linux flush={d} " ++ fmt, .{app.trace_flush} ++ args);
+}
+
 fn appFrom(ctx: ?*anyopaque) *App {
     return @ptrCast(@alignCast(ctx.?));
 }
@@ -152,6 +159,7 @@ fn onSurfaceLayout(
     _ = surface_rows;
     _ = surface_cols;
     const app = appFrom(ctx);
+    traceRender(app, "event=layout_stage surface={d} layers={d}\n", .{ surface_id, count });
     lock(app);
     defer unlock(app);
     app.surface.stageLayers(app.alloc, surface_id, layers[0..count]) catch failFlush(app);
@@ -304,11 +312,15 @@ fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = appFrom(ctx);
+    traceRender(app, "event=destroy_stage grid={d}\n", .{grid_id});
     app.surface.stageDestroy(app.alloc, grid_id) catch failFlush(app);
 }
 
 fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
-    appFrom(ctx).flush_failed = false;
+    const app = appFrom(ctx);
+    app.flush_failed = false;
+    app.trace_flush += 1;
+    traceRender(app, "event=begin\n", .{});
 }
 
 fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
@@ -318,6 +330,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         core.zonvie_core_flush_had_atlas_corruption(cp) or
         core.zonvie_core_flush_was_aborted(cp);
     app.flush_failed = false;
+    var committed = false;
+    defer traceRender(app, "event=end outcome={s}\n", .{if (committed) "commit" else "abort"});
     {
         lock(app);
         defer unlock(app);
@@ -328,6 +342,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             if (core.zonvie_core_flush_is_retryable(cp)) core.zonvie_core_force_resend_locked(cp);
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
             app.flush_seq += 1;
+            // The grids this commit frees, released with it.
+            for (app.surface.destroyed.items) |id| traceRender(app, "event=destroy_release grid={d}\n", .{id});
             app.surface.commit(app.alloc, .{
                 .now_ns = @intCast(clock.nowNs()),
                 .row_h_px = app.cell_h_px,
@@ -335,6 +351,7 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(cp), 32)),
                 .large_jump = app.large_jump,
             });
+            committed = true;
         } else |_| {
             app.surface.cancel();
             core.zonvie_core_abort_flush(cp);
@@ -652,8 +669,15 @@ fn idleResizeToGrid(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 fn onLog(ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
-    _ = ctx;
-    applog.appLogBytes("[core] ", p[0..n]);
+    const s = p[0..n];
+    // The core's render traces carry no flush id: stamp this side's, which
+    // counts the same flushes (windows/callbacks.zig onLog).
+    const tag = "[render_trace] ";
+    if (std.mem.startsWith(u8, s, tag)) {
+        if (applog.isVerbose()) applog.appLog("[render_trace] flush={d} {s}", .{ appFrom(ctx).trace_flush, s[tag.len..] });
+        return;
+    }
+    applog.appLogBytes("[core] ", s);
 }
 
 fn onCallbackError(ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void {
