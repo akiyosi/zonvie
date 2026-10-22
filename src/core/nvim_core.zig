@@ -18,6 +18,7 @@ const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
 const pointer_target = @import("pointer_target.zig");
+const font_slots = @import("font_slots.zig");
 const clock = @import("clock.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
@@ -124,13 +125,17 @@ pub const GlyphCacheSlotKey = struct {
 };
 
 /// Key and probe hash of a glyph cache entry: a glyph id (by-id cache) or a
-/// scalar (non-ASCII cache) plus a style index in 0..3. Every writer and reader
-/// of a cache must use this, or entries silently miss or hit across styles.
-pub fn glyphCacheSlotKey(code: u32, style_index: u32) GlyphCacheSlotKey {
+/// scalar (non-ASCII cache), a style index in 0..3, and the per-grid font
+/// (0 = global). Every writer and reader of a cache must use this, or entries
+/// silently miss or hit across styles or fonts. Font 0's key and hash are the
+/// pre-font values, so a session without per-grid fonts sees no change.
+pub fn glyphCacheSlotKey(code: u32, style_index: u32, font_id: u32) GlyphCacheSlotKey {
     std.debug.assert(style_index < 4);
+    // font_id < max_slots (64) fits the 6 bits at 34..39 above the 32-bit code and 2-bit style.
+    std.debug.assert(font_id < font_slots.max_slots);
     return .{
-        .key = (@as(u64, code) << 2) | @as(u64, style_index),
-        .hash = (code *% 2654435761) ^ style_index,
+        .key = (@as(u64, font_id) << 34) | (@as(u64, code) << 2) | @as(u64, style_index),
+        .hash = (code *% 2654435761) ^ style_index ^ (font_id *% 0x9E3779B1),
     };
 }
 
@@ -1094,6 +1099,10 @@ pub const Core = struct {
     shape_cache_sets: u32 = 2048, // number of sets (power of 2, computed from shape_cache_size)
     shape_cache: ?[]ShapeCacheEntry = null,
     font_generation: u64 = 0,
+    /// Per-grid font of the row or cursor being generated (0 = global). Set
+    /// by flush around one grid and restored to 0; glyph lookups and the
+    /// rasterize/shape dispatch read it.
+    glyph_font_id: u32 = 0,
 
     // ASCII fast path tables (4 style variants × 128 codepoints, no heap alloc)
     ascii_glyph_ids: [4][128]u32 = .{.{0} ** 128} ** 4,
@@ -3224,7 +3233,7 @@ pub const Core = struct {
                 const gid = gids[scalar];
                 if (gid == 0) continue; // .notdef
 
-                const slot_key = glyphCacheSlotKey(gid, @intCast(si));
+                const slot_key = glyphCacheSlotKey(gid, @intCast(si), 0);
                 const key = slot_key.key;
                 const probe = glyphCacheProbe(keys, key, slot_key.hash);
                 const scalar_index = scalar * 4 + si;
@@ -6303,13 +6312,13 @@ test "a glyph grows the atlas only when it overflows a texture that can still gr
 test "glyph cache slot keys separate every style of a code and never equal the empty key" {
     for ([_]u32{ 0, 1, 0x754C, std.math.maxInt(u32) }) |code| {
         for (0..4) |style_a| {
-            const a = glyphCacheSlotKey(code, @intCast(style_a));
+            const a = glyphCacheSlotKey(code, @intCast(style_a), 0);
             try std.testing.expect(a.key != GLYPH_CACHE_INVALID_KEY);
             for (0..4) |style_b| {
                 if (style_a == style_b) continue;
-                try std.testing.expect(a.key != glyphCacheSlotKey(code, @intCast(style_b)).key);
+                try std.testing.expect(a.key != glyphCacheSlotKey(code, @intCast(style_b), 0).key);
             }
-            try std.testing.expect(a.key != glyphCacheSlotKey(code +% 1, @intCast(style_a)).key);
+            try std.testing.expect(a.key != glyphCacheSlotKey(code +% 1, @intCast(style_a), 0).key);
         }
     }
 }
@@ -8274,4 +8283,38 @@ test "a window close asked by the frontend names that window and tolerates it be
     // No Neovim window behind the grid: nothing to ask.
     try std.testing.expect(formatWinCloseCommand(&buf, 0) == null);
     try std.testing.expect(formatWinCloseCommand(&buf, -3) == null);
+}
+
+test "glyph keys of font 0 are unchanged and two fonts never share a key" {
+    for ([_]u32{ 0, 1, 0x754C, 0xFFFF_FFFF }) |code| {
+        for (0..4) |si| {
+            const s: u32 = @intCast(si);
+            const k0 = glyphCacheSlotKey(code, s, 0);
+            try std.testing.expectEqual((@as(u64, code) << 2) | @as(u64, s), k0.key);
+            try std.testing.expectEqual((code *% 2654435761) ^ s, k0.hash);
+            const k1 = glyphCacheSlotKey(code, s, 1);
+            const k2 = glyphCacheSlotKey(code, s, 2);
+            try std.testing.expect(k1.key != k0.key and k2.key != k1.key);
+            try std.testing.expect(k1.key != GLYPH_CACHE_INVALID_KEY);
+        }
+    }
+}
+
+test "glyph keys of two fonts differ and an atlas reset clears both" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+    const keys = core.glyph_keys_by_id.?;
+    const cache = core.glyph_cache_by_id.?;
+    const a = glyphCacheSlotKey(42, 0, 0);
+    const b = glyphCacheSlotKey(42, 0, 5);
+    const pa = glyphCacheProbe(keys, a.key, a.hash);
+    keys[pa.insert] = a.key;
+    cache[pa.insert] = std.mem.zeroes(c_api.GlyphEntry);
+    const pb = glyphCacheProbe(keys, b.key, b.hash);
+    try std.testing.expect(pb.hit == null);
+    keys[pb.insert] = b.key;
+    core.resetGlyphCacheFlags();
+    try std.testing.expect(glyphCacheProbe(keys, a.key, a.hash).hit == null);
+    try std.testing.expect(glyphCacheProbe(keys, b.key, b.hash).hit == null);
 }

@@ -25,6 +25,7 @@ const msg_view = @import("msg_view.zig");
 const rpc = @import("rpc_encode.zig");
 const Logger = @import("log.zig").Logger;
 const nvim_core = @import("nvim_core.zig");
+const font_slots = @import("font_slots.zig");
 const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
 const block_elements = @import("block_elements.zig");
@@ -2128,8 +2129,8 @@ fn resolveClusterGlyph(
     ensure_ns: *i64,
 ) ?c_api.GlyphEntry {
     const extras = getOverflowForCell(core, rc, row, src_col);
-    const key = clusterCacheKey(scalar, style_index, extras);
-    const hash = clusterCacheHash(scalar, style_index, extras);
+    const key = clusterCacheKey(scalar, style_index, core.glyph_font_id, extras);
+    const hash = clusterCacheHash(scalar, style_index, core.glyph_font_id, extras);
     const cacheable = cache != null and keys != null and keys.?.len > 0;
     if (cacheable) {
         const probe = nvim_core.glyphCacheProbe(keys.?, key, hash);
@@ -2539,8 +2540,9 @@ pub fn generateRowVertices(
 
                     if (!used_ascii_fast_path) {
                         // Shape cache lookup / callback
-                        const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], c_style);
-                        const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], c_style);
+                        const sc_style = font_slots.shapeStyleKey(c_style, core.glyph_font_id);
+                        const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], sc_style);
+                        const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], sc_style);
                         const sc_set_base = (sc_hash1 & (@as(u64, core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
                         const sc_font_gen = core.font_generation;
 
@@ -2955,7 +2957,7 @@ pub fn generateRowVertices(
                                 break :gid_blk false;
                             }
                             if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                                const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, core.glyph_font_id);
                                 const key = slot_key.key;
                                 const probe = nvim_core.glyphCacheProbe(glyph_keys_id.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
@@ -3200,7 +3202,7 @@ pub fn generateRowVertices(
                                 }
                             }
                             if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const slot_key = nvim_core.glyphCacheSlotKey(scalar, style_index);
+                                const slot_key = nvim_core.glyphCacheSlotKey(scalar, style_index, core.glyph_font_id);
                                 const key = slot_key.key;
                                 const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
@@ -7639,8 +7641,8 @@ pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, co
 /// Build a cache key for a cell's full cluster (base scalar + overflow extras + style).
 /// Overflow extras are folded into the key so different ZWJ sequences with the same
 /// first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct cache entries.
-pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u64 {
-    var key: u64 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).key;
+pub fn clusterCacheKey(first_scalar: u32, style_index: u32, font_id: u32, overflow: ?[]const u32) u64 {
+    var key: u64 = nvim_core.glyphCacheSlotKey(first_scalar, style_index, font_id).key;
     // Fold in overflow codepoints. Rotate between folds so the key depends
     // on extras ORDER, not just their multiset -- plain XOR-fold alone is
     // commutative, so two different-order sequences of the same codepoints
@@ -7657,8 +7659,8 @@ pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u
 }
 
 /// Build a cache hash index for a cell's full cluster.
-fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u32 {
-    var h: u32 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).hash;
+fn clusterCacheHash(first_scalar: u32, style_index: u32, font_id: u32, overflow: ?[]const u32) u32 {
+    var h: u32 = nvim_core.glyphCacheSlotKey(first_scalar, style_index, font_id).hash;
     if (overflow) |extras| {
         for (extras) |cp| {
             h ^= cp *% 2246822519;
@@ -7707,8 +7709,8 @@ fn ensureCachedPhase2Glyph(
         if (core.glyph_cache_non_ascii) |cache| {
             if (core.glyph_keys_non_ascii) |keys| {
                 if (cache.len != 0 and cache.len == keys.len) {
-                    const key = clusterCacheKey(scalar, style_index, overflow);
-                    const hash = clusterCacheHash(scalar, style_index, overflow);
+                    const key = clusterCacheKey(scalar, style_index, core.glyph_font_id, overflow);
+                    const hash = clusterCacheHash(scalar, style_index, core.glyph_font_id, overflow);
                     const probe = nvim_core.glyphCacheProbe(keys, key, hash);
                     if (probe.hit) |hit| return cache[hit];
                     non_ascii_insert = probe.insert;
@@ -7769,7 +7771,7 @@ fn ensureCachedPhase2Glyph(
                     if (core.glyph_keys_by_id) |keys| {
                         if (cache.len != 0 and cache.len == keys.len) {
                             const gid = glyph_ids[0];
-                            const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                            const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, core.glyph_font_id);
                             const key = slot_key.key;
                             const probe = nvim_core.glyphCacheProbe(keys, key, slot_key.hash);
                             if (probe.hit) |hit| {
@@ -10714,7 +10716,7 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
 
     const gid: u32 = 77;
     const style_index: u32 = 0;
-    const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, 0);
     const key = slot_key.key;
     const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     var shaped_entry = std.mem.zeroes(c_api.GlyphEntry);
@@ -11015,7 +11017,7 @@ test "box drawing glyph quads are trimmed to their cell rows" {
     core.cb.on_atlas_upload = State.upload;
     core.cb.on_atlas_create = State.create;
     const gid: u32 = 42;
-    const slot_key = nvim_core.glyphCacheSlotKey(gid, 0);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, 0, 0);
     const key = slot_key.key;
     const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     core.glyph_cache_by_id.?[probe.insert] = entry;
@@ -14085,47 +14087,47 @@ const WARNING: u32 = 0x26A0;
 
 test "cluster key separates a bare base from the same base with a ZWJ tail" {
     // 👩 vs 👩‍💻: a key built from the base scalar alone collapses these.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, null) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, null) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }));
 }
 
 test "cluster key separates two ZWJ sequences sharing base and joiner" {
     // 👩‍💻 vs 👩‍🔬 — the pair flush.zig's own key comment names.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE }));
 }
 
 test "cluster key separates text and emoji presentation of one scalar" {
     // ❤ vs ❤️ differ only by a variation selector carried in the overflow map.
-    const text = clusterCacheKey(HEART, 0, null);
-    try std.testing.expect(text != clusterCacheKey(HEART, 0, &.{VS16}));
+    const text = clusterCacheKey(HEART, 0, 0, null);
+    try std.testing.expect(text != clusterCacheKey(HEART, 0, 0, &.{VS16}));
     // An empty tail must agree with no tail: both mean the rasterizer receives
     // the base scalar alone, so they must not occupy separate entries.
-    try std.testing.expectEqual(text, clusterCacheKey(HEART, 0, &.{}));
+    try std.testing.expectEqual(text, clusterCacheKey(HEART, 0, 0, &.{}));
 }
 
 test "cluster key depends on tail order, not just the multiset" {
     // Distinct grapheme clusters can share codepoints in a different order; a
     // commutative fold would hand them one bitmap.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP, ZWJ, MICROSCOPE }) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE, ZWJ, LAPTOP }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP, ZWJ, MICROSCOPE }) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE, ZWJ, LAPTOP }));
 }
 
 test "cluster key separates styles and bases" {
-    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
-        clusterCacheKey(HEART, 0, &.{VS16}));
-    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
-        clusterCacheKey(WARNING, 1, &.{VS16}));
+    try std.testing.expect(clusterCacheKey(WARNING, 0, 0, &.{VS16}) !=
+        clusterCacheKey(HEART, 0, 0, &.{VS16}));
+    try std.testing.expect(clusterCacheKey(WARNING, 0, 0, &.{VS16}) !=
+        clusterCacheKey(WARNING, 1, 0, &.{VS16}));
 }
 
 test "cluster hash tracks the key across the same distinctions" {
     // The hash only picks the probe slot, so a collision costs a miss rather
     // than a wrong glyph — but a hash ignoring the tail would send every
     // sequence sharing a base to one slot and evict them in a loop.
-    try std.testing.expect(clusterCacheHash(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
-        clusterCacheHash(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
-    try std.testing.expect(clusterCacheHash(HEART, 0, null) !=
-        clusterCacheHash(HEART, 0, &.{VS16}));
+    try std.testing.expect(clusterCacheHash(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheHash(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE }));
+    try std.testing.expect(clusterCacheHash(HEART, 0, 0, null) !=
+        clusterCacheHash(HEART, 0, 0, &.{VS16}));
 }
 
 test "the emoji branch is decided by the tail alone" {
@@ -14170,8 +14172,8 @@ test "clusters that key differently are handed different scalars" {
     for (cases, 0..) |a, i| {
         for (cases, 0..) |b, j| {
             if (i == j) continue;
-            try std.testing.expect(clusterCacheKey(a.base, 0, a.extras) !=
-                clusterCacheKey(b.base, 0, b.extras));
+            try std.testing.expect(clusterCacheKey(a.base, 0, 0, a.extras) !=
+                clusterCacheKey(b.base, 0, 0, b.extras));
             const la = buildEmojiCluster(&buf_a, a.base, a.extras);
             const lb = buildEmojiCluster(&buf_b, b.base, b.extras);
             try std.testing.expect(!std.mem.eql(u32, buf_a[0..la], buf_b[0..lb]));
