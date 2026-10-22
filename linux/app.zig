@@ -143,6 +143,9 @@ pub const App = struct {
 
     // Core thread only.
     flush_failed: bool = false,
+    /// Counts on_flush_begin, as the core counts its flushes, so render
+    /// traces of both sides carry one id.
+    trace_flush: u64 = 0,
     fonts: Fonts = .{},
 
     clipboard_mu: std.Io.Mutex = .init,

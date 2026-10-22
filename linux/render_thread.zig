@@ -326,6 +326,7 @@ fn idlePresent(data: ?*anyopaque) callconv(.c) c_int {
     gtk.g_object_unref(tex);
     rt.app.presented_seq = seq;
     rt.app.presented_ns = clock.nowNs();
+    if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
     return 0;
 }
 

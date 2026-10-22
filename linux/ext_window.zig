@@ -112,7 +112,8 @@ fn open(app: *App, op: Op) void {
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), w);
     gtk.gtk_window_present(win);
     _ = gtk.gtk_widget_grab_focus(area);
-    applog.appLog("[linux] ext window opened grid={d} {d}x{d}\n", .{ op.grid_id, op.rows, op.cols });
+    // The GUI harness's marker for a new external window (test/gui/app_log.zig).
+    applog.appLog("[external_window] open gridId={d} rows={d} cols={d}\n", .{ op.grid_id, op.rows, op.cols });
 }
 
 fn close(app: *App, grid_id: i64) void {

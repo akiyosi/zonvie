@@ -20,6 +20,9 @@ const layout_retry_ms = 8;
 const Startup = struct {
     /// Tokenized by the core (rpc_session.zig tokenizeCommand).
     nvim_cmd: [:0]const u8,
+    /// --connect-nvim / --remote-ui: attach to this running server instead
+    /// of spawning nvim.
+    connect_addr: ?[]const u8 = null,
     /// ext_* UI extensions: config.toml's `external` keys, or a CLI flag.
     ext_cmdline: bool = false,
     ext_popupmenu: bool = false,
@@ -195,6 +198,7 @@ fn startCore(app: *App, area: *anyopaque) void {
         } else |_| {}
     } else |_| {}
     if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
+    if (applog.isVerbose()) core.zonvie_core_set_log_verbose(cp, 1);
     if (startup.ext_cmdline) core.zonvie_core_set_ext_cmdline(cp, 1);
     if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
@@ -211,7 +215,10 @@ fn startCore(app: *App, area: *anyopaque) void {
     const h_px: u32 = @intFromFloat(@as(f32, @floatFromInt(if (h_logical > 0) h_logical else default_h_logical)) * scale);
     const rows: u32 = if (ch != 0) @max(1, h_px / ch) else 24;
     const cols: u32 = if (cw != 0) @max(1, w_px / cw) else 80;
-    const rc = core.zonvie_core_start(cp, startup.nvim_cmd.ptr, rows, cols);
+    const rc = if (startup.connect_addr) |addr|
+        core.zonvie_core_start_connect(cp, addr.ptr, addr.len, rows, cols)
+    else
+        core.zonvie_core_start(cp, startup.nvim_cmd.ptr, rows, cols);
     if (rc != 0) return failStart(app, rc);
     // A resize that arrived before the core existed.
     pushLayout(app);
@@ -327,6 +334,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ext_tabline = config.tabline.external;
     var ext_windows = config.windows.external;
     var threaded = false;
+    var connect_addr: ?[]const u8 = null;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -347,6 +355,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             ext_messages = true;
         } else if (std.mem.eql(u8, arg, "--exttabline")) {
             ext_tabline = true;
+        } else if (std.mem.startsWith(u8, arg, "--connect-nvim=")) {
+            connect_addr = arg["--connect-nvim=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--remote-ui=")) {
+            connect_addr = arg["--remote-ui=".len..];
+        } else if ((std.mem.eql(u8, arg, "--connect-nvim") or std.mem.eql(u8, arg, "--remote-ui")) and i + 1 < args.len) {
+            i += 1;
+            connect_addr = args[i];
         } else if (std.mem.eql(u8, arg, "--renderer=thread")) {
             threaded = true;
         } else if (std.mem.eql(u8, arg, "--renderer=glarea")) {
@@ -360,6 +375,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             extra.append(aa, arg) catch return 1;
         }
     }
+    applog.setVerbose(config.log.verbose and !config.log.perf_only and !config.log.scroll_only);
     if (log_path) |p| {
         applog.setEnabled(true);
         applog.setLogPath(p);
@@ -377,6 +393,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .ext_tabline = ext_tabline,
         .ext_windows = ext_windows,
         .threaded = threaded,
+        .connect_addr = connect_addr,
     };
 
     const app = alloc.create(App) catch return 1;

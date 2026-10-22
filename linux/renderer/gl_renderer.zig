@@ -350,6 +350,7 @@ pub fn render(app: *App) void {
     app.gl.h_px = app.drawable_h_px;
     const f = renderMain(app, &app.gl);
     app.presented_seq = f.flush_seq;
+    if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
     if (f.moving) startEaseTick(app);
 }
 
@@ -364,6 +365,7 @@ pub fn renderExternal(app: *App, t: *Target, surface_id: i64) void {
     if (!begin(app, t)) return;
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
     if (d.moving) startEaseTick(app);
+    if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{surface_id});
 }
 
 fn rgba(rgb: u32, a: f32) [4]f32 {
