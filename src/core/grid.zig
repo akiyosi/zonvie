@@ -1231,6 +1231,8 @@ pub const GridPos = struct {
     /// window it is anchored in resizes, so the position is resolved again
     /// from this against the window's new size.
     anchor: ?FloatAnchor = null,
+    /// win_float_pos anchored NE or SE: a scale_view float keeps its right edge.
+    anchor_east: bool = false,
 };
 
 /// win_float_pos' anchor corner and offset, in the anchor grid's cells.
@@ -1240,6 +1242,28 @@ pub const FloatAnchor = struct {
     row: i64,
     col: i64,
 };
+
+pub const FontMode = enum { resize, font_view, scale_view };
+
+/// One window's per-grid font (font_slots.zig). Cell sizes are the slot's;
+/// frame cells are global cells; req_* is the last try_resize_grid sent;
+/// extent_* is the pixel box the frontend clips the layer to.
+pub const GridFont = struct {
+    win_id: i64,
+    font_id: u32,
+    mode: FontMode,
+    cell_w_px: u32,
+    cell_h_px: u32,
+    frame_rows: u32,
+    frame_cols: u32,
+    req_rows: u32 = 0,
+    req_cols: u32 = 0,
+    extent_w_px: u32 = 0,
+    extent_h_px: u32 = 0,
+};
+
+/// win_pos' width/height: a split's frame in global cells.
+pub const WinFrame = struct { rows: u32, cols: u32 };
 
 /// Info for an external grid (displayed in a separate window).
 pub const ExternalGridInfo = struct {
@@ -1430,6 +1454,13 @@ pub const Grid = struct {
     float_config_wanted: std.ArrayListUnmanaged(i64) = .empty,
 
     grid_metrics: std.AutoHashMapUnmanaged(i64, CellMetricsPx) = .{},
+    grid_fonts: std.AutoHashMapUnmanaged(i64, GridFont) = .{},
+    win_frames: std.AutoHashMapUnmanaged(i64, WinFrame) = .{},
+    // Window handles whose font variables the core should read; drained
+    // after the redraw batch like float_config_wanted.
+    font_query_wanted: std.ArrayListUnmanaged(i64) = .empty,
+    // Slots whose grid was destroyed; the core releases them after the batch.
+    font_releases_pending: std.ArrayListUnmanaged(u32) = .empty,
 
     // Viewport info per grid (from win_viewport / win_viewport_margins)
     viewport: std.AutoHashMapUnmanaged(i64, Viewport) = .{},
@@ -1605,6 +1636,10 @@ pub const Grid = struct {
         self.pending_ext_window_grids.deinit(self.alloc);
         self.ext_windows_grids.deinit(self.alloc);
         self.grid_metrics.deinit(self.alloc);
+        self.grid_fonts.deinit(self.alloc);
+        self.win_frames.deinit(self.alloc);
+        self.font_query_wanted.deinit(self.alloc);
+        self.font_releases_pending.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
 
@@ -1693,6 +1728,11 @@ pub const Grid = struct {
         self.viewport.clearRetainingCapacity();
         self.viewport_margins.clearRetainingCapacity();
         self.grid_metrics.clearRetainingCapacity();
+        // Slot references are dropped by Core.resetFontSlotsForNewSession.
+        self.grid_fonts.clearRetainingCapacity();
+        self.win_frames.clearRetainingCapacity();
+        self.font_query_wanted.clearRetainingCapacity();
+        self.font_releases_pending.clearRetainingCapacity();
         self.clearAllOverflow();
         self.layer_order_counter = 0;
         self.subgrid_surface_vertex_count = 0;
@@ -2253,6 +2293,13 @@ pub const Grid = struct {
             if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
+            // Neovim answered a font request with another size (split layout
+            // changed under it): treat it as a frame change.
+            if (self.grid_fonts.get(grid_id)) |gf| {
+                if (gf.mode == .resize and gf.req_rows != 0 and (gf.req_rows != rows or gf.req_cols != cols)) {
+                    self.wantFontQuery(gf.win_id);
+                }
+            }
             self.invalidateCursorOutside(grid_id, rows, cols);
 
             // The pixels the resize exposes are the frontend's, from the
@@ -2701,6 +2748,26 @@ pub const Grid = struct {
         self.float_config_wanted.append(self.alloc, win_id) catch {};
     }
 
+    /// Queue `win_id` for a font-variable read. OOM leaves it unasked; the
+    /// next trigger asks again.
+    pub fn wantFontQuery(self: *Grid, win_id: i64) void {
+        if (win_id <= 0) return;
+        for (self.font_query_wanted.items) |w| if (w == win_id) return;
+        self.font_query_wanted.append(self.alloc, win_id) catch {};
+    }
+
+    /// Record a split's frame from win_pos; a changed frame re-reads its font.
+    pub fn noteWinFrame(self: *Grid, grid_id: i64, win_id: i64, rows: u32, cols: u32) void {
+        const prev = self.win_frames.get(grid_id);
+        if (prev != null and prev.?.rows == rows and prev.?.cols == cols) return;
+        self.win_frames.put(self.alloc, grid_id, .{ .rows = rows, .cols = cols }) catch return;
+        self.wantFontQuery(win_id);
+    }
+
+    pub fn setWinFloatEast(self: *Grid, grid_id: i64, east: bool) void {
+        if (self.win_pos.getPtr(grid_id)) |p| p.anchor_east = east;
+    }
+
     /// Clear scrolled grid tracking (called after flush notification).
     pub fn clearScrolledGrids(self: *Grid) void {
         self.scrolled_grid_count = 0;
@@ -2807,6 +2874,10 @@ pub const Grid = struct {
         _ = self.win_layer.remove(grid_id);
         // Clean up per-grid metadata that was previously leaked on destroy.
         _ = self.grid_metrics.remove(grid_id);
+        if (self.grid_fonts.fetchRemove(grid_id)) |kv| {
+            self.font_releases_pending.append(self.alloc, kv.value.font_id) catch {};
+        }
+        _ = self.win_frames.remove(grid_id);
         _ = self.viewport.remove(grid_id);
         _ = self.viewport_margins.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
@@ -5747,4 +5818,46 @@ test "a grid 1 scroll is notified once with its summed rows and never takes the 
     // Grid 1 has no on_grid_row_scroll: the whole region is regenerated.
     try std.testing.expect(!buf.row_scroll_notify_pending);
     for (0..10) |r| try std.testing.expect(grid.isRowDirty(@intCast(r)));
+}
+
+test "destroying a font grid queues its slot release and drops its state" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 40);
+    try grid.resizeGrid(2, 5, 20);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1000, .font_id = 3, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 5, .frame_cols = 20 });
+    try grid.destroyGrid(2);
+    try std.testing.expect(!grid.grid_fonts.contains(2));
+    try std.testing.expectEqualSlices(u32, &.{3}, grid.font_releases_pending.items);
+}
+
+test "a grid_resize that misses the last font request queues a re-query" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 40);
+    try grid.resizeGrid(2, 5, 20);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1000, .font_id = 3, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 5, .frame_cols = 20, .req_rows = 10, .req_cols = 40 });
+    grid.font_query_wanted.clearRetainingCapacity();
+    try grid.resizeGrid(2, 10, 40);
+    try std.testing.expectEqual(@as(usize, 0), grid.font_query_wanted.items.len);
+    try grid.resizeGrid(2, 9, 40);
+    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+}
+
+test "a win_pos frame change queues one query and a session reset forgets font state" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    grid.noteWinFrame(2, 1000, 5, 20);
+    grid.noteWinFrame(2, 1000, 5, 20);
+    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+    grid.font_query_wanted.clearRetainingCapacity();
+    grid.noteWinFrame(2, 1000, 6, 20);
+    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1000, .font_id = 3, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 5, .frame_cols = 20 });
+    grid.resetForNewSession();
+    try std.testing.expectEqual(@as(usize, 0), grid.grid_fonts.count());
+    try std.testing.expectEqual(@as(usize, 0), grid.win_frames.count());
+    try std.testing.expectEqual(@as(usize, 0), grid.font_query_wanted.items.len);
 }

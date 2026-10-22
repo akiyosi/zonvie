@@ -92,6 +92,41 @@ pub const Table = struct {
     }
 };
 
+/// Cells of `grid_cell_px` that fit in `frame_cells` cells of
+/// `global_cell_px`, at least 1 and at most `max_cells`. 0 means "cannot
+/// compute": a 0 px cell is a failed load, never a divisor.
+pub fn requestedCells(frame_cells: u32, global_cell_px: u32, grid_cell_px: u32, max_cells: u32) u32 {
+    if (grid_cell_px == 0) return 0;
+    const frame_px: u64 = @as(u64, frame_cells) * @as(u64, global_cell_px);
+    const fit: u64 = frame_px / grid_cell_px;
+    return @intCast(@max(@as(u64, 1), @min(fit, @as(u64, max_cells))));
+}
+
+/// Global cells covered by `cells` cells of `grid_cell_px` (rounded up).
+pub fn footprintCells(cells: u32, grid_cell_px: u32, global_cell_px: u32) u32 {
+    if (global_cell_px == 0) return cells;
+    const px: u64 = @as(u64, cells) * @as(u64, grid_cell_px);
+    return @intCast(std.math.divCeil(u64, px, global_cell_px) catch unreachable);
+}
+
+/// x_px of a scaled float whose right edge stays where Neovim put it
+/// (col + cols global cells), clamped to the surface's left edge.
+pub fn eastSnappedX(col: u32, cols: u32, global_w_px: u32, grid_w_px: u32) i64 {
+    const right: i64 = (@as(i64, col) + @as(i64, cols)) * @as(i64, global_w_px);
+    return @max(0, right - @as(i64, cols) * @as(i64, grid_w_px));
+}
+
+pub fn clampNeovideScale(v: f64) f32 {
+    if (!std.math.isFinite(v)) return 1.0;
+    return @floatCast(std.math.clamp(v, 0.1, 1.0));
+}
+
+/// Style word the shape cache hashes. Style flags use the low bits only, so
+/// `font_id << 8` keeps font 0's hash input identical to today's.
+pub fn shapeStyleKey(style_flags: u32, font_id: u32) u32 {
+    return style_flags | (font_id << 8);
+}
+
 test "font slot dedup shares one slot and counts references" {
     var t: Table = .{};
     const a = try t.acquire("Menlo\t12", 1.0);
@@ -141,4 +176,35 @@ test "the slot table refuses when full and never hands out slot 0" {
     try std.testing.expectError(error.SlotsFull, t.acquire("overflow", 1.0));
     const long = [_]u8{'x'} ** (max_guifont_bytes + 1);
     try std.testing.expectError(error.GuifontTooLong, t.acquire(&long, 1.0));
+}
+
+test "requested cells floor the frame pixels and never go below one" {
+    // 40 global cols of 10 px = 400 px; a 7 px font fits 57 cols.
+    try std.testing.expectEqual(@as(u32, 57), requestedCells(40, 10, 7, 20_000));
+    // A larger font that does not fit one cell still gets one.
+    try std.testing.expectEqual(@as(u32, 1), requestedCells(1, 10, 25, 20_000));
+    try std.testing.expectEqual(@as(u32, 1), requestedCells(0, 10, 7, 20_000));
+}
+
+test "requested cells clamp to the grid ceiling and a zero cell is refused" {
+    try std.testing.expectEqual(@as(u32, 20_000), requestedCells(20_000, 10, 1, 20_000));
+    try std.testing.expectEqual(@as(u32, 0), requestedCells(40, 10, 0, 20_000));
+}
+
+test "footprint rounds a scaled extent up to whole global cells" {
+    try std.testing.expectEqual(@as(u32, 4), footprintCells(10, 4, 10)); // 40 px -> 4 cells
+    try std.testing.expectEqual(@as(u32, 5), footprintCells(9, 5, 10)); // 45 px -> 5 cells
+    try std.testing.expectEqual(@as(u32, 0), footprintCells(0, 5, 10));
+}
+
+test "neovide scale clamps to the documented range" {
+    try std.testing.expectEqual(@as(f32, 0.1), clampNeovideScale(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), clampNeovideScale(3.0));
+    try std.testing.expectEqual(@as(f32, 0.5), clampNeovideScale(0.5));
+}
+
+test "shape style key is unchanged for font 0 and differs per font" {
+    try std.testing.expectEqual(@as(u32, 3), shapeStyleKey(3, 0));
+    try std.testing.expect(shapeStyleKey(3, 1) != shapeStyleKey(3, 2));
+    try std.testing.expect(shapeStyleKey(3, 1) != 3);
 }
