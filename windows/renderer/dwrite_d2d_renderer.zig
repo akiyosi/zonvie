@@ -257,12 +257,10 @@ pub const Renderer = struct {
     gsub_cache: [4]GsubCacheEntry = [_]GsubCacheEntry{.{}} ** 4,
 
     /// Per-grid font faces by font_id (on_font_slot_load); slot 0 is the
-    /// global font above and stays null. Features and axes are the global
-    /// font's.
+    /// global font above and stays null.
     slot_faces: [MAX_FONT_SLOTS]?FaceSet = [_]?FaceSet{null} ** MAX_FONT_SLOTS,
 
-    /// The core's slot table size (src/core/font_slots.zig max_slots).
-    pub const MAX_FONT_SLOTS = 64;
+    pub const MAX_FONT_SLOTS = core.font_slots.max_slots;
 
     /// The font-dependent fields one shaping or raster call reads. A per-grid
     /// font is drawn by swapping its set in under `mu` and back out after, so
@@ -285,6 +283,10 @@ pub const Renderer = struct {
         cell_h_px: u32 = 0,
         font_name: [64]u16 = [_]u16{0} ** 64,
         base_face_varied: bool = false,
+        font_features: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = std.mem.zeroes([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE),
+        font_feature_count: u32 = 0,
+        font_axis_values: [MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = std.mem.zeroes([MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE),
+        font_axis_count: u32 = 0,
     };
 
     fn swapFaceSet(self: *Renderer, set: *FaceSet) void {
@@ -304,6 +306,10 @@ pub const Renderer = struct {
         std.mem.swap(u32, &self.cell_h_px, &set.cell_h_px);
         std.mem.swap([64]u16, &self.font_name, &set.font_name);
         std.mem.swap(bool, &self.base_face_varied, &set.base_face_varied);
+        std.mem.swap([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE, &self.font_features, &set.font_features);
+        std.mem.swap(u32, &self.font_feature_count, &set.font_feature_count);
+        std.mem.swap([MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE, &self.font_axis_values, &set.font_axis_values);
+        std.mem.swap(u32, &self.font_axis_count, &set.font_axis_count);
     }
 
     fn releaseFaceSet(s: *FaceSet) void {
@@ -1575,6 +1581,7 @@ pub const Renderer = struct {
             var fields = std.mem.splitScalar(u8, line, '\t');
             const name = fields.next() orelse "";
             const size_pt = std.fmt.parseFloat(f32, fields.next() orelse "") catch 0;
+            const features = fields.rest();
             const use_name = if (name.len == 0) self.font_name_utf8[0..self.font_name_utf8_len] else name;
             const use_pt = (if (size_pt > 0) size_pt else self.base_point_size) * scale;
             if (use_name.len == 0 or !(use_pt > 0)) continue;
@@ -1583,9 +1590,11 @@ pub const Renderer = struct {
             defer self.alloc.free(name_w);
             var set = self.buildFaceSetLocked(name_w, false, false, emSizePxForPointSize(self.dpi, use_pt)) catch continue;
 
-            // Measured, axis-varied and given its styled faces on the swapped-in
-            // set by the routines the global font uses.
+            // Its own features and axes, then measured, axis-varied and given
+            // its styled faces on the swapped-in set by the routines the
+            // global font uses.
             self.swapFaceSet(&set);
+            if (features.len > 0) self.parseFontFeatures(features);
             if (self.font_face) |face| {
                 self.font_face = self.withUserAxes(face);
                 self.base_face_varied = self.font_face != face;

@@ -564,25 +564,25 @@ fn gridFontIn(fonts: *const GridFonts, grid_id: i64) ?GridFontPx {
 /// Stamp `fonts` into the layer list `tbs` is about to commit. `changed`: the
 /// table moved, so a surface whose committed layers no longer match it
 /// re-stages them; otherwise only a list this flush staged is stamped.
-fn stampLayerFonts(alloc: std.mem.Allocator, budget: *core.render_layout.Budget, fonts: *const GridFonts, tbs: *TripleBufferedSurface, changed: bool) void {
+/// False when a restage could not be allocated.
+fn stampLayerFonts(alloc: std.mem.Allocator, budget: *core.render_layout.Budget, fonts: *const GridFonts, tbs: *TripleBufferedSurface, changed: bool) bool {
     if (tbs.flush_layers == null) {
-        if (!changed) return;
+        if (!changed) return true;
         const committed = tbs.committed_layers.slice();
         const stale = for (committed) |l| {
             if (!layerFontMatches(l, gridFontIn(fonts, l.grid_id))) break true;
         } else false;
-        if (!stale) return;
+        if (!stale) return true;
         var copy = tbs.prepareLayers(alloc, budget, committed.len) catch {
-            // The grid's rows go out in the new font on the old geometry
-            // until the next layout or font change restages.
             if (applog.isEnabled()) applog.appLog("[font_slot] layer restage failed\n", .{});
-            return;
+            return false;
         };
         @memcpy(copy.items[0..committed.len], committed);
         tbs.stageLayers(copy);
     }
     const staged = &tbs.flush_layers.?;
     for (staged.items[0..staged.len]) |*l| setLayerFont(l, gridFontIn(fonts, l.grid_id));
+    return true;
 }
 
 fn layerFontMatches(l: SurfaceLayer, gf: ?GridFontPx) bool {
@@ -3339,6 +3339,16 @@ pub fn applyScrollShift(
 
 /// Draw rows from slot-based row_map with separate RowVB GPU buffers.
 /// This is the TBS row-mode draw path.
+/// A root row's surface-local band [top, bottom). The last row of a root grid
+/// in its own font reaches `extent_h_px` (0 = none): the core draws the
+/// bottom margin, in Normal bg or skipped as the default bg is, with it.
+pub fn rootRowBandPx(row: u32, row_count: usize, row_h_px: i32, extent_h_px: u32) [2]i32 {
+    const top = @as(i32, @intCast(row)) * row_h_px;
+    var bottom = top + row_h_px;
+    if (extent_h_px > 0 and @as(usize, row) + 1 == row_count) bottom = @max(bottom, @as(i32, @intCast(extent_h_px)));
+    return .{ top, bottom };
+}
+
 pub fn drawSurfaceRowsVBFromSlots(
     g: *d3d11.Renderer,
     budget: *RowVBPhysicalBudget,
@@ -3361,6 +3371,8 @@ pub fn drawSurfaceRowsVBFromSlots(
     layer_origin_y_px: f32,
     /// See RowModeDrawParams.root_rows_may_be_empty.
     root_rows_may_be_empty: bool,
+    /// See RowModeDrawParams.root_extent_h_px.
+    root_extent_h_px: u32,
     /// Set for rows of an eased scroll region: the caller set the region's
     /// scissor and cleared it once, so each row is drawn at this offset with
     /// neither, its pixels straddling row boundaries.
@@ -3408,8 +3420,9 @@ pub fn drawSurfaceRowsVBFromSlots(
             // Overwrite the band with the background so stale pixels go and
             // the row's alpha is reset rather than compounded.
             if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
-                const clear_top = y_offset + @as(i32, @intCast(row)) * row_h_px;
-                const clear_bot = clear_top + row_h_px;
+                const band = rootRowBandPx(row, row_map.len, row_h_px, root_extent_h_px);
+                const clear_top = y_offset + band[0];
+                const clear_bot = y_offset + band[1];
                 var sc: c.D3D11_RECT = .{ .left = x_offset, .top = clear_top, .right = content_right, .bottom = clear_bot };
                 rs_set_sc_fn.?(ctx_ptr, 1, &sc);
                 if (vp_dirty) {
@@ -3465,8 +3478,9 @@ pub fn drawSurfaceRowsVBFromSlots(
 
         const row_shift = render_pipeline_helpers.rootRowShift(slotRowShiftPx(slot, row, row_h_px), ease_offset_px != null);
         if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
-            const top = y_offset + @as(i32, @intCast(row)) * row_h_px;
-            const bottom = top + row_h_px;
+            const band = rootRowBandPx(row, row_map.len, row_h_px, root_extent_h_px);
+            const top = y_offset + band[0];
+            const bottom = y_offset + band[1];
             var sc: c.D3D11_RECT = .{
                 .left = x_offset,
                 .top = top,
@@ -3670,6 +3684,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             params.layer_origin_x_px,
             params.layer_origin_y_px,
             params.root_rows_may_be_empty,
+            params.root_extent_h_px,
             if (eased) params.root_ease.?.offset_px else null,
             log_enabled,
             &result.metrics,
@@ -3924,6 +3939,9 @@ pub const RowModeDrawParams = struct {
     /// layers hold its content — and must not be counted as a failed or
     /// missing row by the present decision.
     root_rows_may_be_empty: bool = false,
+    /// The root grid's font extent height when it has its own font, else 0:
+    /// its last row reaches it (rootRowBandPx).
+    root_extent_h_px: u32 = 0,
     content_y_offset: ?u32 = null,
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
@@ -6293,15 +6311,18 @@ pub const App = struct {
             self.grid_fonts.clearRetainingCapacity();
             var it = self.grid_fonts_staged.iterator();
             while (it.next()) |e| self.grid_fonts.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
-            self.grid_fonts_dirty = false;
-            stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, true);
+            // A surface that could not restage retries at the next commit.
+            var ok = stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, true);
             var ext_it = self.external_windows.valueIterator();
-            while (ext_it.next()) |ext| stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, true);
+            while (ext_it.next()) |ext| {
+                if (!stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, true)) ok = false;
+            }
+            self.grid_fonts_dirty = !ok;
             return;
         }
-        stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, false);
+        _ = stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, false);
         var ext_it = self.external_windows.valueIterator();
-        while (ext_it.next()) |ext| stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, false);
+        while (ext_it.next()) |ext| _ = stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, false);
     }
 
     /// Close paint admission before onAtlasCreate invalidates the atlas.
@@ -7329,12 +7350,12 @@ test "a per-grid font reaches the layers with the commit, and is redrawn whole" 
     }
 
     // Control: an unchanged (empty) table restages nothing.
-    stampLayerFonts(alloc, &budget, &fonts, &tbs, true);
+    try std.testing.expect(stampLayerFonts(alloc, &budget, &fonts, &tbs, true));
     try std.testing.expect(tbs.flush_layers == null);
 
     // A font arrives between flushes: no layout comes with it.
     try fonts.put(alloc, 2, .{ .font_id = 1, .cell_w_px = 12, .cell_h_px = 24, .extent_w_px = 100, .extent_h_px = 80 });
-    stampLayerFonts(alloc, &budget, &fonts, &tbs, true);
+    try std.testing.expect(stampLayerFonts(alloc, &budget, &fonts, &tbs, true));
     try std.testing.expect(tbs.flush_layers != null);
     // Not visible before the commit.
     for (tbs.committed_layers.slice()) |l| try std.testing.expectEqual(@as(u32, 0), l.font_cell_h_px);
@@ -7351,7 +7372,7 @@ test "a per-grid font reaches the layers with the commit, and is redrawn whole" 
 
     // A layout staged in a later flush is stamped too.
     try LayerTestProbe.place(&tbs, alloc, &budget, &.{ 2, 3 }, 3, 0);
-    stampLayerFonts(alloc, &budget, &fonts, &tbs, false);
+    try std.testing.expect(stampLayerFonts(alloc, &budget, &fonts, &tbs, false));
     try std.testing.expectEqual(@as(u32, 12), tbs.flush_layers.?.items[1].font_cell_w_px);
     tbs.cancelFlush();
 }
@@ -7392,6 +7413,14 @@ test "a font grid's last row owns its bottom margin and is clipped to its extent
     viewed.font_extent_h_px = 60;
     try std.testing.expectEqual([2]i32{ 30, 60 }, viewed.rowsBandPx(1, 2, 20));
     try std.testing.expectEqual([2]i32{ 60, 60 }, viewed.rowsBandPx(2, 3, 20));
+}
+
+test "a root grid in its own font draws its bottom margin with its last row" {
+    // Control: no font, every row is one row tall.
+    try std.testing.expectEqual([2]i32{ 48, 72 }, rootRowBandPx(2, 3, 24, 0));
+    // 3 rows of 24 px in an 80 px frame: the last row reaches the extent.
+    try std.testing.expectEqual([2]i32{ 24, 48 }, rootRowBandPx(1, 3, 24, 80));
+    try std.testing.expectEqual([2]i32{ 48, 80 }, rootRowBandPx(2, 3, 24, 80));
 }
 
 test "the cursor grid's cell, and a row height with linespace" {

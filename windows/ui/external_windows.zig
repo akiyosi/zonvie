@@ -779,8 +779,11 @@ fn drawNormalExternalSurfaceRowMode(
         return .{ .force_full_rows = false };
     }
 
+    // A root grid in its own font draws its bottom margin with its last row.
+    const root_extent_h_px: u32 = if (tbs_snap.layers.root()) |l| @min(l.font_extent_h_px, g.height) else 0;
     const draw_params = app_mod.RowModeDrawParams{
-        .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
+        .content_height = @max(app_mod.snappedContentHeight(g.height, fallback_row_h, 0), root_extent_h_px),
+        .root_extent_h_px = root_extent_h_px,
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = paint_policy.preserve_back,
@@ -860,6 +863,10 @@ fn drawNormalExternalSurfaceRowMode(
     // into the rows + 6 slots reserved before the layer plan above, which
     // publishes each drawn layer's rectangle into the same list.
     present.addRowSpans(rows_to_draw.items, 0, @intCast(g.width), row_h_px);
+    if (root_extent_h_px > 0 and ext_rows > 0 and std.mem.indexOfScalar(u32, rows_to_draw.items, ext_rows - 1) != null) {
+        const band = app_mod.rootRowBandPx(ext_rows - 1, ext_rows, row_h_px, root_extent_h_px);
+        present.add(.{ .left = 0, .top = band[0], .right = @intCast(g.width), .bottom = band[1] });
+    }
     present.addOpt(scroll_damage);
     present.addOpt(restored_scrollbar_rect);
 

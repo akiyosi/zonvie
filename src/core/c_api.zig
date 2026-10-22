@@ -21,6 +21,7 @@ pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const damage_bands = @import("damage_bands.zig");
+pub const font_slots = @import("font_slots.zig");
 pub const scroll_ease = @import("scroll_ease.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
