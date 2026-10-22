@@ -125,14 +125,20 @@ pub fn resolve(
     return .{ .grid_id = b.grid_id, .row = row - b.start_row, .col = col - b.start_col };
 }
 
+/// NaN maps to 0; other values clamp to +-2^24 cells so the i32 conversion cannot trap.
+fn floorCell(v: f32) i32 {
+    if (std.math.isNan(v)) return 0;
+    return @intFromFloat(@floor(std.math.clamp(v, -16777216.0, 16777216.0)));
+}
+
 /// The cell `local_*_px` names in a grid of `cell_*_px` cells whose layer is
 /// `extent_*_px` large. Past the last cell clamps; negative keeps its sign.
 pub fn cellInGrid(local_x_px: f32, local_y_px: f32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) Hit {
     if (cell_w_px == 0 or cell_h_px == 0) return .{ .grid_id = 0, .row = 0, .col = 0 };
     const rows: i32 = @intCast(@max(1, extent_h_px / cell_h_px));
     const cols: i32 = @intCast(@max(1, extent_w_px / cell_w_px));
-    const r: i32 = @intFromFloat(@floor(local_y_px / @as(f32, @floatFromInt(cell_h_px))));
-    const c: i32 = @intFromFloat(@floor(local_x_px / @as(f32, @floatFromInt(cell_w_px))));
+    const r = floorCell(local_y_px / @as(f32, @floatFromInt(cell_h_px)));
+    const c = floorCell(local_x_px / @as(f32, @floatFromInt(cell_w_px)));
     return .{ .grid_id = 0, .row = @min(r, rows - 1), .col = @min(c, cols - 1) };
 }
 
@@ -310,4 +316,17 @@ test "a pixel in a per-grid font names that font's cell, and the margin clamps" 
     // A zero cell never divides.
     const zero = cellInGrid(5.0, 5.0, 0, 0, 100, 50);
     try testing.expectEqual(@as(i32, 0), zero.row);
+}
+
+test "a non-finite or huge pixel coordinate clamps instead of trapping" {
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const a = cellInGrid(nan, nan, 6, 12, 100, 50);
+    try testing.expectEqual(@as(i32, 0), a.row);
+    try testing.expectEqual(@as(i32, 0), a.col);
+    const b = cellInGrid(inf, inf, 6, 12, 100, 50);
+    try testing.expectEqual(@as(i32, 3), b.row);
+    try testing.expectEqual(@as(i32, 15), b.col);
+    const c = cellInGrid(-inf, -1.0e30, 6, 12, 100, 50);
+    try testing.expect(c.row < 0 and c.col < 0);
 }
