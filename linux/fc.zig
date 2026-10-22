@@ -54,3 +54,27 @@ pub extern "c" fn FcPatternGetString(p: *FcPattern, object: [*:0]const u8, n: c_
 pub extern "c" fn FcConfigSubstitute(config: ?*FcConfig, p: *FcPattern, kind: FcMatchKind) FcBool;
 pub extern "c" fn FcDefaultSubstitute(pattern: *FcPattern) void;
 pub extern "c" fn FcFontMatch(config: ?*FcConfig, p: *FcPattern, result: *FcResult) ?*FcPattern;
+
+// =========================================================================
+// Match policy
+// =========================================================================
+
+const std = @import("std");
+
+/// Generic names fontconfig resolves by configuration, so any family it picks
+/// for them is the one asked for.
+const generic_families = [_][]const u8{ "monospace", "mono", "sans-serif", "sans", "serif" };
+
+/// FcFontMatch always returns a font, falling back to an unrelated family for
+/// one that is not installed. A guifont candidate that fell back must fail so
+/// the next candidate is tried (zonvie_core.h on_guifont).
+pub fn familyAccepted(requested: []const u8, matched: []const u8) bool {
+    for (generic_families) |g| if (std.ascii.eqlIgnoreCase(requested, g)) return true;
+    return std.ascii.eqlIgnoreCase(requested, matched);
+}
+
+test "a fallback family is not the requested one" {
+    try std.testing.expect(!familyAccepted("Source Code Pro", "Liberation Sans"));
+    try std.testing.expect(familyAccepted("dejavu sans mono", "DejaVu Sans Mono"));
+    try std.testing.expect(familyAccepted("monospace", "JetBrainsMono Nerd Font"));
+}

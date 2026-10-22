@@ -4,4 +4,5 @@ test {
     _ = @import("keymap.zig");
     _ = @import("transform.zig");
     _ = @import("atlas_pixels.zig");
+    _ = @import("fc.zig");
 }

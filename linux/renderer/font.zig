@@ -181,6 +181,17 @@ fn findFontFile(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic
     var result: fc.FcResult = undefined;
     const match = fc.FcFontMatch(null, pattern, &result) orelse return null;
     defer fc.FcPatternDestroy(match);
+    // A font lists every family name it answers to (localized, aliases).
+    var accepted = false;
+    var i: c_int = 0;
+    var family_ptr: [*c]fc.FcChar8 = undefined;
+    while (fc.FcPatternGetString(match, fc.FC_FAMILY, i, &family_ptr) == .match) : (i += 1) {
+        if (fc.familyAccepted(family, std.mem.span(@as([*:0]const u8, @ptrCast(family_ptr))))) {
+            accepted = true;
+            break;
+        }
+    }
+    if (!accepted) return null;
     var file_ptr: [*c]fc.FcChar8 = undefined;
     if (fc.FcPatternGetString(match, fc.FC_FILE, 0, &file_ptr) != .match) return null;
     return alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)))) catch null;
