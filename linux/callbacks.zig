@@ -431,13 +431,17 @@ fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height:
 fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
     const app = appFrom(ctx);
     ensureFont(app);
-    return @intFromBool(app.fonts.rasterizeScalar(scalar, style_flags, out_bitmap));
+    // Valid only during this callback (zonvie_core.h).
+    var cluster_len: u8 = 0;
+    const cluster_ptr = core.zonvie_core_get_emoji_cluster(app.corep, &cluster_len);
+    const cluster: []const u32 = if (cluster_ptr) |p| p[0..cluster_len] else &.{};
+    return @intFromBool(app.fonts.rasterizeScalar(app.alloc, scalar, style_flags, cluster, out_bitmap));
 }
 
 fn onRasterizeGlyphById(ctx: ?*anyopaque, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
     const app = appFrom(ctx);
     ensureFont(app);
-    return @intFromBool(app.fonts.rasterizeGlyphId(glyph_id, style_flags, out_bitmap));
+    return @intFromBool(app.fonts.rasterizeGlyphId(app.alloc, glyph_id, style_flags, out_bitmap));
 }
 
 fn onShapeTextRun(

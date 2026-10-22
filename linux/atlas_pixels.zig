@@ -84,3 +84,36 @@ test "unsupported bytes_per_pixel and null pixels yield zeros" {
     toRgba8(&bm, &out);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &out);
 }
+
+/// Box-filters a premultiplied 4-byte-per-pixel bitmap (src_w x src_h, rows
+/// `src_pitch` bytes apart) into `dst` (dst_w x dst_h, tightly packed): each
+/// destination pixel averages the source pixels its footprint covers. For
+/// fixed-strike colour emoji, whose only size is larger than the cell.
+pub fn downscale4(src: []const u8, src_w: usize, src_h: usize, src_pitch: usize, dst: []u8, dst_w: usize, dst_h: usize) void {
+    for (0..dst_h) |dy| {
+        const y0 = dy * src_h / dst_h;
+        const y1 = @max(y0 + 1, (dy + 1) * src_h / dst_h);
+        for (0..dst_w) |dx| {
+            const x0 = dx * src_w / dst_w;
+            const x1 = @max(x0 + 1, (dx + 1) * src_w / dst_w);
+            var sum: [4]u32 = .{ 0, 0, 0, 0 };
+            for (y0..y1) |y| {
+                for (x0..x1) |x| {
+                    const p = src[y * src_pitch + x * 4 ..][0..4];
+                    inline for (0..4) |c| sum[c] += p[c];
+                }
+            }
+            const n: u32 = @intCast((y1 - y0) * (x1 - x0));
+            const o = dst[(dy * dst_w + dx) * 4 ..][0..4];
+            inline for (0..4) |c| o[c] = @intCast((sum[c] + n / 2) / n);
+        }
+    }
+}
+
+test "downscale4 averages each footprint" {
+    // 2x2 -> 1x1: the mean of four pixels, per channel.
+    const src = [_]u8{ 0, 0, 0, 0, 100, 100, 100, 100, 200, 200, 200, 200, 100, 100, 100, 100 };
+    var dst: [4]u8 = undefined;
+    downscale4(&src, 2, 2, 8, &dst, 1, 1);
+    try testing.expectEqualSlices(u8, &.{ 100, 100, 100, 100 }, &dst);
+}
