@@ -1252,17 +1252,21 @@ final class GlyphAtlas {
         return result
     }
 
-    /// Cached Apple Color Emoji CTFont for emoji fallback.
-    private var cachedEmojiFont: CTFont?
-    private var cachedEmojiFontSize: CGFloat = 0
+    /// Apple Color Emoji per size: the global font and each per-grid slot
+    /// ask for their own size, and a single entry would recreate the font
+    /// on every switch. Bounded by the slot count plus the global font.
+    private var cachedEmojiFonts: [CGFloat: CTFont] = [:]
+    private let maxEmojiFontSizes = 65
 
     private func emojiFont(size: CGFloat) -> CTFont? {
-        if let cached = cachedEmojiFont, cachedEmojiFontSize == size {
+        if let cached = cachedEmojiFonts[size] {
             return cached
         }
+        if cachedEmojiFonts.count >= maxEmojiFontSizes {
+            cachedEmojiFonts.removeAll(keepingCapacity: true)
+        }
         let f = CTFontCreateWithName("Apple Color Emoji" as CFString, size, nil)
-        cachedEmojiFont = f
-        cachedEmojiFontSize = size
+        cachedEmojiFonts[size] = f
         return f
     }
 
@@ -1945,6 +1949,7 @@ final class GlyphAtlas {
 
         os_unfair_lock_lock(&mu)
         let old = slotFaces.updateValue(slot, forKey: fontId)
+        purgeSlotCaches_locked(fontId: fontId, old: old)
         os_unfair_lock_unlock(&mu)
         // No reader holds an hbft outside mu, so the replaced one can go now.
         if let old { Self.destroySlotFace(old) }
@@ -1955,8 +1960,22 @@ final class GlyphAtlas {
     func releaseSlot(fontId: UInt32) {
         os_unfair_lock_lock(&mu)
         let s = slotFaces.removeValue(forKey: fontId)
+        purgeSlotCaches_locked(fontId: fontId, old: s)
         os_unfair_lock_unlock(&mu)
         if let s { Self.destroySlotFace(s) }
+    }
+
+    /// A font id is recycled for another font, and a dead CTFont's address
+    /// can be reused, so drop entries naming either before the next lookup.
+    private func purgeSlotCaches_locked(fontId: UInt32, old: SlotFace?) {
+        let idBits = UInt64(fontId & 0xFF)
+        failedScalarCache = failedScalarCache.filter { ($0 >> 24) & 0xFF != idBits }
+        guard let old else { return }
+        func addr(_ f: CTFont) -> UInt { UInt(bitPattern: Unmanaged.passUnretained(f as AnyObject).toOpaque()) }
+        var ptrs = Set(old.faces.map { addr($0.ctFont) })
+        for (k, v) in fallbackFontCache where ptrs.contains(k.baseFont) { ptrs.insert(addr(v)) }
+        fallbackFontCache = fallbackFontCache.filter { !ptrs.contains($0.key.baseFont) }
+        scalarToGlyphIDCache = scalarToGlyphIDCache.filter { !ptrs.contains(UInt($0.key.fontKey)) }
     }
 
     private static func destroySlotFace(_ s: SlotFace) {

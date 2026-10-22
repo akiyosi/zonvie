@@ -1633,6 +1633,7 @@ final class ZonvieCore {
                     String(decoding: UnsafeRawBufferPointer(start: $0, count: len), as: UTF8.self)
                 } ?? ""
                 // Synchronous by contract: the core sizes the grid from the answer.
+                // Runs under grid_mu; a one-time cost per new font.
                 guard let cell = me.loadFontSlot(fontId: fontId, payload: payload, scale: CGFloat(scale)) else { return 0 }
                 outW.pointee = cell.cellWidthPx
                 outH.pointee = cell.cellHeightPx

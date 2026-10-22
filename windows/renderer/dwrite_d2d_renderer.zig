@@ -1609,6 +1609,8 @@ pub const Renderer = struct {
 
             if (self.slot_faces[font_id]) |*old| releaseFaceSet(old);
             self.slot_faces[font_id] = set;
+            // Keyed by face address, which a released face can hand on.
+            self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
             return .{ .cell_w_px = set.cell_w_px, .cell_h_px = set.cell_h_px };
         }
         return null;
@@ -1621,6 +1623,7 @@ pub const Renderer = struct {
         defer self.mu.unlock(core.clock.io());
         if (self.slot_faces[font_id]) |*s| releaseFaceSet(s);
         self.slot_faces[font_id] = null;
+        self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
     }
 
     /// Parse comma-separated features string into font_features array.
