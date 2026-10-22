@@ -1962,6 +1962,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
+        self.drainFontReleasesLocked();
         self.takeFloatConfigQueriesLocked();
         if (self.perGridFontsEnabled()) self.takeFontQueriesLocked(clock.nowNs()) else self.grid.font_query_wanted.clearRetainingCapacity();
         self.unlockGridAsRedrawOwner();

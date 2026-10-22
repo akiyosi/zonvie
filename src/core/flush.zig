@@ -4060,6 +4060,8 @@ pub const FlushCtx = struct {
         // separate consumer gated on cursor_rev, which no grid dirtying touches.
         ctx.core.grid.markEverySurfaceDirty();
         ctx.core.grid.cursor_rev +%= 1;
+        // A face change at the same cell size still stales scale-only slots.
+        ctx.core.noteGlobalCellChangeLocked();
 
         ctx.core.emitGuiFont(font);
     }
