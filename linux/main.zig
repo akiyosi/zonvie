@@ -9,6 +9,7 @@ const input = @import("input.zig");
 const applog = @import("app_log.zig");
 const config_mod = @import("config.zig");
 const ui_widgets = @import("ui_widgets.zig");
+const ext_window = @import("ext_window.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -22,6 +23,7 @@ const Startup = struct {
     ext_popupmenu: bool = false,
     ext_messages: bool = false,
     ext_tabline: bool = false,
+    ext_windows: bool = false,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -50,7 +52,7 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     }
     // A realize after an unrealize leaves the texture empty; the next render
     // rebuilds it from the CPU atlas mirror (gl_renderer.drainAtlas).
-    if (!gl_renderer.realize(app)) return;
+    if (!gl_renderer.realize(&app.gl)) return;
     if (app.gl_realized_once) return;
     app.gl_realized_once = true;
     startCore(app, area);
@@ -58,7 +60,7 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
 fn onUnrealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     gtk.gtk_gl_area_make_current(widget.?);
-    gl_renderer.unrealize(appFrom(data));
+    gl_renderer.unrealize(&appFrom(data).gl);
 }
 
 fn onRender(area: ?*anyopaque, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
@@ -140,6 +142,7 @@ fn startCore(app: *App, area: *anyopaque) void {
     if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
     if (startup.ext_tabline) core.zonvie_core_set_ext_tabline(cp, 1);
+    if (startup.ext_windows) core.zonvie_core_set_ext_windows(cp, 1);
 
     lock(app);
     const cw = app.cell_w_px;
@@ -211,7 +214,8 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = gtk.g_signal_connect(area, "unrealize", @ptrCast(&onUnrealize), app);
     _ = gtk.g_signal_connect(area, "render", @ptrCast(&onRender), app);
     _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onResize), app);
-    input.attach(app, area);
+    app.pointer = .{ .app = app };
+    input.attach(&app.pointer, area);
 
     gtk.gtk_window_set_child(win, ui_widgets.build(app, area));
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
@@ -252,6 +256,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ext_popupmenu = config.popup.external;
     var ext_messages = config.messages.external;
     var ext_tabline = config.tabline.external;
+    var ext_windows = config.windows.external;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -272,6 +277,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             ext_messages = true;
         } else if (std.mem.eql(u8, arg, "--exttabline")) {
             ext_tabline = true;
+        } else if (std.mem.eql(u8, arg, "--extwindows")) {
+            ext_windows = true;
         } else if (std.mem.eql(u8, arg, "--log") and i + 1 < args.len) {
             i += 1;
             log_path = args[i];
@@ -294,6 +301,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .ext_popupmenu = ext_popupmenu,
         .ext_messages = ext_messages,
         .ext_tabline = ext_tabline,
+        .ext_windows = ext_windows,
     };
 
     const app = alloc.create(App) catch return 1;
@@ -321,6 +329,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     app.corep = null;
     // Run idles still queued, so stale clipboard tasks free themselves.
     while (gtk.g_main_context_iteration(null, 0) != 0) {}
+    ext_window.closeAll(app);
     // Destroys the window; unrealize still needs `app`.
     gtk.g_object_unref(gapp);
     app.gtk_app = null;
