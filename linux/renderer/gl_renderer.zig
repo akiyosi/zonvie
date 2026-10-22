@@ -8,6 +8,10 @@ const gl = @import("../gl.zig");
 const App = @import("../app.zig").App;
 const transform = @import("../transform.zig");
 const applog = @import("../app_log.zig");
+const gtk = @import("../gtk_bindings.zig");
+const surface_store = @import("../surface_store.zig");
+const GridRows = surface_store.GridRows;
+const Row = surface_store.Row;
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -53,6 +57,8 @@ pub fn realize(app: *App) bool {
     app.gl_program = prog;
     app.gl_u_scale = gl.glGetUniformLocation(prog, "u_scale");
     app.gl_u_offset = gl.glGetUniformLocation(prog, "u_offset");
+    app.gl_u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
+    app.gl_u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
     gl.glUseProgram(prog);
     gl.glUniform1i(gl.glGetUniformLocation(prog, "u_atlas"), 0);
 
@@ -71,6 +77,8 @@ pub fn realize(app: *App) bool {
     gl.glVertexAttribPointer(2, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, @ptrFromInt(@offsetOf(core.Vertex, "color")));
     gl.glEnableVertexAttribArray(3);
     gl.glVertexAttribIPointer(3, 1, gl.GL_UNSIGNED_INT, stride, @ptrFromInt(@offsetOf(core.Vertex, "deco_flags")));
+    gl.glEnableVertexAttribArray(4);
+    gl.glVertexAttribPointer(4, 1, gl.GL_FLOAT, gl.GL_FALSE, stride, @ptrFromInt(@offsetOf(core.Vertex, "deco_phase")));
 
     gl.glGenTextures(1, &app.gl_atlas_tex);
     gl.glBindTexture(gl.GL_TEXTURE_2D, app.gl_atlas_tex);
@@ -125,8 +133,9 @@ fn drainAtlas(app: *App) void {
     }
 }
 
-/// Uploads `verts` into the persistent VBO and draws them as triangles.
-fn drawVerts(app: *App, verts: []const core.Vertex, layer: core.Layer) void {
+/// Uploads `verts` into the persistent VBO and draws them as triangles,
+/// scrollable content `scroll_offset_px` lower.
+fn drawVerts(app: *App, verts: []const core.Vertex, layer: core.Layer, scroll_offset_px: f32) void {
     if (verts.len == 0) return;
     const bytes = verts.len * @sizeOf(core.Vertex);
     if (bytes > app.gl_vbo_cap_bytes) {
@@ -139,7 +148,60 @@ fn drawVerts(app: *App, verts: []const core.Vertex, layer: core.Layer) void {
     const t = transform.layerXform(layer, app.cell_w_px, app.cell_h_px, app.drawable_w_px, app.drawable_h_px);
     gl.glUniform2f(app.gl_u_scale, t.scale[0], t.scale[1]);
     gl.glUniform2f(app.gl_u_offset, t.offset[0], t.offset[1]);
+    gl.glUniform1f(app.gl_u_scroll_offset, scroll_offset_px);
+    gl.glUniform1f(app.gl_u_layer_origin_x, @floatFromInt(layer.x_px));
     gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(verts.len));
+}
+
+/// Clips to rows [row_start, row_end) of `layer`, in GL's bottom-left origin.
+fn scissorRows(app: *const App, layer: core.Layer, row_start: u32, row_end: u32) void {
+    const h: i32 = @intCast(app.cell_h_px);
+    const top = layer.y_px + @as(i32, @intCast(row_start)) * h;
+    const bottom = layer.y_px + @as(i32, @intCast(row_end)) * h;
+    gl.glScissor(
+        layer.x_px,
+        @as(i32, @intCast(app.drawable_h_px)) - bottom,
+        @intCast(layer.cols * app.cell_w_px),
+        @max(0, bottom - top),
+    );
+}
+
+/// Appends rows [start, end) to the scratch buffer.
+fn gatherRows(app: *App, rows: []const Row, start: usize, end: usize) void {
+    for (rows[start..end]) |row| {
+        app.gl_scratch.appendSlice(app.alloc, row.verts.items) catch break;
+    }
+}
+
+/// Draws one layer's committed rows. An eased grid's scroll region is drawn
+/// apart, under its own scissor, at the ease offset together with the rows
+/// it scrolled out, so the band the offset opens is filled and nothing moves
+/// into the margins around it. Returns the vertex count drawn.
+fn drawLayer(app: *App, layer: core.Layer, grid: *const GridRows, region: [2]u32, offset_px: f32) usize {
+    const rows = grid.committedRows();
+    const r0: usize = @min(region[0], rows.len);
+    const r1: usize = @min(region[1], rows.len);
+    var total: usize = 0;
+
+    app.gl_scratch.clearRetainingCapacity();
+    gatherRows(app, rows, 0, r0);
+    gatherRows(app, rows, r1, rows.len);
+    total += app.gl_scratch.items.len;
+    drawVerts(app, app.gl_scratch.items, layer, 0);
+    if (r0 == r1) return total;
+
+    app.gl_scratch.clearRetainingCapacity();
+    gatherRows(app, rows, r0, r1);
+    for (grid.retainedRows()) |r| {
+        if (!r.live) continue;
+        app.gl_scratch.appendSlice(app.alloc, r.verts.items) catch break;
+    }
+    total += app.gl_scratch.items.len;
+    gl.glEnable(gl.GL_SCISSOR_TEST);
+    scissorRows(app, layer, @intCast(r0), @intCast(r1));
+    drawVerts(app, app.gl_scratch.items, layer, offset_px);
+    gl.glDisable(gl.GL_SCISSOR_TEST);
+    return total;
 }
 
 pub fn render(app: *App) void {
@@ -168,29 +230,62 @@ pub fn render(app: *App) void {
     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
 
     var verts_total: usize = 0;
+    var any_moving = false;
+    const now_ns: i64 = @intCast(t0);
     const layers = app.surface.committedLayers();
     // The core sends layers back-to-front; draw in order (windows/app.zig:4432).
     for (layers) |layer| {
         const grid = app.surface.committedGrid(layer.grid_id) orelse continue;
-        app.gl_scratch.clearRetainingCapacity();
-        for (grid.committedRows()) |row| {
-            app.gl_scratch.appendSlice(app.alloc, row.verts.items) catch break;
-        }
-        verts_total += app.gl_scratch.items.len;
-        drawVerts(app, app.gl_scratch.items, layer);
+        const ease = app.surface.gridEase(layer.grid_id).?;
+        ease.plan(now_ns, app.cell_h_px, grid.committedRows().len);
+        if (ease.moving()) any_moving = true;
+        verts_total += drawLayer(app, layer, grid, ease.region(), ease.offset_px);
     }
     const cur = app.surface.committedCursor();
     if (cur.verts.len != 0) {
         for (layers) |layer| {
             if (layer.grid_id != cur.grid_id) continue;
             verts_total += cur.verts.len;
-            drawVerts(app, cur.verts, layer);
+            // The cursor rides its grid's ease, clipped like the region.
+            const ease = app.surface.gridEase(layer.grid_id);
+            const region: [2]u32 = if (ease) |e| e.region() else .{ 0, 0 };
+            if (region[0] != region[1]) {
+                gl.glEnable(gl.GL_SCISSOR_TEST);
+                scissorRows(app, layer, region[0], region[1]);
+            }
+            drawVerts(app, cur.verts, layer, if (ease) |e| e.offset_px else 0);
+            gl.glDisable(gl.GL_SCISSOR_TEST);
             break;
         }
     }
+    if (any_moving) startEaseTick(app);
 
     if (applog.isEnabled()) {
         const us = @divTrunc(clock.nowNs() - t0, 1000);
-        applog.appLog("[perf] linux_render us={d} layers={d} verts={d}\n", .{ us, layers.len, verts_total });
+        applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, verts_total, any_moving });
     }
+}
+
+/// Redraws on every frame-clock tick while some grid eases; the render that
+/// finds every ease at rest lets the callback remove itself.
+fn startEaseTick(app: *App) void {
+    if (app.ease_tick_active) return;
+    const area = app.gl_area orelse return;
+    app.ease_tick_active = true;
+    _ = gtk.gtk_widget_add_tick_callback(area, &onEaseTick, app, null);
+}
+
+fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
+    _ = frame_clock;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    gtk.gtk_gl_area_queue_render(widget.?);
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    var moving = false;
+    for (app.surface.committedLayers()) |layer| {
+        const e = app.surface.gridEase(layer.grid_id) orelse continue;
+        if (e.moving()) moving = true;
+    }
+    if (!moving) app.ease_tick_active = false;
+    return @intFromBool(moving);
 }

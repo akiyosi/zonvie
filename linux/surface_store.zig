@@ -6,12 +6,15 @@
 const std = @import("std");
 const core = @import("zonvie_core");
 const Vertex = core.Vertex;
+const grid_ease = @import("grid_ease.zig");
+pub const ScrollInput = grid_ease.ScrollInput;
 
 pub const Row = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
 };
 
-const Shift = struct { row_start: u32, row_end: u32, rows_delta: i32 };
+/// `total_rows` is the grid's row count the scroll was made at.
+const Shift = struct { row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32 };
 
 pub const GridRows = struct {
     front: std.ArrayListUnmanaged(Row) = .empty,
@@ -22,8 +25,10 @@ pub const GridRows = struct {
     staged_clear: bool = false,
     /// The core sends at most one shift per grid per flush (zonvie_core.h).
     staged_shift: ?Shift = null,
+    ease: grid_ease.GridEase = .{},
 
     pub fn deinit(self: *GridRows, alloc: std.mem.Allocator) void {
+        self.ease.deinit(alloc);
         for (self.front.items) |*r| r.verts.deinit(alloc);
         for (self.back.items) |*r| r.verts.deinit(alloc);
         self.front.deinit(alloc);
@@ -49,8 +54,8 @@ pub const GridRows = struct {
         self.dirty.set(row);
     }
 
-    pub fn stageShift(self: *GridRows, row_start: u32, row_end: u32, rows_delta: i32) void {
-        self.staged_shift = .{ .row_start = row_start, .row_end = row_end, .rows_delta = rows_delta };
+    pub fn stageShift(self: *GridRows, row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32) void {
+        self.staged_shift = .{ .row_start = row_start, .row_end = row_end, .rows_delta = rows_delta, .total_rows = total_rows };
     }
 
     pub fn stageClear(self: *GridRows) void {
@@ -72,16 +77,30 @@ pub const GridRows = struct {
         try self.front.ensureTotalCapacity(alloc, len);
     }
 
-    /// Caller holds App.mu; prepareCommit must have succeeded since the last stage.
-    pub fn commit(self: *GridRows, alloc: std.mem.Allocator) void {
+    /// Caller holds App.mu; prepareCommit must have succeeded since the last
+    /// stage. `eases` says whether this grid's scrolls animate.
+    pub fn commit(self: *GridRows, alloc: std.mem.Allocator, eases: bool, in: ScrollInput) void {
         defer self.cancel();
         if (self.staged_clear) {
             for (self.front.items) |*r| r.verts.deinit(alloc);
             self.front.clearRetainingCapacity();
+            self.ease.spring.reset();
+            self.ease.dropRetained();
             return;
         }
-        if (self.staged_shift) |s| self.applyShift(s);
         const len: usize = self.staged_len orelse self.front.items.len;
+        if (self.staged_shift) |s| {
+            self.ease.beforeShift(s.row_start, s.row_end, s.rows_delta, in);
+            if (self.applyShift(s, in.row_h_px)) |end| {
+                // A scroll made at another size cannot be given back.
+                if (eases and s.total_rows == len) {
+                    self.ease.seedAndRetain(self.front.items, s.row_start, end, s.rows_delta, in);
+                } else {
+                    self.ease.spring.reset();
+                    self.ease.dropRetained();
+                }
+            }
+        }
         while (self.front.items.len < len) self.front.appendAssumeCapacity(.{});
         while (self.front.items.len > len) {
             var r = self.front.pop().?;
@@ -94,19 +113,29 @@ pub const GridRows = struct {
         }
     }
 
-    fn applyShift(self: *GridRows, s: Shift) void {
+    /// Rotates the region and rebases every row in it by the distance it
+    /// moved, so committed vertices always sit at their current row. Returns
+    /// the clamped region end, or null when nothing moved.
+    fn applyShift(self: *GridRows, s: Shift, row_h_px: u32) ?u32 {
         const end = @min(s.row_end, @as(u32, @intCast(self.front.items.len)));
-        if (s.row_start >= end) return;
+        if (s.row_start >= end) return null;
         const region = self.front.items[s.row_start..end];
         const n: usize = @intCast(@abs(s.rows_delta));
-        if (n >= region.len) return;
+        if (n >= region.len) return null;
         // rows_delta > 0: content moves up (row i takes row i+n); matches
         // windows/render_pipeline_helpers.zig rotateRegion.
         if (s.rows_delta > 0) std.mem.rotate(Row, region, n) else std.mem.rotate(Row, region, region.len - n);
+        const dy: f32 = @floatFromInt(-s.rows_delta * @as(i32, @intCast(row_h_px)));
+        for (region) |*r| grid_ease.moveVerts(r.verts.items, dy);
+        return end;
     }
 
     pub fn committedRows(self: *const GridRows) []const Row {
         return self.front.items;
+    }
+
+    pub fn retainedRows(self: *const GridRows) []const grid_ease.RetainedRow {
+        return &self.ease.retained;
     }
 };
 
@@ -189,9 +218,11 @@ pub const SurfaceStore = struct {
     }
 
     /// Caller holds App.mu; prepareCommit must have succeeded since the last stage.
-    pub fn commit(self: *SurfaceStore, alloc: std.mem.Allocator) void {
-        var it = self.grids.valueIterator();
-        while (it.next()) |g| g.*.commit(alloc);
+    pub fn commit(self: *SurfaceStore, alloc: std.mem.Allocator, in: ScrollInput) void {
+        var it = self.grids.iterator();
+        // Grid 1 is the root, holding chrome and messages, and negative ids
+        // are UI the core owns: neither eases.
+        while (it.next()) |kv| kv.value_ptr.*.commit(alloc, kv.key_ptr.* >= 2, in);
         if (self.layers_staged) {
             std.mem.swap(std.ArrayListUnmanaged(core.Layer), &self.layers_front, &self.layers_back);
             self.layers_staged = false;
@@ -225,12 +256,21 @@ pub const SurfaceStore = struct {
         return self.grids.get(grid_id);
     }
 
+    /// Caller holds App.mu. The paint settles each drawn grid's ease here.
+    pub fn gridEase(self: *SurfaceStore, grid_id: i64) ?*grid_ease.GridEase {
+        const g = self.grids.get(grid_id) orelse return null;
+        return &g.ease;
+    }
+
     pub fn committedCursor(self: *const SurfaceStore) struct { grid_id: i64, verts: []const Vertex } {
         return .{ .grid_id = self.cursor_front_grid, .verts = self.cursor_front.items };
     }
 };
 
 const testing = std.testing;
+
+/// No row height: shifts rotate without rebasing and nothing eases.
+const no_scroll: ScrollInput = .{ .now_ns = 1, .row_h_px = 0, .mousescroll_ver = 3, .large_jump = .partial };
 
 fn v(y: f32) Vertex {
     return .{ .position = .{ 0, y }, .texCoord = .{ -1, -1 }, .color = .{ 1, 1, 1, 1 }, .grid_id = 2, .deco_flags = 0, .deco_phase = 0 };
@@ -248,7 +288,7 @@ test "staged row is invisible until commit" {
     try g.stageRow(testing.allocator, 0, &.{v(10)}, 3);
     try testing.expectEqual(@as(?f32, null), firstY(&g, 0));
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(?f32, 10), firstY(&g, 0));
 }
 
@@ -258,10 +298,10 @@ test "rows not resent keep previous contents" {
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 2);
     try g.stageRow(testing.allocator, 1, &.{v(2)}, 2);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try g.stageRow(testing.allocator, 1, &.{v(20)}, 2);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 20), firstY(&g, 1));
 }
@@ -271,11 +311,11 @@ test "cancel keeps committed rows" {
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 1);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try g.stageRow(testing.allocator, 0, &.{v(99)}, 1);
     g.cancel();
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator); // a later empty commit must not resurrect the cancelled row
+    g.commit(testing.allocator, true, no_scroll); // a later empty commit must not resurrect the cancelled row
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
 }
 
@@ -284,14 +324,14 @@ test "resize shrink then grow" {
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try g.stageRow(testing.allocator, 0, &.{v(0)}, 2);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(usize, 2), g.committedRows().len);
     try g.stageRow(testing.allocator, 0, &.{v(0)}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(usize, 4), g.committedRows().len);
     try testing.expectEqual(@as(?f32, null), firstY(&g, 3)); // new row is empty, not stale
 }
@@ -303,11 +343,11 @@ test "shift then vacated rows" {
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
-    g.stageShift(0, 4, 1);
+    g.commit(testing.allocator, true, no_scroll);
+    g.stageShift(0, 4, 1, 4);
     try g.stageRow(testing.allocator, 3, &.{v(40)}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 3), firstY(&g, 2));
     try testing.expectEqual(@as(?f32, 40), firstY(&g, 3));
@@ -319,11 +359,11 @@ test "shift down by 1 with region" {
     defer g.deinit(testing.allocator);
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
-    g.stageShift(1, 4, -1);
+    g.commit(testing.allocator, true, no_scroll);
+    g.stageShift(1, 4, -1, 4);
     try g.stageRow(testing.allocator, 1, &.{v(10)}, 4);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(?f32, 0), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 10), firstY(&g, 1));
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 2));
@@ -335,10 +375,10 @@ test "stageClear empties every row at commit" {
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 1);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     g.stageClear();
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(usize, 0), g.committedRows().len);
 }
 
@@ -348,9 +388,9 @@ test "failed prepareCommit then cancel keeps the committed frame, even with a sh
     for (0..2) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 2);
     try g.prepareCommit(testing.allocator);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
 
-    g.stageShift(0, 2, 1);
+    g.stageShift(0, 2, 1, 2);
     try g.stageRow(testing.allocator, 1, &.{v(50)}, 64);
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, g.prepareCommit(failing.allocator()));
@@ -371,7 +411,7 @@ test "layers publish at commit only" {
     try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
     try testing.expectEqual(@as(usize, 0), s.committedLayers().len);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 2), s.committedLayers().len);
 }
 
@@ -380,11 +420,11 @@ test "cursor-only update never touches rows" {
     defer s.deinit(testing.allocator);
     try (try s.rowsFor(testing.allocator, 2)).stageRow(testing.allocator, 0, &.{v(5)}, 1);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageLayers(testing.allocator, &.{layer(2, 0)}, 10, 10);
     try s.stageCursor(testing.allocator, 2, &.{v(77)});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(?f32, 5), firstY(s.committedGrid(2).?, 0));
     try testing.expectEqual(@as(f32, 77), s.committedCursor().verts[0].position[1]);
 }
@@ -395,10 +435,10 @@ test "layout drop hides a grid's rows and its cursor" {
     try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(3, 1) }, 10, 10);
     try s.stageCursor(testing.allocator, 3, &.{v(1)});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 1), s.committedLayers().len);
     try testing.expectEqual(@as(usize, 0), s.committedCursor().verts.len);
 }
@@ -409,7 +449,7 @@ test "cancel keeps committed layers and cursor" {
     try s.stageLayers(testing.allocator, &.{layer(1, 0)}, 10, 10);
     try s.stageCursor(testing.allocator, 1, &.{v(1)});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
     try s.stageCursor(testing.allocator, 2, &.{v(2)});
     s.cancel();
@@ -422,11 +462,11 @@ test "destroy frees the grid at commit, not before" {
     defer s.deinit(testing.allocator);
     try (try s.rowsFor(testing.allocator, 4)).stageRow(testing.allocator, 0, &.{v(1)}, 1);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageDestroy(testing.allocator, 4);
     try testing.expect(s.committedGrid(4) != null);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expect(s.committedGrid(4) == null);
 }
 
@@ -437,7 +477,7 @@ test "failed prepareCommit then cancel keeps committed layers, cursor and rows" 
     try s.stageCursor(testing.allocator, 1, &.{v(1)});
     try (try s.rowsFor(testing.allocator, 1)).stageRow(testing.allocator, 0, &.{v(9)}, 1);
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
 
     try s.stageLayers(testing.allocator, &.{ layer(1, 0), layer(2, 1) }, 10, 10);
     try s.stageCursor(testing.allocator, 2, &.{v(2)});
@@ -464,7 +504,7 @@ test "cursor clear from a non-owner in the same flush keeps the owner's cursor" 
     try s.stageCursor(testing.allocator, 2, &.{v(7)});
     try s.stageCursor(testing.allocator, 1, &.{});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(i64, 2), s.committedCursor().grid_id);
     try testing.expectEqual(@as(usize, 1), s.committedCursor().verts.len);
 }
@@ -475,10 +515,10 @@ test "cursor clear from a non-owner in a later flush keeps the committed cursor"
     try twoGridStore(&s);
     try s.stageCursor(testing.allocator, 2, &.{v(7)});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageCursor(testing.allocator, 1, &.{});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(i64, 2), s.committedCursor().grid_id);
     try testing.expectEqual(@as(usize, 1), s.committedCursor().verts.len);
 }
@@ -489,10 +529,10 @@ test "cursor clear from the owner empties the cursor" {
     try twoGridStore(&s);
     try s.stageCursor(testing.allocator, 2, &.{v(7)});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try s.stageCursor(testing.allocator, 2, &.{});
     try s.prepareCommit(testing.allocator);
-    s.commit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 0), s.committedCursor().verts.len);
 }
 
@@ -501,10 +541,10 @@ test "a row with no total_rows is content and never shrinks the grid" {
     defer g.deinit(testing.allocator);
     try g.stageRow(testing.allocator, 0, &.{v(1)}, 3);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try g.stageRow(testing.allocator, 1, &.{v(2)}, 0);
     try g.prepareCommit(testing.allocator);
-    g.commit(testing.allocator);
+    g.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(usize, 3), g.committedRows().len);
     try testing.expectEqual(@as(?f32, 1), firstY(&g, 0));
     try testing.expectEqual(@as(?f32, 2), firstY(&g, 1));
@@ -513,7 +553,55 @@ test "a row with no total_rows is content and never shrinks the grid" {
     defer h.deinit(testing.allocator);
     try h.stageRow(testing.allocator, 2, &.{v(5)}, 0);
     try h.prepareCommit(testing.allocator);
-    h.commit(testing.allocator);
+    h.commit(testing.allocator, true, no_scroll);
     try testing.expectEqual(@as(usize, 3), h.committedRows().len);
     try testing.expectEqual(@as(?f32, 5), firstY(&h, 2));
+}
+
+test "a shift rebases moved rows to their new row" {
+    var g: GridRows = .{};
+    defer g.deinit(testing.allocator);
+    const in: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 0, .large_jump = .snap };
+    for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator, true, in);
+    g.stageShift(0, 4, 1, 4);
+    try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator, true, in);
+    for (0..4) |i| try testing.expectEqual(@as(?f32, @floatFromInt(i * 10)), firstY(&g, i));
+}
+
+test "an eased shift keeps the scrolled-out row and the resend fills the band" {
+    var g: GridRows = .{};
+    defer g.deinit(testing.allocator);
+    const in: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 3, .large_jump = .partial };
+    for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator, true, in);
+    g.stageShift(0, 4, 1, 4);
+    try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
+    try g.prepareCommit(testing.allocator);
+    g.commit(testing.allocator, true, in);
+    try testing.expectEqual(@as(?f32, 30), firstY(&g, 3));
+    const kept = g.retainedRows()[0];
+    try testing.expect(kept.live);
+    try testing.expectEqual(@as(i32, -1), kept.row);
+    try testing.expectEqual(@as(f32, -10), kept.verts.items[0].position[1]);
+    try testing.expect(g.ease.moving());
+}
+
+test "the root grid never eases" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    const in: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 3, .large_jump = .partial };
+    const g = try s.rowsFor(testing.allocator, 1);
+    for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, in);
+    g.stageShift(0, 4, 1, 4);
+    try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, in);
+    try testing.expect(!g.ease.moving());
 }

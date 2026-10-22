@@ -5,6 +5,7 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const SurfaceStore = @import("surface_store.zig").SurfaceStore;
 const Fonts = @import("renderer/font.zig").Fonts;
+const scroll_ease = core.scroll_ease;
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -56,6 +57,8 @@ pub const App = struct {
     /// Neovim-requested grid size, consumed by the window.
     requested_rows: u32 = 0,
     requested_cols: u32 = 0,
+    /// config.scroll.large_jump_behavior; set before the core starts.
+    large_jump: scroll_ease.LargeJumpBehavior = .snap,
     title: [256]u8 = undefined,
     title_len: usize = 0,
     exit_code: ?i32 = null,
@@ -73,6 +76,8 @@ pub const App = struct {
     gl_atlas_h: u32 = 0,
     gl_u_scale: i32 = -1,
     gl_u_offset: i32 = -1,
+    gl_u_scroll_offset: i32 = -1,
+    gl_u_layer_origin_x: i32 = -1,
     /// One layer's rows concatenated for a single upload; capacity reused across frames.
     gl_scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
 
@@ -81,6 +86,9 @@ pub const App = struct {
     window: ?*anyopaque = null,
     gtk_app: ?*anyopaque = null,
     im_context: ?*anyopaque = null,
+    /// A frame-clock tick callback is installed and redraws every frame
+    /// while some grid eases.
+    ease_tick_active: bool = false,
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
     /// on_quit_requested's argument, read by its idle.

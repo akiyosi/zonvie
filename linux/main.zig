@@ -270,7 +270,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     const app = alloc.create(App) catch return 1;
     defer alloc.destroy(app);
-    app.* = .{ .alloc = alloc, .startup = @constCast(@ptrCast(&startup)) };
+    app.* = .{
+        .alloc = alloc,
+        .startup = @constCast(@ptrCast(&startup)),
+        .large_jump = config.scroll.large_jump_behavior,
+    };
     defer app.deinit();
 
     // Each process owns its own nvim, so a second launch must not forward

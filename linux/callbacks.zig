@@ -115,7 +115,6 @@ fn onGridRowScroll(
     total_rows: u32,
     total_cols: u32,
 ) callconv(.c) void {
-    _ = total_rows;
     const app = appFrom(ctx);
     if (rows_delta == 0 or row_end <= row_start) return;
     // Rows are stored full-width; a partial-width shift cannot be applied
@@ -126,7 +125,7 @@ fn onGridRowScroll(
         return;
     }
     const rows = rowsFor(app, grid_id) orelse return failFlush(app);
-    rows.stageShift(row_start, row_end, rows_delta);
+    rows.stageShift(row_start, row_end, rows_delta, total_rows);
 }
 
 fn onSurfaceLayout(
@@ -175,7 +174,13 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             app.surface.cancel();
             if (core.zonvie_core_flush_is_retryable(cp)) core.zonvie_core_force_resend_locked(cp);
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
-            app.surface.commit(app.alloc);
+            app.surface.commit(app.alloc, .{
+                .now_ns = @intCast(clock.nowNs()),
+                .row_h_px = app.cell_h_px,
+                // Lock-free: an atomic the core's reporter keeps current.
+                .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(cp), 32)),
+                .large_jump = app.large_jump,
+            });
         } else |_| {
             app.surface.cancel();
             core.zonvie_core_abort_flush(cp);
