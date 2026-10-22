@@ -1,4 +1,4 @@
-// runner.zig — entrypoint for `zig build gui-test` (macOS and Windows hosts).
+// runner.zig — entrypoint for `zig build gui-test` (macOS, Windows and Linux hosts).
 //
 // Launches the REAL zonvie app: windows will appear on the current
 // desktop while tests run. Skips cleanly when the app build or nvim is
@@ -42,9 +42,14 @@ fn requirePrereqs() !void {
         else => return e,
     };
     testing.allocator.free(app);
+    if (builtin.os.tag == .linux and !driver.platform.available()) {
+        std.debug.print("[gui] no compositor IPC to observe windows (Hyprland)\n", .{});
+        return missingPrereq();
+    }
 }
 
-// Scenarios are grouped by platform applicability:
+// Scenarios are grouped by platform applicability (Linux observes windows
+// through Hyprland's IPC: linux_window.zig):
 //   common/  — run on every host (behavior-level, driven via nvim RPC)
 //   macos/   — macOS-only behavior
 //   windows/ — Windows-only behavior
@@ -55,6 +60,15 @@ fn requirePrereqs() !void {
 const is_macos = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 const can_capture = driver.capture.supported;
+const is_linux = builtin.os.tag == .linux;
+
+/// The Linux renderer draws every committed row of every layer each frame:
+/// no row reuse, blit, scroll fast path or per-row gating, so the scenarios
+/// that assert those paths ran have nothing to observe there.
+const redraws_partially = !is_linux;
+/// The cmdline is an overlay in the main window on Linux, not a window of its
+/// own, and a tiling compositor sizes the window, not :set columns/lines.
+const places_own_windows = !is_linux;
 
 /// The build runner holds a test's stderr until the test process ends, so a
 /// scenario that hangs until the CI step timeout leaves no trace of which one
@@ -110,8 +124,13 @@ fn gated(comptime ok: bool, comptime M: type) !void {
     }
 }
 
+// The Linux capture module's own image codec test.
+test {
+    if (is_linux) _ = driver.capture;
+}
+
 test "gui:cmdline_window" {
-    try gated(true, @import("scenarios/common/cmdline_window.zig"));
+    try gated(true and places_own_windows, @import("scenarios/common/cmdline_window.zig"));
 }
 
 test "gui:external_window" {
@@ -123,7 +142,7 @@ test "gui:render_trace" {
 }
 
 test "gui:set_columns_lines" {
-    try gated(true, @import("scenarios/common/set_columns_lines.zig"));
+    try gated(true and places_own_windows, @import("scenarios/common/set_columns_lines.zig"));
 }
 
 test "gui:window_frame_stability" {
@@ -220,11 +239,11 @@ test "gui:visual_split" {
 }
 
 test "gui:visual_partial_matches_full" {
-    try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
 test "gui:visual_partial_matches_full_float_move" {
-    try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full_float_move.zig"));
 }
 
 test "gui:visual_split_divider_survives_layer_redraw" {
@@ -232,7 +251,7 @@ test "gui:visual_split_divider_survives_layer_redraw" {
 }
 
 test "gui:visual_statusline_survives_layer_redraw" {
-    try gated(can_capture, @import("scenarios/visual/statusline_survives_layer_redraw.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/statusline_survives_layer_redraw.zig"));
 }
 
 test "gui:visual_float" {
@@ -268,15 +287,15 @@ test "gui:visual_cmdline_cursor_animation" {
 }
 
 test "gui:visual_continuous_j_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_extwin_continuous_j_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_incremental_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/incremental_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/incremental_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_scroll_then_cursor_move" {
@@ -284,11 +303,11 @@ test "gui:visual_scroll_then_cursor_move" {
 }
 
 test "gui:visual_scrolled_layer_row_gating" {
-    try gated(can_capture, @import("scenarios/visual/scrolled_layer_row_gating.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/scrolled_layer_row_gating.zig"));
 }
 
 test "gui:visual_float_over_scrolled_split" {
-    try gated(can_capture, @import("scenarios/visual/float_over_scrolled_split.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/float_over_scrolled_split.zig"));
 }
 
 test "gui:visual_extfloat_over_scrolled_anchor" {
@@ -296,7 +315,7 @@ test "gui:visual_extfloat_over_scrolled_anchor" {
 }
 
 test "gui:visual_extfloat_opaque_partial" {
-    if (comptime can_capture) {
+    if (comptime can_capture and redraws_partially) {
         try requirePrereqs();
         try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").runOpaque(testing.allocator);
     } else return error.SkipZigTest;
@@ -307,7 +326,7 @@ test "gui:visual_extfloat_over_born_external_anchor" {
 }
 
 test "gui:visual_scrollbind_layers_blit_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
 }
 
 test "gui:visual_proportional_font_support" {
@@ -372,11 +391,11 @@ test "gui:extwin_hosted_float_phantom_hit" {
 }
 
 test "gui:extwin_cursor_move_reuses_rows" {
-    try gated(true, @import("scenarios/common/extwin_cursor_move_reuses_rows.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/extwin_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_hosted_layer_row_gating" {
-    try gated(true, @import("scenarios/common/extwin_hosted_layer_row_gating.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/extwin_hosted_layer_row_gating.zig"));
 }
 
 test "gui:extwin_blink_without_cursor_skips" {
@@ -425,11 +444,11 @@ test "gui:extwin_animated_shader_reuses_rows" {
 }
 
 test "gui:main_idle_while_extwin_updates" {
-    try gated(true, @import("scenarios/common/main_idle_while_extwin_updates.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/main_idle_while_extwin_updates.zig"));
 }
 
 test "gui:main_cursor_move_reuses_rows" {
-    try gated(true, @import("scenarios/common/main_cursor_move_reuses_rows.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/main_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_float_follows_externalized_anchor" {

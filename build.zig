@@ -266,6 +266,69 @@ pub fn build(b: *std.Build) !void {
     windows_step.dependOn(&wake_state_tests.step);
     const wake_state_test_step = b.step("windows-wake-state-test", "Build the top-level HWND wake-state integration test");
     wake_state_test_step.dependOn(&b.addInstallArtifact(wake_state_tests, .{}).step);
+    // Linux frontend
+    //
+    // All GTK4/GLib/GDK/OpenGL/fontconfig/hbft functions use hand-written
+    // extern "c" declarations (no @cImport, no zig-gobject). This enables
+    // cross-compilation from macOS without system headers.
+    const linux_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .root_source_file = b.path("linux/main.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+
+    const is_cross = !target.query.isNative();
+
+    const linux_exe = b.addExecutable(.{
+        .name = "zonvie",
+        .root_module = linux_mod,
+    });
+    linux_mod.linkLibrary(core_lib);
+
+    // System libraries (linked at link time only, no C header processing).
+    if (target.result.os.tag == .linux and !is_cross) {
+        // HarfBuzz/FreeType bridge (shared C implementation used by all
+        // frontends). It needs FreeType headers, so a cross build omits it.
+        linux_mod.addCSourceFile(.{
+            .file = b.path("macos/Sources/Font/HBFTBridge.c"),
+            .flags = &.{},
+        });
+        linux_mod.linkSystemLibrary("gtk-4", .{});
+        linux_mod.linkSystemLibrary("GL", .{});
+        linux_mod.linkSystemLibrary("EGL", .{});
+        linux_mod.linkSystemLibrary("gbm", .{});
+        linux_mod.linkSystemLibrary("freetype2", .{});
+        linux_mod.linkSystemLibrary("harfbuzz", .{});
+        linux_mod.linkSystemLibrary("fontconfig", .{});
+        // GLib/GObject/GIO (needed explicitly when pkg-config transitive deps
+        // are not propagated by the Zig build system linker).
+        linux_mod.linkSystemLibrary("glib-2.0", .{});
+        linux_mod.linkSystemLibrary("gobject-2.0", .{});
+        linux_mod.linkSystemLibrary("gio-2.0", .{});
+    }
+
+    const linux_step = b.step("linux", "Build Linux frontend");
+
+    if (is_cross) {
+        // Cross-compilation (e.g. from macOS): system .so files are not
+        // available. Produce a compiled object to verify Zig compilation
+        // succeeds. The full executable must be built natively on Linux.
+        const linux_obj = b.addObject(.{
+            .name = "zonvie",
+            .root_module = linux_mod,
+        });
+        linux_step.dependOn(&linux_obj.step);
+    } else {
+        const install_linux = b.addInstallArtifact(linux_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "../linux/zig-out" } },
+        });
+        linux_step.dependOn(&install_linux.step);
+    }
 
     // Unit tests
     const test_step = b.step("test", "Run unit tests");
@@ -622,6 +685,22 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
 
+    // Pure-logic tests for the Linux frontend. They import only std and
+    // zonvie_core, so they run on every host.
+    const linux_pure_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("linux/tests.zig"),
+        .imports = &.{.{ .name = "zonvie_core", .module = core_mod }},
+    });
+    linux_pure_test_mod.linkLibrary(core_lib);
+    const linux_pure_tests = b.addTest(.{
+        .name = "zonvie-linux-pure-test",
+        .root_module = linux_pure_test_mod,
+        .filters = test_filters,
+    });
+    test_step.dependOn(&b.addRunArtifact(linux_pure_tests).step);
+
     // Platform-independent coverage for the Windows frontend's lossy,
     // non-blocking logging queue.
     const windows_app_log_test_mod = b.createModule(.{
@@ -744,11 +823,11 @@ pub fn build(b: *std.Build) !void {
     e2e_run.has_side_effects = true;
     e2e_step.dependOn(&e2e_run.step);
 
-    // GUI test driver (macOS and Windows hosts): launches the REAL zonvie
+    // GUI test driver (macOS, Windows and Linux hosts): launches the REAL zonvie
     // app against a shared `nvim --listen` server and observes OS windows
-    // (CGWindowList / EnumWindows). Real windows appear; `zig build gui-test`
+    // (CGWindowList / EnumWindows / Hyprland IPC). Real windows appear; `zig build gui-test`
     // on the respective host, locally, or on the Windows CI runner.
-    if (host_os == .macos or host_os == .windows) {
+    if (host_os == .macos or host_os == .windows or host_os == .linux) {
         const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (real windows appear)");
         const gui_mod = b.createModule(.{
             .target = target,
@@ -761,10 +840,12 @@ pub fn build(b: *std.Build) !void {
             gui_mod.linkFramework("CoreFoundation", .{});
             gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
             gui_mod.linkFramework("ApplicationServices", .{}); // AXUIElement (drag-resize emulation)
-        } else {
+        } else if (host_os == .windows) {
             gui_mod.linkSystemLibrary("user32", .{});
             gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture
         }
+        // Linux observes windows through hyprctl and captures with grim:
+        // nothing to link.
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
             .filters = test_filters,

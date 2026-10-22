@@ -29,7 +29,11 @@ const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_extwin_float_follows_anchor.log";
-const trace_side = if (builtin.os.tag == .windows) "side=windows" else "side=macos";
+const trace_side = switch (builtin.os.tag) {
+    .windows => "side=windows",
+    .linux => "side=linux",
+    else => "side=macos",
+};
 
 /// The last layer count `side` published for `surface` since `since_ms`.
 fn lastLayerCount(

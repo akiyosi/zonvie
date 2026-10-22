@@ -3627,6 +3627,7 @@ pub export fn zonvie_core_update_layout_px_locked(
 pub const zonvie_shader_target = enum(c_int) {
     msl = 0, // Metal Shading Language
     hlsl = 1, // HLSL (shader model 5.0)
+    glsl = 2, // GLSL 330 core (OpenGL 3.3)
     _,
 };
 
@@ -3914,6 +3915,7 @@ pub export fn zonvie_shader_compile_glsl(
     const t: shader_compiler.Target = switch (target) {
         .msl => .msl,
         .hlsl => .hlsl,
+        .glsl => .glsl,
         _ => return buildShaderError("unknown shader target"),
     };
     const compiled = shader_compiler.compileGlslToTarget(gpa, src, t) catch |err| {
