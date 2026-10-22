@@ -945,6 +945,7 @@ ZONVIE_API void zonvie_core_glow_chain_plan(
 typedef enum {
     ZONVIE_SHADER_TARGET_MSL  = 0, /* Metal Shading Language (macOS) */
     ZONVIE_SHADER_TARGET_HLSL = 1, /* High-Level Shading Language (D3D11 on Windows) */
+    ZONVIE_SHADER_TARGET_GLSL = 2, /* GLSL 330 core (OpenGL 3.3 on Linux); resources bind by name */
 } zonvie_shader_target;
 
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
