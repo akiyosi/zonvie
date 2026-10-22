@@ -74,6 +74,9 @@ pub const GL_SRC_ALPHA: GLenum = 0x0302;
 pub const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const GL_ONE: GLenum = 0x0001;
 
+// Scissor
+pub const GL_SCISSOR_TEST: GLenum = 0x0C11;
+
 // Clear
 pub const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 
@@ -107,6 +110,7 @@ pub extern "c" fn glDeleteProgram(program: GLuint) void;
 pub extern "c" fn glUseProgram(program: GLuint) void;
 pub extern "c" fn glGetUniformLocation(program: GLuint, name: [*:0]const GLchar) GLint;
 pub extern "c" fn glUniform1i(location: GLint, v0: GLint) void;
+pub extern "c" fn glUniform1f(location: GLint, v0: GLfloat) void;
 pub extern "c" fn glUniform2f(location: GLint, v0: GLfloat, v1: GLfloat) void;
 
 // VAO
@@ -148,6 +152,7 @@ pub extern "c" fn glClear(mask: GLbitfield) void;
 pub extern "c" fn glEnable(cap: GLenum) void;
 pub extern "c" fn glDisable(cap: GLenum) void;
 pub extern "c" fn glBlendFunc(sfactor: GLenum, dfactor: GLenum) void;
+pub extern "c" fn glScissor(x: GLint, y: GLint, width: GLsizei, height: GLsizei) void;
 
 // Pixel store
 pub extern "c" fn glPixelStorei(pname: GLenum, param: GLint) void;

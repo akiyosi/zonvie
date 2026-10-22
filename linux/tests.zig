@@ -5,4 +5,5 @@ test {
     _ = @import("transform.zig");
     _ = @import("atlas_pixels.zig");
     _ = @import("fc.zig");
+    _ = @import("grid_ease.zig");
 }
