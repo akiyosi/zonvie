@@ -16,6 +16,10 @@ const layout_retry_ms = 8;
 const Startup = struct {
     /// Tokenized by the core (rpc_session.zig tokenizeCommand).
     nvim_cmd: [:0]const u8,
+    /// ext_* UI extensions: config.toml's `external` keys, or a CLI flag.
+    ext_cmdline: bool = false,
+    ext_popupmenu: bool = false,
+    ext_messages: bool = false,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -85,7 +89,8 @@ fn pushLayout(app: *App) void {
     const ch = app.cell_h_px;
     unlock(app);
     if (w == 0 or h == 0 or cw == 0 or ch == 0) return;
-    if (!core.zonvie_core_try_update_layout_px(cp, w, h, cw, ch, 0, 0)) {
+    const cols = callbacks.cmdlineCols(app, w, cw);
+    if (!core.zonvie_core_try_update_layout_px(cp, w, h, cw, ch, cols.screen_cols, cols.default_cols)) {
         if (!app.layout_retry_queued) {
             app.layout_retry_queued = true;
             _ = gtk.g_timeout_add(layout_retry_ms, &retryLayout, app);
@@ -129,7 +134,9 @@ fn startCore(app: *App, area: *anyopaque) void {
         } else |_| {}
     } else |_| {}
     if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
-    // ext_* stay off in M1.
+    if (startup.ext_cmdline) core.zonvie_core_set_ext_cmdline(cp, 1);
+    if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
+    if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
 
     lock(app);
     const cw = app.cell_w_px;
@@ -238,6 +245,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var nvim_path: []const u8 = if (config.neovim.path.len > 0) config.neovim.path else "nvim";
     var log_path: ?[]const u8 = null;
+    var ext_cmdline = config.cmdline.external;
+    var ext_popupmenu = config.popup.external;
+    var ext_messages = config.messages.external;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -250,6 +260,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             nvim_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "--nvim=")) {
             nvim_path = arg["--nvim=".len..];
+        } else if (std.mem.eql(u8, arg, "--extcmdline")) {
+            ext_cmdline = true;
+        } else if (std.mem.eql(u8, arg, "--extpopup")) {
+            ext_popupmenu = true;
+        } else if (std.mem.eql(u8, arg, "--extmessages")) {
+            ext_messages = true;
         } else if (std.mem.eql(u8, arg, "--log") and i + 1 < args.len) {
             i += 1;
             log_path = args[i];
@@ -266,7 +282,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var cmd: std.ArrayListUnmanaged(u8) = .empty;
     appendArg(&cmd, aa, nvim_path) catch return 1;
     for (extra.items) |a| appendArg(&cmd, aa, a) catch return 1;
-    const startup = Startup{ .nvim_cmd = aa.dupeZ(u8, cmd.items) catch return 1 };
+    const startup = Startup{
+        .nvim_cmd = aa.dupeZ(u8, cmd.items) catch return 1,
+        .ext_cmdline = ext_cmdline,
+        .ext_popupmenu = ext_popupmenu,
+        .ext_messages = ext_messages,
+    };
 
     const app = alloc.create(App) catch return 1;
     defer alloc.destroy(app);

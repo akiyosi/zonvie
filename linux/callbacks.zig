@@ -11,6 +11,7 @@ const atlas_pixels = @import("atlas_pixels.zig");
 const gtk = @import("gtk_bindings.zig");
 const applog = @import("app_log.zig");
 const input = @import("input.zig");
+const overlay_layout = @import("overlay_layout.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -21,6 +22,9 @@ pub fn makeCallbacks() core.Callbacks {
         .on_surface_layout = onSurfaceLayout,
         .on_grid_destroy = onGridDestroy,
         .on_grid_row_scroll = onGridRowScroll,
+        .on_external_window = onExternalWindow,
+        .on_external_window_close = onExternalWindowClose,
+        .on_popupmenu_show = onPopupmenuShow,
         .on_atlas_create = onAtlasCreate,
         .on_atlas_upload = onAtlasUpload,
         .on_rasterize_glyph = onRasterizeGlyph,
@@ -136,17 +140,77 @@ fn onSurfaceLayout(
     surface_rows: u32,
     surface_cols: u32,
 ) callconv(.c) void {
+    _ = surface_rows;
+    _ = surface_cols;
     const app = appFrom(ctx);
-    // ext_windows stays off in M1, so only the main surface exists. A force
-    // resend here would loop, since no surface will ever register.
-    if (surface_id != 1) {
+    // A surface this frontend never opened (an ext_windows grid before M4)
+    // is ignored: a force resend here would loop, since none will open.
+    if (surface_id != 1 and overlay_layout.kindOf(surface_id) == null) {
         if (!app.foreign_surface_logged) {
             applog.appLog("[linux] on_surface_layout: ignoring surface {d}\n", .{surface_id});
             app.foreign_surface_logged = true;
         }
         return;
     }
-    app.surface.stageLayers(app.alloc, layers[0..count], surface_rows, surface_cols) catch failFlush(app);
+    lock(app);
+    defer unlock(app);
+    app.surface.stageLayers(app.alloc, surface_id, layers[0..count]) catch failFlush(app);
+}
+
+/// Immediate (zonvie_core.h): applied now and kept if the flush is refused.
+/// A repeat for an open surface updates its size and anchor.
+fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
+    const app = appFrom(ctx);
+    const kind = overlay_layout.kindOf(grid_id) orelse {
+        applog.appLog("[linux] on_external_window: no window for grid {d}\n", .{grid_id});
+        return;
+    };
+    applog.appLog("[linux] external window open grid={d} win={d} {d}x{d} at ({d},{d})\n", .{ grid_id, win, rows, cols, start_row, start_col });
+    lock(app);
+    defer unlock(app);
+    app.surface.openSurface(app.alloc, grid_id) catch {
+        // Not recorded by the core when the flush aborts: the retry opens it.
+        failFlush(app);
+        return;
+    };
+    app.overlays[@intFromEnum(kind)] = .{ .open = true, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col };
+}
+
+fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+    const app = appFrom(ctx);
+    const kind = overlay_layout.kindOf(grid_id) orelse return;
+    applog.appLog("[linux] external window close grid={d}\n", .{grid_id});
+    {
+        lock(app);
+        defer unlock(app);
+        app.surface.closeSurface(app.alloc, grid_id);
+        app.overlays[@intFromEnum(kind)] = .{};
+    }
+    queueRender(app);
+}
+
+fn onPopupmenuShow(
+    ctx: ?*anyopaque,
+    items: ?*const anyopaque,
+    item_count: usize,
+    selected: i32,
+    row: i32,
+    col: i32,
+    grid_id: i64,
+    colors: ?*const core.PopupmenuColors,
+) callconv(.c) void {
+    _ = items;
+    _ = item_count;
+    _ = selected;
+    _ = row;
+    _ = col;
+    _ = grid_id;
+    // The core draws the items on its own grid; only the fill is ours.
+    const c = colors orelse return;
+    const app = appFrom(ctx);
+    lock(app);
+    defer unlock(app);
+    app.pmenu_bg = c.pmenu_bg;
 }
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
@@ -328,8 +392,20 @@ fn sendLayout(app: *App) void {
     const ch = app.cell_h_px;
     unlock(app);
     if (w == 0 or h == 0 or cw == 0) return;
-    // On the redraw thread the core applies this without taking grid_mu.
-    core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
+    const cols = cmdlineCols(app, w, cw);
+    // On the redraw thread the core applies this under the grid_mu it holds.
+    _ = core.zonvie_core_try_update_layout_px(app.corep, w, h, cw, ch, cols.screen_cols, cols.default_cols);
+}
+
+/// The cmdline's width budget: its overlay spans the main view, less the
+/// panel padding and the screen margin. Caller does not hold App.mu.
+pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols {
+    lock(app);
+    const scale: u32 = @intFromFloat(app.scale);
+    unlock(app);
+    const chrome: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_padding_pt));
+    const margin: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_screen_margin_pt));
+    return rules.cmdlineCols(main_w_px, main_w_px, chrome, margin, cell_w_px);
 }
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
