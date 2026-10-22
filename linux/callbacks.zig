@@ -497,6 +497,8 @@ fn updateMetrics(app: *App) void {
     app.cell_w_px = app.fonts.cell_w_px;
     app.cell_h_px = @intCast(@max(1, h));
     unlock(app);
+    // The line the GUI harness reads the cell size from, as on Windows.
+    applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ app.fonts.cell_w_px, @max(1, h) });
 }
 
 fn sendLayout(app: *App) void {

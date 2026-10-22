@@ -8,6 +8,7 @@
 #define DECO_UNDERDASHED   (1u << 4)
 // Transport-only: the vertex is in the scrollable content area, not a margin.
 #define DECO_SCROLLABLE    (1u << 7)
+#define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
 
 #ifdef VERTEX
@@ -45,6 +46,9 @@ uniform sampler2D u_atlas;
 // Layer left edge in surface px, so pattern decorations phase from the
 // layer's own edge instead of the window's.
 uniform float u_layer_origin_x_px;
+// 0 draws the grid; 1 extracts the glyphs the core marked DECO_GLOW, in their
+// own colour, for the bloom (windows/shaders/main.hlsl PSGlowExtract).
+uniform int u_mode;
 
 in vec2 v_uv;
 in vec4 v_col;
@@ -58,6 +62,17 @@ vec4 premultiply(vec4 c) {
 }
 
 void main() {
+    if (u_mode == 1) {
+        if ((v_deco & DECO_GLOW) == 0u || v_uv.x < 0.0) discard;
+        vec4 tex = texture(u_atlas, v_uv);
+        if ((v_deco & DECO_COLOR_EMOJI) != 0u) {
+            o_color = tex;
+            return;
+        }
+        float cov = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
+        o_color = vec4(v_col.rgb * cov, cov);
+        return;
+    }
     // Solid quads (backgrounds, decorations, cursor) carry uv.x < 0; for
     // decorations uv.y is the local y within the quad (0 top, 1 bottom).
     if (v_uv.x < 0.0) {

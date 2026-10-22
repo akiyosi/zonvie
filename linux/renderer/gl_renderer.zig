@@ -16,6 +16,7 @@ const GridRows = surface_store.GridRows;
 const Row = surface_store.Row;
 const overlay_layout = @import("../overlay_layout.zig");
 const rules = core.frontend_rules;
+const postfx = @import("postfx.zig");
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -37,11 +38,15 @@ pub const Target = struct {
     u_offset: i32 = -1,
     u_scroll_offset: i32 = -1,
     u_layer_origin_x: i32 = -1,
+    u_mode: i32 = -1,
     w_px: u32 = 0,
     h_px: u32 = 0,
     /// Row 0 of the framebuffer is the image's top: an FBO over a dmabuf
     /// that GTK reads top-down, unlike a GLArea's.
     flip_y: bool = false,
+    /// Framebuffer px per surface px: 0.5 while the bloom extracts into its
+    /// half-resolution texture, so scissors land on the same content.
+    px_scale: f32 = 1,
     /// One layer's rows concatenated for a single upload; capacity reused
     /// across frames. Per target, so the render thread and the GTK thread
     /// never share one.
@@ -95,6 +100,7 @@ pub fn realize(t: *Target) bool {
     t.u_offset = gl.glGetUniformLocation(prog, "u_offset");
     t.u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
     t.u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
+    t.u_mode = gl.glGetUniformLocation(prog, "u_mode");
     gl.glUseProgram(prog);
     gl.glUniform1i(gl.glGetUniformLocation(prog, "u_atlas"), 0);
 
@@ -210,7 +216,13 @@ fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Laye
 /// Clips to a rect given top-down in surface px.
 fn scissor(t: *const Target, x: i32, top: i32, w: i32, h: i32) void {
     const y = if (t.flip_y) top else @as(i32, @intCast(t.h_px)) - top - h;
-    gl.glScissor(x, y, w, @max(0, h));
+    const s = t.px_scale;
+    const f = struct {
+        fn px(v: i32, k: f32) i32 {
+            return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * k));
+        }
+    }.px;
+    gl.glScissor(f(x, s), f(y, s), f(w, s), f(@max(0, h), s));
 }
 
 /// Clips to rows [row_start, row_end) of `layer`.
@@ -273,6 +285,7 @@ fn begin(app: *App, t: *Target) bool {
     gl.glClear(gl.GL_COLOR_BUFFER_BIT);
     if (t.atlas_w == 0 or t.w_px == 0 or t.h_px == 0) return false;
     gl.glUseProgram(t.program);
+    gl.glUniform1i(t.u_mode, 0);
     gl.glBindVertexArray(t.vao);
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
     gl.glEnable(gl.GL_BLEND);
@@ -344,10 +357,47 @@ pub fn renderMain(app: *App, t: *Target) Frame {
     return .{ .moving = d.moving, .flush_seq = seq };
 }
 
+/// A surface's glow-flagged glyphs, in extract mode, into the bound
+/// framebuffer: `scale` of the surface's size, cleared first. The eases were
+/// planned by this frame's scene pass, so the glyphs sit where it drew them.
+/// Takes App.mu.
+pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void {
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    const w: i32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(t.w_px)) * scale)));
+    const h: i32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(t.h_px)) * scale)));
+    gl.glViewport(0, 0, w, h);
+    gl.glClearColor(0, 0, 0, 0);
+    gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+    gl.glUseProgram(t.program);
+    gl.glUniform1i(t.u_mode, 1);
+    gl.glBindVertexArray(t.vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
+    gl.glActiveTexture(gl.GL_TEXTURE0);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    gl.glEnable(gl.GL_BLEND);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+    t.px_scale = scale;
+    defer t.px_scale = 1;
+    for (app.surface.committedSurfaceLayers(surface_id)) |layer| {
+        const grid = app.surface.committedGrid(layer.grid_id) orelse continue;
+        const ease = app.surface.gridEase(layer.grid_id).?;
+        _ = drawLayer(app, t, layer, grid, ease.region(), ease.offset_px);
+    }
+    gl.glUniform1i(t.u_mode, 0);
+}
+
 /// The main GLArea's render signal.
 pub fn render(app: *App) void {
     app.gl.w_px = app.drawable_w_px;
     app.gl.h_px = app.drawable_h_px;
+    if (postfx.active(app)) {
+        const f = postfx.renderFrame(app, &app.gl, &app.postfx, 1);
+        app.presented_seq = f.flush_seq;
+        if (f.moving or app.postfx.animating) startEaseTick(app);
+        if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
+        return;
+    }
     const f = renderMain(app, &app.gl);
     app.presented_seq = f.flush_seq;
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
@@ -355,16 +405,27 @@ pub fn render(app: *App) void {
 }
 
 /// An external window: the surface rooted at `surface_id`.
-pub fn renderExternal(app: *App, t: *Target, surface_id: i64) void {
-    if (t.program == 0) return;
+/// An external surface into `t`, with no overlays. Takes App.mu.
+pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
+    if (t.program == 0) return .{};
     const t0 = clock.nowNs();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
 
     syncAtlas(app, t);
-    if (!begin(app, t)) return;
+    const seq = app.flush_seq;
+    if (!begin(app, t)) return .{ .flush_seq = seq };
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
-    if (d.moving) startEaseTick(app);
+    return .{ .moving = d.moving, .flush_seq = seq };
+}
+
+/// An external window's render signal: the surface rooted at `surface_id`.
+pub fn renderExternal(app: *App, t: *Target, p: *postfx.PostFx, surface_id: i64) void {
+    const f = if (postfx.active(app))
+        postfx.renderFrame(app, t, p, surface_id)
+    else
+        renderExternalScene(app, t, surface_id);
+    if (f.moving or p.animating) startEaseTick(app);
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{surface_id});
 }
 
@@ -462,7 +523,8 @@ fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) 
     app.queueRenderAll();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
-    var moving = false;
+    // An animated custom shader keeps frames coming as an ease does.
+    var moving = app.postfx.animating;
     var it = app.surface.grids.valueIterator();
     while (it.next()) |g| {
         if (g.*.ease.moving()) moving = true;

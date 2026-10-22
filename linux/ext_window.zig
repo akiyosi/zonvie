@@ -10,6 +10,7 @@ const clock = core.clock;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
+const postfx = @import("renderer/postfx.zig");
 const input = @import("input.zig");
 const applog = @import("app_log.zig");
 
@@ -26,6 +27,8 @@ pub const ExtWindow = struct {
     window: ?*anyopaque = null,
     area: ?*anyopaque = null,
     gl: gl_renderer.Target = .{},
+    /// Its own bloom and shader chain: GL objects belong to one context.
+    postfx: postfx.PostFx = .{},
     pointer: input.Pointer,
     /// The grid's size as the core last opened or updated it.
     rows: u32,
@@ -148,14 +151,16 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
 fn onUnrealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     gtk.gtk_gl_area_make_current(widget.?);
-    gl_renderer.unrealize(&extFrom(data).gl);
+    const w = extFrom(data);
+    postfx.unrealize(&w.postfx);
+    gl_renderer.unrealize(&w.gl);
 }
 
 fn onRender(area: ?*anyopaque, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
     _ = area;
     _ = context;
     const w = extFrom(data);
-    gl_renderer.renderExternal(w.app, &w.gl, w.grid_id);
+    gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id);
     return 1;
 }
 
