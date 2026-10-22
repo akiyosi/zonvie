@@ -5270,30 +5270,42 @@ pub const Core = struct {
         self.float_config_outbox.clearRetainingCapacity();
     }
 
-    /// Move the windows the batch queued into the outbox, skipping a window
-    /// with no font state asked less than 1 s ago unless the helper forced it.
-    /// Caller holds grid_mu.
+    /// Move up to one reply's worth of queued windows into the outbox,
+    /// dropping a window with no font state asked less than 1 s ago unless
+    /// the helper forced it. While a query is in flight, and past the cap,
+    /// windows stay queued (forced flag included) for the take after the
+    /// reply. Caller holds grid_mu.
     pub fn takeFontQueriesLocked(self: *Core, now_ns: i128) void {
         self.font_query_outbox.clearRetainingCapacity();
-        for (self.grid.font_query_wanted.items) |win_id| {
-            const forced = for (self.font_query_forced.items) |f| {
-                if (f == win_id) break true;
-            } else false;
+        if (self.font_query_msgid != 0) return;
+        const wanted = &self.grid.font_query_wanted;
+        var kept: usize = 0;
+        for (wanted.items) |win_id| {
+            if (self.font_query_outbox.items.len == rpc_session.max_font_answers) {
+                wanted.items[kept] = win_id;
+                kept += 1;
+                continue;
+            }
+            const forced_idx = std.mem.indexOfScalar(i64, self.font_query_forced.items, win_id);
+            if (forced_idx) |i| _ = self.font_query_forced.swapRemove(i);
             const has_font = blk: {
                 var it = self.grid.grid_fonts.valueIterator();
                 while (it.next()) |gf| if (gf.win_id == win_id) break :blk true;
                 break :blk false;
             };
-            if (!forced and !has_font) {
+            if (forced_idx == null and !has_font) {
                 if (self.font_query_last_ns.get(win_id)) |last| {
                     if (now_ns - last < std.time.ns_per_s) continue;
                 }
             }
-            self.font_query_last_ns.put(self.alloc, win_id, now_ns) catch {};
             self.font_query_outbox.append(self.alloc, win_id) catch {};
         }
-        self.grid.font_query_wanted.clearRetainingCapacity();
-        self.font_query_forced.clearRetainingCapacity();
+        wanted.shrinkRetainingCapacity(kept);
+    }
+
+    /// Start the throttle clock for the windows just sent.
+    pub fn noteFontQueriesSent(self: *Core, now_ns: i128) void {
+        for (self.font_query_outbox.items) |w| self.font_query_last_ns.put(self.alloc, w, now_ns) catch {};
     }
 
     const font_query_lua =
@@ -5310,17 +5322,10 @@ pub const Core = struct {
         \\return out
     ;
 
-    /// One tracked nvim_exec_lua for the outbox. While a query is in flight
-    /// the outbox goes back to the wanted list for the next batch.
+    /// One tracked nvim_exec_lua for the outbox; takeFontQueriesLocked leaves
+    /// it empty while another query is in flight.
     pub fn sendFontQueries(self: *Core) void {
         if (self.font_query_outbox.items.len == 0) return;
-        if (self.font_query_msgid != 0) {
-            self.grid_mu.lockUncancelable(clock.io());
-            for (self.font_query_outbox.items) |w| self.grid.wantFontQuery(w);
-            self.grid_mu.unlock(clock.io());
-            self.font_query_outbox.clearRetainingCapacity();
-            return;
-        }
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
@@ -5334,7 +5339,10 @@ pub const Core = struct {
             self.sendRaw(buf.items) catch break :blk false;
             break :blk true;
         };
-        if (ok) self.font_query_msgid = id;
+        if (ok) {
+            self.font_query_msgid = id;
+            self.noteFontQueriesSent(clock.nowNs());
+        }
         self.font_query_outbox.clearRetainingCapacity();
     }
 

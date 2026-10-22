@@ -703,11 +703,17 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         self.font_query_msgid = 0;
         // An error keeps the current state; the next trigger asks again.
         if (has_err) return;
-        var answers: [64]WindowFontAnswer = undefined;
+        var answers: [max_font_answers]WindowFontAnswer = undefined;
         const n = parseWindowFontAnswers(top[3], &answers);
         self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-        for (answers[0..n]) |a| self.applyWindowFontLocked(a);
+        for (answers[0..n]) |a| {
+            if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
+            self.applyWindowFontLocked(a);
+        }
+        // Windows queued while this query was in flight go out now.
+        self.takeFontQueriesLocked(clock.nowNs());
+        self.grid_mu.unlock(clock.io());
+        self.sendFontQueries();
         return;
     }
 
@@ -721,6 +727,9 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         applyGlowConfig(self, top[3]);
     }
 }
+
+/// Windows per font query; the reply is parsed into a stack array this size.
+pub const max_font_answers = 64;
 
 pub const WindowFontAnswer = struct {
     win: i64,
@@ -4255,6 +4264,7 @@ test "an unset window is re-queried at most once a second unless forced" {
     core.grid.wantFontQuery(1000);
     core.takeFontQueriesLocked(10 * std.time.ns_per_s);
     try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+    core.noteFontQueriesSent(10 * std.time.ns_per_s);
     core.font_query_outbox.clearRetainingCapacity();
     core.grid.wantFontQuery(1000);
     core.takeFontQueriesLocked(10 * std.time.ns_per_s + 500 * std.time.ns_per_ms);
@@ -4263,4 +4273,53 @@ test "an unset window is re-queried at most once a second unless forced" {
     try core.font_query_forced.append(core.alloc, 1000);
     core.takeFontQueriesLocked(10 * std.time.ns_per_s + 600 * std.time.ns_per_ms);
     try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "a window taken but never sent is not throttled" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    core.font_query_outbox.clearRetainingCapacity();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "a window queued while a query is in flight waits for the reply and keeps its forced flag" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 5;
+    try core.font_query_last_ns.put(core.alloc, 1000, 10 * std.time.ns_per_s);
+    core.grid.wantFontQuery(1000);
+    try core.font_query_forced.append(core.alloc, 1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_outbox.items.len);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.grid.font_query_wanted.items);
+    core.font_query_msgid = 0;
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "one font query carries at most the answers one reply can hold; the rest wait" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var w: i64 = 1000;
+    while (w < 1070) : (w += 1) core.grid.wantFontQuery(w);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, max_font_answers), core.font_query_outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 70 - max_font_answers), core.grid.font_query_wanted.items.len);
+    try std.testing.expectEqual(@as(i64, 1000 + max_font_answers), core.grid.font_query_wanted.items[0]);
+}
+
+test "a font answer for a closed window forgets its throttle stamp" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 9;
+    try core.font_query_last_ns.put(core.alloc, 1001, 5);
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = false } };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expect(!core.font_query_last_ns.contains(1001));
 }
