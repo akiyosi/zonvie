@@ -2335,7 +2335,7 @@ pub fn generateRowVertices(
             try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), run_grid_id, run_deco);
             c = end;
         }
-        if (p.margin_right_px > 0 or p.margin_bottom_px > 0) {
+        if (!p.skip_default_bg and (p.margin_right_px > 0 or p.margin_bottom_px > 0)) {
             const bg_alpha: f32 = if (p.blur_enabled) 0.5 else p.background_opacity;
             const gid = if (cols > 0) rc.grid_ids.items[0] else 0;
             const x_end: f32 = @as(f32, @floatFromInt(cols)) * cellW;
@@ -19753,6 +19753,25 @@ test "frame margins are painted with the default background right of and below t
     }
     try std.testing.expectEqual(Box{ .x0 = 14, .y0 = 12, .x1 = 17, .y1 = 24 }, boxes[1]);
     try std.testing.expectEqual(Box{ .x0 = 0, .y0 = 24, .x1 = 17, .y1 = 28 }, boxes[2]);
+
+    // A root that skips its default background skips its margins too.
+    out.clearRetainingCapacity();
+    const skipped = try generateRowVertices(&core, .{
+        .row = 1,
+        .cols = 2,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = true,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .skip_default_bg = true,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+    try std.testing.expectEqual(@as(usize, 0), skipped.pass_ends[0]);
 }
 
 test "a non-zero font never reads or writes the ASCII direct cache" {
