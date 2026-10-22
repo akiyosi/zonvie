@@ -654,7 +654,8 @@ fn drawNormalExternalSurfaceRowMode(
     restored_scrollbar_rect: ?c.RECT,
 ) !ExternalPresentFacts {
     const log_enabled = applog.isEnabled();
-    const fallback_row_h = row_h_px_snapshot;
+    // A root grid in its own font is laid out in that font's rows.
+    const fallback_row_h: u32 = if (tbs_snap.layers.root()) |l| @intCast(l.rowHeightPx(@intCast(row_h_px_snapshot))) else row_h_px_snapshot;
     const row_h_px: i32 = @intCast(fallback_row_h);
     // Reserve the scrollbar strip in "always" mode, as the main window's paint
     // does. An external window shows a permanently visible scrollbar in that
@@ -877,7 +878,7 @@ fn drawNormalExternalSurfaceRowMode(
         0,
         content_right,
         cursor_layer_y_px,
-        row_h_px,
+        app_mod.layerCellPx(tbs_snap.layers.slice(), tbs_snap.cursor_layer_grid_id, 0, row_h_px)[1],
         @intCast(g.width),
         @intCast(g.height),
     );
@@ -1296,13 +1297,18 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const is_msg_show = req.grid_id == app_mod.MESSAGE_GRID_ID;
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
+    var cell_w = app.cell_w_px;
+    var cell_h = app.rowHeightPx();
 
     var current_hwnd: ?c.HWND = null;
     const surface_dpi_scale: f32 = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
+        // A grid in its own font is framed in that font's cells.
+        if (app.gridCellPx(req.grid_id)) |gf| {
+            cell_w = gf.cell_w_px;
+            cell_h = gf.cell_h_px;
+        }
         const w = app.external_windows.get(req.grid_id) orelse break :blk app.dpi_scale;
         current_hwnd = w.hwnd;
         break :blk w.dpi_scale;
@@ -2481,8 +2487,10 @@ pub export fn ExternalWndProc(
                     surface_dpi_scale = hit.win.dpi_scale;
                 }
 
-                const cell_w = app.cell_w_px;
-                const cell_h = app.rowHeightPx();
+                // A grid in its own font counts its rows and columns in that font.
+                const gf = if (grid_id) |gid| app.gridCellPx(gid) else null;
+                const cell_w = if (gf) |f| f.cell_w_px else app.cell_w_px;
+                const cell_h = if (gf) |f| f.cell_h_px else app.rowHeightPx();
                 const corep = app.corep;
                 // Same reservation the paint applies, and the same one the main
                 // window's grid-size derivation has always applied: in "always"
@@ -3161,6 +3169,8 @@ pub const ShaderCursorForward = struct {
     /// A cursor on a grid this surface draws as a LAYER is in that layer's
     /// pixels, and the layer sits at its own origin inside the surface.
     layer_origin: [2]i32,
+    /// The cursor grid's own cell when it has a font; 0 = the surface's.
+    cell_px: [2]u32 = .{ 0, 0 },
 };
 
 /// Put this external renderer's custom shaders in the main window's shader
@@ -3226,6 +3236,7 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
                 )) |cb| {
                     const rect: [4]f32 = .{ cb.left, cb.bottom, cb.width(), cb.height() };
                     main_r2.setCursorShaderState(rect, cur.verts[0].color);
+                    main_r2.shader_cursor_cell_px = cur.cell_px;
                     g_sh.shader_cursor_forwarded = rect;
                 }
             }
@@ -3241,6 +3252,7 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
             g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+            g_sh.shader_cursor_cell_px = main_r3.shader_cursor_cell_px;
         }
         // iCellSize, which also sizes this window's cell-age grid; the core
         // stamps it under this window's grid id.
@@ -3374,6 +3386,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             tbs_snapshot.cursor_layer_grid_id,
             grid_id,
         ),
+        .cell_px = blk: {
+            const cell = app_mod.layerCellPx(tbs_snapshot.layers.slice(), tbs_snapshot.cursor_layer_grid_id, 0, 0);
+            break :blk .{ @intCast(cell[0]), @intCast(cell[1]) };
+        },
     });
 
     // Determine rendering mode from TBS committed set.

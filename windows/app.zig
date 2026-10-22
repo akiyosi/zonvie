@@ -497,7 +497,124 @@ pub const SurfaceLayer = struct {
     /// it -- Neovim refuses an event addressed to such a window rather than
     /// passing it to what is behind.
     mouse_enabled: bool = true,
+    /// A grid drawn in its own font (on_grid_font), stamped at commit
+    /// (App.commitGridFonts): its cell and the pixel box the core clips it
+    /// to, margin included. 0 = the surface's cell.
+    font_cell_w_px: u32 = 0,
+    font_cell_h_px: u32 = 0,
+    font_extent_w_px: u32 = 0,
+    font_extent_h_px: u32 = 0,
+
+    pub fn rowHeightPx(self: SurfaceLayer, surface_row_h_px: i32) i32 {
+        return if (self.font_cell_h_px > 0) @intCast(self.font_cell_h_px) else surface_row_h_px;
+    }
+
+    pub fn widthPx(self: SurfaceLayer, surface_cell_w_px: i32) i32 {
+        return if (self.font_extent_w_px > 0) @intCast(self.font_extent_w_px) else @as(i32, @intCast(self.cols)) * surface_cell_w_px;
+    }
+
+    /// Rows [start, end) as a layer-local pixel band [top, bottom). A grid in
+    /// its own font is clipped to its extent, and its last row reaches the
+    /// extent's bottom: the core draws the bottom margin with that row.
+    pub fn rowsBandPx(self: SurfaceLayer, start: u32, end: u32, surface_row_h_px: i32) [2]i32 {
+        const h = self.rowHeightPx(surface_row_h_px);
+        var top: i32 = @as(i32, @intCast(start)) * h;
+        var bottom: i32 = @as(i32, @intCast(end)) * h;
+        if (self.font_extent_h_px > 0) {
+            const ext: i32 = @intCast(self.font_extent_h_px);
+            if (end >= self.rows) bottom = ext;
+            top = @min(top, ext);
+            bottom = @min(bottom, ext);
+        }
+        return .{ top, bottom };
+    }
+
+    /// The rows a surface band [band_top, band_bottom) reaches in a layer at
+    /// `origin_y_px` holding `row_count` rows, inclusive. A band that meets
+    /// only a font grid's bottom margin reaches its last row.
+    pub fn rowsForBand(self: SurfaceLayer, band: core.damage_bands.Band, origin_y_px: i32, row_count: u32, surface_row_h_px: i32) ?[2]u32 {
+        const h = self.rowHeightPx(surface_row_h_px);
+        var r = core.damage_bands.layerRowsForBand(band, origin_y_px, row_count, h);
+        if (self.font_extent_h_px == 0 or row_count == 0 or row_count < self.rows) return r;
+        const margin_top = origin_y_px + @as(i32, @intCast(row_count)) * h;
+        const margin_bottom = origin_y_px + self.rowsBandPx(0, row_count, surface_row_h_px)[1];
+        if (margin_bottom <= margin_top or band.top_px >= margin_bottom or band.bottom_px <= margin_top) return r;
+        const last = row_count - 1;
+        r = if (r) |x| .{ @min(x[0], last), last } else .{ last, last };
+        return r;
+    }
 };
+
+/// A grid's own font as on_grid_font reports it, published at commit.
+pub const GridFontPx = struct {
+    font_id: u32,
+    cell_w_px: u32,
+    cell_h_px: u32,
+    extent_w_px: u32,
+    extent_h_px: u32,
+};
+
+pub const GridFonts = std.AutoHashMapUnmanaged(i64, GridFontPx);
+
+fn gridFontIn(fonts: *const GridFonts, grid_id: i64) ?GridFontPx {
+    if (fonts.count() == 0) return null;
+    return fonts.get(grid_id);
+}
+
+/// Stamp `fonts` into the layer list `tbs` is about to commit. `changed`: the
+/// table moved, so a surface whose committed layers no longer match it
+/// re-stages them; otherwise only a list this flush staged is stamped.
+fn stampLayerFonts(alloc: std.mem.Allocator, budget: *core.render_layout.Budget, fonts: *const GridFonts, tbs: *TripleBufferedSurface, changed: bool) void {
+    if (tbs.flush_layers == null) {
+        if (!changed) return;
+        const committed = tbs.committed_layers.slice();
+        const stale = for (committed) |l| {
+            if (!layerFontMatches(l, gridFontIn(fonts, l.grid_id))) break true;
+        } else false;
+        if (!stale) return;
+        var copy = tbs.prepareLayers(alloc, budget, committed.len) catch {
+            // The grid's rows go out in the new font on the old geometry
+            // until the next layout or font change restages.
+            if (applog.isEnabled()) applog.appLog("[font_slot] layer restage failed\n", .{});
+            return;
+        };
+        @memcpy(copy.items[0..committed.len], committed);
+        tbs.stageLayers(copy);
+    }
+    const staged = &tbs.flush_layers.?;
+    for (staged.items[0..staged.len]) |*l| setLayerFont(l, gridFontIn(fonts, l.grid_id));
+}
+
+fn layerFontMatches(l: SurfaceLayer, gf: ?GridFontPx) bool {
+    var probe = l;
+    setLayerFont(&probe, gf);
+    return probe.font_cell_w_px == l.font_cell_w_px and probe.font_cell_h_px == l.font_cell_h_px and
+        probe.font_extent_w_px == l.font_extent_w_px and probe.font_extent_h_px == l.font_extent_h_px;
+}
+
+fn setLayerFont(l: *SurfaceLayer, gf: ?GridFontPx) void {
+    const f = gf orelse GridFontPx{ .font_id = 0, .cell_w_px = 0, .cell_h_px = 0, .extent_w_px = 0, .extent_h_px = 0 };
+    l.font_cell_w_px = f.cell_w_px;
+    l.font_cell_h_px = f.cell_h_px;
+    l.font_extent_w_px = f.extent_w_px;
+    l.font_extent_h_px = f.extent_h_px;
+}
+
+/// The row height and cell width of `grid_id`'s layer, or the surface's when
+/// it has no font or is not placed. For the cursor, whose rows are its grid's.
+pub fn layerCellPx(layers: []const SurfaceLayer, grid_id: i64, surface_cell_w_px: i32, surface_row_h_px: i32) [2]i32 {
+    for (layers) |l| {
+        if (l.grid_id != grid_id) continue;
+        return .{ if (l.font_cell_w_px > 0) @intCast(l.font_cell_w_px) else surface_cell_w_px, l.rowHeightPx(surface_row_h_px) };
+    }
+    return .{ surface_cell_w_px, surface_row_h_px };
+}
+
+/// A row height: the cell plus 'linespace', floored at 1 (see rowHeightPx).
+pub fn rowHeightWithLinespacePx(cell_h_px: u32, linespace_px: i32) u32 {
+    const total: i32 = @as(i32, @intCast(cell_h_px)) + linespace_px;
+    return if (total < 1) 1 else @intCast(total);
+}
 
 /// Immutable while retained by a paint; capacity is reused after retirement.
 pub const SurfaceLayers = core.render_layout.List(SurfaceLayer);
@@ -1607,7 +1724,9 @@ pub const TripleBufferedSurface = struct {
                 if (prev.grid_id != layer.grid_id) continue;
                 break prev.x_px == layer.x_px and prev.y_px == layer.y_px and
                     prev.rows == layer.rows and prev.cols == layer.cols and
-                    prev.z == layer.z and prev.follows_scroll == layer.follows_scroll;
+                    prev.z == layer.z and prev.follows_scroll == layer.follows_scroll and
+                    prev.font_cell_w_px == layer.font_cell_w_px and prev.font_cell_h_px == layer.font_cell_h_px and
+                    prev.font_extent_w_px == layer.font_extent_w_px and prev.font_extent_h_px == layer.font_extent_h_px;
             } else false;
             if (unchanged) continue;
             const p = self.pending_layer_damage.getOrAdd(alloc, layer.grid_id, layer.rows) orelse {
@@ -4052,7 +4171,7 @@ pub fn planLayerFrame(
         state.ease.easing = false;
         if (p.ease) |ein| {
             const whole = if (state.draw_scroll) |s| s.total_rows == layer.rows and s.total_cols == layer.cols else false;
-            state.ease.plan(layer.grid_id, state.draw_scroll, whole, state.row_vbs.items, row_limit, ein, h);
+            state.ease.plan(layer.grid_id, state.draw_scroll, whole, state.row_vbs.items, row_limit, ein, layer.rowHeightPx(h));
         }
         // An eased frame moves every row of the layer, which no copy of the
         // previous frame's pixels can serve.
@@ -4066,6 +4185,11 @@ pub fn planLayerFrame(
     //    runs once the cheaper ones passed, and an accepted copy is always the
     //    lowest in the stack, so the marking below it stays one-directional.
     const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
+    // A grid in its own font is off the row lattice the copy and its
+    // over-blit rules assume, as a layer above a copy or as the one scrolled.
+    const any_font_layer = for (layers[1..n]) |l| {
+        if (l.font_cell_h_px > 0) break true;
+    } else false;
     for (layers[1..n], 1..) |layer, li| {
         const state = paint.layerState(layer.grid_id) orelse continue;
         const scroll = state.draw_scroll orelse continue;
@@ -4081,6 +4205,7 @@ pub fn planLayerFrame(
             if (layer.rows == 0 or layer.cols == 0) break :ladder "layout";
             if (scroll.total_rows != layer.rows or scroll.total_cols != layer.cols)
                 break :ladder "size";
+            if (any_font_layer) break :ladder "font";
             const made = core.row_scroll.make(
                 scroll.row_start,
                 scroll.row_end,
@@ -4132,7 +4257,7 @@ pub fn planLayerFrame(
         };
 
         if (refusal) |reason| {
-            refuseLayerBlit(state, layer.grid_id, scroll, origin_y, tex_h, h, reason, p.log_enabled);
+            refuseLayerBlit(state, layer.grid_id, scroll, origin_y, tex_h, layer.rowHeightPx(h), reason, p.log_enabled);
             continue;
         }
 
@@ -4197,21 +4322,22 @@ pub fn planLayerFrame(
         const row_limit = src.rows(layer).len;
         if (row_limit == 0) continue;
         if (state.draw_all) {
-            try spans.append(src.alloc, .{ .top_px = layer.y_px, .bottom_px = layer.y_px + @as(i32, @intCast(row_limit)) * h });
+            const b = layer.rowsBandPx(0, @intCast(row_limit), h);
+            try spans.append(src.alloc, .{ .top_px = layer.y_px + b[0], .bottom_px = layer.y_px + b[1] });
             continue;
         }
         var it = state.draw_rows.iterator(.{});
         while (it.next()) |ri| {
             if (ri >= row_limit) break;
-            const top = layer.y_px + @as(i32, @intCast(ri)) * h;
-            try spans.append(src.alloc, .{ .top_px = top, .bottom_px = top + h });
+            const b = layer.rowsBandPx(@intCast(ri), @intCast(ri + 1), h);
+            try spans.append(src.alloc, .{ .top_px = layer.y_px + b[0], .bottom_px = layer.y_px + b[1] });
         }
         if (layer.grid_id == p.cursor_grid) {
             for (p.cursor_erase_rows) |maybe_row| {
                 const r = maybe_row orelse continue;
                 if (r >= row_limit) continue;
-                const top = layer.y_px + @as(i32, @intCast(r)) * h;
-                try spans.append(src.alloc, .{ .top_px = top, .bottom_px = top + h });
+                const b = layer.rowsBandPx(r, r + 1, h);
+                try spans.append(src.alloc, .{ .top_px = layer.y_px + b[0], .bottom_px = layer.y_px + b[1] });
             }
         }
     }
@@ -4223,7 +4349,7 @@ pub fn planLayerFrame(
         for (layers[1..n]) |layer| {
             const state = paint.layerState(layer.grid_id) orelse continue;
             if (state.draw_all) continue;
-            const rows = core.damage_bands.layerRowsForBand(band, layer.y_px, @intCast(src.rows(layer).len), h) orelse continue;
+            const rows = layer.rowsForBand(band, layer.y_px, @intCast(src.rows(layer).len), h) orelse continue;
             markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
         }
         const root_rows = core.damage_bands.layerRowsForBand(band, root.y_px, p.root_rows, h) orelse continue;
@@ -4353,12 +4479,13 @@ const LayerRowDrawCtx = struct {
 /// The surface rectangle of rows [row_start, row_end) of a layer, clipped to
 /// the content area. Null when nothing of it is visible.
 fn layerRowsScissor(d: LayerRowDrawCtx, row_start: u32, row_end: u32) ?c.D3D11_RECT {
-    const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(row_start)) * d.row_h_px;
+    // d.row_h_px is already the layer's own row height.
+    const band = d.layer.rowsBandPx(row_start, row_end, d.row_h_px);
     const sc: c.D3D11_RECT = .{
         .left = @max(d.x_offset, d.x_offset + d.layer.x_px),
-        .top = top,
+        .top = d.y_offset + d.layer.y_px + band[0],
         .right = @min(d.content_right, d.x_offset + d.layer.x_px + d.layer_w_px),
-        .bottom = top + @as(i32, @intCast(row_end - row_start)) * d.row_h_px,
+        .bottom = d.y_offset + d.layer.y_px + band[1],
     };
     if (sc.right <= sc.left or sc.bottom <= sc.top) return null;
     return sc;
@@ -4444,14 +4571,14 @@ pub fn drawSurfaceLayers(
 
         const d = LayerRowDrawCtx{
             .layer = layer,
-            .layer_w_px = @as(i32, @intCast(layer.cols)) * cell_w_px,
+            .layer_w_px = layer.widthPx(cell_w_px),
             .origin_x = @floatFromInt(layer.x_px),
             .origin_y = @floatFromInt(layer.y_px),
             .base_vp = base_vp,
             .x_offset = x_offset,
             .y_offset = y_offset,
             .content_right = content_right,
-            .row_h_px = row_h_px,
+            .row_h_px = layer.rowHeightPx(row_h_px),
             .ctx_ptr = ctx_ptr,
             .rs_set_sc_fn = rs_set_sc_fn,
         };
@@ -4929,7 +5056,7 @@ fn drawBloomRowBuffers(
                         const rvb = state.row_vbs.items[ri];
                         if (rvb.uploaded_slot != mapping.slot or rvb.uploaded_ver != slot.ver) continue;
                         const vb = rvb.vb orelse continue;
-                        const row_dy = slotRowShiftPx(slot, ri, ctx.row_h_px);
+                        const row_dy = slotRowShiftPx(slot, ri, layer.rowHeightPx(ctx.row_h_px));
                         // Glow follows the text through a smooth scroll.
                         const ease_px: f32 = if (state.ease.easing) state.ease.offset_px else 0;
                         g.setLayerTransformScrolled(origin_x, origin_y + row_dy, extent_w_px, extent_h_px, ease_px) catch return false;
@@ -5180,6 +5307,8 @@ pub fn drawSurfaceRowFrame(
     var cursor_layer_row: ?LayerCursorRow = null;
     var cursor_layer_w_px: ?i32 = null;
     var cursor_ease: ?CursorEase = null;
+    // The cursor's rows are its own grid's, in that grid's font.
+    var cursor_row_h_px = row_h_px;
     if (cursor_on_root) {
         if (in.draw_params.root_ease) |ease| {
             const r = ease.region(in.row_map.len);
@@ -5193,7 +5322,8 @@ pub fn drawSurfaceRowFrame(
     } else {
         for (in.layers) |layer| {
             if (layer.grid_id != in.cursor_grid) continue;
-            cursor_layer_w_px = @as(i32, @intCast(layer.cols)) * cell_w_px;
+            cursor_layer_w_px = layer.widthPx(cell_w_px);
+            cursor_row_h_px = layer.rowHeightPx(row_h_px);
             const src = in.layer_src orelse break;
             const state = src.paint.layerState(layer.grid_id) orelse break;
             const region_start, const region_end = state.ease.region(src.rows(layer).len);
@@ -5207,7 +5337,7 @@ pub fn drawSurfaceRowFrame(
                     .x_offset = in.draw_params.x_offset,
                     .y_offset = in.draw_params.y_offset,
                     .content_right = in.draw_params.content_right,
-                    .row_h_px = row_h_px,
+                    .row_h_px = cursor_row_h_px,
                     .ctx_ptr = null,
                     .rs_set_sc_fn = null,
                 };
@@ -5238,7 +5368,7 @@ pub fn drawSurfaceRowFrame(
         .content_right = in.draw_params.content_right,
         .content_width = rowModeViewportWidth(g, in.draw_params),
         .content_height = in.draw_params.content_height,
-        .row_h_px = row_h_px,
+        .row_h_px = cursor_row_h_px,
         .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
         .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
         .cursor_layer_w_px = cursor_layer_w_px,
@@ -5397,9 +5527,11 @@ pub fn drawSurfaceRowPass(
             if (has_layers and p.row_h_px > 0 and in.snapshot.scroll_dy_px != 0) {
                 const shift_rows: u32 = @intCast(@abs(@divTrunc(in.snapshot.scroll_dy_px, p.row_h_px)));
                 for (layers[1..]) |layer| {
+                    // In root rows: a grid in its own font covers its extent.
+                    const covered_px = layer.rowsBandPx(0, layer.rows, p.row_h_px)[1];
                     const span = render_pipeline_helpers.rootRowsLayerScrollReached(
                         layer.y_px,
-                        layer.rows,
+                        @intCast(@divFloor(covered_px + p.row_h_px - 1, p.row_h_px)),
                         shift_rows,
                         p.row_h_px,
                         in.total_rows,
@@ -5902,6 +6034,12 @@ pub const App = struct {
     // cell metrics used for layout->core_update_layout_px
     cell_w_px: u32 = 9,
     cell_h_px: u32 = 18,
+    /// Per-grid fonts, guarded by `mu`: staged by on_grid_font, published
+    /// with the next committed flush (commitGridFonts). Empty unless a window
+    /// sets a per-grid font.
+    grid_fonts_staged: std.AutoHashMapUnmanaged(i64, GridFontPx) = .empty,
+    grid_fonts: std.AutoHashMapUnmanaged(i64, GridFontPx) = .empty,
+    grid_fonts_dirty: bool = false,
 
     // Timestamp of last WM_SIZE (ns since epoch).
     last_resize_ns: i128 = 0,
@@ -6136,8 +6274,34 @@ pub const App = struct {
     /// too much room between lines, so the sum is taken signed and floored —
     /// the layout divides the client area by this to get its row count.
     pub fn rowHeightPx(self: *const App) u32 {
-        const total: i32 = @as(i32, @intCast(self.cell_h_px)) + self.linespace_px;
-        return if (total < 1) 1 else @intCast(total);
+        return rowHeightWithLinespacePx(self.cell_h_px, self.linespace_px);
+    }
+
+    /// The published per-grid font of `grid_id`, or null on the global font.
+    /// Caller holds `mu`.
+    pub fn gridCellPx(self: *const App, grid_id: i64) ?GridFontPx {
+        return gridFontIn(&self.grid_fonts, grid_id);
+    }
+
+    /// Publish the per-grid fonts staged since the last commit, and stamp the
+    /// published table into every layer list this commit promotes, so a paint
+    /// pins a grid's rows and its geometry from one commit. Core thread,
+    /// `mu` held, before the surfaces' commitFlush.
+    pub fn commitGridFonts(self: *App) void {
+        if (self.grid_fonts_dirty) publish: {
+            self.grid_fonts.ensureTotalCapacity(self.alloc, self.grid_fonts_staged.count()) catch break :publish;
+            self.grid_fonts.clearRetainingCapacity();
+            var it = self.grid_fonts_staged.iterator();
+            while (it.next()) |e| self.grid_fonts.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
+            self.grid_fonts_dirty = false;
+            stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, true);
+            var ext_it = self.external_windows.valueIterator();
+            while (ext_it.next()) |ext| stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, true);
+            return;
+        }
+        stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &self.surf.tbs, false);
+        var ext_it = self.external_windows.valueIterator();
+        while (ext_it.next()) |ext| stampLayerFonts(self.alloc, &self.layout_budget, &self.grid_fonts, &ext.*.surf.tbs, false);
     }
 
     /// Close paint admission before onAtlasCreate invalidates the atlas.
@@ -6376,6 +6540,8 @@ pub const App = struct {
         self.ime_composition_str.deinit(self.alloc);
         self.ime_composition_utf8.deinit(self.alloc);
         self.ime_clause_info.deinit(self.alloc);
+        self.grid_fonts_staged.deinit(self.alloc);
+        self.grid_fonts.deinit(self.alloc);
 
         // External windows cleanup
         var ext_it = self.external_windows.iterator();
@@ -7144,6 +7310,103 @@ test "a layer that moves is redrawn whole" {
     var moved = tbs.acquireForPaint(alloc);
     defer _ = LayerTestProbe.unpin(&tbs, &moved);
     try std.testing.expect(LayerTestProbe.damageFor(moved, 2).?.full);
+}
+
+test "a per-grid font reaches the layers with the commit, and is redrawn whole" {
+    const alloc = std.testing.allocator;
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+    var fonts: GridFonts = .empty;
+    defer fonts.deinit(alloc);
+
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{ 2, 3 }, 3, 0);
+    try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 3);
+    tbs.commitFlush(alloc);
+    {
+        var drain = tbs.acquireForPaint(alloc);
+        _ = LayerTestProbe.unpin(&tbs, &drain);
+    }
+
+    // Control: an unchanged (empty) table restages nothing.
+    stampLayerFonts(alloc, &budget, &fonts, &tbs, true);
+    try std.testing.expect(tbs.flush_layers == null);
+
+    // A font arrives between flushes: no layout comes with it.
+    try fonts.put(alloc, 2, .{ .font_id = 1, .cell_w_px = 12, .cell_h_px = 24, .extent_w_px = 100, .extent_h_px = 80 });
+    stampLayerFonts(alloc, &budget, &fonts, &tbs, true);
+    try std.testing.expect(tbs.flush_layers != null);
+    // Not visible before the commit.
+    for (tbs.committed_layers.slice()) |l| try std.testing.expectEqual(@as(u32, 0), l.font_cell_h_px);
+    tbs.commitFlush(alloc);
+
+    var pinned = tbs.acquireForPaint(alloc);
+    defer _ = LayerTestProbe.unpin(&tbs, &pinned);
+    const layers = pinned.layers.slice();
+    try std.testing.expectEqual(@as(u32, 24), layers[1].font_cell_h_px);
+    try std.testing.expectEqual(@as(u32, 80), layers[1].font_extent_h_px);
+    try std.testing.expectEqual(@as(u32, 0), layers[2].font_cell_h_px);
+    try std.testing.expect(LayerTestProbe.damageFor(pinned, 2).?.full);
+    try std.testing.expect(LayerTestProbe.damageFor(pinned, 3) == null);
+
+    // A layout staged in a later flush is stamped too.
+    try LayerTestProbe.place(&tbs, alloc, &budget, &.{ 2, 3 }, 3, 0);
+    stampLayerFonts(alloc, &budget, &fonts, &tbs, false);
+    try std.testing.expectEqual(@as(u32, 12), tbs.flush_layers.?.items[1].font_cell_w_px);
+    tbs.cancelFlush();
+}
+
+test "a font grid's last row owns its bottom margin and is clipped to its extent" {
+    const base: SurfaceLayer = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 100, .rows = 3, .cols = 10, .z = 1, .follows_scroll = false };
+    // Control: the surface's lattice.
+    try std.testing.expectEqual([2]i32{ 20, 40 }, base.rowsBandPx(1, 2, 20));
+    try std.testing.expectEqual([2]i32{ 0, 60 }, base.rowsBandPx(0, 3, 20));
+    try std.testing.expectEqual(@as(i32, 80), base.widthPx(8));
+
+    // Resize mode: 3 rows of 24 px in an 80 px frame leave an 8 px margin.
+    var resized = base;
+    resized.font_cell_w_px = 9;
+    resized.font_cell_h_px = 24;
+    resized.font_extent_w_px = 95;
+    resized.font_extent_h_px = 80;
+    try std.testing.expectEqual(@as(i32, 24), resized.rowHeightPx(20));
+    try std.testing.expectEqual(@as(i32, 95), resized.widthPx(8));
+    try std.testing.expectEqual([2]i32{ 24, 48 }, resized.rowsBandPx(1, 2, 20));
+    try std.testing.expectEqual([2]i32{ 48, 80 }, resized.rowsBandPx(2, 3, 20));
+    // Below the extent: nothing.
+    try std.testing.expectEqual(@as(?[2]u32, null), resized.rowsForBand(.{ .top_px = 300, .bottom_px = 320 }, 100, 3, 20));
+
+    // A margin taller than a row (a grid clamped to the row ceiling): a band
+    // over the margin alone, past the one-row slack, still reaches the last row.
+    var clamped = base;
+    clamped.rows = 1;
+    clamped.font_cell_h_px = 10;
+    clamped.font_extent_h_px = 50;
+    try std.testing.expectEqual(@as(?[2]u32, .{ 0, 0 }), clamped.rowsForBand(.{ .top_px = 145, .bottom_px = 150 }, 100, 1, 20));
+    // Without the margin rule the same band reaches nothing.
+    try std.testing.expectEqual(@as(?[2]u32, null), core.damage_bands.layerRowsForBand(.{ .top_px = 145, .bottom_px = 150 }, 100, 1, 10));
+
+    // font_view: 3 rows of 30 px clipped to 3 x 20 px.
+    var viewed = base;
+    viewed.font_cell_h_px = 30;
+    viewed.font_extent_h_px = 60;
+    try std.testing.expectEqual([2]i32{ 30, 60 }, viewed.rowsBandPx(1, 2, 20));
+    try std.testing.expectEqual([2]i32{ 60, 60 }, viewed.rowsBandPx(2, 3, 20));
+}
+
+test "the cursor grid's cell, and a row height with linespace" {
+    var font_layer: SurfaceLayer = .{ .grid_id = 4, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 2, .cols = 2, .z = 1, .follows_scroll = false };
+    font_layer.font_cell_w_px = 11;
+    font_layer.font_cell_h_px = 23;
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 10, .cols = 10, .z = 0, .follows_scroll = false },
+        font_layer,
+    };
+    try std.testing.expectEqual([2]i32{ 8, 16 }, layerCellPx(&layers, 1, 8, 16));
+    try std.testing.expectEqual([2]i32{ 11, 23 }, layerCellPx(&layers, 4, 8, 16));
+    try std.testing.expectEqual([2]i32{ 8, 16 }, layerCellPx(&layers, 9, 8, 16));
+    try std.testing.expectEqual(@as(u32, 21), rowHeightWithLinespacePx(18, 3));
+    try std.testing.expectEqual(@as(u32, 1), rowHeightWithLinespacePx(2, -5));
 }
 
 /// A committed set holding `rows_each[i]` empty rows for grid `grids[i]`, and

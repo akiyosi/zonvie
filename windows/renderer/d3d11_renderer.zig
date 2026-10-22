@@ -427,6 +427,9 @@ pub const Renderer = struct {
     /// height, 'linespace' included, so cell lookups track the drawn rows.
     cell_w_px: u32 = 0,
     cell_h_px: u32 = 0,
+    /// The cell of the grid iCurrentCursor is on, when that grid has its own
+    /// font; 0 = `cell_w_px`/`cell_h_px`. Bar/block is classified against it.
+    shader_cursor_cell_px: [2]u32 = .{ 0, 0 },
     cursor_blink_on: bool = true,
     /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
     shader_grid_origin: [2]f32 = .{ 0, 0 },
@@ -3292,8 +3295,8 @@ pub const Renderer = struct {
         u.iTimeCursorChange = self.shader_cursor_change_time;
         core.fillEditUniforms(
             &u,
-            @floatFromInt(self.cell_w_px),
-            @floatFromInt(self.cell_h_px),
+            @floatFromInt(if (self.shader_cursor_cell_px[0] > 0) self.shader_cursor_cell_px[0] else self.cell_w_px),
+            @floatFromInt(if (self.shader_cursor_cell_px[1] > 0) self.shader_cursor_cell_px[1] else self.cell_h_px),
             self.shader_grid_origin,
             self.cell_age_cache.last_edit,
             self.cursor_blink_on,
