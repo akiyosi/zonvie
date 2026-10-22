@@ -2268,6 +2268,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return ranks
     }
 
+    /// Where the committed layout places `gridId`, for the pointer.
+    func committedLayerOriginPx(_ gridId: Int64) -> simd_float2? {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedSurfaceLayers.first { $0.gridId == gridId }?.originPx
+    }
+
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
     /// does not allocate.
     private var commitGridIdScratch: [Int64] = []

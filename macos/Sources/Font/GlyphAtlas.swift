@@ -1366,8 +1366,9 @@ final class GlyphAtlas {
     }
 
     private func resolveHbftAndGlyph_locked(fontId: UInt32 = 0, scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer?, glyphID: UInt32, ctFont: CTFont)? {
-        // fontId sits above the 21 scalar bits; font_id 0 keys as before.
-        let failKey = (UInt64(styleFlags) << 32) | (UInt64(fontId) << 24) | UInt64(scalar)
+        // fontId in bits 24-31, above the 21 scalar bits and below the style
+        // flags (font_id < 64 = font_slots.max_slots); font_id 0 keys as before.
+        let failKey = (UInt64(styleFlags) << 32) | (UInt64(fontId & 0xFF) << 24) | UInt64(scalar)
         if failedScalarCache.contains(failKey) {
             return nil
         }
@@ -1559,7 +1560,8 @@ final class GlyphAtlas {
     /// Must be called with mu locked. Stores pixel data in rasterizeScratch.
     private func renderEmojiClusterWithCoreGraphics_locked(
         scalars: UnsafePointer<UInt32>, count: Int,
-        outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+        outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>,
+        sizePx: CGFloat? = nil
     ) -> Bool {
         // Build a String from the cluster scalars using UnicodeScalarView
         // to preserve the exact sequence (Character append may break ZWJ joining).
@@ -1571,7 +1573,7 @@ final class GlyphAtlas {
         if str.isEmpty { return false }
 
         // Use Apple Color Emoji as the primary font
-        guard let ef = emojiFont(size: CTFontGetSize(font)) else { return false }
+        guard let ef = emojiFont(size: sizePx ?? CTFontGetSize(font)) else { return false }
 
         // Create an attributed string with the emoji font
         let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
@@ -1689,7 +1691,9 @@ final class GlyphAtlas {
             outBitmap.pointee.ascent_px = ascentPx
             outBitmap.pointee.descent_px = descentPx
             if renderEmojiClusterWithCoreGraphics_locked(
-                scalars: ptr, count: Int(clusterLen), outBitmap: outBitmap
+                scalars: ptr, count: Int(clusterLen), outBitmap: outBitmap,
+                // A per-grid font draws its emoji at its own size.
+                sizePx: fontId != 0 ? slotFaces[fontId].map { CTFontGetSize($0.faces[0].ctFont) } : nil
             ) {
                 outBitmap.pointee.ascent_px = ascentPx
                 outBitmap.pointee.descent_px = descentPx

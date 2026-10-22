@@ -479,14 +479,8 @@ final class MetalTerminalView: GridInputView {
         guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
             return (1, g.globalRow, g.globalCol)
         }
-        if let gf = core.gridCellPx(pinned) {
-            var r: Int32 = 0
-            var c: Int32 = 0
-            zonvie_core_pointer_cell_in_grid(
-                Float(g.pointPx.x) - Float(current.startCol) * Float(g.cellW),
-                Float(g.pointPx.y) - Float(current.startRow) * Float(g.cellH),
-                gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
-            return (pinned, r, c)
+        if let fc = fontGridCell(pinned, grid: current, g: g, scrollOffsetPx: drawnScrollOffsetPx(pinned, cellH: g.cellH)) {
+            return (pinned, fc.row, fc.col)
         }
         let localRow: Int32
         if let followerOffsetPx = drawnFollowerOffsetsPx()[pinned] {
@@ -979,6 +973,23 @@ final class MetalTerminalView: GridInputView {
         return renderer.drawnFollowerOffsetsPx()
     }
 
+    /// The cell a pointer names in a grid drawn in its own font, measured
+    /// from the layer's committed origin (a scale_view float may sit off the
+    /// global lattice) with the drawn scroll offset undone. nil on the global font.
+    private func fontGridCell(
+        _ gridId: Int64, grid: ZonvieCore.GridInfo, g: PointerGeometry, scrollOffsetPx: CGFloat
+    ) -> (row: Int32, col: Int32)? {
+        guard let gf = core?.gridCellPx(gridId) else { return nil }
+        let origin = renderer?.committedLayerOriginPx(gridId)
+            ?? simd_float2(Float(grid.startCol) * Float(g.cellW), Float(grid.startRow) * Float(g.cellH))
+        var r: Int32 = 0
+        var c: Int32 = 0
+        zonvie_core_pointer_cell_in_grid(
+            Float(g.pointPx.x) - origin.x, Float(g.pointPx.y - scrollOffsetPx) - origin.y,
+            gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
+        return (r, c)
+    }
+
     /// `requireScrollable`: a non-scrollable float is transparent to a wheel,
     /// which falls through to the scrollable grid beneath it.
     private func hitTestGrid(at point: CGPoint, requireScrollable: Bool = false) -> (gridId: Int64, row: Int32, col: Int32) {
@@ -1051,15 +1062,9 @@ final class MetalTerminalView: GridInputView {
             )
             // A grid in its own font: the global lattice found the grid; the
             // cell inside it is measured in the grid's own cells.
-            if bestGridId != 1, let gf = core.gridCellPx(bestGridId) {
-                var r: Int32 = 0
-                var c: Int32 = 0
-                zonvie_core_pointer_cell_in_grid(
-                    Float(pointPx.x) - Float(grid.startCol) * Float(g.cellW),
-                    Float(pointPx.y - offsetPx) - Float(grid.startRow) * Float(cellH),
-                    gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
-                localRow = r
-                localCol = c
+            if bestGridId != 1, let fc = fontGridCell(bestGridId, grid: grid, g: g, scrollOffsetPx: offsetPx) {
+                localRow = fc.row
+                localCol = fc.col
             }
         }
 
