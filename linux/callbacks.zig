@@ -327,6 +327,7 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             app.surface.cancel();
             if (core.zonvie_core_flush_is_retryable(cp)) core.zonvie_core_force_resend_locked(cp);
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
+            app.flush_seq += 1;
             app.surface.commit(app.alloc, .{
                 .now_ns = @intCast(clock.nowNs()),
                 .row_h_px = app.cell_h_px,
@@ -342,8 +343,10 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     queueRender(app);
 }
 
-/// Callable from any thread; at most one idle is outstanding.
+/// Callable from any thread; at most one idle is outstanding. The render
+/// thread is woken here directly, not through the GTK loop.
 pub fn queueRender(app: *App) void {
+    if (app.render_thread) |rt| rt.request();
     if (app.render_idle_queued.swap(true, .acq_rel)) return;
     _ = gtk.g_idle_add(&idleQueueRender, app);
 }

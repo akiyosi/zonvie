@@ -300,6 +300,8 @@ pub fn build(b: *std.Build) !void {
         });
         linux_mod.linkSystemLibrary("gtk-4", .{});
         linux_mod.linkSystemLibrary("GL", .{});
+        linux_mod.linkSystemLibrary("EGL", .{});
+        linux_mod.linkSystemLibrary("gbm", .{});
         linux_mod.linkSystemLibrary("freetype2", .{});
         linux_mod.linkSystemLibrary("harfbuzz", .{});
         linux_mod.linkSystemLibrary("fontconfig", .{});
