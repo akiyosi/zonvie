@@ -125,6 +125,17 @@ pub fn resolve(
     return .{ .grid_id = b.grid_id, .row = row - b.start_row, .col = col - b.start_col };
 }
 
+/// The cell `local_*_px` names in a grid of `cell_*_px` cells whose layer is
+/// `extent_*_px` large. Past the last cell clamps; negative keeps its sign.
+pub fn cellInGrid(local_x_px: f32, local_y_px: f32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) Hit {
+    if (cell_w_px == 0 or cell_h_px == 0) return .{ .grid_id = 0, .row = 0, .col = 0 };
+    const rows: i32 = @intCast(@max(1, extent_h_px / cell_h_px));
+    const cols: i32 = @intCast(@max(1, extent_w_px / cell_w_px));
+    const r: i32 = @intFromFloat(@floor(local_y_px / @as(f32, @floatFromInt(cell_h_px))));
+    const c: i32 = @intFromFloat(@floor(local_x_px / @as(f32, @floatFromInt(cell_w_px))));
+    return .{ .grid_id = 0, .row = @min(r, rows - 1), .col = @min(c, cols - 1) };
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 /// Whether `a` is drawn in front of `b`, by the published layer order.
@@ -282,4 +293,21 @@ test "a point outside every grid resolves to nothing" {
 
 test "an empty grid list resolves to nothing" {
     try testing.expect(resolve(Candidate, &.{}, 1, 5, 5, false) == null);
+}
+
+test "a pixel in a per-grid font names that font's cell, and the margin clamps" {
+    // 6x12 cells in a 100x50 px frame: 16 cols, 4 rows fit; 4 px and 2 px margins.
+    const in = cellInGrid(13.0, 25.0, 6, 12, 100, 50);
+    try testing.expectEqual(@as(i32, 2), in.row);
+    try testing.expectEqual(@as(i32, 2), in.col);
+    const margin = cellInGrid(99.0, 49.0, 6, 12, 100, 50);
+    try testing.expectEqual(@as(i32, 3), margin.row);
+    try testing.expectEqual(@as(i32, 15), margin.col);
+    // A drag above/left of the grid keeps its sign for Neovim's drag rules.
+    const drag = cellInGrid(-7.0, -1.0, 6, 12, 100, 50);
+    try testing.expectEqual(@as(i32, -1), drag.row);
+    try testing.expectEqual(@as(i32, -2), drag.col);
+    // A zero cell never divides.
+    const zero = cellInGrid(5.0, 5.0, 0, 0, 100, 50);
+    try testing.expectEqual(@as(i32, 0), zero.row);
 }

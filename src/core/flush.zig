@@ -2577,8 +2577,7 @@ pub fn generateRowVertices(
                             try bufs.setLen(core.alloc, scalar_count);
 
                             const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                            const glyph_count = shape_text_run.?(
-                                core.ctx,
+                            const glyph_count = core.callShapeTextRun(
                                 core.shaping_scalars.items.ptr,
                                 scalar_count,
                                 c_style,
@@ -2604,8 +2603,7 @@ pub fn generateRowVertices(
                                 try bufs.setLen(core.alloc, glyph_count);
                                 {
                                     const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                                    final_glyph_count = shape_text_run.?(
-                                        core.ctx,
+                                    final_glyph_count = core.callShapeTextRun(
                                         core.shaping_scalars.items.ptr,
                                         scalar_count,
                                         c_style,
@@ -7737,7 +7735,7 @@ fn ensureCachedPhase2Glyph(
         for (extras, 0..) |extra, i| core.emoji_cluster_buf[i + 1] = extra;
         core.emoji_cluster_len = @intCast(1 + extras.len);
         resolved = core.ensureGlyphPhase2(scalar, style_flags);
-    } else if (core.cb.on_shape_text_run) |shape| {
+    } else if (core.cb.on_shape_text_run != null) {
         if (core.cb.on_rasterize_glyph_by_id != null) {
             var glyph_ids: [8]u32 = undefined;
             var clusters: [8]u32 = undefined;
@@ -7749,8 +7747,7 @@ fn ensureCachedPhase2Glyph(
             var cluster: [1 + grid_mod.OverflowExtras.capacity]u32 = undefined;
             cluster[0] = scalar;
             @memcpy(cluster[1..][0..extras.len], extras);
-            const glyph_count = shape(
-                core.ctx,
+            const glyph_count = core.callShapeTextRun(
                 &cluster,
                 1 + extras.len,
                 style_flags,

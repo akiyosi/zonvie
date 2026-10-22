@@ -276,6 +276,17 @@ ZONVIE_API int zonvie_core_resolve_pointer_grid(
     int require_scrollable,
     zonvie_pointer_hit *out);
 
+/* The cell a pixel names inside a grid drawn in its own font. local_* is
+   relative to the layer's origin; a point in the frame's leftover margin
+   clamps to the last row/column (rows = extent_h / cell_h). A negative
+   coordinate stays negative so a drag past the edge keeps its meaning.
+   Pure, no lock. */
+ZONVIE_API void zonvie_core_pointer_cell_in_grid(
+    float local_x_px, float local_y_px,
+    uint32_t cell_w_px, uint32_t cell_h_px,
+    uint32_t extent_w_px, uint32_t extent_h_px,
+    int32_t *out_row, int32_t *out_col);
+
 /* How a viewport's scrollbar should look, filled by
    zonvie_core_scrollbar_metrics. Fractions, not pixels: the track rectangle
    and a minimum knob height are chrome and stay with the frontend. */

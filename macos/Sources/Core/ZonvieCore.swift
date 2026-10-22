@@ -1623,7 +1623,13 @@ final class ZonvieCore {
                     ? UnsafeBufferPointer(start: stamps!, count: n)
                     : UnsafeBufferPointer<zonvie_cell_stamp>(start: nil, count: 0)
                 shared.cellAge.apply(buf, clear: clear != 0, now: shared.shaderTimeNow())
-            }
+            },
+            on_font_slot_load: nil,
+            on_font_slot_release: nil,
+            on_grid_font: nil,
+            on_shape_text_run_ex: nil,
+            on_rasterize_glyph_ex: nil,
+            on_rasterize_glyph_by_id_ex: nil
         )
 
         self.core = zonvie_core_create(&cb, MemoryLayout<zonvie_callbacks>.size, self.ctxPtr)

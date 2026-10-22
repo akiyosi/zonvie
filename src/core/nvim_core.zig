@@ -482,6 +482,12 @@ pub const Callbacks = struct {
         n: usize,
         clear: i32,
     ) callconv(.c) void = null,
+    on_font_slot_load: ?c_api.FontSlotLoadFn = null,
+    on_font_slot_release: ?c_api.FontSlotReleaseFn = null,
+    on_grid_font: ?c_api.GridFontFn = null,
+    on_shape_text_run_ex: ?c_api.ShapeTextRunExFn = null,
+    on_rasterize_glyph_ex: ?c_api.RasterizeGlyphExFn = null,
+    on_rasterize_glyph_by_id_ex: ?c_api.RasterizeGlyphExFn = null,
 };
 
 const GridEntry = flush.GridEntry;
@@ -2384,6 +2390,32 @@ pub const Core = struct {
             self.cb.on_atlas_create != null;
     }
 
+    pub fn perGridFontsEnabled(self: *const Core) bool {
+        return self.cb.on_font_slot_load != null and self.cb.on_font_slot_release != null and
+            self.cb.on_grid_font != null and self.cb.on_shape_text_run_ex != null and
+            self.cb.on_rasterize_glyph_ex != null and self.cb.on_rasterize_glyph_by_id_ex != null;
+    }
+
+    /// on_shape_text_run for font 0, on_shape_text_run_ex otherwise.
+    pub fn callShapeTextRun(
+        self: *Core,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        if (self.glyph_font_id != 0) {
+            if (self.cb.on_shape_text_run_ex) |ex| return ex(self.ctx, self.glyph_font_id, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+        }
+        const f = self.cb.on_shape_text_run orelse return 0;
+        return f(self.ctx, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+    }
+
     fn recordAtlasCapacityNegative(self: *Core) void {
         if (!self.atlas_has_capacity_negative) {
             if (self.atlas_negative_recovery_armed) {
@@ -3312,6 +3344,7 @@ pub const Core = struct {
         key: u32,
         style_flags: u32,
         rasterize: c_api.RasterizeGlyphFn,
+        rasterize_ex: ?c_api.RasterizeGlyphExFn,
         arm_transient_retry: bool,
     ) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
@@ -3327,7 +3360,10 @@ pub const Core = struct {
         // Ask the frontend to rasterize (no packing / UV).
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = rasterize(self.ctx, key, style_flags, &bm);
+        const ok = if (self.glyph_font_id != 0 and rasterize_ex != null)
+            rasterize_ex.?(self.ctx, self.glyph_font_id, key, style_flags, &bm)
+        else
+            rasterize(self.ctx, key, style_flags, &bm);
         if (log_on) {
             const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
             self.perf_rasterize_ns_total +%= dt;
@@ -3348,6 +3384,7 @@ pub const Core = struct {
             scalar,
             style_flags,
             self.cb.on_rasterize_glyph.?,
+            self.cb.on_rasterize_glyph_ex,
             // A scalar that failed to rasterize is the case the bounded
             // reprobe exists for: a font the frontend had not finished
             // loading yet answers on a later attempt.
@@ -3365,6 +3402,7 @@ pub const Core = struct {
             glyph_id,
             style_flags,
             self.cb.on_rasterize_glyph_by_id.?,
+            self.cb.on_rasterize_glyph_by_id_ex,
             // NOT armed, which is how this path has always behaved. A shaped
             // glyph that fails to rasterize caches a blank and is not
             // reprobed. Nothing on record says that was decided rather than
@@ -8317,4 +8355,63 @@ test "glyph keys of two fonts differ and an atlas reset clears both" {
     core.resetGlyphCacheFlags();
     try std.testing.expect(glyphCacheProbe(keys, a.key, a.hash).hit == null);
     try std.testing.expect(glyphCacheProbe(keys, b.key, b.hash).hit == null);
+}
+
+test "per-grid fonts are off unless every font callback is present" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try std.testing.expect(!core.perGridFontsEnabled());
+    const S = struct {
+        fn load(_: ?*anyopaque, _: u32, _: [*]const u8, _: usize, _: f32, w: *u32, h: *u32) callconv(.c) c_int {
+            w.* = 5;
+            h.* = 10;
+            return 1;
+        }
+        fn release(_: ?*anyopaque, _: u32) callconv(.c) void {}
+        fn gridFont(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+        fn shape(_: ?*anyopaque, _: u32, _: [*]const u32, _: usize, _: u32, _: [*]u32, _: [*]u32, _: [*]i32, _: [*]i32, _: [*]i32, _: usize) callconv(.c) usize {
+            return 0;
+        }
+        fn raster(_: ?*anyopaque, _: u32, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    core.cb.on_font_slot_load = S.load;
+    core.cb.on_font_slot_release = S.release;
+    core.cb.on_grid_font = S.gridFont;
+    core.cb.on_shape_text_run_ex = S.shape;
+    core.cb.on_rasterize_glyph_ex = S.raster;
+    try std.testing.expect(!core.perGridFontsEnabled());
+    core.cb.on_rasterize_glyph_by_id_ex = S.raster;
+    try std.testing.expect(core.perGridFontsEnabled());
+}
+
+test "glyph rasterization dispatches font 0 to the old callback and others to the ex one" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    const S = struct {
+        var legacy_calls: u32 = 0;
+        var ex_font: u32 = 0;
+        fn legacy(_: ?*anyopaque, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+            legacy_calls += 1;
+            return 0;
+        }
+        fn ex(_: ?*anyopaque, font_id: u32, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+            ex_font = font_id;
+            return 0;
+        }
+        fn upload(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: *const c_api.GlyphBitmap) callconv(.c) void {}
+        fn create(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {}
+    };
+    core.cb.on_rasterize_glyph = S.legacy;
+    core.cb.on_rasterize_glyph_ex = S.ex;
+    core.cb.on_atlas_upload = S.upload;
+    core.cb.on_atlas_create = S.create;
+    _ = core.ensureGlyphPhase2('A', 0);
+    try std.testing.expectEqual(@as(u32, 1), S.legacy_calls);
+    core.glyph_font_id = 4;
+    _ = core.ensureGlyphPhase2('B', 0);
+    core.glyph_font_id = 0;
+    try std.testing.expectEqual(@as(u32, 1), S.legacy_calls);
+    try std.testing.expectEqual(@as(u32, 4), S.ex_font);
 }

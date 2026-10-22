@@ -121,6 +121,40 @@ typedef int (*zonvie_rasterize_glyph_by_id_fn)(
     zonvie_glyph_bitmap* out_bitmap
 );
 
+/* Per-grid fonts. font_id 0 is the global font and is never loaded or
+   released through these. `utf8` is the same "<name>\t<size>[\t<features>]"
+   candidate list (newline-separated) on_guifont receives; empty means "the
+   current global font". The size is multiplied by `scale`. The frontend
+   loads the face synchronously, writes the cell width and the row height
+   ('linespace' included, the unit it passes to zonvie_core_update_layout_px
+   as cell_h_px), and returns 1; 0 means the load failed. */
+typedef int (*zonvie_on_font_slot_load_fn)(
+    void* ctx, uint32_t font_id, const char* utf8, size_t len, float scale,
+    uint32_t* out_cell_w_px, uint32_t* out_cell_h_px);
+typedef void (*zonvie_on_font_slot_release_fn)(void* ctx, uint32_t font_id);
+/* A grid's font changed. font_id 0 means it is back on the global font.
+   extent_* is the pixel box the layer is clipped to (its frame in resize
+   mode, rows x cell in scale_view). IMMEDIATE class: core thread, grid_mu held. */
+typedef void (*zonvie_on_grid_font_fn)(
+    void* ctx, int64_t grid_id, uint32_t font_id,
+    uint32_t cell_w_px, uint32_t cell_h_px,
+    uint32_t extent_w_px, uint32_t extent_h_px);
+/* font_id-taking variants of on_shape_text_run, on_rasterize_glyph and
+   on_rasterize_glyph_by_id. Called only with font_id != 0. */
+typedef size_t (*zonvie_shape_text_run_ex_fn)(
+    void* ctx, uint32_t font_id,
+    const uint32_t* scalars, size_t scalar_count,
+    uint32_t style_flags,
+    uint32_t* out_glyph_ids, uint32_t* out_clusters,
+    int32_t* out_x_advance, int32_t* out_x_offset, int32_t* out_y_offset,
+    size_t out_cap);
+typedef int (*zonvie_rasterize_glyph_ex_fn)(
+    void* ctx, uint32_t font_id, uint32_t scalar, uint32_t style_flags,
+    zonvie_glyph_bitmap* out_bitmap);
+typedef int (*zonvie_rasterize_glyph_by_id_ex_fn)(
+    void* ctx, uint32_t font_id, uint32_t glyph_id, uint32_t style_flags,
+    zonvie_glyph_bitmap* out_bitmap);
+
 /* ASCII fast path: retrieve pre-computed shaping tables for a style variant.
    Frontend fills out_glyph_ids[128], out_x_advances[128], out_lig_triggers[128]
    from its HarfBuzz font handle for the given style.
@@ -1034,6 +1068,16 @@ typedef struct zonvie_callbacks {
        struct for ABI compat. */
     void (*on_cell_age_stamps)(void* ctx, const zonvie_cell_stamp* stamps,
                                size_t n, int clear);
+
+    /* Per-grid fonts (vim.w.zonvie_guifont / zonvie_font_scale /
+       neovide_font_scale). All six must be set, or the core ignores the
+       window variables. Appended at the end for ABI compat. */
+    zonvie_on_font_slot_load_fn on_font_slot_load;
+    zonvie_on_font_slot_release_fn on_font_slot_release;
+    zonvie_on_grid_font_fn on_grid_font;
+    zonvie_shape_text_run_ex_fn on_shape_text_run_ex;
+    zonvie_rasterize_glyph_ex_fn on_rasterize_glyph_ex;
+    zonvie_rasterize_glyph_by_id_ex_fn on_rasterize_glyph_by_id_ex;
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
