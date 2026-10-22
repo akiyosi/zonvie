@@ -85,6 +85,22 @@ final class GlyphAtlas {
     private var hbftFont: OpaquePointer?
     private var hbftFontData: NSData?
 
+    /// Per-grid font faces keyed by the core's font_id (never 0): regular,
+    /// bold, italic, bold-italic, each a (CTFont, hbft) pair whose hbft is
+    /// nil when that style did not load. Built in loadSlot outside `mu`,
+    /// published and destroyed under it. A global font change keeps them;
+    /// the core reloads the slots derived from the global font itself.
+    private struct SlotFace {
+        let faces: [(ctFont: CTFont, hbft: OpaquePointer?)]
+        /// The mapped font files the borrowed hbft handles read.
+        let data: [NSData]
+        let px: UInt32
+        let ascentPx: Float
+        let descentPx: Float
+        let hasFeatures: Bool
+    }
+    private var slotFaces: [UInt32: SlotFace] = [:]
+
     // HarfBuzz+FreeType handles for font variants
     private var hbftBold: OpaquePointer?
     private var hbftItalic: OpaquePointer?
@@ -682,94 +698,86 @@ final class GlyphAtlas {
         needsAtlasRebuild = true
     }
 
+    /// FreeType cell metrics of one face: the rules the global font and every
+    /// per-grid slot face are measured by. A nil field could not be measured
+    /// and keeps the caller's previous value; the baseline is placed in the
+    /// measured cell height, or `cellHeightFallbackPx` without one.
+    private static func measureCell(
+        ctFont: CTFont, hbft: OpaquePointer, advanceGlyph: UInt32?, cellHeightFallbackPx: Float
+    ) -> (cellWidthPx: Float?, cellHeightPx: Float?, ascentPx: Float?, descentPx: Float?) {
+        var asc26_6: Int32 = 0
+        var desc26_6: Int32 = 0
+        var height26_6: Int32 = 0
+
+        // "metrics-only" call: scalar_count=0, out_cap=0
+        var dummy: UInt32 = 0
+        withUnsafePointer(to: &dummy) { dummyPtr in
+            _ = zonvie_hb_shape_utf32(
+                hbft, dummyPtr, 0, nil, nil, nil, nil, nil, nil, 0,
+                &asc26_6, &desc26_6, &height26_6
+            )
+        }
+
+        let ascPx = Float(asc26_6) / 64.0
+        let descPx = Float(-desc26_6) / 64.0 // FT descender is typically negative
+        let heightPx = Float(height26_6) / 64.0
+
+        let descent: Float? = descPx > 0 ? Float(ceil(descPx)) : nil
+
+        // Use FT height if valid; fallback to asc+desc.
+        let h = (heightPx > 0) ? heightPx : (ascPx + descPx)
+        let cellHeight: Float? = h > 0 ? Float(ceil(h)) : nil
+
+        // FreeType reports both metrics already grid-fitted outward, so the
+        // baseline is placed from CoreText's unrounded values for the same
+        // face instead. Rounding them here would drop the glyph's descender
+        // past the bottom of the cell, where it gets clipped away.
+        let ascent: Float? = ascPx > 0
+            ? FontCellFit.baselinePx(
+                fontAscentPx: Float(CTFontGetAscent(ctFont)),
+                fontDescentPx: Float(CTFontGetDescent(ctFont)),
+                cellHeightPx: cellHeight ?? cellHeightFallbackPx
+            )
+            : nil
+
+        // Cell width from the FT advance of space (or 'M'), monospace assumed.
+        var cellWidth: Float? = nil
+        if let gid = advanceGlyph {
+            var bufPtr: UnsafePointer<UInt8>? = nil
+            var w: Int32 = 0
+            var hh: Int32 = 0
+            var pitch: Int32 = 0
+            var left: Int32 = 0
+            var top: Int32 = 0
+            var adv26_6: Int32 = 0
+
+            let r = zonvie_ft_render_glyph(hbft, gid, &bufPtr, &w, &hh, &pitch, &left, &top, &adv26_6)
+
+            if r == 0 && adv26_6 > 0 {
+                cellWidth = Float(ceil(Float(adv26_6) / 64.0))
+            } else {
+                // Fallback: CoreText advance (still in pixels for the current CTFont size).
+                var cg = CGGlyph(gid)
+                var adv = CGSize.zero
+                CTFontGetAdvancesForGlyphs(ctFont, .horizontal, &cg, &adv, 1)
+                if adv.width > 0 {
+                    cellWidth = Float(ceil(adv.width))
+                }
+            }
+        }
+        return (cellWidth, cellHeight, ascent, descent)
+    }
+
     private func recomputeMetrics() {
         // Prefer FreeType metrics to match the rasterization backend.
         if let hbftFont {
-            var asc26_6: Int32 = 0
-            var desc26_6: Int32 = 0
-            var height26_6: Int32 = 0
-    
-            // "metrics-only" call: scalar_count=0, out_cap=0
-            var dummy: UInt32 = 0
-            withUnsafePointer(to: &dummy) { dummyPtr in
-                _ = zonvie_hb_shape_utf32(
-                    hbftFont,
-                    dummyPtr,
-                    0,
-                    nil,
-                    nil,
-                    nil,
-                    nil,
-                    nil,
-                    nil,
-                    0,
-                    &asc26_6,
-                    &desc26_6,
-                    &height26_6
-                )
-            }
-    
-            let ascPx = Float(asc26_6) / 64.0
-            let descPx = Float(-desc26_6) / 64.0 // FT descender is typically negative
-            let heightPx = Float(height26_6) / 64.0
-    
-            if descPx > 0 { descentPx = Float(ceil(descPx)) }
-    
-            // Use FT height if valid; fallback to asc+desc.
-            let h = (heightPx > 0) ? heightPx : (ascPx + descPx)
-            if h > 0 { cellHeightPx = Float(ceil(h)) }
-    
-            // FreeType reports both metrics already grid-fitted outward, so the
-            // baseline is placed from CoreText's unrounded values for the same
-            // face instead. Rounding them here would drop the glyph's descender
-            // past the bottom of the cell, where it gets clipped away.
-            if ascPx > 0 {
-                ascentPx = FontCellFit.baselinePx(
-                    fontAscentPx: Float(CTFontGetAscent(font)),
-                    fontDescentPx: Float(CTFontGetDescent(font)),
-                    cellHeightPx: cellHeightPx
-                )
-            }
-    
-            // --- Determine cellWidthPx from FT advance (monospace assumption) ---
             // Prefer space; fallback to 'M' if space has no glyph/advance.
-            let scalarSpace: UInt32 = 32
-            let scalarM: UInt32 = UInt32(UnicodeScalar("M").value)
-
-            if let gid = glyphID(in: font, scalar: scalarSpace) ?? glyphID(in: font, scalar: scalarM) {
-                var bufPtr: UnsafePointer<UInt8>? = nil
-                var w: Int32 = 0
-                var h: Int32 = 0
-                var pitch: Int32 = 0
-                var left: Int32 = 0
-                var top: Int32 = 0
-                var adv26_6: Int32 = 0
-
-                let r = zonvie_ft_render_glyph(
-                    hbftFont,
-                    gid,
-                    &bufPtr,
-                    &w,
-                    &h,
-                    &pitch,
-                    &left,
-                    &top,
-                    &adv26_6
-                )
-
-                if r == 0 && adv26_6 > 0 {
-                    let advPx = Float(adv26_6) / 64.0
-                    cellWidthPx = Float(ceil(advPx))
-                } else {
-                    // Fallback: CoreText advance (still in pixels for the current CTFont size).
-                    var cg = CGGlyph(gid)
-                    var adv = CGSize.zero
-                    CTFontGetAdvancesForGlyphs(font, .horizontal, &cg, &adv, 1)
-                    if adv.width > 0 {
-                        cellWidthPx = Float(ceil(adv.width))
-                    }
-                }
-            }
+            let advanceGlyph = glyphID(in: font, scalar: 32) ?? glyphID(in: font, scalar: UInt32(UnicodeScalar("M").value))
+            let m = Self.measureCell(ctFont: font, hbft: hbftFont, advanceGlyph: advanceGlyph, cellHeightFallbackPx: cellHeightPx)
+            if let v = m.descentPx { descentPx = v }
+            if let v = m.cellHeightPx { cellHeightPx = v }
+            if let v = m.ascentPx { ascentPx = v }
+            if let v = m.cellWidthPx { cellWidthPx = v }
         } else {
             // Fallback: CoreText metrics are in pixels for the current CTFont size (already scaled).
             let ascent = CTFontGetAscent(font)
@@ -1036,7 +1044,9 @@ final class GlyphAtlas {
     /// Prevents repeated expensive Data(contentsOf:) loads.
     private var failedHbftURLs: Set<String> = []
 
-    private func ensureHbFtFace_locked(for ctFont: CTFont) -> HbFtFace? {
+    /// `slotPx`: the pixel size of the per-grid font this fallback serves;
+    /// nil for the global font.
+    private func ensureHbFtFace_locked(for ctFont: CTFont, slotPx: UInt32? = nil) -> HbFtFace? {
         let desc = CTFontCopyFontDescriptor(ctFont)
         guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL else {
             return nil
@@ -1048,6 +1058,7 @@ final class GlyphAtlas {
         let instanceAxes = FontInstanceAxes.coordinates(of: ctFont)
         var urlKey = "\(url.absoluteString)#\(faceIndex)"
         for axis in instanceAxes { urlKey += "#\(axis.tag)=\(axis.value)" }
+        if let slotPx { urlKey += "@\(slotPx)" }
 
         if var cached = fallbackFacesByURL[urlKey] {
             // LRU: update access order on hit
@@ -1063,7 +1074,7 @@ final class GlyphAtlas {
         }
 
         let generation = fontGeneration
-        let px = UInt32(ceil(pointSize * backingScale))
+        let px = slotPx ?? UInt32(ceil(pointSize * backingScale))
         let features = fontFeatures
 
         // Font files can be hundreds of MiB. Keep mapping and FreeType/HarfBuzz
@@ -1088,7 +1099,7 @@ final class GlyphAtlas {
         }
         if fontGeneration != generation {
             os_unfair_lock_unlock(&fallbackLoadLock)
-            return ensureHbFtFace_locked(for: ctFont)
+            return ensureHbFtFace_locked(for: ctFont, slotPx: slotPx)
         }
         os_unfair_lock_unlock(&mu)
 
@@ -1128,7 +1139,7 @@ final class GlyphAtlas {
         // generation; the function contract still returns with mu held.
         if fontGeneration != generation {
             if let created { zonvie_ft_hb_font_destroy(created) }
-            return ensureHbFtFace_locked(for: ctFont)
+            return ensureHbFtFace_locked(for: ctFont, slotPx: slotPx)
         }
 
         guard let hbft = created else {
@@ -1272,6 +1283,7 @@ final class GlyphAtlas {
             zonvie_ft_hb_font_destroy(f.hbft)
         }
         fallbackFacesByURL.removeAll()
+        for (_, s) in slotFaces { Self.destroySlotFace(s) }
     }
 
     private func resetAtlas_locked() {
@@ -1353,13 +1365,17 @@ final class GlyphAtlas {
         return nil
     }
 
-    private func resolveHbftAndGlyph_locked(scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer?, glyphID: UInt32, ctFont: CTFont)? {
-        let failKey = (UInt64(styleFlags) << 32) | UInt64(scalar)
+    private func resolveHbftAndGlyph_locked(fontId: UInt32 = 0, scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer?, glyphID: UInt32, ctFont: CTFont)? {
+        // fontId sits above the 21 scalar bits; font_id 0 keys as before.
+        let failKey = (UInt64(styleFlags) << 32) | (UInt64(fontId) << 24) | UInt64(scalar)
         if failedScalarCache.contains(failKey) {
             return nil
         }
 
-        let (fontToUse, hbftToUse) = selectFace_locked(styleFlags: styleFlags)
+        let slot = fontId != 0 ? slotFaces[fontId] : nil
+        let hasFeatures = slot?.hasFeatures ?? self.hasFeatures
+        let (font, hbftFont) = slot.map { $0.faces[0] } ?? (self.font, self.hbftFont)
+        let (fontToUse, hbftToUse) = selectFace_locked(fontId: fontId, styleFlags: styleFlags)
 
         guard let hbft = hbftToUse else {
             insertFailedScalar_locked(failKey)
@@ -1399,7 +1415,7 @@ final class GlyphAtlas {
 
         // Try to create HarfBuzz/FreeType handle for the fallback font.
         // This may fail for bitmap-only fonts (e.g., Apple Color Emoji sbix).
-        let face = ensureHbFtFace_locked(for: fbCT)
+        let face = ensureHbFtFace_locked(for: fbCT, slotPx: slot?.px)
         let fbHbft: OpaquePointer? = face?.hbft
 
         if let fbHbft {
@@ -1428,7 +1444,8 @@ final class GlyphAtlas {
     /// Uses CTFont + CGContext to render the glyph into an RGBA bitmap.
     /// Must be called with mu locked. Stores pixel data in rasterizeScratch.
     private func renderGlyphWithCoreGraphics_locked(
-        ctFont: CTFont, glyphID: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+        ctFont: CTFont, glyphID: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>,
+        metrics: (ascentPx: Float, descentPx: Float)
     ) -> Bool {
         var glyph = CGGlyph(glyphID)
 
@@ -1505,8 +1522,8 @@ final class GlyphAtlas {
         outBitmap.pointee.bearing_y = bearingY
         outBitmap.pointee.advance_26_6 = Int32(advance.width * 64.0)
         outBitmap.pointee.bytes_per_pixel = 4
-        outBitmap.pointee.ascent_px = ascentPx
-        outBitmap.pointee.descent_px = descentPx
+        outBitmap.pointee.ascent_px = metrics.ascentPx
+        outBitmap.pointee.descent_px = metrics.descentPx
         if !CTFontGetSymbolicTraits(ctFont).contains(.traitColorGlyphs) {
             compactWhiteRgbaToCoverage_locked(width: bitmapW, height: bitmapH, outBitmap: outBitmap)
         }
@@ -1650,8 +1667,17 @@ final class GlyphAtlas {
     /// Fills outBitmap with the FreeType bitmap data.
     /// The pixel pointer is valid until the next rasterize call.
     func rasterizeOnly(scalar: UInt32, styleFlags: UInt32, corePtr: OpaquePointer?, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+        rasterizeOnly(fontId: 0, scalar: scalar, styleFlags: styleFlags, corePtr: corePtr, outBitmap: outBitmap)
+    }
+
+    /// rasterizeOnly in per-grid font `fontId`. An emoji cluster is drawn by
+    /// the global emoji path at the global size.
+    func rasterizeOnly(fontId: UInt32, scalar: UInt32, styleFlags: UInt32, corePtr: OpaquePointer?, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
+        let metrics = faceMetrics_locked(fontId: fontId)
+        let ascentPx = metrics.ascentPx
+        let descentPx = metrics.descentPx
 
         // Check if flush set an emoji cluster context (e.g., base + VS16,
         // ZWJ sequence, flag sequence). Render the full cluster via CTLine
@@ -1665,12 +1691,14 @@ final class GlyphAtlas {
             if renderEmojiClusterWithCoreGraphics_locked(
                 scalars: ptr, count: Int(clusterLen), outBitmap: outBitmap
             ) {
+                outBitmap.pointee.ascent_px = ascentPx
+                outBitmap.pointee.descent_px = descentPx
                 return true
             }
             // Fall through to normal path if cluster rendering failed
         }
 
-        guard let resolved = resolveHbftAndGlyph_locked(scalar: scalar, styleFlags: styleFlags) else {
+        guard let resolved = resolveHbftAndGlyph_locked(fontId: fontId, scalar: scalar, styleFlags: styleFlags) else {
             return false
         }
 
@@ -1679,7 +1707,8 @@ final class GlyphAtlas {
             outBitmap.pointee.ascent_px = ascentPx
             outBitmap.pointee.descent_px = descentPx
             if renderGlyphWithCoreGraphics_locked(
-                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap
+                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap,
+                metrics: metrics
             ) {
                 return true
             }
@@ -1710,7 +1739,8 @@ final class GlyphAtlas {
         // Fall back to CoreGraphics for color emoji (sbix/COLR fonts need libpng).
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
             if renderGlyphWithCoreGraphics_locked(
-                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap
+                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap,
+                metrics: metrics
             ) {
                 return true
             }
@@ -1820,9 +1850,129 @@ final class GlyphAtlas {
         return (font, hbftFont)
     }
 
+    /// selectFace_locked for a per-grid font; font_id 0, or a slot already
+    /// released, is the global font. Must be called with mu locked.
+    private func selectFace_locked(fontId: UInt32, styleFlags: UInt32) -> (ctFont: CTFont, hbft: OpaquePointer?) {
+        guard fontId != 0, let s = slotFaces[fontId] else { return selectFace_locked(styleFlags: styleFlags) }
+        let idx = ((styleFlags & ZONVIE_STYLE_BOLD) != 0 ? 1 : 0) + ((styleFlags & ZONVIE_STYLE_ITALIC) != 0 ? 2 : 0)
+        if s.faces[idx].hbft != nil { return s.faces[idx] }
+        return s.faces[0]
+    }
+
+    /// The ascent/descent a glyph of `fontId` is placed with. Must be called with mu locked.
+    private func faceMetrics_locked(fontId: UInt32) -> (ascentPx: Float, descentPx: Float) {
+        guard fontId != 0, let s = slotFaces[fontId] else { return (ascentPx, descentPx) }
+        return (s.ascentPx, s.descentPx)
+    }
+
+    /// Load per-grid font `fontId` from `face` (nil = the current global
+    /// font) at its size times `scale`, and answer its cell the way the
+    /// global font's reaches the core (GridSurfaceRenderer.coreCellPx):
+    /// rounded, `linespace` included. Synchronous: on_font_slot_load sizes
+    /// the grid from the answer. nil when no usable face loads.
+    func loadSlot(
+        fontId: UInt32, face: (name: String, pointSize: CGFloat, features: String)?,
+        scale: CGFloat, lineSpacePx: Int32
+    ) -> (cellWidthPx: UInt32, cellHeightPx: UInt32)? {
+        guard fontId != 0, scale > 0 else { return nil }
+        os_unfair_lock_lock(&mu)
+        let name = face?.name ?? fontName
+        let pointSize = face?.pointSize ?? self.pointSize
+        let features = face.map { Self.parseFontFeatures($0.features) } ?? fontFeatures
+        let backingScale = self.backingScale
+        os_unfair_lock_unlock(&mu)
+
+        // Mapping font files and building FreeType handles takes tens of
+        // milliseconds; like rebuildHbFtFont_locked, do it outside mu.
+        let size = pointSize * scale * backingScale
+        let px = UInt32(ceil(size))
+        guard px > 0 else { return nil }
+        let base = CTFontCreateWithName(name as CFString, size, nil)
+        let styled: [CTFont?] = [
+            base,
+            CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitBold, .traitBold),
+            CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitItalic, .traitItalic),
+            CTFontCreateCopyWithSymbolicTraits(base, 0, nil, [.traitBold, .traitItalic], [.traitBold, .traitItalic]),
+        ]
+        let userAxes = Self.extractVariationAxes(from: features).map {
+            FontInstanceAxes.Axis(tag: $0.tag, value: Double($0.value))
+        }
+        var faces: [(ctFont: CTFont, hbft: OpaquePointer?)] = []
+        var data: [NSData] = []
+        for ct in styled {
+            guard let ct, let loaded = createHbFtFontBorrowed(for: ct, px: px) else {
+                faces.append((ctFont: ct ?? base, hbft: nil))
+                continue
+            }
+            let axes = FontInstanceAxes.merged(instance: FontInstanceAxes.coordinates(of: ct), user: userAxes)
+            if !axes.isEmpty {
+                axes.map(Self.fontAxis).withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_variation_axes(loaded.handle, buf.baseAddress, buf.count)
+                }
+            }
+            if !features.isEmpty {
+                features.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+                }
+            }
+            faces.append((ctFont: ct, hbft: loaded.handle))
+            data.append(loaded.data)
+        }
+
+        var cell: (cellWidthPx: UInt32, cellHeightPx: UInt32)? = nil
+        var slot: SlotFace? = nil
+        if let baseHb = faces[0].hbft {
+            let m = Self.measureCell(ctFont: base, hbft: baseHb, advanceGlyph: Self.advanceGlyph(base), cellHeightFallbackPx: 0)
+            if let w = m.cellWidthPx, let h = m.cellHeightPx {
+                let rowH = max(1, h + Float(lineSpacePx))
+                cell = (UInt32(max(1, Int(w.rounded(.toNearestOrAwayFromZero)))),
+                        UInt32(max(1, Int(rowH.rounded(.toNearestOrAwayFromZero)))))
+                slot = SlotFace(faces: faces, data: data, px: px,
+                                ascentPx: m.ascentPx ?? Float(CTFontGetAscent(base)),
+                                descentPx: m.descentPx ?? Float(CTFontGetDescent(base)),
+                                hasFeatures: !features.isEmpty)
+            }
+        }
+        guard let slot, let cell else {
+            Self.destroySlotFace(SlotFace(faces: faces, data: data, px: px, ascentPx: 0, descentPx: 0, hasFeatures: false))
+            ZonvieCore.appLog("[GlyphAtlas.loadSlot] font_id=\(fontId) '\(name)' px=\(px): no usable face")
+            return nil
+        }
+
+        os_unfair_lock_lock(&mu)
+        let old = slotFaces.updateValue(slot, forKey: fontId)
+        os_unfair_lock_unlock(&mu)
+        // No reader holds an hbft outside mu, so the replaced one can go now.
+        if let old { Self.destroySlotFace(old) }
+        ZonvieCore.appLog("[GlyphAtlas.loadSlot] font_id=\(fontId) '\(name)' px=\(px) cell=\(cell.cellWidthPx)x\(cell.cellHeightPx)")
+        return cell
+    }
+
+    func releaseSlot(fontId: UInt32) {
+        os_unfair_lock_lock(&mu)
+        let s = slotFaces.removeValue(forKey: fontId)
+        os_unfair_lock_unlock(&mu)
+        if let s { Self.destroySlotFace(s) }
+    }
+
+    private static func destroySlotFace(_ s: SlotFace) {
+        for f in s.faces { if let h = f.hbft { zonvie_ft_hb_font_destroy(h) } }
+    }
+
+    /// The glyph a monospace cell is measured by: space, else 'M'.
+    private static func advanceGlyph(_ ctFont: CTFont) -> UInt32? {
+        for ch: UniChar in [32, 77] {
+            var c = ch
+            var g = CGGlyph(0)
+            if CTFontGetGlyphsForCharacters(ctFont, &c, &g, 1) { return UInt32(g) }
+        }
+        return nil
+    }
+
     /// Phase B: Shape a text run using HarfBuzz.
     /// Returns the actual glyph count. If > outCap, caller should retry with larger buffers.
     func shapeTextRun(
+        fontId: UInt32 = 0,
         scalars: UnsafePointer<UInt32>, scalarCount: Int,
         styleFlags: UInt32,
         outGlyphIDs: UnsafeMutablePointer<UInt32>,
@@ -1835,7 +1985,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return 0 }
+        guard let hbft = selectFace_locked(fontId: fontId, styleFlags: styleFlags).hbft else { return 0 }
 
         // zonvie_hb_shape_utf32 outputs y_advance too, but our callback doesn't need it.
         // Use persistent buffer to avoid per-call heap allocation.
@@ -1877,11 +2027,13 @@ final class GlyphAtlas {
     }
 
     /// Phase B: Rasterize a glyph by its glyph ID (post-shaping, skips scalar→glyph_id lookup).
-    func rasterizeByGlyphID(glyphID: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+    func rasterizeByGlyphID(fontId: UInt32 = 0, glyphID: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return false }
+        let face = selectFace_locked(fontId: fontId, styleFlags: styleFlags)
+        guard let hbft = face.hbft else { return false }
+        let metrics = faceMetrics_locked(fontId: fontId)
 
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
@@ -1896,14 +2048,13 @@ final class GlyphAtlas {
         outBitmap.pointee.bearing_x = left
         outBitmap.pointee.bearing_y = top
         outBitmap.pointee.advance_26_6 = adv26_6
-        outBitmap.pointee.ascent_px = ascentPx
-        outBitmap.pointee.descent_px = descentPx
+        outBitmap.pointee.ascent_px = metrics.ascentPx
+        outBitmap.pointee.descent_px = metrics.descentPx
 
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
             // FreeType color failed — try CoreGraphics fallback
-            let ctFontToUse = selectFace_locked(styleFlags: styleFlags).ctFont
             if renderGlyphWithCoreGraphics_locked(
-                ctFont: ctFontToUse, glyphID: glyphID, outBitmap: outBitmap
+                ctFont: face.ctFont, glyphID: glyphID, outBitmap: outBitmap, metrics: metrics
             ) {
                 return true
             }

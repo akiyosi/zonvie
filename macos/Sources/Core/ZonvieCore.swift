@@ -1322,6 +1322,8 @@ final class ZonvieCore {
                 // Neovim's default background, for the viewport-edge clear
                 // colour, published by the commit it came with.
                 let defaultBg = me.core.map { zonvie_core_get_default_bg($0) } ?? 0
+                // Per-grid fonts go out with the rows this flush drew in them.
+                me.sharedResources?.commitGridFonts()
                 // Only a surface that joined commits, the main one as an
                 // external one; the one that did not still draws from the
                 // texture this flush published.
@@ -1624,12 +1626,57 @@ final class ZonvieCore {
                     : UnsafeBufferPointer<zonvie_cell_stamp>(start: nil, count: 0)
                 shared.cellAge.apply(buf, clear: clear != 0, now: shared.shaderTimeNow())
             },
-            on_font_slot_load: nil,
-            on_font_slot_release: nil,
-            on_grid_font: nil,
-            on_shape_text_run_ex: nil,
-            on_rasterize_glyph_ex: nil,
-            on_rasterize_glyph_by_id_ex: nil
+            on_font_slot_load: { ctx, fontId, utf8, len, scale, outW, outH in
+                guard let ctx, let outW, let outH else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                let payload = utf8.map {
+                    String(decoding: UnsafeRawBufferPointer(start: $0, count: len), as: UTF8.self)
+                } ?? ""
+                // Synchronous by contract: the core sizes the grid from the answer.
+                guard let cell = me.loadFontSlot(fontId: fontId, payload: payload, scale: CGFloat(scale)) else { return 0 }
+                outW.pointee = cell.cellWidthPx
+                outH.pointee = cell.cellHeightPx
+                return 1
+            },
+            on_font_slot_release: { ctx, fontId in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.sharedAtlas?.releaseSlot(fontId: fontId)
+            },
+            on_grid_font: { ctx, gridId, fontId, cellW, cellH, extentW, extentH in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.sharedResources?.setGridFont(gridId, fontId == 0 ? nil : GridFontPx(
+                    fontId: fontId, cellWidthPx: cellW, cellHeightPx: cellH,
+                    extentWidthPx: extentW, extentHeightPx: extentH))
+            },
+            on_shape_text_run_ex: { ctx, fontId, scalars, scalarCount, styleFlags, outGlyphIDs, outClusters, outXAdvance, outXOffset, outYOffset, outCap in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.shapeTextRun(
+                    fontId: fontId,
+                    scalars: scalars!, scalarCount: scalarCount,
+                    styleFlags: styleFlags,
+                    outGlyphIDs: outGlyphIDs!, outClusters: outClusters!,
+                    outXAdvance: outXAdvance!, outXOffset: outXOffset!, outYOffset: outYOffset!,
+                    outCap: outCap
+                )
+            },
+            on_rasterize_glyph_ex: { ctx, fontId, scalar, styleFlags, outBitmap in
+                guard let ctx, let outBitmap else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.rasterizeOnly(fontId: fontId, scalar: scalar, styleFlags: styleFlags,
+                                           corePtr: me.core, outBitmap: outBitmap) ? 1 : 0
+            },
+            on_rasterize_glyph_by_id_ex: { ctx, fontId, glyphID, styleFlags, outBitmap in
+                guard let ctx, let outBitmap else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.rasterizeByGlyphID(fontId: fontId, glyphID: glyphID, styleFlags: styleFlags,
+                                                outBitmap: outBitmap) ? 1 : 0
+            }
         )
 
         self.core = zonvie_core_create(&cb, MemoryLayout<zonvie_callbacks>.size, self.ctxPtr)
@@ -2999,6 +3046,35 @@ final class ZonvieCore {
     func resize(rows: UInt32, cols: UInt32) {
         guard let core else { return }
         zonvie_core_resize(core, rows, cols)
+    }
+
+    /// The font a grid is drawn in when it is not the global one.
+    func gridCellPx(_ gridId: Int64) -> GridFontPx? {
+        sharedResources?.gridFont(gridId)
+    }
+
+    /// on_font_slot_load: the first available candidate of `payload` (the
+    /// guifont list format; empty = the global font), sizes defaulting to the
+    /// global font's. Core thread; loads synchronously.
+    fileprivate func loadFontSlot(fontId: UInt32, payload: String, scale: CGFloat) -> (cellWidthPx: UInt32, cellHeightPx: UInt32)? {
+        guard let shared = sharedResources else { return nil }
+        var face: (name: String, pointSize: CGFloat, features: String)? = nil
+        if !payload.isEmpty {
+            let defaultSize = Double(shared.atlas.currentPointSize)
+            for line in payload.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let parsed = Self.parseFontCandidate(String(line), defaultSize: defaultSize, sizeExplicit: false) else { continue }
+                // CTFontCreateWithName substitutes a missing family silently.
+                if Self.isFontAvailable(parsed.name) {
+                    face = (parsed.name, CGFloat(parsed.size), parsed.features)
+                    break
+                }
+            }
+            guard face != nil else {
+                Self.appLog("[font_slot] font_id=\(fontId) no available font in '\(payload)'")
+                return nil
+            }
+        }
+        return shared.atlas.loadSlot(fontId: fontId, face: face, scale: scale, lineSpacePx: shared.lineSpacePx)
     }
 
     /// Request resize of a specific grid (for external windows).
@@ -4746,8 +4822,10 @@ final class ZonvieCore {
             let widthPx = contentSize.width * scale
             let heightPx = contentSize.height * scale
 
-            let cols = UInt32(widthPx / cellWidthPx)
-            let rows = UInt32(heightPx / cellHeightPx)
+            // A grid in its own font counts its rows and columns in that font.
+            let gf = core.gridCellPx(gridId)
+            let cols = UInt32(widthPx / (gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx))
+            let rows = UInt32(heightPx / (gf.map { CGFloat($0.cellHeightPx) } ?? cellHeightPx))
 
             ZonvieCore.appLog("[external_window] windowDidResize gridId=\(gridId) contentSize=\(contentSize) scale=\(scale) cellH=\(cellHeightPx) cellW=\(cellWidthPx) heightPx=\(heightPx) widthPx=\(widthPx) rows=\(rows) cols=\(cols) lastGridRows=\(lastGridRows) lastGridCols=\(lastGridCols) suppress=\(suppressResizeCallback)")
 
@@ -4828,8 +4906,11 @@ final class ZonvieCore {
                 // surface's rows for the new metrics (invalidate_glyph_cache),
                 // as Windows relies on. Asking Neovim for rows+1 then rows made
                 // every window grow a row and shrink, with two WinResized.
+                let gf = self.gridCellPx(gridId)
                 self.frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                         rows: rows, cols: cols, cellW: cellWidthPx, cellH: cellHeightPx,
+                                         rows: rows, cols: cols,
+                                         cellW: gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx,
+                                         cellH: gf.map { CGFloat($0.cellHeightPx) } ?? cellHeightPx,
                                          applyAnchors: false)
                 ZonvieCore.appLog("[resizeExternalWindows] gridId=\(gridId) rows=\(rows) cols=\(cols)")
             }
@@ -5341,8 +5422,10 @@ final class ZonvieCore {
         }
 
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
-        let cellW = CGFloat(renderer.cellWidthPx)
-        let cellH = CGFloat(renderer.cellHeightPx)
+        // A grid in its own font is framed in that font's cells.
+        let gf = gridCellPx(gridId)
+        let cellW = gf.map { CGFloat($0.cellWidthPx) } ?? CGFloat(renderer.cellWidthPx)
+        let cellH = gf.map { CGFloat($0.cellHeightPx) } ?? CGFloat(renderer.cellHeightPx)
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
         // Resize the OS window to match the grid size. Integer row/col counts
         // on the delegate, not the frame, so floating-point drift cannot
@@ -7214,6 +7297,9 @@ final class ZonvieCore {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=destroy_release grid=\(gridId)")
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
         terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
+        // Runs after a commit or outside any flush, so publishing is safe.
+        sharedResources?.setGridFont(gridId, nil)
+        sharedResources?.commitGridFonts()
         externalGridViewsLock.lock()
         gridSurfaceOwners.removeValue(forKey: gridId)
         let hosts = externalGridViews.filter { $0.key != gridId }.map { $0.value }

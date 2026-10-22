@@ -85,7 +85,14 @@ func stubDamageBandLayerRows(
     _ band: zonvie_damage_band, _ originYPx: Int32, _ layerRows: UInt32, _ rowHeightPx: Int32,
     _ first: UnsafeMutablePointer<UInt32>?, _ last: UnsafeMutablePointer<UInt32>?
 ) -> Bool {
-    fatalError("not used by this test")
+    // The rows the band overlaps; enough to check the Swift margin rule on top.
+    let top = Int(band.top_px) - Int(originYPx)
+    let bottom = Int(band.bottom_px) - Int(originYPx)
+    let h = Int(rowHeightPx)
+    guard h > 0, layerRows > 0, bottom > 0, top < Int(layerRows) * h else { return false }
+    first!.pointee = UInt32(max(0, top) / h)
+    last!.pointee = UInt32(min(Int(layerRows) - 1, (bottom - 1) / h))
+    return true
 }
 
 @_cdecl("zonvie_core_damage_band_for_layer_row")
@@ -257,6 +264,41 @@ private enum SurfaceFramePureTests {
         expect(damage(b, []), [[30, 70]], "all removed")
     }
 
+    /// A grid in its own font (on_grid_font): rows of its own height, clipped
+    /// to its extent, whose bottom margin belongs to its last row.
+    private static func verifyFontLayerGeometry() {
+        var font = SurfaceLayer(gridId: 2, anchorGrid: 1, originPx: simd_float2(0, 30),
+                                rows: 3, cols: 13, z: 1, followsScroll: false)
+        font.cellWidthPx = 7
+        font.cellHeightPx = 12
+        font.extentWidthPx = 100
+        font.extentHeightPx = 40
+        if font.rowHeightPx(surfaceCellHeightPx: 10) != 12 { fail("font layer row height \(font.rowHeightPx(surfaceCellHeightPx: 10))") }
+        if font.drawWidthPx(surfaceCellWidthPx: 8) != 100 { fail("font layer width \(font.drawWidthPx(surfaceCellWidthPx: 8))") }
+        if font.drawHeightPx(rows: 3, surfaceCellHeightPx: 10) != 40 { fail("font layer height with margin \(font.drawHeightPx(rows: 3, surfaceCellHeightPx: 10))") }
+        if font.drawHeightPx(rows: 2, surfaceCellHeightPx: 10) != 24 { fail("font layer partial height \(font.drawHeightPx(rows: 2, surfaceCellHeightPx: 10))") }
+
+        let plain = SurfaceLayer(gridId: 3, anchorGrid: 1, originPx: simd_float2(0, 0),
+                                 rows: 3, cols: 13, z: 1, followsScroll: false)
+        if plain.rowHeightPx(surfaceCellHeightPx: 10) != 10 || plain.drawWidthPx(surfaceCellWidthPx: 8) != 104
+            || plain.drawHeightPx(rows: 3, surfaceCellHeightPx: 10) != 30 {
+            fail("plain layer geometry changed")
+        }
+
+        let b = SurfaceDamageBands()
+        let frame = SurfaceLayerFrame(layer: font, set: nil, state: nil)
+        let got = damage(b, [frame])
+        if got != [[30, 70]] { fail("font layer placement damaged \(got), expected [[30, 70]]") }
+
+        // A band reaching only the margin strip (30 + 3*12 = 66 .. 70) draws the last row.
+        let margin = zonvie_damage_band(top_px: 67, bottom_px: 70)
+        let r = SurfaceDamageBands.rows(in: margin, layer: font, originYPx: 30, rowCount: 3, surfaceCellHeightPx: 10)
+        if r != 2...2 { fail("margin band rows \(String(describing: r)), expected 2...2") }
+        let mid = zonvie_damage_band(top_px: 42, bottom_px: 50)
+        let m = SurfaceDamageBands.rows(in: mid, layer: font, originYPx: 30, rowCount: 3, surfaceCellHeightPx: 10)
+        if m != 1...1 { fail("mid band rows \(String(describing: m)), expected 1...1") }
+    }
+
     private static func verifyLedgerRequire() {
         let ledger = SurfaceRowCapacityLedger(maxRowBuffers: 8)
         ledger.require(rows: 5, row: 2, vertexCount: 10)
@@ -279,6 +321,7 @@ private enum SurfaceFramePureTests {
         verifyTermsBridge()
         verifyDecisionBridge()
         verifyPlacementDamage()
+        verifyFontLayerGeometry()
         verifyLedgerRequire()
         if failures != 0 {
             print("surface frame pure: \(failures) failure(s)")

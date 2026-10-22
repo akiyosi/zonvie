@@ -2351,8 +2351,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             }
 
             // Cell dimensions — integer-rounded, same formula as GridSurfaceRenderer.
-            let cw = Float(shared.cellWidthPx)
-            f.ch = Float(shared.cellHeightPx)
+            // A root grid in its own font is laid out in that font's cell.
+            let gridFont = core?.gridCellPx(gridId)
+            let cw = gridFont.map { Float($0.cellWidthPx) } ?? Float(shared.cellWidthPx)
+            f.ch = gridFont.map { Float($0.cellHeightPx) } ?? Float(shared.cellHeightPx)
             f.cellWi = max(1, UInt32(cw.rounded(.up)))
             f.cellHi = max(1, UInt32(f.ch.rounded(.up)))
             // Viewport: grid-rows based (NOT drawable-based). An external
@@ -2381,7 +2383,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             fixedFloatMask.rebuild(
                 layers: layerSnapshot, rootGridId: gridId, smoothScrolling: f.smoothScrolling,
                 offsets: f.hostedScrollOffsets, rootScrolled: f.scrollOffset != nil,
-                cellW: Float(shared.cellWidthPx), cellH: Float(f.ch), scratch: &fixedFloatRectsScratch
+                cellW: cw, cellH: Float(f.ch), scratch: &fixedFloatRectsScratch
             )
 
             // Glow disables partial-redraw optimizations to prevent additive
@@ -2852,7 +2854,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         for (layerGridId, rows) in layerPlacementRowsUp {
             placementRowsUpSnapshot[layerGridId] = rows
         }
-        for layer in committedSurfaceLayers where layer.gridId != gridId {
+        for var layer in committedSurfaceLayers where layer.gridId != gridId {
+            shared.applyGridFont(to: &layer)
             if let sets = gridBuffers.existingSets(for: layer.gridId) {
                 // This surface keeps no per-layer draw state, so every
                 // entry owes everything.
@@ -3215,10 +3218,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let glow = glowPipeline != nil
         guard f.fontIsCurrent else { return }
         let cellWi = Int(f.cellWi)
-        let cellHi = Int(f.cellHi)
+        let surfaceCellHi = Int(f.cellHi)
         let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
         for entry in layerSnapshot {
             let layer = entry.layer
+            let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rows = min(layer.rows, set.rowLogicalToSlot.count)
             guard rows > 0 else { continue }
@@ -3241,8 +3245,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             guard let scissor = makeSurfaceLayerScissor(
                 originPx: origin,
                 viewportOriginPx: simd_float2(Float(f.vpOriginX), Float(f.vpOriginY)),
-                cols: layer.cols, rows: rows,
-                cellWidthPx: cellWi, cellHeightPx: cellHi,
+                widthPx: layer.drawWidthPx(surfaceCellWidthPx: cellWi),
+                heightPx: layer.drawHeightPx(rows: rows, surfaceCellHeightPx: surfaceCellHi),
                 scale: glow ? 0.5 : 1,
                 targetWidth: glow ? max(1, backTex.width / 2) : backTex.width,
                 targetHeight: glow ? max(1, backTex.height / 2) : backTex.height
@@ -3283,8 +3287,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     encoder.setScissorRect(MTLScissorRect(x: scissor.x, y: top,
                         width: scissor.width, height: bottom - top))
                     guard let bandRows = SurfaceDamageBands.rows(
-                        in: band, originYPx: Int(origin.y.rounded(.down)),
-                        rowCount: rows, rowHeightPx: cellHi
+                        in: band, layer: layer, originYPx: Int(origin.y.rounded(.down)),
+                        rowCount: rows, surfaceCellHeightPx: surfaceCellHi
                     ) else { continue }
                     encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: bandRows,
                         resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
@@ -3925,6 +3929,18 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         guard let hit, let info = grids.first(where: { $0.gridId == hit.gridId }) else {
             return resolveRootTarget(pointPx: pointPx)
         }
+        if hit.gridId == gridId, let fc = fontCell(gridId, localX: pointPx.x, localY: pointPx.y) {
+            return (gridId, fc.row, fc.col)
+        }
+        if core.gridCellPx(hit.gridId) != nil {
+            lock.lock()
+            let layer = committedSurfaceLayers.first { $0.gridId == hit.gridId }
+            lock.unlock()
+            if let layer, let fc = fontCell(hit.gridId, localX: pointPx.x - CGFloat(layer.originPx.x),
+                                            localY: pointPx.y - CGFloat(layer.originPx.y)) {
+                return (hit.gridId, fc.row, fc.col)
+            }
+        }
         return (hit.gridId,
                 scrollAdjustedLocalRow(
                     pointPxY: pointPx.y,
@@ -4025,6 +4041,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
                                              rootOffsetPx: rootOffsetPx, cellH: cellH)
         let info = core?.getVisibleGridsCached().first { $0.gridId == pressed }
+        if let fc = fontCell(pressed, localX: pointPx.x - CGFloat(layer.originPx.x), localY: pointPx.y - originY) {
+            return (pressed, fc.row, fc.col)
+        }
         // Deliberately unclamped to the layer rectangle: a drag that leaves the
         // float still belongs to it, and Neovim clamps the position into the
         // window it was addressed to.
@@ -4035,10 +4054,22 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         )
     }
 
+    /// The cell a layer-local pixel names in a grid drawn in its own font;
+    /// nil for a grid on the global font.
+    private func fontCell(_ gid: Int64, localX: CGFloat, localY: CGFloat) -> (row: Int32, col: Int32)? {
+        guard let gf = core?.gridCellPx(gid) else { return nil }
+        var r: Int32 = 0
+        var c: Int32 = 0
+        zonvie_core_pointer_cell_in_grid(Float(localX), Float(localY), gf.cellWidthPx, gf.cellHeightPx,
+                                         gf.extentWidthPx, gf.extentHeightPx, &r, &c)
+        return (r, c)
+    }
+
     /// This surface's own grid at `pointPx`, with the ease its rows were drawn
     /// with undone.
     private func resolveRootTarget(pointPx: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let scroll = core?.scrollModel else { return (gridId, 0, 0) }
+        if let fc = fontCell(gridId, localX: pointPx.x, localY: pointPx.y) { return (gridId, fc.row, fc.col) }
         let cellW = CGFloat(shared.cellWidthPx)
         let cellH = CGFloat(shared.cellHeightPx)
         guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }

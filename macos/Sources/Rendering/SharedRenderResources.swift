@@ -37,6 +37,16 @@ import QuartzCore
 /// exception and carries `metricsLock`, which is a **leaf**: a surface may take
 /// it while holding its own lock, and nothing under it calls back into a
 /// surface. The atlas has locks of its own and documents them itself.
+/// A grid's own font as on_grid_font reports it: the font, its cell, and the
+/// pixel box the core clips the grid to.
+struct GridFontPx {
+    let fontId: UInt32
+    let cellWidthPx: UInt32
+    let cellHeightPx: UInt32
+    let extentWidthPx: UInt32
+    let extentHeightPx: UInt32
+}
+
 final class SharedRenderResources {
     let device: MTLDevice
 
@@ -67,6 +77,56 @@ final class SharedRenderResources {
         metricsLock.lock()
         linespacePx = px
         metricsLock.unlock()
+    }
+
+    /// `linespace` in drawable pixels, as cellHeightPx folds it in.
+    var lineSpacePx: Int32 {
+        metricsLock.lock()
+        defer { metricsLock.unlock() }
+        return linespacePx
+    }
+
+    /// Grids drawn in their own font (on_grid_font). The core thread stages
+    /// changes and publishes them with the flush that regenerates those
+    /// grids' rows (commitGridFonts), so a frame never pairs rows of one font
+    /// with the geometry of another. Read by draw, layout and input on the
+    /// main thread; a leaf lock like `metricsLock`. Empty unless a window
+    /// sets a per-grid font, so the common lookup is one lock and an empty
+    /// probe.
+    private var gridFontsLock = os_unfair_lock()
+    private var gridFonts: [Int64: GridFontPx] = [:]
+    /// Core thread only.
+    private var stagedGridFonts: [Int64: GridFontPx] = [:]
+    private var gridFontsStaged = false
+
+    /// Core thread. `nil` = the grid is back on the global font, or gone.
+    func setGridFont(_ gridId: Int64, _ font: GridFontPx?) {
+        if let font { stagedGridFonts[gridId] = font } else { stagedGridFonts.removeValue(forKey: gridId) }
+        gridFontsStaged = true
+    }
+
+    /// Core thread, at a committed flush end.
+    func commitGridFonts() {
+        guard gridFontsStaged else { return }
+        gridFontsStaged = false
+        os_unfair_lock_lock(&gridFontsLock)
+        gridFonts = stagedGridFonts
+        os_unfair_lock_unlock(&gridFontsLock)
+    }
+
+    func gridFont(_ gridId: Int64) -> GridFontPx? {
+        os_unfair_lock_lock(&gridFontsLock)
+        defer { os_unfair_lock_unlock(&gridFontsLock) }
+        return gridFonts.isEmpty ? nil : gridFonts[gridId]
+    }
+
+    /// Fill a layer's per-grid font geometry from the committed table.
+    func applyGridFont(to layer: inout SurfaceLayer) {
+        guard let gf = gridFont(layer.gridId) else { return }
+        layer.cellWidthPx = Int(gf.cellWidthPx)
+        layer.cellHeightPx = Int(gf.cellHeightPx)
+        layer.extentWidthPx = Int(gf.extentWidthPx)
+        layer.extentHeightPx = Int(gf.extentHeightPx)
     }
 
     func setBackingScale(_ s: CGFloat) {
@@ -454,8 +514,12 @@ final class SharedRenderResources {
         // the two cannot disagree for a frame.
         let visible = cursorVisible ||
             (cmdlineCursorVisible && cursor.gridId == ZonvieCore.cmdlineGridId)
+        // The cursor grid's own cell when it has a font, so bar/block is
+        // classified against the cell the cursor is drawn in.
+        let cursorFont = gridFont(cursor.gridId)
         zonvie_shader_fill_edit_uniforms(
-            &uniforms, cellWidthPx, cellHeightPx, Float(gridOrigin.x), Float(gridOrigin.y),
+            &uniforms, cursorFont.map { Float($0.cellWidthPx) } ?? cellWidthPx,
+            cursorFont.map { Float($0.cellHeightPx) } ?? cellHeightPx, Float(gridOrigin.x), Float(gridOrigin.y),
             cellAge.lastEdit(grid: cellAgeGrid), visible, shaderWantsEditInputs)
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,

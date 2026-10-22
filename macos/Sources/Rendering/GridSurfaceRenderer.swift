@@ -142,8 +142,8 @@ func layerOverBlitRows(
         Int32(clamping: Int(layer.originPx.y.rounded(.down))),
         UInt32(clamping: layer.rows),
         UInt32(clamping: layer.cols),
-        Int32(clamping: cellWidthPx),
-        Int32(clamping: rowHeightPx),
+        Int32(clamping: layer.cellWidthPx > 0 ? layer.cellWidthPx : cellWidthPx),
+        Int32(clamping: layer.rowHeightPx(surfaceCellHeightPx: rowHeightPx)),
         &over
     ) else { return nil }
     return over
@@ -3896,7 +3896,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             f.anyLayerWork = true
         }
         swap(&f.bgClear, &bgClearPending)
-        for layer in committedSurfaceLayers {
+        for var layer in committedSurfaceLayers {
+            shared.applyGridFont(to: &layer)
             // Only a grid the committed layout places is consumed. Work
             // staged for one not on screen yet waits for the layout that
             // places it, which marks it fully dirty (see commitFlush).
@@ -4076,6 +4077,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // Staged against a grid size the committed layout no longer
                 // places, so its rows do not name this rectangle's rows.
                 refusalReason = "size"
+            } else if layer.cellHeightPx > 0 {
+                // A grid in its own font: its rows and margin are not on the
+                // surface's row lattice the blit and its overlap rules assume.
+                refusalReason = "font"
             } else {
                 plan = RowScrollBlitPlan.make(
                     rowStart: scroll.rowStart,
@@ -4175,7 +4180,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 rowEnd: scroll.rowEnd,
                 originYPx: originYPx,
                 textureHeightPx: backTex.height,
-                rowHeightPx: cellHi
+                rowHeightPx: layer.rowHeightPx(surfaceCellHeightPx: cellHi)
             ) else { continue }
             state.drawRows.append(contentsOf: refusedRows)
         }
@@ -4218,11 +4223,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     retainedRowCount: retainedRowCount,
                     loadActionIsClear: false
                 ) {
-                    damageBands.addRows(state.drawRows, originYPx: topPx, rowHeightPx: bandRowHeightPx)
+                    let layerRowHeightPx = layer.rowHeightPx(surfaceCellHeightPx: bandRowHeightPx)
+                    damageBands.addRows(state.drawRows, originYPx: topPx, rowHeightPx: layerRowHeightPx)
+                    // The core emits a font grid's bottom margin with its last row.
+                    let rowsBottomPx = topPx + rowCount * layerRowHeightPx
+                    let layerBottomPx = topPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: bandRowHeightPx)
+                    if layerBottomPx > rowsBottomPx, state.drawRows.contains(rowCount - 1) {
+                        damageBands.addSpan(topPx: rowsBottomPx, bottomPx: layerBottomPx)
+                    }
                     continue
                 }
             }
-            damageBands.addSpan(topPx: topPx, bottomPx: topPx + rowCount * bandRowHeightPx)
+            damageBands.addSpan(topPx: topPx, bottomPx: topPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: bandRowHeightPx))
         }
         damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: backTex.height)
         if f.rowMode {
@@ -4233,9 +4245,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         for entry in layerSnapshot.dropFirst() {
             guard let state = entry.state else { continue }
             damageBands.layerRows(
+                entry.layer,
                 originYPx: Int(entry.layer.originPx.y.rounded(.down)),
                 rowCount: f.layerResolvableRowCount(entry),
-                rowHeightPx: bandRowHeightPx, into: &state.drawRows)
+                surfaceCellHeightPx: bandRowHeightPx, into: &state.drawRows)
         }
     }
 
@@ -4385,11 +4398,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         backTex: MTLTexture,
         loadActionIsClear: Bool
     ) {
-        let cellHi = Int(f.cellHi)
+        let surfaceCellHi = Int(f.cellHi)
         let use2Pass = f.use2Pass
         enc.setRenderPipelineState(shared.pipeline!)
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
+            let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rowCount = f.layerResolvableRowCount(entry)
             guard rowCount > 0 else { continue }
@@ -4409,7 +4423,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let bodilyMoved = placed.bodilyMoved
             let originX = Int(drawOriginPx.x.rounded(.down))
             let originY = Int(drawOriginPx.y.rounded(.down))
-            let widthPx = layer.cols * Int(f.cellWi)
+            let widthPx = layer.drawWidthPx(surfaceCellWidthPx: Int(f.cellWi))
             let scissorPadY = surfaceLayerScissorPadY(topPx: drawOriginPx.y)
 
             // This layer's rows, then the rows its own smooth scroll
@@ -4513,10 +4527,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // there. A row the band only reaches through its extra
                 // row is cleared and drawn under the same clip: outside
                 // the band nothing of it lands.
-                let layerBottomPx = originY + rowCount * cellHi + scissorPadY
+                let layerBottomPx = originY + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: surfaceCellHi) + scissorPadY
                 for band in damageBands.bands {
                     guard let rows = SurfaceDamageBands.rows(
-                        in: band, originYPx: originY, rowCount: rowCount, rowHeightPx: cellHi
+                        in: band, layer: layer, originYPx: originY, rowCount: rowCount,
+                        surfaceCellHeightPx: surfaceCellHi
                     ) else { continue }
                     let top = max(Int(band.top_px), originY)
                     let bottom = min(Int(band.bottom_px), layerBottomPx)
@@ -4623,7 +4638,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // root-side extraction to fall back on: the root
                 // pass takes only gridId == 1 retained rows.
                 let retainedForGlowCount = collectLayerRetainedRows(layer.gridId, &f)
-                let cellHi = Float(f.cellHi)
+                let cellHi = Float(layer.rowHeightPx(surfaceCellHeightPx: Int(f.cellHi)))
                 encodeSurfaceLayerGlowRows(
                     encoder: enc,
                     rows: 0..<(rowCount + retainedForGlowCount),
@@ -5454,8 +5469,8 @@ fileprivate struct MainSurfaceFrame {
             : layer.originPx
         guard let scissor = makeSurfaceLayerScissor(
             originPx: drawOriginPx,
-            cols: layer.cols, rows: rows,
-            cellWidthPx: Int(cellWi), cellHeightPx: Int(cellHi),
+            widthPx: layer.drawWidthPx(surfaceCellWidthPx: Int(cellWi)),
+            heightPx: layer.drawHeightPx(rows: rows, surfaceCellHeightPx: Int(cellHi)),
             scale: scale,
             targetWidth: targetWidth, targetHeight: targetHeight
         ) else { return nil }

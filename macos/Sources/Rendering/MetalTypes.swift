@@ -1164,6 +1164,28 @@ struct SurfaceLayer {
     /// A floating window (Neovim zindex > 0), not a split; `z` is the paint
     /// rank and is > 0 for both.
     var isFloat: Bool = false
+    /// A grid drawn in its own font (on_grid_font): its cell and the pixel
+    /// box the core clips it to, margin included. 0 = the surface's cell.
+    var cellWidthPx: Int = 0
+    var cellHeightPx: Int = 0
+    var extentWidthPx: Int = 0
+    var extentHeightPx: Int = 0
+
+    func rowHeightPx(surfaceCellHeightPx: Int) -> Int {
+        cellHeightPx > 0 ? cellHeightPx : surfaceCellHeightPx
+    }
+
+    func drawWidthPx(surfaceCellWidthPx: Int) -> Int {
+        extentWidthPx > 0 ? extentWidthPx : cols * surfaceCellWidthPx
+    }
+
+    /// The first `rows` rows; all of them reach the extent, whose bottom
+    /// margin the core emits with the last row.
+    func drawHeightPx(rows n: Int, surfaceCellHeightPx: Int) -> Int {
+        let h = n * rowHeightPx(surfaceCellHeightPx: surfaceCellHeightPx)
+        guard extentHeightPx > 0 else { return h }
+        return n >= rows ? extentHeightPx : min(h, extentHeightPx)
+    }
 }
 
 /// One published cursor, and the buffers the frames reading it need.
@@ -1338,10 +1360,8 @@ func surfaceLayerScissorPadY(topPx: Float) -> Int {
 func makeSurfaceLayerScissor(
     originPx: simd_float2,
     viewportOriginPx: simd_float2 = simd_float2(0, 0),
-    cols: Int,
-    rows: Int,
-    cellWidthPx: Int,
-    cellHeightPx: Int,
+    widthPx: Int,
+    heightPx: Int,
     scale: Float = 1,
     targetWidth: Int,
     targetHeight: Int
@@ -1350,8 +1370,8 @@ func makeSurfaceLayerScissor(
     return clampScissor(
         x: Int(((viewportOriginPx.x + originPx.x) * scale).rounded(.down)),
         y: Int(topPx.rounded(.down)),
-        width: Int(Float(cols * cellWidthPx) * scale),
-        height: Int(Float(rows * cellHeightPx) * scale) + surfaceLayerScissorPadY(topPx: topPx),
+        width: Int(Float(widthPx) * scale),
+        height: Int(Float(heightPx) * scale) + surfaceLayerScissorPadY(topPx: topPx),
         targetWidth: targetWidth,
         targetHeight: targetHeight
     )
@@ -3755,6 +3775,12 @@ final class SurfaceFixedFloatMask {
         return false
     }
 
+    /// A layer's bottom-right corner; a grid in its own font ends at its extent.
+    static func layerEnd(_ l: SurfaceLayer, cellW: Float, cellH: Float) -> (x1: Float, y1: Float) {
+        (l.originPx.x + (l.extentWidthPx > 0 ? Float(l.extentWidthPx) : Float(l.cols) * cellW),
+         l.originPx.y + (l.extentHeightPx > 0 ? Float(l.extentHeightPx) : Float(l.rows) * cellH))
+    }
+
     /// Whether a fixed float at `rect` can receive a scrolled fragment at
     /// all: the fragment shader clips scrolled content to its own grid's
     /// rectangle (`content_top_y`/`content_bottom_y`), so a float that meets
@@ -3774,8 +3800,7 @@ final class SurfaceFixedFloatMask {
             // it reaches nothing; a placed one reaches its own rectangle.
             guard let entry = layers.first(where: { $0.layer.gridId == gridId }) else { continue }
             let l = entry.layer
-            let x1 = l.originPx.x + Float(l.cols) * cellW
-            let y1 = l.originPx.y + Float(l.rows) * cellH
+            let (x1, y1) = Self.layerEnd(l, cellW: cellW, cellH: cellH)
             if l.originPx.x < rect.x1 && x1 > rect.x0 && l.originPx.y < rect.bottom && y1 > rect.top {
                 return true
             }
@@ -3801,11 +3826,12 @@ final class SurfaceFixedFloatMask {
         if smoothScrolling {
             for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) {
                 let layer = entry.layer
+                let (x1, y1) = Self.layerEnd(layer, cellW: cellW, cellH: cellH)
                 let rect = GridSurfaceRenderer.FixedFloatRect(
                     x0: layer.originPx.x,
-                    x1: layer.originPx.x + Float(layer.cols) * cellW,
+                    x1: x1,
                     top: layer.originPx.y,
-                    bottom: layer.originPx.y + Float(layer.rows) * cellH,
+                    bottom: y1,
                     zindex: Int32(clamping: layer.z)
                 )
                 if !rootScrolled && !Self.reachable(rect, offsets: offsets, layers: layers, rootGridId: rootGridId, cellW: cellW, cellH: cellH) {

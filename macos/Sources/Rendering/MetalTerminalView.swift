@@ -479,6 +479,15 @@ final class MetalTerminalView: GridInputView {
         guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
             return (1, g.globalRow, g.globalCol)
         }
+        if let gf = core.gridCellPx(pinned) {
+            var r: Int32 = 0
+            var c: Int32 = 0
+            zonvie_core_pointer_cell_in_grid(
+                Float(g.pointPx.x) - Float(current.startCol) * Float(g.cellW),
+                Float(g.pointPx.y) - Float(current.startRow) * Float(g.cellH),
+                gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
+            return (pinned, r, c)
+        }
         let localRow: Int32
         if let followerOffsetPx = drawnFollowerOffsetsPx()[pinned] {
             // A follower is drawn displaced bodily and has no ease of its
@@ -1040,6 +1049,18 @@ final class MetalTerminalView: GridInputView {
                 band: GridRowBand(of: grid),
                 scrollOffsetPx: offsetPx
             )
+            // A grid in its own font: the global lattice found the grid; the
+            // cell inside it is measured in the grid's own cells.
+            if bestGridId != 1, let gf = core.gridCellPx(bestGridId) {
+                var r: Int32 = 0
+                var c: Int32 = 0
+                zonvie_core_pointer_cell_in_grid(
+                    Float(pointPx.x) - Float(grid.startCol) * Float(g.cellW),
+                    Float(pointPx.y - offsetPx) - Float(grid.startRow) * Float(cellH),
+                    gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
+                localRow = r
+                localCol = c
+            }
         }
 
         ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol) scrollOffset=\(offsetPx)")
