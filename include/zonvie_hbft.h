@@ -25,6 +25,12 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
 zonvie_ft_hb_font* zonvie_ft_hb_font_create_borrowed(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index);
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f);
 
+// The fixed strike (px) a bitmap-only face such as a CBDT colour emoji font
+// was opened at, when it has no size near the requested pixel_size; 0 for a
+// scalable face. Its bitmaps, advances and positions are then in strike px,
+// and the caller scales them to pixel_size.
+uint32_t zonvie_ft_hb_font_strike_px(const zonvie_ft_hb_font* f);
+
 // Set OpenType features for HarfBuzz shaping.
 // Stored on the font handle and applied to all subsequent hb_shape() calls.
 // count must be <= ZONVIE_MAX_FONT_FEATURES; excess features are silently ignored.
