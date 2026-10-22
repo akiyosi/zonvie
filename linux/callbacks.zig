@@ -13,6 +13,7 @@ const applog = @import("app_log.zig");
 const input = @import("input.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const ui_widgets = @import("ui_widgets.zig");
+const ext_window = @import("ext_window.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -151,15 +152,6 @@ fn onSurfaceLayout(
     _ = surface_rows;
     _ = surface_cols;
     const app = appFrom(ctx);
-    // A surface this frontend never opened (an ext_windows grid before M4)
-    // is ignored: a force resend here would loop, since none will open.
-    if (surface_id != 1 and overlay_layout.kindOf(surface_id) == null) {
-        if (!app.foreign_surface_logged) {
-            applog.appLog("[linux] on_surface_layout: ignoring surface {d}\n", .{surface_id});
-            app.foreign_surface_logged = true;
-        }
-        return;
-    }
     lock(app);
     defer unlock(app);
     app.surface.stageLayers(app.alloc, surface_id, layers[0..count]) catch failFlush(app);
@@ -169,31 +161,39 @@ fn onSurfaceLayout(
 /// A repeat for an open surface updates its size and anchor.
 fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
     const app = appFrom(ctx);
-    const kind = overlay_layout.kindOf(grid_id) orelse {
-        applog.appLog("[linux] on_external_window: no window for grid {d}\n", .{grid_id});
-        return;
-    };
     applog.appLog("[linux] external window open grid={d} win={d} {d}x{d} at ({d},{d})\n", .{ grid_id, win, rows, cols, start_row, start_col });
-    lock(app);
-    defer unlock(app);
-    app.surface.openSurface(app.alloc, grid_id) catch {
+    {
+        lock(app);
+        defer unlock(app);
         // Not recorded by the core when the flush aborts: the retry opens it.
-        failFlush(app);
-        return;
-    };
-    app.overlays[@intFromEnum(kind)] = .{ .open = true, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col };
+        app.surface.openSurface(app.alloc, grid_id) catch return failFlush(app);
+        if (overlay_layout.kindOf(grid_id)) |kind| {
+            app.overlays[@intFromEnum(kind)] = .{ .open = true, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col };
+            return;
+        }
+        // An ext_windows grid: a window of its own, opened on the GTK thread.
+        app.ext_ops.append(app.alloc, .{ .kind = .open, .grid_id = grid_id, .rows = rows, .cols = cols }) catch return failFlush(app);
+    }
+    ext_window.queueApply(app);
 }
 
 fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = appFrom(ctx);
-    const kind = overlay_layout.kindOf(grid_id) orelse return;
     applog.appLog("[linux] external window close grid={d}\n", .{grid_id});
     {
         lock(app);
         defer unlock(app);
+        if (overlay_layout.kindOf(grid_id)) |kind| {
+            app.overlays[@intFromEnum(kind)] = .{};
+        } else {
+            // Reserved before closing, so a refused close leaves the surface
+            // open for the retry to close again.
+            app.ext_ops.ensureUnusedCapacity(app.alloc, 1) catch return failFlush(app);
+            app.ext_ops.appendAssumeCapacity(.{ .kind = .close, .grid_id = grid_id });
+        }
         app.surface.closeSurface(app.alloc, grid_id);
-        app.overlays[@intFromEnum(kind)] = .{};
     }
+    ext_window.queueApply(app);
     queueRender(app);
 }
 
@@ -351,7 +351,7 @@ pub fn queueRender(app: *App) void {
 fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     app.render_idle_queued.store(false, .release);
-    if (app.gl_area) |area| gtk.gtk_gl_area_queue_render(area);
+    app.queueRenderAll();
     input.updateImeCursor(app);
     return 0;
 }
@@ -376,6 +376,7 @@ fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void
     };
     @memset(ops.mirror.items, 0);
     ops.recreate = true;
+    ops.gen +%= 1;
     ops.w = atlas_w;
     ops.h = atlas_h;
 }
@@ -404,6 +405,7 @@ fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height:
         @memcpy(ops.mirror.items[dst_off..][0..row_bytes], src[r * row_bytes ..][0..row_bytes]);
     }
     ops.uploads.appendAssumeCapacity(.{ .x = dest_x, .y = dest_y, .w = width, .h = height, .offset = offset });
+    ops.gen +%= 1;
 }
 
 fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
@@ -610,7 +612,7 @@ fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
-    if (appFrom(data).im_context) |im| gtk.gtk_im_context_reset(im);
+    if (appFrom(data).pointer.im_context) |im| gtk.gtk_im_context_reset(im);
     return 0;
 }
 

@@ -9,42 +9,64 @@ const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
 
-fn appFrom(data: ?*anyopaque) *App {
+/// One GLArea's input: the surface its pointer addresses, its IME context
+/// and the press it is tracking. The main window's lives in App; each
+/// external window owns one.
+pub const Pointer = struct {
+    app: *App,
+    /// 1 for the main window, else the external window's root grid.
+    surface_id: i64 = 1,
+    im_context: ?*anyopaque = null,
+    /// Logical widget px of the last pointer motion; the wheel has no position.
+    x: f64 = 0,
+    y: f64 = 0,
+    /// Button held since a press, and the grid that press chose.
+    held_button: ?[*:0]const u8 = null,
+    press_grid_id: i64 = 1,
+    drag_row: i32 = -1,
+    drag_col: i32 = -1,
+};
+
+fn ptrFrom(data: ?*anyopaque) *Pointer {
     return @ptrCast(@alignCast(data.?));
 }
 
-pub fn attach(app: *App, area: *anyopaque) void {
+fn appFrom(data: ?*anyopaque) *App {
+    return ptrFrom(data).app;
+}
+
+pub fn attach(p: *Pointer, area: *anyopaque) void {
     const im = gtk.gtk_im_multicontext_new() orelse return;
-    app.im_context = im;
+    p.im_context = im;
     gtk.gtk_im_context_set_client_widget(im, area);
-    _ = gtk.g_signal_connect(im, "commit", @ptrCast(&onImCommit), app);
-    _ = gtk.g_signal_connect(im, "preedit-changed", @ptrCast(&onPreeditChanged), app);
-    _ = gtk.g_signal_connect(im, "preedit-end", @ptrCast(&onPreeditEnd), app);
+    _ = gtk.g_signal_connect(im, "commit", @ptrCast(&onImCommit), p);
+    _ = gtk.g_signal_connect(im, "preedit-changed", @ptrCast(&onPreeditChanged), p);
+    _ = gtk.g_signal_connect(im, "preedit-end", @ptrCast(&onPreeditEnd), p);
 
     if (gtk.gtk_event_controller_key_new()) |key| {
         // The controller runs gtk_im_context_filter_keypress itself and
         // emits key-pressed only for keys the IME did not consume.
         gtk.gtk_event_controller_key_set_im_context(key, im);
-        _ = gtk.g_signal_connect(key, "key-pressed", @ptrCast(&onKeyPressed), app);
+        _ = gtk.g_signal_connect(key, "key-pressed", @ptrCast(&onKeyPressed), p);
         gtk.gtk_widget_add_controller(area, key);
     }
     if (gtk.gtk_event_controller_focus_new()) |focus| {
-        _ = gtk.g_signal_connect(focus, "enter", @ptrCast(&onFocusIn), app);
-        _ = gtk.g_signal_connect(focus, "leave", @ptrCast(&onFocusOut), app);
+        _ = gtk.g_signal_connect(focus, "enter", @ptrCast(&onFocusIn), p);
+        _ = gtk.g_signal_connect(focus, "leave", @ptrCast(&onFocusOut), p);
         gtk.gtk_widget_add_controller(area, focus);
     }
     if (gtk.gtk_gesture_click_new()) |click| {
         gtk.gtk_gesture_single_set_button(click, 0);
-        _ = gtk.g_signal_connect(click, "pressed", @ptrCast(&onPressed), app);
-        _ = gtk.g_signal_connect(click, "released", @ptrCast(&onReleased), app);
+        _ = gtk.g_signal_connect(click, "pressed", @ptrCast(&onPressed), p);
+        _ = gtk.g_signal_connect(click, "released", @ptrCast(&onReleased), p);
         gtk.gtk_widget_add_controller(area, click);
     }
     if (gtk.gtk_event_controller_motion_new()) |motion| {
-        _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onMotion), app);
+        _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onMotion), p);
         gtk.gtk_widget_add_controller(area, motion);
     }
     if (gtk.gtk_event_controller_scroll_new(gtk.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES | gtk.GTK_EVENT_CONTROLLER_SCROLL_DISCRETE)) |scroll| {
-        _ = gtk.g_signal_connect(scroll, "scroll", @ptrCast(&onScroll), app);
+        _ = gtk.g_signal_connect(scroll, "scroll", @ptrCast(&onScroll), p);
         gtk.gtk_widget_add_controller(area, scroll);
     }
 }
@@ -111,17 +133,18 @@ fn onPreeditEnd(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
 fn onFocusIn(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
-    if (appFrom(data).im_context) |im| gtk.gtk_im_context_focus_in(im);
+    if (ptrFrom(data).im_context) |im| gtk.gtk_im_context_focus_in(im);
 }
 
 fn onFocusOut(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
-    if (appFrom(data).im_context) |im| gtk.gtk_im_context_focus_out(im);
+    if (ptrFrom(data).im_context) |im| gtk.gtk_im_context_focus_out(im);
 }
 
-/// Places the IME candidate window at the committed cursor, in logical px.
+/// Places the main window's IME candidate window at the committed cursor,
+/// in logical px.
 pub fn updateImeCursor(app: *App) void {
-    const im = app.im_context orelse return;
+    const im = app.pointer.im_context orelse return;
     var rect: gtk.GdkRectangle = undefined;
     {
         app.mu.lockUncancelable(clock.io());
@@ -177,25 +200,28 @@ fn surfaceCell(app: *App, x: f64, y: f64) ?@TypeOf(transform.pxToCell(0, 0, 1, 1
     return transform.pxToCell(x * s, y * s, cw, ch);
 }
 
-fn resolve(app: *App, cp: *core.zonvie_core, x: f64, y: f64, require_scrollable: c_int) ?Cell {
+/// On a miss the surface's own root grid takes the position.
+fn resolve(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64, require_scrollable: c_int) ?Cell {
+    const app = p.app;
     const c = surfaceCell(app, x, y) orelse return null;
     refreshGrids(app, cp);
     var hit: core.zonvie_pointer_hit = undefined;
-    if (core.zonvie_core_resolve_pointer_grid(&app.pointer_grids, app.pointer_grids_len, 1, c.row, c.col, require_scrollable, &hit) != 0) {
+    if (core.zonvie_core_resolve_pointer_grid(&app.pointer_grids, app.pointer_grids_len, p.surface_id, c.row, c.col, require_scrollable, &hit) != 0) {
         return .{ .grid_id = hit.grid_id, .row = hit.row, .col = hit.col };
     }
-    return .{ .grid_id = 1, .row = @max(0, c.row), .col = @max(0, c.col) };
+    return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
 }
 
 /// Rebases a surface position into the grid the press chose, so a drag that
 /// leaves a float keeps addressing it.
-fn inPressGrid(app: *App, x: f64, y: f64) ?Cell {
+fn inPressGrid(p: *Pointer, x: f64, y: f64) ?Cell {
+    const app = p.app;
     const c = surfaceCell(app, x, y) orelse return null;
     for (app.pointer_grids[0..app.pointer_grids_len]) |g| {
-        if (g.grid_id != app.press_grid_id or app.press_grid_id == 1) continue;
+        if (g.grid_id != p.press_grid_id or p.press_grid_id == p.surface_id) continue;
         return .{ .grid_id = g.grid_id, .row = c.row - g.start_row, .col = c.col - g.start_col };
     }
-    return .{ .grid_id = 1, .row = @max(0, c.row), .col = @max(0, c.col) };
+    return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
 }
 
 fn buttonName(button: c_uint) ?[*:0]const u8 {
@@ -211,59 +237,59 @@ fn buttonName(button: c_uint) ?[*:0]const u8 {
 
 fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
     _ = n_press;
-    const app = appFrom(data);
-    const cp = app.corep orelse return;
+    const p = ptrFrom(data);
+    const cp = p.app.corep orelse return;
     const name = buttonName(gtk.gtk_gesture_single_get_current_button(gesture.?)) orelse return;
-    const c = resolve(app, cp, x, y, 0) orelse return;
+    const c = resolve(p, cp, x, y, 0) orelse return;
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
-    app.held_button = name;
-    app.press_grid_id = c.grid_id;
-    app.drag_row = c.row;
-    app.drag_col = c.col;
+    p.held_button = name;
+    p.press_grid_id = c.grid_id;
+    p.drag_row = c.row;
+    p.drag_col = c.col;
     core.zonvie_core_send_mouse_input(cp, name, "press", m.ptr, c.grid_id, c.row, c.col);
 }
 
 fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
     _ = n_press;
-    const app = appFrom(data);
-    const cp = app.corep orelse return;
-    const name = app.held_button orelse return;
-    app.held_button = null;
-    const c = inPressGrid(app, x, y) orelse return;
+    const p = ptrFrom(data);
+    const cp = p.app.corep orelse return;
+    const name = p.held_button orelse return;
+    p.held_button = null;
+    const c = inPressGrid(p, x, y) orelse return;
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "release", m.ptr, c.grid_id, c.row, c.col);
 }
 
 fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
-    const app = appFrom(data);
-    app.pointer_x = x;
-    app.pointer_y = y;
-    const name = app.held_button orelse return;
-    const cp = app.corep orelse return;
-    const c = inPressGrid(app, x, y) orelse return;
-    if (c.row == app.drag_row and c.col == app.drag_col) return;
-    app.drag_row = c.row;
-    app.drag_col = c.col;
+    const p = ptrFrom(data);
+    p.x = x;
+    p.y = y;
+    const name = p.held_button orelse return;
+    const cp = p.app.corep orelse return;
+    const c = inPressGrid(p, x, y) orelse return;
+    if (c.row == p.drag_row and c.col == p.drag_col) return;
+    p.drag_row = c.row;
+    p.drag_col = c.col;
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "drag", m.ptr, c.grid_id, c.row, c.col);
 }
 
 fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {
-    const app = appFrom(data);
-    const cp = app.corep orelse return 0;
+    const p = ptrFrom(data);
+    const cp = p.app.corep orelse return 0;
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     if (dy != 0) {
         // Vertical only: a float showing all its lines lets the wheel through.
-        const c = resolve(app, cp, app.pointer_x, app.pointer_y, 1) orelse return 1;
+        const c = resolve(p, cp, p.x, p.y, 1) orelse return 1;
         const dir: [*:0]const u8 = if (dy > 0) "down" else "up";
         sendSteps(cp, c, dir, m.ptr, dy);
     }
     if (dx != 0) {
-        const c = resolve(app, cp, app.pointer_x, app.pointer_y, 0) orelse return 1;
+        const c = resolve(p, cp, p.x, p.y, 0) orelse return 1;
         const dir: [*:0]const u8 = if (dx > 0) "right" else "left";
         sendSteps(cp, c, dir, m.ptr, dx);
     }

@@ -108,6 +108,8 @@ pub extern "c" fn gtk_application_new(application_id: [*:0]const u8, flags: c_ui
 pub extern "c" fn g_application_run(application: *anyopaque, argc: c_int, argv: ?*anyopaque) c_int;
 pub extern "c" fn g_object_unref(object: *anyopaque) void;
 pub extern "c" fn gtk_application_window_new(application: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_window_new() ?*anyopaque;
+pub extern "c" fn gtk_window_set_application(window: *anyopaque, application: ?*anyopaque) void;
 pub extern "c" fn gtk_window_set_default_size(window: *anyopaque, width: c_int, height: c_int) void;
 pub extern "c" fn gtk_window_set_child(window: *anyopaque, child: ?*anyopaque) void;
 pub extern "c" fn gtk_window_present(window: *anyopaque) void;

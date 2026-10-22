@@ -1,5 +1,7 @@
 //! OpenGL 3.3 painter for the committed surface snapshot. Runs on the GTK
-//! main thread with the GtkGLArea context current and its FBO bound.
+//! main thread with a GtkGLArea's context current and its FBO bound. Each
+//! GLArea (the main window, every external window) owns a Target: GTK gives
+//! every area a context of its own, so nothing GL is shared between them.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -17,6 +19,27 @@ const rules = core.frontend_rules;
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
+
+/// One GLArea's GL objects, valid between realize and unrealize, and the
+/// size it draws at (device px), set by its resize handler.
+pub const Target = struct {
+    program: u32 = 0,
+    vao: u32 = 0,
+    vbo: u32 = 0,
+    vbo_cap_bytes: usize = 0,
+    atlas_tex: u32 = 0,
+    /// Size the atlas texture was allocated at; 0 until it holds the atlas.
+    atlas_w: u32 = 0,
+    atlas_h: u32 = 0,
+    /// AtlasOps.gen this texture matches; external windows sync by it.
+    atlas_gen: u64 = 0,
+    u_scale: i32 = -1,
+    u_offset: i32 = -1,
+    u_scroll_offset: i32 = -1,
+    u_layer_origin_x: i32 = -1,
+    w_px: u32 = 0,
+    h_px: u32 = 0,
+};
 
 fn compile(kind: gl.GLenum, prefix: [:0]const u8) ?gl.GLuint {
     const sh = gl.glCreateShader(kind);
@@ -37,7 +60,7 @@ fn compile(kind: gl.GLenum, prefix: [:0]const u8) ?gl.GLuint {
     return sh;
 }
 
-pub fn realize(app: *App) bool {
+pub fn realize(t: *Target) bool {
     const vs = compile(gl.GL_VERTEX_SHADER, "#version 330 core\n#define VERTEX\n") orelse return false;
     defer gl.glDeleteShader(vs);
     const fs = compile(gl.GL_FRAGMENT_SHADER, "#version 330 core\n#define FRAGMENT\n") orelse return false;
@@ -56,20 +79,20 @@ pub fn realize(app: *App) bool {
         gl.glDeleteProgram(prog);
         return false;
     }
-    app.gl_program = prog;
-    app.gl_u_scale = gl.glGetUniformLocation(prog, "u_scale");
-    app.gl_u_offset = gl.glGetUniformLocation(prog, "u_offset");
-    app.gl_u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
-    app.gl_u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
+    t.program = prog;
+    t.u_scale = gl.glGetUniformLocation(prog, "u_scale");
+    t.u_offset = gl.glGetUniformLocation(prog, "u_offset");
+    t.u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
+    t.u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
     gl.glUseProgram(prog);
     gl.glUniform1i(gl.glGetUniformLocation(prog, "u_atlas"), 0);
 
-    gl.glGenVertexArrays(1, &app.gl_vao);
-    gl.glBindVertexArray(app.gl_vao);
-    gl.glGenBuffers(1, &app.gl_vbo);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, app.gl_vbo);
+    gl.glGenVertexArrays(1, &t.vao);
+    gl.glBindVertexArray(t.vao);
+    gl.glGenBuffers(1, &t.vbo);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
     gl.glBufferData(gl.GL_ARRAY_BUFFER, @intCast(initial_vbo_bytes), null, gl.GL_DYNAMIC_DRAW);
-    app.gl_vbo_cap_bytes = initial_vbo_bytes;
+    t.vbo_cap_bytes = initial_vbo_bytes;
     const stride: gl.GLsizei = @sizeOf(core.Vertex);
     gl.glEnableVertexAttribArray(0);
     gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, @ptrFromInt(@offsetOf(core.Vertex, "position")));
@@ -82,87 +105,102 @@ pub fn realize(app: *App) bool {
     gl.glEnableVertexAttribArray(4);
     gl.glVertexAttribPointer(4, 1, gl.GL_FLOAT, gl.GL_FALSE, stride, @ptrFromInt(@offsetOf(core.Vertex, "deco_phase")));
 
-    gl.glGenTextures(1, &app.gl_atlas_tex);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, app.gl_atlas_tex);
+    gl.glGenTextures(1, &t.atlas_tex);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
     // Point sampling and clamp, as the D3D11 atlas sampler.
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
     // A fresh texture has no storage; the first render allocates it.
-    app.gl_atlas_w = 0;
-    app.gl_atlas_h = 0;
+    t.atlas_w = 0;
+    t.atlas_h = 0;
     return true;
 }
 
-pub fn unrealize(app: *App) void {
-    if (app.gl_atlas_tex != 0) gl.glDeleteTextures(1, &app.gl_atlas_tex);
-    if (app.gl_vbo != 0) gl.glDeleteBuffers(1, &app.gl_vbo);
-    if (app.gl_vao != 0) gl.glDeleteVertexArrays(1, &app.gl_vao);
-    if (app.gl_program != 0) gl.glDeleteProgram(app.gl_program);
-    app.gl_atlas_tex = 0;
-    app.gl_vbo = 0;
-    app.gl_vao = 0;
-    app.gl_program = 0;
-    app.gl_vbo_cap_bytes = 0;
-    app.gl_atlas_w = 0;
-    app.gl_atlas_h = 0;
+pub fn unrealize(t: *Target) void {
+    if (t.atlas_tex != 0) gl.glDeleteTextures(1, &t.atlas_tex);
+    if (t.vbo != 0) gl.glDeleteBuffers(1, &t.vbo);
+    if (t.vao != 0) gl.glDeleteVertexArrays(1, &t.vao);
+    if (t.program != 0) gl.glDeleteProgram(t.program);
+    const w = t.w_px;
+    const h = t.h_px;
+    t.* = .{ .w_px = w, .h_px = h };
 }
 
-/// Caller holds App.mu.
-fn drainAtlas(app: *App) void {
+/// The main window's atlas: queued uploads applied as they come. Caller
+/// holds App.mu.
+fn drainAtlas(app: *App, t: *Target) void {
     const ops = &app.atlas_pending;
     gl.glActiveTexture(gl.GL_TEXTURE0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, app.gl_atlas_tex);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-    // On atlas create, or a context realized again (gl_atlas_w reset to 0),
+    // On atlas create, or a context realized again (atlas_w reset to 0),
     // the texture is rebuilt from the full mirror, which already holds every
     // queued upload.
-    if (ops.recreate or (ops.w != 0 and (app.gl_atlas_w != ops.w or app.gl_atlas_h != ops.h))) {
+    if (ops.recreate or (ops.w != 0 and (t.atlas_w != ops.w or t.atlas_h != ops.h))) {
         if (ops.w != 0 and ops.h != 0) {
             gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items.ptr);
-            app.gl_atlas_w = ops.w;
-            app.gl_atlas_h = ops.h;
+            t.atlas_w = ops.w;
+            t.atlas_h = ops.h;
             ops.clearQueued();
         }
         ops.recreate = false;
     }
-    if (app.gl_atlas_w != 0) {
+    if (t.atlas_w != 0) {
         for (ops.uploads.items) |u| {
             gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, @intCast(u.x), @intCast(u.y), @intCast(u.w), @intCast(u.h), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.pixels.items[u.offset..].ptr);
         }
         ops.clearQueued();
     }
+    t.atlas_gen = ops.gen;
 }
 
-/// Uploads `verts` into the persistent VBO and draws them as triangles,
-/// scrollable content `scroll_offset_px` lower.
-fn drawVerts(app: *App, verts: []const core.Vertex, layer: core.Layer, scroll_offset_px: f32) void {
+/// An external window's atlas: the whole CPU mirror, whenever the atlas
+/// changed since this texture last took it. Glyphs are added rarely once a
+/// session warms up, and the main window's queue is not replayed per window.
+/// Caller holds App.mu.
+fn syncAtlas(app: *App, t: *Target) void {
+    const ops = &app.atlas_pending;
+    gl.glActiveTexture(gl.GL_TEXTURE0);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    if (ops.w == 0 or ops.h == 0) return;
+    if (t.atlas_w != 0 and t.atlas_gen == ops.gen) return;
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items.ptr);
+    t.atlas_w = ops.w;
+    t.atlas_h = ops.h;
+    t.atlas_gen = ops.gen;
+}
+
+/// Uploads `verts` into the target's persistent VBO and draws them as
+/// triangles, scrollable content `scroll_offset_px` lower.
+fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Layer, scroll_offset_px: f32) void {
     if (verts.len == 0) return;
     const bytes = verts.len * @sizeOf(core.Vertex);
-    if (bytes > app.gl_vbo_cap_bytes) {
-        var cap = @max(app.gl_vbo_cap_bytes, initial_vbo_bytes);
+    if (bytes > t.vbo_cap_bytes) {
+        var cap = @max(t.vbo_cap_bytes, initial_vbo_bytes);
         while (cap < bytes) cap *= 2;
         gl.glBufferData(gl.GL_ARRAY_BUFFER, @intCast(cap), null, gl.GL_DYNAMIC_DRAW);
-        app.gl_vbo_cap_bytes = cap;
+        t.vbo_cap_bytes = cap;
     }
     gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, @intCast(bytes), verts.ptr);
-    const t = transform.layerXform(layer, app.cell_w_px, app.cell_h_px, app.drawable_w_px, app.drawable_h_px);
-    gl.glUniform2f(app.gl_u_scale, t.scale[0], t.scale[1]);
-    gl.glUniform2f(app.gl_u_offset, t.offset[0], t.offset[1]);
-    gl.glUniform1f(app.gl_u_scroll_offset, scroll_offset_px);
-    gl.glUniform1f(app.gl_u_layer_origin_x, @floatFromInt(layer.x_px));
+    const x = transform.layerXform(layer, app.cell_w_px, app.cell_h_px, t.w_px, t.h_px);
+    gl.glUniform2f(t.u_scale, x.scale[0], x.scale[1]);
+    gl.glUniform2f(t.u_offset, x.offset[0], x.offset[1]);
+    gl.glUniform1f(t.u_scroll_offset, scroll_offset_px);
+    gl.glUniform1f(t.u_layer_origin_x, @floatFromInt(layer.x_px));
     gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(verts.len));
 }
 
 /// Clips to rows [row_start, row_end) of `layer`, in GL's bottom-left origin.
-fn scissorRows(app: *const App, layer: core.Layer, row_start: u32, row_end: u32) void {
+fn scissorRows(app: *const App, t: *const Target, layer: core.Layer, row_start: u32, row_end: u32) void {
     const h: i32 = @intCast(app.cell_h_px);
     const top = layer.y_px + @as(i32, @intCast(row_start)) * h;
     const bottom = layer.y_px + @as(i32, @intCast(row_end)) * h;
     gl.glScissor(
         layer.x_px,
-        @as(i32, @intCast(app.drawable_h_px)) - bottom,
+        @as(i32, @intCast(t.h_px)) - bottom,
         @intCast(layer.cols * app.cell_w_px),
         @max(0, bottom - top),
     );
@@ -179,7 +217,7 @@ fn gatherRows(app: *App, rows: []const Row, start: usize, end: usize) void {
 /// apart, under its own scissor, at the ease offset together with the rows
 /// it scrolled out, so the band the offset opens is filled and nothing moves
 /// into the margins around it. Returns the vertex count drawn.
-fn drawLayer(app: *App, layer: core.Layer, grid: *const GridRows, region: [2]u32, offset_px: f32) usize {
+fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, region: [2]u32, offset_px: f32) usize {
     const rows = grid.committedRows();
     const r0: usize = @min(region[0], rows.len);
     const r1: usize = @min(region[1], rows.len);
@@ -189,7 +227,7 @@ fn drawLayer(app: *App, layer: core.Layer, grid: *const GridRows, region: [2]u32
     gatherRows(app, rows, 0, r0);
     gatherRows(app, rows, r1, rows.len);
     total += app.gl_scratch.items.len;
-    drawVerts(app, app.gl_scratch.items, layer, 0);
+    drawVerts(app, t, app.gl_scratch.items, layer, 0);
     if (r0 == r1) return total;
 
     app.gl_scratch.clearRetainingCapacity();
@@ -200,22 +238,17 @@ fn drawLayer(app: *App, layer: core.Layer, grid: *const GridRows, region: [2]u32
     }
     total += app.gl_scratch.items.len;
     gl.glEnable(gl.GL_SCISSOR_TEST);
-    scissorRows(app, layer, @intCast(r0), @intCast(r1));
-    drawVerts(app, app.gl_scratch.items, layer, offset_px);
+    scissorRows(app, t, layer, @intCast(r0), @intCast(r1));
+    drawVerts(app, t, app.gl_scratch.items, layer, offset_px);
     gl.glDisable(gl.GL_SCISSOR_TEST);
     return total;
 }
 
-pub fn render(app: *App) void {
-    if (app.gl_program == 0) return;
-    const t0 = clock.nowNs();
-    app.mu.lockUncancelable(clock.io());
-    defer app.mu.unlock(clock.io());
-
-    drainAtlas(app);
-
+/// Clears the target and binds its pipeline. False when there is nothing to
+/// draw with yet.
+fn begin(app: *App, t: *Target) bool {
     const bg = app.default_bg;
-    gl.glViewport(0, 0, @intCast(app.drawable_w_px), @intCast(app.drawable_h_px));
+    gl.glViewport(0, 0, @intCast(t.w_px), @intCast(t.h_px));
     gl.glClearColor(
         @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0,
         @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0,
@@ -223,50 +256,82 @@ pub fn render(app: *App) void {
         1.0,
     );
     gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-    if (app.gl_atlas_w == 0 or app.drawable_w_px == 0 or app.drawable_h_px == 0) return;
-
-    gl.glUseProgram(app.gl_program);
-    gl.glBindVertexArray(app.gl_vao);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, app.gl_vbo);
+    if (t.atlas_w == 0 or t.w_px == 0 or t.h_px == 0) return false;
+    gl.glUseProgram(t.program);
+    gl.glBindVertexArray(t.vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
     gl.glEnable(gl.GL_BLEND);
     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+    return true;
+}
 
-    var verts_total: usize = 0;
-    var any_moving = false;
-    const now_ns: i64 = @intCast(t0);
-    const layers = app.surface.committedLayers();
+const SurfaceDraw = struct { verts: usize = 0, moving: bool = false };
+
+/// One surface's layers back-to-front, eased, then the cursor when its grid
+/// is on this surface. Caller holds App.mu.
+fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) SurfaceDraw {
+    var out: SurfaceDraw = .{};
     // The core sends layers back-to-front; draw in order (windows/app.zig:4432).
     for (layers) |layer| {
         const grid = app.surface.committedGrid(layer.grid_id) orelse continue;
         const ease = app.surface.gridEase(layer.grid_id).?;
         ease.plan(now_ns, app.cell_h_px, grid.committedRows().len);
-        if (ease.moving()) any_moving = true;
-        verts_total += drawLayer(app, layer, grid, ease.region(), ease.offset_px);
+        if (ease.moving()) out.moving = true;
+        out.verts += drawLayer(app, t, layer, grid, ease.region(), ease.offset_px);
     }
     const cur = app.surface.committedCursor();
-    if (cur.verts.len != 0) {
-        for (layers) |layer| {
-            if (layer.grid_id != cur.grid_id) continue;
-            verts_total += cur.verts.len;
-            // The cursor rides its grid's ease, clipped like the region.
-            const ease = app.surface.gridEase(layer.grid_id);
-            const region: [2]u32 = if (ease) |e| e.region() else .{ 0, 0 };
-            if (region[0] != region[1]) {
-                gl.glEnable(gl.GL_SCISSOR_TEST);
-                scissorRows(app, layer, region[0], region[1]);
-            }
-            drawVerts(app, cur.verts, layer, if (ease) |e| e.offset_px else 0);
-            gl.glDisable(gl.GL_SCISSOR_TEST);
-            break;
+    if (cur.verts.len == 0) return out;
+    for (layers) |layer| {
+        if (layer.grid_id != cur.grid_id) continue;
+        out.verts += cur.verts.len;
+        // The cursor rides its grid's ease, clipped like the region.
+        const ease = app.surface.gridEase(layer.grid_id);
+        const region: [2]u32 = if (ease) |e| e.region() else .{ 0, 0 };
+        if (region[0] != region[1]) {
+            gl.glEnable(gl.GL_SCISSOR_TEST);
+            scissorRows(app, t, layer, region[0], region[1]);
         }
+        drawVerts(app, t, cur.verts, layer, if (ease) |e| e.offset_px else 0);
+        gl.glDisable(gl.GL_SCISSOR_TEST);
+        break;
     }
-    verts_total += drawOverlays(app);
-    if (any_moving) startEaseTick(app);
+    return out;
+}
+
+pub fn render(app: *App) void {
+    const t = &app.gl;
+    if (t.program == 0) return;
+    const t0 = clock.nowNs();
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+
+    t.w_px = app.drawable_w_px;
+    t.h_px = app.drawable_h_px;
+    drainAtlas(app, t);
+    if (!begin(app, t)) return;
+
+    const layers = app.surface.committedLayers();
+    const d = drawSurface(app, t, layers, @intCast(t0));
+    const overlay_verts = drawOverlays(app, t);
+    if (d.moving) startEaseTick(app);
 
     if (applog.isEnabled()) {
         const us = @divTrunc(clock.nowNs() - t0, 1000);
-        applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, verts_total, any_moving });
+        applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, d.verts + overlay_verts, d.moving });
     }
+}
+
+/// An external window: the surface rooted at `surface_id`.
+pub fn renderExternal(app: *App, t: *Target, surface_id: i64) void {
+    if (t.program == 0) return;
+    const t0 = clock.nowNs();
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+
+    syncAtlas(app, t);
+    if (!begin(app, t)) return;
+    const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
+    if (d.moving) startEaseTick(app);
 }
 
 fn rgba(rgb: u32, a: f32) [4]f32 {
@@ -301,11 +366,11 @@ const surface_layer: core.Layer = .{ .grid_id = 0, .anchor_grid = 0, .x_px = 0, 
 
 /// The core-owned ext UI surfaces, over everything else on the main
 /// surface: a panel, then the surface's layers inside its padding.
-fn drawOverlays(app: *App) usize {
+fn drawOverlays(app: *App, t: *Target) usize {
     const scale: i32 = @intFromFloat(app.scale);
     const rects = overlay_layout.place(&app.overlays, .{
-        .main_w_px = @intCast(app.drawable_w_px),
-        .main_h_px = @intCast(app.drawable_h_px),
+        .main_w_px = @intCast(t.w_px),
+        .main_h_px = @intCast(t.h_px),
         .cell_w_px = @intCast(app.cell_w_px),
         .cell_h_px = @intCast(app.cell_h_px),
         .scale = scale,
@@ -326,20 +391,20 @@ fn drawOverlays(app: *App) usize {
         app.gl_scratch.clearRetainingCapacity();
         pushRect(app, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
         pushRect(app, r.x, r.y, r.w, r.h, fill);
-        drawVerts(app, app.gl_scratch.items, surface_layer, 0);
+        drawVerts(app, t, app.gl_scratch.items, surface_layer, 0);
 
         // A cmdline wider than the window is clipped to its panel.
         gl.glEnable(gl.GL_SCISSOR_TEST);
-        gl.glScissor(r.x, @as(i32, @intCast(app.drawable_h_px)) - r.y - r.h, r.w, r.h);
+        gl.glScissor(r.x, @as(i32, @intCast(t.h_px)) - r.y - r.h, r.w, r.h);
         const pad = overlay_layout.paddingPx(kind, scale);
         for (layers) |layer| {
             var placed = layer;
             placed.x_px += r.x + pad;
             placed.y_px += r.y + pad;
-            if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, placed, grid, .{ 0, 0 }, 0);
+            if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, t, placed, grid, .{ 0, 0 }, 0);
             if (cur.verts.len != 0 and cur.grid_id == layer.grid_id) {
                 total += cur.verts.len;
-                drawVerts(app, cur.verts, placed, 0);
+                drawVerts(app, t, cur.verts, placed, 0);
             }
         }
         gl.glDisable(gl.GL_SCISSOR_TEST);
@@ -347,8 +412,8 @@ fn drawOverlays(app: *App) usize {
     return total;
 }
 
-/// Redraws on every frame-clock tick while some grid eases; the render that
-/// finds every ease at rest lets the callback remove itself.
+/// Redraws every window on each frame-clock tick while some grid eases; the
+/// tick that finds every ease at rest removes itself.
 fn startEaseTick(app: *App) void {
     if (app.ease_tick_active) return;
     const area = app.gl_area orelse return;
@@ -357,15 +422,16 @@ fn startEaseTick(app: *App) void {
 }
 
 fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
+    _ = widget;
     _ = frame_clock;
     const app: *App = @ptrCast(@alignCast(data.?));
-    gtk.gtk_gl_area_queue_render(widget.?);
+    app.queueRenderAll();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
     var moving = false;
-    for (app.surface.committedLayers()) |layer| {
-        const e = app.surface.gridEase(layer.grid_id) orelse continue;
-        if (e.moving()) moving = true;
+    var it = app.surface.grids.valueIterator();
+    while (it.next()) |g| {
+        if (g.*.ease.moving()) moving = true;
     }
     if (!moving) app.ease_tick_active = false;
     return @intFromBool(moving);

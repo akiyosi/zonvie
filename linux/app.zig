@@ -9,6 +9,10 @@ const scroll_ease = core.scroll_ease;
 const overlay_layout = @import("overlay_layout.zig");
 const ui_state = @import("ui_state.zig");
 const ui_widgets = @import("ui_widgets.zig");
+const gl_renderer = @import("renderer/gl_renderer.zig");
+const input = @import("input.zig");
+const ext_window = @import("ext_window.zig");
+const gtk = @import("gtk_bindings.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -27,6 +31,9 @@ pub const AtlasOps = struct {
     /// The whole atlas as RGBA8, w*h*4. A GL context realized again starts
     /// with an empty texture; uploading this restores what the core caches.
     mirror: std.ArrayListUnmanaged(u8) = .empty,
+    /// Bumped by every create and upload; external windows resync from
+    /// `mirror` when theirs differs.
+    gen: u64 = 0,
 
     pub fn clearQueued(self: *AtlasOps) void {
         self.uploads.clearRetainingCapacity();
@@ -75,27 +82,25 @@ pub const App = struct {
 
     atlas_pending: AtlasOps = .{},
 
-    // GL objects; GTK main thread only, valid between realize and unrealize.
-    gl_program: u32 = 0,
-    gl_vao: u32 = 0,
-    gl_vbo: u32 = 0,
-    gl_vbo_cap_bytes: usize = 0,
-    gl_atlas_tex: u32 = 0,
-    /// Size the GL texture was allocated at; 0 until the first atlas create lands.
-    gl_atlas_w: u32 = 0,
-    gl_atlas_h: u32 = 0,
-    gl_u_scale: i32 = -1,
-    gl_u_offset: i32 = -1,
-    gl_u_scroll_offset: i32 = -1,
-    gl_u_layer_origin_x: i32 = -1,
-    /// One layer's rows concatenated for a single upload; capacity reused across frames.
+    /// The main GLArea's GL objects; GTK main thread only.
+    gl: gl_renderer.Target = .{},
+    /// One layer's rows concatenated for a single upload; capacity reused
+    /// across frames and windows.
     gl_scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
 
     // GTK objects; written and read only on the GTK main thread.
     gl_area: ?*anyopaque = null,
     window: ?*anyopaque = null,
     gtk_app: ?*anyopaque = null,
-    im_context: ?*anyopaque = null,
+    /// The main window's input; set up with the window.
+    pointer: input.Pointer = undefined,
+    /// ext_windows by root grid id; GTK main thread only.
+    ext_windows: std.AutoHashMapUnmanaged(i64, *ext_window.ExtWindow) = .empty,
+    /// Opens and closes the core queued (under `mu`), and the list the GTK
+    /// idle swaps them into, so neither side allocates while the other reads.
+    ext_ops: std.ArrayListUnmanaged(ext_window.Op) = .empty,
+    ext_ops_gtk: std.ArrayListUnmanaged(ext_window.Op) = .empty,
+    ext_idle_queued: std.atomic.Value(bool) = .init(false),
     /// A frame-clock tick callback is installed and redraws every frame
     /// while some grid eases.
     ease_tick_active: bool = false,
@@ -120,14 +125,6 @@ pub const App = struct {
     layout_retry_queued: bool = false,
     start_failed: bool = false,
     preedit_active: bool = false,
-    /// Logical widget px of the last pointer motion; the wheel has no position.
-    pointer_x: f64 = 0,
-    pointer_y: f64 = 0,
-    /// Button held since a press, and the grid that press chose.
-    held_button: ?[*:0]const u8 = null,
-    press_grid_id: i64 = 1,
-    drag_row: i32 = -1,
-    drag_col: i32 = -1,
     /// Last complete visible-grid snapshot for pointer hit tests; kept when
     /// the non-blocking query finds grid_mu busy.
     pointer_grids: [32]core.GridInfo = undefined,
@@ -136,7 +133,6 @@ pub const App = struct {
     // Core thread only.
     flush_failed: bool = false,
     fonts: Fonts = .{},
-    foreign_surface_logged: bool = false,
 
     clipboard_mu: std.Io.Mutex = .init,
     /// A get's whole text; out_len reports its full size (zonvie_core.h).
@@ -153,5 +149,14 @@ pub const App = struct {
         self.gl_scratch.deinit(self.alloc);
         self.fonts.deinit(self.alloc);
         self.clipboard_text.deinit(self.alloc);
+        self.ext_ops.deinit(self.alloc);
+        self.ext_ops_gtk.deinit(self.alloc);
+    }
+
+    /// GTK main thread: every window draws the committed frame.
+    pub fn queueRenderAll(self: *App) void {
+        if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);
+        var it = self.ext_windows.valueIterator();
+        while (it.next()) |w| if (w.*.area) |a| gtk.gtk_gl_area_queue_render(a);
     }
 };
