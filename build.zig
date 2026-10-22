@@ -823,11 +823,11 @@ pub fn build(b: *std.Build) !void {
     e2e_run.has_side_effects = true;
     e2e_step.dependOn(&e2e_run.step);
 
-    // GUI test driver (macOS and Windows hosts): launches the REAL zonvie
+    // GUI test driver (macOS, Windows and Linux hosts): launches the REAL zonvie
     // app against a shared `nvim --listen` server and observes OS windows
-    // (CGWindowList / EnumWindows). Real windows appear; `zig build gui-test`
+    // (CGWindowList / EnumWindows / Hyprland IPC). Real windows appear; `zig build gui-test`
     // on the respective host, locally, or on the Windows CI runner.
-    if (host_os == .macos or host_os == .windows) {
+    if (host_os == .macos or host_os == .windows or host_os == .linux) {
         const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (real windows appear)");
         const gui_mod = b.createModule(.{
             .target = target,
@@ -840,10 +840,12 @@ pub fn build(b: *std.Build) !void {
             gui_mod.linkFramework("CoreFoundation", .{});
             gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
             gui_mod.linkFramework("ApplicationServices", .{}); // AXUIElement (drag-resize emulation)
-        } else {
+        } else if (host_os == .windows) {
             gui_mod.linkSystemLibrary("user32", .{});
             gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture
         }
+        // Linux observes windows through hyprctl and captures with grim:
+        // nothing to link.
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
             .filters = test_filters,
