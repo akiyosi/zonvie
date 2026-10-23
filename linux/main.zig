@@ -39,6 +39,8 @@ const Startup = struct {
     /// --nofork: nvim keeps the shell's cwd; otherwise the core starts it
     /// in $HOME, as on macOS.
     inherit_cwd: bool = false,
+    /// Shown over the window until the first frame (a devcontainer start).
+    progress: ?[:0]const u8 = null,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -308,6 +310,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     input.attach(&app.pointer, area);
 
     gtk.gtk_window_set_child(win, ui_widgets.build(app, area, frames));
+    if (startup.progress) |text| ui_widgets.showProgress(app, text);
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
     blink.watchWindow(app, win);
     gtk.gtk_window_present(win);
@@ -373,6 +376,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var cli_nvim_path: ?[]const u8 = null;
     var ssh: ?cli.Ssh = if (config.neovim.ssh) if (config.neovim.ssh_host) |h| cli.Ssh{ .host = h, .port = config.neovim.ssh_port, .identity = config.neovim.ssh_identity } else null else null;
     var ssh_identity: ?[]const u8 = config.neovim.ssh_identity;
+    var devcontainer: ?cli.Devcontainer = null;
+    var devcontainer_config: ?[]const u8 = null;
+    var devcontainer_rebuild = false;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -404,6 +410,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 const t = core.frontend_rules.sshTarget(args[i]);
                 ssh = .{ .host = t.host, .port = t.port };
             }
+        } else if (std.mem.startsWith(u8, arg, "--devcontainer=")) {
+            devcontainer = .{ .workspace = arg["--devcontainer=".len..] };
+        } else if (std.mem.eql(u8, arg, "--devcontainer")) {
+            if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
+                i += 1;
+                devcontainer = .{ .workspace = args[i] };
+            }
+        } else if (std.mem.startsWith(u8, arg, "--devcontainer-config=")) {
+            devcontainer_config = arg["--devcontainer-config=".len..];
+        } else if (std.mem.eql(u8, arg, "--devcontainer-config")) {
+            if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
+                i += 1;
+                devcontainer_config = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
+            devcontainer_rebuild = true;
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg["--ssh-identity=".len..];
         } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
@@ -449,8 +471,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer applog.deinit();
 
-    if (ssh != null and connect_addr != null) {
-        std.debug.print("--connect-nvim is mutually exclusive with --ssh (or [neovim] ssh in config.toml). Remove the conflicting option and retry.\n", .{});
+    if (@as(u8, @intFromBool(ssh != null)) + @intFromBool(connect_addr != null) + @intFromBool(devcontainer != null) > 1) {
+        std.debug.print("--connect-nvim, --ssh (or [neovim] ssh in config.toml) and --devcontainer are mutually exclusive. Remove the conflicting option and retry.\n", .{});
         return 1;
     }
     var cmd: std.ArrayListUnmanaged(u8) = .empty;
@@ -463,7 +485,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         target.identity = ssh_identity;
         cli.setAskpassEnv(askpass.env_mode);
         break :blk cli.sshCommand(aa, target, cli_nvim_path orelse "nvim") catch return 1;
+    } else if (devcontainer) |d| blk: {
+        // Paths in the container's terms are the host's: `~` is expanded
+        // here, as macOS does, since `--devcontainer=~/x` reaches no shell.
+        const target: cli.Devcontainer = .{
+            .workspace = cli.expandTilde(aa, d.workspace) catch return 1,
+            .config = if (devcontainer_config) |c| cli.expandTilde(aa, c) catch return 1 else null,
+            .rebuild = devcontainer_rebuild,
+        };
+        break :blk cli.devcontainerCommand(aa, target, cli.nvimConfigDir(aa) catch return 1) catch return 1;
     } else aa.dupeZ(u8, cmd.items) catch return 1;
+    const progress: ?[:0]const u8 = if (devcontainer != null)
+        (if (devcontainer_rebuild) "Building devcontainer..." else "Connecting to devcontainer...")
+    else
+        null;
     const startup = Startup{
         .nvim_cmd = nvim_cmd,
         .ext_cmdline = ext_cmdline,
@@ -474,6 +509,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .threaded = threaded,
         .connect_addr = connect_addr,
         .inherit_cwd = nofork,
+        .progress = progress,
     };
 
     const app = alloc.create(App) catch return 1;

@@ -33,6 +33,8 @@ pub const Widgets = struct {
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
     toast: ?*anyopaque = null,
+    /// A start that takes a while (a devcontainer), until the first frame.
+    progress: ?*anyopaque = null,
     /// The IME composition, drawn over the cursor cell ([input]
     /// ime_preedit_mode = "overlay", or outside insert mode).
     preedit: ?*anyopaque = null,
@@ -133,6 +135,12 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     gtk.gtk_widget_set_margin_top(toast, m);
     w.toast = toast;
     gtk.gtk_overlay_add_overlay(overlay, toast);
+
+    const progress = label(&.{ "zonvie-panel", "zonvie-confirm" });
+    gtk.gtk_widget_set_halign(progress, gtk.GTK_ALIGN_CENTER);
+    gtk.gtk_widget_set_valign(progress, gtk.GTK_ALIGN_CENTER);
+    w.progress = progress;
+    gtk.gtk_overlay_add_overlay(overlay, progress);
 
     const preedit = gtk.gtk_label_new(null).?;
     gtk.gtk_widget_add_css_class(preedit, "zonvie-preedit");
@@ -358,6 +366,27 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-agent {{ margin-left: 8px; }}
     , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
+}
+
+/// The start's progress over the window; hidden once Neovim's first layout
+/// is committed (hideProgress). GTK main thread.
+pub fn showProgress(app: *App, text: [:0]const u8) void {
+    const l = app.widgets.progress orelse return;
+    // Before Neovim's first colours: the panel styles exist only once a
+    // stylesheet is built, and the theme's text is unreadable on the black
+    // view.
+    app.mu.lockUncancelable(clock.io());
+    const fg = app.default_fg;
+    const bg = app.default_bg;
+    app.mu.unlock(clock.io());
+    applyCss(&app.widgets, fg, bg);
+    gtk.gtk_label_set_text(l, text.ptr);
+    gtk.gtk_widget_set_visible(l, 1);
+}
+
+pub fn hideProgress(app: *App) void {
+    const l = app.widgets.progress orelse return;
+    if (gtk.gtk_widget_get_visible(l) != 0) gtk.gtk_widget_set_visible(l, 0);
 }
 
 /// Shows `text` (null-terminated) with the IME's Pango `attrs` (its

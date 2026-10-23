@@ -51,9 +51,12 @@ const usage =
     \\    --extwindows                  Enable external windows (each Neovim window as OS window)
     \\    --ssh=<user@host[:port]>      Connect to remote host via SSH
     \\    --ssh-identity=<path>         Path to SSH private key file
+    \\    --devcontainer=<workspace>    Run inside a devcontainer
+    \\    --devcontainer-config=<path>  Path to devcontainer.json
+    \\    --devcontainer-rebuild        Rebuild devcontainer before starting
     \\    --connect-nvim=<addr>         Attach to a running Neovim server.
     \\                                    Address: TCP "host:port" or Unix socket path.
-    \\                                    Mutually exclusive with --ssh.
+    \\                                    Mutually exclusive with --ssh / --devcontainer.
     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
     \\    --renderer=<glarea|thread>    Draw in GTK's GLArea (default) or on a render thread
     \\    --install                     Create default config file and exit
@@ -179,6 +182,85 @@ pub fn setAskpassEnv(env_mode: [:0]const u8) void {
     _ = setenv("SSH_ASKPASS", &buf, 1);
     _ = setenv("SSH_ASKPASS_REQUIRE", "force", 1);
     _ = setenv(env_mode, "1", 1);
+}
+
+/// `~/...` against $HOME.
+pub fn expandTilde(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, path, "~/")) return path;
+    const home = std.c.getenv("HOME") orelse return path;
+    return std.fs.path.join(alloc, &.{ std.mem.span(home), path[2..] });
+}
+
+/// The host's nvim config, which a rebuilt devcontainer mounts.
+pub fn nvimConfigDir(alloc: std.mem.Allocator) ![]const u8 {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |x| {
+        if (std.mem.span(x).len > 0) return std.fs.path.join(alloc, &.{ std.mem.span(x), "nvim" });
+    }
+    const home = std.c.getenv("HOME") orelse return "";
+    return std.fs.path.join(alloc, &.{ std.mem.span(home), ".config", "nvim" });
+}
+
+pub const Devcontainer = struct {
+    workspace: []const u8,
+    config: ?[]const u8 = null,
+    rebuild: bool = false,
+};
+
+/// `s` double-quoted for sh.
+fn appendShDq(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try out.append(alloc, '"');
+    for (s) |ch| {
+        if (ch == '\\' or ch == '"' or ch == '$' or ch == '`') try out.append(alloc, '\\');
+        try out.append(alloc, ch);
+    }
+    try out.append(alloc, '"');
+}
+
+/// The command the core spawns for `--devcontainer`: the core's `devcontainer
+/// exec` line into a running container, as macOS starts it. With rebuild,
+/// `devcontainer up` (the core's arguments: the Neovim feature, the nvim
+/// config mount, --remove-existing-container) runs first in a shell the
+/// core spawns as is (its "/bin/sh" mode); the single-quoted script reaches
+/// sh verbatim, so everything in it is double-quoted.
+pub fn devcontainerCommand(alloc: std.mem.Allocator, d: Devcontainer, nvim_config_dir: []const u8) ![:0]u8 {
+    var exec_buf: [4096]u8 = undefined;
+    const cfg = d.config orelse "";
+    const n = core.zonvie_core_devcontainer_exec_cmd(&exec_buf, exec_buf.len, d.workspace.ptr, d.workspace.len, if (d.config != null) cfg.ptr else null, cfg.len);
+    const exec_cmd = exec_buf[0..n];
+    if (!d.rebuild) return alloc.dupeZ(u8, exec_cmd);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "/bin/sh -c 'devcontainer up --workspace-folder ");
+    try appendShDq(&out, alloc, d.workspace);
+    if (d.config) |c| {
+        try out.appendSlice(alloc, " --config ");
+        try appendShDq(&out, alloc, c);
+    }
+    var args_buf: [4096]u8 = undefined;
+    const len = core.zonvie_core_devcontainer_up_args(&args_buf, args_buf.len, nvim_config_dir.ptr, nvim_config_dir.len, true);
+    var it = std.mem.splitScalar(u8, args_buf[0..len], 0);
+    while (it.next()) |arg| {
+        if (arg.len == 0) continue;
+        try out.append(alloc, ' ');
+        try appendShDq(&out, alloc, arg);
+    }
+    try out.appendSlice(alloc, " && exec ");
+    try out.appendSlice(alloc, exec_cmd);
+    try out.append(alloc, '\'');
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+test "a devcontainer rebuild runs up, then execs nvim" {
+    const a = std.testing.allocator;
+    const plain = try devcontainerCommand(a, .{ .workspace = "/w s" }, "/home/u/.config/nvim");
+    defer a.free(plain);
+    try std.testing.expect(std.mem.startsWith(u8, plain, "devcontainer exec --workspace-folder \"/w s\""));
+    const rebuild = try devcontainerCommand(a, .{ .workspace = "/w", .rebuild = true }, "/home/u/.config/nvim");
+    defer a.free(rebuild);
+    try std.testing.expect(std.mem.startsWith(u8, rebuild, "/bin/sh -c 'devcontainer up --workspace-folder \"/w\" \"--additional-features\" \"{\\\"ghcr.io/"));
+    try std.testing.expect(std.mem.indexOf(u8, rebuild, "\"--remove-existing-container\" && exec devcontainer exec --workspace-folder \"/w\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, rebuild, "nvim --embed'"));
 }
 
 test "the ssh command quotes the remote nvim for the login shell" {

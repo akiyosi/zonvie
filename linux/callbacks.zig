@@ -411,8 +411,14 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const have_anchor = if (app.corep) |cp| core.zonvie_core_msg_anchor(cp, &anchor) else false;
     lock(app);
     app.msg_anchor = if (have_anchor) anchor else null;
+    // Neovim's first layout: the core's own first flush, before attach,
+    // commits an empty one.
+    const nvim_drawn = for (app.surface.committedLayers()) |l| {
+        if (l.rows != 0) break true;
+    } else false;
     unlock(app);
     ui_widgets.placeMessages(app);
+    if (nvim_drawn) ui_widgets.hideProgress(app);
     app.queueRenderAll();
     input.updateImeCursor(app);
     // Every flush may carry a mode change, and with it a new cadence.
