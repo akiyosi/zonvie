@@ -83,9 +83,67 @@ pub fn printVersion() void {
     writeStdout("\n");
 }
 
+pub const app_id = "io.github.akiyosi.zonvie";
+
+/// The desktop entry: named after the GtkApplication id, which is the
+/// Wayland app_id, so the compositor and launchers match the window to it.
+/// `%F` hands chosen files to nvim; the MIME list puts Zonvie under "Open
+/// with" for text files, the role Windows' Applications\zonvie.exe has.
+fn desktopEntry(buf: []u8, exe: []const u8, icon: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf,
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Zonvie
+        \\GenericName=Text Editor
+        \\Comment=A fast, feature-rich Neovim GUI
+        \\Exec="{s}" %F
+        \\Icon={s}
+        \\Terminal=false
+        \\Categories=Utility;TextEditor;
+        \\Keywords=Text;Editor;Neovim;Vim;
+        \\MimeType=text/plain;text/markdown;text/x-csrc;text/x-chdr;text/x-c++src;text/x-python;text/x-shellscript;application/x-shellscript;application/json;application/toml;application/x-yaml;
+        \\StartupWMClass={s}
+        \\
+    , .{ exe, icon, app_id });
+}
+
+fn writeFile(path: []const u8, data: []const u8) !void {
+    const io = clock.io();
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+    const f = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
+}
+
+/// The desktop entry and its icon under $XDG_DATA_HOME (~/.local/share),
+/// pointing at this executable. Rewritten on every install, so a moved
+/// binary is picked up again.
+fn installDesktopEntry(alloc: std.mem.Allocator) !void {
+    const data_home = if (std.c.getenv("XDG_DATA_HOME")) |x| (if (std.mem.span(x).len > 0) try alloc.dupe(u8, std.mem.span(x)) else null) else null;
+    const base = data_home orelse blk: {
+        const home = std.c.getenv("HOME") orelse return error.NoHome;
+        break :blk try std.fs.path.join(alloc, &.{ std.mem.span(home), ".local", "share" });
+    };
+    defer alloc.free(base);
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+    if (n <= 0) return error.NoExe;
+    const exe = exe_buf[0..@intCast(n)];
+
+    const icon = try std.fs.path.join(alloc, &.{ base, "icons", app_id ++ ".png" });
+    defer alloc.free(icon);
+    try writeFile(icon, @embedFile("zonvie-256.png"));
+    const entry_path = try std.fs.path.join(alloc, &.{ base, "applications", app_id ++ ".desktop" });
+    defer alloc.free(entry_path);
+    var buf: [4096]u8 = undefined;
+    try writeFile(entry_path, try desktopEntry(&buf, exe, icon));
+    std.debug.print("Desktop entry installed: {s}\n", .{entry_path});
+}
+
 /// Writes the default config.toml where the app reads it, never over an
-/// existing one. Returns the process exit code.
+/// existing one, and the desktop entry. Returns the process exit code.
 pub fn install(alloc: std.mem.Allocator) u8 {
+    installDesktopEntry(alloc) catch |e| std.debug.print("Failed to install the desktop entry: {any}\n", .{e});
     const path = config_mod.configFilePath(alloc) catch {
         std.debug.print("Cannot determine the config path: HOME is not set\n", .{});
         return 1;
@@ -271,6 +329,13 @@ test "the ssh command quotes the remote nvim for the login shell" {
     const keyed = try sshCommand(a, .{ .host = "box", .port = 2222, .identity = "/k/my key" }, "/opt/n\\vim");
     defer a.free(keyed);
     try std.testing.expectEqualStrings("ssh-askpass ssh -p 2222 -i \"/k/my key\" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=accept-new box '$SHELL --login -c \"\\\"/opt/n\\\\vim\\\" --embed\"'", keyed);
+}
+
+test "the desktop entry runs this executable with the chosen files" {
+    var buf: [4096]u8 = undefined;
+    const e = try desktopEntry(&buf, "/opt/zonvie/zonvie", "/x/icon.png");
+    try std.testing.expect(std.mem.indexOf(u8, e, "Exec=\"/opt/zonvie/zonvie\" %F\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "StartupWMClass=io.github.akiyosi.zonvie\n") != null);
 }
 
 test "flags after -- belong to nvim" {

@@ -550,7 +550,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // first registers the id on the session bus and a later launch hands it
     // its files (or just raises it) and exits, as Windows does.
     const single = config.server.single_instance;
-    const gapp = gtk.gtk_application_new("io.github.akiyosi.zonvie", if (single) gtk.G_APPLICATION_HANDLES_OPEN else gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
+    const gapp = gtk.gtk_application_new(cli.app_id, if (single) gtk.G_APPLICATION_HANDLES_OPEN else gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
     if (single and gtk.g_application_register(gapp, null, null) != 0 and gtk.g_application_get_is_remote(gapp) != 0) {
         // GApplication's own command line turns these into an Open call on
         // the running instance (an Activate without files).
