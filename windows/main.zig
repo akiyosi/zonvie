@@ -298,6 +298,10 @@ pub fn main() u8 {
         return 0; // Exit immediately
     }
 
+    // Claude Code running in a :terminal inside zonvie should render its cursor
+    // natively; nvim and its children inherit the live process environment.
+    _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("CLAUDE_CODE_NATIVE_CURSOR"), std.unicode.utf8ToUtf16LeStringLiteral("1"));
+
     // Reduce Windows scheduler quantum to 1ms for responsive rendering.
     // DWrite glyph rasterization makes COM calls that can yield the thread;
     // default 15.6ms quantum causes 10-16ms stalls when preempted.

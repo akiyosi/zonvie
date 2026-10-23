@@ -142,6 +142,10 @@ if launchedFromFinder {
     loadShellEnvironment()
 }
 
+// Claude Code running in a :terminal inside zonvie should render its cursor
+// natively; nvim and its children inherit the live environ at spawn.
+setenv("CLAUDE_CODE_NATIVE_CURSOR", "1", 1)
+
 func loadShellEnvironment() {
     // Get user's default shell
     let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
