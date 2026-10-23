@@ -82,6 +82,11 @@ pub const App = struct {
     preedit_family: [128]u8 = undefined,
     preedit_family_len: usize = 0,
     preedit_px: f32 = 0,
+    /// The size the font in use was loaded at, in points; under `mu`.
+    font_pt: f32 = 0,
+    /// The next guifont broadcast is a font-dialog pick (font_picker.zig),
+    /// which wins over an explicit [font] family and size.
+    font_picked: std.atomic.Value(bool) = .init(false),
     /// config.toml's [messages] msg_pos.
     msg_pos: core.config.Config.MsgPosConfig = .{},
     /// The core's message anchor as of the last committed flush; null before

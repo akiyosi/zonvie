@@ -16,6 +16,7 @@ const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
 const blink = @import("blink.zig");
 const scrollbar = @import("scrollbar.zig");
+const font_picker = @import("font_picker.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -547,6 +548,9 @@ fn loadFirst(app: *App, list: []const u8, size_explicit: bool) bool {
         const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
         if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features)) {
             applog.appLog("[linux] font: {s} {d}pt features={s}\n", .{ cand.name, cand.point_size, cand.features });
+            lock(app);
+            app.font_pt = cand.point_size;
+            unlock(app);
             return true;
         }
     }
@@ -611,13 +615,17 @@ pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols 
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
     const app = appFrom(ctx);
+    // `:set guifont=*` asks for the font dialog.
+    if (len == 1 and bytes[0] == '*') return font_picker.request(app);
     // An explicit [font] family wins over guifont, as on macOS and Windows:
     // Neovim sends its own default guifont at attach even when the user set
-    // none. An explicit [font] size wins over each entry's `:hN`.
-    const loaded = if (app.font_cfg.family_explicit)
+    // none. An explicit [font] size wins over each entry's `:hN`. A pick
+    // from the font dialog wins over both.
+    const picked = app.font_picked.swap(false, .acq_rel);
+    const loaded = if (app.font_cfg.family_explicit and !picked)
         loadConfigFamily(app)
     else
-        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit);
+        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked);
     if (!loaded) {
         if (app.fonts.regular != null) return;
         if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "")) return;
