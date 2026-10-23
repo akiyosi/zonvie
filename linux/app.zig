@@ -59,6 +59,8 @@ pub const App = struct {
     /// Font cell height plus linespace, as sent to the core.
     cell_h_px: u32 = 0,
     linespace_px: i32 = 0,
+    /// config.toml's [font]; `family` borrows the Config, which outlives the app.
+    font_cfg: core.config.Config.FontConfig = .{},
     /// GLArea size in device pixels and its integer scale factor; written by
     /// the GTK thread, read by the core thread, both under `mu`.
     drawable_w_px: u32 = 0,

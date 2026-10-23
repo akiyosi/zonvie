@@ -485,11 +485,39 @@ fn pixelSize(app: *App, pt: f32) u32 {
     return @intFromFloat(@max(1.0, @round(pt * 96.0 / 72.0 * scale)));
 }
 
-/// Loads `monospace 12` when no guifont has been applied yet. Core thread,
-/// or any thread before zonvie_core_start.
+/// [font] size when config.toml sets it, else the Linux default.
+fn configPt(app: *App) f32 {
+    return if (app.font_cfg.size_explicit and app.font_cfg.size > 0) app.font_cfg.size else default_pt;
+}
+
+/// Loads the first candidate of a newline-separated list (a guifont payload,
+/// or [font] family through the core's formatter) that fontconfig accepts.
+fn loadFirst(app: *App, list: []const u8, size_explicit: bool) bool {
+    var it = std.mem.splitScalar(u8, list, '\n');
+    while (it.next()) |line| {
+        const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
+        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size))) {
+            applog.appLog("[linux] font: {s} {d}pt\n", .{ cand.name, cand.point_size });
+            return true;
+        }
+    }
+    return false;
+}
+
+/// [font] family as a candidate list: each entry inherits [font] size
+/// unless it carries its own `:hN`.
+fn loadConfigFamily(app: *App) bool {
+    var arena = std.heap.ArenaAllocator.init(app.alloc);
+    defer arena.deinit();
+    const list = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.font_cfg.family, configPt(app), default_family) catch return false;
+    return loadFirst(app, list, false);
+}
+
+/// Loads [font] (or its defaults) when no guifont has been applied yet.
+/// Core thread, or any thread before zonvie_core_start.
 pub fn ensureFont(app: *App) void {
     if (app.fonts.regular != null) return;
-    _ = app.fonts.load(app.alloc, default_family, pixelSize(app, default_pt));
+    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)));
     updateMetrics(app);
 }
 
@@ -530,19 +558,16 @@ pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols 
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
     const app = appFrom(ctx);
-    var loaded = false;
-    var it = std.mem.splitScalar(u8, bytes[0..len], '\n');
-    while (it.next()) |line| {
-        const cand = core.config.parseFontCandidateLine(line, default_pt, false) orelse continue;
-        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size))) {
-            applog.appLog("[linux] guifont: {s} {d}pt\n", .{ cand.name, cand.point_size });
-            loaded = true;
-            break;
-        }
-    }
+    // An explicit [font] family wins over guifont, as on macOS and Windows:
+    // Neovim sends its own default guifont at attach even when the user set
+    // none. An explicit [font] size wins over each entry's `:hN`.
+    const loaded = if (app.font_cfg.family_explicit)
+        loadConfigFamily(app)
+    else
+        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit);
     if (!loaded) {
         if (app.fonts.regular != null) return;
-        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, default_pt))) return;
+        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)))) return;
     }
     updateMetrics(app);
     if (app.corep) |cp| core.zonvie_core_invalidate_glyph_cache(cp);
