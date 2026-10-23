@@ -59,6 +59,13 @@ pub const App = struct {
     /// Font cell height plus linespace, as sent to the core.
     cell_h_px: u32 = 0,
     linespace_px: i32 = 0,
+    /// config.toml's [input].
+    input_cfg: core.config.Config.InputConfig = .{},
+    /// The editor font as the preedit label draws it: family and logical px.
+    /// Written with the metrics under `mu`.
+    preedit_family: [128]u8 = undefined,
+    preedit_family_len: usize = 0,
+    preedit_px: f32 = 0,
     /// config.toml's [messages] msg_pos.
     msg_pos: core.config.Config.MsgPosConfig = .{},
     /// The core's message anchor as of the last committed flush; null before

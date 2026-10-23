@@ -310,6 +310,8 @@ pub fn build(b: *std.Build) !void {
         linux_mod.linkSystemLibrary("glib-2.0", .{});
         linux_mod.linkSystemLibrary("gobject-2.0", .{});
         linux_mod.linkSystemLibrary("gio-2.0", .{});
+        // Pango attribute lists for the IME preedit label.
+        linux_mod.linkSystemLibrary("pango-1.0", .{});
     }
 
     const linux_step = b.step("linux", "Build Linux frontend");

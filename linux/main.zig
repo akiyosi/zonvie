@@ -443,6 +443,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .large_jump = config.scroll.large_jump_behavior,
         .font_cfg = config.font,
         .msg_pos = config.messages.msg_pos,
+        .input_cfg = config.input,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
     };
     defer app.deinit();

@@ -32,6 +32,24 @@ pub fn coreKeycode(keyval: u32) u32 {
     return 0x10000 | vk;
 }
 
+/// The `:` <-> `;` swap ([input] swap_colon_semicolon) for one typed
+/// character. Paste and IME commits do not come through here.
+pub fn swapColonSemicolon(scalar: u32, enabled: bool) u32 {
+    if (!enabled) return scalar;
+    return switch (scalar) {
+        ':' => ';',
+        ';' => ':',
+        else => scalar,
+    };
+}
+
+test "colon and semicolon swap only when enabled" {
+    try testing.expectEqual(@as(u32, ';'), swapColonSemicolon(':', true));
+    try testing.expectEqual(@as(u32, ':'), swapColonSemicolon(';', true));
+    try testing.expectEqual(@as(u32, 'a'), swapColonSemicolon('a', true));
+    try testing.expectEqual(@as(u32, ':'), swapColonSemicolon(':', false));
+}
+
 pub fn coreMods(gdk_state: u32) u32 {
     var m: u32 = 0;
     if (gdk_state & GDK_CONTROL_MASK != 0) m |= core.MOD_CTRL;

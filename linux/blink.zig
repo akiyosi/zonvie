@@ -45,6 +45,11 @@ fn idleSettleActive(data: ?*anyopaque) callconv(.c) c_int {
     if (active == app.app_active) return 0;
     app.app_active = active;
     if (app.corep) |cp| core.zonvie_core_set_focus(cp, active);
+    // [input] ime_disable_on_activate, as on Windows: the IME starts each
+    // activation off (GTK's nearest is resetting the context).
+    if (active and app.input_cfg.ime_disable_on_activate) {
+        if (app.pointer.im_context) |im| gtk.gtk_im_context_reset(im);
+    }
     // The timer stops with the app, as on macOS and Windows; activation
     // re-arms it through the gate.
     if (active) update(app) else pause(app);

@@ -21,6 +21,9 @@ pub const Widgets = struct {
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
     toast: ?*anyopaque = null,
+    /// The IME composition, drawn over the cursor cell ([input]
+    /// ime_preedit_mode = "overlay", or outside insert mode).
+    preedit: ?*anyopaque = null,
     css: ?*anyopaque = null,
     /// The colors the stylesheet was last built from; 0xffffffff until then.
     css_fg: u32 = 0xffffffff,
@@ -91,6 +94,15 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     gtk.gtk_widget_set_margin_top(toast, m);
     w.toast = toast;
     gtk.gtk_overlay_add_overlay(overlay, toast);
+
+    const preedit = gtk.gtk_label_new(null).?;
+    gtk.gtk_widget_add_css_class(preedit, "zonvie-preedit");
+    gtk.gtk_widget_set_halign(preedit, gtk.GTK_ALIGN_START);
+    gtk.gtk_widget_set_valign(preedit, gtk.GTK_ALIGN_START);
+    gtk.gtk_widget_set_can_target(preedit, 0);
+    gtk.gtk_widget_set_visible(preedit, 0);
+    w.preedit = preedit;
+    gtk.gtk_overlay_add_overlay(overlay, preedit);
 
     if (gtk.gtk_css_provider_new()) |css| {
         w.css = css;
@@ -230,12 +242,58 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-confirm {{ padding: 12px 16px; }}
         \\.zonvie-panel.tone-error {{ border-color: #e06c75; color: #e06c75; }}
         \\.zonvie-panel.tone-warn {{ border-color: #e5c07b; }}
+        \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar {{ background-color: #{x:0>6}; }}
         \\.zonvie-tabbar button {{ background: none; color: alpha(#{x:0>6}, 0.6); border-radius: 0;
         \\  border: none; padding: 4px 14px; font-family: monospace; }}
         \\.zonvie-tabbar button.current {{ background-color: #{x:0>6}; color: #{x:0>6}; }}
-    , .{ panel, fg, fg, panel, fg, bg, fg }) catch return;
+    , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
+}
+
+/// Shows `text` (null-terminated) with the IME's Pango `attrs` (its
+/// underlines and the converting clause) in the editor font, or hides the
+/// label for an empty one. GTK main thread.
+pub fn showPreedit(app: *App, text: [:0]const u8, attrs: ?*anyopaque, at: ?gtk.GdkRectangle) void {
+    const l = app.widgets.preedit orelse return;
+    if (text.len == 0) {
+        gtk.gtk_widget_set_visible(l, 0);
+        return;
+    }
+    var family: [129]u8 = undefined;
+    app.mu.lockUncancelable(clock.io());
+    const n = app.preedit_family_len;
+    @memcpy(family[0..n], app.preedit_family[0..n]);
+    const px = app.preedit_px;
+    app.mu.unlock(clock.io());
+    family[n] = 0;
+    // Font first, so the IME's own attributes still apply over it.
+    const list = (if (attrs) |a| gtk.pango_attr_list_copy(a) else gtk.pango_attr_list_new()) orelse return;
+    defer gtk.pango_attr_list_unref(list);
+    if (n != 0) {
+        if (gtk.pango_attr_family_new(@ptrCast(&family))) |f| gtk.pango_attr_list_insert_before(list, f);
+    }
+    if (px > 0) {
+        if (gtk.pango_attr_size_new_absolute(@intFromFloat(px * @as(f32, @floatFromInt(gtk.PANGO_SCALE))))) |s| gtk.pango_attr_list_insert_before(list, s);
+    }
+    gtk.gtk_label_set_text(l, text.ptr);
+    gtk.gtk_label_set_attributes(l, list);
+    placePreedit(app, at);
+    gtk.gtk_widget_set_visible(l, 1);
+}
+
+/// Moves the preedit label to the cursor cell `at` (logical px), when it is
+/// up. GTK main thread.
+pub fn placePreedit(app: *App, at: ?gtk.GdkRectangle) void {
+    const l = app.widgets.preedit orelse return;
+    const r = at orelse return;
+    gtk.gtk_widget_set_margin_start(l, @max(0, r.x));
+    gtk.gtk_widget_set_margin_top(l, @max(0, r.y));
+}
+
+pub fn preeditShown(app: *const App) bool {
+    const l = app.widgets.preedit orelse return false;
+    return gtk.gtk_widget_get_visible(l) != 0;
 }
 
 const TabClick = struct { app: *App, index: u32 };

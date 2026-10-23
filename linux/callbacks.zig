@@ -535,6 +535,10 @@ fn updateMetrics(app: *App) void {
     lock(app);
     app.cell_w_px = app.fonts.cell_w_px;
     app.cell_h_px = @intCast(@max(1, h));
+    const n = app.fonts.family_len;
+    @memcpy(app.preedit_family[0..n], app.fonts.family[0..n]);
+    app.preedit_family_len = n;
+    app.preedit_px = @as(f32, @floatFromInt(app.fonts.pixel_size)) / app.scale;
     unlock(app);
     // The line the GUI harness reads the cell size from, as on Windows.
     applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ app.fonts.cell_w_px, @max(1, h) });

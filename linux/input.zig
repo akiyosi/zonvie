@@ -8,6 +8,7 @@ const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
+const ui_widgets = @import("ui_widgets.zig");
 
 /// One GLArea's input: the surface its pointer addresses, its IME context
 /// and the press it is tracking. The main window's lives in App; each
@@ -85,7 +86,7 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     const mods = keymap.coreMods(state);
     var buf: [4]u8 = undefined;
     var n: usize = 0;
-    const cp_u = gtk.gdk_keyval_to_unicode(keyval);
+    const cp_u = keymap.swapColonSemicolon(gtk.gdk_keyval_to_unicode(keyval), app.input_cfg.swap_colon_semicolon);
     if (cp_u != 0) n = std.unicode.utf8Encode(@intCast(cp_u), &buf) catch 0;
     // A bare modifier or dead key: nothing the core can format.
     if (code == 0 and n == 0) return 0;
@@ -102,30 +103,51 @@ fn onImCommit(im: ?*anyopaque, text: ?[*:0]const u8, data: ?*anyopaque) callconv
     if (app.preedit_active) {
         app.preedit_active = false;
         core.zonvie_core_clear_preedit(cp);
+        hidePreedit(ptrFrom(data));
+    } else if (t.len == 1) {
+        // A single character with no composition before it is a keypress:
+        // the one place [input] swap_colon_semicolon applies.
+        const ch: u8 = @intCast(keymap.swapColonSemicolon(t[0], app.input_cfg.swap_colon_semicolon));
+        core.zonvie_core_send_input(cp, &[_]u8{ch}, 1);
+        return;
     }
     if (t.len != 0) core.zonvie_core_send_input(cp, t.ptr, t.len);
 }
 
 fn onPreeditChanged(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    const app = appFrom(data);
+    const p = ptrFrom(data);
+    const app = p.app;
     const cp = app.corep orelse return;
     var str: ?[*:0]u8 = null;
-    gtk.gtk_im_context_get_preedit_string(im.?, &str, null, null);
+    var attrs: ?*anyopaque = null;
+    gtk.gtk_im_context_get_preedit_string(im.?, &str, &attrs, null);
     defer gtk.g_free(str);
-    const t: []const u8 = if (str) |s| std.mem.span(s) else "";
+    defer gtk.pango_attr_list_unref(attrs);
+    const t: [:0]const u8 = if (str) |s| std.mem.span(s) else "";
     if (t.len == 0) {
         if (app.preedit_active) core.zonvie_core_clear_preedit(cp);
         app.preedit_active = false;
+        hidePreedit(p);
         return;
     }
     app.preedit_active = true;
-    // No target clause: GTK reports it only through Pango attributes.
-    _ = core.zonvie_core_set_preedit(cp, t.ptr, t.len, 0, 0);
+    // No target clause: GTK reports it only through Pango attributes, which
+    // the overlay label draws as they are.
+    const inline_shown = core.zonvie_core_set_preedit(cp, t.ptr, t.len, 0, 0) != 0;
+    // The overlay is the main window's: an external window's composition
+    // shows only inline.
+    if (p.surface_id != 1) return;
+    ui_widgets.showPreedit(app, if (inline_shown) "" else t, attrs, cursorRect(app));
+}
+
+fn hidePreedit(p: *Pointer) void {
+    if (p.surface_id == 1) ui_widgets.showPreedit(p.app, "", null, null);
 }
 
 fn onPreeditEnd(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = im;
     const app = appFrom(data);
+    hidePreedit(ptrFrom(data));
     if (!app.preedit_active) return;
     app.preedit_active = false;
     if (app.corep) |cp| core.zonvie_core_clear_preedit(cp);
@@ -141,19 +163,27 @@ fn onFocusOut(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     if (ptrFrom(data).im_context) |im| gtk.gtk_im_context_focus_out(im);
 }
 
-/// Places the main window's IME candidate window at the committed cursor,
-/// in logical px.
+/// Places the main window's IME candidate window, and the preedit label when
+/// it is up, at the committed cursor.
 pub fn updateImeCursor(app: *App) void {
     const im = app.pointer.im_context orelse return;
+    const rect = cursorRect(app) orelse return;
+    gtk.gtk_im_context_set_cursor_location(im, &rect);
+    if (ui_widgets.preeditShown(app)) ui_widgets.placePreedit(app, rect);
+}
+
+/// The committed cursor on the main surface, in logical px; null when it is
+/// elsewhere.
+fn cursorRect(app: *App) ?gtk.GdkRectangle {
     var rect: gtk.GdkRectangle = undefined;
     {
         app.mu.lockUncancelable(clock.io());
         defer app.mu.unlock(clock.io());
         const cur = app.surface.committedCursor();
-        if (cur.verts.len == 0) return;
+        if (cur.verts.len == 0) return null;
         const layer = for (app.surface.committedLayers()) |l| {
             if (l.grid_id == cur.grid_id) break l;
-        } else return;
+        } else return null;
         var x0: f32 = std.math.floatMax(f32);
         var y0: f32 = std.math.floatMax(f32);
         var x1: f32 = -std.math.floatMax(f32);
@@ -174,7 +204,7 @@ pub fn updateImeCursor(app: *App) void {
             .height = @intFromFloat(@max(1.0, (y1 - y0) / s)),
         };
     }
-    gtk.gtk_im_context_set_cursor_location(im, &rect);
+    return rect;
 }
 
 // =========================================================================
