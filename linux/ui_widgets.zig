@@ -14,7 +14,16 @@ const overlay_layout = @import("overlay_layout.zig");
 const margin_pt = 10;
 
 pub const Widgets = struct {
+    /// The tab strip: `tabs`, then the new-tab button.
     tabbar: ?*anyopaque = null,
+    /// One box per tab, equal sizes, so a drag's drop index is the core's
+    /// tabDropIndex over them.
+    tabs: ?*anyopaque = null,
+    /// [tabline] style = "sidebar": the strip runs down one side.
+    sidebar: bool = false,
+    /// The tab a drag started on, and where.
+    drag_from: ?u32 = null,
+    drag_start: [2]f64 = .{ 0, 0 },
     /// Holds the editor view and the boxes over it; the same size as the view.
     overlay: ?*anyopaque = null,
     mini_box: ?*anyopaque = null,
@@ -44,25 +53,52 @@ fn label(classes: []const [*:0]const u8) *anyopaque {
     return l;
 }
 
-/// Builds the window content around `area`: a vertical box holding the tab
-/// strip and an overlay whose child is the editor widget. `frames`, when the
-/// render thread draws, is the picture showing its frames, layered over
-/// `area` and under the message widgets. Returns the box.
+/// Builds the window content around `area`: a box holding the tab strip
+/// (above, or beside it as a [tabline] sidebar) and an overlay whose child is
+/// the editor widget. `frames`, when the render thread draws, is the picture
+/// showing its frames, layered over `area` and under the message widgets.
+/// Returns the box.
 pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     const w = &app.widgets;
-    const root = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
-    const tabbar = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
+    const cfg = app.tabline_cfg;
+    w.sidebar = std.mem.eql(u8, cfg.style, "sidebar");
+    const along: c_int = if (w.sidebar) gtk.GTK_ORIENTATION_VERTICAL else gtk.GTK_ORIENTATION_HORIZONTAL;
+    const root = gtk.gtk_box_new(if (w.sidebar) gtk.GTK_ORIENTATION_HORIZONTAL else gtk.GTK_ORIENTATION_VERTICAL, 0).?;
+
+    const tabbar = gtk.gtk_box_new(along, 0).?;
     gtk.gtk_widget_add_css_class(tabbar, "zonvie-tabbar");
     gtk.gtk_widget_set_visible(tabbar, 0);
+    if (w.sidebar) {
+        gtk.gtk_widget_set_size_request(tabbar, @intCast(std.math.clamp(cfg.sidebar_width, 100, 500)), -1);
+        // Set, so the tab names' hexpand does not widen it past that.
+        gtk.gtk_widget_set_hexpand(tabbar, 0);
+    }
+    const tabs = gtk.gtk_box_new(along, 0).?;
+    gtk.gtk_box_set_homogeneous(tabs, 1);
+    if (!w.sidebar) gtk.gtk_widget_set_hexpand(tabs, 1);
+    gtk.gtk_box_append(tabbar, tabs);
+    const plus = gtk.gtk_button_new_with_label("+").?;
+    gtk.gtk_widget_set_focusable(plus, 0);
+    _ = gtk.g_signal_connect(plus, "clicked", @ptrCast(&onNewTab), null);
+    gtk.gtk_box_append(tabbar, plus);
+    if (gtk.gtk_gesture_drag_new()) |drag| {
+        _ = gtk.g_signal_connect(drag, "drag-begin", @ptrCast(&onTabDragBegin), app);
+        _ = gtk.g_signal_connect(drag, "drag-end", @ptrCast(&onTabDragEnd), app);
+        gtk.gtk_widget_add_controller(tabs, drag);
+    }
     w.tabbar = tabbar;
-    gtk.gtk_box_append(root, tabbar);
+    w.tabs = tabs;
 
     const overlay = gtk.gtk_overlay_new().?;
     gtk.gtk_widget_set_vexpand(overlay, 1);
+    gtk.gtk_widget_set_hexpand(overlay, 1);
     gtk.gtk_overlay_set_child(overlay, area);
     w.overlay = overlay;
     if (frames) |f| gtk.gtk_overlay_add_overlay(overlay, f);
+    const right = w.sidebar and std.mem.eql(u8, cfg.sidebar_position, "right");
+    if (!right) gtk.gtk_box_append(root, tabbar);
     gtk.gtk_box_append(root, overlay);
+    if (right) gtk.gtk_box_append(root, tabbar);
 
     const m: c_int = margin_pt;
     const mini_box = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 4).?;
@@ -247,7 +283,9 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-tabbar {{ background-color: #{x:0>6}; }}
         \\.zonvie-tabbar button {{ background: none; color: alpha(#{x:0>6}, 0.6); border-radius: 0;
         \\  border: none; padding: 4px 14px; font-family: monospace; }}
-        \\.zonvie-tabbar button.current {{ background-color: #{x:0>6}; color: #{x:0>6}; }}
+        \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; }}
+        \\.zonvie-tab.current {{ background-color: #{x:0>6}; }}
+        \\.zonvie-tab.current button {{ color: #{x:0>6}; }}
     , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
@@ -297,11 +335,10 @@ pub fn preeditShown(app: *const App) bool {
     return gtk.gtk_widget_get_visible(l) != 0;
 }
 
-const TabClick = struct { app: *App, index: u32 };
-
 fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
     const w = &app.widgets;
     const bar = w.tabbar orelse return;
+    const tabs = w.tabs orelse return;
     gtk.gtk_widget_set_visible(bar, @intFromBool(ui.tabline_visible));
     var same = w.tab_count == ui.tab_count and w.curtab == ui.curtab;
     if (same) {
@@ -312,25 +349,36 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
     // Names are not compared: a rename rebuilds on the next change, and a
     // tabline update without one is the common case worth skipping.
     if (same and ui.tab_count != 0) {
-        var child = gtk.gtk_widget_get_first_child(bar);
+        var child = gtk.gtk_widget_get_first_child(tabs);
         for (ui.tabs[0..ui.tab_count]) |t| {
-            const btn = child orelse break;
-            setButtonLabel(app, btn, t.name.text());
-            child = gtk.gtk_widget_get_next_sibling(btn);
+            const tab = child orelse break;
+            if (gtk.gtk_widget_get_first_child(tab)) |name_btn| setButtonLabel(app, name_btn, t.name.text());
+            child = gtk.gtk_widget_get_next_sibling(tab);
         }
         return;
     }
-    while (gtk.gtk_widget_get_first_child(bar)) |c| gtk.gtk_box_remove(bar, c);
+    while (gtk.gtk_widget_get_first_child(tabs)) |c| gtk.gtk_box_remove(tabs, c);
     w.tab_count = ui.tab_count;
     w.curtab = ui.curtab;
     for (ui.tabs[0..ui.tab_count], 0..) |t, i| {
         w.tab_handles[i] = t.handle;
-        const btn = gtk.gtk_button_new_with_label("") orelse continue;
-        setButtonLabel(app, btn, t.name.text());
-        gtk.gtk_widget_set_focusable(btn, 0);
-        if (t.handle == ui.curtab) gtk.gtk_widget_add_css_class(btn, "current");
-        _ = gtk.g_signal_connect(btn, "clicked", @ptrCast(&onTabClicked), @ptrFromInt(i + 1));
-        gtk.gtk_box_append(bar, btn);
+        const tab = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0) orelse continue;
+        gtk.gtk_widget_add_css_class(tab, "zonvie-tab");
+        if (t.handle == ui.curtab) gtk.gtk_widget_add_css_class(tab, "current");
+        // Signal data is the 1-based tab number: the strip is rebuilt
+        // whenever the list changes, so it never outlives its tab.
+        const name_btn = gtk.gtk_button_new_with_label("") orelse continue;
+        setButtonLabel(app, name_btn, t.name.text());
+        gtk.gtk_widget_set_focusable(name_btn, 0);
+        gtk.gtk_widget_set_hexpand(name_btn, 1);
+        _ = gtk.g_signal_connect(name_btn, "clicked", @ptrCast(&onTabClicked), @ptrFromInt(i + 1));
+        gtk.gtk_box_append(tab, name_btn);
+        const close = gtk.gtk_button_new_with_label("\u{00d7}") orelse continue;
+        gtk.gtk_widget_add_css_class(close, "zonvie-tab-close");
+        gtk.gtk_widget_set_focusable(close, 0);
+        _ = gtk.g_signal_connect(close, "clicked", @ptrCast(&onTabClose), @ptrFromInt(i + 1));
+        gtk.gtk_box_append(tab, close);
+        gtk.gtk_box_append(tabs, tab);
     }
 }
 
@@ -343,15 +391,71 @@ fn setButtonLabel(app: *App, btn: *anyopaque, name: []const u8) void {
     gtk.gtk_button_set_label(btn, @ptrCast(buf.ptr));
 }
 
-/// `data` is the tab's 1-based index; the app is the process-wide one.
-fn onTabClicked(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = btn;
+fn sendCommand(cmd: []const u8) void {
     const app = the_app orelse return;
     const cp = app.corep orelse return;
-    var buf: [32]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&buf, "{d}tabnext", .{@intFromPtr(data)}) catch return;
     core.zonvie_core_send_command(cp, cmd.ptr, cmd.len);
     if (app.gl_area) |a| _ = gtk.gtk_widget_grab_focus(a);
+}
+
+fn onTabClicked(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = btn;
+    var buf: [32]u8 = undefined;
+    sendCommand(std.fmt.bufPrint(&buf, "{d}tabnext", .{@intFromPtr(data)}) catch return);
+}
+
+fn onTabClose(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = btn;
+    var buf: [32]u8 = undefined;
+    sendCommand(std.fmt.bufPrint(&buf, "{d}tabclose", .{@intFromPtr(data)}) catch return);
+}
+
+fn onNewTab(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = btn;
+    _ = data;
+    sendCommand("tabnew");
+}
+
+/// Logical px a press must travel before it is a drag, not a click.
+const drag_threshold = 8;
+
+/// The tab under `pos` along the strip, by the core's rule.
+fn dropIndex(w: *const Widgets, pos: f64) u32 {
+    const tabs = w.tabs orelse return 0;
+    const count: u32 = @intCast(w.tab_count);
+    if (count == 0) return 0;
+    const len: f64 = @floatFromInt(if (w.sidebar) gtk.gtk_widget_get_height(tabs) else gtk.gtk_widget_get_width(tabs));
+    const stride = len / @as(f64, @floatFromInt(count));
+    return core.frontend_rules.tabDropIndex(pos, count, 0, stride, stride);
+}
+
+fn onTabDragBegin(gesture: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = gesture;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const w = &app.widgets;
+    w.drag_start = .{ x, y };
+    const pos = if (w.sidebar) y else x;
+    // The tab containing the press.
+    const count: u32 = @intCast(w.tab_count);
+    const len: f64 = @floatFromInt(if (w.sidebar) gtk.gtk_widget_get_height(w.tabs.?) else gtk.gtk_widget_get_width(w.tabs.?));
+    const stride = if (count == 0) 0 else len / @as(f64, @floatFromInt(count));
+    const under: u32 = if (stride > 0) @intFromFloat(@floor(pos / stride)) else 0;
+    w.drag_from = if (under < count) under else null;
+}
+
+fn onTabDragEnd(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = gesture;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const w = &app.widgets;
+    const from = w.drag_from orelse return;
+    w.drag_from = null;
+    const moved = if (w.sidebar) dy else dx;
+    if (@abs(moved) < drag_threshold) return;
+    const pos = (if (w.sidebar) w.drag_start[1] else w.drag_start[0]) + moved;
+    const cp = app.corep orelse return;
+    // Selects the dragged tab and moves it in one command; nothing for a
+    // drop onto its own slot.
+    _ = core.zonvie_core_tab_move(cp, from, dropIndex(w, pos), @intCast(w.tab_count));
 }
 
 /// Set once in main before the window exists; tab buttons carry only their

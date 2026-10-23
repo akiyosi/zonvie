@@ -63,6 +63,8 @@ pub const App = struct {
     /// config.toml's [window]. Below 1 opacity, or with blur, the windows
     /// are translucent and the compositor blurs what shows through.
     window_cfg: core.config.Config.WindowConfig = .{},
+    /// config.toml's [tabline].
+    tabline_cfg: core.config.Config.TablineConfig = .{},
     /// config.toml's [scrollbar], and the main window's bar.
     scrollbar_cfg: core.config.Config.ScrollbarConfig = .{},
     scrollbar: scrollbar.State = .{},

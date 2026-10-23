@@ -487,6 +487,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .input_cfg = config.input,
         .window_cfg = config.window,
         .scrollbar_cfg = config.scrollbar,
+        .tabline_cfg = config.tabline,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
     };
     defer app.deinit();
