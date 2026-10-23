@@ -59,6 +59,8 @@ const usage =
     \\                                    Mutually exclusive with --ssh / --devcontainer.
     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
     \\    --renderer=<glarea|thread>    Draw in GTK's GLArea (default) or on a render thread
+    \\    --dialog                      Show a dialog at startup to choose the connection
+    \\                                    (Local / SSH / Devcontainer) before launching nvim.
     \\    --install                     Create default config file and exit
     \\    --version                     Show version information and exit
     \\    --help, -h                    Show this help message and exit
@@ -230,7 +232,7 @@ pub fn sshCommand(alloc: std.mem.Allocator, s: Ssh, remote_nvim: []const u8) ![:
 /// Points ssh's SSH_ASKPASS at this executable in askpass mode (askpass.zig),
 /// for every prompt, display or not. Before the core spawns ssh: it passes
 /// the environment as it is then.
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 pub fn setAskpassEnv(env_mode: [:0]const u8) void {
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;

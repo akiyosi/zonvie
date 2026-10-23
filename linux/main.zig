@@ -16,6 +16,7 @@ const render_thread = @import("render_thread.zig");
 const blink = @import("blink.zig");
 const cli = @import("cli.zig");
 const askpass = @import("askpass.zig");
+const connect_dialog = @import("connect_dialog.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -406,6 +407,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var devcontainer: ?cli.Devcontainer = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild = false;
+    var dialog = false;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     // The file arguments among them, absolute: what a second launch hands a
     // running instance under [server] single_instance.
@@ -457,6 +459,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
         } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
             devcontainer_rebuild = true;
+        } else if (std.mem.eql(u8, arg, "--dialog")) {
+            dialog = true;
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg["--ssh-identity=".len..];
         } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
@@ -504,6 +508,58 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer applog.deinit();
 
+    if (dialog and connect_addr != null) {
+        std.debug.print("--dialog chooses the connection, so it cannot be combined with --connect-nvim. Remove the conflicting option and retry.\n", .{});
+        return 1;
+    }
+    if (dialog) {
+        // The CLI and config seed the dialog; its answer replaces them.
+        var seed: connect_dialog.Choice = .{
+            .mode = if (ssh != null) .ssh else if (devcontainer != null) .devcontainer else .local,
+            .nvim_path = cli_nvim_path orelse "",
+            .ssh_host = if (ssh) |s| s.host else "",
+            .ssh_identity = ssh_identity orelse "",
+            .dc_workspace = if (devcontainer) |d| d.workspace else "",
+            .dc_config = devcontainer_config orelse "",
+            .dc_rebuild = devcontainer_rebuild,
+            .ext = .{ ext_cmdline, ext_popupmenu, ext_messages, ext_tabline, ext_windows },
+        };
+        var port_buf: [8]u8 = undefined;
+        if (ssh) |s| if (s.port) |p| {
+            seed.ssh_port = std.fmt.bufPrint(&port_buf, "{d}", .{p}) catch "";
+        };
+        const c = (connect_dialog.run(aa, seed) catch return 1) orelse return 0;
+        if (c.nvim_path.len != 0) {
+            nvim_path = c.nvim_path;
+            cli_nvim_path = c.nvim_path;
+        }
+        ssh = null;
+        devcontainer = null;
+        switch (c.mode) {
+            .local => {},
+            .ssh => if (c.ssh_host.len != 0) {
+                const t = core.frontend_rules.sshTarget(c.ssh_host);
+                ssh = .{ .host = t.host, .port = std.fmt.parseInt(u16, c.ssh_port, 10) catch t.port };
+                ssh_identity = if (c.ssh_identity.len != 0) c.ssh_identity else null;
+            },
+            .devcontainer => if (c.dc_workspace.len != 0) {
+                devcontainer = .{ .workspace = c.dc_workspace };
+                devcontainer_config = if (c.dc_config.len != 0) c.dc_config else null;
+                devcontainer_rebuild = c.dc_rebuild;
+            },
+        }
+        ext_cmdline, ext_popupmenu, ext_messages, ext_tabline, ext_windows = c.ext;
+        // Before the core spawns nvim, which inherits them.
+        var lines = std.mem.splitScalar(u8, c.env, '\n');
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            const eq = std.mem.indexOfScalar(u8, t, '=') orelse continue;
+            if (eq == 0) continue;
+            const k = aa.dupeZ(u8, t[0..eq]) catch return 1;
+            const v = aa.dupeZ(u8, t[eq + 1 ..]) catch return 1;
+            _ = cli.setenv(k, v, 1);
+        }
+    }
     if (@as(u8, @intFromBool(ssh != null)) + @intFromBool(connect_addr != null) + @intFromBool(devcontainer != null) > 1) {
         std.debug.print("--connect-nvim, --ssh (or [neovim] ssh in config.toml) and --devcontainer are mutually exclusive. Remove the conflicting option and retry.\n", .{});
         return 1;
