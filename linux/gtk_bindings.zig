@@ -95,6 +95,16 @@ pub extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellab
 pub extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]u8;
 pub extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const u8) void;
 pub extern "c" fn g_free(ptr: ?*anyopaque) void;
+
+// File drops (GtkDropTarget carrying a GdkFileList).
+pub const GDK_ACTION_COPY: c_uint = 1 << 0;
+pub const GSList = extern struct { data: ?*anyopaque, next: ?*GSList };
+pub extern "c" fn gdk_file_list_get_type() usize;
+pub extern "c" fn gdk_file_list_get_files(list: *anyopaque) ?*GSList;
+pub extern "c" fn gtk_drop_target_new(gtype: usize, actions: c_uint) ?*anyopaque;
+pub extern "c" fn g_value_get_boxed(value: *const anyopaque) ?*anyopaque;
+pub extern "c" fn g_slist_free(list: ?*GSList) void;
+pub extern "c" fn g_file_get_path(file: *anyopaque) ?[*:0]u8;
 pub extern "c" fn g_error_free(err: *anyopaque) void;
 
 pub const GdkRectangle = extern struct { x: c_int, y: c_int, width: c_int, height: c_int };

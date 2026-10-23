@@ -65,6 +65,10 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
         _ = gtk.g_signal_connect(click, "released", @ptrCast(&onReleased), p);
         gtk.gtk_widget_add_controller(area, click);
     }
+    if (gtk.gtk_drop_target_new(gtk.gdk_file_list_get_type(), gtk.GDK_ACTION_COPY)) |drop| {
+        _ = gtk.g_signal_connect(drop, "drop", @ptrCast(&onDrop), p);
+        gtk.gtk_widget_add_controller(area, drop);
+    }
     if (gtk.gtk_event_controller_motion_new()) |motion| {
         _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onMotion), p);
         _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onLeave), p);
@@ -320,6 +324,54 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "drag", m.ptr, c.grid_id, c.row, c.col);
+}
+
+/// Files dropped on a surface: their paths typed into the command line while
+/// it is up, `:drop`ped otherwise (frontend_rules.dropInsertsPath; the
+/// cmdline is drawn in this window, never one of its own).
+fn onDrop(target: ?*anyopaque, value: ?*const anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_int {
+    _ = target;
+    _ = x;
+    _ = y;
+    const app = appFrom(data);
+    const cp = app.corep orelse return 0;
+    const list = gtk.g_value_get_boxed(value orelse return 0) orelse return 0;
+    const files = gtk.gdk_file_list_get_files(list);
+    defer gtk.g_slist_free(files);
+
+    var arena = std.heap.ArenaAllocator.init(app.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var node = files;
+    while (node) |n| : (node = n.next) {
+        const path = gtk.g_file_get_path(n.data orelse continue) orelse continue;
+        defer gtk.g_free(path);
+        paths.append(a, a.dupe(u8, std.mem.span(path)) catch return 0) catch return 0;
+    }
+    if (paths.items.len == 0) return 0;
+
+    const mode = std.mem.span(core.zonvie_core_get_current_mode(cp));
+    if (core.frontend_rules.dropInsertsPath(mode, false, false)) {
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        for (paths.items) |path| {
+            const buf = a.alloc(u8, 2 * path.len + 1) catch return 0;
+            const esc = core.frontend_rules.escapePathForCmdline(buf, path, false) orelse continue;
+            if (line.items.len != 0) line.append(a, ' ') catch return 0;
+            line.appendSlice(a, esc) catch return 0;
+        }
+        if (line.items.len != 0) core.zonvie_core_send_input(cp, line.items.ptr, @intCast(line.items.len));
+        return 1;
+    }
+    // Unescaped: the server escapes each with its own fnameescape().
+    const ptrs = a.alloc([*]const u8, paths.items.len) catch return 0;
+    const lens = a.alloc(usize, paths.items.len) catch return 0;
+    for (paths.items, ptrs, lens) |path, *pp, *l| {
+        pp.* = path.ptr;
+        l.* = path.len;
+    }
+    core.zonvie_core_drop_paths(cp, ptrs.ptr, lens.ptr, paths.items.len, 0);
+    return 1;
 }
 
 fn onLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
