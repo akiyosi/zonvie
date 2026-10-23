@@ -63,6 +63,9 @@ pub const App = struct {
     /// config.toml's [window]. Below 1 opacity, or with blur, the windows
     /// are translucent and the compositor blurs what shows through.
     window_cfg: core.config.Config.WindowConfig = .{},
+    /// [server] open_mode = "current": a single forwarded file replaces the
+    /// current window instead of opening a tab.
+    open_mode_current: bool = false,
     /// config.toml's [tabline].
     tabline_cfg: core.config.Config.TablineConfig = .{},
     /// config.toml's [scrollbar], and the main window's bar.

@@ -218,7 +218,7 @@ ime_disable_on_modechange = false
 ime_preedit_mode = "overlay"  # "overlay" (floating overlay) or "inline" (inline virt_text)
 
 [server]
-single_instance = false  # route `zonvie <file>` to a running instance (Windows only)
+single_instance = false  # route `zonvie <file>` to a running instance (Windows and Linux)
 open_mode = "tab"        # "tab" (new tab) or "current" (replace current window)
 close_to_tray = false    # close button hides to the notification area instead of quitting (Windows only)
 
@@ -391,7 +391,7 @@ The `"titlebar"` style draws the same multi-line label in each tab, up to 4 line
 #### [server]
 | Key | Description |
 |-----|-------------|
-| `single_instance` | **Windows only.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS. |
+| `single_instance` | **Windows and Linux.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS; Linux routes through the session bus (D-Bus). |
 | `open_mode` | How a routed file is shown: `"tab"` opens a new tab (`:tab drop`), `"current"` replaces the current window (`:drop`). Multiple files always open as tabs. Default `"tab"`. |
 | `close_to_tray` | **Windows only.** When true, the close button hides the window to the notification area (system tray) instead of quitting; Neovim keeps running, so the instance stays resident (and reusable via `single_instance`). Left-click the tray icon to restore, right-click for Open/Quit. Default false. |
 

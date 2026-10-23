@@ -275,9 +275,36 @@ fn onCloseRequest(window: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
     return 1;
 }
 
+/// Files a later launch handed over ([server] single_instance): `:drop`ped
+/// through the core, each in a tab unless open_mode is "current" for a
+/// single file, and the window raised.
+fn onOpen(gapp: ?*anyopaque, gfiles: [*]const *anyopaque, n_files: c_int, hint: ?[*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = gapp;
+    _ = hint;
+    const app = appFrom(data);
+    if (app.window) |w| gtk.gtk_window_present(w);
+    const cp = app.corep orelse return;
+    const n: usize = @intCast(@max(0, n_files));
+    var paths: [64][*:0]u8 = undefined;
+    var lens: [64]usize = undefined;
+    var count: usize = 0;
+    for (gfiles[0..n]) |f| {
+        if (count == paths.len) break;
+        const p = gtk.g_file_get_path(f) orelse continue;
+        paths[count] = p;
+        lens[count] = std.mem.len(p);
+        count += 1;
+    }
+    defer for (paths[0..count]) |p| gtk.g_free(p);
+    if (count == 0) return;
+    const tab_per_file = !app.open_mode_current or count > 1;
+    core.zonvie_core_drop_paths(cp, @ptrCast(&paths), &lens, count, @intFromBool(tab_per_file));
+}
+
 fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const app = appFrom(data);
-    if (app.window != null) return;
+    // A later launch under single_instance with no files: just come forward.
+    if (app.window) |w| return gtk.gtk_window_present(w);
     const win = gtk.gtk_application_window_new(gapp.?) orelse return;
     app.window = win;
     gtk.gtk_window_set_title(win, "zonvie");
@@ -380,6 +407,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild = false;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
+    // The file arguments among them, absolute: what a second launch hands a
+    // running instance under [server] single_instance.
+    var files: std.ArrayListUnmanaged([:0]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -389,8 +419,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var nvim_dash_dash = false;
             for (args[i + 1 ..], i + 1..) |a, j| {
                 const prev: ?[]const u8 = if (j > i + 1) args[j - 1] else null;
-                const fwd = if (nvim_dash_dash) cli.absoluteFileArg(aa, prev, a, true) catch return 1 else cli.absoluteFileArg(aa, prev, a, false) catch return 1;
+                const fwd = cli.absoluteFileArg(aa, prev, a, nvim_dash_dash) catch return 1;
                 extra.append(aa, fwd) catch return 1;
+                if (core.frontend_rules.nvimArgIsFile(prev, a, nvim_dash_dash)) files.append(aa, aa.dupeZ(u8, fwd) catch return 1) catch return 1;
                 if (!nvim_dash_dash and std.mem.eql(u8, a, "--")) nvim_dash_dash = true;
             }
             break;
@@ -460,7 +491,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--nofork") or std.mem.eql(u8, arg, "--install")) {
             // Handled above.
         } else {
-            extra.append(aa, cli.absoluteFileArg(aa, args[i - 1], arg, false) catch return 1) catch return 1;
+            const fwd = cli.absoluteFileArg(aa, args[i - 1], arg, false) catch return 1;
+            extra.append(aa, fwd) catch return 1;
+            if (core.frontend_rules.nvimArgIsFile(args[i - 1], arg, false)) files.append(aa, aa.dupeZ(u8, fwd) catch return 1) catch return 1;
         }
     }
     applog.setVerbose(config.log.verbose and !config.log.perf_only and !config.log.scroll_only);
@@ -512,6 +545,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .progress = progress,
     };
 
+    // Without [server] single_instance each process owns its own nvim, so a
+    // second launch must not forward to the first instance. With it, the
+    // first registers the id on the session bus and a later launch hands it
+    // its files (or just raises it) and exits, as Windows does.
+    const single = config.server.single_instance;
+    const gapp = gtk.gtk_application_new("io.github.akiyosi.zonvie", if (single) gtk.G_APPLICATION_HANDLES_OPEN else gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
+    if (single and gtk.g_application_register(gapp, null, null) != 0 and gtk.g_application_get_is_remote(gapp) != 0) {
+        // GApplication's own command line turns these into an Open call on
+        // the running instance (an Activate without files).
+        var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+        argv.append(aa, "zonvie") catch return 1;
+        for (files.items) |f| argv.append(aa, f.ptr) catch return 1;
+        argv.append(aa, null) catch return 1;
+        return @intCast(gtk.g_application_run(gapp, @intCast(argv.items.len - 1), @ptrCast(argv.items.ptr)));
+    }
+
     const app = alloc.create(App) catch return 1;
     defer alloc.destroy(app);
     app.* = .{
@@ -524,6 +573,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .window_cfg = config.window,
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
+        .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
         .shader_preserve_alpha = config.shaders.preserve_alpha,
         .shader_epoch_ns = clock.nowNs(),
@@ -533,11 +583,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     ui_widgets.the_app = app;
     defer latency_bench.deinit(app);
 
-    // Each process owns its own nvim, so a second launch must not forward
-    // to the first instance.
-    const gapp = gtk.gtk_application_new("io.github.akiyosi.zonvie", gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
     app.gtk_app = gapp;
     _ = gtk.g_signal_connect(gapp, "activate", @ptrCast(&onActivate), app);
+    if (single) _ = gtk.g_signal_connect(gapp, "open", @ptrCast(&onOpen), app);
     _ = gtk.g_application_run(gapp, 0, null);
 
     // The loop no longer serves clipboard idles; release a core thread
