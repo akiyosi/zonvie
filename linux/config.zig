@@ -29,32 +29,26 @@ pub fn loadWithPath(alloc: std.mem.Allocator) struct { config: Config, path: ?[]
     };
 }
 
-/// Get config file path: $XDG_CONFIG_HOME/zonvie/config.toml or ~/.config/zonvie/config.toml
-pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
-    // Try $XDG_CONFIG_HOME/zonvie/config.toml first
+/// Where the config lives, chosen without looking at the filesystem:
+/// $XDG_CONFIG_HOME/zonvie/config.toml whenever XDG_CONFIG_HOME is set and
+/// non-empty, ~/.config/zonvie/config.toml otherwise (README, as on macOS).
+pub fn configFilePath(alloc: std.mem.Allocator) ![]const u8 {
     // std.process.Environ needs the block handed to main on POSIX; libc's
     // getenv reads the same environment without threading it through.
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
-        const path = try std.fs.path.join(alloc, &.{ std.mem.span(xdg), "zonvie", "config.toml" });
-
-        // Check if file exists
-        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
-            return path;
-        } else |_| {
-            alloc.free(path);
-        }
+        const base = std.mem.span(xdg);
+        if (base.len > 0) return std.fs.path.join(alloc, &.{ base, "zonvie", "config.toml" });
     }
+    const home = std.c.getenv("HOME") orelse return error.NoConfigPath;
+    return std.fs.path.join(alloc, &.{ std.mem.span(home), ".config", "zonvie", "config.toml" });
+}
 
-    // Fallback to ~/.config/zonvie/config.toml
-    if (std.c.getenv("HOME")) |home| {
-        const path = try std.fs.path.join(alloc, &.{ std.mem.span(home), ".config", "zonvie", "config.toml" });
-
-        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
-            return path;
-        } else |_| {
-            alloc.free(path);
-        }
-    }
-
-    return error.NoConfigPath;
+/// configFilePath when the file exists.
+pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
+    const path = try configFilePath(alloc);
+    std.Io.Dir.accessAbsolute(clock.io(), path, .{}) catch {
+        alloc.free(path);
+        return error.NoConfigPath;
+    };
+    return path;
 }

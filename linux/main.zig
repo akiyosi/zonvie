@@ -14,6 +14,7 @@ const ext_window = @import("ext_window.zig");
 const latency_bench = @import("latency_bench.zig");
 const render_thread = @import("render_thread.zig");
 const blink = @import("blink.zig");
+const cli = @import("cli.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -34,6 +35,9 @@ const Startup = struct {
     /// --renderer=thread: draw the main window on a render thread into
     /// dmabufs; the GLArea otherwise, and when that is unavailable.
     threaded: bool = false,
+    /// --nofork: nvim keeps the shell's cwd; otherwise the core starts it
+    /// in $HOME, as on macOS.
+    inherit_cwd: bool = false,
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -203,6 +207,7 @@ fn startCore(app: *App, area: *anyopaque) void {
     } else |_| {}
     if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
     if (applog.isVerbose()) core.zonvie_core_set_log_verbose(cp, 1);
+    if (startup.inherit_cwd) core.zonvie_core_set_inherit_cwd(cp, 1);
     if (startup.ext_cmdline) core.zonvie_core_set_ext_cmdline(cp, 1);
     if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
@@ -318,7 +323,6 @@ fn appendArg(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, arg: [
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
-    clock.init();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -327,6 +331,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer args_arena.deinit();
     const aa = args_arena.allocator();
     const args = init.args.toSlice(aa) catch return 1;
+
+    if (cli.hasFlag(args, "--help") or cli.hasFlag(args, "-h")) {
+        cli.printHelp();
+        return 0;
+    }
+    if (cli.hasFlag(args, "--version")) {
+        cli.printVersion();
+        return 0;
+    }
+    const nofork = cli.hasFlag(args, "--nofork");
+    // Attaching to a server never forks, as on macOS: its failures must
+    // reach the shell's exit code. Nor does a launch with no terminal to
+    // leave (a desktop launcher). Before any thread exists.
+    const connects = cli.hasPrefix(args, "--connect-nvim") or cli.hasPrefix(args, "--remote-ui");
+    if (!nofork and !connects and std.c.isatty(0) != 0 and cli.detach()) return 0;
+
+    clock.init();
+    if (cli.hasFlag(args, "--install")) return cli.install(alloc);
 
     var config = config_mod.load(alloc);
     defer config.deinit();
@@ -345,7 +367,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--")) {
-            for (args[i + 1 ..]) |a| extra.append(aa, a) catch return 1;
+            // Everything after is nvim's own command line, which may carry
+            // its own `--` before files.
+            var nvim_dash_dash = false;
+            for (args[i + 1 ..], i + 1..) |a, j| {
+                const prev: ?[]const u8 = if (j > i + 1) args[j - 1] else null;
+                const fwd = if (nvim_dash_dash) cli.absoluteFileArg(aa, prev, a, true) catch return 1 else cli.absoluteFileArg(aa, prev, a, false) catch return 1;
+                extra.append(aa, fwd) catch return 1;
+                if (!nvim_dash_dash and std.mem.eql(u8, a, "--")) nvim_dash_dash = true;
+            }
             break;
         } else if (std.mem.eql(u8, arg, "--nvim") and i + 1 < args.len) {
             i += 1;
@@ -376,12 +406,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--log") and i + 1 < args.len) {
             i += 1;
             log_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--nofork") or std.mem.eql(u8, arg, "--install")) {
+            // Handled above.
         } else {
-            extra.append(aa, arg) catch return 1;
+            extra.append(aa, cli.absoluteFileArg(aa, args[i - 1], arg, false) catch return 1) catch return 1;
         }
     }
     applog.setVerbose(config.log.verbose and !config.log.perf_only and !config.log.scroll_only);
-    if (log_path) |p| {
+    // --log wins over [log], as on Windows.
+    if (log_path orelse if (config.log.enabled) config.log.path else null) |p| {
         applog.setEnabled(true);
         applog.setLogPath(p);
     }
@@ -399,6 +432,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .ext_windows = ext_windows,
         .threaded = threaded,
         .connect_addr = connect_addr,
+        .inherit_cwd = nofork,
     };
 
     const app = alloc.create(App) catch return 1;

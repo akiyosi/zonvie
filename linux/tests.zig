@@ -8,4 +8,5 @@ test {
     _ = @import("grid_ease.zig");
     _ = @import("overlay_layout.zig");
     _ = @import("ui_state.zig");
+    _ = @import("cli.zig");
 }
