@@ -66,6 +66,9 @@ pub const App = struct {
     /// [server] open_mode = "current": a single forwarded file replaces the
     /// current window instead of opening a tab.
     open_mode_current: bool = false,
+    /// [cmdline] / [messages] copy_button.
+    copy_cmdline: bool = true,
+    copy_messages: bool = true,
     /// config.toml's [tabline].
     tabline_cfg: core.config.Config.TablineConfig = .{},
     /// config.toml's [scrollbar], and the main window's bar.

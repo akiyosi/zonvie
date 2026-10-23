@@ -573,6 +573,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .window_cfg = config.window,
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
+        .copy_cmdline = config.cmdline.copy_button,
+        .copy_messages = config.messages.copy_button,
         .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
         .shader_preserve_alpha = config.shaders.preserve_alpha,

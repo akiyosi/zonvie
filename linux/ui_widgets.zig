@@ -10,6 +10,7 @@ const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const ui_state = @import("ui_state.zig");
 const overlay_layout = @import("overlay_layout.zig");
+const gl_renderer = @import("renderer/gl_renderer.zig");
 
 const margin_pt = 10;
 
@@ -33,6 +34,12 @@ pub const Widgets = struct {
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
     toast: ?*anyopaque = null,
+    /// Copy buttons over the cmdline, msg_show and msg_history panels, by
+    /// overlay_layout.Kind; null for the popupmenu.
+    copy: [4]?*anyopaque = @splat(null),
+    /// A click's remaining tries while the core's grid lock is busy.
+    copy_tries: u8 = 0,
+    copy_grid: i64 = 0,
     /// A start that takes a while (a devcontainer), until the first frame.
     progress: ?*anyopaque = null,
     /// The IME composition, drawn over the cursor cell ([input]
@@ -135,6 +142,18 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     gtk.gtk_widget_set_margin_top(toast, m);
     w.toast = toast;
     gtk.gtk_overlay_add_overlay(overlay, toast);
+
+    for ([_]overlay_layout.Kind{ .cmdline, .msg_show, .msg_history }) |kind| {
+        const b = gtk.gtk_button_new_with_label(copy_glyph).?;
+        gtk.gtk_widget_add_css_class(b, "zonvie-copy");
+        gtk.gtk_widget_set_focusable(b, 0);
+        gtk.gtk_widget_set_halign(b, gtk.GTK_ALIGN_START);
+        gtk.gtk_widget_set_valign(b, gtk.GTK_ALIGN_START);
+        gtk.gtk_widget_set_visible(b, 0);
+        _ = gtk.g_signal_connect(b, "clicked", @ptrCast(&onCopyClicked), @ptrFromInt(@as(usize, @intFromEnum(kind)) + 1));
+        w.copy[@intFromEnum(kind)] = b;
+        gtk.gtk_overlay_add_overlay(overlay, b);
+    }
 
     const progress = label(&.{ "zonvie-panel", "zonvie-confirm" });
     gtk.gtk_widget_set_halign(progress, gtk.GTK_ALIGN_CENTER);
@@ -364,8 +383,98 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-tab.current {{ background-color: #{x:0>6}; }}
         \\.zonvie-tab.current button {{ color: #{x:0>6}; }}
         \\.zonvie-agent {{ margin-left: 8px; }}
-    , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg }) catch return;
+        \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
+        \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
+        \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
+    , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg, fg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
+}
+
+const copy_glyph = "\u{29c9}";
+const copied_glyph = "\u{2713}";
+const copied_ms = 800;
+const copy_retry_ms = 16;
+const copy_tries = 10;
+
+/// Puts each copy button on its panel's trailing edge, where the renderer
+/// left room for it, and hides those whose panel is closed. After every
+/// flush: panels open, close and resize there. GTK main thread.
+pub fn placeCopyButtons(app: *App) void {
+    const w = &app.widgets;
+    const view = w.overlay orelse return;
+    const vw = gtk.gtk_widget_get_width(view);
+    const vh = gtk.gtk_widget_get_height(view);
+    if (vw <= 0 or vh <= 0) return;
+    app.mu.lockUncancelable(clock.io());
+    const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
+    const in = gl_renderer.overlayInputs(app, @intCast(vw * scale), @intCast(vh * scale));
+    const rects = overlay_layout.place(&app.overlays, in);
+    app.mu.unlock(clock.io());
+    for (w.copy, 0..) |btn, i| {
+        const b = btn orelse continue;
+        const kind: overlay_layout.Kind = @enumFromInt(i);
+        const box = if (rects[i]) |r| overlay_layout.copyButtonRect(kind, r, in) else null;
+        const r = box orelse {
+            gtk.gtk_widget_set_visible(b, 0);
+            continue;
+        };
+        gtk.gtk_widget_set_margin_start(b, @divTrunc(r.x, scale));
+        gtk.gtk_widget_set_margin_top(b, @divTrunc(r.y, scale));
+        gtk.gtk_widget_set_size_request(b, @divTrunc(r.w, scale), @divTrunc(r.h, scale));
+        gtk.gtk_widget_set_visible(b, 1);
+    }
+}
+
+fn onCopyClicked(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = btn;
+    const app = the_app orelse return;
+    const kind: overlay_layout.Kind = @enumFromInt(@intFromPtr(data) - 1);
+    app.widgets.copy_grid = overlay_layout.gridId(kind);
+    app.widgets.copy_tries = copy_tries;
+    _ = copyAttempt(app);
+}
+
+/// The panel's text, as the core's grid holds it, onto the clipboard. A busy
+/// grid lock retries a few times (the macOS and Windows rule); the button
+/// shows a check only for a copy that happened. GTK main thread.
+fn copyAttempt(data: ?*anyopaque) callconv(.c) c_int {
+    const app: *App = if (data) |d| @ptrCast(@alignCast(d)) else (the_app orelse return 0);
+    const w = &app.widgets;
+    const cp = app.corep orelse return 0;
+    var stack: [4096]u8 = undefined;
+    var heap: ?[]u8 = null;
+    defer if (heap) |h| app.alloc.free(h);
+    var needed = core.zonvie_core_try_get_grid_text(cp, w.copy_grid, &stack, stack.len - 1);
+    var buf: []u8 = &stack;
+    if (needed > 0 and @as(usize, @intCast(needed)) > stack.len - 1) {
+        heap = app.alloc.alloc(u8, @as(usize, @intCast(needed)) + 1) catch return 0;
+        buf = heap.?;
+        needed = core.zonvie_core_try_get_grid_text(cp, w.copy_grid, buf.ptr, buf.len - 1);
+    }
+    if (needed < 0) {
+        if (w.copy_tries > 0) {
+            w.copy_tries -= 1;
+            _ = gtk.g_timeout_add(copy_retry_ms, &copyAttempt, app);
+        }
+        return 0;
+    }
+    if (needed == 0) return 0;
+    const n: usize = @min(@as(usize, @intCast(needed)), buf.len - 1);
+    buf[n] = 0;
+    const view = w.overlay orelse return 0;
+    const clipboard = gtk.gtk_widget_get_clipboard(view) orelse return 0;
+    gtk.gdk_clipboard_set_text(clipboard, @ptrCast(buf.ptr));
+    const kind = overlay_layout.kindOf(w.copy_grid) orelse return 0;
+    if (w.copy[@intFromEnum(kind)]) |b| {
+        gtk.gtk_button_set_label(b, copied_glyph);
+        _ = gtk.g_timeout_add(copied_ms, &onCopiedRevert, b);
+    }
+    return 0;
+}
+
+fn onCopiedRevert(data: ?*anyopaque) callconv(.c) c_int {
+    gtk.gtk_button_set_label(data.?, copy_glyph);
+    return 0;
 }
 
 /// The start's progress over the window; hidden once Neovim's first layout

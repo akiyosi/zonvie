@@ -418,6 +418,7 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     } else false;
     unlock(app);
     ui_widgets.placeMessages(app);
+    ui_widgets.placeCopyButtons(app);
     if (nvim_drawn) ui_widgets.hideProgress(app);
     app.queueRenderAll();
     input.updateImeCursor(app);

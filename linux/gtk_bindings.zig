@@ -95,6 +95,7 @@ pub extern "c" fn g_application_quit(application: *anyopaque) void;
 pub const GAsyncReadyCallback = *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) void;
 pub extern "c" fn gdk_display_get_default() ?*anyopaque;
 pub extern "c" fn gdk_display_get_clipboard(display: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_widget_get_clipboard(widget: *anyopaque) ?*anyopaque;
 pub extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellable: ?*anyopaque, callback: GAsyncReadyCallback, user_data: ?*anyopaque) void;
 pub extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]u8;
 pub extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const u8) void;

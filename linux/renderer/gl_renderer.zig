@@ -480,18 +480,31 @@ fn pushRect(app: *App, t: *Target, x: i32, y: i32, w: i32, h: i32, color: [4]f32
 
 const surface_layer: core.Layer = .{ .grid_id = 0, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 0, .cols = 0, .z = 0, .flags = 0 };
 
+/// What places the ext UI panels on a `w_px` x `h_px` main view: the one
+/// answer for the panels drawn here and the copy buttons over them
+/// (ui_widgets.placeCopyButtons). Caller holds App.mu.
+pub fn overlayInputs(app: *const App, w_px: u32, h_px: u32) overlay_layout.Inputs {
+    const w: i32 = @intCast(w_px);
+    const h: i32 = @intCast(h_px);
+    const cw: i32 = @intCast(app.cell_w_px);
+    const ch: i32 = @intCast(app.cell_h_px);
+    return .{
+        .main_w_px = w,
+        .main_h_px = h,
+        .cell_w_px = cw,
+        .cell_h_px = ch,
+        .scale = @intFromFloat(app.scale),
+        .msg_target = overlay_layout.msgTarget(app.msg_pos.ext_float, app.msg_anchor, w, h, cw, ch),
+        .copy_cmdline = app.copy_cmdline,
+        .copy_messages = app.copy_messages,
+    };
+}
+
 /// The core-owned ext UI surfaces, over everything else on the main
 /// surface: a panel, then the surface's layers inside its padding.
 fn drawOverlays(app: *App, t: *Target) usize {
     const scale: i32 = @intFromFloat(app.scale);
-    const rects = overlay_layout.place(&app.overlays, .{
-        .main_w_px = @intCast(t.w_px),
-        .main_h_px = @intCast(t.h_px),
-        .cell_w_px = @intCast(app.cell_w_px),
-        .cell_h_px = @intCast(app.cell_h_px),
-        .scale = scale,
-        .msg_target = overlay_layout.msgTarget(app.msg_pos.ext_float, app.msg_anchor, @intCast(t.w_px), @intCast(t.h_px), @intCast(app.cell_w_px), @intCast(app.cell_h_px)),
-    });
+    const rects = overlay_layout.place(&app.overlays, overlayInputs(app, t.w_px, t.h_px));
     const bg = rgba(app.default_bg, 1);
     const panel = rules.panelBg(bg[0], bg[1], bg[2]);
     const border = rgba(app.default_fg, 0.25);

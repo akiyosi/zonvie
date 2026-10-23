@@ -80,7 +80,39 @@ pub const Inputs = struct {
     /// What msg_show and msg_history hang from (msgTarget); the whole view
     /// when null.
     msg_target: ?rules.Rect = null,
+    /// [cmdline] / [messages] copy_button: those panels reserve room for it.
+    copy_cmdline: bool = false,
+    copy_messages: bool = false,
 };
+
+/// The copy button's box and gaps, as windows/app.zig's COPY_BUTTON_*.
+pub const copy_size_pt: i32 = 18;
+const copy_margin_left_pt: i32 = 4;
+const copy_margin_right_pt: i32 = 8;
+
+fn hasCopy(kind: Kind, in: Inputs) bool {
+    return switch (kind) {
+        .cmdline => in.copy_cmdline,
+        .msg_show, .msg_history => in.copy_messages,
+        .popupmenu => false,
+    };
+}
+
+/// The copy button inside panel `r`, surface px: at its trailing edge,
+/// centred on the one-row cmdline and near the top of a message.
+pub fn copyButtonRect(kind: Kind, r: Rect, in: Inputs) ?Rect {
+    if (!hasCopy(kind, in)) return null;
+    const box = copy_size_pt * in.scale;
+    const right = copy_margin_right_pt * in.scale;
+    if (r.w <= box + right or r.h < box) return null;
+    const centred = @divTrunc(r.h - box, 2);
+    return .{
+        .x = r.x + r.w - box - right,
+        .y = r.y + if (kind == .cmdline) centred else @min(right, centred),
+        .w = box,
+        .h = box,
+    };
+}
 
 /// The rect msg_pos `mode` places message boxes against, in main-view px:
 /// the cells of the window the cursor is in (.grid) when that window is on
@@ -102,8 +134,10 @@ pub fn msgTarget(mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, main_w_
 
 fn size(kind: Kind, s: Surface, in: Inputs) [2]i32 {
     const pad = 2 * paddingPx(kind, in.scale);
+    // The copy button sits beside the text, never over it.
+    const copy: i32 = if (hasCopy(kind, in)) (copy_margin_left_pt + copy_size_pt + copy_margin_right_pt) * in.scale else 0;
     return .{
-        @as(i32, @intCast(s.cols)) * in.cell_w_px + pad,
+        @as(i32, @intCast(s.cols)) * in.cell_w_px + pad + copy,
         @as(i32, @intCast(s.rows)) * in.cell_h_px + pad,
     };
 }
@@ -238,4 +272,18 @@ test "msg_pos grid hangs messages from the cursor's window, the rest from the vi
     in.msg_target = .{ .left = 0, .top = 0, .right = 390, .bottom = 600 };
     const m = place(&s, in)[@intFromEnum(Kind.msg_show)].?;
     try testing.expectEqual(@as(i32, 390 - 10), m.x + m.w);
+}
+
+test "a copy button widens its panel and sits at the trailing edge" {
+    var s: [4]Surface = @splat(.{});
+    s[@intFromEnum(Kind.msg_show)] = open(3, 20, -2, -2);
+    const plain = place(&s, in1)[@intFromEnum(Kind.msg_show)].?;
+    try testing.expect(copyButtonRect(.msg_show, plain, in1) == null);
+    var in = in1;
+    in.copy_messages = true;
+    const r = place(&s, in)[@intFromEnum(Kind.msg_show)].?;
+    try testing.expectEqual(plain.w + 30, r.w);
+    const b = copyButtonRect(.msg_show, r, in).?;
+    try testing.expectEqual(r.x + r.w - 8, b.x + b.w);
+    try testing.expectEqual(r.y + 8, b.y);
 }
