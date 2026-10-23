@@ -9,6 +9,7 @@ const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
 const ui_widgets = @import("ui_widgets.zig");
+const scrollbar = @import("scrollbar.zig");
 
 /// One GLArea's input: the surface its pointer addresses, its IME context
 /// and the press it is tracking. The main window's lives in App; each
@@ -26,6 +27,8 @@ pub const Pointer = struct {
     press_grid_id: i64 = 1,
     drag_row: i32 = -1,
     drag_col: i32 = -1,
+    /// The scrollbar took the held press; Neovim never saw it.
+    bar_held: bool = false,
 };
 
 fn ptrFrom(data: ?*anyopaque) *Pointer {
@@ -64,6 +67,7 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
     }
     if (gtk.gtk_event_controller_motion_new()) |motion| {
         _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onMotion), p);
+        _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onLeave), p);
         gtk.gtk_widget_add_controller(area, motion);
     }
     if (gtk.gtk_event_controller_scroll_new(gtk.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES | gtk.GTK_EVENT_CONTROLLER_SCROLL_DISCRETE)) |scroll| {
@@ -269,7 +273,12 @@ fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyop
     _ = n_press;
     const p = ptrFrom(data);
     const cp = p.app.corep orelse return;
-    const name = buttonName(gtk.gtk_gesture_single_get_current_button(gesture.?)) orelse return;
+    const button = gtk.gtk_gesture_single_get_current_button(gesture.?);
+    if (button == 1 and p.held_button == null and scrollbar.press(p.app, p.surface_id, x, y)) {
+        p.bar_held = true;
+        return;
+    }
+    const name = buttonName(button) orelse return;
     const c = resolve(p, cp, x, y, 0) orelse return;
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
@@ -283,6 +292,11 @@ fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyop
 fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
     _ = n_press;
     const p = ptrFrom(data);
+    if (p.bar_held) {
+        p.bar_held = false;
+        _ = scrollbar.release(p.app, p.surface_id);
+        return;
+    }
     const cp = p.app.corep orelse return;
     const name = p.held_button orelse return;
     p.held_button = null;
@@ -296,6 +310,7 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     const p = ptrFrom(data);
     p.x = x;
     p.y = y;
+    if (scrollbar.motion(p.app, p.surface_id, x, y)) return;
     const name = p.held_button orelse return;
     const cp = p.app.corep orelse return;
     const c = inPressGrid(p, x, y) orelse return;
@@ -305,6 +320,12 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     var mods: [8]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "drag", m.ptr, c.grid_id, c.row, c.col);
+}
+
+fn onLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = ctrl;
+    const p = ptrFrom(data);
+    scrollbar.leave(p.app, p.surface_id);
 }
 
 fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {

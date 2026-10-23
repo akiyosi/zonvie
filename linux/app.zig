@@ -15,6 +15,7 @@ const ext_window = @import("ext_window.zig");
 const gtk = @import("gtk_bindings.zig");
 const render_thread = @import("render_thread.zig");
 const postfx = @import("renderer/postfx.zig");
+const scrollbar = @import("scrollbar.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -62,6 +63,10 @@ pub const App = struct {
     /// config.toml's [window]. Below 1 opacity, or with blur, the windows
     /// are translucent and the compositor blurs what shows through.
     window_cfg: core.config.Config.WindowConfig = .{},
+    /// config.toml's [scrollbar], and the main window's bar.
+    scrollbar_cfg: core.config.Config.ScrollbarConfig = .{},
+    scrollbar: scrollbar.State = .{},
+    scrollbar_retry_queued: bool = false,
     /// config.toml's [input].
     input_cfg: core.config.Config.InputConfig = .{},
     /// The editor font as the preedit label draws it: family and logical px.

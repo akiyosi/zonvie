@@ -17,6 +17,7 @@ const Row = surface_store.Row;
 const overlay_layout = @import("../overlay_layout.zig");
 const rules = core.frontend_rules;
 const postfx = @import("postfx.zig");
+const scrollbar = @import("../scrollbar.zig");
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -351,6 +352,7 @@ pub fn renderMain(app: *App, t: *Target) Frame {
 
     const layers = app.surface.committedLayers();
     const d = drawSurface(app, t, layers, @intCast(t0));
+    drawScrollbar(app, t, &app.scrollbar);
     const overlay_verts = drawOverlays(app, t);
 
     if (applog.isEnabled()) {
@@ -419,7 +421,23 @@ pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
     const seq = app.flush_seq;
     if (!begin(app, t)) return .{ .flush_seq = seq };
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
+    if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar);
     return .{ .moving = d.moving, .flush_seq = seq };
+}
+
+/// The surface's scrollbar over its grids, under the ext UI overlays.
+/// Caller holds App.mu.
+fn drawScrollbar(app: *App, t: *Target, st: *const scrollbar.State) void {
+    const vp = scrollbar.drawn(app, st) orelse return;
+    const g = scrollbar.geometry(vp, @floatFromInt(t.w_px), @floatFromInt(t.h_px), app.scale);
+    if (!g.scrollable and !app.scrollbar_cfg.isAlways()) return;
+    const c = scrollbar.colors(app, st.alpha);
+    t.scratch.clearRetainingCapacity();
+    const tl: i32 = @intFromFloat(@floor(g.track_left));
+    const tw: i32 = @intFromFloat(@ceil(g.track_right - g.track_left));
+    pushRect(app, t, tl, @intFromFloat(g.track_top), tw, @intFromFloat(g.track_bottom - g.track_top), c.track);
+    if (g.scrollable) pushRect(app, t, tl, @intFromFloat(g.knob_top), tw, @intFromFloat(@max(1, g.knob_bottom - g.knob_top)), c.knob);
+    drawVerts(app, t, t.scratch.items, surface_layer, 0);
 }
 
 /// An external window's render signal: the surface rooted at `surface_id`.

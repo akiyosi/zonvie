@@ -14,6 +14,7 @@ const postfx = @import("renderer/postfx.zig");
 const input = @import("input.zig");
 const applog = @import("app_log.zig");
 const blink = @import("blink.zig");
+const scrollbar = @import("scrollbar.zig");
 
 pub const Op = struct {
     kind: enum { open, close },
@@ -31,6 +32,7 @@ pub const ExtWindow = struct {
     /// Its own bloom and shader chain: GL objects belong to one context.
     postfx: postfx.PostFx = .{},
     pointer: input.Pointer,
+    scrollbar: scrollbar.State = .{},
     /// The grid's size as the core last opened or updated it.
     rows: u32,
     cols: u32,
@@ -125,6 +127,7 @@ fn open(app: *App, op: Op) void {
 fn close(app: *App, grid_id: i64) void {
     const kv = app.ext_windows.fetchRemove(grid_id) orelse return;
     const w = kv.value;
+    scrollbar.cancelTimers(&w.scrollbar);
     // Destroying unrealizes the area, which still reads `w`.
     if (w.window) |win| gtk.gtk_window_destroy(win);
     w.gl.deinit(app.alloc);
