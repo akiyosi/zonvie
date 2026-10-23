@@ -85,6 +85,10 @@ pub fn g_signal_connect(
 
 pub extern "c" fn gtk_gl_area_queue_render(area: *anyopaque) void;
 pub extern "c" fn gtk_window_set_title(window: *anyopaque, title: [*:0]const u8) void;
+pub extern "c" fn gtk_window_set_resizable(window: *anyopaque, resizable: c_int) void;
+pub extern "c" fn gtk_init() void;
+pub extern "c" fn gtk_password_entry_new() ?*anyopaque;
+pub extern "c" fn gtk_editable_get_text(editable: *anyopaque) [*:0]const u8;
 pub extern "c" fn gtk_im_context_reset(context: *anyopaque) void;
 pub extern "c" fn g_application_quit(application: *anyopaque) void;
 

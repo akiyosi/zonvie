@@ -15,6 +15,7 @@ const latency_bench = @import("latency_bench.zig");
 const render_thread = @import("render_thread.zig");
 const blink = @import("blink.zig");
 const cli = @import("cli.zig");
+const askpass = @import("askpass.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -336,6 +337,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const aa = args_arena.allocator();
     const args = init.args.toSlice(aa) catch return 1;
 
+    // ssh running this executable as its SSH_ASKPASS, with the prompt.
+    if (askpass.requested()) return askpass.run(if (args.len > 1) args[1] else "Password:");
+
     if (cli.hasFlag(args, "--help") or cli.hasFlag(args, "-h")) {
         cli.printHelp();
         return 0;
@@ -366,6 +370,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ext_windows = config.windows.external;
     var threaded = false;
     var connect_addr: ?[]const u8 = null;
+    var cli_nvim_path: ?[]const u8 = null;
+    var ssh: ?cli.Ssh = if (config.neovim.ssh) if (config.neovim.ssh_host) |h| cli.Ssh{ .host = h, .port = config.neovim.ssh_port, .identity = config.neovim.ssh_identity } else null else null;
+    var ssh_identity: ?[]const u8 = config.neovim.ssh_identity;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -384,8 +391,26 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--nvim") and i + 1 < args.len) {
             i += 1;
             nvim_path = args[i];
+            cli_nvim_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "--nvim=")) {
             nvim_path = arg["--nvim=".len..];
+            cli_nvim_path = nvim_path;
+        } else if (std.mem.startsWith(u8, arg, "--ssh=")) {
+            const t = core.frontend_rules.sshTarget(arg["--ssh=".len..]);
+            ssh = .{ .host = t.host, .port = t.port };
+        } else if (std.mem.eql(u8, arg, "--ssh")) {
+            if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
+                i += 1;
+                const t = core.frontend_rules.sshTarget(args[i]);
+                ssh = .{ .host = t.host, .port = t.port };
+            }
+        } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
+            ssh_identity = arg["--ssh-identity=".len..];
+        } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
+            if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
+                i += 1;
+                ssh_identity = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "--extcmdline")) {
             ext_cmdline = true;
         } else if (std.mem.eql(u8, arg, "--extpopup")) {
@@ -424,11 +449,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer applog.deinit();
 
+    if (ssh != null and connect_addr != null) {
+        std.debug.print("--connect-nvim is mutually exclusive with --ssh (or [neovim] ssh in config.toml). Remove the conflicting option and retry.\n", .{});
+        return 1;
+    }
     var cmd: std.ArrayListUnmanaged(u8) = .empty;
     appendArg(&cmd, aa, nvim_path) catch return 1;
     for (extra.items) |a| appendArg(&cmd, aa, a) catch return 1;
+    // --ssh: nvim runs on the host; local file arguments do not apply there,
+    // as on macOS and Windows. --nvim names the remote executable.
+    const nvim_cmd: [:0]const u8 = if (ssh) |s| blk: {
+        var target = s;
+        target.identity = ssh_identity;
+        cli.setAskpassEnv(askpass.env_mode);
+        break :blk cli.sshCommand(aa, target, cli_nvim_path orelse "nvim") catch return 1;
+    } else aa.dupeZ(u8, cmd.items) catch return 1;
     const startup = Startup{
-        .nvim_cmd = aa.dupeZ(u8, cmd.items) catch return 1,
+        .nvim_cmd = nvim_cmd,
         .ext_cmdline = ext_cmdline,
         .ext_popupmenu = ext_popupmenu,
         .ext_messages = ext_messages,

@@ -49,8 +49,11 @@ const usage =
     \\    --extmessages                 Enable external messages UI
     \\    --exttabline                  Enable external tabline UI
     \\    --extwindows                  Enable external windows (each Neovim window as OS window)
+    \\    --ssh=<user@host[:port]>      Connect to remote host via SSH
+    \\    --ssh-identity=<path>         Path to SSH private key file
     \\    --connect-nvim=<addr>         Attach to a running Neovim server.
     \\                                    Address: TCP "host:port" or Unix socket path.
+    \\                                    Mutually exclusive with --ssh.
     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
     \\    --renderer=<glarea|thread>    Draw in GTK's GLArea (default) or on a render thread
     \\    --install                     Create default config file and exit
@@ -131,6 +134,61 @@ pub fn absoluteFileArg(alloc: std.mem.Allocator, prev: ?[]const u8, arg: []const
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.c.getcwd(&buf, buf.len) orelse return arg;
     return std.fs.path.join(alloc, &.{ std.mem.sliceTo(cwd, 0), arg });
+}
+
+pub const Ssh = struct { host: []const u8, port: ?u16 = null, identity: ?[]const u8 = null };
+
+/// The command the core spawns for `--ssh`: ssh behind the `ssh-askpass`
+/// marker (rpc_session.zig: SSH_ASKPASS answers prompts, the core does not
+/// watch for them), running nvim through the remote login shell for its
+/// PATH, as macOS builds it. A key turns password prompts off.
+pub fn sshCommand(alloc: std.mem.Allocator, s: Ssh, remote_nvim: []const u8) ![:0]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "ssh-askpass ssh");
+    if (s.port) |p| try out.print(alloc, " -p {d}", .{p});
+    if (s.identity) |id| {
+        // The core splits on spaces; quoted, a key path with one survives.
+        if (std.mem.indexOfScalar(u8, id, ' ') != null) try out.print(alloc, " -i \"{s}\"", .{id}) else try out.print(alloc, " -i {s}", .{id});
+        try out.appendSlice(alloc, " -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no");
+    }
+    try out.appendSlice(alloc, " -o StrictHostKeyChecking=accept-new ");
+    try out.appendSlice(alloc, s.host);
+    // '$SHELL --login -c "\"nvim\" --embed"': the core keeps the single-
+    // quoted span as one argument, and the remote shell reads \" as a quote
+    // protecting a path with spaces. Backslashes in the path are doubled.
+    try out.appendSlice(alloc, " '$SHELL --login -c \"\\\"");
+    for (remote_nvim) |ch| {
+        if (ch == '\\') try out.append(alloc, '\\');
+        try out.append(alloc, ch);
+    }
+    try out.appendSlice(alloc, "\\\" --embed\"'");
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// Points ssh's SSH_ASKPASS at this executable in askpass mode (askpass.zig),
+/// for every prompt, display or not. Before the core spawns ssh: it passes
+/// the environment as it is then.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+pub fn setAskpassEnv(env_mode: [:0]const u8) void {
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &buf, buf.len - 1);
+    if (n <= 0) return;
+    buf[@intCast(n)] = 0;
+    _ = setenv("SSH_ASKPASS", &buf, 1);
+    _ = setenv("SSH_ASKPASS_REQUIRE", "force", 1);
+    _ = setenv(env_mode, "1", 1);
+}
+
+test "the ssh command quotes the remote nvim for the login shell" {
+    const a = std.testing.allocator;
+    const plain = try sshCommand(a, .{ .host = "me@box" }, "nvim");
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("ssh-askpass ssh -o StrictHostKeyChecking=accept-new me@box '$SHELL --login -c \"\\\"nvim\\\" --embed\"'", plain);
+    const keyed = try sshCommand(a, .{ .host = "box", .port = 2222, .identity = "/k/my key" }, "/opt/n\\vim");
+    defer a.free(keyed);
+    try std.testing.expectEqualStrings("ssh-askpass ssh -p 2222 -i \"/k/my key\" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=accept-new box '$SHELL --login -c \"\\\"/opt/n\\\\vim\\\" --embed\"'", keyed);
 }
 
 test "flags after -- belong to nvim" {
