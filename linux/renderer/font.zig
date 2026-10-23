@@ -71,8 +71,11 @@ pub const Fonts = struct {
     }
 
     /// Replaces every face only once the regular face loaded, so a bad
-    /// candidate keeps the current font.
-    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32) bool {
+    /// candidate keeps the current font. `features` is a guifont candidate's
+    /// feature field ("+ss01,-liga,wght=500"), applied to every style, as
+    /// macOS applies it: each entry is an OpenType feature for shaping and,
+    /// where the font has that axis, a variation coordinate.
+    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32, features: []const u8) bool {
         if (pixel_size == 0) return false;
         const regular = loadFace(alloc, family, false, false, pixel_size) orelse return false;
         self.destroyFaces();
@@ -80,6 +83,15 @@ pub const Fonts = struct {
         self.bold = loadFace(alloc, family, true, false, pixel_size);
         self.italic = loadFace(alloc, family, false, true, pixel_size);
         self.bold_italic = loadFace(alloc, family, true, true, pixel_size);
+        var list: [32]hbft.zonvie_font_feature = undefined;
+        const n_features = core.zonvie_core_parse_font_features(features.ptr, features.len, @ptrCast(&list), list.len);
+        if (n_features != 0) {
+            for ([_]?*Font{ self.regular, self.bold, self.italic, self.bold_italic }) |face| {
+                const f = face orelse continue;
+                hbft.zonvie_ft_hb_font_set_features(f, &list, n_features);
+                hbft.zonvie_ft_hb_font_set_variations(f, &list, n_features);
+            }
+        }
         const n = @min(family.len, self.family.len);
         @memcpy(self.family[0..n], family[0..n]);
         self.family_len = n;

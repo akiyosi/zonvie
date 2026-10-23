@@ -22,6 +22,12 @@ pub extern "c" fn zonvie_ft_hb_font_create(
 ) ?*zonvie_ft_hb_font;
 
 pub extern "c" fn zonvie_ft_hb_font_destroy(f: *zonvie_ft_hb_font) void;
+
+/// include/zonvie_hbft.h zonvie_font_feature: an OpenType feature, or a
+/// variation axis value.
+pub const zonvie_font_feature = extern struct { tag: [4]u8, value: i32 };
+pub extern "c" fn zonvie_ft_hb_font_set_features(f: *zonvie_ft_hb_font, features: [*]const zonvie_font_feature, count: usize) void;
+pub extern "c" fn zonvie_ft_hb_font_set_variations(f: *zonvie_ft_hb_font, variations: [*]const zonvie_font_feature, count: usize) void;
 pub extern "c" fn zonvie_ft_hb_font_strike_px(f: *const zonvie_ft_hb_font) u32;
 
 // =========================================================================

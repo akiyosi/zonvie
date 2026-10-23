@@ -544,8 +544,8 @@ fn loadFirst(app: *App, list: []const u8, size_explicit: bool) bool {
     var it = std.mem.splitScalar(u8, list, '\n');
     while (it.next()) |line| {
         const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
-        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size))) {
-            applog.appLog("[linux] font: {s} {d}pt\n", .{ cand.name, cand.point_size });
+        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features)) {
+            applog.appLog("[linux] font: {s} {d}pt features={s}\n", .{ cand.name, cand.point_size, cand.features });
             return true;
         }
     }
@@ -565,7 +565,7 @@ fn loadConfigFamily(app: *App) bool {
 /// Core thread, or any thread before zonvie_core_start.
 pub fn ensureFont(app: *App) void {
     if (app.fonts.regular != null) return;
-    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)));
+    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "");
     updateMetrics(app);
 }
 
@@ -619,7 +619,7 @@ fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void
         loadFirst(app, bytes[0..len], app.font_cfg.size_explicit);
     if (!loaded) {
         if (app.fonts.regular != null) return;
-        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)))) return;
+        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "")) return;
     }
     updateMetrics(app);
     if (app.corep) |cp| core.zonvie_core_invalidate_glyph_cache(cp);
