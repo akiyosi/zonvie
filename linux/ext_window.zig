@@ -13,6 +13,7 @@ const gl_renderer = @import("renderer/gl_renderer.zig");
 const postfx = @import("renderer/postfx.zig");
 const input = @import("input.zig");
 const applog = @import("app_log.zig");
+const blink = @import("blink.zig");
 
 pub const Op = struct {
     kind: enum { open, close },
@@ -113,6 +114,7 @@ fn open(app: *App, op: Op) void {
     input.attach(&w.pointer, area);
     gtk.gtk_window_set_child(win, area);
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), w);
+    blink.watchWindow(app, win);
     gtk.gtk_window_present(win);
     _ = gtk.gtk_widget_grab_focus(area);
     // The GUI harness's marker for a new external window (test/gui/app_log.zig).

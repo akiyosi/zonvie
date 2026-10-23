@@ -457,6 +457,11 @@ test "gui:blink_survives_popupmenu" {
     try gated(is_macos, @import("scenarios/macos/blink_survives_popupmenu.zig"));
 }
 
+test "gui:cursor_blinks" {
+    // Linux only: the timer and its log line are linux/blink.zig's.
+    try gated(is_linux, @import("scenarios/linux/cursor_blinks.zig"));
+}
+
 test "gui:extwin_animated_shader_reuses_rows" {
     // macOS only: ExternalGridView is macOS frontend code.
     try gated(is_macos, @import("scenarios/macos/extwin_animated_shader_reuses_rows.zig"));

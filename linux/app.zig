@@ -142,6 +142,14 @@ pub const App = struct {
     layout_retry_queued: bool = false,
     start_failed: bool = false,
     preedit_active: bool = false,
+    /// Cursor blink phase; `visible` is read by the renderer under `mu`.
+    cursor_blink: core.frontend_rules.Blink = .{},
+    /// GTK main thread only, as are the fields below (blink.zig).
+    blink_timer: c_uint = 0,
+    blink_retry_queued: bool = false,
+    /// Some window of the app has focus.
+    app_active: bool = false,
+    active_idle_queued: bool = false,
     /// Last complete visible-grid snapshot for pointer hit tests; kept when
     /// the non-blocking query finds grid_mu busy.
     pointer_grids: [32]core.GridInfo = undefined,

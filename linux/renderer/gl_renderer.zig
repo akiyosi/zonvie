@@ -308,7 +308,7 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
         out.verts += drawLayer(app, t, layer, grid, ease.region(), ease.offset_px);
     }
     const cur = app.surface.committedCursor();
-    if (cur.verts.len == 0) return out;
+    if (cur.verts.len == 0 or !app.cursor_blink.visible) return out;
     for (layers) |layer| {
         if (layer.grid_id != cur.grid_id) continue;
         out.verts += cur.verts.len;
@@ -497,7 +497,7 @@ fn drawOverlays(app: *App, t: *Target) usize {
             placed.x_px += r.x + pad;
             placed.y_px += r.y + pad;
             if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, t, placed, grid, .{ 0, 0 }, 0);
-            if (cur.verts.len != 0 and cur.grid_id == layer.grid_id) {
+            if (cur.verts.len != 0 and cur.grid_id == layer.grid_id and app.cursor_blink.visible) {
                 total += cur.verts.len;
                 drawVerts(app, t, cur.verts, placed, 0);
             }

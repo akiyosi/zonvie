@@ -13,6 +13,7 @@ const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
 const latency_bench = @import("latency_bench.zig");
 const render_thread = @import("render_thread.zig");
+const blink = @import("blink.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -298,6 +299,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
     gtk.gtk_window_set_child(win, ui_widgets.build(app, area, frames));
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
+    blink.watchWindow(app, win);
     gtk.gtk_window_present(win);
     _ = gtk.gtk_widget_grab_focus(area);
 }

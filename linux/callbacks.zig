@@ -14,6 +14,7 @@ const input = @import("input.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
+const blink = @import("blink.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -373,6 +374,8 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     app.render_idle_queued.store(false, .release);
     app.queueRenderAll();
     input.updateImeCursor(app);
+    // Every flush may carry a mode change, and with it a new cadence.
+    blink.update(app);
     return 0;
 }
 

@@ -61,6 +61,8 @@ pub extern "c" fn g_timeout_add(interval: c_uint, function: GSourceFunc, data: ?
 /// Remove a source by ID.
 pub extern "c" fn g_source_remove(tag: c_uint) c_int;
 
+pub extern "c" fn gtk_window_is_active(window: *anyopaque) c_int;
+
 // =========================================================================
 // GDK standalone functions (not available as methods in zig-gobject)
 // =========================================================================
