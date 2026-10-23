@@ -41,6 +41,15 @@ pub const Tab = struct {
     name: TextBuf(128) = .{},
 };
 
+/// An agent completion to announce (on_agent_status with bit 7).
+pub const Completion = struct {
+    title: TextBuf(128) = .{},
+    /// It stopped for input rather than finishing.
+    waiting: bool = false,
+};
+
+pub const Agent = struct { handle: i64 = 0, state: u8 = 0 };
+
 pub const UiState = struct {
     minis: [4]TextBuf(256) = @splat(.{}),
     /// A prompt Neovim blocks on, shown until the next message or a clear.
@@ -54,6 +63,46 @@ pub const UiState = struct {
     curtab: i64 = 0,
     tabs: [tab_cap]Tab = @splat(.{}),
     tab_count: usize = 0,
+    /// AI-agent state by tab handle, `state & 0x7f`; none for 0.
+    agents: [tab_cap]Agent = @splat(.{}),
+    agent_count: usize = 0,
+    /// Completions not yet announced; the GTK thread drains them.
+    done: [8]Completion = @splat(.{}),
+    done_count: usize = 0,
+
+    /// on_agent_status. Bit 7 asks for the OS notification; `announce` is
+    /// [tabline] agent_notification.
+    pub fn agentStatus(self: *UiState, handle: i64, state: u8, title: []const u8, announce: bool) void {
+        const base = state & 0x7f;
+        if (announce and state & 0x80 != 0 and self.done_count < self.done.len) {
+            const d = &self.done[self.done_count];
+            d.title.clear();
+            d.title.append(title);
+            d.waiting = base == 4;
+            self.done_count += 1;
+        }
+        for (self.agents[0..self.agent_count], 0..) |*a, i| {
+            if (a.handle != handle) continue;
+            if (base == 0) {
+                self.agents[i] = self.agents[self.agent_count - 1];
+                self.agent_count -= 1;
+            } else a.state = base;
+            return;
+        }
+        if (base == 0 or self.agent_count == self.agents.len) return;
+        self.agents[self.agent_count] = .{ .handle = handle, .state = base };
+        self.agent_count += 1;
+    }
+
+    pub fn agentState(self: *const UiState, handle: i64) u8 {
+        for (self.agents[0..self.agent_count]) |a| if (a.handle == handle) return a.state;
+        return 0;
+    }
+
+    pub fn anyWorking(self: *const UiState) bool {
+        for (self.agents[0..self.agent_count]) |a| if (a.state == 2 or a.state == 3) return true;
+        return false;
+    }
 
     /// on_msg_show for a view this frontend draws. `kind` picks the confirm
     /// box; append (:echon) extends the text shown, anything else replaces it.
@@ -109,6 +158,24 @@ pub const UiState = struct {
     }
 };
 
+/// The notification for completions drained together, as Windows words it:
+/// one names its summary, several are counted, and "needs input" is never
+/// reported as finished.
+pub fn completionMessage(buf: []u8, done: []const Completion) []const u8 {
+    if (done.len == 1) {
+        const d = done[0];
+        const label = if (d.waiting) "Needs input" else "Finished";
+        const fallback = if (d.waiting) "AI agent needs input" else "AI agent finished";
+        if (d.title.len == 0) return fallback;
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ label, d.title.text() }) catch fallback;
+    }
+    var waiting: usize = 0;
+    for (done) |d| waiting += @intFromBool(d.waiting);
+    if (waiting == done.len) return std.fmt.bufPrint(buf, "{d} AI agents need input", .{done.len}) catch "AI agents need input";
+    if (waiting > 0) return std.fmt.bufPrint(buf, "{d} finished, {d} need input", .{ done.len - waiting, waiting }) catch "AI agents finished";
+    return std.fmt.bufPrint(buf, "{d} AI agents finished", .{done.len}) catch "AI agents finished";
+}
+
 const testing = std.testing;
 
 fn chunk(s: []const u8) core.MsgChunk {
@@ -154,4 +221,30 @@ test "the tabline keeps at most tab_cap tabs" {
     s.tabline(2, &entries);
     try testing.expectEqual(@as(usize, tab_cap), s.tab_count);
     try testing.expect(s.tabline_visible);
+}
+
+test "agent state per tab, and a flagged report queues one completion" {
+    var s: UiState = .{};
+    s.agentStatus(7, 2, "", true);
+    try testing.expectEqual(@as(u8, 2), s.agentState(7));
+    try testing.expect(s.anyWorking());
+    s.agentStatus(7, 0x80 | 1, "fixed the bug", true);
+    try testing.expectEqual(@as(u8, 1), s.agentState(7));
+    try testing.expectEqual(@as(usize, 1), s.done_count);
+    s.agentStatus(7, 0x80 | 4, "", false);
+    try testing.expectEqual(@as(usize, 1), s.done_count);
+    s.agentStatus(7, 0, "", true);
+    try testing.expectEqual(@as(u8, 0), s.agentState(7));
+    try testing.expect(!s.anyWorking());
+}
+
+test "a completion message names one and counts several" {
+    var buf: [128]u8 = undefined;
+    var one: [1]Completion = .{.{}};
+    one[0].title.append("fixed the bug");
+    try testing.expectEqualStrings("Finished: fixed the bug", completionMessage(&buf, &one));
+    one[0] = .{ .waiting = true };
+    try testing.expectEqualStrings("AI agent needs input", completionMessage(&buf, &one));
+    const mixed = [_]Completion{ .{}, .{ .waiting = true }, .{} };
+    try testing.expectEqualStrings("2 finished, 1 need input", completionMessage(&buf, &mixed));
 }

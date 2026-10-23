@@ -36,6 +36,7 @@ pub fn makeCallbacks() core.Callbacks {
         .on_msg_ruler = onMsgRuler,
         .on_tabline_update = onTablineUpdate,
         .on_tabline_hide = onTablineHide,
+        .on_agent_status = onAgentStatus,
         .on_atlas_create = onAtlasCreate,
         .on_atlas_upload = onAtlasUpload,
         .on_rasterize_glyph = onRasterizeGlyph,
@@ -300,6 +301,16 @@ fn onTablineUpdate(
     const app = appFrom(ctx);
     lock(app);
     app.ui.tabline(curtab, tabs[0..tab_count]);
+    unlock(app);
+    ui_widgets.queueRefresh(app);
+}
+
+/// Not coupled to a flush: a background tab's agent still updates.
+fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*c]const u8, title_len: usize) callconv(.c) void {
+    const app = appFrom(ctx);
+    const t: []const u8 = if (title != null) title[0..title_len] else "";
+    lock(app);
+    app.ui.agentStatus(tab_handle, state, t, app.tabline_cfg.agent_notification);
     unlock(app);
     ui_widgets.queueRefresh(app);
 }

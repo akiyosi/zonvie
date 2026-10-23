@@ -199,6 +199,9 @@ pub extern "c" fn gtk_widget_set_hexpand(widget: *anyopaque, expand: c_int) void
 pub extern "c" fn gtk_widget_set_size_request(widget: *anyopaque, width: c_int, height: c_int) void;
 pub extern "c" fn gtk_box_set_homogeneous(box: *anyopaque, homogeneous: c_int) void;
 pub extern "c" fn gtk_gesture_drag_new() ?*anyopaque;
+pub extern "c" fn g_notification_new(title: [*:0]const u8) ?*anyopaque;
+pub extern "c" fn g_notification_set_body(notification: *anyopaque, body: [*:0]const u8) void;
+pub extern "c" fn g_application_send_notification(app: *anyopaque, id: ?[*:0]const u8, notification: *anyopaque) void;
 pub extern "c" fn gtk_widget_set_vexpand(widget: *anyopaque, expand: c_int) void;
 pub extern "c" fn gtk_widget_set_margin_top(widget: *anyopaque, m: c_int) void;
 pub extern "c" fn gtk_widget_set_margin_bottom(widget: *anyopaque, m: c_int) void;

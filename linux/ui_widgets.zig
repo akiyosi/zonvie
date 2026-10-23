@@ -21,6 +21,9 @@ pub const Widgets = struct {
     tabs: ?*anyopaque = null,
     /// [tabline] style = "sidebar": the strip runs down one side.
     sidebar: bool = false,
+    /// Advances the working agents' spinners while any runs.
+    spinner_timer: c_uint = 0,
+    spinner_frame: u32 = 0,
     /// The tab a drag started on, and where.
     drag_from: ?u32 = null,
     drag_start: [2]f64 = .{ 0, 0 },
@@ -167,6 +170,8 @@ fn idleRefresh(data: ?*anyopaque) callconv(.c) c_int {
     const snap = &app.ui_snapshot;
     app.mu.lockUncancelable(clock.io());
     snap.* = .{ .ui = app.ui, .fg = app.default_fg, .bg = app.default_bg };
+    // Announced once: the snapshot carries them out.
+    app.ui.done_count = 0;
     app.mu.unlock(clock.io());
     apply(app, snap);
     return 0;
@@ -203,6 +208,70 @@ fn apply(app: *App, snap: *const Snapshot) void {
     }
     applyTabline(app, &snap.ui);
     placeMessages(app);
+    if (snap.ui.done_count != 0) notifyCompletions(app, snap.ui.done[0..snap.ui.done_count]);
+}
+
+/// The OS notification for agent completions ([tabline] agent_notification),
+/// sent always: the agent runs in this app's own terminal, so focus says
+/// nothing about whether the user saw it.
+fn notifyCompletions(app: *App, done: []const ui_state.Completion) void {
+    const gapp = app.gtk_app orelse return;
+    var buf: [320]u8 = undefined;
+    const msg = ui_state.completionMessage(buf[0 .. buf.len - 1], done);
+    var z: [320]u8 = undefined;
+    @memcpy(z[0..msg.len], msg);
+    z[msg.len] = 0;
+    const n = gtk.g_notification_new("Zonvie") orelse return;
+    defer gtk.g_object_unref(n);
+    gtk.g_notification_set_body(n, @ptrCast(&z));
+    gtk.g_application_send_notification(gapp, "agent", n);
+}
+
+const claude_frames = [_][:0]const u8{ "·", "✢", "✳", "✶", "✻", "✽" };
+const braille_frames = [_][:0]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const spinner_interval_ms = 120;
+
+/// The per-tab indicator for an agent state: 🤖 done, ⏸ waiting for input,
+/// a spinner while working, as Windows draws them.
+fn indicatorGlyph(state: u8, frame: u32) [:0]const u8 {
+    return switch (state) {
+        1 => "\u{1f916}",
+        2 => claude_frames[frame % claude_frames.len],
+        3 => braille_frames[frame % braille_frames.len],
+        4 => "\u{23f8}",
+        else => "",
+    };
+}
+
+/// Sets every tab's indicator from `ui`, and runs the spinner timer while
+/// some agent works.
+fn applyIndicators(app: *App, ui: *const ui_state.UiState) void {
+    const w = &app.widgets;
+    if (!app.tabline_cfg.agent_indicator) return;
+    var child = if (w.tabs) |t| gtk.gtk_widget_get_first_child(t) else null;
+    for (ui.tabs[0..ui.tab_count]) |t| {
+        const tab = child orelse break;
+        child = gtk.gtk_widget_get_next_sibling(tab);
+        const ind = gtk.gtk_widget_get_first_child(tab) orelse continue;
+        const glyph = indicatorGlyph(ui.agentState(t.handle), w.spinner_frame);
+        gtk.gtk_label_set_text(ind, glyph.ptr);
+        gtk.gtk_widget_set_visible(ind, @intFromBool(glyph.len != 0));
+    }
+    const working = ui.anyWorking();
+    if (working and w.spinner_timer == 0) {
+        w.spinner_timer = gtk.g_timeout_add(spinner_interval_ms, &onSpinner, app);
+    } else if (!working and w.spinner_timer != 0) {
+        _ = gtk.g_source_remove(w.spinner_timer);
+        w.spinner_timer = 0;
+    }
+}
+
+fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.widgets.spinner_frame +%= 1;
+    applyIndicators(app, &app.ui_snapshot.ui);
+    // applyIndicators keeps the timer while anything works.
+    return @intFromBool(app.widgets.spinner_timer != 0);
 }
 
 /// Hangs the toast from the top-right of msg_pos.ext_float's target and the
@@ -286,6 +355,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; }}
         \\.zonvie-tab.current {{ background-color: #{x:0>6}; }}
         \\.zonvie-tab.current button {{ color: #{x:0>6}; }}
+        \\.zonvie-agent {{ margin-left: 8px; }}
     , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
@@ -352,9 +422,12 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         var child = gtk.gtk_widget_get_first_child(tabs);
         for (ui.tabs[0..ui.tab_count]) |t| {
             const tab = child orelse break;
-            if (gtk.gtk_widget_get_first_child(tab)) |name_btn| setButtonLabel(app, name_btn, t.name.text());
+            // Children: indicator, name, close.
+            const ind = gtk.gtk_widget_get_first_child(tab);
+            if (ind) |i| if (gtk.gtk_widget_get_next_sibling(i)) |name_btn| setButtonLabel(app, name_btn, t.name.text());
             child = gtk.gtk_widget_get_next_sibling(tab);
         }
+        applyIndicators(app, ui);
         return;
     }
     while (gtk.gtk_widget_get_first_child(tabs)) |c| gtk.gtk_box_remove(tabs, c);
@@ -365,6 +438,10 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         const tab = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0) orelse continue;
         gtk.gtk_widget_add_css_class(tab, "zonvie-tab");
         if (t.handle == ui.curtab) gtk.gtk_widget_add_css_class(tab, "current");
+        const ind = gtk.gtk_label_new(null) orelse continue;
+        gtk.gtk_widget_add_css_class(ind, "zonvie-agent");
+        gtk.gtk_widget_set_visible(ind, 0);
+        gtk.gtk_box_append(tab, ind);
         // Signal data is the 1-based tab number: the strip is rebuilt
         // whenever the list changes, so it never outlives its tab.
         const name_btn = gtk.gtk_button_new_with_label("") orelse continue;
@@ -380,6 +457,7 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         gtk.gtk_box_append(tab, close);
         gtk.gtk_box_append(tabs, tab);
     }
+    applyIndicators(app, ui);
 }
 
 fn setButtonLabel(app: *App, btn: *anyopaque, name: []const u8) void {
