@@ -314,6 +314,15 @@ fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = appFrom(ctx);
+    if (!app.in_flush) {
+        // A session teardown (SurfaceStore.destroyNow), not a flush's.
+        traceRender(app, "event=destroy_now grid={d}\n", .{grid_id});
+        lock(app);
+        app.surface.destroyNow(app.alloc, grid_id);
+        unlock(app);
+        queueRender(app);
+        return;
+    }
     traceRender(app, "event=destroy_stage grid={d}\n", .{grid_id});
     app.surface.stageDestroy(app.alloc, grid_id) catch failFlush(app);
 }
@@ -321,12 +330,14 @@ fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
 fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     const app = appFrom(ctx);
     app.flush_failed = false;
+    app.in_flush = true;
     app.trace_flush += 1;
     traceRender(app, "event=begin\n", .{});
 }
 
 fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const app = appFrom(ctx);
+    app.in_flush = false;
     const cp = app.corep;
     const failed = app.flush_failed or
         core.zonvie_core_flush_had_atlas_corruption(cp) or

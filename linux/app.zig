@@ -180,6 +180,8 @@ pub const App = struct {
 
     // Core thread only.
     flush_failed: bool = false,
+    /// Between on_flush_begin and on_flush_end. Core thread only.
+    in_flush: bool = false,
     /// Counts on_flush_begin, as the core counts its flushes, so render
     /// traces of both sides carry one id.
     trace_flush: u64 = 0,

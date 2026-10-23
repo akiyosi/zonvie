@@ -257,6 +257,17 @@ pub const SurfaceStore = struct {
         self.cursor_staged = true;
     }
 
+    /// A destroy outside any flush bracket: the core tears the old session's
+    /// grids down this way when it restarts or reconnects, and the new
+    /// session reuses their ids. Staged, it would be released by the next
+    /// commit together with the first rows sent for the new grid. Caller
+    /// holds App.mu.
+    pub fn destroyNow(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64) void {
+        const kv = self.grids.fetchRemove(grid_id) orelse return;
+        kv.value.deinit(alloc);
+        alloc.destroy(kv.value);
+    }
+
     pub fn stageDestroy(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64) !void {
         // Bounded by live grid count; capacity is reused across flushes.
         try self.destroyed.append(alloc, grid_id);
@@ -700,4 +711,18 @@ test "layers for a surface never opened are dropped" {
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 0), s.committedSurfaceLayers(-101).len);
+}
+
+test "a grid destroyed between flushes keeps the rows a later flush sends for its id" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try (try s.rowsFor(testing.allocator, 2)).stageRow(testing.allocator, 0, &.{v(5)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    s.destroyNow(testing.allocator, 2);
+    try testing.expect(s.committedGrid(2) == null);
+    try (try s.rowsFor(testing.allocator, 2)).stageRow(testing.allocator, 0, &.{v(9)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    try testing.expectEqual(@as(?f32, 9), firstY(s.committedGrid(2).?, 0));
 }
