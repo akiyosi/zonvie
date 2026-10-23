@@ -372,6 +372,14 @@ pub fn queueRender(app: *App) void {
 fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     app.render_idle_queued.store(false, .release);
+    // The anchor the flush just committed published; taken before App.mu,
+    // which the core's own lock is never held under.
+    var anchor: core.MsgAnchor = undefined;
+    const have_anchor = if (app.corep) |cp| core.zonvie_core_msg_anchor(cp, &anchor) else false;
+    lock(app);
+    app.msg_anchor = if (have_anchor) anchor else null;
+    unlock(app);
+    ui_widgets.placeMessages(app);
     app.queueRenderAll();
     input.updateImeCursor(app);
     // Every flush may carry a mode change, and with it a new cadence.

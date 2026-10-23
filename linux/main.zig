@@ -442,6 +442,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .startup = @constCast(@ptrCast(&startup)),
         .large_jump = config.scroll.large_jump_behavior,
         .font_cfg = config.font,
+        .msg_pos = config.messages.msg_pos,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
     };
     defer app.deinit();

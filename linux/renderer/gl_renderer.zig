@@ -469,6 +469,7 @@ fn drawOverlays(app: *App, t: *Target) usize {
         .cell_w_px = @intCast(app.cell_w_px),
         .cell_h_px = @intCast(app.cell_h_px),
         .scale = scale,
+        .msg_target = overlay_layout.msgTarget(app.msg_pos.ext_float, app.msg_anchor, @intCast(t.w_px), @intCast(t.h_px), @intCast(app.cell_w_px), @intCast(app.cell_h_px)),
     });
     const bg = rgba(app.default_bg, 1);
     const panel = rules.panelBg(bg[0], bg[1], bg[2]);

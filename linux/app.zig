@@ -59,6 +59,12 @@ pub const App = struct {
     /// Font cell height plus linespace, as sent to the core.
     cell_h_px: u32 = 0,
     linespace_px: i32 = 0,
+    /// config.toml's [messages] msg_pos.
+    msg_pos: core.config.Config.MsgPosConfig = .{},
+    /// The core's message anchor as of the last committed flush; null before
+    /// the first (zonvie_core_msg_anchor). Written on the GTK main thread
+    /// under `mu`.
+    msg_anchor: ?core.MsgAnchor = null,
     /// config.toml's [font]; `family` borrows the Config, which outlives the app.
     font_cfg: core.config.Config.FontConfig = .{},
     /// GLArea size in device pixels and its integer scale factor; written by

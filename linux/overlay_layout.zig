@@ -77,7 +77,28 @@ pub const Inputs = struct {
     cell_h_px: i32,
     /// Integer surface scale for the chrome constants.
     scale: i32,
+    /// What msg_show and msg_history hang from (msgTarget); the whole view
+    /// when null.
+    msg_target: ?rules.Rect = null,
 };
+
+/// The rect msg_pos `mode` places message boxes against, in main-view px:
+/// the cells of the window the cursor is in (.grid) when that window is on
+/// the main surface, else the whole view. Wayland lets no box sit outside
+/// the window, so .display is the view too, and the boxes of an external
+/// window's grid are drawn here as well.
+pub fn msgTarget(mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, main_w_px: i32, main_h_px: i32, cell_w_px: i32, cell_h_px: i32) rules.Rect {
+    const view: rules.Rect = .{ .left = 0, .top = 0, .right = main_w_px, .bottom = main_h_px };
+    if (mode != .grid) return view;
+    const a = anchor orelse return view;
+    if (a.anchor_surface != 1) return view;
+    return .{
+        .left = a.start_col * cell_w_px,
+        .top = a.start_row * cell_h_px,
+        .right = @min(main_w_px, (a.start_col + a.cols) * cell_w_px),
+        .bottom = @min(main_h_px, (a.start_row + a.rows) * cell_h_px),
+    };
+}
 
 fn size(kind: Kind, s: Surface, in: Inputs) [2]i32 {
     const pad = 2 * paddingPx(kind, in.scale);
@@ -107,18 +128,20 @@ pub fn place(surfaces: *const [4]Surface, in: Inputs) [4]?Rect {
         };
     }
 
+    // A box wider than a narrow target keeps its left edge in the view.
+    const msg_area = in.msg_target orelse area;
     const history = surfaces[@intFromEnum(Kind.msg_history)];
     if (history.open) {
         const wh = size(.msg_history, history, in);
-        const o = rules.msgFloatTopRight(area, wh[0], null, msg_margin_pt * in.scale, msg_history_gap_pt * in.scale);
-        out[@intFromEnum(Kind.msg_history)] = .{ .x = o.x, .y = o.y, .w = wh[0], .h = wh[1] };
+        const o = rules.msgFloatTopRight(msg_area, wh[0], null, msg_margin_pt * in.scale, msg_history_gap_pt * in.scale);
+        out[@intFromEnum(Kind.msg_history)] = .{ .x = @max(0, o.x), .y = o.y, .w = wh[0], .h = wh[1] };
     }
     const show = surfaces[@intFromEnum(Kind.msg_show)];
     if (show.open) {
         const wh = size(.msg_show, show, in);
         const history_bottom: ?i32 = if (out[@intFromEnum(Kind.msg_history)]) |r| r.bottom() else null;
-        const o = rules.msgFloatTopRight(area, wh[0], history_bottom, msg_margin_pt * in.scale, msg_history_gap_pt * in.scale);
-        out[@intFromEnum(Kind.msg_show)] = .{ .x = o.x, .y = o.y, .w = wh[0], .h = wh[1] };
+        const o = rules.msgFloatTopRight(msg_area, wh[0], history_bottom, msg_margin_pt * in.scale, msg_history_gap_pt * in.scale);
+        out[@intFromEnum(Kind.msg_show)] = .{ .x = @max(0, o.x), .y = o.y, .w = wh[0], .h = wh[1] };
     }
 
     const pum = surfaces[@intFromEnum(Kind.popupmenu)];
@@ -198,4 +221,21 @@ test "msg_show stacks below msg_history at the top-right" {
     const m = out[@intFromEnum(Kind.msg_show)].?;
     try testing.expectEqual(@as(i32, 800 - 10), h.x + h.w);
     try testing.expect(m.y >= h.y + h.h);
+}
+
+test "msg_pos grid hangs messages from the cursor's window, the rest from the view" {
+    const a: core.MsgAnchor = .{ .cursor_surface = 1, .anchor_surface = 1, .anchor_grid = 4, .start_row = 0, .start_col = 40, .rows = 28, .cols = 40 };
+    const grid = msgTarget(.grid, a, 800, 600, 10, 20);
+    try testing.expectEqual(rules.Rect{ .left = 400, .top = 0, .right = 800, .bottom = 560 }, grid);
+    try testing.expectEqual(rules.Rect{ .left = 0, .top = 0, .right = 800, .bottom = 600 }, msgTarget(.window, a, 800, 600, 10, 20));
+    var ext = a;
+    ext.anchor_surface = 7;
+    try testing.expectEqual(@as(i32, 0), msgTarget(.grid, ext, 800, 600, 10, 20).left);
+
+    var s: [4]Surface = @splat(.{});
+    s[@intFromEnum(Kind.msg_show)] = open(1, 20, -2, -2);
+    var in = in1;
+    in.msg_target = .{ .left = 0, .top = 0, .right = 390, .bottom = 600 };
+    const m = place(&s, in)[@intFromEnum(Kind.msg_show)].?;
+    try testing.expectEqual(@as(i32, 390 - 10), m.x + m.w);
 }

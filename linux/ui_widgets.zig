@@ -9,11 +9,14 @@ const clock = core.clock;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const ui_state = @import("ui_state.zig");
+const overlay_layout = @import("overlay_layout.zig");
 
 const margin_pt = 10;
 
 pub const Widgets = struct {
     tabbar: ?*anyopaque = null,
+    /// Holds the editor view and the boxes over it; the same size as the view.
+    overlay: ?*anyopaque = null,
     mini_box: ?*anyopaque = null,
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
@@ -54,6 +57,7 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     const overlay = gtk.gtk_overlay_new().?;
     gtk.gtk_widget_set_vexpand(overlay, 1);
     gtk.gtk_overlay_set_child(overlay, area);
+    w.overlay = overlay;
     if (frames) |f| gtk.gtk_overlay_add_overlay(overlay, f);
     gtk.gtk_box_append(root, overlay);
 
@@ -150,6 +154,39 @@ fn apply(app: *App, snap: *const Snapshot) void {
         }
     }
     applyTabline(app, &snap.ui);
+    placeMessages(app);
+}
+
+/// Hangs the toast from the top-right of msg_pos.ext_float's target and the
+/// minis from the bottom-right of msg_pos.mini's (overlay_layout.msgTarget),
+/// as macOS and Windows place them. Rerun after each flush: the cursor's
+/// window moves the targets. GTK main thread.
+pub fn placeMessages(app: *App) void {
+    const w = &app.widgets;
+    const view = w.overlay orelse return;
+    const view_w = gtk.gtk_widget_get_width(view);
+    const view_h = gtk.gtk_widget_get_height(view);
+    if (view_w <= 0 or view_h <= 0) return;
+    app.mu.lockUncancelable(clock.io());
+    const anchor = app.msg_anchor;
+    const pos = app.msg_pos;
+    const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
+    const cw: i32 = @intCast(app.cell_w_px);
+    const ch: i32 = @intCast(app.cell_h_px);
+    app.mu.unlock(clock.io());
+    const vw = view_w * scale;
+    const vh = view_h * scale;
+    const m: c_int = margin_pt;
+    if (w.toast) |t| {
+        const r = overlay_layout.msgTarget(pos.ext_float, anchor, vw, vh, cw, ch);
+        gtk.gtk_widget_set_margin_top(t, @divTrunc(r.top, scale) + m);
+        gtk.gtk_widget_set_margin_end(t, @divTrunc(vw - r.right, scale) + m);
+    }
+    if (w.mini_box) |b| {
+        const r = overlay_layout.msgTarget(pos.mini, anchor, vw, vh, cw, ch);
+        gtk.gtk_widget_set_margin_bottom(b, @divTrunc(vh - r.bottom, scale) + m);
+        gtk.gtk_widget_set_margin_end(b, @divTrunc(vw - r.right, scale) + m);
+    }
 }
 
 const tone_classes = [_][*:0]const u8{ "tone-error", "tone-warn" };
