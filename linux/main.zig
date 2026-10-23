@@ -489,6 +489,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
+        .shader_preserve_alpha = config.shaders.preserve_alpha,
+        .shader_epoch_ns = clock.nowNs(),
+        .cell_age = core.cell_age_store.Stores.init(alloc),
     };
     defer app.deinit();
     ui_widgets.the_app = app;

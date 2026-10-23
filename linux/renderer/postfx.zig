@@ -39,6 +39,10 @@ const Rt = struct {
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo);
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self.tex, 0);
+        // A new texture holds garbage; iPrevFrame reads it before any pass
+        // has written it.
+        gl.glClearColor(0, 0, 0, 0);
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
         self.w = w;
         self.h = h;
     }
@@ -65,6 +69,10 @@ const Custom = struct {
     u_prev: i32 = -1,
     u_age: i32 = -1,
     needs_animation: bool = false,
+    /// Reads iPrevFrame (frontend_rules.shaderUsesPrevFrame).
+    uses_prev: bool = false,
+    /// Reads iCellAge or its companions (frontend_rules.shaderUsesEditInputs).
+    uses_edit: bool = false,
 };
 
 const max_custom = 8;
@@ -83,9 +91,19 @@ pub const PostFx = struct {
     custom: [max_custom]Custom = @splat(.{}),
     custom_len: usize = 0,
     ubo: u32 = 0,
-    /// 1x1 black: what iPrevFrame and iCellAge read until those inputs exist
-    /// on Linux.
+    /// 1x1 black: what iPrevFrame and iCellAge read when no shader uses them.
     black: u32 = 0,
+    /// The previous frame's final output, top-down, when a shader reads
+    /// iPrevFrame.
+    prev: Rt = .{},
+    uses_prev: bool = false,
+    /// This surface's iCellAge: cols x rows R32F of edit times, when a shader
+    /// reads it.
+    age_tex: u32 = 0,
+    age_cols: u32 = 0,
+    age_rows: u32 = 0,
+    age_cache: core.cell_age_store.SyncCache = .{},
+    uses_edit: bool = false,
     /// Some shader reads time: the frame clock keeps drawing.
     animating: bool = false,
     start_ns: i128 = 0,
@@ -234,7 +252,14 @@ fn setup(app: *App, p: *PostFx) bool {
             p.custom[p.custom_len] = c;
             p.custom_len += 1;
             if (c.needs_animation) p.animating = true;
+            if (c.uses_prev) p.uses_prev = true;
+            if (c.uses_edit) p.uses_edit = true;
         }
+    }
+    // The core records no stamps until a shader wants them. Every window
+    // compiles the same config, so the answer is the same for all.
+    if (p.uses_edit) {
+        if (app.corep) |cp| core.zonvie_core_set_shader_inputs_enabled(cp, 1);
     }
     p.ready = true;
     p.failed = false;
@@ -250,7 +275,21 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
         return null;
     };
     defer app.alloc.free(src);
-    var result = core.zonvie_shader_compile_glsl(src.ptr, src.len, .glsl);
+    // [shaders] preserve_alpha: the core's Shadertoy bridge keeps the
+    // terminal's alpha under this define, as Windows compiles it. Only for
+    // Shadertoy-style sources; a raw shader must start with #version.
+    var with_define: ?[]u8 = null;
+    defer if (with_define) |b| app.alloc.free(b);
+    const define = "#define ZONVIE_PRESERVE_ALPHA 1\n";
+    if (app.shader_preserve_alpha and std.mem.indexOf(u8, src, "mainImage") != null) {
+        if (app.alloc.alloc(u8, define.len + src.len)) |b| {
+            @memcpy(b[0..define.len], define);
+            @memcpy(b[define.len..], src);
+            with_define = b;
+        } else |_| {}
+    }
+    const compile_src = with_define orelse src;
+    var result = core.zonvie_shader_compile_glsl(compile_src.ptr, compile_src.len, .glsl);
     defer core.zonvie_shader_result_destroy(&result);
     const data = result.data orelse {
         applog.appLog("[postfx] {s}: {s}\n", .{ path, if (result.error_msg) |m| std.mem.span(m) else "compile failed" });
@@ -271,6 +310,8 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
         .u_prev = u_prev,
         .u_age = u_age,
         .needs_animation = core.zonvie_core_shader_needs_animation(src.ptr, src.len),
+        .uses_prev = core.frontend_rules.shaderUsesPrevFrame(src),
+        .uses_edit = core.frontend_rules.shaderUsesEditInputs(src),
     };
 }
 
@@ -351,7 +392,8 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     const w: f32 = @floatFromInt(t.w_px);
     const h: f32 = @floatFromInt(t.h_px);
     u.iResolution = .{ w, h, 1 };
-    u.iTime = @floatCast(@as(f64, @floatFromInt(now - p.start_ns)) / std.time.ns_per_s);
+    // From the app's epoch, shared with every window and the cell-age stamps.
+    u.iTime = @floatCast(@as(f64, @floatFromInt(now - app.shader_epoch_ns)) / std.time.ns_per_s);
     u.iTimeDelta = @floatCast(@as(f64, @floatFromInt(now - p.last_ns)) / std.time.ns_per_s);
     if (u.iTimeDelta > 0) u.iFrameRate = 0.9 * u.iFrameRate + 0.1 * (1.0 / u.iTimeDelta);
     p.last_ns = now;
@@ -360,6 +402,9 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     u.iWindowOffset = .{ 0, 0 };
     u.iWindowSize = .{ w, h };
     u.iCellSize = .{ @floatFromInt(app.cell_w_px), @floatFromInt(app.cell_h_px) };
+    // The root grid starts at the surface's corner.
+    u.iGridOrigin = .{ 0, 0 };
+    u.iTimeLastEdit = p.age_cache.last_edit;
     if (cursorState(app, surface_id)) |c| {
         if (!std.mem.eql(f32, &c.rect, &p.cursor_cur)) {
             u.iPreviousCursor = u.iCurrentCursor;
@@ -407,14 +452,16 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         return f;
     }
 
+    const age = if (p.uses_edit) syncCellAge(app, p, surface_id) else 0;
     fillUniforms(app, t, p, surface_id);
     gl.glBindBuffer(gl.GL_UNIFORM_BUFFER, p.ubo);
     gl.glBufferSubData(gl.GL_UNIFORM_BUFFER, 0, @sizeOf(Uniforms), &p.uniforms);
     gl.glBindBufferBase(gl.GL_UNIFORM_BUFFER, 1, p.ubo);
-    for ([_]gl.GLenum{ gl.GL_TEXTURE2, gl.GL_TEXTURE3 }) |unit| {
-        gl.glActiveTexture(unit);
-        gl.glBindTexture(gl.GL_TEXTURE_2D, p.black);
-    }
+    if (p.uses_prev) p.prev.ensure(t.w_px, t.h_px);
+    gl.glActiveTexture(gl.GL_TEXTURE2);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, if (p.uses_prev) p.prev.tex else p.black);
+    gl.glActiveTexture(gl.GL_TEXTURE3);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, if (age != 0) age else p.black);
     var src = p.scene.tex;
     for (p.custom[0..p.custom_len], 0..) |c, i| {
         const last = i + 1 == p.custom_len;
@@ -428,7 +475,48 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         drawFullscreen(c.pass, src, last);
         if (!last) src = p.ping[i % 2].tex;
     }
+    if (p.uses_prev) {
+        // The output just drawn is next frame's iPrevFrame: copied back,
+        // flipped to the top-down rows every offscreen texture keeps.
+        const w: gl.GLint = @intCast(t.w_px);
+        const h: gl.GLint = @intCast(t.h_px);
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, @intCast(screen_fbo));
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, p.prev.fbo);
+        gl.glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST);
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
+    }
     return f;
+}
+
+/// This surface's iCellAge texture, uploaded when the core stamped it since
+/// the last frame; 0 when it cannot be bound. Its size is the surface's
+/// root grid: the main window's screen-space cells (texture 1), or the
+/// external window's own grid.
+fn syncCellAge(app: *App, p: *PostFx, surface_id: i64) u32 {
+    app.mu.lockUncancelable(clock.io());
+    const layers = app.surface.committedSurfaceLayers(surface_id);
+    const root: ?core.Layer = for (layers) |l| {
+        if (l.grid_id == surface_id) break l;
+    } else null;
+    app.mu.unlock(clock.io());
+    const r = root orelse return 0;
+    const fresh = p.age_tex == 0 or p.age_cols != r.cols or p.age_rows != r.rows;
+    var values: []const f32 = &.{};
+    switch (app.cell_age.sync(surface_id, r.cols, r.rows, fresh, &p.age_cache, &values)) {
+        .unavailable => return 0,
+        .clean => {},
+        .dirty => {
+            defer app.cell_age.endUpload();
+            if (p.age_tex == 0) gl.glGenTextures(1, &p.age_tex);
+            gl.glBindTexture(gl.GL_TEXTURE_2D, p.age_tex);
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32F, @intCast(r.cols), @intCast(r.rows), 0, gl.GL_RED, gl.GL_FLOAT, values.ptr);
+            p.age_cols = r.cols;
+            p.age_rows = r.rows;
+        },
+    }
+    return p.age_tex;
 }
 
 /// Frees the context's objects; the next realize builds them again.
@@ -437,6 +525,8 @@ pub fn unrealize(p: *PostFx) void {
     p.extract.deinit();
     for (&p.mips) |*m| m.deinit();
     for (&p.ping) |*r| r.deinit();
+    p.prev.deinit();
+    if (p.age_tex != 0) gl.glDeleteTextures(1, &p.age_tex);
     for (p.custom[0..p.custom_len]) |c| gl.glDeleteProgram(c.pass.prog);
     for ([_]Pass{ p.copy, p.down, p.up }) |pass| if (pass.prog != 0) gl.glDeleteProgram(pass.prog);
     if (p.ubo != 0) gl.glDeleteBuffers(1, &p.ubo);

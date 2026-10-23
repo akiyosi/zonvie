@@ -82,6 +82,9 @@ pub const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 
 // Framebuffer
 pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
+pub const GL_READ_FRAMEBUFFER: GLenum = 0x8CA8;
+pub const GL_DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
+pub const GL_R32F: GLint = 0x822E;
 pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 pub const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 pub const GL_FRAMEBUFFER_BINDING: GLenum = 0x8CA6;
@@ -137,6 +140,7 @@ pub extern "c" fn glVertexAttribIPointer(index: GLuint, size: GLint, @"type": GL
 // Texture
 pub extern "c" fn glGenTextures(n: GLsizei, textures: *GLuint) void;
 pub extern "c" fn glBindTexture(target: GLenum, texture: GLuint) void;
+pub extern "c" fn glBlitFramebuffer(srcX0: GLint, srcY0: GLint, srcX1: GLint, srcY1: GLint, dstX0: GLint, dstY0: GLint, dstX1: GLint, dstY1: GLint, mask: GLbitfield, filter: GLenum) void;
 pub extern "c" fn glTexImage2D(target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, @"type": GLenum, data: ?*const anyopaque) void;
 pub extern "c" fn glTexSubImage2D(target: GLenum, level: GLint, xoffset: GLint, yoffset: GLint, width: GLsizei, height: GLsizei, format: GLenum, @"type": GLenum, data: ?*const anyopaque) void;
 pub extern "c" fn glTexParameteri(target: GLenum, pname: GLenum, param: GLint) void;

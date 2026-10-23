@@ -116,6 +116,14 @@ pub const App = struct {
     /// config.toml [shaders] paths when enabled; borrowed from the config,
     /// which outlives the App.
     shader_paths: []const []const u8 = &.{},
+    /// [shaders] preserve_alpha.
+    shader_preserve_alpha: bool = false,
+    /// iTime's origin for every window's shaders, and the clock cell-age
+    /// stamps are taken on, so `iTime - stamp` is an age.
+    shader_epoch_ns: i128 = 0,
+    /// iCellAge mirrors (main and external windows); the core thread writes
+    /// them from on_cell_age_stamps, each window's draw uploads its own.
+    cell_age: core.cell_age_store.Stores = undefined,
     /// Bumped by every committed flush (under `mu`), so a frame can say
     /// which commit it shows.
     flush_seq: u64 = 0,
@@ -206,6 +214,7 @@ pub const App = struct {
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
         self.ext_ops_gtk.deinit(self.alloc);
+        self.cell_age.deinit();
     }
 
     /// GTK main thread: every window draws the committed frame.

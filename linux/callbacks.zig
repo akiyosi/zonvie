@@ -37,6 +37,7 @@ pub fn makeCallbacks() core.Callbacks {
         .on_tabline_update = onTablineUpdate,
         .on_tabline_hide = onTablineHide,
         .on_agent_status = onAgentStatus,
+        .on_cell_age_stamps = onCellAgeStamps,
         .on_atlas_create = onAtlasCreate,
         .on_atlas_upload = onAtlasUpload,
         .on_rasterize_glyph = onRasterizeGlyph,
@@ -303,6 +304,15 @@ fn onTablineUpdate(
     app.ui.tabline(curtab, tabs[0..tab_count]);
     unlock(app);
     ui_widgets.queueRefresh(app);
+}
+
+/// Cells the core stamped as just edited, for iCellAge: into the CPU mirror,
+/// which each window's next shaded draw uploads. Core thread, grid_mu held.
+fn onCellAgeStamps(ctx: ?*anyopaque, stamps: ?[*]const core.zonvie_cell_stamp, n: usize, clear: c_int) callconv(.c) void {
+    const app = appFrom(ctx);
+    const now: f32 = @floatCast(@as(f64, @floatFromInt(clock.nowNs() - app.shader_epoch_ns)) / std.time.ns_per_s);
+    const slice: []const core.zonvie_cell_stamp = if (stamps != null and n > 0) stamps.?[0..n] else &.{};
+    app.cell_age.apply(slice, clear != 0, now);
 }
 
 /// Not coupled to a flush: a background tab's agent still updates.

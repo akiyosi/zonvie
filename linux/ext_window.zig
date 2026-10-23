@@ -128,6 +128,8 @@ fn close(app: *App, grid_id: i64) void {
     const kv = app.ext_windows.fetchRemove(grid_id) orelse return;
     const w = kv.value;
     scrollbar.cancelTimers(&w.scrollbar);
+    // A later window reusing this grid id starts unedited.
+    app.cell_age.drop(grid_id);
     // Destroying unrealizes the area, which still reads `w`.
     if (w.window) |win| gtk.gtk_window_destroy(win);
     w.gl.deinit(app.alloc);
