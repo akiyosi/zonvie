@@ -208,6 +208,9 @@ fn startCore(app: *App, area: *anyopaque) void {
     if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
     if (applog.isVerbose()) core.zonvie_core_set_log_verbose(cp, 1);
     if (startup.inherit_cwd) core.zonvie_core_set_inherit_cwd(cp, 1);
+    // Default-background cells take this alpha (0.5 under blur), as on Windows.
+    core.zonvie_core_set_background_opacity(cp, app.window_cfg.opacity);
+    core.zonvie_core_set_blur_enabled(cp, @intFromBool(app.window_cfg.blur));
     if (startup.ext_cmdline) core.zonvie_core_set_ext_cmdline(cp, 1);
     if (startup.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(cp, 1);
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
@@ -275,6 +278,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const win = gtk.gtk_application_window_new(gapp.?) orelse return;
     app.window = win;
     gtk.gtk_window_set_title(win, "zonvie");
+    if (app.translucent()) gtk.gtk_widget_add_css_class(win, "zonvie-translucent");
     gtk.gtk_window_set_default_size(win, default_w_logical, default_h_logical);
 
     const startup: *const Startup = @ptrCast(@alignCast(app.startup.?));
@@ -444,6 +448,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .font_cfg = config.font,
         .msg_pos = config.messages.msg_pos,
         .input_cfg = config.input,
+        .window_cfg = config.window,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
     };
     defer app.deinit();

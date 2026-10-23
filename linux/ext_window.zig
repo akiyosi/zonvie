@@ -97,6 +97,7 @@ fn open(app: *App, op: Op) void {
     const win = gtk.gtk_window_new() orelse return;
     w.window = win;
     if (app.gtk_app) |a| gtk.gtk_window_set_application(win, a);
+    if (app.translucent()) gtk.gtk_widget_add_css_class(win, "zonvie-translucent");
     gtk.gtk_window_set_title(win, "zonvie");
     const sz = logicalSize(app, op.rows, op.cols);
     gtk.gtk_window_set_default_size(win, sz[0], sz[1]);

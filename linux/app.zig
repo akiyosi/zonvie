@@ -59,6 +59,9 @@ pub const App = struct {
     /// Font cell height plus linespace, as sent to the core.
     cell_h_px: u32 = 0,
     linespace_px: i32 = 0,
+    /// config.toml's [window]. Below 1 opacity, or with blur, the windows
+    /// are translucent and the compositor blurs what shows through.
+    window_cfg: core.config.Config.WindowConfig = .{},
     /// config.toml's [input].
     input_cfg: core.config.Config.InputConfig = .{},
     /// The editor font as the preedit label draws it: family and logical px.
@@ -197,6 +200,10 @@ pub const App = struct {
     }
 
     /// GTK main thread: every window draws the committed frame.
+    pub fn translucent(self: *const App) bool {
+        return self.window_cfg.opacity < 1.0 or self.window_cfg.blur;
+    }
+
     pub fn queueRenderAll(self: *App) void {
         if (self.render_thread) |rt| rt.request();
         if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);

@@ -275,12 +275,15 @@ fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, re
 /// draw with yet.
 fn begin(app: *App, t: *Target) bool {
     const bg = app.default_bg;
+    // Premultiplied: [window] opacity is the background's alpha, as Windows
+    // clears its swapchain.
+    const a = std.math.clamp(app.window_cfg.opacity, 0, 1);
     gl.glViewport(0, 0, @intCast(t.w_px), @intCast(t.h_px));
     gl.glClearColor(
-        @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0,
-        @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0,
-        @as(f32, @floatFromInt(bg & 0xff)) / 255.0,
-        1.0,
+        @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0 * a,
+        @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0 * a,
+        @as(f32, @floatFromInt(bg & 0xff)) / 255.0 * a,
+        a,
     );
     gl.glClear(gl.GL_COLOR_BUFFER_BIT);
     if (t.atlas_w == 0 or t.w_px == 0 or t.h_px == 0) return false;

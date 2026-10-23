@@ -242,6 +242,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\.zonvie-confirm {{ padding: 12px 16px; }}
         \\.zonvie-panel.tone-error {{ border-color: #e06c75; color: #e06c75; }}
         \\.zonvie-panel.tone-warn {{ border-color: #e5c07b; }}
+        \\window.zonvie-translucent {{ background: transparent; }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar {{ background-color: #{x:0>6}; }}
         \\.zonvie-tabbar button {{ background: none; color: alpha(#{x:0>6}, 0.6); border-radius: 0;
