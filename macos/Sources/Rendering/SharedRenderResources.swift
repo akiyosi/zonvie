@@ -120,6 +120,13 @@ final class SharedRenderResources {
         return gridFonts.isEmpty ? nil : gridFonts[gridId]
     }
 
+    /// The row height `gridId` is drawn at: its own font's, else the global one.
+    /// Scroll offsets and retained rows are measured in it.
+    func rowHeightPx(_ gridId: Int64) -> Float {
+        if let gf = gridFont(gridId) { return Float(gf.cellHeightPx) }
+        return cellHeightPx
+    }
+
     /// Fill a layer's per-grid font geometry from the committed table.
     func applyGridFont(to layer: inout SurfaceLayer) {
         guard let gf = gridFont(layer.gridId) else { return }

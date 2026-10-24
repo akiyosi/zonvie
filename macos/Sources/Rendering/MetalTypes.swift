@@ -429,12 +429,18 @@ final class ScrollRetention {
     /// surface displaces: an external surface asked it of its root only, so a
     /// float it hosts stretched its edge row over the rows it had retained.
     func releaseCoveredPins(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], cellHeightNDC: Float) {
+        releaseCoveredPins(&offsets) { _ in cellHeightNDC }
+    }
+
+    /// `cellHeightNDC` answers per grid: a grid drawn in its own font has
+    /// its band measured in its own row height.
+    func releaseCoveredPins(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], cellHeightNDC: (Int32) -> Float) {
         for i in offsets.indices {
             let retained = publishedCount(gridId: Int64(offsets[i].grid_id))
             if retained > 0, Self.coversBand(
                 retainedRows: retained,
                 offsetNDC: offsets[i].offset_y,
-                cellHeightNDC: cellHeightNDC
+                cellHeightNDC: cellHeightNDC(offsets[i].grid_id)
             ) {
                 offsets[i].pin_edges = 0
             }

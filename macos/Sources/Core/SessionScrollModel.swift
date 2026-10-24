@@ -436,7 +436,7 @@ final class SessionScrollModel {
     ) -> CGFloat {
         guard let core, let renderer else { return 0 }
 
-        let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        let rowHeightPx = CGFloat(renderer.rowHeightPx(gridId))
         guard rowHeightPx > 0 else { return 0 }
 
         // grid=1 (global grid) does not support pixel-based smooth scrolling
@@ -1074,7 +1074,6 @@ final class SessionScrollModel {
 
         guard !pending.isEmpty else { return }
 
-        let rowHeightPx = CGFloat(renderer?.cellHeightPx ?? 0)
         // One wheel event's worth of rows, the unit the lookahead books in and
         // therefore the most it may ever be running ahead by. Read once: it is
         // a lock-free atomic, but this loop runs per arrival.
@@ -1094,6 +1093,7 @@ final class SessionScrollModel {
             // distance here: until the float's own placement travels the same
             // way, it is carrying a compensation for a step it has not taken.
             anchorLandedRowsUp[gridId, default: 0] += rowsDelta
+            let rowHeightPx = CGFloat(renderer?.rowHeightPx(gridId) ?? 0)
 
             // grid_scroll received — reset stale tracking for this grid.
             // A response also proves the grid is not blocked at a buffer edge.
@@ -1341,11 +1341,11 @@ final class SessionScrollModel {
                 externalEaseGridScratch.insert(id)
             }
         }
-        let externalMaxOffsetPx = externalEaseGridScratch.isEmpty ? 0
-            : rowHeightPx * CGFloat(ScrollRetention.depthRows(forBandRows: core?.getMouseScrollVer() ?? 0))
+        let externalMaxOffsetRows = externalEaseGridScratch.isEmpty ? 0
+            : CGFloat(ScrollRetention.depthRows(forBandRows: core?.getMouseScrollVer() ?? 0))
 
         scrollOffsetLock.lock()
-        let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
+        let maxOffsetRows = CGFloat(renderer.retentionDepthRows)
 
         // Tick before seeding. The offset is re-read: a gesture or a clear may
         // have written it since the last tick.
@@ -1380,7 +1380,7 @@ final class SessionScrollModel {
             // a larger step keeps ver and snaps as before.
             let capVer = abs(rowsDelta) <= ver ? max(ver, ScrollRetention.minDepthRows) : ver
             guard zonvie_scroll_spring_seed(&spring, nowNs, Int32(clamping: rowsDelta),
-                                            Int32(clamping: Int(rowHeightPx.rounded())), Int32(clamping: capVer),
+                                            Int32(clamping: Int(CGFloat(renderer.rowHeightPx(gridId)).rounded())), Int32(clamping: capVer),
                                             UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { continue }
             easeSprings[gridId] = spring
             scrollOffsetPx[gridId] = CGFloat(spring.offset_px)
@@ -1412,7 +1412,7 @@ final class SessionScrollModel {
             for gridId in easeDecayScratch {
                 // Clamped to what the drawing surface's retention can cover:
                 // past that the vacated band has no row to show.
-                let limitPx = externalEaseGridScratch.contains(gridId) ? externalMaxOffsetPx : maxOffsetPx
+                let limitPx = CGFloat(renderer.rowHeightPx(gridId)) * (externalEaseGridScratch.contains(gridId) ? externalMaxOffsetRows : maxOffsetRows)
                 let offset = scrollOffsetPx[gridId] ?? 0
                 let eased = max(-limitPx, min(limitPx, offset))
                 let spring = easeSprings[gridId] ?? zonvie_scroll_spring()
@@ -1518,8 +1518,9 @@ final class SessionScrollModel {
         }
 
         staleKeysScratch.removeAll(keepingCapacity: true)
+        let rowRenderer = renderer
         for (gridId, offsetPx) in scrollOffsetPx {
-            let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: cellHeightPx)
+            let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: rowRenderer.map { CGFloat($0.rowHeightPx(gridId)) } ?? cellHeightPx)
             // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
             // preventing markAllRowsDirty from firing every frame. Also prune
             // the entry itself — otherwise scrollOffsetPx never becomes empty

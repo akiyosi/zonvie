@@ -151,7 +151,8 @@ func layerOverBlitRows(
 
 extension GridSurfaceRenderer.ScrollOffsetInfo {
     /// One grid's entry, with its rows and margins from the core's grid info.
-    init(grid: ZonvieCore.GridInfo, offsetYPx: Float, gridTopYNDC: Float, zindex: Int32) {
+    init(grid: ZonvieCore.GridInfo, offsetYPx: Float, gridTopYNDC: Float, zindex: Int32,
+         rowHeightPx: Float = 0, extentHeightPx: Float = 0) {
         self.init(
             gridId: grid.gridId,
             offsetYPx: offsetYPx,
@@ -159,7 +160,9 @@ extension GridSurfaceRenderer.ScrollOffsetInfo {
             gridRows: grid.rows,
             marginTop: grid.marginTop,
             marginBottom: grid.marginBottom,
-            zindex: zindex
+            zindex: zindex,
+            rowHeightPx: rowHeightPx,
+            extentHeightPx: extentHeightPx
         )
     }
 }
@@ -2020,6 +2023,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Cell height in drawable pixel coordinates, `linespace` included.
     var cellHeightPx: Float { shared.cellHeightPx }
 
+    /// `gridId`'s row height: its own font's, else `cellHeightPx`.
+    func rowHeightPx(_ gridId: Int64) -> Float { shared.rowHeightPx(gridId) }
+
     /// The integer cell size the core lays out with and the window snaps to.
     var coreCellPx: (w: Int, h: Int) {
         (max(1, Int(cellWidthPx.rounded(.toNearestOrAwayFromZero))),
@@ -3010,6 +3016,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // The grid those rows were counted on, which can change from frame to
         // frame for an editor-anchored float (see floatDebtBaselineFollowing).
         var debtAnchorGridId: Int64 = 0
+        // The grid's own row height when it is drawn in its own font; 0 =
+        // the surface cell height. The content clip and the band coverage
+        // are measured in it.
+        var rowHeightPx: Float = 0
+        // That grid's clip box height (on_grid_font extent_h_px). gridRows is
+        // its footprint in SURFACE cells, so the content bottom comes from
+        // here, not from gridRows x rowHeightPx.
+        var extentHeightPx: Float = 0
     }
 
     /// draw()'s cell-snapped viewport height: the committed extent, else the
@@ -3071,7 +3085,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // again on the frames this function does not run at all — which is
         // every frame once nothing is easing.
         retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
-        retention.releaseCoveredPins(&scrollOffsetData, cellHeightNDC: cellHeightNDC)
+        retention.releaseCoveredPins(&scrollOffsetData) { gid in
+            for info in offsets where info.gridId == Int64(gid) && info.rowHeightPx > 0 {
+                return info.rowHeightPx * scale
+            }
+            return cellHeightNDC
+        }
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
             // Logged AFTER the pin decision so pin/retained carry the values
@@ -3126,7 +3145,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// - Returns: ScrollOffset struct ready for shader
     static func computeScrollOffset(info: ScrollOffsetInfo, viewportHeight: Float, cellHeightPx: Float) -> ScrollOffset {
         let scale: Float = viewportHeight > 0 ? 2.0 / viewportHeight : 0
-        let cellHeightNDC: Float = cellHeightPx * scale
+        let cellHeightNDC: Float = (info.rowHeightPx > 0 ? info.rowHeightPx : cellHeightPx) * scale
         let ndc = -info.offsetYPx * scale
 
         // Content bounds in NDC, used only for fragment-level clipping of
@@ -3135,7 +3154,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // (clipToContent == false) translates bodily, so widen the bounds past
         // the screen and clip nothing.
         let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
-        let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
+        let contentBottomY: Float
+        if !info.clipToContent {
+            contentBottomY = -2.0
+        } else if info.rowHeightPx > 0 {
+            contentBottomY = info.gridTopYNDC - info.extentHeightPx * scale + Float(info.marginBottom) * cellHeightNDC
+        } else {
+            contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
+        }
 
         return ScrollOffset(
             grid_id: Int32(truncatingIfNeeded: info.gridId),
@@ -3999,12 +4025,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Retained rows of this layer at the current cell height, collected
     /// into `retainedIndexScratch`; the draw loop refills it per layer.
-    private func collectLayerRetainedRows(_ gridId: Int64, _ f: inout MainSurfaceFrame) -> Int {
+    private func collectLayerRetainedRows(_ layer: SurfaceLayer, _ f: inout MainSurfaceFrame) -> Int {
         collectSurfaceLayerRetainedRows(
-            gridId: gridId,
+            gridId: layer.gridId,
             retained: f.retained,
-            hasScrollOffset: surfaceScrollOffset(gridId: gridId, offsets: f.scrollOffsets) != nil,
-            cellHeightPx: Float(f.cellHi),
+            hasScrollOffset: surfaceScrollOffset(gridId: layer.gridId, offsets: f.scrollOffsets) != nil,
+            cellHeightPx: Float(layer.rowHeightPx(surfaceCellHeightPx: Int(f.cellHi))),
             into: &retainedIndexScratch
         )
     }
@@ -4135,7 +4161,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // the rungs above already passed
                 // SurfaceFrameDecision answers .load.
                 let rowCount = f.layerResolvableRowCount(entry)
-                let retainedRowCount = collectLayerRetainedRows(layer.gridId, &f)
+                let retainedRowCount = collectLayerRetainedRows(layer, &f)
                 if f.layerNeedsAllRows(
                     state: state,
                     rowCount: rowCount,
@@ -4223,7 +4249,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // ladder passes it: a frame that does clear redraws every
             // layer whole anyway, so the disagreement cannot lose a row.
             if let state = entry.state {
-                let retainedRowCount = collectLayerRetainedRows(layer.gridId, &f)
+                let retainedRowCount = collectLayerRetainedRows(layer, &f)
                 if !f.layerNeedsAllRows(
                     state: state,
                     rowCount: rowCount,
@@ -4436,7 +4462,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // This layer's rows, then the rows its own smooth scroll
             // retained; both in its grid-local space. The index list is
             // reused so a layer costs no allocation per frame.
-            let retainedForLayerCount = collectLayerRetainedRows(layer.gridId, &f)
+            let retainedForLayerCount = collectLayerRetainedRows(layer, &f)
 
             // What one row of this layer owes the encoder. Shared by both
             // arms below so the gated path resolves rows the same way.
@@ -4644,7 +4670,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // a row missing here has no previous frame and no
                 // root-side extraction to fall back on: the root
                 // pass takes only gridId == 1 retained rows.
-                let retainedForGlowCount = collectLayerRetainedRows(layer.gridId, &f)
+                let retainedForGlowCount = collectLayerRetainedRows(layer, &f)
                 let cellHi = Float(layer.rowHeightPx(surfaceCellHeightPx: Int(f.cellHi)))
                 encodeSurfaceLayerGlowRows(
                     encoder: enc,
@@ -5071,7 +5097,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             retention: retention,
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
-            cellHeightPx: shared.cellHeightPx
+            cellHeightPx: shared.rowHeightPx(gridId)
         )
         if !captured {
             ZonvieCore.appLog(
@@ -5119,7 +5145,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
             stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
-            cellHeightPx: shared.cellHeightPx
+            cellHeightPx: shared.rowHeightPx(gridId)
         )
     }
 

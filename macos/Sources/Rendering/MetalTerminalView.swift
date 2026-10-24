@@ -834,12 +834,15 @@ final class MetalTerminalView: GridInputView {
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
+            let gridFont = core.gridCellPx(gridId)
             scrollOffsetInfoScratch.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 grid: info,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
                 // The paint rank is written at draw (rankOffsets).
-                zindex: 0
+                zindex: 0,
+                rowHeightPx: gridFont.map { Float($0.cellHeightPx) } ?? 0,
+                extentHeightPx: gridFont.map { Float($0.extentHeightPx) } ?? 0
             ))
         }
 
@@ -962,7 +965,7 @@ final class MetalTerminalView: GridInputView {
     /// that dropped the scroll transform, as on the external surface.
     private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat) -> CGFloat {
         if drewWithoutScrollTransform || renderer.drewWithoutScrollTransform { return 0 }
-        return scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
+        return scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: core?.gridCellPx(grid).map { CGFloat($0.cellHeightPx) } ?? cellH) ?? 0
     }
 
     /// The renderer's follower map, skipped while nothing is displaced: the

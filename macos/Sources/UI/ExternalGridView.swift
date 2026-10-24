@@ -1435,7 +1435,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             pendingGridScrollScratch.append((gridId: id, rowsDelta: rowsDelta, bounds: bounds))
         }
         lock.unlock()
-        let capturedCellHeightPx = Float(shared.cellHeightPx)
         for pending in pendingGridScrollScratch {
             let id = pending.gridId
             // The root is a grid of this surface like any other, read from
@@ -1460,7 +1459,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 retention: retention,
                 lock: lock,
                 bracketStagedGrids: &bracketStagedGrids,
-                cellHeightPx: capturedCellHeightPx
+                cellHeightPx: shared.rowHeightPx(id)
             )
             // Seeding is decided by who compensates the scroll, not by which
             // path captured the rows: the root's capture here serves a
@@ -1505,7 +1504,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
             stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
-            cellHeightPx: Float(shared.cellHeightPx)
+            cellHeightPx: shared.rowHeightPx(id)
         )
     }
 
@@ -1568,7 +1567,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     lock: lock,
                     bracketStagedGrids: &bracketStagedGrids,
                     stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
-                    cellHeightPx: Float(shared.cellHeightPx)
+                    cellHeightPx: shared.rowHeightPx(gridId)
                 )
             }
         }
@@ -3687,11 +3686,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // update, taken only once some grid is displaced.
         var visibleGrids: [ZonvieCore.GridInfo]? = nil
         func displacedInfo(_ id: Int64, gridTopYNDC: Float, zindex: Int32) -> GridSurfaceRenderer.ScrollOffsetInfo? {
-            guard let offsetPx = scroll.settledVisualOffsetPx(gridId: id, cellHeightPx: cellHeightPx) else { return nil }
+            let gridFont = shared.gridFont(id)
+            let fontRowHeightPx = gridFont.map { Float($0.cellHeightPx) } ?? 0
+            guard let offsetPx = scroll.settledVisualOffsetPx(
+                gridId: id, cellHeightPx: fontRowHeightPx > 0 ? fontRowHeightPx : cellHeightPx) else { return nil }
             if visibleGrids == nil { visibleGrids = core?.getVisibleGridsCached() ?? [] }
             guard let grid = visibleGrids?.first(where: { $0.gridId == id }) else { return nil }
             return GridSurfaceRenderer.ScrollOffsetInfo(
-                grid: grid, offsetYPx: offsetPx, gridTopYNDC: gridTopYNDC, zindex: zindex)
+                grid: grid, offsetYPx: offsetPx, gridTopYNDC: gridTopYNDC, zindex: zindex,
+                rowHeightPx: fontRowHeightPx,
+                extentHeightPx: gridFont.map { Float($0.extentHeightPx) } ?? 0)
         }
 
         hostedScrollOffsetScratch.removeAll(keepingCapacity: true)
@@ -3719,6 +3723,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // left; the edge-row background stretch would paint over them, so it
         // is released per grid once they cover the whole band.
         let cellHeightNDC = cellHeightPx * (2.0 / viewportHeight)
+        let rowHeightNDC: (Int32) -> Float = { [shared] gid in
+            shared.gridFont(Int64(gid)).map { Float($0.cellHeightPx) * (2.0 / viewportHeight) } ?? cellHeightNDC
+        }
 
         // Get scroll offset info from the main view's shared scroll state.
         // No second clamp here. settledVisualOffsetPx already applied the
@@ -3763,7 +3770,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             pruneOffsetsScratch.append(scrollOffset)
             pruneOffsetsScratch.append(contentsOf: hostedScrollOffsetScratch)
             retention.pruneUndisplaced(offsets: pruneOffsetsScratch, seedGrids: smoothScrollSeeds)
-            retention.releaseCoveredPins(&pruneOffsetsScratch, cellHeightNDC: cellHeightNDC)
+            retention.releaseCoveredPins(&pruneOffsetsScratch, cellHeightNDC: rowHeightNDC)
 
             scrollOffsetData = pruneOffsetsScratch[0]
             scrollOffsetLatch.setActive(true)
@@ -3784,7 +3791,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             pruneOffsetsScratch.removeAll(keepingCapacity: true)
             pruneOffsetsScratch.append(contentsOf: hostedScrollOffsetScratch)
             retention.pruneUndisplaced(offsets: pruneOffsetsScratch, seedGrids: smoothScrollSeeds)
-            retention.releaseCoveredPins(&hostedScrollOffsetScratch, cellHeightNDC: cellHeightNDC)
+            retention.releaseCoveredPins(&hostedScrollOffsetScratch, cellHeightNDC: rowHeightNDC)
 
             scrollOffsetData = nil
             // A hosted grid easing on its own keeps this surface in a smooth
@@ -3863,7 +3870,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// The ease offset the last frame drew `grid` with: none at all on a
     /// frame that dropped the scroll transform.
     private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat, scroll: SessionScrollModel) -> CGFloat {
-        drewWithoutScrollTransform ? 0 : scroll.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH)
+        drewWithoutScrollTransform ? 0 : scroll.visualScrollOffsetPx(
+            gridId: grid, cellHeightPx: shared.gridFont(grid).map { CGFloat($0.cellHeightPx) } ?? cellH)
     }
 
     /// Which grid a pointer event at `pointPx` (surface content pixels,
