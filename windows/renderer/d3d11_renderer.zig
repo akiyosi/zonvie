@@ -292,8 +292,14 @@ pub const Renderer = struct {
     // Persistent back buffer (like macOS backBuffer)
     back_tex: ?*c.ID3D11Texture2D = null,
     back_rtv: ?*c.ID3D11RenderTargetView = null,
+    /// back_tex's allocated extent. Grow-only and at least `width`x`height`;
+    /// only the top-left logical `width`x`height` region holds frame content,
+    /// so a live-resize drag does not recreate it on every size change.
+    back_cap_w_px: u32 = 0,
+    back_cap_h_px: u32 = 0,
 
-    // Staging texture for back_tex scroll (same size/format, lazily created)
+    // Staging texture for back_tex scroll (back_tex's capacity and format,
+    // lazily created, released only when back_tex is reallocated)
     scroll_staging_tex: ?*c.ID3D11Texture2D = null,
 
     // Clean pixels covered by the alpha-blended scrollbar in back_tex.
@@ -341,8 +347,12 @@ pub const Renderer = struct {
     glow_mip_tex: [3]?*c.ID3D11Texture2D = .{ null, null, null },
     glow_mip_rtv: [3]?*c.ID3D11RenderTargetView = .{ null, null, null },
     glow_mip_srv: [3]?*c.ID3D11ShaderResourceView = .{ null, null, null },
-    glow_half_w: u32 = 0,
-    glow_half_h: u32 = 0,
+    /// Surface extent the glow textures were planned for: grow-only and at
+    /// least `width`x`height`. Each texture is `glow_chain.plan` of this
+    /// capacity; the passes run on `plan` of the logical size and sample
+    /// through GlowParams' UV scale/clamp.
+    glow_cap_w_px: u32 = 0,
+    glow_cap_h_px: u32 = 0,
     vs_fullscreen: ?*c.ID3D11VertexShader = null,
     /// Vertex shader paired with the user's custom post-process PS. The
     /// output struct field name is `vUV` so it matches the PS input name
@@ -870,9 +880,12 @@ pub const Renderer = struct {
         const src: *c.ID3D11Resource = @ptrCast(back_tex);
         const vtbl = ctx.*.lpVtbl;
 
+        const copy = vtbl.*.CopySubresourceRegion orelse return error.RenderResourcesUnavailable;
         if (self.bb_damage.full[index]) {
-            const copy = vtbl.*.CopyResource orelse return error.RenderResourcesUnavailable;
-            copy(ctx, dst, src);
+            // back_tex may be larger than the swapchain buffer (capacity),
+            // so copy the logical extent rather than the whole resource.
+            const full_box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = self.width, .bottom = self.height, .back = 1 };
+            copy(ctx, dst, 0, 0, 0, 0, src, 0, &full_box);
             self.bb_damage.clear(index);
             return .{ .full = true };
         }
@@ -880,7 +893,6 @@ pub const Renderer = struct {
         const pending = self.bb_damage.pending(index);
         const count: usize = pending.len;
         if (count == 0) return .{};
-        const copy = vtbl.*.CopySubresourceRegion orelse return error.RenderResourcesUnavailable;
         for (pending, 0..) |rect, i| {
             const box: c.D3D11_BOX = .{
                 .left = @intCast(rect.left),
@@ -970,9 +982,10 @@ pub const Renderer = struct {
             self.bb_rtv = null;
             self.bb_tex = null;
         }
-        safeRelease(&self.back_rtv);
-        safeRelease(&self.back_tex);
-        safeRelease(&self.scroll_staging_tex);
+        // back_tex / back_rtv / scroll_staging_tex are kept: they are sized
+        // by capacity, and createBackTargets reallocates them only when the
+        // new logical size exceeds it. has_presented_once=false above forces
+        // the full clear + redraw the stale region outside the old size needs.
         safeRelease(&self.scrollbar_underlay_tex);
         self.scrollbar_underlay_state.resourceFailed();
         safeRelease(&self.clear_row_vb);
@@ -2151,43 +2164,62 @@ pub const Renderer = struct {
             );
         }
 
-        desc.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
-        desc.Usage = c.D3D11_USAGE_DEFAULT;
-        desc.CPUAccessFlags = 0;
-
-        var back: ?*c.ID3D11Texture2D = null;
-
-        // ID3D11Device::CreateTexture2D (call via vtbl; avoids anytype/@ptrCast issues)
-        const dev_vtbl3 = dev.*.lpVtbl;
-        const create_tex2d = dev_vtbl3.*.CreateTexture2D orelse return error.D3DCreateBackTexFailed;
-
-        // Signature: (This, pDesc, pInitialData, ppTexture2D) -> HRESULT
-        const hr_back = create_tex2d(dev, &desc, null, @ptrCast(&back));
-        if (c.FAILED(hr_back) or back == null) return error.D3DCreateBackTexFailed;
-
-        if (applog.isEnabled()) {
-            applog.appLog(
-                "[d3d] back_tex_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
-                .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
-            );
-        }
-
-        self.back_tex = back;
-
-        var back_rtv: ?*c.ID3D11RenderTargetView = null;
-
         const dev_vtbl2 = dev.*.lpVtbl;
         const create_rtv2 = dev_vtbl2.*.CreateRenderTargetView orelse return error.D3DCreateBackRTVFailed;
 
-        const hr_back_rtv = create_rtv2(
-            dev,
-            @ptrCast(back.?), // pResource: ID3D11Resource*
-            null,
-            @ptrCast(&back_rtv),
-        );
-        if (c.FAILED(hr_back_rtv) or back_rtv == null) return error.D3DCreateBackRTVFailed;
+        // Persistent back buffer: reallocated only when the logical size
+        // outgrows its capacity, so a live-resize drag reuses it.
+        const need_w = @max(desc.Width, self.width);
+        const need_h = @max(desc.Height, self.height);
+        if (self.back_tex == null or self.back_rtv == null or need_w > self.back_cap_w_px or need_h > self.back_cap_h_px) {
+            const cap_w = grownCapacityPx(if (self.back_tex != null) self.back_cap_w_px else 0, need_w);
+            const cap_h = grownCapacityPx(if (self.back_tex != null) self.back_cap_h_px else 0, need_h);
+            safeRelease(&self.back_rtv);
+            safeRelease(&self.back_tex);
+            safeRelease(&self.scroll_staging_tex);
+            self.back_cap_w_px = 0;
+            self.back_cap_h_px = 0;
 
-        self.back_rtv = back_rtv;
+            desc.Width = cap_w;
+            desc.Height = cap_h;
+            desc.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
+            desc.Usage = c.D3D11_USAGE_DEFAULT;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+
+            var back: ?*c.ID3D11Texture2D = null;
+
+            // ID3D11Device::CreateTexture2D (call via vtbl; avoids anytype/@ptrCast issues)
+            const create_tex2d = dev_vtbl2.*.CreateTexture2D orelse return error.D3DCreateBackTexFailed;
+
+            // Signature: (This, pDesc, pInitialData, ppTexture2D) -> HRESULT
+            const hr_back = create_tex2d(dev, &desc, null, @ptrCast(&back));
+            if (c.FAILED(hr_back) or back == null) return error.D3DCreateBackTexFailed;
+
+            if (applog.isEnabled()) {
+                applog.appLog(
+                    "[d3d] back_tex_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
+                    .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
+                );
+            }
+
+            var back_rtv: ?*c.ID3D11RenderTargetView = null;
+            const hr_back_rtv = create_rtv2(
+                dev,
+                @ptrCast(back.?), // pResource: ID3D11Resource*
+                null,
+                @ptrCast(&back_rtv),
+            );
+            if (c.FAILED(hr_back_rtv) or back_rtv == null) {
+                safeRelease(&back);
+                return error.D3DCreateBackRTVFailed;
+            }
+
+            self.back_tex = back;
+            self.back_rtv = back_rtv;
+            self.back_cap_w_px = cap_w;
+            self.back_cap_h_px = cap_h;
+        }
 
         // RTVs on each swapchain buffer — used by drawCustomShaderPass
         // to write shader output directly into the current bb_tex,
@@ -2271,7 +2303,8 @@ pub const Renderer = struct {
             dst_y = sr_top;
         }
 
-        // Lazy-create staging texture matching back_tex format and dimensions
+        // Lazy-create staging texture matching back_tex format and capacity;
+        // createBackTargets releases it whenever back_tex is reallocated.
         if (self.scroll_staging_tex == null) {
             // Query back_tex format to ensure CopySubresourceRegion compatibility
             var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
@@ -2280,8 +2313,8 @@ pub const Renderer = struct {
             get_desc(back_tex, &back_desc);
 
             var desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
-            desc.Width = w;
-            desc.Height = h;
+            desc.Width = back_desc.Width;
+            desc.Height = back_desc.Height;
             desc.MipLevels = 1;
             desc.ArraySize = 1;
             desc.Format = back_desc.Format;
@@ -2484,10 +2517,16 @@ pub const Renderer = struct {
     }
 
     fn ensureGlowTextures(self: *Renderer) void {
-        const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
+        if (self.glow_extract_tex != null and self.width <= self.glow_cap_w_px and self.height <= self.glow_cap_h_px) return;
+        const cap_w = grownCapacityPx(if (self.glow_extract_tex != null) self.glow_cap_w_px else 0, self.width);
+        const cap_h = grownCapacityPx(if (self.glow_extract_tex != null) self.glow_cap_h_px else 0, self.height);
+        // Texture extents only; level_count is the radius's and is read from
+        // the logical plan each frame.
+        const chain = core.glow_chain.plan(cap_w, cap_h, self.glow_radius_scale);
         const hw = chain.half_w_px;
         const hh = chain.half_h_px;
-        if (self.glow_extract_tex != null and self.glow_half_w == hw and self.glow_half_h == hh) return;
+        self.glow_cap_w_px = 0;
+        self.glow_cap_h_px = 0;
 
         // Release old textures
         safeRelease(&self.glow_extract_srv);
@@ -2521,14 +2560,18 @@ pub const Renderer = struct {
             self.glow_mip_srv[i] = m.srv;
         }
 
-        self.glow_half_w = hw;
-        self.glow_half_h = hh;
+        self.glow_cap_w_px = cap_w;
+        self.glow_cap_h_px = cap_h;
     }
 
-    /// Ensure a scratch texture matching the persistent back buffer exists,
+    /// Ensure a scratch texture of back_tex's format exists,
     /// so the custom shader pass can sample a stable copy of `back_tex`
     /// while writing back into `back_rtv` (reading and writing the same
     /// resource is disallowed in D3D11).
+    ///
+    /// Scratch, pong and feedback stay exactly the logical size, not
+    /// capacity: the core's shader bridge samples them over the whole
+    /// [0,1] UV range, so a larger texture would show its stale margin.
     fn ensureCustomShaderScratch(self: *Renderer) void {
         if (self.custom_shader_scratch_tex != null and self.custom_shader_scratch_w == self.width and self.custom_shader_scratch_h == self.height) return;
 
@@ -2544,11 +2587,11 @@ pub const Renderer = struct {
         const get_desc = back_vtbl.*.GetDesc orelse return;
         get_desc(back, &back_desc);
 
-        const scratch = createTex2D(dev, back_desc.Width, back_desc.Height, back_desc.Format, c.D3D11_BIND_SHADER_RESOURCE) orelse return;
+        const scratch = createTex2D(dev, self.width, self.height, back_desc.Format, c.D3D11_BIND_SHADER_RESOURCE) orelse return;
         self.custom_shader_scratch_tex = scratch.tex;
         self.custom_shader_scratch_srv = scratch.srv;
-        self.custom_shader_scratch_w = back_desc.Width;
-        self.custom_shader_scratch_h = back_desc.Height;
+        self.custom_shader_scratch_w = self.width;
+        self.custom_shader_scratch_h = self.height;
     }
 
     /// Ensure two ping-pong textures (render-target + shader-resource
@@ -2572,7 +2615,7 @@ pub const Renderer = struct {
         const bind = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
         var pong: [2]Tex2D = undefined;
         for (0..2) |i| {
-            pong[i] = createTex2D(dev, back_desc.Width, back_desc.Height, back_desc.Format, bind) orelse {
+            pong[i] = createTex2D(dev, self.width, self.height, back_desc.Format, bind) orelse {
                 for (pong[0..i]) |*p| p.release();
                 return;
             };
@@ -2582,8 +2625,8 @@ pub const Renderer = struct {
             self.custom_shader_pong_srv[i] = p.srv;
             self.custom_shader_pong_rtv[i] = p.rtv;
         }
-        self.custom_shader_pong_w = back_desc.Width;
-        self.custom_shader_pong_h = back_desc.Height;
+        self.custom_shader_pong_w = self.width;
+        self.custom_shader_pong_h = self.height;
     }
 
     /// Allocate the feedback pair used to expose iPrevFrame. Same
@@ -2603,8 +2646,8 @@ pub const Renderer = struct {
         get_desc(back, &back_desc);
 
         var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
-        td.Width = back_desc.Width;
-        td.Height = back_desc.Height;
+        td.Width = self.width;
+        td.Height = self.height;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = back_desc.Format;
@@ -2641,8 +2684,8 @@ pub const Renderer = struct {
             self.feedback_srv[i] = srv_i;
             self.feedback_rtv[i] = rtv_i;
         }
-        self.feedback_w = back_desc.Width;
-        self.feedback_h = back_desc.Height;
+        self.feedback_w = self.width;
+        self.feedback_h = self.height;
         self.feedback_index = 0;
         self.feedback_primed = false;
     }
@@ -3446,8 +3489,10 @@ pub const Renderer = struct {
         // source. back_tex itself is never rebound as an RTV by this
         // method, so the next frame's sample still reflects the real
         // terminal content instead of our own output.
-        if (ctx_vtbl.*.CopyResource) |copy_res| {
-            copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
+        // back_tex is capacity-sized; scratch holds its logical region.
+        if (ctx_vtbl.*.CopySubresourceRegion) |copy_sub| {
+            const box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = self.width, .bottom = self.height, .back = 1 };
+            copy_sub(ctx, @ptrCast(scratch), 0, 0, 0, 0, @ptrCast(back), 0, &box);
         } else return false;
 
         // Shared pipeline/state setup (shared by every pass).
@@ -3687,6 +3732,9 @@ pub const Renderer = struct {
         // The chain's geometry is the core's (src/core/glow_chain.zig): which
         // texture each pass reads and writes, and at what size.
         const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
+        // The allocated extents; the logical chain occupies each texture's
+        // top-left corner.
+        const cap_chain = core.glow_chain.plan(self.glow_cap_w_px, self.glow_cap_h_px, self.glow_radius_scale);
 
         // Setup common state for fullscreen passes
         vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
@@ -3703,13 +3751,6 @@ pub const Renderer = struct {
         // than just the last pass.
         const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return true;
         if (self.glow_cb) |gcb| {
-            const gcb_res: *c.ID3D11Resource = @ptrCast(gcb);
-            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
-            if (!c.FAILED(mapDiscard(ctx, gcb_res, &mapped))) {
-                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
-                dst.* = .{ intensity, self.glow_radius_scale, 0, 0 };
-                unmap0(ctx, gcb_res);
-            }
             var cbs: [1]?*c.ID3D11Buffer = .{gcb};
             ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
         }
@@ -3753,6 +3794,7 @@ pub const Renderer = struct {
                     self.glow_extract_srv.?
                 else
                     self.glow_mip_srv[@intCast(pass.src)].?;
+                self.writeGlowParams(ctx, intensity, glowTargetExtent(chain, pass.src), glowTargetExtent(cap_chain, pass.src));
                 var srvs: [1]?*c.ID3D11ShaderResourceView = .{src_srv};
                 ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
@@ -3771,6 +3813,7 @@ pub const Renderer = struct {
             om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
             self.setFullViewport();
 
+            self.writeGlowParams(ctx, intensity, glowTargetExtent(chain, core.glow_chain.extract_target), glowTargetExtent(cap_chain, core.glow_chain.extract_target));
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.glow_extract_srv.?};
             ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
@@ -3821,6 +3864,30 @@ pub const Renderer = struct {
             rs_set_sc(ctx, 1, &restore_sr);
         }
         return true;
+    }
+
+    /// GlowParams for one fullscreen pass sampling a `src_px` region held in
+    /// the top-left of a `src_cap_px` texture: UV scale maps the pass's 0..1
+    /// onto that region, and the clamp keeps bilinear taps off the stale
+    /// margin beyond it.
+    fn writeGlowParams(self: *Renderer, ctx: *c.ID3D11DeviceContext, intensity: f32, src_px: [2]u32, src_cap_px: [2]u32) void {
+        const gcb = self.glow_cb orelse return;
+        const gcb_res: *c.ID3D11Resource = @ptrCast(gcb);
+        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+        if (c.FAILED(mapDiscard(ctx, gcb_res, &mapped))) return;
+        const lw: f32 = @floatFromInt(src_px[0]);
+        const lh: f32 = @floatFromInt(src_px[1]);
+        const cw: f32 = @floatFromInt(@max(1, src_cap_px[0]));
+        const ch: f32 = @floatFromInt(@max(1, src_cap_px[1]));
+        const dst: *[8]f32 = @ptrCast(@alignCast(mapped.pData));
+        dst.* = .{ intensity, self.glow_radius_scale, 0, 0, lw / cw, lh / ch, (lw - 0.5) / cw, (lh - 0.5) / ch };
+        unmap0(ctx, gcb_res);
+    }
+
+    fn glowTargetExtent(chain: core.glow_chain.Chain, target: i32) [2]u32 {
+        if (target == core.glow_chain.extract_target) return .{ chain.half_w_px, chain.half_h_px };
+        const i: usize = @intCast(target);
+        return .{ chain.mip_w_px[i], chain.mip_h_px[i] };
     }
 
     /// Public entry point for bloom passes (used by row-mode rendering).
@@ -4197,12 +4264,12 @@ pub const Renderer = struct {
             self.bilinear_sampler = bsamp;
         }
 
-        // --- Glow constant buffer (16 bytes: float intensity + padding) ---
+        // --- Glow constant buffer (32 bytes: GlowParams in main.hlsl) ---
         {
             const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVSCBFailed;
 
             var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
-            cbd.ByteWidth = 16;
+            cbd.ByteWidth = 32;
             cbd.Usage = c.D3D11_USAGE_DYNAMIC;
             cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
             cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
@@ -4354,6 +4421,18 @@ const Tex2D = struct {
         safeRelease(&self.tex);
     }
 };
+
+/// Grow-only offscreen extent for one axis: exact on first allocation,
+/// otherwise at least 1.25x the current capacity so a live-resize drag
+/// reallocates a handful of times instead of every tick. Headroom is capped
+/// at the D3D11 texture limit; a `need_px` above it is returned as is and
+/// fails at creation as it did before.
+fn grownCapacityPx(cur_px: u32, need_px: u32) u32 {
+    if (need_px <= cur_px) return cur_px;
+    if (cur_px == 0) return need_px;
+    const grown_px = @min(cur_px +| cur_px / 4, @as(u32, c.D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION));
+    return @max(need_px, grown_px);
+}
 
 /// A `w`x`h` single-mip default-usage texture plus the SRV and RTV that
 /// `bind_flags` asks for. On any failure everything created is released and

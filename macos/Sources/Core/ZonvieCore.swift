@@ -4114,6 +4114,13 @@ final class ZonvieCore {
     /// Main thread only (touches NSWindow), and grid_mu must NOT be held —
     /// setFrame can trigger windowDidResize synchronously. No-op when the window
     /// already holds the target size, so steady-state user resizes are safe.
+    /// A user drag leaves `clientPx % cellPx` uncovered just as a cell change
+    /// does, so the end of a live resize snaps too. maybeResizeCoreGrid has
+    /// already taken the dragged size as desiredTermPx. Main thread only.
+    func snapMainWindowAfterLiveResize() {
+        snapMainWindowContentToCell()
+    }
+
     private func snapMainWindowContentToCell() {
         guard let view = terminalView else { return }
         guard let window = view.window else { return }
@@ -4833,13 +4840,46 @@ final class ZonvieCore {
             // Skip if rows/cols match the last programmatic resize (from grid_resize).
             // windowDidResize can fire asynchronously after suppressResizeCallback
             // is cleared, so this check prevents overriding Neovim's grid dimensions.
-            if rows == lastGridRows && cols == lastGridCols { return }
+            if rows == lastGridRows && cols == lastGridCols {
+                wantedSize = nil
+                return
+            }
 
             // Only resize if we have valid dimensions
             if rows > 0 && cols > 0 {
-                ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(rows) cols=\(cols)")
-                core.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
+                wantedSize = (rows, cols)
+                sendWantedSize()
             }
+        }
+
+        /// One try_resize_grid in flight per window: a drag reports sizes at
+        /// display rate, faster than Neovim answers a large grid, and every
+        /// queued request would replay the drag after mouse-up. The answer
+        /// (or a timeout, when Neovim sends no grid_resize) releases the next.
+        private var wantedSize: (rows: UInt32, cols: UInt32)?
+        private var inFlightToken = 0
+        private var requestInFlight = false
+
+        private func sendWantedSize() {
+            guard !requestInFlight, let size = wantedSize, let core else { return }
+            wantedSize = nil
+            if size.rows == lastGridRows && size.cols == lastGridCols { return }
+            requestInFlight = true
+            inFlightToken += 1
+            let token = inFlightToken
+            ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(size.rows) cols=\(size.cols)")
+            core.tryResizeGrid(gridId: gridId, rows: size.rows, cols: size.cols)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.requestInFlight, self.inFlightToken == token else { return }
+                self.requestInFlight = false
+                self.sendWantedSize()
+            }
+        }
+
+        /// A grid_resize for this window arrived. Main thread only.
+        func gridResizeArrived() {
+            requestInFlight = false
+            sendWantedSize()
         }
 
         func windowDidEndLiveResize(_ notification: Notification) {
@@ -5442,6 +5482,7 @@ final class ZonvieCore {
                                 rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
         }
+        (window.delegate as? ExternalWindowDelegate)?.gridResizeArrived()
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).
         // Falls back to vertex-extracted bgColor if the group is not defined.

@@ -116,6 +116,15 @@ pub fn eastSnappedX(col: u32, cols: u32, global_w_px: u32, grid_w_px: u32) i64 {
     return @max(0, right - @as(i64, cols) * @as(i64, grid_w_px));
 }
 
+/// zonvie_font_scale range. The frontends size a glyph bitmap from
+/// pt * scale * backing in u32 pixels, so an unbounded scale traps there.
+pub const min_zonvie_scale: f64 = 0.1;
+pub const max_zonvie_scale: f64 = 4.0;
+
+pub fn clampZonvieScale(v: f64) f64 {
+    return std.math.clamp(v, min_zonvie_scale, max_zonvie_scale);
+}
+
 pub fn clampNeovideScale(v: f64) f32 {
     if (!std.math.isFinite(v)) return 1.0;
     return @floatCast(std.math.clamp(v, 0.1, 1.0));

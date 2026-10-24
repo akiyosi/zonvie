@@ -5344,8 +5344,14 @@ pub const Core = struct {
         wanted.shrinkRetainingCapacity(kept);
     }
 
-    /// Start the throttle clock for the windows just sent.
+    /// Start the throttle clock for the windows just sent. A stamp older
+    /// than the throttle window no longer suppresses anything, so it is
+    /// dropped here; the map holds only windows asked within the last second.
     pub fn noteFontQueriesSent(self: *Core, now_ns: i128) void {
+        var it = self.font_query_last_ns.iterator();
+        while (it.next()) |e| {
+            if (now_ns - e.value_ptr.* >= std.time.ns_per_s) self.font_query_last_ns.removeByPtr(e.key_ptr);
+        }
         for (self.font_query_outbox.items) |w| self.font_query_last_ns.put(self.alloc, w, now_ns) catch {};
     }
 
@@ -5508,18 +5514,23 @@ pub const Core = struct {
     }
 
     /// Drop a grid's font. With `give_back`, a resized window gets its size
-    /// back: 0x0 clears a split's request (ui.c:775-778); an external window
-    /// is re-requested in global cells for its frame.
+    /// back: 0x0 clears a split's request (ui.c:775-778), sent only while
+    /// the window is a split (on a float it means a 1x1 config); an external
+    /// window is re-requested in global cells for its frame.
     fn clearGridFontLocked(self: *Core, grid_id: i64, give_back: bool) void {
-        const kv = self.grid.grid_fonts.fetchRemove(grid_id) orelse return;
+        const kind = self.gridKind(grid_id);
+        const held = give_back and kind == .split and self.grid.split_request_held.remove(grid_id);
+        const kv = self.grid.grid_fonts.fetchRemove(grid_id) orelse {
+            if (held) self.sendFontResize(grid_id, 0, 0);
+            return;
+        };
         const gf = kv.value;
         self.releaseFontSlot(gf.font_id);
         _ = self.grid.grid_metrics.remove(grid_id);
-        if (give_back and gf.mode == .resize) {
-            switch (self.gridKind(grid_id)) {
-                .external => self.sendFontResize(grid_id, gf.frame_rows, gf.frame_cols),
-                else => self.sendFontResize(grid_id, 0, 0),
-            }
+        if (held or (give_back and kind == .split and gf.mode == .resize)) {
+            self.sendFontResize(grid_id, 0, 0);
+        } else if (give_back and kind == .external and gf.mode == .resize) {
+            self.sendFontResize(grid_id, gf.frame_rows, gf.frame_cols);
         }
         self.notifyGridFont(grid_id, null);
         self.grid.markEverySurfaceDirty();
@@ -5616,13 +5627,24 @@ pub const Core = struct {
                     gf.req_rows = p.req_rows;
                     gf.req_cols = p.req_cols;
                 };
-                const rows = font_slots.requestedCells(frame.rows, gh, gf.cell_h_px, grid_mod.MAX_GRID_ROWS);
+                // A split's request is its view height (window.c
+                // win_set_inner_size); the grid adds the winbar, which the
+                // frame already counts. Width has no such rows to leave.
+                const m = if (kind == .split) self.grid.getViewportMargins(grid_id) else grid_mod.ViewportMargins{};
+                const rows = @max(1, font_slots.requestedCells(frame.rows, gh, gf.cell_h_px, grid_mod.MAX_GRID_ROWS) -| (m.top + m.bottom));
                 const cols = font_slots.requestedCells(frame.cols, gw, gf.cell_w_px, grid_mod.MAX_GRID_COLS);
-                if (rows != gf.req_rows or cols != gf.req_cols) {
+                // An external window's request in an unchanged font is the
+                // OS window's own (drainOsResizesLocked). Its frame is that
+                // request rounded up to global cells, so recomputing from the
+                // frame would ask for a different size than the window has.
+                const keep_os_request = kind == .external and gf.req_rows != 0 and
+                    prev.?.cell_w_px == gf.cell_w_px and prev.?.cell_h_px == gf.cell_h_px;
+                if (!keep_os_request and (rows != gf.req_rows or cols != gf.req_cols)) {
                     gf.req_rows = rows;
                     gf.req_cols = cols;
                     self.sendFontResize(grid_id, rows, cols);
                 }
+                if (kind == .split) self.grid.split_request_held.put(self.alloc, grid_id, {}) catch {};
             },
             .font_view => {
                 // Logical rows/cols stay Neovim's; clipped to logical size x
@@ -9158,6 +9180,31 @@ test "an external window OS resize in grid cells is not taken for a frame change
     try std.testing.expectEqual(@as(u32, 50), core.last_font_resize_cols);
 }
 
+test "an external window's OS size survives its winbar and a font re-query" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(4, 10, 40);
+    try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
+    try core.grid.setViewportMargins(4, 1, 0, 0, 0);
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try core.grid.resizeGrid(4, 21, 80);
+    // An odd row count: its frame rounds up to 20 global rows, which
+    // converts back to 40 font rows, not 39.
+    core.requestTryResizeGrid(4, 39, 101);
+    core.drainOsResizesLocked();
+    core.grid.font_query_wanted.clearRetainingCapacity();
+    // Neovim sizes the view (window.c win_set_inner_size): 39 + winbar.
+    try core.grid.resizeGrid(4, 40, 101);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
+    // A re-query of the same font (WinResized) must not ask for another size.
+    const sent = core.font_resize_requests;
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try std.testing.expectEqual(sent, core.font_resize_requests);
+}
+
 test "a global cell change re-requests every font grid and reloads derived slots" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -9235,6 +9282,62 @@ test "font resizes are queued under the lock and sent after it" {
     try std.testing.expectEqual(@as(u32, 20), core.font_resize_outbox.items[0].rows);
     core.sendFontResizes();
     try std.testing.expectEqual(@as(usize, 0), core.font_resize_outbox.items.len);
+}
+
+// ui.c ui_grid_resize: 0x0 on a non-floating window clears w_*_request; on a
+// floating one it sets config width/height to MAX(0, 1) = 1x1. The request
+// survives win_config_float (window.c win_set_inner_size reads it).
+test "a split's request is never released with 0x0 to a float, and is released once it is a split again" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try splitWithFrame(&core);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    const sent = core.font_resize_requests;
+    // nvim_win_set_config turned the split into a float; its font is unset.
+    try core.grid.setWinFloatPos(2, 1000, 1, 1, 50, 0, 1, true);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true });
+    try std.testing.expect(!core.grid.grid_fonts.contains(2));
+    try std.testing.expectEqual(sent, core.font_resize_requests);
+    // Back to a split: the held request is released.
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true });
+    try std.testing.expectEqual(sent + 1, core.font_resize_requests);
+    try std.testing.expectEqual(@as(u32, 0), core.last_font_resize_rows);
+    try std.testing.expectEqual(@as(u32, 0), core.last_font_resize_cols);
+    // Released once only.
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true });
+    try std.testing.expectEqual(sent + 1, core.font_resize_requests);
+}
+
+// window.c: win_pos height is w_height (view + winbar); w_height_request
+// sets the view height (win_set_inner_size), so the grid is request + winbar.
+test "a resized split with a winbar requests a view that leaves room for the winbar" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try splitWithFrame(&core);
+    try core.grid.viewport_margins.put(core.grid.alloc, 2, .{ .top = 1, .bottom = 0, .left = 0, .right = 0 });
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    try std.testing.expectEqual(@as(u32, 19), core.last_font_resize_rows); // 10*20/10 - 1
+    try std.testing.expectEqual(@as(u32, 80), core.last_font_resize_cols);
+    // Neovim's answer is view + winbar rows: not a frame change.
+    core.grid.font_query_wanted.clearRetainingCapacity();
+    try core.grid.resizeGrid(2, 20, 80);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
+}
+
+test "a split that becomes a float re-reads its font when it is a split again with the same frame" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try splitWithFrame(&core);
+    try core.grid.setWinFloatPos(2, 1000, 1, 1, 50, 0, 1, true);
+    core.grid.font_query_wanted.clearRetainingCapacity();
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    core.grid.noteWinFrame(2, 1000, 10, 40);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.grid.font_query_wanted.items);
 }
 
 test "a split grid_resize missing the last request re-reads the font, a matching echo does not" {

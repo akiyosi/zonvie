@@ -13,6 +13,7 @@ const log_mod = @import("log.zig");
 const Logger = log_mod.Logger;
 const flush = @import("flush.zig");
 const nvim_core = @import("nvim_core.zig");
+const font_slots = @import("font_slots.zig");
 const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
 const rpc_transport = @import("rpc_transport.zig");
@@ -707,15 +708,21 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         const n = parseWindowFontAnswers(top[3], &answers);
         self.grid_mu.lockUncancelable(clock.io());
         self.drainOsResizesLocked();
+        const rev_before = self.grid.cursor_rev;
         for (answers[0..n]) |a| {
             if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
             self.applyWindowFontLocked(a);
         }
+        // Frontends commit on_grid_font at flush end. A resize brings its
+        // own grid_resize batch and flush; a float, or a font that needs no
+        // resize, has nothing else coming and is flushed here.
+        const needs_flush = self.grid.cursor_rev != rev_before and self.font_resize_outbox.items.len == 0;
         // Windows queued while this query was in flight go out now.
         self.takeFontQueriesLocked(clock.nowNs());
         self.grid_mu.unlock(clock.io());
         self.sendFontResizes();
         self.sendFontQueries();
+        if (needs_flush) forceGlowFlush(self);
         return;
     }
 
@@ -768,7 +775,7 @@ pub fn parseWindowFontAnswers(result: mp.Value, out: []WindowFontAnswer) usize {
             .valid = true,
             .guifont = if (r[2] == .str and r[2].str.len > 0) r[2].str else null,
             // NaN would defeat slot dedup; a non-finite or non-positive scale is unset.
-            .zonvie_scale = if (numberOf(r[3])) |s| (if (std.math.isFinite(s) and s > 0) s else null) else null,
+            .zonvie_scale = if (numberOf(r[3])) |s| (if (std.math.isFinite(s) and s > 0) font_slots.clampZonvieScale(s) else null) else null,
             .neovide_scale = numberOf(r[4]),
         };
         n += 1;
@@ -804,7 +811,8 @@ fn takeTrackedRequest(slot: *std.atomic.Value(i64), id: i64) bool {
 }
 
 /// Force full vertex regeneration (dirty_all + onFlush).
-/// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
+/// Used when glow state changes to ensure DECO_GLOW flags are set/cleared,
+/// and when a font answer changes a grid no redraw batch will follow.
 fn forceGlowFlush(self: *Core) void {
     self.lockGridAsRedrawOwner();
     defer self.unlockGridAsRedrawOwner();
@@ -4327,4 +4335,69 @@ test "a font answer for a closed window forgets its throttle stamp" {
     var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
     handleRpcResponse(&core, &top);
     try std.testing.expect(!core.font_query_last_ns.contains(1001));
+}
+
+test "a font answer caps zonvie_font_scale to the range a frontend can rasterize" {
+    var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .nil, .{ .float = 1e30 }, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var out: [1]WindowFontAnswer = undefined;
+    try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+    try std.testing.expectEqual(@as(f64, @import("font_slots.zig").max_zonvie_scale), out[0].zonvie_scale.?);
+    row[3] = .{ .float = 1e-30 };
+    try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+    try std.testing.expectEqual(@as(f64, @import("font_slots.zig").min_zonvie_scale), out[0].zonvie_scale.?);
+}
+
+test "throttle stamps past the throttle window are dropped when a query is sent" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.font_query_last_ns.put(core.alloc, 1001, 0);
+    try core.font_query_outbox.append(core.alloc, 1002);
+    core.noteFontQueriesSent(5 * std.time.ns_per_s);
+    try std.testing.expect(!core.font_query_last_ns.contains(1001));
+    try std.testing.expect(core.font_query_last_ns.contains(1002));
+}
+
+test "a font answer for a float flushes so the frontend commits the font" {
+    const S = struct {
+        var flushes: u32 = 0;
+        fn load(_: ?*anyopaque, _: u32, _: [*]const u8, _: usize, _: f32, w: *u32, h: *u32) callconv(.c) c_int {
+            w.* = 5;
+            h.* = 10;
+            return 1;
+        }
+        fn release(_: ?*anyopaque, _: u32) callconv(.c) void {}
+        fn begin(_: ?*anyopaque) callconv(.c) void {
+            flushes += 1;
+        }
+        fn gridFont(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+        fn shape(_: ?*anyopaque, _: u32, _: [*]const u32, _: usize, _: u32, _: [*]u32, _: [*]u32, _: [*]i32, _: [*]i32, _: [*]i32, _: usize) callconv(.c) usize {
+            return 0;
+        }
+        fn raster(_: ?*anyopaque, _: u32, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    S.flushes = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cb.on_font_slot_load = S.load;
+    core.cb.on_font_slot_release = S.release;
+    core.cb.on_grid_font = S.gridFont;
+    core.cb.on_shape_text_run_ex = S.shape;
+    core.cb.on_rasterize_glyph_ex = S.raster;
+    core.cb.on_rasterize_glyph_by_id_ex = S.raster;
+    core.cb.on_flush_begin = S.begin;
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(3, 4, 20);
+    try core.grid.setWinFloatPos(3, 1001, 1, 1, 50, 0, 1, true);
+    core.font_query_msgid = 9;
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = true }, .nil, .{ .float = 0.5 }, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expect(core.grid.grid_fonts.contains(3));
+    try std.testing.expectEqual(@as(u32, 1), S.flushes);
 }

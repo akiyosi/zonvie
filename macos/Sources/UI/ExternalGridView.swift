@@ -280,8 +280,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         followsScroll: Bool,
         ownOffset: GridSurfaceRenderer.ScrollOffset?,
         rootOffset: GridSurfaceRenderer.ScrollOffset?,
-        viewportHeightPx: Float,
-        cellHeightPx: Float
+        viewportHeightPx: Float
     ) -> simd_float2 {
         guard followsRootScrollNow(anchorGrid: anchorGrid, followsScroll: followsScroll,
                                    ownOffset: ownOffset, rootOffset: rootOffset),
@@ -291,6 +290,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // where a NaN traps.
         var origin = displacedLayerOriginPx(originPx: originPx, offset: rootOffset, viewportHeightPx: viewportHeightPx)
         // Sign as in hostedFloatDebtPx.
+        // The debt counts this surface grid's rows, in its own font when it has one.
+        let cellHeightPx = shared.rowHeightPx(gridId)
         if cellHeightPx > 0 {
             origin.y -= Float(followerDebtRowsSnapshot[layerGridId] ?? 0) * cellHeightPx
         }
@@ -1243,7 +1244,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     staged: staged,
                     committed: committedSurfaceLayers,
                     rootGridId: gridId,
-                    cellHeightPx: Float(shared.cellHeightPx),
+                    rowHeightPx: { self.shared.rowHeightPx($0) },
                     into: &layerPlacementRowsUp
                 )
                 committedSurfaceLayers = staged
@@ -1800,18 +1801,25 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     // MARK: - Back Buffer Management
 
-    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
-        if backBuffer != nil, backBufferSize == drawableSize { return }
-        let desc = makeSurfaceTextureDescriptor(
-            size: drawableSize,
-            pixelFormat: pixelFormat,
-            usage: [.renderTarget, .shaderRead]
-        )
-        backBuffer = mtlDevice.makeTexture(descriptor: desc)
+    /// `backBufferSize` is the LOGICAL size (the drawable's); the texture may
+    /// be larger during a live resize (surfaceTextureCapacity).
+    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat, inLiveResize: Bool) {
+        let capacity = surfaceTextureCapacity(current: backBuffer, logicalSize: drawableSize, inLiveResize: inLiveResize)
+        let reallocate = backBuffer?.width != capacity.widthPx || backBuffer?.height != capacity.heightPx
+        if !reallocate, backBufferSize == drawableSize { return }
+        if reallocate {
+            let desc = makeSurfaceTextureDescriptor(
+                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                pixelFormat: pixelFormat,
+                usage: [.renderTarget, .shaderRead]
+            )
+            backBuffer = mtlDevice.makeTexture(descriptor: desc)
+        }
         backBufferSize = drawableSize
         // The ping-pong is not dropped here: `SurfacePingPongTextures.ensure`
-        // is keyed on the size it is asked for and reallocates when the
-        // drawable changes, which is the only thing the main surface relies on.
+        // is keyed on the back buffer's allocated extent and reallocates with
+        // it, which is the only thing the main surface relies on.
+        // A reused texture is stale outside the old logical region: clear once.
         hasPresentedOnce = false
     }
 
@@ -1990,8 +1998,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             rowEnd: scroll.rowEnd,
             rowsDelta: scroll.rowsDelta,
             widthPx: drawableWidthPx,
-            textureWidthPx: backTexture.width,
-            textureHeightPx: backTexture.height,
+            textureWidthPx: Int(backBufferSize.width),
+            textureHeightPx: Int(backBufferSize.height),
             rowHeightPx: rowHeightPx
         ) else { return nil }
 
@@ -2003,7 +2011,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             backTexture: backTexture,
             scratch: scrollScratch,
             device: mtlDevice,
-            backBufferSize: backBufferSize,
             commandBuffer: commandBuffer,
             encoder: &blit
         ) else {
@@ -2118,16 +2125,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
                 ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) early return: drawableSize invalid (\(view.drawableSize))")
-                return
-            }
-
-            // Preserve the last exact-size frame during interactive resize.
-            // Returning before the semaphore/state snapshot leaves pending rows
-            // untouched; viewDidEndLiveResize performs the single texture
-            // recreation and full redraw for the final drawable size.
-            if view.inLiveResize, backBuffer != nil, backBufferSize != view.drawableSize {
-                redrawScheduler.didDrawFrame()
-                finishedRedraw = true
                 return
             }
 
@@ -2441,7 +2438,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             f.smoothRowRange = 0..<(f.safeRowCount + f.retainedRows.count)
 
             // --- Ensure back buffer ---
-            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
+            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
             guard let backTex = backBuffer else {
                 bailWithoutSubmit("no backbuffer", &f, finishedRedraw: &finishedRedraw)
                 return
@@ -2584,8 +2581,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 followsScroll: f.cursorLayerFollowsScroll,
                 ownOffset: surfaceScrollOffset(gridId: f.cursorOwner, offsets: f.hostedScrollOffsets),
                 rootOffset: f.scrollOffset,
-                viewportHeightPx: f.viewportMetrics.fragmentHeight,
-                cellHeightPx: Float(f.ch)
+                viewportHeightPx: f.viewportMetrics.fragmentHeight
             )
 
             if plan.encodesSurfacePass {
@@ -2915,7 +2911,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // main surface folds it into offset_y.
         var cursorShaderOffset = f.cursorOwnerOffset
         if cursorFollowsRoot, var followed = cursorShaderOffset, scrollOffsetViewportHeight > 0 {
-            let debtPx = -Float(followerDebtRowsSnapshot[f.cursorOwner] ?? 0) * Float(shared.cellHeightPx)
+            let debtPx = -Float(followerDebtRowsSnapshot[f.cursorOwner] ?? 0) * shared.rowHeightPx(gridId)
             followed.offset_y -= debtPx * 2 / scrollOffsetViewportHeight
             cursorShaderOffset = followed
         }
@@ -3058,7 +3054,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             if let stale = RowScrollBlitPlan.dirtyRowsWithoutBlit(
                 rowStart: scroll.rowStart,
                 rowEnd: scroll.rowEnd,
-                textureHeightPx: backTex.height,
+                textureHeightPx: Int(backBufferSize.height),
                 rowHeightPx: Int(f.cellHi)
             ) {
                 f.dirtyRows.append(contentsOf: stale)
@@ -3082,7 +3078,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         damageBands.reset()
         if f.rowMode && !f.dirtyRows.isEmpty && Int(f.cellHi) > 0 {
             damageBands.addRows(f.dirtyRows, originYPx: 0, rowHeightPx: Int(f.cellHi))
-            damageBands.resolve(rowHeightPx: Int(f.cellHi), surfaceHeightPx: backTex.height)
+            damageBands.resolve(rowHeightPx: Int(f.cellHi), surfaceHeightPx: Int(backBufferSize.height))
             damageBands.layerRows(originYPx: 0, rowCount: f.safeRowCount, rowHeightPx: Int(f.cellHi), into: &f.dirtyRows)
         }
         if let scroll = f.pendingScroll {
@@ -3238,8 +3234,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 followsScroll: layer.followsScroll,
                 ownOffset: layerOffset,
                 rootOffset: f.scrollOffset,
-                viewportHeightPx: extent.y,
-                cellHeightPx: Float(f.ch)
+                viewportHeightPx: extent.y
             )
             guard let scissor = makeSurfaceLayerScissor(
                 originPx: origin,
@@ -3651,7 +3646,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             liveWidth: gridCols,
             liveHeight: gridRows
         ).height
-        let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
+        // In the root grid's own font cell, as draw() lays it out.
+        let rootRowHeightPx = shared.gridFont(gridId).map { Float($0.cellHeightPx) } ?? cellHeightPx
+        let cellHi = max(1, UInt32(rootRowHeightPx.rounded(.up)))
         let viewportHeight = Float(rowsForHeight) * Float(cellHi)
         guard viewportHeight > 0 else { return false }
         // The height every NDC below is built against, kept beside them so
@@ -3937,7 +3934,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         guard let hit, let info = grids.first(where: { $0.gridId == hit.gridId }) else {
             return resolveRootTarget(pointPx: pointPx)
         }
-        if hit.gridId == gridId, let fc = fontCell(gridId, localX: pointPx.x, localY: pointPx.y) {
+        if hit.gridId == gridId, let fc = fontCell(gridId, localX: pointPx.x,
+                                                      localY: pointPx.y - drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)) {
             return (gridId, fc.row, fc.col)
         }
         if core.gridCellPx(hit.gridId) != nil {
@@ -3945,7 +3943,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             let layer = committedSurfaceLayers.first { $0.gridId == hit.gridId }
             lock.unlock()
             if let layer, let fc = fontCell(hit.gridId, localX: pointPx.x - CGFloat(layer.originPx.x),
-                                            localY: pointPx.y - CGFloat(layer.originPx.y)) {
+                                            localY: pointPx.y - CGFloat(layer.originPx.y)
+                                                - drawnScrollOffsetPx(hit.gridId, cellH: cellH, scroll: scroll)) {
                 return (hit.gridId, fc.row, fc.col)
             }
         }
@@ -3984,7 +3983,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let debtPx = hostedFloatDebtPx(
             gridId: layer.gridId,
             anchorGridId: layer.anchorGrid,
-            cellHeightPx: Float(cellH),
+            cellHeightPx: shared.rowHeightPx(gridId),
             seedingBaseline: false
         )
         return CGFloat(layer.originPx.y) + rootOffsetPx + CGFloat(debtPx)
@@ -4049,7 +4048,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
                                              rootOffsetPx: rootOffsetPx, cellH: cellH)
         let info = core?.getVisibleGridsCached().first { $0.gridId == pressed }
-        if let fc = fontCell(pressed, localX: pointPx.x - CGFloat(layer.originPx.x), localY: pointPx.y - originY) {
+        if let fc = fontCell(pressed, localX: pointPx.x - CGFloat(layer.originPx.x), localY: pointPx.y - originY - ownOffsetPx) {
             return (pressed, fc.row, fc.col)
         }
         // Deliberately unclamped to the layer rectangle: a drag that leaves the
@@ -4063,13 +4062,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     /// The cell a layer-local pixel names in a grid drawn in its own font;
-    /// nil for a grid on the global font.
+    /// nil for a grid on the global font. Callers pass `localY` with the
+    /// grid's drawn ease offset already subtracted, as the main window does.
     private func fontCell(_ gid: Int64, localX: CGFloat, localY: CGFloat) -> (row: Int32, col: Int32)? {
         guard let gf = core?.gridCellPx(gid) else { return nil }
         var r: Int32 = 0
         var c: Int32 = 0
         zonvie_core_pointer_cell_in_grid(Float(localX), Float(localY), gf.cellWidthPx, gf.cellHeightPx,
                                          gf.extentWidthPx, gf.extentHeightPx, &r, &c)
+        // The core clamps to extent / cell size, which exceeds the grid's
+        // logical size when its font is smaller; a margin click names the nearest cell.
+        if let info = core?.getVisibleGridsCached().first(where: { $0.gridId == gid }) {
+            r = min(r, max(info.rows - 1, 0))
+            c = min(c, max(info.cols - 1, 0))
+        }
         return (r, c)
     }
 
@@ -4077,7 +4083,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// with undone.
     private func resolveRootTarget(pointPx: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let scroll = core?.scrollModel else { return (gridId, 0, 0) }
-        if let fc = fontCell(gridId, localX: pointPx.x, localY: pointPx.y) { return (gridId, fc.row, fc.col) }
+        if let fc = fontCell(gridId, localX: pointPx.x,
+                             localY: pointPx.y - drawnScrollOffsetPx(gridId, cellH: CGFloat(shared.cellHeightPx), scroll: scroll)) {
+            return (gridId, fc.row, fc.col)
+        }
         let cellW = CGFloat(shared.cellWidthPx)
         let cellH = CGFloat(shared.cellHeightPx)
         guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
@@ -4162,6 +4171,14 @@ extension ExternalGridView {
 }
 
 extension ExternalGridView {
+    /// One draw outside the live resize gives the back buffer's resize slack
+    /// back (surfaceTextureCapacity), even with no Neovim traffic behind it.
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        activateSurfaceDrawLoop()
+        setNeedsDisplay(bounds)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         hasEverPresented = false

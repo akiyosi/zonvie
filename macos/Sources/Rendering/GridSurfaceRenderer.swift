@@ -451,8 +451,12 @@ func encodeSurfaceBackBufferToDrawable(
         // the NEXT frame can sample it as iPrevFrame, and a copy then moves it
         // onto the drawable. Frame 0 has nothing in the read slot yet; the
         // shader gets the current composite instead of uninitialized memory.
+        // Every texture the chain samples shares the back buffer's allocated
+        // extent, of which `pongSize` (the drawable) is the defined region.
+        let capacitySize = CGSize(width: backTex.width, height: backTex.height)
+        let uvScale = surfaceUVScale(logicalSize: pongSize, capacity: backTex)
         let feedback = editInputs?.feedback
-        feedback?.ensure(device: drawableTexture.device, size: pongSize, pixelFormat: drawableTexture.pixelFormat)
+        feedback?.ensure(device: drawableTexture.device, size: capacitySize, pixelFormat: drawableTexture.pixelFormat)
         let feedbackWrite = feedback?.write
         let prevFrame = feedbackWrite == nil ? nil : (feedback!.primed ? feedback!.read : backTex)
         if encodeSurfaceCustomShaderChain(
@@ -461,10 +465,12 @@ func encodeSurfaceBackBufferToDrawable(
             input: backTex,
             output: feedbackWrite ?? drawableTexture,
             pong: customShaderPong,
-            pongSize: pongSize,
+            pongSize: capacitySize,
+            viewportSize: pongSize,
+            uvScale: uvScale,
             copyVertexBuffer: copyVB,
             sampler: bilinSamp,
-            uniforms: makeUniforms(),
+            uniforms: scaledWindowSize(makeUniforms(), by: uvScale),
             prevFrame: prevFrame,
             cellAge: editInputs?.cellAge
         ) {
@@ -475,6 +481,7 @@ func encodeSurfaceBackBufferToDrawable(
                encodeSurfaceDrawableCopy(
                    cmd: cmd, input: feedbackWrite, output: drawableTexture,
                    pipeline: copyPipe, copyVertexBuffer: copyVB, sampler: samp,
+                   uvScale: uvScale,
                    prepare: { _ in }
                )
             {
@@ -493,9 +500,21 @@ func encodeSurfaceBackBufferToDrawable(
         pipeline: copyPipe,
         copyVertexBuffer: copyVB,
         sampler: samp,
+        uvScale: surfaceUVScale(logicalSize: pongSize, capacity: backTex),
         prepare: prepareCopy
     )
     return copied ? .plainCopy : .notEncoded
+}
+
+/// The preamble derives fragCoord as `iWindowOffset + vUV * iWindowSize` and
+/// samples at `local_px / iWindowSize`. With vUV scaled into the textures'
+/// defined region, iWindowSize must be their allocated extent for fragCoord to
+/// stay in logical pixels and the samples to land on it.
+private func scaledWindowSize(_ uniforms: zonvie_shader_uniforms, by uvScale: SIMD2<Float>) -> zonvie_shader_uniforms {
+    var u = uniforms
+    u.iWindowSize.0 /= uvScale.x
+    u.iWindowSize.1 /= uvScale.y
+    return u
 }
 
 /// The bloom pass, taking its resources from where they live rather than from
@@ -535,7 +554,10 @@ func encodeSurfaceBloom(
           let compositePipe = shared.glowCompositePipeline,
           let copyVB = shared.copyVertexBuffer,
           let bilinSamp = shared.bilinearSampler else { return false }
-    let key = (widthPx: Int(drawableSize.width), heightPx: Int(drawableSize.height), radiusScale: radiusScale)
+    // Planned over the back buffer's allocated extent rather than the
+    // drawable, so the glow textures follow its capacity and the composite's
+    // full-target quad lines up with it (surfaceTextureCapacity).
+    let key = (widthPx: backTex.width, heightPx: backTex.height, radiusScale: radiusScale)
     let chain: SurfaceGlowChain
     if let cached = glowTextures.chain, glowTextures.chainKey == key {
         chain = cached
@@ -814,6 +836,9 @@ func encodeSurfaceCustomShaderChain(
     output: MTLTexture,
     pong: SurfacePingPongTextures,
     pongSize: CGSize,
+    /// The logical region every pass renders and samples (surfaceUVScale).
+    viewportSize: CGSize,
+    uvScale: SIMD2<Float>,
     copyVertexBuffer: MTLBuffer,
     sampler: MTLSamplerState,
     uniforms: zonvie_shader_uniforms,
@@ -833,6 +858,8 @@ func encodeSurfaceCustomShaderChain(
             cmd: cmd,
             input: inputTex,
             output: outputTex,
+            viewportSize: viewportSize,
+            uvScale: uvScale,
             copyVertexBuffer: copyVertexBuffer,
             sampler: sampler,
             uniforms: uniforms,
@@ -2196,6 +2223,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// A cell's height in the NDC the offsets above were built in, so the
     /// debt, which is counted in rows, can be paid in them.
     private var scrollDebtCellHeightNDC: Float = 0
+    /// Each follower anchor's row height in the same NDC: the debt counts the
+    /// ANCHOR's rows, and a font grid's rows are not the global cell height.
+    private var scrollDebtRowHeightNDC: [Int32: Float] = [:]
     /// The viewport height those NDC were built against. Written under `lock`
     /// with them; draw recovers the shader cursor's pixels from it.
     private var scrollOffsetViewportHeight: Float = 0
@@ -2227,7 +2257,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             guard debtRows != 0 else { continue }
             // offset_y is NDC and negated against the pixel offset the view
             // built (see computeScrollOffset), so withholding pixels adds here.
-            snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
+            snapshot[i].offset_y += Float(debtRows) * (scrollDebtRowHeightNDC[snapshot[i].grid_id] ?? scrollDebtCellHeightNDC)
         }
     }
 
@@ -2258,7 +2288,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         guard scrollOffsetViewportHeight > 0 else { return [:] }
         var result: [Int64: CGFloat] = [:]
         for entry in scrollOffsetData where entry.move_all != 0 {
-            let debtNDC = Float(floatDebtRows(for: entry.grid_id, seeding: false)) * scrollDebtCellHeightNDC
+            let debtNDC = Float(floatDebtRows(for: entry.grid_id, seeding: false)) * (scrollDebtRowHeightNDC[entry.grid_id] ?? scrollDebtCellHeightNDC)
             let px = -(entry.offset_y + debtNDC) * scrollOffsetViewportHeight / 2
             if px.isFinite { result[Int64(entry.grid_id)] = CGFloat(px) }
         }
@@ -2374,19 +2404,24 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// this frame's idle gate. Draw thread only.
     private var shaderCursorMovedThisFrame = false
 
-    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
-        if backBuffer != nil, backBufferSize == drawableSize { return }
+    /// `backBufferSize` is the LOGICAL size (the drawable's); the texture may
+    /// be larger during a live resize (surfaceTextureCapacity).
+    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat, inLiveResize: Bool) {
+        let capacity = surfaceTextureCapacity(current: backBuffer, logicalSize: drawableSize, inLiveResize: inLiveResize)
+        let reallocate = backBuffer?.width != capacity.widthPx || backBuffer?.height != capacity.heightPx
+        if !reallocate, backBufferSize == drawableSize { return }
 
         let oldSize = backBufferSize
         let wasPresented = hasPresentedOnce
 
-        let desc = makeSurfaceTextureDescriptor(
-            size: drawableSize,
-            pixelFormat: pixelFormat,
-            usage: [.renderTarget, .shaderRead]
-        )
-
-        backBuffer = shared.device.makeTexture(descriptor: desc)
+        if reallocate {
+            let desc = makeSurfaceTextureDescriptor(
+                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                pixelFormat: pixelFormat,
+                usage: [.renderTarget, .shaderRead]
+            )
+            backBuffer = shared.device.makeTexture(descriptor: desc)
+        }
         // backBufferSize is read from updateCursorShaderStateFromVerts() on
         // the core/RPC thread (to convert cursor NDC coords to pixels) —
         // guard the write with `lock` so that read never sees a stale size
@@ -2394,12 +2429,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // no longer matches it.
         lock.lock()
         backBufferSize = drawableSize
-        // After resize, we must clear once (contents undefined).
+        // After resize, we must clear once: a new texture is undefined, and
+        // a reused one is stale outside the old logical region.
         hasPresentedOnce = false
         lock.unlock()
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
-        ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+        ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) capacity=\(capacity.widthPx)x\(capacity.heightPx) reallocated=\(reallocate) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
     }
 
     init?(view: MTKView, collectsGpuPerfSamples: Bool = true) {
@@ -2732,10 +2768,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // registry has its own lock and the established order is
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
-        // Read here rather than inside the region below for symmetry with the
-        // line above, not out of necessity: the accessor takes a leaf lock
-        // inside `shared`, so reading it under `lock` would be safe.
-        let ledgerCellHeightPx = shared.cellHeightPx
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -2779,7 +2811,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 staged: staged,
                 committed: committedSurfaceLayers,
                 rootGridId: Self.rootGridId,
-                cellHeightPx: ledgerCellHeightPx,
+                rowHeightPx: { shared.rowHeightPx($0) },
                 into: &layerPlacementRowsUp
             )
             // The pixels a move, resize, restack or removal exposes are this
@@ -3062,12 +3094,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         scrollOffsetData.reserveCapacity(offsets.count)
         scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
         scrollDebtAnchorGridId.removeAll(keepingCapacity: true)
+        scrollDebtRowHeightNDC.removeAll(keepingCapacity: true)
         scrollDebtCellHeightNDC = cellHeightNDC
         scrollOffsetViewportHeight = drawableHeight
         for info in offsets {
             if let anchorRowsUp = info.debtAnchorRowsUp {
                 scrollDebtAnchorRowsUp[Int32(clamping: info.gridId)] = anchorRowsUp
                 scrollDebtAnchorGridId[Int32(clamping: info.gridId)] = info.debtAnchorGridId
+                scrollDebtRowHeightNDC[Int32(clamping: info.gridId)] = shared.rowHeightPx(info.debtAnchorGridId) * scale
             }
             scrollOffsetData.append(Self.computeScrollOffset(
                 info: info,
@@ -3278,16 +3312,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
-                host?.didDrawFrame()
-                return
-            }
-
-            // Keep the last exact-size frame while AppKit is live-resizing.
-            // Recreating back/scratch/ping-pong textures for every size tick
-            // creates a stream of IOAccelerator resources. Do this before the
-            // committed/dirty snapshots below so no render state is consumed;
-            // viewDidEndLiveResize requests one exact-size full redraw.
-            if view.inLiveResize, backBuffer != nil, backBufferSize != view.drawableSize {
                 host?.didDrawFrame()
                 return
             }
@@ -3580,7 +3604,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_backbuf_start = CFAbsoluteTimeGetCurrent()
             }
-            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
+            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
             if ZonvieCore.appLogEnabled {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
@@ -4122,8 +4146,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     originXPx: originXPx,
                     originYPx: originYPx,
                     widthPx: layer.cols * cellWi,
-                    textureWidthPx: backTex.width,
-                    textureHeightPx: backTex.height,
+                    textureWidthPx: Int(backBufferSize.width),
+                    textureHeightPx: Int(backBufferSize.height),
                     rowHeightPx: cellHi
                 )
                 if plan == nil {
@@ -4181,7 +4205,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     backTexture: backTex,
                     scratch: scrollScratch,
                     device: shared.device,
-                    backBufferSize: backBufferSize,
                     commandBuffer: cmd,
                     encoder: &scrollBlitEncoder
                 ) {
@@ -4212,7 +4235,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 rowStart: scroll.rowStart,
                 rowEnd: scroll.rowEnd,
                 originYPx: originYPx,
-                textureHeightPx: backTex.height,
+                textureHeightPx: Int(backBufferSize.height),
                 rowHeightPx: layer.rowHeightPx(surfaceCellHeightPx: cellHi)
             ) else { continue }
             state.drawRows.append(contentsOf: refusedRows)
@@ -4269,7 +4292,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
             damageBands.addSpan(topPx: topPx, bottomPx: topPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: bandRowHeightPx))
         }
-        damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: backTex.height)
+        damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: Int(backBufferSize.height))
         if f.rowMode {
             damageBands.layerRows(
                 originYPx: rootOriginYPx, rowCount: f.safeRowCount,

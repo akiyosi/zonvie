@@ -1455,6 +1455,10 @@ pub const Grid = struct {
 
     grid_metrics: std.AutoHashMapUnmanaged(i64, CellMetricsPx) = .{},
     grid_fonts: std.AutoHashMapUnmanaged(i64, GridFont) = .{},
+    // Splits Neovim holds a w_height_request/w_width_request for. A float
+    // cannot release it (try_resize_grid rewrites a float's config), so it
+    // is released with 0x0 once the window is a split again.
+    split_request_held: std.AutoHashMapUnmanaged(i64, void) = .{},
     win_frames: std.AutoHashMapUnmanaged(i64, WinFrame) = .{},
     // Window handles whose font variables the core should read; drained
     // after the redraw batch like float_config_wanted.
@@ -1638,6 +1642,7 @@ pub const Grid = struct {
         self.grid_metrics.deinit(self.alloc);
         self.grid_fonts.deinit(self.alloc);
         self.win_frames.deinit(self.alloc);
+        self.split_request_held.deinit(self.alloc);
         self.font_query_wanted.deinit(self.alloc);
         self.font_releases_pending.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
@@ -1731,6 +1736,7 @@ pub const Grid = struct {
         // Slot references are dropped by Core.resetFontSlotsForNewSession.
         self.grid_fonts.clearRetainingCapacity();
         self.win_frames.clearRetainingCapacity();
+        self.split_request_held.clearRetainingCapacity();
         self.font_query_wanted.clearRetainingCapacity();
         self.font_releases_pending.clearRetainingCapacity();
         self.clearAllOverflow();
@@ -2294,9 +2300,12 @@ pub const Grid = struct {
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
             // Neovim answered a font request with another size (split layout
-            // changed under it): treat it as a frame change.
+            // changed under it): treat it as a frame change. A split's or
+            // external window's grid is the requested view plus its winbar
+            // rows (both are non-floating, ui.c:775).
             if (self.grid_fonts.get(grid_id)) |gf| {
-                if (gf.mode == .resize and gf.req_rows != 0 and (gf.req_rows != rows or gf.req_cols != cols)) {
+                const m = if (self.split_request_held.contains(grid_id) or self.external_grids.contains(grid_id)) self.getViewportMargins(grid_id) else ViewportMargins{};
+                if (gf.mode == .resize and gf.req_rows != 0 and (gf.req_rows + m.top + m.bottom != rows or gf.req_cols != cols)) {
                     self.wantFontQuery(gf.win_id);
                 }
             }
@@ -2878,6 +2887,7 @@ pub const Grid = struct {
             self.font_releases_pending.append(self.alloc, kv.value.font_id) catch {};
         }
         _ = self.win_frames.remove(grid_id);
+        _ = self.split_request_held.remove(grid_id);
         _ = self.viewport.remove(grid_id);
         _ = self.viewport_margins.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
@@ -3026,6 +3036,9 @@ pub const Grid = struct {
     ) !void {
         if (grid_id == 1) return;
         if (!gridCoordFitsFrontend(row) or !gridCoordFitsFrontend(col)) return;
+        // win_frames holds split frames only; a split shown again must see
+        // its frame as new and re-read its font.
+        _ = self.win_frames.remove(grid_id);
 
         const was_external = self.external_grids.contains(grid_id);
         const old_pos_before = self.win_pos.get(grid_id);
@@ -3127,6 +3140,10 @@ pub const Grid = struct {
         if (self.grid_win_ids.get(grid_id)) |win_id| _ = self.float_follows.remove(win_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
+        // A font answer for a hidden window has no grid to land on, and the
+        // re-show's win_pos repeats the frame: forgetting it makes that
+        // win_pos re-read the font.
+        _ = self.win_frames.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
         // The gate entry belongs to the hidden placement; a re-show that needs
@@ -3143,6 +3160,7 @@ pub const Grid = struct {
     /// Returns true if this is a new external grid, false if it was already external.
     pub fn setWinExternalPos(self: *Grid, grid_id: i64, win: i64) !bool {
         if (grid_id == 1) return false; // Global grid cannot be external
+        _ = self.win_frames.remove(grid_id); // split frames only, as in setWinFloatPos
 
         // Reserve every fallible map insertion before changing composition.
         // In particular, an external_grids OOM must not leave win_pos removed
@@ -5860,4 +5878,20 @@ test "a win_pos frame change queues one query and a session reset forgets font s
     try std.testing.expectEqual(@as(usize, 0), grid.grid_fonts.count());
     try std.testing.expectEqual(@as(usize, 0), grid.win_frames.count());
     try std.testing.expectEqual(@as(usize, 0), grid.font_query_wanted.items.len);
+}
+
+test "a window shown again with the frame it was hidden with re-reads its font" {
+    // :tabnext sends win_hide, then win_pos with the same w_height/w_width.
+    // An answer that arrived while it was hidden had no grid to land on.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resizeGrid(1, 10, 40);
+    try grid.resizeGrid(2, 5, 20);
+    try grid.setWinPos(2, 1000, 0, 0);
+    grid.noteWinFrame(2, 1000, 5, 20);
+    grid.font_query_wanted.clearRetainingCapacity();
+    try grid.hideWin(2);
+    try grid.setWinPos(2, 1000, 0, 0);
+    grid.noteWinFrame(2, 1000, 5, 20);
+    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
 }

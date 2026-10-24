@@ -393,11 +393,20 @@ pub fn isSpecialVk(vk: u32) bool {
 pub const CellPos = struct { row: i32, col: i32 };
 
 /// The cell a layer-local pixel names in a grid drawn in its own font, by the
-/// core's rule (margin clamp; a negative coordinate stays negative).
-pub fn fontGridCell(gf: app_mod.GridFontPx, x: i32, y: i32) CellPos {
+/// core's rule (margin clamp; a negative coordinate stays negative), then
+/// clamped to the grid's logical size: the core clamps to extent / cell size,
+/// which exceeds it when the grid's font is smaller. Call outside app.mu.
+pub fn fontGridCell(app: *App, grid_id: i64, gf: app_mod.GridFontPx, x: i32, y: i32) CellPos {
     var row: i32 = 0;
     var col: i32 = 0;
     core.zonvie_core_pointer_cell_in_grid(@floatFromInt(x), @floatFromInt(y), gf.cell_w_px, gf.cell_h_px, gf.extent_w_px, gf.extent_h_px, &row, &col);
+    const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+    for (grids) |g| {
+        if (g.grid_id != grid_id) continue;
+        row = @min(row, @max(g.rows - 1, 0));
+        col = @min(col, @max(g.cols - 1, 0));
+        break;
+    }
     return .{ .row = row, .col = col };
 }
 
@@ -827,7 +836,7 @@ pub fn showUrlCursor(app: *App, target: ?MouseTarget) bool {
         const cell_w = app.cell_w_px;
         const row_h = app.rowHeightPx();
         app.mu.unlock(core.clock.io());
-        const font_cell: ?CellPos = if (gf) |f| fontGridCell(f, t.x, t.y) else null;
+        const font_cell: ?CellPos = if (gf) |f| fontGridCell(app, t.grid_id, f, t.x, t.y) else null;
         const col: i32 = if (font_cell) |fc| fc.col else if (cell_w > 0) @divFloor(t.x, @as(i32, @intCast(cell_w))) else 0;
         const row: i32 = if (font_cell) |fc| fc.row else if (row_h > 0) @divFloor(t.y, @as(i32, @intCast(row_h))) else 0;
         const result = core.zonvie_core_try_cell_has_url(corep, t.grid_id, row, col);
@@ -1025,7 +1034,7 @@ pub fn sendMouseButton(
     app.mu.unlock(core.clock.io());
 
     const drag = action == .drag;
-    const cell = if (gf) |f| fontGridCell(f, x, y) else clientPxToCell(app, false, x, y, cell_w, row_h, drag);
+    const cell = if (gf) |f| fontGridCell(app, grid_id, f, x, y) else clientPxToCell(app, false, x, y, cell_w, row_h, drag);
     const mod_buf = buildMouseModifiers(wParam);
 
     core.zonvie_core_send_mouse_input(

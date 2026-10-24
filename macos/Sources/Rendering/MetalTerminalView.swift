@@ -990,7 +990,9 @@ final class MetalTerminalView: GridInputView {
         zonvie_core_pointer_cell_in_grid(
             Float(g.pointPx.x) - origin.x, Float(g.pointPx.y - scrollOffsetPx) - origin.y,
             gf.cellWidthPx, gf.cellHeightPx, gf.extentWidthPx, gf.extentHeightPx, &r, &c)
-        return (r, c)
+        // The core clamps to extent / cell size, which exceeds the grid's
+        // logical size when its font is smaller; a margin click names the nearest cell.
+        return (min(r, max(grid.rows - 1, 0)), min(c, max(grid.cols - 1, 0)))
     }
 
     /// `requireScrollable`: a non-scrollable float is transparent to a wheel,
@@ -1458,6 +1460,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
+        if core?.terminalView === self { core?.snapMainWindowAfterLiveResize() }
         activateSurfaceDrawLoop()
         requestRedraw()
     }

@@ -3442,6 +3442,10 @@ fn dispatchGridRowScroll(
     if (!frontendHasSurface(core, surface_id)) return false;
     const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
     if (sg.scroll_fast_path_blocked) return false;
+    // The bottom frame margin is generated with the last row's vertices
+    // (gridRowGenParams); a shifted row buffer would carry it off that row.
+    const r = core.gridRender(grid_id);
+    if ((r.mode == .resize or r.mode == .font_view) and r.extent_h_px > sg.rows * r.cell_h_px) return false;
 
     const op = sg.last_scroll_op orelse return false;
     const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols) orelse return false;
@@ -19706,6 +19710,39 @@ test "a font grid's row uses its own cell size and fills the frame margin" {
     try std.testing.expectEqual(@as(f32, 20), g.cell_h);
     try std.testing.expectEqual(@as(f32, 0), g.margin_right_px);
     try std.testing.expectEqual(@as(f32, 0), g.margin_bottom_px);
+}
+
+// zonvie_core.h on_grid_row_scroll: the frontend moves row buffers, so a row
+// moved into or out of the last slot would take or lose the bottom margin
+// quad generated with the last row.
+test "a font grid whose last row carries a bottom margin is not row-shifted" {
+    const S = struct {
+        var calls: u32 = 0;
+        fn onRowScroll(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: i32, _: u32, _: u32) callconv(.c) void {
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 4, 13);
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    // 4 rows of 12 px in a 52 px frame: the last row carries a 4 px margin.
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 1000, .font_id = 1, .mode = .resize, .cell_w_px = 7, .cell_h_px = 12, .frame_rows = 2, .frame_cols = 10, .req_rows = 4, .req_cols = 13, .extent_w_px = 100, .extent_h_px = 52 });
+    try std.testing.expect(gridRowGenParams(&core, core.gridRender(2), 13, 4, 3).margin_bottom_px > 0);
+    core.grid.scrollGrid(2, 0, 4, 0, 13, -1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, S.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 0), S.calls);
+    // An exact fit carries no margin and keeps the fast path.
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    core.grid.grid_fonts.getPtr(2).?.extent_h_px = 48;
+    core.grid.scrollGrid(2, 0, 4, 0, 13, -1, 0);
+    try std.testing.expect(dispatchGridRowScroll(&core, S.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 1), S.calls);
 }
 
 test "frame margins are painted with the default background right of and below the cells" {

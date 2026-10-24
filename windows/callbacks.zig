@@ -1435,7 +1435,9 @@ pub fn onGridRowScroll(
     }
 
     // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
-    const row_h: i32 = @intCast(app.rowHeightPx());
+    // In this grid's own row height as of this flush: the staged table, since
+    // the published one lags a flush that changes the grid's font.
+    const row_h: i32 = if (app.grid_fonts_staged.get(grid_id)) |gf| @intCast(gf.cell_h_px) else @intCast(app.rowHeightPx());
     const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
     const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
     const delta_px: i32 = -rows_delta * row_h;

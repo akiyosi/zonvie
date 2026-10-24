@@ -615,14 +615,13 @@ func encodeSurfaceRowScrollBlit(
     backTexture: MTLTexture,
     scratch: SurfaceScrollScratchTexture,
     device: MTLDevice,
-    backBufferSize: CGSize,
     commandBuffer: MTLCommandBuffer,
     encoder: inout MTLBlitCommandEncoder?
 ) -> Bool {
     if encoder == nil {
         scratch.ensure(
             device: device,
-            drawableSize: backBufferSize,
+            drawableSize: CGSize(width: backTexture.width, height: backTexture.height),
             pixelFormat: backTexture.pixelFormat
         )
         encoder = commandBuffer.makeBlitCommandEncoder()

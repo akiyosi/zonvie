@@ -1480,8 +1480,17 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // Get cell dimensions from main atlas
     // Note: cell_h must include linespace_px to match core's vertex generation
-    const cell_w: u32 = app.cell_w_px;
-    const cell_h: u32 = app.rowHeightPx();
+    var cell_w: u32 = app.cell_w_px;
+    var cell_h: u32 = app.rowHeightPx();
+    {
+        // A grid in its own font is framed in that font's cells.
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        if (app.gridCellPx(req.grid_id)) |gf| {
+            cell_w = gf.cell_w_px;
+            cell_h = gf.cell_h_px;
+        }
+    }
     const content_w: c_int = @intCast(req.cols * cell_w);
     const content_h: c_int = @intCast(req.rows * cell_h);
 

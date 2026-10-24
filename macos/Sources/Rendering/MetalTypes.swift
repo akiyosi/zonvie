@@ -4064,6 +4064,9 @@ func encodeSurfaceBloomPasses(
     else { return false }
 
     intensityBuf.contents().storeBytes(of: intensity, as: Float.self)
+    // The glow chain is planned over the back buffer's whole allocated
+    // extent, so its passes sample every texture whole.
+    var fullUVScale = SIMD2<Float>(1, 1)
 
     let halfW = max(1, Int(viewportSize.width / 2.0))
     let halfH = max(1, Int(viewportSize.height / 2.0))
@@ -4110,6 +4113,7 @@ func encodeSurfaceBloomPasses(
                                          width: Double(pass.dstWidthPx), height: Double(pass.dstHeightPx),
                                          znear: 0, zfar: 1))
             enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+            enc.setVertexBytes(&fullUVScale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
             enc.setFragmentTexture(srcTex, index: 0)
             enc.setFragmentSamplerState(bilinearSampler, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
@@ -4128,6 +4132,7 @@ func encodeSurfaceBloomPasses(
     // No explicit viewport: default = full backBuffer so blur bleed
     // extends naturally into margin areas beyond the grid viewport.
     compositeEnc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+    compositeEnc.setVertexBytes(&fullUVScale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
     compositeEnc.setFragmentTexture(extractTex, index: 0)
     compositeEnc.setFragmentSamplerState(bilinearSampler, index: 0)
     compositeEnc.setFragmentBuffer(intensityBuf, offset: 0, index: 0)
@@ -4175,12 +4180,15 @@ func accumulateSurfaceLayerPlacementTravel(
     staged: [SurfaceLayer],
     committed: [SurfaceLayer],
     rootGridId: Int64,
-    cellHeightPx: Float,
+    rowHeightPx: (Int64) -> Float,
     into rowsUp: inout [Int64: Int]
 ) {
-    guard cellHeightPx > 0 else { return }
     for layer in staged where layer.gridId != rootGridId {
         guard let previous = committed.first(where: { $0.gridId == layer.gridId }) else { continue }
+        // Counted in the ANCHOR's rows, as its compensation is: a font grid's
+        // rows are not the global cell height.
+        let cellHeightPx = rowHeightPx(layer.anchorGrid)
+        guard cellHeightPx > 0 else { continue }
         let travelled = Int(((previous.originPx.y - layer.originPx.y) / cellHeightPx).rounded())
         if travelled != 0 { rowsUp[layer.gridId, default: 0] += travelled }
     }
@@ -4466,6 +4474,8 @@ func encodeSurfaceDrawableCopy(
     pipeline: MTLRenderPipelineState,
     copyVertexBuffer: MTLBuffer,
     sampler: MTLSamplerState,
+    /// `input`'s defined region, which `output` covers exactly.
+    uvScale: SIMD2<Float>,
     prepare: (MTLRenderPassDescriptor) -> Void
 ) -> Bool {
     let rpd = MTLRenderPassDescriptor()
@@ -4476,6 +4486,8 @@ func encodeSurfaceDrawableCopy(
     guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
     enc.setRenderPipelineState(pipeline)
     enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+    var scale = uvScale
+    enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
     enc.setFragmentTexture(input, index: 0)
     enc.setFragmentSamplerState(sampler, index: 0)
     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
@@ -4619,6 +4631,40 @@ func makeSurfaceTextureDescriptor(
     return desc
 }
 
+/// The allocated extent of a surface's back buffer for a drawable of
+/// `logicalSize`. Every other off-screen texture a surface owns is sized from
+/// the back buffer's allocated extent, so this is the one capacity rule.
+///
+/// During a live resize the capacity only grows, with 25% headroom per axis, so
+/// a drag allocates a handful of textures instead of one set per size tick
+/// (each is an IOAccelerator resource). Outside a live resize it is the exact
+/// size, which is also how a drag's slack is given back: the first draw after
+/// the drag ends reallocates once at the final size. While capacity exceeds
+/// the logical size, only the top-left logical region is defined and every
+/// pass that samples these textures with normalized UVs scales them by
+/// `surfaceUVScale`.
+func surfaceTextureCapacity(current: MTLTexture?, logicalSize: CGSize, inLiveResize: Bool) -> (widthPx: Int, heightPx: Int) {
+    let wantW = max(1, Int(logicalSize.width))
+    let wantH = max(1, Int(logicalSize.height))
+    guard inLiveResize, let current else { return (wantW, wantH) }
+    if wantW <= current.width, wantH <= current.height { return (current.width, current.height) }
+    // 16384 is the 2D texture limit of every Mac GPU this app runs on.
+    let maxPx = 16384
+    func grow(_ want: Int, _ have: Int) -> Int {
+        want <= have ? have : max(want, min(maxPx, have + have / 4))
+    }
+    return (grow(wantW, current.width), grow(wantH, current.height))
+}
+
+/// Normalized-UV scale that maps a full-target quad onto the defined
+/// `logicalSize` region of a texture of `capacity` extent.
+func surfaceUVScale(logicalSize: CGSize, capacity: MTLTexture) -> SIMD2<Float> {
+    SIMD2<Float>(
+        Float(max(1, Int(logicalSize.width))) / Float(capacity.width),
+        Float(max(1, Int(logicalSize.height))) / Float(capacity.height)
+    )
+}
+
 /// The off-screen texture pair a multi-pass custom shader chain ping-pongs
 /// between. Both surfaces size it from their own drawable, so the pair lives
 /// with this holder rather than being restated per surface class.
@@ -4710,6 +4756,8 @@ final class SurfaceScrollScratchTexture {
         size = .zero
     }
 
+    /// `drawableSize` is the back buffer's allocated extent: a blit may span
+    /// all of it.
     func ensure(device: MTLDevice, drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if texture != nil, size == drawableSize { return }
         // `.shaderRead` alone, matching the descriptor default this used to
