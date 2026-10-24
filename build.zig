@@ -853,9 +853,11 @@ pub fn build(b: *std.Build) !void {
         } else if (host_os == .windows) {
             gui_mod.linkSystemLibrary("user32", .{});
             gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture
+        } else if (host_os == .linux) {
+            // Synthetic pointer input (test/gui/linux_pointer.zig). Windows
+            // are observed through hyprctl and captured with grim.
+            gui_mod.linkSystemLibrary("wayland-client", .{});
         }
-        // Linux observes windows through hyprctl and captures with grim:
-        // nothing to link.
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
             .filters = test_filters,

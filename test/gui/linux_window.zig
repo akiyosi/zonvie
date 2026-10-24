@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const gui_io = @import("gui_io.zig");
+const linux_pointer = @import("linux_pointer.zig");
 
 pub const Bounds = struct { x: f64, y: f64, w: f64, h: f64 };
 pub const MainWindow = struct { number: u32, bounds: Bounds };
@@ -150,4 +151,70 @@ pub fn dumpWindowsForPid(pid: i32) void {
     const n = clients(std.heap.page_allocator, pid, &buf);
     std.debug.print("[gui] windows of pid {d}: {d}\n", .{ pid, n });
     for (buf[0..n]) |c| std.debug.print("[gui]   stableId={x} focus={d} at=({d:.0},{d:.0}) size={d:.0}x{d:.0}\n", .{ c.stable_id, c.focus_rank, c.bounds.x, c.bounds.y, c.bounds.w, c.bounds.h });
+}
+
+/// The output layout's extent in logical px: what a virtual pointer's
+/// absolute positions are relative to.
+fn layoutExtent() ?[2]u32 {
+    const alloc = std.heap.page_allocator;
+    const result = std.process.run(alloc, gui_io.io(), .{ .argv = &.{ "hyprctl", "-j", "monitors" } }) catch return null;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result.stdout, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .array) return null;
+    var w: f64 = 0;
+    var h: f64 = 0;
+    for (parsed.value.array.items) |m| {
+        if (m != .object) continue;
+        const o = m.object;
+        const scale = switch (o.get("scale") orelse continue) {
+            .float => |f| f,
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            else => continue,
+        };
+        const x: f64 = @floatFromInt((o.get("x") orelse continue).integer);
+        const y: f64 = @floatFromInt((o.get("y") orelse continue).integer);
+        const mw: f64 = @floatFromInt((o.get("width") orelse continue).integer);
+        const mh: f64 = @floatFromInt((o.get("height") orelse continue).integer);
+        w = @max(w, x + mw / scale);
+        h = @max(h, y + mh / scale);
+    }
+    if (w <= 0 or h <= 0) return null;
+    return .{ @intFromFloat(@round(w)), @intFromFloat(@round(h)) };
+}
+
+/// A virtual pointer over the whole output layout, or null when the
+/// compositor offers none (the scenario then skips).
+pub fn pointer() ?linux_pointer.Pointer {
+    const e = layoutExtent() orelse return null;
+    return linux_pointer.open(e[0], e[1]);
+}
+
+/// The bounds of the first mapped window of `pid` whose title contains
+/// `needle` (a dialog the app opened), or null.
+pub fn windowWithTitle(pid: i32, needle: []const u8) ?Bounds {
+    const alloc = std.heap.page_allocator;
+    const result = std.process.run(alloc, gui_io.io(), .{ .argv = &.{ "hyprctl", "-j", "clients" } }) catch return null;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result.stdout, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .array) return null;
+    for (parsed.value.array.items) |c| {
+        if (c != .object) continue;
+        const o = c.object;
+        if ((o.get("pid") orelse continue).integer != pid) continue;
+        const title = (o.get("title") orelse continue).string;
+        if (std.mem.indexOf(u8, title, needle) == null) continue;
+        const at = (o.get("at") orelse continue).array.items;
+        const size = (o.get("size") orelse continue).array.items;
+        return .{
+            .x = @floatFromInt(at[0].integer),
+            .y = @floatFromInt(at[1].integer),
+            .w = @floatFromInt(size[0].integer),
+            .h = @floatFromInt(size[1].integer),
+        };
+    }
+    return null;
 }

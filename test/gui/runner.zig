@@ -457,6 +457,26 @@ test "gui:blink_survives_popupmenu" {
     try gated(is_macos, @import("scenarios/macos/blink_survives_popupmenu.zig"));
 }
 
+test "gui:scrollbar_pointer" {
+    // Linux only: linux/scrollbar.zig through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/scrollbar_pointer.zig"));
+}
+
+test "gui:tabline_pointer" {
+    // Linux only: linux/ui_widgets.zig's tab strip through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));
+}
+
+test "gui:copy_button_pointer" {
+    // Linux only: linux/ui_widgets.zig's copy buttons through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/copy_button_pointer.zig"));
+}
+
+test "gui:font_dialog_pointer" {
+    // Linux only: linux/font_picker.zig through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/font_dialog_pointer.zig"));
+}
+
 test "gui:cursor_blinks" {
     // Linux only: the timer and its log line are linux/blink.zig's.
     try gated(is_linux, @import("scenarios/linux/cursor_blinks.zig"));
