@@ -1,0 +1,9 @@
+# Fixture for the Linux msg_pos_float_anchor scenario: both message views
+# anchor to the grid under the cursor.
+[messages.msg_pos]
+ext-float = "grid"
+mini = "grid"
+
+[log]
+enabled = true
+verbose = false

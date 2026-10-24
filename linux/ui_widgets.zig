@@ -9,6 +9,7 @@ const clock = core.clock;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const ui_state = @import("ui_state.zig");
+const applog = @import("app_log.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
 
@@ -22,6 +23,8 @@ pub const Widgets = struct {
     tabs: ?*anyopaque = null,
     /// [tabline] style = "sidebar": the strip runs down one side.
     sidebar: bool = false,
+    /// The minis' margins from the view's right and bottom edges, logical px.
+    mini_place: [2]c_int = .{ -1, -1 },
     /// Advances the working agents' spinners while any runs.
     spinner_timer: c_uint = 0,
     spinner_frame: u32 = 0,
@@ -328,8 +331,14 @@ pub fn placeMessages(app: *App) void {
     }
     if (w.mini_box) |b| {
         const r = overlay_layout.msgTarget(pos.mini, anchor, vw, vh, cw, ch);
-        gtk.gtk_widget_set_margin_bottom(b, @divTrunc(vh - r.bottom, scale) + m);
-        gtk.gtk_widget_set_margin_end(b, @divTrunc(vw - r.right, scale) + m);
+        const place: [2]c_int = .{ @divTrunc(vw - r.right, scale) + m, @divTrunc(vh - r.bottom, scale) + m };
+        gtk.gtk_widget_set_margin_end(b, place[0]);
+        gtk.gtk_widget_set_margin_bottom(b, place[1]);
+        // What the GUI harness reads the minis' corner from, on a change.
+        if (!std.mem.eql(c_int, &place, &w.mini_place)) {
+            w.mini_place = place;
+            applog.appLog("[mini_pos] end={d} bottom={d}\n", .{ place[0], place[1] });
+        }
     }
 }
 

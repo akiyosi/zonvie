@@ -117,6 +117,9 @@ pub const Pointer = struct {
     time_ms: u32 = 0,
 
     pub fn deinit(self: *Pointer) void {
+        // Destroying the device at once can drop its last events before
+        // the compositor hands them on.
+        gui_io.sleepNs(200 * std.time.ns_per_ms);
         _ = wl_proxy_marshal_flags(self.ptr, op_destroy, null, 1, 1);
         _ = wl_display_roundtrip(self.display);
         wl_display_disconnect(self.display);

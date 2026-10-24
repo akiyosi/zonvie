@@ -218,3 +218,18 @@ pub fn windowWithTitle(pid: i32, needle: []const u8) ?Bounds {
     }
     return null;
 }
+
+/// `notches` wheel notches at layout point (x, y): positive scrolls up,
+/// negative down, the Win32 convention windows_window.sendWheel takes. The
+/// window under the point gets them, as a real wheel's do.
+pub fn sendWheel(pid: i32, notches: i32, x: i32, y: i32) bool {
+    _ = pid;
+    var p = pointer() orelse return false;
+    defer p.deinit();
+    p.moveTo(@floatFromInt(x), @floatFromInt(y));
+    gui_io.sleepNs(150 * std.time.ns_per_ms);
+    p.moveTo(@floatFromInt(x + 1), @floatFromInt(y));
+    gui_io.sleepNs(150 * std.time.ns_per_ms);
+    p.wheel(-notches);
+    return true;
+}

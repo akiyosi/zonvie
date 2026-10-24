@@ -219,9 +219,10 @@ test "gui:extfloat_message_position" {
 }
 
 test "gui:wheel_scroll" {
-    // Windows only: synthesizes WM_MOUSEWHEEL into the real frontend wheel
-    // handler. No macOS equivalent in this driver.
-    try gated(is_windows, @import("scenarios/windows/wheel_scroll.zig"));
+    // Windows synthesizes WM_MOUSEWHEEL into the real frontend wheel handler,
+    // Linux a virtual pointer's wheel notch. No macOS equivalent in this
+    // driver.
+    try gated(is_windows or is_linux, @import("scenarios/windows/wheel_scroll.zig"));
 }
 
 // Visual scenarios run wherever the screenshot layer is implemented.
@@ -475,6 +476,18 @@ test "gui:copy_button_pointer" {
 test "gui:font_dialog_pointer" {
     // Linux only: linux/font_picker.zig through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/font_dialog_pointer.zig"));
+}
+
+test "gui:msg_pos_float_anchor" {
+    // Linux only: messages are drawn inside the main window there, so their
+    // places come from the log (the macOS scenarios watch new OS windows).
+    try gated(is_linux, @import("scenarios/linux/msg_pos_float_anchor.zig"));
+}
+
+test "gui:main_float_mouse_disabled_wheel" {
+    // Linux only: the main_float_mouse_disabled_scroll rule through
+    // virtual-pointer wheel notches.
+    try gated(is_linux, @import("scenarios/linux/main_float_mouse_disabled_wheel.zig"));
 }
 
 test "gui:cursor_blinks" {
