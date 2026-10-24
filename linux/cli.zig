@@ -192,8 +192,13 @@ pub fn detach() bool {
 /// `arg` made absolute against this process's cwd when nvim would read it
 /// as a file: the core starts nvim in $HOME unless the cwd is inherited.
 pub fn absoluteFileArg(alloc: std.mem.Allocator, prev: ?[]const u8, arg: []const u8, after_dash_dash: bool) ![]const u8 {
-    if (std.fs.path.isAbsolute(arg)) return arg;
     if (!core.frontend_rules.nvimArgIsFile(prev, arg, after_dash_dash)) return arg;
+    return absolutePath(alloc, arg);
+}
+
+/// `path` against this process's cwd, unless it is absolute already.
+pub fn absolutePath(alloc: std.mem.Allocator, arg: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(arg)) return arg;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.c.getcwd(&buf, buf.len) orelse return arg;
     return std.fs.path.join(alloc, &.{ std.mem.sliceTo(cwd, 0), arg });

@@ -771,6 +771,31 @@ test "nvimArgIsFile keeps flags, commands and option values out of the file list
     try std.testing.expect(!nvimArgIsFile(null, "-", true));
 }
 
+/// Walks nvim's own command line — what follows zonvie's `--` — token by
+/// token, saying which are files. Its `after_dash_dash` is nvim's `--`, not
+/// zonvie's: treating zonvie's as nvim's made `zonvie -- -u init.lua` hand
+/// nvim `<cwd>/-u <cwd>/init.lua`. nvim's `--` itself is no file.
+pub const NvimArgScan = struct {
+    prev: ?[]const u8 = null,
+    after_dash_dash: bool = false,
+
+    pub fn isFile(self: *NvimArgScan, arg: []const u8) bool {
+        defer self.prev = arg;
+        if (!self.after_dash_dash and std.mem.eql(u8, arg, "--")) {
+            self.after_dash_dash = true;
+            return false;
+        }
+        return nvimArgIsFile(self.prev, arg, self.after_dash_dash);
+    }
+};
+
+test "nvim's command line keeps its flags until its own --" {
+    var scan: NvimArgScan = .{};
+    const args = [_][]const u8{ "-u", "init.lua", "+10", "a.txt", "--", "-b.txt", "-" };
+    const want = [_]bool{ false, false, false, true, false, true, false };
+    for (args, want) |a, w| try std.testing.expectEqual(w, scan.isFile(a));
+}
+
 /// A devcontainer workspace or config path as the devcontainer commands can
 /// quote it: one pair of Explorer "Copy as path" quotes dropped, and trailing
 /// backslashes dropped (`C:\proj\` is `C:\proj`); a root keeps its backslash

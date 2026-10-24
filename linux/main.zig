@@ -418,13 +418,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, arg, "--")) {
             // Everything after is nvim's own command line, which may carry
             // its own `--` before files.
-            var nvim_dash_dash = false;
-            for (args[i + 1 ..], i + 1..) |a, j| {
-                const prev: ?[]const u8 = if (j > i + 1) args[j - 1] else null;
-                const fwd = cli.absoluteFileArg(aa, prev, a, nvim_dash_dash) catch return 1;
-                extra.append(aa, fwd) catch return 1;
-                if (core.frontend_rules.nvimArgIsFile(prev, a, nvim_dash_dash)) files.append(aa, aa.dupeZ(u8, fwd) catch return 1) catch return 1;
-                if (!nvim_dash_dash and std.mem.eql(u8, a, "--")) nvim_dash_dash = true;
+            var scan: core.frontend_rules.NvimArgScan = .{};
+            for (args[i + 1 ..]) |a| {
+                if (!scan.isFile(a)) {
+                    extra.append(aa, a) catch return 1;
+                    continue;
+                }
+                const abs = cli.absolutePath(aa, a) catch return 1;
+                extra.append(aa, abs) catch return 1;
+                files.append(aa, aa.dupeZ(u8, abs) catch return 1) catch return 1;
             }
             break;
         } else if (std.mem.eql(u8, arg, "--nvim") and i + 1 < args.len) {
