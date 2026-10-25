@@ -2672,6 +2672,7 @@ pub fn onSurfaceLayout(
             .z = l.z,
             .follows_scroll = (l.flags & core.LAYER_FOLLOWS_SCROLL) != 0,
             .mouse_enabled = (l.flags & core.LAYER_MOUSE_ENABLED) != 0,
+            .float = (l.flags & core.LAYER_FLOAT) != 0,
         };
     }
     tbs.stageLayers(staged);

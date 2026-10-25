@@ -3794,12 +3794,12 @@ final class SurfaceFixedFloatMask {
     /// root reaches every float.
     func rebuild(
         layers: [SurfaceLayerFrame], rootGridId: Int64, smoothScrolling: Bool,
-        offsets: [GridSurfaceRenderer.ScrollOffset], rootScrolled: Bool = false,
+        offsets: [GridSurfaceRenderer.ScrollOffset], rootScrolled: Bool = false, peelGridId: Int64 = 0,
         cellW: Float, cellH: Float, scratch: inout [GridSurfaceRenderer.FixedFloatRect]
     ) {
         scratch.removeAll(keepingCapacity: true)
         if smoothScrolling {
-            for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) {
+            for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) && entry.layer.gridId != peelGridId {
                 let layer = entry.layer
                 let rect = GridSurfaceRenderer.FixedFloatRect(
                     x0: layer.originPx.x,

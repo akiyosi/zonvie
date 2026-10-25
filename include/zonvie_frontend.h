@@ -889,6 +889,68 @@ ZONVIE_API bool zonvie_scroll_spring_seed(
 ZONVIE_API bool zonvie_scroll_ease_admits(int32_t rows_delta, int32_t mousescroll_ver, uint8_t large_jump);
 
 /* ---------------------------------------------------------------------------
+   Float peel ([floats] peel).
+
+   When a hosted float (ZONVIE_LAYER_FLOAT) is painted over the cursor, it is
+   curled back as a flat fold so the cursor and what surrounds it show
+   through. corner is the float corner nearest the cursor (surface px), dir
+   the unit vector from it toward the cursor. A float pixel p with
+   s = dot(p - corner, dir) < fold_px is folded away; a pixel with s >= fold_px
+   shows the flap's back when its mirror (s' = 2 * fold_px - s) lies inside
+   the float, and the float itself otherwise.
+
+   Call zonvie_float_peel_advance once per frame per surface with that
+   surface's layer list (origins in surface px) and the cursor's box in surface
+   px (zonvie_core_cursor_rect with its layer origin; NULL when the cursor is
+   not on the surface) and owning grid. It eases fold_px in and back out,
+   restoring one float before peeling another. The corner follows the cursor
+   across either of the float's midpoints (restore, then peel from the other
+   corner).
+
+   click_px is a mouse press this frame (x, y in surface px), or NULL. A press
+   inside the peel's bounds restores the float and holds it (dismissed) until
+   the cursor leaves it; the press is still the float's to handle.
+
+   The frame names the float to curl (grid_id, 0 for none), which the frontend
+   draws alone into an offscreen target and folds over the back buffer within
+   bounds_px (float_px grown to hold the flap). Every layer redraws the surface
+   rows [redraw_top_px, redraw_bottom_px) whenever a frame is drawn: the curl
+   is blended into the retained back buffer. changed asks for a frame without
+   other damage; moving asks for another one.
+   Zero-initialise. Pure — no core pointer, no lock. */
+typedef struct {
+    int64_t grid_id;
+    float corner_x_px;
+    float corner_y_px;
+    float dir_x;
+    float dir_y;
+    float target_px;
+    uint32_t dismissed;
+    zonvie_scroll_spring spring;
+    int32_t last_top_px;
+    int32_t last_bottom_px;
+} zonvie_float_peel;
+typedef struct {
+    int64_t grid_id;
+    zonvie_cursor_rect float_px;
+    zonvie_cursor_rect bounds_px;
+    float corner_x_px;
+    float corner_y_px;
+    float dir_x;
+    float dir_y;
+    float fold_px;
+    int32_t redraw_top_px;
+    int32_t redraw_bottom_px;
+    bool changed;
+    bool moving;
+} zonvie_float_peel_frame;
+ZONVIE_API void zonvie_float_peel_advance(
+    zonvie_float_peel *peel, const zonvie_layer *layers, size_t count,
+    int64_t cursor_grid, const zonvie_cursor_rect *cursor, const float *click_px,
+    uint32_t cell_w_px, uint32_t cell_h_px, int64_t now_ns,
+    zonvie_float_peel_frame *out);
+
+/* ---------------------------------------------------------------------------
    Bloom chain geometry.
 
    How large each of the bloom's scratch textures is, and which one every pass

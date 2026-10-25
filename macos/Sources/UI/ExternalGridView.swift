@@ -301,6 +301,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// Built in draw() from the committed layer snapshot, so it needs no lock
     /// of its own; rebuilt only when the rectangles change.
     private let fixedFloatMask = SurfaceFixedFloatMask()
+    private let floatPeel = SurfaceFloatPeel()
     private var fixedFloatRectsScratch: [GridSurfaceRenderer.FixedFloatRect] = []
     /// Shared with GridSurfaceRenderer. Starts nil — nothing staged yet — and
     /// a nil owner owns nothing, which is what makes a clear from a grid that
@@ -2278,7 +2279,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // popupmenu / messages / cmdline / ext-window background stays
             // frozen while the main window animates.
             let shaderAnimates = shared.anyCustomShaderNeedsAnimation
-            if shaderAnimates {
+            if shaderAnimates || f.peel.moving {
                 activateSurfaceDrawLoop()
             }
 
@@ -2305,7 +2306,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 hasPresentedOnce: hasPresentedOnce,
                 rowModeSatisfied: f.rowMode,
                 hasNewCommit: f.hasNewCommit,
-                hasDirtyRows: hasDirtyContent,
+                hasDirtyRows: hasDirtyContent || f.peel.changed,
                 // Layout damage is the whole surface owing a redraw that no
                 // row expresses. It came only with a commit until a
                 // background change could raise it between commits.
@@ -2380,7 +2381,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // surface-absolute, so the rectangle needs no further placement.
             fixedFloatMask.rebuild(
                 layers: layerSnapshot, rootGridId: gridId, smoothScrolling: f.smoothScrolling,
-                offsets: f.hostedScrollOffsets, rootScrolled: f.scrollOffset != nil,
+                offsets: f.hostedScrollOffsets, rootScrolled: f.scrollOffset != nil, peelGridId: f.peel.grid_id,
                 cellW: Float(shared.cellWidthPx), cellH: Float(f.ch), scratch: &fixedFloatRectsScratch
             )
 
@@ -2500,6 +2501,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             f.dirtyRows.removeAll(keepingCapacity: true)
             if f.mayGpuScrollCopy || !f.hasPendingScroll {
                 f.dirtyRows.append(contentsOf: f.submittedDirtyRows)
+                // The curl blends into backTex, so a frame that repaints any
+                // row repaints the curled float's too, or the old curl stays.
+                let peelTop = Int(f.peel.redraw_top_px) / Int(f.cellHi)
+                let peelBottom = min(f.safeRowCount, (Int(f.peel.redraw_bottom_px) + Int(f.cellHi) - 1) / Int(f.cellHi))
+                if f.peel.changed || !f.dirtyRows.isEmpty, peelTop < peelBottom {
+                    f.dirtyRows.append(contentsOf: max(0, peelTop)..<peelBottom)
+                }
             }
             defer {
                 f.dirtyRows.removeAll(keepingCapacity: true)
@@ -2607,6 +2615,25 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     pipeline: pipeline, sampler: sampler, atlasTex: atlasTex,
                     backTex: backTex, view: view
                 )
+                if f.peel.grid_id != 0 {
+                    floatPeel.encode(
+                        f.peel, originPx: simd_float2(Float(f.vpOriginX), Float(f.vpOriginY)),
+                        cmd: cmd, backTex: backTex, shared: shared
+                    ) { enc, peelTex in
+                        beginSurfaceRowPass(
+                            encoder: enc,
+                            viewportMetrics: f.viewportMetrics,
+                            pipeline: pipeline,
+                            atlasTexture: atlasTex,
+                            sampler: sampler,
+                            backgroundAlpha: f.backgroundAlpha,
+                            fixedFloatBands: fixedFloatMask.bands,
+                            fixedFloatIntervals: fixedFloatMask.intervals,
+                            bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: f.scrollOffset) }
+                        )
+                        encodeHostedLayers(&f, encoder: enc, pipeline: pipeline, backTex: peelTex, only: f.peel.grid_id)
+                    }
+                }
             } else {
                 // Traced on the path that actually skipped, not where the flag
                 // is computed: the claim being made is that no surface pass was
@@ -2858,6 +2885,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // entry owes everything.
                 layerSnapshot.append(SurfaceLayerFrame(layer: layer, set: sets[f.csi], state: nil))
             }
+        }
+        if ZonvieConfig.shared.floats.peel {
+            // The cursor's grid-local box, placed at its layer's origin: the
+            // space the layers' origins are in.
+            let forwarded = committedForwardedCursor
+            let box = forwarded.gridId == f.cursorOwner ? forwarded.px.map { c in
+                zonvie_cursor_rect(
+                    left: f.cursorLayerOrigin.x + c.minX, top: f.cursorLayerOrigin.y + c.minY,
+                    right: f.cursorLayerOrigin.x + c.maxX, bottom: f.cursorLayerOrigin.y + c.maxY)
+            } : nil
+            f.peel = floatPeel.advance(
+                layers: committedSurfaceLayers, cursorGrid: f.cursorOwner, cursorBox: box,
+                cellWidthPx: max(1, UInt32(shared.cellWidthPx.rounded(.up))),
+                cellHeightPx: max(1, UInt32(shared.cellHeightPx.rounded(.up))))
         }
         // The displacements this frame draws with, latched with the rows
         // and the cursor rect they belong to. Only this thread writes
@@ -3210,7 +3251,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         encoder: MTLRenderCommandEncoder,
         glowPipeline: MTLRenderPipelineState? = nil,
         pipeline: MTLRenderPipelineState,
-        backTex: MTLTexture
+        backTex: MTLTexture,
+        /// Draw this grid alone (the peel texture); otherwise every layer
+        /// but the curled float.
+        only: Int64? = nil
     ) {
         let glow = glowPipeline != nil
         guard f.fontIsCurrent else { return }
@@ -3219,6 +3263,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
         for entry in layerSnapshot {
             let layer = entry.layer
+            if let only {
+                if layer.gridId != only { continue }
+            } else if layer.gridId == f.peel.grid_id && !glow {
+                continue
+            }
             guard let set = entry.set else { continue }
             let rows = min(layer.rows, set.rowLogicalToSlot.count)
             guard rows > 0 else { continue }
@@ -3271,7 +3320,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     cellHeightPx: Float(cellHi)
                 )
             }
-            if f.partialHostedContents && !glow {
+            if f.partialHostedContents && !glow && only == nil {
                 // Recompose each damage band back-to-front. Every
                 // layer is clipped to the band the root erased, so
                 // unchanged pixels are neither cleared nor blended.
@@ -4001,6 +4050,17 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         resolveInputTarget(pointPx: surfacePointPx(event), requireScrollable: requireScrollable)
     }
 
+    override func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
+        if action == "press", ZonvieConfig.shared.floats.peel {
+            let p = surfacePointPx(event)
+            lock.lock()
+            floatPeel.press = [Float(p.x), Float(p.y)]
+            lock.unlock()
+            activateSurfaceDrawLoop()
+        }
+        super.sendGridMouseEvent(button: button, action: action, event: event)
+    }
+
     /// The layer's CURRENT drawn origin, so a float that moves mid-drag keeps
     /// receiving the right cells. A layer that has gone falls back to this
     /// surface's own grid rather than re-resolving.
@@ -4195,6 +4255,7 @@ fileprivate struct ExternalSurfaceFrame {
     var committedExtent = SurfaceCommittedExtent()
     var lastKnownCursorRow = 0
     var cursorBlink = false
+    var peel = zonvie_float_peel_frame()
     var fontIsCurrent = false
     /// The root's offset, nil when it is not displaced this frame.
     var scrollOffset: GridSurfaceRenderer.ScrollOffset?
