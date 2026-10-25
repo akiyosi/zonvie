@@ -708,15 +708,18 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         const n = parseWindowFontAnswers(top[3], &answers);
         self.grid_mu.lockUncancelable(clock.io());
         self.drainOsResizesLocked();
-        const rev_before = self.grid.cursor_rev;
-        for (answers[0..n]) |a| {
-            if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
-            self.applyWindowFontLocked(a);
-        }
         // Frontends commit on_grid_font at flush end. A resize brings its
         // own grid_resize batch and flush; a float, or a font that needs no
-        // resize, has nothing else coming and is flushed here.
-        const needs_flush = self.grid.cursor_rev != rev_before and self.font_resize_outbox.items.len == 0;
+        // resize, has nothing else coming and is flushed here, even when
+        // another answer in the batch resized.
+        var needs_flush = false;
+        for (answers[0..n]) |a| {
+            if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
+            const rev_before = self.grid.cursor_rev;
+            const resizes_before = self.font_resize_outbox.items.len;
+            self.applyWindowFontLocked(a);
+            if (self.grid.cursor_rev != rev_before and self.font_resize_outbox.items.len == resizes_before) needs_flush = true;
+        }
         // Windows queued while this query was in flight go out now.
         self.takeFontQueriesLocked(clock.nowNs());
         self.grid_mu.unlock(clock.io());

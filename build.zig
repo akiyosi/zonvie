@@ -347,9 +347,8 @@ pub fn build(b: *std.Build) !void {
                     "macos/Tests/ScrollRetentionTests.swift",
                 },
             },
-            // The one rule that turns a pixel into a grid row while a sub-row ease
-            // is running. It had a second, band-less copy on the drag path, so a
-            // press and the drag after it disagreed about the same pixel.
+            // Where a displaced follower float is hit, and how horizontal scroll
+            // input is paid out. The sub-row ease rule itself is the core's.
             .{
                 .exe_name = "scroll-adjusted-row-tests",
                 .sources = &.{

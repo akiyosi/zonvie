@@ -1768,17 +1768,33 @@ pub export fn zonvie_core_resolve_pointer_grid(
     return 1;
 }
 
+pub const GridGeometry = pointer_target.GridGeometry;
+
 pub export fn zonvie_core_pointer_cell_in_grid(
     local_x_px: f32,
     local_y_px: f32,
+    scroll_offset_px: f32,
     cell_w_px: u32,
     cell_h_px: u32,
     extent_w_px: u32,
     extent_h_px: u32,
+    rows: i32,
+    cols: i32,
+    margin_top: i32,
+    margin_bottom: i32,
     out_row: ?*i32,
     out_col: ?*i32,
 ) callconv(.c) void {
-    const hit = pointer_target.cellInGrid(local_x_px, local_y_px, cell_w_px, cell_h_px, extent_w_px, extent_h_px);
+    const hit = pointer_target.cellInGridEased(local_x_px, local_y_px, scroll_offset_px, .{
+        .cell_w_px = cell_w_px,
+        .cell_h_px = cell_h_px,
+        .extent_w_px = extent_w_px,
+        .extent_h_px = extent_h_px,
+        .rows = rows,
+        .cols = cols,
+        .margin_top = margin_top,
+        .margin_bottom = margin_bottom,
+    });
     if (out_row) |r| r.* = hit.row;
     if (out_col) |c| c.* = hit.col;
 }

@@ -131,15 +131,64 @@ fn floorCell(v: f32) i32 {
     return @intFromFloat(@floor(std.math.clamp(v, -16777216.0, 16777216.0)));
 }
 
+/// What a grid is, as far as a pixel inside it is concerned. The layer it is
+/// drawn on is `extent_*_px` large; the grid itself is `rows` x `cols` of
+/// `cell_*_px` cells, which may not fill the layer (a grid in a smaller font
+/// than the frame it sits in). `rows`/`cols` 0 = unknown: the layer decides.
+pub const GridGeometry = struct {
+    cell_w_px: u32,
+    cell_h_px: u32,
+    extent_w_px: u32,
+    extent_h_px: u32,
+    rows: i32 = 0,
+    cols: i32 = 0,
+    margin_top: i32 = 0,
+    margin_bottom: i32 = 0,
+};
+
+/// The cell a layer-local pixel names in `g`, when the grid is drawn
+/// `scroll_offset_px` further down than its rows say (a sub-row scroll ease).
+///
+/// Only the scrolling band -- the rows between the margins -- moves with the
+/// ease, so the offset is undone only when both the drawn row and the row it
+/// came from lie inside it; a winbar or a status line is hit where it is.
+/// A point inside the layer past the last cell (the leftover margin) names
+/// that cell. A point outside the layer keeps its row and column, negative
+/// or past the end, so a drag off the grid keeps its meaning to Neovim.
+pub fn cellInGridEased(local_x_px: f32, local_y_px: f32, scroll_offset_px: f32, g: GridGeometry) Hit {
+    var hit = cellInGrid(local_x_px, local_y_px, g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px);
+    if (g.cell_h_px == 0) return hit;
+    const layer_rows: i32 = @intCast(@max(1, g.extent_h_px / g.cell_h_px));
+    const rows = if (g.rows > 0) g.rows else layer_rows;
+    if (@abs(scroll_offset_px) > 0.001) {
+        const from = cellInGrid(local_x_px, local_y_px - scroll_offset_px, g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px);
+        const band_top = g.margin_top;
+        const band_end = rows - g.margin_bottom;
+        if (hit.row >= band_top and hit.row < band_end and from.row >= band_top and from.row < band_end) hit.row = from.row;
+    }
+    if (g.rows > 0 and insideLayer(local_y_px, g.extent_h_px)) hit.row = @min(hit.row, g.rows - 1);
+    if (g.cols > 0 and insideLayer(local_x_px, g.extent_w_px)) hit.col = @min(hit.col, g.cols - 1);
+    return hit;
+}
+
+fn insideLayer(px: f32, extent_px: u32) bool {
+    return px < @as(f32, @floatFromInt(extent_px));
+}
+
 /// The cell `local_*_px` names in a grid of `cell_*_px` cells whose layer is
-/// `extent_*_px` large. Past the last cell clamps; negative keeps its sign.
+/// `extent_*_px` large. Inside the layer, past the last whole cell clamps to
+/// it; outside it (negative, or past the layer) the row and column keep going.
 pub fn cellInGrid(local_x_px: f32, local_y_px: f32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) Hit {
     if (cell_w_px == 0 or cell_h_px == 0) return .{ .grid_id = 0, .row = 0, .col = 0 };
     const rows: i32 = @intCast(@max(1, extent_h_px / cell_h_px));
     const cols: i32 = @intCast(@max(1, extent_w_px / cell_w_px));
     const r = floorCell(local_y_px / @as(f32, @floatFromInt(cell_h_px)));
     const c = floorCell(local_x_px / @as(f32, @floatFromInt(cell_w_px)));
-    return .{ .grid_id = 0, .row = @min(r, rows - 1), .col = @min(c, cols - 1) };
+    return .{
+        .grid_id = 0,
+        .row = if (insideLayer(local_y_px, extent_h_px)) @min(r, rows - 1) else r,
+        .col = if (insideLayer(local_x_px, extent_w_px)) @min(c, cols - 1) else c,
+    };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -324,9 +373,67 @@ test "a non-finite or huge pixel coordinate clamps instead of trapping" {
     const a = cellInGrid(nan, nan, 6, 12, 100, 50);
     try testing.expectEqual(@as(i32, 0), a.row);
     try testing.expectEqual(@as(i32, 0), a.col);
+    // Past the layer the coordinate keeps going, bounded by floorCell.
     const b = cellInGrid(inf, inf, 6, 12, 100, 50);
-    try testing.expectEqual(@as(i32, 3), b.row);
-    try testing.expectEqual(@as(i32, 15), b.col);
+    try testing.expectEqual(@as(i32, 16777216), b.row);
+    try testing.expectEqual(@as(i32, 16777216), b.col);
     const c = cellInGrid(-inf, -1.0e30, 6, 12, 100, 50);
     try testing.expect(c.row < 0 and c.col < 0);
+}
+
+test "a grid smaller than its layer clamps to its own last cell, not the layer's" {
+    // 6x12 cells on a 100x50 px layer (16x4 fit), but the grid is 3x10.
+    const g: GridGeometry = .{ .cell_w_px = 6, .cell_h_px = 12, .extent_w_px = 100, .extent_h_px = 50, .rows = 3, .cols = 10 };
+    const margin = cellInGridEased(99.0, 49.0, 0, g);
+    try testing.expectEqual(@as(i32, 2), margin.row);
+    try testing.expectEqual(@as(i32, 9), margin.col);
+    // Unknown size: the layer decides, as cellInGrid.
+    const layer = cellInGridEased(99.0, 49.0, 0, .{ .cell_w_px = 6, .cell_h_px = 12, .extent_w_px = 100, .extent_h_px = 50 });
+    try testing.expectEqual(@as(i32, 3), layer.row);
+    try testing.expectEqual(@as(i32, 15), layer.col);
+    // A drag above the grid stays negative.
+    try testing.expectEqual(@as(i32, -1), cellInGridEased(5.0, -1.0, 0, g).row);
+}
+
+test "an ease is undone inside the scrolling band only" {
+    // 10 rows of 12 px, a 1-row winbar on top and a 1-row status line below;
+    // the content is drawn 7 px down.
+    const g: GridGeometry = .{ .cell_w_px = 6, .cell_h_px = 12, .extent_w_px = 60, .extent_h_px = 120, .rows = 10, .cols = 10, .margin_top = 1, .margin_bottom = 1 };
+    // y=50 is drawn row 4; it came from (50-7)/12 = row 3.
+    try testing.expectEqual(@as(i32, 3), cellInGridEased(0, 50.0, 7.0, g).row);
+    // y=5 is the winbar: it does not move.
+    try testing.expectEqual(@as(i32, 0), cellInGridEased(0, 5.0, 7.0, g).row);
+    // y=12 is drawn row 1 (band), but it came from row 0 (winbar): stays 1.
+    try testing.expectEqual(@as(i32, 1), cellInGridEased(0, 12.0, 7.0, g).row);
+    // y=110 is the status line: it does not move.
+    try testing.expectEqual(@as(i32, 9), cellInGridEased(0, 110.0, 7.0, g).row);
+    // No ease: the drawn row.
+    try testing.expectEqual(@as(i32, 4), cellInGridEased(0, 50.0, 0.0, g).row);
+}
+
+test "a grid on the global font: the ease band rule the frontends carried" {
+    // 10 rows of 20 px; `decorated` has a winbar on top and a border row at
+    // the bottom (rows 1..8 scroll), `plain` scrolls every row.
+    const decorated: GridGeometry = .{ .cell_w_px = 20, .cell_h_px = 20, .extent_w_px = 200, .extent_h_px = 200, .rows = 10, .cols = 10, .margin_top = 1, .margin_bottom = 1 };
+    const plain: GridGeometry = .{ .cell_w_px = 20, .cell_h_px = 20, .extent_w_px = 200, .extent_h_px = 200, .rows = 10, .cols = 10 };
+    // A content pixel, eased: undone, because the shader moved that pixel.
+    try testing.expectEqual(@as(i32, 1), cellInGridEased(0, 50, 20, decorated).row);
+    try testing.expectEqual(@as(i32, 2), cellInGridEased(0, 50, 0, decorated).row);
+    // The margins did not move: a pixel on them keeps its drawn row.
+    try testing.expectEqual(@as(i32, 0), cellInGridEased(0, 10, -20, decorated).row);
+    try testing.expectEqual(@as(i32, 9), cellInGridEased(0, 190, 20, decorated).row);
+    // An adjustment that would land on a margin is refused.
+    try testing.expectEqual(@as(i32, 1), cellInGridEased(0, 30, 20, decorated).row);
+    try testing.expectEqual(@as(i32, 8), cellInGridEased(0, 170, -20, decorated).row);
+    // Without margins every row scrolls.
+    try testing.expectEqual(@as(i32, 1), cellInGridEased(0, 10, -20, plain).row);
+    // A sub-pixel offset is not an ease.
+    try testing.expectEqual(@as(i32, 2), cellInGridEased(0, 50, 0.0005, plain).row);
+    // A zero cell cannot name a row and must not divide.
+    try testing.expectEqual(@as(i32, 0), cellInGridEased(0, 50, 20, .{ .cell_w_px = 0, .cell_h_px = 0, .extent_w_px = 0, .extent_h_px = 0 }).row);
+    // A drag a fraction of a cell above the grid is row -1 (floored), which
+    // starts Neovim's drag autoscroll; below the layer it keeps going too.
+    try testing.expectEqual(@as(i32, -1), cellInGridEased(0, -5, 0, plain).row);
+    try testing.expectEqual(@as(i32, 12), cellInGridEased(0, 250, 0, plain).row);
+    try testing.expectEqual(@as(i32, 9), cellInGridEased(0, 199.5, 0, plain).row);
 }

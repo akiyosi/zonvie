@@ -5457,12 +5457,15 @@ pub const Core = struct {
         for (pending[0..n]) |r| {
             const gf = self.grid.grid_fonts.getPtr(r.grid_id) orelse continue;
             if (gf.mode != .resize) continue;
+            // An external window is a float: the request is its whole grid,
+            // winbar included (winfloat.c win_config_float).
+            const grid_rows = r.rows;
             gf.req_rows = r.rows;
             gf.req_cols = r.cols;
-            gf.frame_rows = font_slots.footprintCells(r.rows, gf.cell_h_px, @max(1, self.cell_h_px));
+            gf.frame_rows = font_slots.footprintCells(grid_rows, gf.cell_h_px, @max(1, self.cell_h_px));
             gf.frame_cols = font_slots.footprintCells(r.cols, gf.cell_w_px, @max(1, self.cell_w_px));
             const ext_w = r.cols * gf.cell_w_px;
-            const ext_h = r.rows * gf.cell_h_px;
+            const ext_h = grid_rows * gf.cell_h_px;
             if (ext_w == gf.extent_w_px and ext_h == gf.extent_h_px) continue;
             gf.extent_w_px = ext_w;
             gf.extent_h_px = ext_h;
@@ -5629,16 +5632,22 @@ pub const Core = struct {
                 };
                 // A split's request is its view height (window.c
                 // win_set_inner_size); the grid adds the winbar, which the
-                // frame already counts. Width has no such rows to leave.
+                // frame already counts. An external window is a float, whose
+                // request is the whole grid. Width has no such rows to leave.
                 const m = if (kind == .split) self.grid.getViewportMargins(grid_id) else grid_mod.ViewportMargins{};
                 const rows = @max(1, font_slots.requestedCells(frame.rows, gh, gf.cell_h_px, grid_mod.MAX_GRID_ROWS) -| (m.top + m.bottom));
                 const cols = font_slots.requestedCells(frame.cols, gw, gf.cell_w_px, grid_mod.MAX_GRID_COLS);
                 // An external window's request in an unchanged font is the
                 // OS window's own (drainOsResizesLocked). Its frame is that
-                // request rounded up to global cells, so recomputing from the
-                // frame would ask for a different size than the window has.
+                // request rounded up to global cells, so recomputing the
+                // request or extent from the frame would differ from the
+                // window it has.
                 const keep_os_request = kind == .external and gf.req_rows != 0 and
                     prev.?.cell_w_px == gf.cell_w_px and prev.?.cell_h_px == gf.cell_h_px;
+                if (keep_os_request) {
+                    gf.extent_w_px = prev.?.extent_w_px;
+                    gf.extent_h_px = prev.?.extent_h_px;
+                }
                 if (!keep_os_request and (rows != gf.req_rows or cols != gf.req_cols)) {
                     gf.req_rows = rows;
                     gf.req_cols = cols;
@@ -9190,19 +9199,44 @@ test "an external window's OS size survives its winbar and a font re-query" {
     try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
     try core.grid.setViewportMargins(4, 1, 0, 0, 0);
     core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
-    try core.grid.resizeGrid(4, 21, 80);
-    // An odd row count: its frame rounds up to 20 global rows, which
-    // converts back to 40 font rows, not 39.
+    // 10 global rows hold 20 font rows. An external window is a float:
+    // its request is the whole grid, winbar included (winfloat.c).
+    try std.testing.expectEqual(@as(u32, 20), core.last_font_resize_rows);
+    try core.grid.resizeGrid(4, 20, 80);
+    // A 39-row OS window, an odd grid whose frame rounds up to 20 global
+    // rows (40 font rows).
     core.requestTryResizeGrid(4, 39, 101);
     core.drainOsResizesLocked();
+    try std.testing.expectEqual(@as(u32, 39), core.grid.grid_fonts.get(4).?.req_rows);
     core.grid.font_query_wanted.clearRetainingCapacity();
-    // Neovim sizes the view (window.c win_set_inner_size): 39 + winbar.
-    try core.grid.resizeGrid(4, 40, 101);
+    try core.grid.resizeGrid(4, 39, 101);
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
-    // A re-query of the same font (WinResized) must not ask for another size.
+    // The extent covers the whole grid, winbar included.
+    try std.testing.expectEqual(@as(u32, 390), core.grid.grid_fonts.get(4).?.extent_h_px);
+    // A re-query of the same font (WinResized) must not ask for another
+    // size or move the extent to the rounded-up frame.
     const sent = core.font_resize_requests;
     core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
     try std.testing.expectEqual(sent, core.font_resize_requests);
+    try std.testing.expectEqual(@as(u32, 390), core.grid.grid_fonts.get(4).?.extent_h_px);
+    try std.testing.expectEqual(@as(u32, 390), s.last_extent_h);
+}
+
+test "clearing an external window's font gives back its whole grid, winbar included" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(4, 10, 40);
+    try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
+    try core.grid.setViewportMargins(4, 1, 0, 0, 0);
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try core.grid.resizeGrid(4, 20, 80);
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true });
+    // The float's request is the 10-row grid the window had.
+    try std.testing.expectEqual(@as(u32, 10), core.last_font_resize_rows);
+    try std.testing.expectEqual(@as(u32, 40), core.last_font_resize_cols);
 }
 
 test "a global cell change re-requests every font grid and reloads derived slots" {

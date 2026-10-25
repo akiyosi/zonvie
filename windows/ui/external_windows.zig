@@ -1298,6 +1298,33 @@ pub fn restackMsgShowBelowHistory(app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ pos.x, pos.y });
 }
 
+const ExternalResize = struct { rows: u32, cols: u32 };
+
+/// The wanted size to send now, if any; marks it in flight. `app.mu` held.
+/// A size equal to the answered grid is still sent when the request in
+/// flight targets another size, so a drag ending back at the current size
+/// is not left at the in-flight one.
+fn takeExternalResizeLocked(w: *app_mod.ExternalWindow) ?ExternalResize {
+    if (w.resize_in_flight or w.resize_wanted_rows == 0) return null;
+    const s: ExternalResize = .{ .rows = w.resize_wanted_rows, .cols = w.resize_wanted_cols };
+    w.resize_wanted_rows = 0;
+    w.resize_wanted_cols = 0;
+    const at_answer = s.rows == w.resize_answer_rows and s.cols == w.resize_answer_cols;
+    const at_sent = s.rows == w.resize_sent_rows and s.cols == w.resize_sent_cols;
+    if (at_answer and at_sent) return null;
+    w.resize_in_flight = true;
+    w.resize_sent_rows = s.rows;
+    w.resize_sent_cols = s.cols;
+    return s;
+}
+
+/// `app.mu` NOT held: the core may call back into the frontend.
+fn sendExternalResize(hwnd: c.HWND, corep: ?*app_mod.zonvie_core, grid_id: i64, s: ExternalResize) void {
+    if (applog.isEnabled()) applog.appLog("[win] external resize grid_id={d} rows={d} cols={d}\n", .{ grid_id, s.rows, s.cols });
+    app_mod.zonvie_core_try_resize_grid(corep, grid_id, s.rows, s.cols);
+    _ = c.SetTimer(hwnd, app_mod.TIMER_EXTERNAL_RESIZE_ANSWER, app_mod.EXTERNAL_RESIZE_ANSWER_TIMEOUT_MS, null);
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
@@ -1387,11 +1414,25 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const had_old_rect = is_cmdline and c.GetWindowRect(hwnd, &old_rect) != 0;
     const updated = c.SetWindowPos(hwnd, null, x, y, window_w, window_h, flags) != 0;
     app.mu.lockUncancelable(core.clock.io());
+    // Neovim's grid_resize answer: it releases the next wanted size.
+    var resize_send: ?ExternalResize = null;
+    const resize_corep = app.corep;
     if (app.external_windows.get(req.grid_id)) |ext_win| {
-        if (ext_win.hwnd == hwnd) ext_win.suppress_resize_callback = false;
+        if (ext_win.hwnd == hwnd) {
+            ext_win.suppress_resize_callback = false;
+            ext_win.resize_answer_rows = req.rows;
+            ext_win.resize_answer_cols = req.cols;
+            ext_win.resize_in_flight = false;
+            resize_send = takeExternalResizeLocked(ext_win);
+        }
     }
     const pum_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.POPUPMENU_GRID_ID)) |pw| pw.hwnd else null;
     app.mu.unlock(core.clock.io());
+    if (resize_send) |s| {
+        sendExternalResize(hwnd, resize_corep, req.grid_id, s);
+    } else {
+        _ = c.KillTimer(hwnd, app_mod.TIMER_EXTERNAL_RESIZE_ANSWER);
+    }
     // The completion menu is placed against the cmdline, which now moves as it
     // grows: carry it along by the same distance.
     if (updated and had_old_rect and (flags & c.SWP_NOMOVE) == 0) {
@@ -2531,7 +2572,15 @@ pub export fn ExternalWndProc(
                             if (applog.isEnabled()) applog.appLog("[win] external WM_SIZE grid_id={d} client=({d},{d}) cell=({d},{d}) -> rows={d} cols={d}\n", .{
                                 gid, client_w, client_h, cell_w, cell_h, new_rows, new_cols,
                             });
-                            app_mod.zonvie_core_try_resize_grid(corep, gid, new_rows, new_cols);
+                            app.mu.lockUncancelable(core.clock.io());
+                            const send = if (app.external_windows.get(gid)) |w| blk: {
+                                if (w.hwnd != hwnd) break :blk null;
+                                w.resize_wanted_rows = new_rows;
+                                w.resize_wanted_cols = new_cols;
+                                break :blk takeExternalResizeLocked(w);
+                            } else null;
+                            app.mu.unlock(core.clock.io());
+                            if (send) |s| sendExternalResize(hwnd, corep, gid, s);
                         }
                     }
                 }
@@ -2827,6 +2876,22 @@ pub export fn ExternalWndProc(
                 const hit = findExternalWindowByHwnd(app, hwnd);
                 const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
                 const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
+
+                if (timer_id == app_mod.TIMER_EXTERNAL_RESIZE_ANSWER) {
+                    _ = c.KillTimer(hwnd, app_mod.TIMER_EXTERNAL_RESIZE_ANSWER);
+                    if (grid_id) |gid| {
+                        app.mu.lockUncancelable(core.clock.io());
+                        const corep = app.corep;
+                        const send = if (app.external_windows.get(gid)) |w| blk: {
+                            if (w.hwnd != hwnd) break :blk null;
+                            w.resize_in_flight = false;
+                            break :blk takeExternalResizeLocked(w);
+                        } else null;
+                        app.mu.unlock(core.clock.io());
+                        if (send) |s| sendExternalResize(hwnd, corep, gid, s);
+                    }
+                    return 0;
+                }
 
                 if (ext_window) |ext_win| {
                     if (timer_id == app_mod.TIMER_EXTERNAL_UNCLOAK) {

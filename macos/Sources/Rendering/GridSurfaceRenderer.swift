@@ -2311,6 +2311,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return committedSurfaceLayers.first { $0.gridId == gridId }?.originPx
     }
 
+    /// The layer's rows and columns in its own cells, as the hit test clamps by.
+    func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedSurfaceLayers.first { $0.gridId == gridId }.map { (Int32($0.rows), Int32($0.cols)) }
+    }
+
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
     /// does not allocate.
     private var commitGridIdScratch: [Int64] = []

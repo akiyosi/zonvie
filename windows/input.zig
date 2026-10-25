@@ -392,22 +392,67 @@ pub fn isSpecialVk(vk: u32) bool {
 /// already has them in hand from the same locked read as the other metrics.
 pub const CellPos = struct { row: i32, col: i32 };
 
-/// The cell a layer-local pixel names in a grid drawn in its own font, by the
-/// core's rule (margin clamp; a negative coordinate stays negative), then
-/// clamped to the grid's logical size: the core clamps to extent / cell size,
-/// which exceeds it when the grid's font is smaller. Call outside app.mu.
-pub fn fontGridCell(app: *App, grid_id: i64, gf: app_mod.GridFontPx, x: i32, y: i32) CellPos {
-    var row: i32 = 0;
-    var col: i32 = 0;
-    core.zonvie_core_pointer_cell_in_grid(@floatFromInt(x), @floatFromInt(y), gf.cell_w_px, gf.cell_h_px, gf.extent_w_px, gf.extent_h_px, &row, &col);
+/// The cell a layer-local pixel names in `grid_id`, by the core's rule, with
+/// the grid's size from the committed layers and the sub-row ease this frame
+/// drew it with. `gf` null = the global font, `cell_w` x `row_h`. Call
+/// outside app.mu (UI thread: the ease is UI-thread state).
+pub fn gridCellAt(app: *App, grid_id: i64, gf: ?app_mod.GridFontPx, x: i32, y: i32, cell_w: u32, row_h: u32) CellPos {
     const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+    var margin_top: i32 = 0;
+    var margin_bottom: i32 = 0;
     for (grids) |g| {
         if (g.grid_id != grid_id) continue;
-        row = @min(row, @max(g.rows - 1, 0));
-        col = @min(col, @max(g.cols - 1, 0));
+        margin_top = g.margin_top;
+        margin_bottom = g.margin_bottom;
         break;
     }
+    app.mu.lockUncancelable(core.clock.io());
+    const size = committedGridSizeLocked(app, grid_id);
+    const ease_px = drawnEaseOffsetPxLocked(app, grid_id);
+    app.mu.unlock(core.clock.io());
+    const rows: i32 = if (size) |s| @intCast(s.rows) else 0;
+    const cols: i32 = if (size) |s| @intCast(s.cols) else 0;
+    const cw: u32 = if (gf) |f| f.cell_w_px else cell_w;
+    const ch: u32 = if (gf) |f| f.cell_h_px else row_h;
+    // A grid on the global font fills its layer exactly.
+    const ext_w: u32 = if (gf) |f| f.extent_w_px else cw * @as(u32, @intCast(cols));
+    const ext_h: u32 = if (gf) |f| f.extent_h_px else ch * @as(u32, @intCast(rows));
+    var row: i32 = 0;
+    var col: i32 = 0;
+    core.zonvie_core_pointer_cell_in_grid(@floatFromInt(x), @floatFromInt(y), ease_px, cw, ch, ext_w, ext_h, rows, cols, margin_top, margin_bottom, &row, &col);
     return .{ .row = row, .col = col };
+}
+
+/// The offset the last paint drew `grid_id`'s scrolling band at: a layer's
+/// GridEase on whichever surface draws it, or an external root's own.
+/// `app.mu` held, UI thread.
+fn drawnEaseOffsetPxLocked(app: *App, grid_id: i64) f32 {
+    if (app.surf.paint.layerState(grid_id)) |s| return if (s.ease.easing) s.ease.offset_px else 0;
+    var it = app.external_windows.valueIterator();
+    while (it.next()) |ext| {
+        if (ext.*.surf.paint.layerState(grid_id)) |s| return if (s.ease.easing) s.ease.offset_px else 0;
+    }
+    if (app.external_windows.get(grid_id)) |w| {
+        return if (w.surf.paint.root_ease.easing) w.surf.paint.root_ease.offset_px else 0;
+    }
+    return 0;
+}
+
+/// The rows/cols of `grid_id` in the committed layer lists the hit test reads
+/// (main surface, then external windows), else an external window's own
+/// surface size. `app.mu` held.
+fn committedGridSizeLocked(app: *App, grid_id: i64) ?struct { rows: u32, cols: u32 } {
+    for (app.surf.tbs.committed_layers.slice()) |l| {
+        if (l.grid_id == grid_id) return .{ .rows = l.rows, .cols = l.cols };
+    }
+    var it = app.external_windows.valueIterator();
+    while (it.next()) |ext| {
+        for (ext.*.surf.tbs.committed_layers.slice()) |l| {
+            if (l.grid_id == grid_id) return .{ .rows = l.rows, .cols = l.cols };
+        }
+    }
+    if (app.external_windows.get(grid_id)) |w| return .{ .rows = w.surf.surface.rows, .cols = w.surf.surface.cols };
+    return null;
 }
 
 /// `allow_negative` keeps a position above or left of the grid as a negative
@@ -836,9 +881,9 @@ pub fn showUrlCursor(app: *App, target: ?MouseTarget) bool {
         const cell_w = app.cell_w_px;
         const row_h = app.rowHeightPx();
         app.mu.unlock(core.clock.io());
-        const font_cell: ?CellPos = if (gf) |f| fontGridCell(app, t.grid_id, f, t.x, t.y) else null;
-        const col: i32 = if (font_cell) |fc| fc.col else if (cell_w > 0) @divFloor(t.x, @as(i32, @intCast(cell_w))) else 0;
-        const row: i32 = if (font_cell) |fc| fc.row else if (row_h > 0) @divFloor(t.y, @as(i32, @intCast(row_h))) else 0;
+        const cell = gridCellAt(app, t.grid_id, gf, t.x, t.y, cell_w, row_h);
+        const col = cell.col;
+        const row = cell.row;
         const result = core.zonvie_core_try_cell_has_url(corep, t.grid_id, row, col);
         if (result >= 0) {
             app.cursor_is_hand = (result == 1);
@@ -1034,7 +1079,7 @@ pub fn sendMouseButton(
     app.mu.unlock(core.clock.io());
 
     const drag = action == .drag;
-    const cell = if (gf) |f| fontGridCell(app, grid_id, f, x, y) else clientPxToCell(app, false, x, y, cell_w, row_h, drag);
+    const cell = gridCellAt(app, grid_id, gf, x, y, cell_w, row_h);
     const mod_buf = buildMouseModifiers(wParam);
 
     core.zonvie_core_send_mouse_input(

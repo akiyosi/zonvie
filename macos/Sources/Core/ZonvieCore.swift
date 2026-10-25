@@ -4840,7 +4840,10 @@ final class ZonvieCore {
             // Skip if rows/cols match the last programmatic resize (from grid_resize).
             // windowDidResize can fire asynchronously after suppressResizeCallback
             // is cleared, so this check prevents overriding Neovim's grid dimensions.
-            if rows == lastGridRows && cols == lastGridCols {
+            // While a request is in flight Neovim will end at its target, not
+            // at lastGridRows/Cols, so even a size equal to the last grid must
+            // be queued: the answer re-frames the window to the in-flight size.
+            if !requestInFlight && rows == lastGridRows && cols == lastGridCols {
                 wantedSize = nil
                 return
             }
@@ -4857,6 +4860,7 @@ final class ZonvieCore {
         /// queued request would replay the drag after mouse-up. The answer
         /// (or a timeout, when Neovim sends no grid_resize) releases the next.
         private var wantedSize: (rows: UInt32, cols: UInt32)?
+        private var inFlightSize: (rows: UInt32, cols: UInt32)?
         private var inFlightToken = 0
         private var requestInFlight = false
 
@@ -4865,6 +4869,7 @@ final class ZonvieCore {
             wantedSize = nil
             if size.rows == lastGridRows && size.cols == lastGridCols { return }
             requestInFlight = true
+            inFlightSize = size
             inFlightToken += 1
             let token = inFlightToken
             ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(size.rows) cols=\(size.cols)")
@@ -4874,6 +4879,15 @@ final class ZonvieCore {
                 self.requestInFlight = false
                 self.sendWantedSize()
             }
+        }
+
+        /// True when a user size newer than the in-flight request differs from
+        /// it: framing to that intermediate answer would make the window jump
+        /// back before the queued request re-frames it. Compared with the
+        /// request, not the answer, which Neovim may clamp.
+        func supersedesAnswer() -> Bool {
+            guard requestInFlight, let size = wantedSize, let sent = inFlightSize else { return false }
+            return size.rows != sent.rows || size.cols != sent.cols
         }
 
         /// A grid_resize for this window arrived. Main thread only.
@@ -5478,11 +5492,17 @@ final class ZonvieCore {
             // tryResizeGrid with stale window dimensions.
             delegate.lastGridRows = rows
             delegate.lastGridCols = cols
-            frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
+            // A superseded answer is not framed; gridResizeArrived() below
+            // sends the newer size, and that answer frames the window.
+            if !delegate.supersedesAnswer() {
+                frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                    rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
+            }
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
+            // Only a size change answers a request: row-0 redraws (winbar)
+            // come through here too.
+            delegate.gridResizeArrived()
         }
-        (window.delegate as? ExternalWindowDelegate)?.gridResizeArrived()
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).
         // Falls back to vertex-extracted bgColor if the group is not defined.

@@ -2300,12 +2300,15 @@ pub const Grid = struct {
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
             // Neovim answered a font request with another size (split layout
-            // changed under it): treat it as a frame change. A split's or
-            // external window's grid is the requested view plus its winbar
-            // rows (both are non-floating, ui.c:775).
+            // changed under it): treat it as a frame change. A split's grid
+            // is the requested view plus its winbar rows (ui.c:775). An
+            // external window's frame is its OS window, which no layout
+            // change moves; a re-query would keep the same request.
             if (self.grid_fonts.get(grid_id)) |gf| {
-                const m = if (self.split_request_held.contains(grid_id) or self.external_grids.contains(grid_id)) self.getViewportMargins(grid_id) else ViewportMargins{};
-                if (gf.mode == .resize and gf.req_rows != 0 and (gf.req_rows + m.top + m.bottom != rows or gf.req_cols != cols)) {
+                const m = if (self.split_request_held.contains(grid_id)) self.getViewportMargins(grid_id) else ViewportMargins{};
+                if (gf.mode == .resize and gf.req_rows != 0 and !self.external_grids.contains(grid_id) and
+                    (gf.req_rows + m.top + m.bottom != rows or gf.req_cols != cols))
+                {
                     self.wantFontQuery(gf.win_id);
                 }
             }

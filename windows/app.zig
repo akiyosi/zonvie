@@ -335,6 +335,10 @@ pub const TIMER_COPY_BUTTON_RETRY: c.UINT_PTR = 23;
 /// invisible.
 pub const TIMER_EXTERNAL_UNCLOAK: c.UINT_PTR = 24;
 pub const EXTERNAL_UNCLOAK_TIMEOUT_MS: c.UINT = 250;
+/// Releases an external window's in-flight try_resize_grid when Neovim sends
+/// no grid_resize answer (macOS uses the same 0.5s).
+pub const TIMER_EXTERNAL_RESIZE_ANSWER: c.UINT_PTR = 25;
+pub const EXTERNAL_RESIZE_ANSWER_TIMEOUT_MS: c.UINT = 500;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 /// Tray icon init delay in milliseconds
@@ -2914,6 +2918,19 @@ pub const ExternalWindow = struct {
 
     // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
     suppress_resize_callback: bool = false,
+
+    /// One try_resize_grid in flight per window: a drag reports sizes faster
+    /// than Neovim answers, and every queued request would replay the drag
+    /// after mouse-up. The grid_resize answer (geometry update) or
+    /// TIMER_EXTERNAL_RESIZE_ANSWER releases the latest wanted size.
+    /// All under `app.mu`. 0 rows = nothing wanted / not yet known.
+    resize_in_flight: bool = false,
+    resize_wanted_rows: u32 = 0,
+    resize_wanted_cols: u32 = 0,
+    resize_sent_rows: u32 = 0,
+    resize_sent_cols: u32 = 0,
+    resize_answer_rows: u32 = 0,
+    resize_answer_cols: u32 = 0,
 
     // Close state - set when window is scheduled for closing (don't paint or access renderer)
     is_pending_close: bool = false,
