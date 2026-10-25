@@ -607,7 +607,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // second launch must not forward to the first instance. With it, the
     // first registers the id on the session bus and a later launch hands it
     // its files (or just raises it) and exits, as Windows does.
-    const single = config.server.single_instance;
+    // A `--dialog` launch is a new session (New Session spawns one), so it
+    // never hands itself to a running instance.
+    const single = config.server.single_instance and !dialog;
     const gapp = gtk.gtk_application_new(cli.app_id, if (single) gtk.G_APPLICATION_HANDLES_OPEN else gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
     if (single and gtk.g_application_register(gapp, null, null) != 0 and gtk.g_application_get_is_remote(gapp) != 0) {
         // GApplication's own command line turns these into an Open call on

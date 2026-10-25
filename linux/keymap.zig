@@ -76,6 +76,21 @@ pub fn mouseModString(gdk_state: u32, buf: *[8]u8) [:0]const u8 {
     return buf[0..n :0];
 }
 
+/// Ctrl+Shift+N, the frontend's New Session (macOS's Cmd+N; Super is the
+/// compositor's on Linux). Neovim never sees it.
+pub fn isNewSession(keyval: u32, gdk_state: u32) bool {
+    const mods = gdk_state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
+    return mods == GDK_SHIFT_MASK | GDK_CONTROL_MASK and (keyval == 'N' or keyval == 'n');
+}
+
+test "only Ctrl+Shift+N is New Session" {
+    try testing.expect(isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK));
+    try testing.expect(isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK | 0x10)); // NumLock (Mod2)
+    try testing.expect(!isNewSession('n', GDK_CONTROL_MASK));
+    try testing.expect(!isNewSession('N', GDK_SHIFT_MASK));
+    try testing.expect(!isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_ALT_MASK));
+}
+
 /// While a preedit is active the IME owns every key, including Return.
 pub fn swallowDuringPreedit(preedit_active: bool, keyval: u32) bool {
     _ = keyval;

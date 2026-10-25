@@ -105,8 +105,13 @@ fn desktopEntry(buf: []u8, exe: []const u8, icon: []const u8) ![]const u8 {
         \\Keywords=Text;Editor;Neovim;Vim;
         \\MimeType=text/plain;text/markdown;text/x-csrc;text/x-chdr;text/x-c++src;text/x-python;text/x-shellscript;application/x-shellscript;application/json;application/toml;application/x-yaml;
         \\StartupWMClass={s}
+        \\Actions=new-session;
         \\
-    , .{ exe, icon, app_id });
+        \\[Desktop Action new-session]
+        \\Name=New Session
+        \\Exec="{s}" --dialog
+        \\
+    , .{ exe, icon, app_id, exe });
 }
 
 fn writeFile(path: []const u8, data: []const u8) !void {
@@ -343,6 +348,7 @@ test "the desktop entry runs this executable with the chosen files" {
     const e = try desktopEntry(&buf, "/opt/zonvie/zonvie", "/x/icon.png");
     try std.testing.expect(std.mem.indexOf(u8, e, "Exec=\"/opt/zonvie/zonvie\" %F\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, e, "StartupWMClass=io.github.akiyosi.zonvie\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "[Desktop Action new-session]\nName=New Session\nExec=\"/opt/zonvie/zonvie\" --dialog\n") != null);
 }
 
 test "flags after -- belong to nvim" {

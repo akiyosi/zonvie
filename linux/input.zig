@@ -10,6 +10,7 @@ const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const scrollbar = @import("scrollbar.zig");
+const askpass = @import("askpass.zig");
 
 /// One GLArea's input: the surface its pointer addresses, its IME context
 /// and the press it is tracking. The main window's lives in App; each
@@ -88,6 +89,10 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     _ = ctrl;
     _ = keycode;
     const app = appFrom(data);
+    if (keymap.isNewSession(keyval, state)) {
+        openNewSession();
+        return 1;
+    }
     const cp = app.corep orelse return 0;
     if (keymap.swallowDuringPreedit(app.preedit_active, keyval)) return 1;
     const code = keymap.coreKeycode(keyval);
@@ -100,6 +105,31 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     if (code == 0 and n == 0) return 0;
     core.zonvie_core_send_key_event(cp, code, mods, &buf, @intCast(n), &buf, @intCast(n));
     return 1;
+}
+
+/// New Session: another zonvie process showing the connection dialog, as
+/// macOS opens a window with it. Its own process, so it has its own nvim,
+/// GTK app and single-instance opt-out (`--dialog` never forwards).
+fn openNewSession() void {
+    var exe: [std.fs.max_path_bytes:0]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &exe, exe.len - 1);
+    if (n <= 0) return;
+    exe[@intCast(n)] = 0;
+    const argv = [_:null]?[*:0]const u8{ &exe, "--dialog" };
+    // An SSH session marked this process's environment for its askpass
+    // children; the new session must start as zonvie, not as a prompt.
+    const envp = gtk.g_environ_unsetenv(gtk.g_get_environ(), askpass.env_mode);
+    defer gtk.g_strfreev(envp);
+    // GLib reaps the child itself (no DO_NOT_REAP_CHILD) and gives it
+    // /dev/null for stdin, so it never detaches from a terminal again.
+    if (gtk.g_spawn_async(null, &argv, envp, 0, &newSessionSetup, null, null, null) == 0)
+        std.log.warn("new session: cannot start {s}", .{exe[0..@intCast(n)]});
+}
+
+/// In the child before exec: its own session, so closing the terminal this
+/// process may run in does not take it down.
+fn newSessionSetup(_: ?*anyopaque) callconv(.c) void {
+    _ = std.c.setsid();
 }
 
 fn onImCommit(im: ?*anyopaque, text: ?[*:0]const u8, data: ?*anyopaque) callconv(.c) void {

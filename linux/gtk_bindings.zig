@@ -120,6 +120,11 @@ pub extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellab
 pub extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]u8;
 pub extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const u8) void;
 pub extern "c" fn g_free(ptr: ?*anyopaque) void;
+pub extern "c" fn g_strfreev(str_array: ?[*:null]?[*:0]u8) void;
+pub extern "c" fn g_get_environ() ?[*:null]?[*:0]u8;
+pub extern "c" fn g_environ_unsetenv(envp: ?[*:null]?[*:0]u8, variable: [*:0]const u8) ?[*:null]?[*:0]u8;
+pub const GSpawnChildSetupFunc = *const fn (?*anyopaque) callconv(.c) void;
+pub extern "c" fn g_spawn_async(working_directory: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: ?[*:null]?[*:0]u8, flags: c_uint, child_setup: ?GSpawnChildSetupFunc, user_data: ?*anyopaque, child_pid: ?*c_int, err: ?*?*anyopaque) c_int;
 
 // File drops (GtkDropTarget carrying a GdkFileList).
 pub const GDK_ACTION_COPY: c_uint = 1 << 0;
