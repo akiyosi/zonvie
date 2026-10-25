@@ -114,6 +114,12 @@ final class SharedRenderResources {
         os_unfair_lock_unlock(&gridFontsLock)
     }
 
+    /// The font the flush in progress draws `gridId` in, before
+    /// commitGridFonts publishes it. Core thread only.
+    func flushGridFont(_ gridId: Int64) -> GridFontPx? {
+        stagedGridFonts[gridId]
+    }
+
     func gridFont(_ gridId: Int64) -> GridFontPx? {
         os_unfair_lock_lock(&gridFontsLock)
         defer { os_unfair_lock_unlock(&gridFontsLock) }

@@ -507,6 +507,21 @@ pub fn dragResizeWindowByMouse(
     return true;
 }
 
+/// One left click at (x, y), CGWindowList coordinates. Every event is
+/// ownership-checked like the drag above, and the press and release are at
+/// the same point, so nothing is dragged. The pointer is put back.
+pub fn clickAt(pid: i32, x: f64, y: f64) bool {
+    const restore = cursorLocation();
+    defer _ = CGWarpMouseCursorPosition(restore);
+    if (!postMouseChecked(pid, kCGEventMouseMoved, x, y)) return false;
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    if (!postMouseChecked(pid, kCGEventLeftMouseDown, x, y)) return false;
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    if (!postMouseChecked(pid, kCGEventLeftMouseUp, x, y)) return false;
+    gui_io.sleepNs(100 * std.time.ns_per_ms);
+    return true;
+}
+
 /// Trackpad-style pixel-precise scrolling, split so a caller can observe
 /// the surface WHILE the gesture is open.
 ///

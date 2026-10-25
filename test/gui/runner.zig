@@ -365,6 +365,11 @@ test "gui:extwin_float_stack_scroll_continuity" {
     try gated(is_macos, @import("scenarios/macos/extwin_float_stack_scroll_continuity.zig"));
 }
 
+test "gui:extwin_font_grid_click" {
+    // macOS only: ExternalGridView's hit test is macOS frontend code.
+    try gated(is_macos, @import("scenarios/macos/extwin_font_grid_click.zig"));
+}
+
 test "gui:extwin_hosted_float_phantom_hit" {
     // macOS only: the main window's hit test and ExternalGridView are macOS
     // frontend code.

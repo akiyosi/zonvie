@@ -873,13 +873,19 @@ final class ZonvieCore {
                             // Size only: a normal grid's background is the
                             // core's default bg (resolveHlGroupBgColor), never
                             // row 0's quads, which the core drops under blur.
+                            // Framed in the font these rows were drawn in: the
+                            // block can run before this flush's
+                            // commitGridFonts, and the committed table then
+                            // still holds the previous font.
+                            let font = core.sharedResources?.flushGridFont(gridId)
                             DispatchQueue.main.async { [weak core] in
                                 guard let core = core else { return }
                                 core.configureExternalGridFromRow(
                                     gridId: gridId,
                                     gridView: gridView,
                                     rows: totalRows,
-                                    cols: totalCols
+                                    cols: totalCols,
+                                    font: font
                                 )
                             }
                         }
@@ -5432,7 +5438,8 @@ final class ZonvieCore {
         gridId: Int64,
         gridView: ExternalGridView,
         rows: UInt32,
-        cols: UInt32
+        cols: UInt32,
+        font: GridFontPx?
     ) {
         precondition(Thread.isMainThread, "configureExternalGridFromRow must be called on the main thread")
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) rows=\(rows) cols=\(cols)")
@@ -5451,19 +5458,23 @@ final class ZonvieCore {
             gridView: gridView,
             bgColor: nil,
             rows: rows,
-            cols: cols
+            cols: cols,
+            font: font
         )
     }
 
     /// Apply background color and layout configuration to an external grid.
     /// Called from configureExternalGridFromRow (normal path) and onExternalWindow (pending config path).
+    /// `font` is the font the grid's rows were drawn in, when the caller
+    /// knows it; omitted, the committed table answers.
     private func applyExternalGridConfig(
         gridId: Int64,
         window: NSWindow,
         gridView: ExternalGridView,
         bgColor: NSColor?,
         rows: UInt32,
-        cols: UInt32
+        cols: UInt32,
+        font: GridFontPx?? = nil
     ) {
         if classifyExternalGridKind(gridId) != .normal {
             updateDecoratedExternalGrid(
@@ -5478,7 +5489,7 @@ final class ZonvieCore {
 
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
         // A grid in its own font is framed in that font's cells.
-        let gf = gridCellPx(gridId)
+        let gf = font ?? gridCellPx(gridId)
         let cellW = gf.map { CGFloat($0.cellWidthPx) } ?? CGFloat(renderer.cellWidthPx)
         let cellH = gf.map { CGFloat($0.cellHeightPx) } ?? CGFloat(renderer.cellHeightPx)
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
