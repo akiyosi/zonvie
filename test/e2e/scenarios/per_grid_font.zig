@@ -87,6 +87,36 @@ pub fn runSplitResize(alloc: std.mem.Allocator) !void {
     try waitGridSize(h, pair.left, requestedCells(frame.rows, global_cell_h_px, 10), requestedCells(frame.cols - 4, global_cell_w_px, 5));
 }
 
+pub fn runSplitToExternalResize(alloc: std.mem.Allocator) !void {
+    var h = try Harness.init(alloc, .{ .font_slots = true });
+    defer h.deinit();
+    const pair = try vsplitPair(h);
+    const frame = h.subGridSize(pair.left) orelse return error.GridNotFound;
+    try h.command("lua zonvie.set_window_font(0, { scale = 0.5 })");
+    const rows = requestedCells(frame.rows, global_cell_h_px, 10);
+    const cols = requestedCells(frame.cols, global_cell_w_px, 5);
+    try waitGridSize(h, pair.left, rows, cols);
+    try h.command("wincmd ge");
+    const Ctx = struct { g: i64 };
+    try h.waitUntil(Ctx{ .g = pair.left }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return hh.isExternalGrid(c.g);
+        }
+    }.check, h.opts.timeout_ms);
+    // The split's request survives into the float; the core releases it.
+    try h.waitUntil(Ctx{ .g = pair.left }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return !hh.core.grid.split_request_held.contains(c.g) and hh.core.split_release_outbox.items.len == 0;
+        }
+    }.check, h.opts.timeout_ms);
+    // A round trip after the release: Neovim has handled it.
+    try h.command("redraw");
+    try waitGridSize(h, pair.left, rows, cols);
+    // The external window's OS resize, in its font's cells: the grid follows.
+    h.core.requestTryResizeGrid(pair.left, rows / 2, cols / 2);
+    try waitGridSize(h, pair.left, rows / 2, cols / 2);
+}
+
 pub fn runClear(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{ .font_slots = true });
     defer h.deinit();

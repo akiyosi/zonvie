@@ -1213,6 +1213,9 @@ pub const Core = struct {
     last_font_resize_cols: u32 = 0,
     // try_resize_grid requests decided under grid_mu, sent after it is released.
     font_resize_outbox: std.ArrayListUnmanaged(FontResize) = .empty,
+    // Held split requests to release on windows that became external,
+    // decided under grid_mu, sent after it is released (sendSplitReleases).
+    split_release_outbox: std.ArrayListUnmanaged(SplitRelease) = .empty,
     // External-window OS resizes recorded on the UI thread without grid_mu;
     // drainOsResizesLocked moves them into the font state on the RPC thread.
     os_resize_mu: std.Io.Mutex = .init,
@@ -1393,6 +1396,7 @@ pub const Core = struct {
         self.font_query_forced.deinit(self.alloc);
         self.font_query_last_ns.deinit(self.alloc);
         self.font_resize_outbox.deinit(self.alloc);
+        self.split_release_outbox.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.flush_replaced_uvs.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
@@ -5409,6 +5413,7 @@ pub const Core = struct {
         self.font_query_forced.clearRetainingCapacity();
         self.font_query_last_ns.clearRetainingCapacity();
         self.font_resize_outbox.clearRetainingCapacity();
+        self.split_release_outbox.clearRetainingCapacity();
         self.os_resize_mu.lockUncancelable(clock.io());
         self.os_resize_pending_len = 0;
         self.os_resize_overflow = false;
@@ -5493,6 +5498,72 @@ pub const Core = struct {
         self.font_resize_outbox.append(self.alloc, .{ .grid_id = grid_id, .rows = rows, .cols = cols }) catch |e| {
             self.log.write("per-grid font: try_resize_grid dropped: {any}\n", .{e});
         };
+    }
+
+    pub const SplitRelease = struct { grid_id: i64, win: i64, rows: u32, cols: u32 };
+
+    /// Queue the release of every held split request whose window is now
+    /// external (`<C-w>ge`, nvim_win_set_config). The request survives into
+    /// the float and keeps setting its view (window.c win_set_inner_size), so
+    /// the OS window's try_resize_grid would change only the config. Neovim
+    /// releases it only on a split. Under ext_windows an external window is
+    /// still a split, whose request the OS resize itself replaces. Caller
+    /// holds grid_mu.
+    pub fn takeExternalSplitReleasesLocked(self: *Core) void {
+        if (self.ext_windows_enabled or self.grid.split_request_held.count() == 0) return;
+        const first = self.split_release_outbox.items.len;
+        var it = self.grid.split_request_held.keyIterator();
+        while (it.next()) |gid| {
+            const info = self.grid.external_grids.get(gid.*) orelse continue;
+            const sg = self.grid.sub_grids.getPtr(gid.*) orelse continue;
+            self.split_release_outbox.append(self.alloc, .{ .grid_id = gid.*, .win = info.win, .rows = sg.rows, .cols = sg.cols }) catch |e| {
+                self.log.write("per-grid font: split release dropped: {any}\n", .{e});
+                break;
+            };
+        }
+        for (self.split_release_outbox.items[first..]) |r| _ = self.grid.split_request_held.remove(r.grid_id);
+    }
+
+    /// Send the releases takeExternalSplitReleasesLocked queued. Call after
+    /// grid_mu is released: sendRaw blocks on the pipe.
+    pub fn sendSplitReleases(self: *Core) void {
+        for (self.split_release_outbox.items) |r| {
+            self.sendSplitRelease(r) catch |e| {
+                self.log.write("per-grid font: split release failed: {any}\n", .{e});
+            };
+        }
+        self.split_release_outbox.clearRetainingCapacity();
+    }
+
+    /// Turn the window back into a split, release its request with 0x0 (on a
+    /// split only, ui.c), and make it external again at its current grid
+    /// size. Neovim handles the three in order. The 0x0 is sent whatever the
+    /// first finds; it reaches a float only if the window stopped being
+    /// external since this batch, and then sets its config to 1x1.
+    fn sendSplitRelease(self: *Core, r: SplitRelease) !void {
+        var buf: [768]u8 = undefined;
+        const to_split = try std.fmt.bufPrint(&buf,
+            \\local win, rows, cols = {d}, {d}, {d}
+            \\if not vim.api.nvim_win_is_valid(win) then return end
+            \\local cfg = vim.api.nvim_win_get_config(win)
+            \\if not cfg.external then return end
+            \\cfg.width, cfg.height = cols, rows
+            \\_G._zonvie_external_cfg = _G._zonvie_external_cfg or {{}}
+            \\_G._zonvie_external_cfg[win] = cfg
+            \\vim.api.nvim_win_set_config(win, {{ split = 'left', win = -1 }})
+        , .{ r.win, r.rows, r.cols });
+        try self.requestExecLua(to_split);
+        try self.requestTryResizeGridInternal(r.grid_id, 0, 0);
+        const back = try std.fmt.bufPrint(&buf,
+            \\local win = {d}
+            \\local saved = _G._zonvie_external_cfg
+            \\local cfg = saved and saved[win]
+            \\if not cfg then return end
+            \\saved[win] = nil
+            \\if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_set_config(win, cfg) end
+        , .{r.win});
+        try self.requestExecLua(back);
+        self.log.write("per-grid font: released split request grid={d} win={d}\n", .{ r.grid_id, r.win });
     }
 
     fn notifyGridFont(self: *Core, grid_id: i64, gf: ?grid_mod.GridFont) void {
@@ -9343,6 +9414,39 @@ test "a split's request is never released with 0x0 to a float, and is released o
     // Released once only.
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true });
     try std.testing.expectEqual(sent + 1, core.font_resize_requests);
+}
+
+test "a held split that becomes external is released once, and not under ext_windows" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try splitWithFrame(&core);
+    core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
+    // Neovim's answer to the font's request.
+    try core.grid.resizeGrid(2, 20, 80);
+    try std.testing.expect(core.grid.split_request_held.contains(2));
+    // Still a split: nothing to release.
+    core.takeExternalSplitReleasesLocked();
+    try std.testing.expectEqual(@as(usize, 0), core.split_release_outbox.items.len);
+    // <C-w>ge: the request survives into the external float.
+    _ = try core.grid.setWinExternalPos(2, 1000);
+    core.ext_windows_enabled = true;
+    core.takeExternalSplitReleasesLocked();
+    try std.testing.expectEqual(@as(usize, 0), core.split_release_outbox.items.len);
+    core.ext_windows_enabled = false;
+    core.takeExternalSplitReleasesLocked();
+    try std.testing.expectEqual(@as(usize, 1), core.split_release_outbox.items.len);
+    const r = core.split_release_outbox.items[0];
+    try std.testing.expectEqual(@as(i64, 2), r.grid_id);
+    try std.testing.expectEqual(@as(i64, 1000), r.win);
+    try std.testing.expectEqual(@as(u32, 20), r.rows);
+    try std.testing.expectEqual(@as(u32, 80), r.cols);
+    try std.testing.expect(!core.grid.split_request_held.contains(2));
+    // Released once only.
+    core.takeExternalSplitReleasesLocked();
+    try std.testing.expectEqual(@as(usize, 1), core.split_release_outbox.items.len);
+    core.split_release_outbox.clearRetainingCapacity();
 }
 
 // window.c: win_pos height is w_height (view + winbar); w_height_request

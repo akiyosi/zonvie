@@ -85,6 +85,11 @@ test "e2e:per_grid_font_split_resize" {
     try @import("scenarios/per_grid_font.zig").runSplitResize(testing.allocator);
 }
 
+test "e2e:per_grid_font_split_to_external_resize" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runSplitToExternalResize(testing.allocator);
+}
+
 test "e2e:per_grid_font_clear" {
     try requireNvim();
     try @import("scenarios/per_grid_font.zig").runClear(testing.allocator);
