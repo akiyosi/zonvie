@@ -3390,6 +3390,9 @@ pub fn drawSurfaceRowsVBFromSlots(
     root_rows_may_be_empty: bool,
     /// See RowModeDrawParams.root_extent_h_px.
     root_extent_h_px: u32,
+    /// See RowModeDrawParams.damage_bands.
+    damage_bands: []const core.damage_bands.Band,
+    root_origin_y_px: i32,
     /// Set for rows of an eased scroll region: the caller set the region's
     /// scissor and cleared it once, so each row is drawn at this offset with
     /// neither, its pixels straddling row boundaries.
@@ -3441,6 +3444,10 @@ pub fn drawSurfaceRowsVBFromSlots(
                 const clear_top = y_offset + band[0];
                 const clear_bot = y_offset + band[1];
                 var sc: c.D3D11_RECT = .{ .left = x_offset, .top = clear_top, .right = content_right, .bottom = clear_bot };
+                if (!clipRootRowToBand(&sc, damage_bands, y_offset, root_origin_y_px, row, row_h_px)) {
+                    metrics.drawn_rows += 1;
+                    continue;
+                }
                 rs_set_sc_fn.?(ctx_ptr, 1, &sc);
                 if (vp_dirty) {
                     if (rs_set_vp_fn) |vp_fn| {
@@ -3504,7 +3511,13 @@ pub fn drawSurfaceRowsVBFromSlots(
                 .right = content_right,
                 .bottom = bottom,
             };
-            if (ease_offset_px == null) rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+            if (ease_offset_px == null) {
+                if (!clipRootRowToBand(&sc, damage_bands, y_offset, root_origin_y_px, row, row_h_px)) {
+                    metrics.drawn_rows += 1;
+                    continue;
+                }
+                rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+            }
 
             if (rs_set_vp_fn) |vp_fn| {
                 if (row_shift.viewport_dy_px != 0) {
@@ -3586,6 +3599,24 @@ pub fn drawSurfaceRowsVBFromSlots(
             vp_fn(ctx_ptr, 1, &vp);
         }
     }
+}
+
+/// Narrow a root row's scissor to the damage band the row belongs to, so a
+/// row a band reaches only through its extra row clears nothing outside the
+/// band (zonvie_core_damage_bands). A row no band names keeps its scissor.
+/// False when nothing of the row is left to draw.
+fn clipRootRowToBand(
+    sc: *c.D3D11_RECT,
+    bands: []const core.damage_bands.Band,
+    y_offset: i32,
+    origin_y_px: i32,
+    row: u32,
+    row_h_px: i32,
+) bool {
+    const band = core.damage_bands.bandForLayerRow(bands, origin_y_px, row, row_h_px) orelse return true;
+    sc.top = @max(sc.top, y_offset + band.top_px);
+    sc.bottom = @min(sc.bottom, y_offset + band.bottom_px);
+    return sc.bottom > sc.top;
 }
 
 /// Shared row-mode rendering with TBS (slot-based COW + separate RowVB array).
@@ -3702,6 +3733,8 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             params.layer_origin_y_px,
             params.root_rows_may_be_empty,
             params.root_extent_h_px,
+            params.damage_bands,
+            params.root_origin_y_px,
             if (eased) params.root_ease.?.offset_px else null,
             log_enabled,
             &result.metrics,
@@ -3959,6 +3992,11 @@ pub const RowModeDrawParams = struct {
     /// The root grid's font extent height when it has its own font, else 0:
     /// its last row reaches it (rootRowBandPx).
     root_extent_h_px: u32 = 0,
+    /// The frame's damage bands when the surface draws layers
+    /// (planLayerFrame), else empty. Each root row is clipped to its band
+    /// (clipRootRowToBand); `root_origin_y_px` is the root layer's y.
+    damage_bands: []const core.damage_bands.Band = &.{},
+    root_origin_y_px: i32 = 0,
     content_y_offset: ?u32 = null,
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
@@ -4455,13 +4493,45 @@ fn drawLayerRow(
 ) LayerRowOutcome {
     // An eased row is drawn under its region's scissor, which drawEasedRegion
     // set and cleared once: the row's pixels straddle row boundaries.
-    if (d.ease_offset_px == null) {
-        if (d.rs_set_sc_fn) |f| {
-            var sc = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse return .{ .encoded = false };
-            f(d.ctx_ptr, 1, &sc);
-        }
-    }
+    if (d.ease_offset_px != null) return drawLayerRowUnder(g, src, state, rows, ri, d);
+    const f = d.rs_set_sc_fn orelse return drawLayerRowUnder(g, src, state, rows, ri, d);
+    const own = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse return .{ .encoded = false };
 
+    // Clipped to every band that names this row (zonvie_core_damage_bands):
+    // a row a band reaches only through its extra row must land nothing
+    // outside the band, where the layers over it are not redrawn. A grid in
+    // its own font is off the root's row lattice, so unclipped its rows and
+    // the root's would erase each other's pixels.
+    var out: LayerRowOutcome = .{ .encoded = false };
+    var hit = false;
+    for (d.bands) |band| {
+        const r = d.layer.rowsForBand(band, d.layer.y_px, @intCast(rows.len), d.row_h_px) orelse continue;
+        if (ri < r[0] or ri > r[1]) continue;
+        hit = true;
+        var sc = own;
+        sc.top = @max(sc.top, d.y_offset + band.top_px);
+        sc.bottom = @min(sc.bottom, d.y_offset + band.bottom_px);
+        if (sc.bottom <= sc.top) continue;
+        f(d.ctx_ptr, 1, &sc);
+        const one = drawLayerRowUnder(g, src, state, rows, ri, d);
+        if (one.encoded) out.encoded = true;
+        if (one.failed) return .{ .encoded = out.encoded, .failed = true, .budget_exceeded = one.budget_exceeded };
+    }
+    if (hit) return out;
+    var sc = own;
+    f(d.ctx_ptr, 1, &sc);
+    return drawLayerRowUnder(g, src, state, rows, ri, d);
+}
+
+/// drawLayerRow's work under the scissor the caller set.
+fn drawLayerRowUnder(
+    g: *d3d11.Renderer,
+    src: LayerFrameSource,
+    state: *LayerPaintState,
+    rows: []const RowMapping,
+    ri: usize,
+    d: LayerRowDrawCtx,
+) LayerRowOutcome {
     const mapping = rows[ri];
     const verts_len: usize = if (mapping.slot != SLOT_NONE) src.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
 
@@ -4509,6 +4579,8 @@ const LayerRowDrawCtx = struct {
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     /// Set while drawing an eased region's rows; see drawEasedRegion.
     ease_offset_px: ?f32 = null,
+    /// The frame's damage bands, which clip every row (drawLayerRow).
+    bands: []const core.damage_bands.Band = &.{},
 };
 
 /// The surface rectangle of rows [row_start, row_end) of a layer, clipped to
@@ -4616,6 +4688,7 @@ pub fn drawSurfaceLayers(
             .row_h_px = layer.rowHeightPx(row_h_px),
             .ctx_ptr = ctx_ptr,
             .rs_set_sc_fn = rs_set_sc_fn,
+            .bands = src.paint.bands.items,
         };
 
         var encoded: u32 = 0;
@@ -5274,6 +5347,12 @@ pub fn drawSurfaceRowFrame(
     const row_h_px = in.draw_params.row_h_px;
     const cell_w_px: i32 = @intCast(@max(1, app.cell_w_px));
 
+    // planLayerFrame set this frame's bands only when it ran (layer_src).
+    var root_params = in.draw_params;
+    if (in.layer_src) |src| {
+        root_params.damage_bands = src.paint.bands.items;
+        root_params.root_origin_y_px = in.layers[0].y_px;
+    }
     out.rows = drawRowModeSetupAndRowsFromSlots(
         g,
         &app.row_vb_budget,
@@ -5282,7 +5361,7 @@ pub fn drawSurfaceRowFrame(
         surface.pool,
         surface.row_vbs,
         in.rows_to_draw,
-        in.draw_params,
+        root_params,
     ) catch |e| {
         out.row_vb_budget_exceeded = e == error.RowVBPhysicalBudgetExceeded;
         if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
@@ -7395,6 +7474,35 @@ test "a per-grid font reaches the layers with the commit, and is redrawn whole" 
     try std.testing.expect(stampLayerFonts(alloc, &budget, &fonts, &tbs, false));
     try std.testing.expectEqual(@as(u32, 12), tbs.flush_layers.?.items[1].font_cell_w_px);
     tbs.cancelFlush();
+}
+
+test "a root row is clipped to its damage band" {
+    // A band whose edges fall inside the root's 25 px rows, as a font
+    // layer's own row lattice leaves them; unclipped, the root's rows 1 and 3
+    // would erase font rows the band does not redraw.
+    const bands = [_]core.damage_bands.Band{.{ .top_px = 50, .bottom_px = 84 }};
+    const y_offset: i32 = 10;
+    const h: i32 = 25;
+    const cases = [_]struct { row: u32, drawn: bool, top: i32 = 0, bottom: i32 = 0 }{
+        // Reached only through the band's extra row: nothing left to draw.
+        .{ .row = 1, .drawn = false },
+        .{ .row = 2, .drawn = true, .top = 60, .bottom = 85 },
+        .{ .row = 3, .drawn = true, .top = 85, .bottom = 94 },
+    };
+    for (cases) |cs| {
+        const top = y_offset + @as(i32, @intCast(cs.row)) * h;
+        var sc: c.D3D11_RECT = .{ .left = 0, .top = top, .right = 100, .bottom = top + h };
+        try std.testing.expectEqual(cs.drawn, clipRootRowToBand(&sc, &bands, y_offset, 0, cs.row, h));
+        if (cs.drawn) {
+            try std.testing.expectEqual(cs.top, sc.top);
+            try std.testing.expectEqual(cs.bottom, sc.bottom);
+        }
+    }
+    // Without bands (a surface with no layers) the row keeps its scissor.
+    var sc: c.D3D11_RECT = .{ .left = 0, .top = 35, .right = 100, .bottom = 60 };
+    try std.testing.expect(clipRootRowToBand(&sc, &.{}, y_offset, 0, 1, h));
+    try std.testing.expectEqual(@as(i32, 35), sc.top);
+    try std.testing.expectEqual(@as(i32, 60), sc.bottom);
 }
 
 test "a font grid's last row owns its bottom margin and is clipped to its extent" {
