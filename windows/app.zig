@@ -6657,6 +6657,9 @@ pub const App = struct {
             self.alloc.free(password);
             self.ssh_password = null;
         }
+
+        // App owns the config strings handed over in main().
+        self.config.deinit();
     }
 };
 

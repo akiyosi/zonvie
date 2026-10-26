@@ -502,6 +502,7 @@ pub fn main() u8 {
     var nvim_file_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
     const shell_cwd: ?[]const u8 = getCwdUtf8(alloc);
+    defer if (shell_cwd) |cwd| alloc.free(cwd);
 
     var i: usize = 1; // Skip argv[0] (executable path)
     while (i < args.len) : (i += 1) {
