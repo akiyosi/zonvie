@@ -788,7 +788,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
     override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
-        resolveInputTarget(pointPx: surfacePointPx(atViewPoint: location), requireScrollable: false)
+        resolveInputTarget(at: location, requireScrollable: false)
     }
 
 
@@ -3864,47 +3864,39 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// drop the scroll transform. Main thread only (draw and input).
     private var drewWithoutScrollTransform = false
 
-    /// The ease offset the last frame drew `grid` with: none at all on a
-    /// frame that dropped the scroll transform.
-    private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat, scroll: SessionScrollModel) -> CGFloat {
-        drewWithoutScrollTransform ? 0 : scroll.visualScrollOffsetPx(
-            gridId: grid, cellHeightPx: shared.gridFont(grid).map { CGFloat($0.cellHeightPx) } ?? cellH)
-    }
-
-    /// Which grid a pointer event at `pointPx` (surface content pixels,
-    /// top-origin) targets, and the point in that grid's own cells: the
-    /// shared rule (GridInputView.resolvePointerTarget) over this surface's
-    /// committed layers.
+    /// Which grid a pointer at `location` (view points) targets, and the
+    /// point in that grid's own cells: the shared rule
+    /// (GridInputView.resolvePointerTarget) over this surface's committed
+    /// layers.
     private func resolveInputTarget(
-        pointPx: CGPoint,
+        at location: CGPoint,
         requireScrollable: Bool
     ) -> (gridId: Int64, row: Int32, col: Int32) {
-        let cellH = CGFloat(shared.cellHeightPx)
-        return resolvePointerTarget(pointPx: pointPx, cellW: CGFloat(shared.cellWidthPx), cellH: cellH,
-                                    requireScrollable: requireScrollable, surface: pointerSurface(cellH: cellH))
+        guard let g = pointerGeometry(at: location) else { return (gridId, 0, 0) }
+        return resolvePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH,
+                                    requireScrollable: requireScrollable)
     }
 
-    /// This surface's committed frame, as the pointer reads it: the view
-    /// holds the layers itself, and a hosted float's displacement is where
-    /// drawHostedLayers draws it (hostedLayerDrawOriginY).
-    private func pointerSurface(cellH: CGFloat) -> PointerSurface {
-        PointerSurface(
-            scrollOffsetPx: { [unowned self] grid in
-                guard let scroll = self.core?.scrollModel else { return 0 }
-                return self.drawnScrollOffsetPx(grid, cellH: cellH, scroll: scroll)
-            },
-            followerOffsetsPx: { [unowned self] in self.drawnFollowerOffsetsPx(cellH: cellH) },
-            paintRanks: { [unowned self] in
-                self.lock.lock()
-                defer { self.lock.unlock() }
-                var ranks: [Int64: Int] = [:]
-                for layer in self.committedSurfaceLayers where ranks[layer.gridId] == nil { ranks[layer.gridId] = layer.z }
-                return ranks
-            },
-            layerOriginPx: { [unowned self] in
-                self.committedLayer($0).map { CGPoint(x: CGFloat($0.originPx.x), y: CGFloat($0.originPx.y)) }
-            },
-            layerCells: { [unowned self] in self.committedLayer($0).map { (Int32($0.rows), Int32($0.cols)) } })
+    // This surface's committed frame, as the pointer reads it: the view
+    // holds the layers itself, and a hosted float's displacement is where
+    // drawHostedLayers draws it (hostedLayerDrawOriginY).
+
+    override var frameDroppedScrollTransform: Bool { drewWithoutScrollTransform }
+
+    override func committedPaintRanks() -> [Int64: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        var ranks: [Int64: Int] = [:]
+        for layer in committedSurfaceLayers where ranks[layer.gridId] == nil { ranks[layer.gridId] = layer.z }
+        return ranks
+    }
+
+    override func committedLayerOriginPx(_ gridId: Int64) -> CGPoint? {
+        committedLayer(gridId).map { CGPoint(x: CGFloat($0.originPx.x), y: CGFloat($0.originPx.y)) }
+    }
+
+    override func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? {
+        committedLayer(gridId).map { (Int32($0.rows), Int32($0.cols)) }
     }
 
     private func committedLayer(_ gid: Int64) -> SurfaceLayer? {
@@ -3916,15 +3908,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// The floats this surface hosts that are drawn displaced bodily this
     /// frame, by how far: the anchor's offset plus the float's debt, with no
     /// ease of their own for the pointer to undo.
-    private func drawnFollowerOffsetsPx(cellH: CGFloat) -> [Int64: CGFloat] {
-        guard let scroll = core?.scrollModel, scroll.hasOffsets else { return [:] }
-        let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
+    override func drawnFollowerOffsetsPx(cellH: CGFloat) -> [Int64: CGFloat] {
+        guard core?.scrollModel.hasOffsets == true else { return [:] }
+        let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH)
         lock.lock()
         let layers = committedSurfaceLayers
         lock.unlock()
         var followers: [Int64: CGFloat] = [:]
         for layer in layers where layer.gridId != gridId {
-            let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH, scroll: scroll)
+            let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH)
             let displacedPx = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
                                                      rootOffsetPx: rootOffsetPx, cellH: cellH)
                 - CGFloat(layer.originPx.y)
@@ -3969,15 +3961,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // A float this surface hosts is drawn above the root, so a press inside
         // it has to name that grid; naming the root applies the press to the
         // window underneath instead.
-        resolveInputTarget(pointPx: surfacePointPx(event), requireScrollable: requireScrollable)
+        resolveInputTarget(at: convert(event.locationInWindow, from: nil), requireScrollable: requireScrollable)
     }
 
     override func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64)
         -> (gridId: Int64, row: Int32, col: Int32)?
     {
-        let cellH = CGFloat(shared.cellHeightPx)
-        return rebasePointerTarget(pointPx: surfacePointPx(event), cellW: CGFloat(shared.cellWidthPx), cellH: cellH,
-                                   pinned: pinned, surface: pointerSurface(cellH: cellH))
+        guard let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
+        return rebasePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH, pinned: pinned)
     }
 
     // MARK: - Scroll Event Handling
@@ -3986,11 +3977,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     override func scrollWheel(with event: NSEvent) {
         guard let scroll = core?.scrollModel else { return }
-        let scale = backingScale
-        let pointPx = surfacePointPx(event)
+        let location = convert(event.locationInWindow, from: nil)
         scroll.handleGridScrollWheel(
-            event, lock: &scrollTargetLock, scale: scale, logTag: "ExternalGridView scroll",
-            resolve: { resolveInputTarget(pointPx: pointPx, requireScrollable: $0) },
+            event, lock: &scrollTargetLock, scale: backingScale, logTag: "ExternalGridView scroll",
+            resolve: { resolveInputTarget(at: location, requireScrollable: $0) },
             // The draw re-runs serviceFrame and updateScrollShaderOffset
             // (settleSurfaceAgainstOwnCommit), and handleScrollInput wakes
             // the draw loop of the view showing the target grid.
