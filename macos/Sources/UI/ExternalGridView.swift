@@ -345,11 +345,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
         guard let layer = (pendingSurfaceLayers ?? committedSurfaceLayers).first(where: { $0.gridId == id }) else { return }
-        let height = max(1, Float(shared.cellHeightPx).rounded(.up))
-        // The host rows the layer rows cover; the draw's damage bands add the
-        // neighbours glyph ink can cross into.
-        let first = max(0, Int(floor(layer.originPx.y / height)) + rowStart)
-        let end = min(Int(gridRows), Int(ceil(layer.originPx.y / height)) + rowEnd)
+        // The host rows the layer rows cover, sized as the draw sizes them:
+        // the host's rows are the root grid's (cellHi), and a layer's are its
+        // own font's, else the host's (SurfaceLayer.rowHeightPx). The draw's
+        // damage bands add the neighbours glyph ink can cross into.
+        let hostHeight = max(1, shared.rowHeightPx(gridId).rounded(.up))
+        let layerHeight = shared.gridFont(id).map { Float($0.cellHeightPx) } ?? hostHeight
+        let topPx = layer.originPx.y + Float(rowStart) * layerHeight
+        let bottomPx = layer.originPx.y + Float(rowEnd) * layerHeight
+        let first = max(0, Int(floor(topPx / hostHeight)))
+        let end = min(Int(gridRows), Int(ceil(bottomPx / hostHeight)))
         if first < end { flushDirtyRows.insert(integersIn: first..<end) }
     }
 
@@ -787,9 +792,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
-    override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
-        resolveInputTarget(at: location, requireScrollable: false)
-    }
 
 
     // Use GridSurfaceRenderer.ScrollOffset for shader data (shared with main window)
@@ -3864,19 +3866,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// drop the scroll transform. Main thread only (draw and input).
     private var drewWithoutScrollTransform = false
 
-    /// Which grid a pointer at `location` (view points) targets, and the
-    /// point in that grid's own cells: the shared rule
-    /// (GridInputView.resolvePointerTarget) over this surface's committed
-    /// layers.
-    private func resolveInputTarget(
-        at location: CGPoint,
-        requireScrollable: Bool
-    ) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let g = pointerGeometry(at: location) else { return (gridId, 0, 0) }
-        return resolvePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH,
-                                    requireScrollable: requireScrollable)
-    }
-
     // This surface's committed frame, as the pointer reads it: the view
     // holds the layers itself, and a hosted float's displacement is where
     // drawHostedLayers draws it (hostedLayerDrawOriginY).
@@ -3957,91 +3946,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
 
-    override func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
-        // A float this surface hosts is drawn above the root, so a press inside
-        // it has to name that grid; naming the root applies the press to the
-        // window underneath instead.
-        resolveInputTarget(at: convert(event.locationInWindow, from: nil), requireScrollable: requireScrollable)
-    }
-
-    override func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64)
-        -> (gridId: Int64, row: Int32, col: Int32)?
-    {
-        guard let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
-        return rebasePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH, pinned: pinned)
-    }
-
-    // MARK: - Scroll Event Handling
-
-    private var scrollTargetLock = ScrollTargetLock()
-
-    override func scrollWheel(with event: NSEvent) {
-        guard let scroll = core?.scrollModel else { return }
-        let location = convert(event.locationInWindow, from: nil)
-        scroll.handleGridScrollWheel(
-            event, lock: &scrollTargetLock, scale: backingScale, logTag: "ExternalGridView scroll",
-            resolve: { resolveInputTarget(at: location, requireScrollable: $0) },
-            // The draw re-runs serviceFrame and updateScrollShaderOffset
-            // (settleSurfaceAgainstOwnCommit), and handleScrollInput wakes
-            // the draw loop of the view showing the target grid.
-            afterPrecise: { _ in requestRedraw() })
-    }
-
-    /// Cursor is grid-local; viewportOriginPt adds a decorated surface's inset
-    /// (e.g. the cmdline icon/padding).
-    override func imeCursorRectInView() -> NSRect? {
-        guard let core = core else { return nil }
-        let cursor = core.getCursorPositionNonBlocking()
-        guard cursor.row >= 0, cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) else { return nil }
-        let cell = imePreeditCellSize
-        return NSRect(x: viewportOriginPt.x + origin.x + CGFloat(cursor.col) * cell.width,
-                      y: imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height,
-                      width: cell.width, height: cell.height)
-    }
-
-    override func imeFallbackRectInView() -> NSRect {
-        let cell = imePreeditCellSize
-        return NSRect(x: viewportOriginPt.x,
-                      y: imeContentTopPt(rowHeightPt: cell.height) - cell.height,
-                      width: cell.width, height: cell.height)
-    }
-}
-
-// MARK: - IME host
-
-extension ExternalGridView {
-    /// Where the cursor's grid sits in this view, in points from the top-left:
-    /// zero for this window's root, the layer origin for a float it hosts,
-    /// nil when the cursor is on another surface. The IME answered only for
-    /// the root, so a hosted float's candidate window fell to the corner.
-    private func imeCursorGridOriginPt(_ cursorGrid: Int64) -> CGPoint? {
-        if cursorGrid == gridId { return .zero }
-        lock.lock()
-        let layer = committedSurfaceLayers.first { $0.gridId == cursorGrid }
-        lock.unlock()
-        guard let layer else { return nil }
-        let scale = backingScale
-        return CGPoint(x: CGFloat(layer.originPx.x) / scale, y: CGFloat(layer.originPx.y) / scale)
-    }
-
-    /// The y, in view points from the bottom, of the top of the grid content.
-    /// A decorated surface's frame is sized to its content, so the grid's own
-    /// height plus the viewport offset is exact there. A normal window draws
-    /// from the top and may carry leftover pixels (zoom, tiling) or a stale row
-    /// count mid-resize; the view's height is its top, as the mouse and the
-    /// main window's IME measure it.
-    private func imeContentTopPt(rowHeightPt: CGFloat) -> CGFloat {
-        guard isDecoratedSurface else { return bounds.height }
-        // The committed row count, under the lock the draw reads it with:
-        // `gridRows` is the core thread's in-flight bracket value, unpublished
-        // and not restored when that bracket is cancelled.
-        lock.lock()
-        let extent = committedExtent
-        lock.unlock()
-        let rows = extent.resolved(liveWidth: gridCols, liveHeight: gridRows).height
-        return viewportOriginPt.y + CGFloat(rows) * rowHeightPt
-    }
-
+    /// A decorated surface's inset (the cmdline icon and padding): the draw
+    /// maps content through MTLViewport(origin: viewportOriginPt * scale).
+    override var contentOriginPt: CGPoint { viewportOriginPt }
 }
 
 extension ExternalGridView {

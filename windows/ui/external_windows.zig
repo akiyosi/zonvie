@@ -1325,24 +1325,32 @@ fn sendExternalResize(hwnd: c.HWND, corep: ?*app_mod.zonvie_core, grid_id: i64, 
     _ = c.SetTimer(hwnd, app_mod.TIMER_EXTERNAL_RESIZE_ANSWER, app_mod.EXTERNAL_RESIZE_ANSWER_TIMEOUT_MS, null);
 }
 
+/// The cell an external window's grid is framed and sized in: its own font's,
+/// else the global one. `cell_h` is the row height, linespace included, as
+/// the core's vertices are laid out. `app.mu` held.
+const FramingCellPx = struct { cell_w: u32, cell_h: u32 };
+
+fn framingCellPxLocked(app: *App, grid_id: i64) FramingCellPx {
+    if (app.gridCellPx(grid_id)) |gf| return .{ .cell_w = gf.cell_w_px, .cell_h = gf.cell_h_px };
+    return .{ .cell_w = app.cell_w_px, .cell_h = app.rowHeightPx() };
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
     const is_msg_show = req.grid_id == app_mod.MESSAGE_GRID_ID;
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    var cell_w = app.cell_w_px;
-    var cell_h = app.rowHeightPx();
+    var cell_w: u32 = 0;
+    var cell_h: u32 = 0;
 
     var current_hwnd: ?c.HWND = null;
     const surface_dpi_scale: f32 = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        // A grid in its own font is framed in that font's cells.
-        if (app.gridCellPx(req.grid_id)) |gf| {
-            cell_w = gf.cell_w_px;
-            cell_h = gf.cell_h_px;
-        }
+        const cell = framingCellPxLocked(app, req.grid_id);
+        cell_w = cell.cell_w;
+        cell_h = cell.cell_h;
         const w = app.external_windows.get(req.grid_id) orelse break :blk app.dpi_scale;
         current_hwnd = w.hwnd;
         break :blk w.dpi_scale;
@@ -1519,19 +1527,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     }
 
-    // Get cell dimensions from main atlas
-    // Note: cell_h must include linespace_px to match core's vertex generation
-    var cell_w: u32 = app.cell_w_px;
-    var cell_h: u32 = app.rowHeightPx();
-    {
-        // A grid in its own font is framed in that font's cells.
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        if (app.gridCellPx(req.grid_id)) |gf| {
-            cell_w = gf.cell_w_px;
-            cell_h = gf.cell_h_px;
-        }
-    }
+    app.mu.lockUncancelable(core.clock.io());
+    const cell = framingCellPxLocked(app, req.grid_id);
+    app.mu.unlock(core.clock.io());
+    const cell_w: u32 = cell.cell_w;
+    const cell_h: u32 = cell.cell_h;
     const content_w: c_int = @intCast(req.cols * cell_w);
     const content_h: c_int = @intCast(req.rows * cell_h);
 
@@ -2545,9 +2545,9 @@ pub export fn ExternalWndProc(
                 }
 
                 // A grid in its own font counts its rows and columns in that font.
-                const gf = if (grid_id) |gid| app.gridCellPx(gid) else null;
-                const cell_w = if (gf) |f| f.cell_w_px else app.cell_w_px;
-                const cell_h = if (gf) |f| f.cell_h_px else app.rowHeightPx();
+                const cell = framingCellPxLocked(app, grid_id orelse 0);
+                const cell_w = cell.cell_w;
+                const cell_h = cell.cell_h;
                 const corep = app.corep;
                 // Same reservation the paint applies, and the same one the main
                 // window's grid-size derivation has always applied: in "always"

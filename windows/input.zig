@@ -1261,16 +1261,28 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
 /// contention yields (-1,-1)).
 const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT };
 
-fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, cell_w: u32, cell_h: u32, row_h_px: u32) ?ImeCursorPoint {
+fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, global_cell_w: u32, global_cell_h: u32, global_row_h_px: u32) ?ImeCursorPoint {
     var row: i32 = 0;
     var col: i32 = 0;
     const grid_id = getCursorPositionNonBlocking(app, corep, &row, &col, null);
     if (row < 0 or col < 0) return null;
 
+    // The cursor's cell as the pointer measures it (gridCellAt): the grid's
+    // own font, and the ease the last paint drew its rows with.
+    var cell_w = global_cell_w;
+    var cell_h = global_cell_h;
+    var row_h_px = global_row_h_px;
+    var ease_px: i32 = 0;
     var main_layer: [2]i32 = .{ 0, 0 };
     const ext_surface = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
+        if (app.gridCellPx(grid_id)) |gf| {
+            cell_w = gf.cell_w_px;
+            cell_h = gf.cell_h_px;
+            row_h_px = gf.cell_h_px;
+        }
+        ease_px = @intFromFloat(@round(drawnEaseOffsetPxLocked(app, grid_id)));
         const es = imeExternalSurfaceLocked(app, grid_id);
         if (es == null) main_layer = render_helpers.layerOriginPx(app_mod.SurfaceLayer, app.surf.tbs.committed_layers.slice(), grid_id, 1);
         break :blk es;
@@ -1289,7 +1301,7 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
         origin_y += origin.y + main_layer[1];
     }
     const x = origin_x + col * @as(c.LONG, @intCast(cell_w));
-    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px));
+    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px)) + ease_px;
     return .{
         .coord_hwnd = coord_hwnd,
         .pt_cursor = .{ .x = x, .y = y },

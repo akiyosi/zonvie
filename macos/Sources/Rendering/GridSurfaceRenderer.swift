@@ -2114,6 +2114,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// the resulting grid_scroll arrives. Armed at send time, not at draw
     /// time: Neovim's response can land within a millisecond, before any
     /// frame is drawn, which left every gesture's first row uncaptured.
+    /// Never disarmed wholesale: a span survives a layout change and is only
+    /// re-armed by the next precise scroll, so a keyboard scroll between a
+    /// window MOVING and that gesture captures against the old span, and a
+    /// grid id another window reuses inherits the old window's span until
+    /// its own next precise scroll re-arms it.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
     /// grid_scroll steps consumed by a bracket that has not committed yet.
     /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
@@ -3157,25 +3162,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         } else {
             gridScrollCaptureBounds.removeValue(forKey: gridId)
         }
-    }
-
-    func clearScrollOffsets() {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Unreachable: its one caller, MetalTerminalView.clearAllScrollOffsets,
-        // has no callers of its own. See that function's note before relying on
-        // any of this running.
-        scrollOffsetData = []
-        scrollOffsetLatch.setActive(false)
-        // The spans describe the layout this reset abandons.
-        gridScrollCaptureBounds.removeAll(keepingCapacity: true)
-        // A parked step describes the same abandoned layout, and would be
-        // replayed against post-reset bounds and a post-reset source set.
-        pendingRetentionReplay.removeAll()
-        bracketSourceShift.removeAll(keepingCapacity: true)
-        // Retained rows were built for the layout being abandoned.
-        retention.clearPublished()
     }
 
     /// Compute ScrollOffset from ScrollOffsetInfo (shared logic for main window and external grids).

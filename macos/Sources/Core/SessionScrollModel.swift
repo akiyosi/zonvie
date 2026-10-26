@@ -366,7 +366,8 @@ final class SessionScrollModel {
     /// grid this one already retained.
     ///
     /// Note the spans are never disarmed in practice (see
-    /// clearAllScrollOffsets), so one gesture arms every grid for the session.
+    /// GridSurfaceRenderer.gridScrollCaptureBounds), so one gesture arms
+    /// every grid for the session.
     private func armScrollRetention(gridId: Int64) {
         guard GridSurfaceRenderer.smoothScrollEnabled, let core, let renderer else { return }
         // The band a wheel event opens is as wide as the rows it moves, so the
@@ -1545,15 +1546,6 @@ final class SessionScrollModel {
         // step with the placement standing still.
         anchors.removeAll(keepingCapacity: true)
         for (gridId, rows) in anchorLandedRowsUp { anchors[gridId] = rows }
-    }
-
-    /// Drop every offset and edge flag. Only reached from the view's
-    /// unreachable clearAllScrollOffsets.
-    func clearAllOffsets() {
-        scrollOffsetLock.lock()
-        scrollOffsetPx.removeAll()
-        scrollEdgeBlocked.removeAll()
-        scrollOffsetLock.unlock()
     }
 
     /// Whether a trackpad gesture is compensating this grid's scrolls through

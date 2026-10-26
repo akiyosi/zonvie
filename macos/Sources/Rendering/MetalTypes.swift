@@ -453,20 +453,6 @@ final class ScrollRetention {
         return published.reduce(0) { $0 + ($1.gridId == gridId ? 1 : 0) }
     }
 
-    /// Drop everything on screen: a retained row is only meaningful while its
-    /// grid is displaced.
-    ///
-    /// Deliberately leaves the STAGED set alone. Called from the draw side
-    /// while the core thread may be mid-bracket, and discarding its staged rows
-    /// would make `commit()` report that nothing was staged — dropping the step
-    /// and with it the caller's per-step state (the main surface's ease seed),
-    /// so the picture snaps instead of easing.
-    func clearPublished() {
-        lock.lock()
-        published.removeAll(keepingCapacity: true)
-        lock.unlock()
-    }
-
     // MARK: - Planning
 
     /// Which rows a step of `rowsDelta` takes out of [rowStart, rowEnd), cut
