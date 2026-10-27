@@ -5467,6 +5467,7 @@ pub const Core = struct {
             const grid_rows = r.rows;
             gf.req_rows = r.rows;
             gf.req_cols = r.cols;
+            gf.os_answer_pending = true;
             gf.frame_rows = font_slots.footprintCells(grid_rows, gf.cell_h_px, @max(1, self.cell_h_px));
             gf.frame_cols = font_slots.footprintCells(r.cols, gf.cell_w_px, @max(1, self.cell_w_px));
             const ext_w = r.cols * gf.cell_w_px;
@@ -5765,6 +5766,31 @@ pub const Core = struct {
     pub fn drainFontReleasesLocked(self: *Core) void {
         for (self.grid.font_releases_pending.items) |id| self.releaseFontSlot(id);
         self.grid.font_releases_pending.clearRetainingCapacity();
+    }
+
+    /// Take the size Neovim gave an external window on its own as that
+    /// window's request, frame and extent, so the frontend frames the OS
+    /// window to it. Runs before the flush that draws the new size, whose
+    /// end commits on_grid_font. Caller holds grid_mu.
+    pub fn notifyAdoptedGridSizesLocked(self: *Core) void {
+        defer self.grid.font_sizes_adopted.clearRetainingCapacity();
+        for (self.grid.font_sizes_adopted.items) |grid_id| {
+            const gf = self.grid.grid_fonts.getPtr(grid_id) orelse continue;
+            const sg = self.grid.sub_grids.getPtr(grid_id) orelse continue;
+            if (gf.mode != .resize or (sg.rows == gf.req_rows and sg.cols == gf.req_cols)) continue;
+            gf.req_rows = sg.rows;
+            gf.req_cols = sg.cols;
+            gf.frame_rows = font_slots.footprintCells(sg.rows, gf.cell_h_px, @max(1, self.cell_h_px));
+            gf.frame_cols = font_slots.footprintCells(sg.cols, gf.cell_w_px, @max(1, self.cell_w_px));
+            const ext_w = sg.cols * gf.cell_w_px;
+            const ext_h = sg.rows * gf.cell_h_px;
+            if (ext_w == gf.extent_w_px and ext_h == gf.extent_h_px) continue;
+            gf.extent_w_px = ext_w;
+            gf.extent_h_px = ext_h;
+            self.notifyGridFont(grid_id, gf.*);
+            self.grid.markEverySurfaceDirty();
+            self.grid.cursor_rev +%= 1;
+        }
     }
 
     /// The global font or cell size changed: every font grid's frame px moved
@@ -9291,6 +9317,32 @@ test "an external window's OS size survives its winbar and a font re-query" {
     try std.testing.expectEqual(sent, core.font_resize_requests);
     try std.testing.expectEqual(@as(u32, 390), core.grid.grid_fonts.get(4).?.extent_h_px);
     try std.testing.expectEqual(@as(u32, 390), s.last_extent_h);
+}
+
+test "an external window Neovim resizes itself takes that size as its frame" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(4, 10, 40);
+    try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try core.grid.resizeGrid(4, 20, 80);
+    core.notifyAdoptedGridSizesLocked();
+    try std.testing.expectEqual(@as(u32, 200), s.last_extent_h); // the request answered
+    core.grid.font_query_wanted.clearRetainingCapacity();
+    // :resize 30 inside the window: no request of ours.
+    const sent = core.font_resize_requests;
+    try core.grid.resizeGrid(4, 30, 80);
+    core.notifyAdoptedGridSizesLocked();
+    const gf = core.grid.grid_fonts.get(4).?;
+    try std.testing.expectEqual(@as(u32, 30), gf.req_rows);
+    try std.testing.expectEqual(@as(u32, 15), gf.frame_rows); // 30*10/20
+    try std.testing.expectEqual(@as(u32, 300), gf.extent_h_px);
+    try std.testing.expectEqual(@as(u32, 300), s.last_extent_h);
+    try std.testing.expectEqual(sent, core.font_resize_requests);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
 }
 
 test "clearing an external window's font gives back its whole grid, winbar included" {

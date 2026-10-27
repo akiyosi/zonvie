@@ -2971,8 +2971,12 @@ fn onGridLine(
             // on any screen and stamps nothing.
             const is_external = grid_id != 1 and grid.external_grids.contains(grid_id);
             const stamp_grid: i64 = if (is_external) grid_id else 1;
+            // A composited grid in its own font has cells off the global
+            // lattice the main texture is indexed by: no screen cell.
             const origin: ?grid_mod.GridPos = if (grid_id == 1 or is_external)
                 grid_mod.GridPos{ .row = 0, .col = 0 }
+            else if (grid.grid_fonts.contains(grid_id))
+                null
             else
                 grid.win_pos.get(grid_id);
 
@@ -5429,6 +5433,39 @@ test "gate 2: a sub-grid with no screen position stamps nothing" {
     try runRedrawEvents(&grid, &hl, arena, &events);
 
     try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+}
+
+test "a composited grid in its own font stamps nothing on the main texture" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 1, 5);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 3;
+    grid.cursor_row = 1;
+
+    // In global cells it stamps the main texture at its win_pos offset.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var ev1 = [_]mp.Value{try testGridLineEvent(arena, 3, 1, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &ev1);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+
+    // In its own font its cells are not on the lattice the main texture is
+    // indexed by.
+    grid.resetCellStamps();
+    try grid.grid_fonts.put(grid.alloc, 3, .{ .win_id = 1000, .font_id = 2, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 5 });
+    const cells2 = [_]mp.Value{try testCell(arena, "b", 0, null)};
+    var ev2 = [_]mp.Value{try testGridLineEvent(arena, 3, 1, 3, &cells2)};
+    try runRedrawEvents(&grid, &hl, arena, &ev2);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
 }
 
 test "gate 3: a full-row rewrite clears instead of stamping" {

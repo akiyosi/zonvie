@@ -1722,6 +1722,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Committed layer list for the main surface, back-to-front. Replaced
     /// wholesale by on_surface_layout and promoted at commitFlush.
     private var pendingSurfaceLayers: [SurfaceLayer]?   // Written under lock; read on the core thread
+    /// The per-grid fonts the committed rows were drawn in, published with
+    /// them under `lock`: the shared table moves before this commit does.
+    private var committedGridFonts: [Int64: GridFontPx] = [:]
     private var committedSurfaceLayers: [SurfaceLayer] = [
         SurfaceLayer(gridId: GridSurfaceRenderer.rootGridId, anchorGrid: GridSurfaceRenderer.rootGridId, originPx: simd_float2(0, 0), rows: 0, cols: 0, z: 0, followsScroll: false)
     ]                                                    // Protected by lock
@@ -2814,6 +2817,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             committedCursorSetIndex = cursorWriteSetIndex
         }
         // Layers and the vertices they place become visible together.
+        committedGridFonts = shared.flushGridFonts()
         if let staged = pendingSurfaceLayers {
             // A layer that is new, or that moved or changed size, cannot reuse
             // anything the back texture holds for it: its rows are somewhere
@@ -3947,7 +3951,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         swap(&f.bgClear, &bgClearPending)
         for var layer in committedSurfaceLayers {
-            shared.applyGridFont(to: &layer)
+            SharedRenderResources.applyGridFont(from: committedGridFonts, to: &layer)
             // Only a grid the committed layout places is consumed. Work
             // staged for one not on screen yet waits for the layout that
             // places it, which marks it fully dirty (see commitFlush).

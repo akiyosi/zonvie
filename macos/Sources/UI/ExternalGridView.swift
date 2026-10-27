@@ -149,6 +149,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     private var pendingSurfaceLayers: [SurfaceLayer]?
+    /// The per-grid fonts the committed rows were drawn in, published with
+    /// them under `lock`: the shared table moves before this commit does.
+    private var committedGridFonts: [Int64: GridFontPx] = [:]
     private var committedSurfaceLayers: [SurfaceLayer] = []
     private var pendingLayoutDamage = false
     private var layerGridIdScratch: [Int64] = []
@@ -347,12 +350,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         guard let layer = (pendingSurfaceLayers ?? committedSurfaceLayers).first(where: { $0.gridId == id }) else { return }
         // The host rows the layer rows cover, sized as the draw sizes them:
         // the host's rows are the root grid's (cellHi), and a layer's are its
-        // own font's, else the host's (SurfaceLayer.rowHeightPx). The draw's
-        // damage bands add the neighbours glyph ink can cross into.
-        let hostHeight = max(1, shared.rowHeightPx(gridId).rounded(.up))
-        let layerHeight = shared.gridFont(id).map { Float($0.cellHeightPx) } ?? hostHeight
+        // own font's, else the global cell's, which the core places hosted
+        // layers in. The draw's damage bands add the neighbours glyph ink can
+        // cross into. Fonts are this flush's, not yet committed: the ones
+        // these rows were drawn in.
+        let globalHeight = max(1, shared.cellHeightPx.rounded(.up))
+        let hostHeight = shared.flushGridFont(gridId).map { Float($0.cellHeightPx) } ?? globalHeight
+        let font = shared.flushGridFont(id)
+        let layerHeight = font.map { Float($0.cellHeightPx) } ?? globalHeight
         let topPx = layer.originPx.y + Float(rowStart) * layerHeight
-        let bottomPx = layer.originPx.y + Float(rowEnd) * layerHeight
+        var bottomPx = layer.originPx.y + Float(rowEnd) * layerHeight
+        // The core draws a font grid's bottom margin with its last row.
+        if let font, font.extentHeightPx > 0, rowEnd >= layer.rows {
+            bottomPx = max(bottomPx, layer.originPx.y + Float(font.extentHeightPx))
+        }
         let first = max(0, Int(floor(topPx / hostHeight)))
         let end = min(Int(gridRows), Int(ceil(bottomPx / hostHeight)))
         if first < end { flushDirtyRows.insert(integersIn: first..<end) }
@@ -1240,6 +1251,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 stagedForwardedCursor = nil
             }
             // Layers and the vertices they place become visible together.
+            committedGridFonts = shared.flushGridFonts()
             if let staged = pendingSurfaceLayers {
                 let placementChanged = surfaceLayerPlacementChanged(staged: staged, committed: committedSurfaceLayers)
                 accumulateSurfaceLayerPlacementTravel(
@@ -2852,7 +2864,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             placementRowsUpSnapshot[layerGridId] = rows
         }
         for var layer in committedSurfaceLayers where layer.gridId != gridId {
-            shared.applyGridFont(to: &layer)
+            SharedRenderResources.applyGridFont(from: committedGridFonts, to: &layer)
             if let sets = gridBuffers.existingSets(for: layer.gridId) {
                 // This surface keeps no per-layer draw state, so every
                 // entry owes everything.
@@ -3031,12 +3043,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // cell grid straddles a row boundary at both ends. Each layer
             // then puts itself back on top: `encodeHostedLayers` redraws
             // every row of it while a scroll is pending.
+            // A hosted layer without its own font sits in global cells,
+            // as encodeHostedLayers draws it.
             appendRowsDraggedByLayers(
                 into: &f.dirtyRows,
                 plan: scrollCopy,
                 rowsDelta: scroll.rowsDelta,
-                cellWidthPx: Int(f.cellWi),
-                rowHeightPx: Int(f.cellHi)
+                cellWidthPx: Int(max(1, Float(shared.cellWidthPx).rounded(.up))),
+                rowHeightPx: Int(max(1, Float(shared.cellHeightPx).rounded(.up)))
             )
         } else {
             // The blit never ran (scratch texture or blit encoder
@@ -3214,8 +3228,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     ) {
         let glow = glowPipeline != nil
         guard f.fontIsCurrent else { return }
-        let cellWi = Int(f.cellWi)
-        let surfaceCellHi = Int(f.cellHi)
+        // The core places and bakes a hosted layer in global cells, whatever
+        // the root's own font (flush.zig collectSurfaceLayers).
+        let cellWi = Int(max(1, UInt32(Float(shared.cellWidthPx).rounded(.up))))
+        let surfaceCellHi = Int(max(1, UInt32(Float(shared.cellHeightPx).rounded(.up))))
         let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
         for entry in layerSnapshot {
             let layer = entry.layer

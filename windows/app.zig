@@ -3973,6 +3973,9 @@ pub fn snappedContentHeight(client_h: u32, cell_total_h_px: u32, y_offset: u32) 
 pub const RowModeDrawParams = struct {
     content_height: u32,
     row_h_px: i32,
+    /// The row height the core places a layer without its own font in: the
+    /// global one, also on a root in its own font. 0 = `row_h_px`.
+    layer_row_h_px: i32 = 0,
     x_offset: i32 = 0,
     y_offset: i32 = 0,
     content_right: i32,
@@ -4003,6 +4006,10 @@ pub const RowModeDrawParams = struct {
     tabbar_bg_color: ?[4]f32 = null,
     /// The root grid's smooth scroll, when this frame draws it eased.
     root_ease: ?*const GridEase = null,
+
+    pub fn layerRowHeightPx(self: RowModeDrawParams) i32 {
+        return if (self.layer_row_h_px > 0) self.layer_row_h_px else self.row_h_px;
+    }
 
     /// Compute bloom viewport from these params.
     pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
@@ -4210,7 +4217,10 @@ pub fn planLayerFrame(
     paint.bands.clearRetainingCapacity();
     if (layers.len <= 1 or p.row_h_px <= 0) return;
     const n = layers.len;
+    // `h` is the row height a layer without its own font has; the root's
+    // rows are its own.
     const h = p.row_h_px;
+    const root_h = layers[0].rowHeightPx(h);
 
     // 1. Take the damage this paint consumed and settle the redraw decision.
     for (layers[1..n]) |layer| {
@@ -4386,8 +4396,8 @@ pub fn planLayerFrame(
     const root = layers[0];
     try spans.ensureUnusedCapacity(src.alloc, p.rows_to_draw.items.len + 3);
     for (p.rows_to_draw.items) |row| {
-        const top = root.y_px + @as(i32, @intCast(row)) * h;
-        spans.appendAssumeCapacity(.{ .top_px = top, .bottom_px = top + h });
+        const top = root.y_px + @as(i32, @intCast(row)) * root_h;
+        spans.appendAssumeCapacity(.{ .top_px = top, .bottom_px = top + root_h });
     }
     if (p.root_scroll_rect) |sr| spans.appendAssumeCapacity(.{ .top_px = sr.top - p.y_offset, .bottom_px = sr.bottom - p.y_offset });
     for (layers[1..n]) |layer| {
@@ -4417,7 +4427,7 @@ pub fn planLayerFrame(
 
     // 4. The bands, and every row they reach.
     try paint.bands.ensureTotalCapacity(src.alloc, @max(1, spans.items.len));
-    paint.bands.items.len = core.damage_bands.bands(spans.items, h, p.content_height, paint.bands.allocatedSlice());
+    paint.bands.items.len = core.damage_bands.bands(spans.items, root_h, p.content_height, paint.bands.allocatedSlice());
     for (paint.bands.items) |band| {
         for (layers[1..n]) |layer| {
             const state = paint.layerState(layer.grid_id) orelse continue;
@@ -4425,7 +4435,7 @@ pub fn planLayerFrame(
             const rows = layer.rowsForBand(band, layer.y_px, @intCast(src.rows(layer).len), h) orelse continue;
             markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
         }
-        const root_rows = core.damage_bands.layerRowsForBand(band, root.y_px, p.root_rows, h) orelse continue;
+        const root_rows = core.damage_bands.layerRowsForBand(band, root.y_px, p.root_rows, root_h) orelse continue;
         if (!render_pipeline_helpers.mergeSortedRowsWithRange(src.alloc, p.rows_to_draw, p.scroll_rows_merge_scratch, root_rows[0], root_rows[1] + 1))
             return error.OutOfMemory;
     }
@@ -5066,6 +5076,7 @@ const BloomRowsContext = struct {
     pool: *const SlotPool,
     row_vbs: []const RowVB,
     row_h_px: i32,
+    layer_row_h_px: i32,
     /// Non-root layers extracted after the root rows: the pinned set the
     /// frame drew them from, and the full layer list, root first.
     layers: []const SurfaceLayer = &.{},
@@ -5164,7 +5175,7 @@ fn drawBloomRowBuffers(
                         const rvb = state.row_vbs.items[ri];
                         if (rvb.uploaded_slot != mapping.slot or rvb.uploaded_ver != slot.ver) continue;
                         const vb = rvb.vb orelse continue;
-                        const row_dy = slotRowShiftPx(slot, ri, layer.rowHeightPx(ctx.row_h_px));
+                        const row_dy = slotRowShiftPx(slot, ri, layer.rowHeightPx(ctx.layer_row_h_px));
                         // Glow follows the text through a smooth scroll.
                         const ease_px: f32 = if (state.ease.easing) state.ease.offset_px else 0;
                         g.setLayerTransformScrolled(origin_x, origin_y + row_dy, extent_w_px, extent_h_px, ease_px) catch return false;
@@ -5345,6 +5356,7 @@ pub fn drawSurfaceRowFrame(
     var out = RowFrameOutcome{};
     const log_enabled = in.log_enabled;
     const row_h_px = in.draw_params.row_h_px;
+    const layer_row_h_px = in.draw_params.layerRowHeightPx();
     const cell_w_px: i32 = @intCast(@max(1, app.cell_w_px));
 
     // planLayerFrame set this frame's bands only when it ran (layer_src).
@@ -5407,7 +5419,7 @@ pub fn drawSurfaceRowFrame(
             in.draw_params.x_offset,
             in.draw_params.y_offset,
             in.draw_params.content_right,
-            row_h_px,
+            layer_row_h_px,
             cell_w_px,
             out.rows.ctx_ptr,
             out.rows.rs_set_sc_fn,
@@ -5437,7 +5449,7 @@ pub fn drawSurfaceRowFrame(
         for (in.layers) |layer| {
             if (layer.grid_id != in.cursor_grid) continue;
             cursor_layer_w_px = layer.widthPx(cell_w_px);
-            cursor_row_h_px = layer.rowHeightPx(row_h_px);
+            cursor_row_h_px = layer.rowHeightPx(layer_row_h_px);
             const src = in.layer_src orelse break;
             const state = src.paint.layerState(layer.grid_id) orelse break;
             const region_start, const region_end = state.ease.region(src.rows(layer).len);
@@ -5642,7 +5654,7 @@ pub fn drawSurfaceRowPass(
                 const shift_rows: u32 = @intCast(@abs(@divTrunc(in.snapshot.scroll_dy_px, p.row_h_px)));
                 for (layers[1..]) |layer| {
                     // In root rows: a grid in its own font covers its extent.
-                    const covered_px = layer.rowsBandPx(0, layer.rows, p.row_h_px)[1];
+                    const covered_px = layer.rowsBandPx(0, layer.rows, p.layerRowHeightPx())[1];
                     const span = render_pipeline_helpers.rootRowsLayerScrollReached(
                         layer.y_px,
                         @intCast(@divFloor(covered_px + p.row_h_px - 1, p.row_h_px)),
@@ -5692,7 +5704,7 @@ pub fn drawSurfaceRowPass(
             .y_offset = p.y_offset,
             .content_right = p.content_right,
             .content_height = @intCast(p.content_height),
-            .row_h_px = p.row_h_px,
+            .row_h_px = p.layerRowHeightPx(),
             .cell_w_px = in.cell_w_px,
             .preserve_back = in.preserve_back,
             .cursor_grid = in.snapshot.cursor_layer_grid_id,
@@ -5787,6 +5799,7 @@ pub fn drawBloomRowsOverlay(
         .pool = pool,
         .row_vbs = row_vbs,
         .row_h_px = draw_params.row_h_px,
+        .layer_row_h_px = draw_params.layerRowHeightPx(),
         .layers = layers,
         .layer_src = layer_src,
         .cursor_layer_origin = cursor_layer_origin,

@@ -1260,6 +1260,9 @@ pub const GridFont = struct {
     req_cols: u32 = 0,
     extent_w_px: u32 = 0,
     extent_h_px: u32 = 0,
+    // An OS resize's request is out and unanswered: the next grid_resize
+    // answers it, whatever size Neovim settled on.
+    os_answer_pending: bool = false,
 };
 
 /// win_pos' width/height: a split's frame in global cells.
@@ -1465,6 +1468,9 @@ pub const Grid = struct {
     font_query_wanted: std.ArrayListUnmanaged(i64) = .empty,
     // Slots whose grid was destroyed; the core releases them after the batch.
     font_releases_pending: std.ArrayListUnmanaged(u32) = .empty,
+    // External windows whose grid Neovim resized on its own; the core
+    // re-sends their font extent before the flush.
+    font_sizes_adopted: std.ArrayListUnmanaged(i64) = .empty,
 
     // Viewport info per grid (from win_viewport / win_viewport_margins)
     viewport: std.AutoHashMapUnmanaged(i64, Viewport) = .{},
@@ -1645,6 +1651,7 @@ pub const Grid = struct {
         self.split_request_held.deinit(self.alloc);
         self.font_query_wanted.deinit(self.alloc);
         self.font_releases_pending.deinit(self.alloc);
+        self.font_sizes_adopted.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
 
@@ -1739,6 +1746,7 @@ pub const Grid = struct {
         self.split_request_held.clearRetainingCapacity();
         self.font_query_wanted.clearRetainingCapacity();
         self.font_releases_pending.clearRetainingCapacity();
+        self.font_sizes_adopted.clearRetainingCapacity();
         self.clearAllOverflow();
         self.layer_order_counter = 0;
         self.subgrid_surface_vertex_count = 0;
@@ -2304,12 +2312,27 @@ pub const Grid = struct {
             // is the requested view plus its winbar rows (ui.c:775). An
             // external window's frame is its OS window, which no layout
             // change moves; a re-query would keep the same request.
-            if (self.grid_fonts.get(grid_id)) |gf| {
+            if (self.grid_fonts.getPtr(grid_id)) |gf| {
                 const m = if (self.split_request_held.contains(grid_id)) self.getViewportMargins(grid_id) else ViewportMargins{};
                 if (gf.mode == .resize and gf.req_rows != 0 and !self.external_grids.contains(grid_id) and
                     (gf.req_rows + m.top + m.bottom != rows or gf.req_cols != cols))
                 {
                     self.wantFontQuery(gf.win_id);
+                }
+                // An external window Neovim resized itself (:resize in it):
+                // its grid becomes the frame. Not the answer to an OS resize,
+                // which may be a superseded request's size or a clamped one
+                // (a drag sends sizes faster than Neovim answers them).
+                if (gf.mode == .resize and gf.req_rows != 0 and self.external_grids.contains(grid_id)) {
+                    if (gf.os_answer_pending) {
+                        gf.os_answer_pending = false;
+                    } else if ((gf.req_rows != rows or gf.req_cols != cols) and
+                        std.mem.indexOfScalar(i64, self.font_sizes_adopted.items, grid_id) == null)
+                    {
+                        self.font_sizes_adopted.append(self.alloc, grid_id) catch {
+                            std.log.warn("per-grid font: adopted size dropped grid={d}", .{grid_id});
+                        };
+                    }
                 }
             }
             self.invalidateCursorOutside(grid_id, rows, cols);

@@ -133,9 +133,15 @@ final class SharedRenderResources {
         return cellHeightPx
     }
 
-    /// Fill a layer's per-grid font geometry from the committed table.
-    func applyGridFont(to layer: inout SurfaceLayer) {
-        guard let gf = gridFont(layer.gridId) else { return }
+    /// The whole table the flush in progress draws in. A surface commits it
+    /// with its rows, under its own lock. Core thread only.
+    func flushGridFonts() -> [Int64: GridFontPx] {
+        stagedGridFonts
+    }
+
+    /// Fill a layer's per-grid font geometry from a surface's committed table.
+    static func applyGridFont(from fonts: [Int64: GridFontPx], to layer: inout SurfaceLayer) {
+        guard let gf = fonts[layer.gridId] else { return }
         layer.cellWidthPx = Int(gf.cellWidthPx)
         layer.cellHeightPx = Int(gf.cellHeightPx)
         layer.extentWidthPx = Int(gf.extentWidthPx)

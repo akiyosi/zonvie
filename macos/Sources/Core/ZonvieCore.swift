@@ -4891,6 +4891,10 @@ final class ZonvieCore {
         /// it: framing to that intermediate answer would make the window jump
         /// back before the queued request re-frames it. Compared with the
         /// request, not the answer, which Neovim may clamp.
+        /// A user size is out and unanswered: the window is at that size,
+        /// not at any count the grid still reports.
+        var hasRequestInFlight: Bool { requestInFlight }
+
         func supersedesAnswer() -> Bool {
             guard requestInFlight, let size = wantedSize, let sent = inFlightSize else { return false }
             return size.rows != sent.rows || size.cols != sent.cols
@@ -4967,18 +4971,27 @@ final class ZonvieCore {
                 // surface's rows for the new metrics (invalidate_glyph_cache),
                 // as Windows relies on. Asking Neovim for rows+1 then rows made
                 // every window grow a row and shrink, with two WinResized.
-                let gf = self.gridCellPx(gridId)
+                let content = Self.externalContentPx(rows: rows, cols: cols, font: self.gridCellPx(gridId),
+                                                     cellW: cellWidthPx, cellH: cellHeightPx)
                 self.frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                         rows: rows, cols: cols,
-                                         cellW: gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx,
-                                         cellH: gf.map { CGFloat($0.cellHeightPx) } ?? cellHeightPx,
+                                         widthPx: content.width, heightPx: content.height,
                                          applyAnchors: false)
                 ZonvieCore.appLog("[resizeExternalWindows] gridId=\(gridId) rows=\(rows) cols=\(cols)")
             }
         }
     }
 
-    /// Size a regular external window to `rows x cols` of `cellW x cellH`
+    /// A regular external window's content in pixels. A grid in its own font
+    /// fills the core's extent, its frame; the rest is `rows x cols` cells.
+    private static func externalContentPx(rows: UInt32, cols: UInt32, font: GridFontPx?,
+                                          cellW: CGFloat, cellH: CGFloat) -> CGSize {
+        if let f = font, f.extentWidthPx > 0, f.extentHeightPx > 0 {
+            return CGSize(width: CGFloat(f.extentWidthPx), height: CGFloat(f.extentHeightPx))
+        }
+        return CGSize(width: CGFloat(cols) * cellW, height: CGFloat(rows) * cellH)
+    }
+
+    /// Size a regular external window's content to `widthPx x heightPx`
     /// pixels, in the window's own scale (the main window's put a window on a
     /// different-DPI screen at a size whose drawable no longer matched the
     /// viewport). The resize callback is suppressed across setFrame. Anchors:
@@ -4986,12 +4999,12 @@ final class ZonvieCore {
     /// bottom or right edge; a font change always keeps the top-left.
     private func frameExternalWindow(
         _ window: NSWindow, gridView: ExternalGridView, delegate: ExternalWindowDelegate,
-        rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat,
+        widthPx: CGFloat, heightPx: CGFloat,
         applyAnchors: Bool = true, display: Bool = false
     ) {
         let scale = window.backingScaleFactor
-        let contentWidth = CGFloat(cols) * cellW / scale
-        let contentHeight = CGFloat(rows) * cellH / scale
+        let contentWidth = widthPx / scale
+        let contentHeight = heightPx / scale
         delegate.suppressResizeCallback = true
         let oldFrame = window.frame
         let anchorsApply = applyAnchors && (window.inLiveResize || delegate.anchorsDescribeCurrentGesture)
@@ -5490,8 +5503,9 @@ final class ZonvieCore {
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
         // A grid in its own font is framed in that font's cells.
         let gf = font ?? gridCellPx(gridId)
-        let cellW = gf.map { CGFloat($0.cellWidthPx) } ?? CGFloat(renderer.cellWidthPx)
-        let cellH = gf.map { CGFloat($0.cellHeightPx) } ?? CGFloat(renderer.cellHeightPx)
+        let content = Self.externalContentPx(rows: rows, cols: cols, font: gf,
+                                             cellW: CGFloat(renderer.cellWidthPx),
+                                             cellH: CGFloat(renderer.cellHeightPx))
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
         // Resize the OS window to match the grid size. Integer row/col counts
         // on the delegate, not the frame, so floating-point drift cannot
@@ -5507,12 +5521,23 @@ final class ZonvieCore {
             // sends the newer size, and that answer frames the window.
             if !delegate.supersedesAnswer() {
                 frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                    rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
+                                    widthPx: content.width, heightPx: content.height, display: true)
             }
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
             // Only a size change answers a request: row-0 redraws (winbar)
             // come through here too.
             delegate.gridResizeArrived()
+        } else if gf != nil, let delegate = window.delegate as? ExternalWindowDelegate,
+                  !window.inLiveResize, !delegate.hasRequestInFlight {
+            // Same counts, other pixels: a font change the grid kept its
+            // size through. Every surface is redrawn then, row 0 included.
+            let scale = window.backingScaleFactor
+            let current = gridView.frame.size
+            if abs(current.width * scale - content.width) >= 1 || abs(current.height * scale - content.height) >= 1 {
+                frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                    widthPx: content.width, heightPx: content.height,
+                                    applyAnchors: false, display: true)
+            }
         }
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).

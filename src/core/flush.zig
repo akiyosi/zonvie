@@ -3479,6 +3479,7 @@ pub const FlushCtx = struct {
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
         ctx.core.grid.assertMainShapeMirrored();
+        ctx.core.notifyAdoptedGridSizesLocked();
         // Pre-size the shaping buffers so a run of up to this many glyphs
         // allocates nothing in the row loop; a longer run still grows them
         // there (ShapingBuffers.setLen).

@@ -1561,7 +1561,9 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // Each surface publishes its root rows, layer rows, placement and
         // cursor in one commit; per-grid fonts go out with the rows this
         // flush drew in them.
+        const fonts_changed = app.grid_fonts_dirty;
         app.commitGridFonts();
+        if (fonts_changed) queueExternalFontReframes(app);
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
             entry.value_ptr.*.surf.tbs.commitFlush(app.alloc);
@@ -2690,10 +2692,15 @@ pub fn queueExternalWindowResizes(
         if (ext_win.is_pending_close) continue;
 
         const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
-        // A grid in its own font is framed in that font's cells.
-        const gf = app.gridCellPx(grid_id);
-        var content_w: c_int = @as(c_int, @intCast(ext_win.surf.surface.cols * (if (gf) |f| f.cell_w_px else cell_w))) + insets.w;
-        const content_h: c_int = @as(c_int, @intCast(ext_win.surf.surface.rows * (if (gf) |f| f.cell_h_px else cell_h))) + insets.h;
+        const rows = ext_win.surf.surface.rows;
+        const cols = ext_win.surf.surface.cols;
+        // A grid in its own font is framed by its font, the rest by the new cell.
+        const content: external_windows.ContentPx = if (app.gridCellPx(grid_id) != null)
+            external_windows.externalContentPxLocked(app, grid_id, rows, cols)
+        else
+            .{ .w = @as(c_int, @intCast(cols * cell_w)), .h = @as(c_int, @intCast(rows * cell_h)) };
+        var content_w: c_int = content.w + insets.w;
+        const content_h: c_int = content.h + insets.h;
         if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd), external_windows.cmdlineScreenMarginPx(app));
 
         // This window's actual style and DPI: WS_OVERLAPPEDWINDOW has a frame
@@ -2710,6 +2717,30 @@ pub fn queueExternalWindowResizes(
         if (hwnd) |mh| {
             _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
         }
+    }
+}
+
+/// Re-frame each external window whose font moved its extent while its grid
+/// kept its size: no grid_resize comes to do it. Caller holds `app.mu`.
+fn queueExternalFontReframes(app: *App) void {
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr.*;
+        if (ext_win.is_pending_close or app.gridCellPx(grid_id) == null) continue;
+        const content = external_windows.externalContentPxLocked(app, grid_id, ext_win.surf.surface.rows, ext_win.surf.surface.cols);
+        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
+        var client: c.RECT = undefined;
+        if (c.GetClientRect(ext_win.hwnd, &client) == 0) continue;
+        const want_w = content.w + insets.w;
+        const want_h = content.h + insets.h;
+        if (client.right - client.left == want_w and client.bottom - client.top == want_h) continue;
+        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, want_w, want_h);
+        ext_win.pending_window_w = outer.w;
+        ext_win.pending_window_h = outer.h;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+        if (app.hwnd) |mh| _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
     }
 }
 

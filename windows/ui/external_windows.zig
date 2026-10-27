@@ -785,6 +785,7 @@ fn drawNormalExternalSurfaceRowMode(
         .content_height = @max(app_mod.snappedContentHeight(g.height, fallback_row_h, 0), root_extent_h_px),
         .root_extent_h_px = root_extent_h_px,
         .row_h_px = row_h_px,
+        .layer_row_h_px = @intCast(row_h_px_snapshot),
         .content_right = content_right,
         .preserve_back = paint_policy.preserve_back,
         .root_rows_may_be_empty = has_layers,
@@ -1335,29 +1336,41 @@ fn framingCellPxLocked(app: *App, grid_id: i64) FramingCellPx {
     return .{ .cell_w = app.cell_w_px, .cell_h = app.rowHeightPx() };
 }
 
+pub const ContentPx = struct { w: c_int, h: c_int };
+
+/// A regular external window's client content, insets excluded. A grid in
+/// its own font fills the core's extent, its frame; the rest is `rows x cols`
+/// cells. `app.mu` held.
+pub fn externalContentPxLocked(app: *App, grid_id: i64, rows: u32, cols: u32) ContentPx {
+    if (app.gridCellPx(grid_id)) |gf| if (gf.extent_w_px > 0 and gf.extent_h_px > 0)
+        return .{ .w = @intCast(gf.extent_w_px), .h = @intCast(gf.extent_h_px) };
+    const cell = framingCellPxLocked(app, grid_id);
+    return .{ .w = @intCast(cols * cell.cell_w), .h = @intCast(rows * cell.cell_h) };
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
     const is_msg_show = req.grid_id == app_mod.MESSAGE_GRID_ID;
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    var cell_w: u32 = 0;
-    var cell_h: u32 = 0;
+    var content_w: c_int = 0;
+    var content_h: c_int = 0;
 
     var current_hwnd: ?c.HWND = null;
     const surface_dpi_scale: f32 = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        const cell = framingCellPxLocked(app, req.grid_id);
-        cell_w = cell.cell_w;
-        cell_h = cell.cell_h;
+        const content = externalContentPxLocked(app, req.grid_id, req.rows, req.cols);
+        content_w = content.w;
+        content_h = content.h;
         const w = app.external_windows.get(req.grid_id) orelse break :blk app.dpi_scale;
         current_hwnd = w.hwnd;
         break :blk w.dpi_scale;
     };
     const insets = externalSurfaceInsetsPx(app, req.grid_id, surface_dpi_scale);
-    var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
-    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
+    var client_w: c_int = content_w + insets.w;
+    const client_h: c_int = content_h + insets.h;
     // The monitor the cmdline is on, which keeps it there as it grows (below).
     if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, app_mod.monitorWorkArea(current_hwnd orelse app.hwnd), cmdlineScreenMarginPx(app));
 
@@ -1528,12 +1541,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     app.mu.lockUncancelable(core.clock.io());
-    const cell = framingCellPxLocked(app, req.grid_id);
+    const content = externalContentPxLocked(app, req.grid_id, req.rows, req.cols);
     app.mu.unlock(core.clock.io());
-    const cell_w: u32 = cell.cell_w;
-    const cell_h: u32 = cell.cell_h;
-    const content_w: c_int = @intCast(req.cols * cell_w);
-    const content_h: c_int = @intCast(req.rows * cell_h);
+    const content_w: c_int = content.w;
+    const content_h: c_int = content.h;
 
     // Check if this is a special window (cmdline, popupmenu, msg_show, msg_history)
     const is_cmdline = (req.grid_id == app_mod.CMDLINE_GRID_ID);
@@ -3335,10 +3346,6 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
             g_sh.shader_cursor_cell_px = main_r3.shader_cursor_cell_px;
         }
-        // iCellSize, which also sizes this window's cell-age grid; the core
-        // stamps it under this window's grid id.
-        g_sh.cell_w_px = app.cell_w_px;
-        g_sh.cell_h_px = app.rowHeightPx();
     }
     g_sh.shader_screen_w = screen_w;
     g_sh.shader_screen_h = screen_h;
@@ -3456,6 +3463,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
+    // iCellSize, which also sizes this window's cell-age grid; the core
+    // stamps it under this window's grid id, in that grid's own cells.
+    const age_cell = framingCellPxLocked(app, g.cell_age_grid);
+    g.cell_w_px = age_cell.cell_w;
+    g.cell_h_px = age_cell.cell_h;
     // A cursor on this surface is forwarded into the main renderer's shader
     // cursor state (see syncExternalShaderFrame).
     syncExternalShaderFrame(app, hwnd, g, .{

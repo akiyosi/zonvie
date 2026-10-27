@@ -1095,8 +1095,8 @@ pub fn sendMouseButton(
 
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
 /// external windows. `grid_id` is the surface this hwnd draws — 1 for the main
-/// window — and is all the core needs to resolve the target against, so this
-/// no longer reaches for the surface's layer list or takes `app.mu`.
+/// window — which the core resolves the target against; only a target in its
+/// own font needs the surface's layer list, to count the cell as a click does.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -1169,6 +1169,23 @@ pub fn handleMouseWheel(
             target_grid_id = hit.grid_id;
             target_row = hit.row;
             target_col = hit.col;
+        }
+    }
+    // The grid's own cell, as a click computes it (sendMouseButton): the
+    // resolver answers in the surface's global cells, not the grid's font.
+    {
+        app.mu.lockUncancelable(core.clock.io());
+        const origin = surfaceOriginPx(app, is_main_window);
+        const layers: []const app_mod.SurfaceLayer = if (is_main_window)
+            app.surf.tbs.committed_layers.slice()
+        else if (app.external_windows.get(grid_id)) |w| w.surf.tbs.committed_layers.slice() else &.{};
+        const t = rebaseToGrid(layers, grid_id, target_grid_id, px - origin.x, py - origin.y);
+        const gf = app.gridCellPx(t.grid_id);
+        app.mu.unlock(core.clock.io());
+        if (gf != null and t.grid_id == target_grid_id) {
+            const local = gridCellAt(app, t.grid_id, gf, t.x, t.y, cell_w, row_h);
+            target_row = @max(0, local.row);
+            target_col = @max(0, local.col);
         }
     }
 
