@@ -1276,7 +1276,8 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
 /// list. The candidate window and the preedit overlay both place against
 /// this. Null when no cursor position is known yet (a cold cache under lock
 /// contention yields (-1,-1)).
-const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT };
+/// `font_id` is the cursor grid's own font, 0 for the global one.
+const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT, font_id: u32 };
 
 fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, global_cell_w: u32, global_cell_h: u32, global_row_h_px: u32) ?ImeCursorPoint {
     var row: i32 = 0;
@@ -1289,6 +1290,7 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
     var cell_w = global_cell_w;
     var cell_h = global_cell_h;
     var row_h_px = global_row_h_px;
+    var font_id: u32 = 0;
     var ease_px: i32 = 0;
     var main_layer: [2]i32 = .{ 0, 0 };
     const ext_surface = blk: {
@@ -1298,6 +1300,7 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
             cell_w = gf.cell_w_px;
             cell_h = gf.cell_h_px;
             row_h_px = gf.cell_h_px;
+            font_id = gf.font_id;
         }
         ease_px = @intFromFloat(@round(drawnEaseOffsetPxLocked(app, grid_id)));
         const es = imeExternalSurfaceLocked(app, grid_id);
@@ -1323,6 +1326,7 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
         .coord_hwnd = coord_hwnd,
         .pt_cursor = .{ .x = x, .y = y },
         .pt_below = .{ .x = x, .y = y + @as(c.LONG, @intCast(cell_h)) },
+        .font_id = font_id,
     };
 }
 
@@ -1410,7 +1414,6 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // Get cursor position and cell metrics
     // Avoid nested mutex acquisition by reading atlas ptr under app.mu, then accessing atlas separately
     var font_name_buf: [64]u16 = [_]u16{0} ** 64;
-    var atlas_cell_w: u32 = 0;
     var atlas_cell_h: u32 = 0;
     var font_em_size: f32 = 14.0;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
@@ -1424,20 +1427,9 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const target_start = app.ime_target_start;
     const target_end = app.ime_target_end;
     atlas_ptr = if (app.atlas) |*a| a else null;
-    atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
-
-    // Access atlas without holding app.mu to avoid nested locking
-    if (atlas_ptr) |atlas| {
-        atlas.mu.lockUncancelable(core.clock.io());
-        defer atlas.mu.unlock(core.clock.io());
-        @memcpy(&font_name_buf, &atlas.font_name);
-        atlas_cell_w = atlas.cell_w_px;
-        atlas_cell_h = atlas.cell_h_px;
-        font_em_size = atlas.font_em_size;
-    }
 
     if (corep == null) {
         if (log_active) applog.appLog("[IME] corep is null\n", .{});
@@ -1453,6 +1445,17 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // No cursor position yet: keep the overlay's previous position rather
     // than drawing off-window.
     const cp = imeCursorClientPoint(app, corep.?, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
+
+    // The face the cells under the composition are drawn in. Read without
+    // app.mu held to avoid nested locking.
+    if (atlas_ptr) |atlas| {
+        atlas.mu.lockUncancelable(core.clock.io());
+        defer atlas.mu.unlock(core.clock.io());
+        const face = atlas.overlayFaceLocked(cp.font_id);
+        font_name_buf = face.font_name;
+        atlas_cell_h = face.cell_h_px;
+        font_em_size = face.em_size;
+    }
 
     // Create a memory DC and font first to measure actual text width
     const screen_dc = c.GetDC(null);

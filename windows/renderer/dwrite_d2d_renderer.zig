@@ -329,6 +329,16 @@ pub const Renderer = struct {
         return null;
     }
 
+    pub const OverlayFace = struct { font_name: [64]u16, em_size: f32, cell_h_px: u32 };
+
+    /// The face text drawn over a grid in `font_id` outside the atlas (the
+    /// IME overlay) is set in: the slot's, else the global font's. Caller
+    /// holds mu.
+    pub fn overlayFaceLocked(self: *Renderer, font_id: u32) OverlayFace {
+        if (self.slotFaceSet(font_id)) |s| return .{ .font_name = s.font_name, .em_size = s.font_em_size, .cell_h_px = s.cell_h_px };
+        return .{ .font_name = self.font_name, .em_size = self.font_em_size, .cell_h_px = self.cell_h_px };
+    }
+
     /// Phase 1 of two-phase init: creates D2D/DWrite factories, sets font, and
     /// computes cellW/cellH. Does NOT create the D2D render target (~30ms).
     /// Call initRenderTarget() to complete initialization before rendering.

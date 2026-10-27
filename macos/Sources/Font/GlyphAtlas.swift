@@ -95,6 +95,8 @@ final class GlyphAtlas {
         /// The mapped font files the borrowed hbft handles read.
         let data: [NSData]
         let px: UInt32
+        /// The face's size in points, `scale` applied.
+        let pointSize: CGFloat
         let ascentPx: Float
         let descentPx: Float
         let hasFeatures: Bool
@@ -1935,14 +1937,14 @@ final class GlyphAtlas {
                 let rowH = max(1, h + Float(lineSpacePx))
                 cell = (UInt32(max(1, Int(w.rounded(.toNearestOrAwayFromZero)))),
                         UInt32(max(1, Int(rowH.rounded(.toNearestOrAwayFromZero)))))
-                slot = SlotFace(faces: faces, data: data, px: px,
+                slot = SlotFace(faces: faces, data: data, px: px, pointSize: pointSize * scale,
                                 ascentPx: m.ascentPx ?? Float(CTFontGetAscent(base)),
                                 descentPx: m.descentPx ?? Float(CTFontGetDescent(base)),
                                 hasFeatures: !features.isEmpty)
             }
         }
         guard let slot, let cell else {
-            Self.destroySlotFace(SlotFace(faces: faces, data: data, px: px, ascentPx: 0, descentPx: 0, hasFeatures: false))
+            Self.destroySlotFace(SlotFace(faces: faces, data: data, px: px, pointSize: 0, ascentPx: 0, descentPx: 0, hasFeatures: false))
             ZonvieCore.appLog("[GlyphAtlas.loadSlot] font_id=\(fontId) '\(name)' px=\(px): no usable face")
             return nil
         }
@@ -1955,6 +1957,17 @@ final class GlyphAtlas {
         if let old { Self.destroySlotFace(old) }
         ZonvieCore.appLog("[GlyphAtlas.loadSlot] font_id=\(fontId) '\(name)' px=\(px) cell=\(cell.cellWidthPx)x\(cell.cellHeightPx)")
         return cell
+    }
+
+    /// Per-grid font `fontId`'s regular face in points, for text drawn over a
+    /// grid in it outside the atlas (the IME preedit). nil for font_id 0 or
+    /// a slot not loaded.
+    func slotFont(fontId: UInt32) -> CTFont? {
+        os_unfair_lock_lock(&mu)
+        let s = fontId == 0 ? nil : slotFaces[fontId]
+        os_unfair_lock_unlock(&mu)
+        guard let s, s.pointSize > 0 else { return nil }
+        return CTFontCreateCopyWithAttributes(s.faces[0].ctFont, s.pointSize, nil, nil)
     }
 
     func releaseSlot(fontId: UInt32) {

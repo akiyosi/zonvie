@@ -2390,10 +2390,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // only meaningful while a scroll is easing — with no offset there is
             // nothing displaced to discard. A layer's originPx is already
             // surface-absolute, so the rectangle needs no further placement.
+            // A hosted layer is placed in global cells whatever the root's own
+            // font, so a layer without an extent is measured in those.
             fixedFloatMask.rebuild(
                 layers: layerSnapshot, rootGridId: gridId, smoothScrolling: f.smoothScrolling,
                 offsets: f.hostedScrollOffsets, rootScrolled: f.scrollOffset != nil,
-                cellW: cw, cellH: Float(f.ch), scratch: &fixedFloatRectsScratch
+                cellW: shared.cellWidthPx, cellH: shared.cellHeightPx, scratch: &fixedFloatRectsScratch
             )
 
             // Glow disables partial-redraw optimizations to prevent additive

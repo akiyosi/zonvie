@@ -1207,8 +1207,18 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     var backingScale: CGFloat { window?.backingScaleFactor ?? surfaceFallbackBackingScale }
 
+    /// The cursor grid's own font, when it has one: the preedit is drawn over
+    /// that grid's cells and must match them.
+    private var imeCursorGridFont: GridFontPx? {
+        guard let core else { return nil }
+        return core.gridCellPx(core.getCursorPositionNonBlocking().gridId)
+    }
+
     var imePreeditFont: NSFont {
         let shared = sharedResources
+        if let gf = imeCursorGridFont, let font = shared.atlas.slotFont(fontId: gf.fontId) {
+            return font as NSFont
+        }
         return NSFont(name: shared.currentFontName, size: shared.currentPointSize)
             ?? NSFont.monospacedSystemFont(ofSize: shared.currentPointSize, weight: .regular)
     }
@@ -1216,8 +1226,9 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     var imePreeditCellSize: CGSize {
         let shared = sharedResources
         let scale = backingScale
-        return CGSize(width: CGFloat(shared.cellWidthPx) / scale,
-                      height: CGFloat(shared.cellHeightPx) / scale)
+        let gf = imeCursorGridFont
+        return CGSize(width: (gf.map { CGFloat($0.cellWidthPx) } ?? CGFloat(shared.cellWidthPx)) / scale,
+                      height: (gf.map { CGFloat($0.cellHeightPx) } ?? CGFloat(shared.cellHeightPx)) / scale)
     }
 
     var imePreeditContainer: NSView { self }

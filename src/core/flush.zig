@@ -5913,20 +5913,44 @@ pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 /// that origin put the popup that far away from the cell; a float the window
 /// hosts was published under its own id, found no window, and was placed
 /// against the main window.
-pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
-    if (g.isSurfaceRoot(anchor_grid)) {
-        return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
+///
+/// (row, col) are global cells (zonvie_core.h on_external_window), which a
+/// grid in its own font is not drawn on: its anchor cell is taken to pixels
+/// where the layout draws it and back to the global cell holding its bottom
+/// edge and its left edge, so a popup below the cell never covers it.
+pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, cell_w_px: u32, cell_h_px: u32, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
+    const gw: i64 = @max(1, cell_w_px);
+    const gh: i64 = @max(1, cell_h_px);
+    var win = anchor_grid;
+    var origin_x_px: i64 = 0;
+    var origin_y_px: i64 = 0;
+    const gf = g.grid_fonts.get(anchor_grid);
+    if (!g.isSurfaceRoot(anchor_grid)) {
+        if (g.win_pos.get(anchor_grid)) |pos| {
+            const placed = g.surfacePlacement(pos);
+            const row: i64 = if (placed) |p| p.row else pos.row;
+            const col: i64 = if (placed) |p| p.col else pos.col;
+            if (placed) |p| if (p.surface != 1) {
+                win = p.surface;
+            };
+            origin_y_px = row *| gh;
+            origin_x_px = col *| gw;
+            // As collectSurfaceLayers places it.
+            if (gf) |f| if (f.mode == .scale_view and pos.anchor_east and placed != null) {
+                if (g.sub_grids.get(anchor_grid)) |sg| {
+                    origin_x_px = font_slots.eastSnappedX(std.math.lossyCast(u32, col), sg.cols, @intCast(gw), f.cell_w_px);
+                }
+            };
+        }
     }
-    const pos = g.win_pos.get(anchor_grid) orelse return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
-    const placed = g.surfacePlacement(pos) orelse return .{
-        .win = anchor_grid,
-        .row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row),
-        .col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col),
-    };
+    const fw: i64 = if (gf) |f| @max(1, f.cell_w_px) else gw;
+    const fh: i64 = if (gf) |f| @max(1, f.cell_h_px) else gh;
+    const bottom_px = origin_y_px +| (@as(i64, anchor_row) +| 1) *| fh;
+    const left_px = origin_x_px +| @as(i64, anchor_col) *| fw;
     return .{
-        .win = if (placed.surface == 1) anchor_grid else placed.surface,
-        .row = anchor_row +| std.math.lossyCast(i32, placed.row),
-        .col = anchor_col +| std.math.lossyCast(i32, placed.col),
+        .win = win,
+        .row = std.math.lossyCast(i32, std.math.divCeil(i64, bottom_px, gh) catch unreachable) -| 1,
+        .col = std.math.lossyCast(i32, std.math.divFloor(i64, left_px, gw) catch unreachable),
     };
 }
 
@@ -6069,7 +6093,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     const placement: PopupmenuAnchorPlacement = if (is_cmdline_completion)
         .{ .win = anchor_grid, .row = -1, .col = anchor_col }
     else
-        popupmenuAnchorPlacement(&self.grid, anchor_grid, anchor_row, anchor_col);
+        popupmenuAnchorPlacement(&self.grid, self.cell_w_px, self.cell_h_px, anchor_grid, anchor_row, anchor_col);
 
     self.grid.putSyntheticExternal(pum_grid_id, .{
         .win = placement.win,
@@ -18436,31 +18460,69 @@ test "popupmenu anchor is published in the coordinates of the window that shows 
     // origin (10, 20). Both frontends place the popup from the external
     // window's own top-left, so the anchor must stay local to it.
     try g.external_grids.put(g.alloc, 5, .{ .win = 1005, .start_row = 10, .start_col = 20 });
-    var p = popupmenuAnchorPlacement(g, 5, 3, 4);
+    var p = popupmenuAnchorPlacement(g, 10, 20, 5, 3, 4);
     try std.testing.expectEqual(@as(i64, 5), p.win);
     try std.testing.expectEqual(@as(i32, 3), p.row);
     try std.testing.expectEqual(@as(i32, 4), p.col);
 
     // Born external (no position): local as well.
     try g.external_grids.put(g.alloc, 6, .{ .win = 1006, .start_row = -1, .start_col = -1 });
-    p = popupmenuAnchorPlacement(g, 6, 3, 4);
+    p = popupmenuAnchorPlacement(g, 10, 20, 6, 3, 4);
     try std.testing.expectEqual(@as(i64, 6), p.win);
     try std.testing.expectEqual(@as(i32, 3), p.row);
 
     // A float the detached window hosts, at (6, 8) of that window's cells.
     // The popup goes to the HOST window, at the float's place inside it.
     try g.win_pos.put(g.alloc, 7, .{ .row = 6, .col = 8, .anchor_grid = 5 });
-    p = popupmenuAnchorPlacement(g, 7, 1, 2);
+    p = popupmenuAnchorPlacement(g, 10, 20, 7, 1, 2);
     try std.testing.expectEqual(@as(i64, 5), p.win);
     try std.testing.expectEqual(@as(i32, 7), p.row);
     try std.testing.expectEqual(@as(i32, 10), p.col);
 
     // A split on the main window: global coordinates, as before.
     try g.win_pos.put(g.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
-    p = popupmenuAnchorPlacement(g, 2, 3, 4);
+    p = popupmenuAnchorPlacement(g, 10, 20, 2, 3, 4);
     try std.testing.expectEqual(@as(i64, 2), p.win);
     try std.testing.expectEqual(@as(i32, 5), p.row);
     try std.testing.expectEqual(@as(i32, 4), p.col);
+}
+
+test "a popupmenu anchored in a grid with its own font is published in global cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    const g = &core.grid;
+    // Global cell 10x20 px; the anchor grids' font cell 15x30 px (1.5x).
+
+    // An external window in its own font: cell (20, 4) is drawn at
+    // x 60..75, y 600..630 of the window. Its bottom edge lies in global
+    // row 31 (620..640) and its left edge in global column 6.
+    try g.external_grids.put(g.alloc, 5, .{ .win = 1005, .start_row = -1, .start_col = -1 });
+    try g.grid_fonts.put(g.alloc, 5, .{ .win_id = 1005, .font_id = 1, .mode = .resize, .cell_w_px = 15, .cell_h_px = 30, .frame_rows = 40, .frame_cols = 60 });
+    var p = popupmenuAnchorPlacement(g, 10, 20, 5, 20, 4);
+    try std.testing.expectEqual(@as(i64, 5), p.win);
+    try std.testing.expectEqual(@as(i32, 31), p.row);
+    try std.testing.expectEqual(@as(i32, 6), p.col);
+
+    // A split on the main window at global row 2: its cell (3, 4) ends at
+    // y 40 + 4*30 = 160, the bottom of global row 7.
+    try g.win_pos.put(g.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
+    try g.grid_fonts.put(g.alloc, 2, .{ .win_id = 1002, .font_id = 1, .mode = .resize, .cell_w_px = 15, .cell_h_px = 30, .frame_rows = 10, .frame_cols = 40 });
+    p = popupmenuAnchorPlacement(g, 10, 20, 2, 3, 4);
+    try std.testing.expectEqual(@as(i64, 2), p.win);
+    try std.testing.expectEqual(@as(i32, 7), p.row);
+    try std.testing.expectEqual(@as(i32, 6), p.col);
+
+    // An east-anchored scale_view float, 4 columns of 5 px placed at global
+    // column 10: the layout puts its right edge on global column 14, so it
+    // starts at x 140 - 20 = 120 (collectSurfaceLayers). Cell (0, 1) is at
+    // x 125 and ends at y 20 + 10 = 30.
+    try g.resizeGrid(3, 2, 4);
+    try g.win_pos.put(g.alloc, 3, .{ .row = 1, .col = 10, .anchor_grid = 1, .anchor_east = true });
+    try g.grid_fonts.put(g.alloc, 3, .{ .win_id = 1003, .font_id = 2, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 2 });
+    p = popupmenuAnchorPlacement(g, 10, 20, 3, 0, 1);
+    try std.testing.expectEqual(@as(i64, 3), p.win);
+    try std.testing.expectEqual(@as(i32, 1), p.row);
+    try std.testing.expectEqual(@as(i32, 12), p.col);
 }
 
 test "a surface root regenerates every row when it gains or loses its layers under blur" {
