@@ -127,14 +127,19 @@ typedef int (*zonvie_rasterize_glyph_by_id_fn)(
    current global font". The size is multiplied by `scale`. The frontend
    loads the face synchronously, writes the cell width and the row height
    ('linespace' included, the unit it passes to zonvie_core_update_layout_px
-   as cell_h_px), and returns 1; 0 means the load failed. */
+   as cell_h_px), and returns 1; 0 means the load failed. Called on the core
+   thread with grid_mu held, like every IMMEDIATE callback: a lock it takes
+   must never be held by a thread that waits for grid_mu. */
 typedef int (*zonvie_on_font_slot_load_fn)(
     void* ctx, uint32_t font_id, const char* utf8, size_t len, float scale,
     uint32_t* out_cell_w_px, uint32_t* out_cell_h_px);
 typedef void (*zonvie_on_font_slot_release_fn)(void* ctx, uint32_t font_id);
-/* A grid's font changed. font_id 0 means it is back on the global font.
-   extent_* is the pixel box the layer is clipped to (its frame in resize
-   mode, rows x cell in scale_view). IMMEDIATE class: core thread, grid_mu held. */
+/* A grid's font changed. font_id 0 means it is back on the global font, and
+   extent_* are then 0. Otherwise extent_* is the pixel box the layer is
+   clipped to and framed by (its frame in resize mode, rows x cell in
+   scale_view), 0 only for a grid with no rows or columns; a frontend sizes
+   the grid's layer from it, not from rows x cell. IMMEDIATE class: core
+   thread, grid_mu held. */
 typedef void (*zonvie_on_grid_font_fn)(
     void* ctx, int64_t grid_id, uint32_t font_id,
     uint32_t cell_w_px, uint32_t cell_h_px,
@@ -1375,9 +1380,19 @@ ZONVIE_API void zonvie_core_send_key_event(
 
 ZONVIE_API void zonvie_core_resize(zonvie_core *core, unsigned rows, unsigned cols);
 
-/* Request resize of a specific grid (for external windows).
- * Calls nvim_ui_try_resize_grid RPC. */
+/* An external window's OS size, in its grid's cells: call on every OS resize.
+ * The core keeps one nvim_ui_try_resize_grid out per window and sends the
+ * newest size when Neovim answers the last, so a drag never queues stale
+ * sizes. Up to 8 windows are coalesced at once; a 9th resizing at the same
+ * time is sent as is, and zonvie_core_external_resize_outstanding answers 0
+ * for it. Any thread; takes no core lock the core thread holds across a batch. */
 ZONVIE_API void zonvie_core_try_resize_grid(zonvie_core *core, int64_t grid_id, unsigned rows, unsigned cols);
+
+/* 1 when an OS size other than rows x cols is queued or unanswered for
+ * grid_id: the window is at a size its grid has not reached, and framing it
+ * to rows x cols (a grid_resize that answered an older request) would make it
+ * jump back. Pass the grid's current size to ask "is any resize pending". */
+ZONVIE_API int zonvie_core_external_resize_outstanding(zonvie_core *core, int64_t grid_id, unsigned rows, unsigned cols);
 
 /* --- Smooth scrolling support --- */
 
@@ -1426,6 +1441,12 @@ typedef struct zonvie_grid_info {
      * published). Larger is drawn on top: the one answer to which of two
      * grids is in front, so no consumer re-derives the draw order. */
     int64_t layer_z;
+    /* The grid's own rows: the unit margin_* and the scrollability rule
+     * (line_count > grid_rows - margins) are in. Equal to `rows` unless the
+     * grid is drawn in its own font (on_grid_font), when `rows`/`cols` are its
+     * footprint in surface cells, the unit start_row/start_col and hit tests
+     * use. */
+    int32_t grid_rows;
 } zonvie_grid_info;
 
 /* Where message boxes (ext-float messages, the toast, the minis) are placed.

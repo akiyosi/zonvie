@@ -1105,10 +1105,6 @@ pub const Core = struct {
     shape_cache_sets: u32 = 2048, // number of sets (power of 2, computed from shape_cache_size)
     shape_cache: ?[]ShapeCacheEntry = null,
     font_generation: u64 = 0,
-    /// Per-grid font of the row or cursor being generated (0 = global). Set
-    /// by flush around one grid and restored to 0; glyph lookups and the
-    /// rasterize/shape dispatch read it.
-    glyph_font_id: u32 = 0,
 
     // ASCII fast path tables (4 style variants × 128 codepoints, no heap alloc)
     ascii_glyph_ids: [4][128]u32 = .{.{0} ** 128} ** 4,
@@ -1219,6 +1215,10 @@ pub const Core = struct {
     // External-window OS resizes recorded on the UI thread without grid_mu;
     // drainOsResizesLocked moves them into the font state on the RPC thread.
     os_resize_mu: std.Io.Mutex = .init,
+    // External windows with an OS resize queued or unanswered
+    // (requestTryResizeGrid). Under os_resize_mu.
+    os_resizes: [8]OsResize = undefined,
+    os_resizes_len: u8 = 0,
     os_resize_pending: [8]FontResize = undefined,
     os_resize_pending_len: u8 = 0,
     os_resize_overflow: bool = false,
@@ -2431,6 +2431,7 @@ pub const Core = struct {
     /// on_shape_text_run for font 0, on_shape_text_run_ex otherwise.
     pub fn callShapeTextRun(
         self: *Core,
+        font_id: u32,
         scalars: [*]const u32,
         scalar_count: usize,
         style_flags: u32,
@@ -2441,8 +2442,8 @@ pub const Core = struct {
         out_y_offset: [*]i32,
         out_cap: usize,
     ) usize {
-        if (self.glyph_font_id != 0) {
-            if (self.cb.on_shape_text_run_ex) |ex| return ex(self.ctx, self.glyph_font_id, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+        if (font_id != 0) {
+            if (self.cb.on_shape_text_run_ex) |ex| return ex(self.ctx, font_id, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
         }
         const f = self.cb.on_shape_text_run orelse return 0;
         return f(self.ctx, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
@@ -3312,7 +3313,7 @@ pub const Core = struct {
                     if ((scalar_entry.bbox_size_px[0] <= 0 or scalar_entry.bbox_size_px[1] <= 0) and
                         self.cb.on_rasterize_glyph != null)
                     {
-                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                        scalar_entry = self.ensureGlyphPhase2(0, @intCast(scalar), c_style) orelse {
                             if (self.flush_aborted) return false;
                             skipped += 1;
                             continue;
@@ -3328,7 +3329,7 @@ pub const Core = struct {
                 }
 
                 // Rasterize + pack + upload
-                if (self.ensureGlyphByID(gid, c_style)) |entry| {
+                if (self.ensureGlyphByID(0, gid, c_style)) |entry| {
                     cache[probe.insert] = entry;
                     keys[probe.insert] = key;
                     var scalar_entry = entry;
@@ -3336,7 +3337,7 @@ pub const Core = struct {
                     if ((entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) and
                         self.cb.on_rasterize_glyph != null)
                     {
-                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                        scalar_entry = self.ensureGlyphPhase2(0, @intCast(scalar), c_style) orelse {
                             if (self.flush_aborted) return false;
                             rasterized += 1;
                             continue;
@@ -3373,6 +3374,7 @@ pub const Core = struct {
     /// once, and the two existing callers answer it differently — see each.
     fn ensureGlyphRasterized(
         self: *Core,
+        font_id: u32,
         key: u32,
         style_flags: u32,
         rasterize: c_api.RasterizeGlyphFn,
@@ -3392,8 +3394,8 @@ pub const Core = struct {
         // Ask the frontend to rasterize (no packing / UV).
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = if (self.glyph_font_id != 0 and rasterize_ex != null)
-            rasterize_ex.?(self.ctx, self.glyph_font_id, key, style_flags, &bm)
+        const ok = if (font_id != 0 and rasterize_ex != null)
+            rasterize_ex.?(self.ctx, font_id, key, style_flags, &bm)
         else
             rasterize(self.ctx, key, style_flags, &bm);
         if (log_on) {
@@ -3411,8 +3413,10 @@ pub const Core = struct {
         return self.packAndUploadBitmap(&bm);
     }
 
-    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+    /// `font_id` 0 is the global font; another goes to the _ex callback.
+    pub fn ensureGlyphPhase2(self: *Core, font_id: u32, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
         return self.ensureGlyphRasterized(
+            font_id,
             scalar,
             style_flags,
             self.cb.on_rasterize_glyph.?,
@@ -3429,8 +3433,9 @@ pub const Core = struct {
     /// A zero result is a cacheable blank but does not itself arm maintenance:
     /// primary-face misses commonly succeed through the caller's scalar/fallback
     /// font path. Only a final scalar miss starts the bounded retry episode.
-    pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
+    pub fn ensureGlyphByID(self: *Core, font_id: u32, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
         return self.ensureGlyphRasterized(
+            font_id,
             glyph_id,
             style_flags,
             self.cb.on_rasterize_glyph_by_id.?,
@@ -3810,9 +3815,10 @@ pub const Core = struct {
             .mouse_enabled = 1,
             .placed_by_surface = gid,
             .layer_z = 0,
+            .grid_rows = grid_mod.saturatingI32FromU32(rows),
         };
         // The footprint in global cells: what hit tests and message anchors
-        // compare against surface cells.
+        // compare against surface cells. grid_rows keeps the grid's own rows.
         if (self.grid.grid_fonts.get(gid)) |gf| {
             info.rows = grid_mod.saturatingI32FromU32(gf.frame_rows);
             info.cols = grid_mod.saturatingI32FromU32(gf.frame_cols);
@@ -4978,35 +4984,132 @@ pub const Core = struct {
     /// once Neovim confirms via grid_resize. Anticipating the requested size
     /// here would mismatch the NDC baked into existing row vertices (e.g. the
     /// frontend requests 44 rows but Neovim keeps 45 including winbar).
+    ///
+    /// An external window's OS resize, in its grid's cells. One request is
+    /// out per window: a drag reports sizes faster than Neovim answers a
+    /// large grid, and every queued request would replay the drag after
+    /// mouse-up. Neovim's response sends the size wanted since
+    /// (osResizeAnswered). UI thread; never takes grid_mu, which is held for
+    /// whole redraw batches.
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
-        // An external window's OS resize, in its grid's cells. Recorded here
-        // without grid_mu (held for whole redraw batches) and drained by the
-        // RPC thread before the batch that can carry the answer. When full,
-        // the newest entry overwrites the last slot and the drain re-reads
-        // every external resized grid's font instead.
-        if (self.perGridFontsEnabled()) {
+        const size: grid_mod.WinFrame = .{ .rows = rows, .cols = cols };
+        var send: ?OsResize = null;
+        {
             self.os_resize_mu.lockUncancelable(clock.io());
             defer self.os_resize_mu.unlock(clock.io());
-            const pending = self.os_resize_pending[0..self.os_resize_pending_len];
-            const idx = for (pending, 0..) |r, i| {
-                if (r.grid_id == grid_id) break i;
-            } else if (pending.len < self.os_resize_pending.len) blk: {
-                self.os_resize_pending_len += 1;
-                break :blk pending.len;
-            } else blk: {
-                if (!self.os_resize_overflow) self.log.write("per-grid font: OS resize queue full; re-querying external fonts\n", .{});
-                self.os_resize_overflow = true;
-                break :blk self.os_resize_pending.len - 1;
-            };
-            self.os_resize_pending[idx] = .{ .grid_id = grid_id, .rows = rows, .cols = cols };
+            if (self.osResizeIndexLocked(grid_id)) |i| {
+                self.os_resizes[i].wanted = size;
+                send = self.takeOsResizeLocked(i);
+            } else if (self.os_resizes_len < self.os_resizes.len) {
+                self.os_resizes[self.os_resizes_len] = .{ .grid_id = grid_id, .wanted = size };
+                self.os_resizes_len += 1;
+                send = self.takeOsResizeLocked(self.os_resizes_len - 1);
+            } else {
+                // More windows resizing at once than tracked: uncoalesced.
+                send = .{ .grid_id = grid_id, .sent = size, .msgid = self.nextMsgId() };
+                self.recordOsResizeForFontLocked(grid_id, size);
+            }
         }
-        self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
+        if (send) |s| self.sendOsResize(s);
+    }
+
+    /// One external window's OS resizes: the size wanted next, and the
+    /// request Neovim has not answered (`msgid`).
+    pub const OsResize = struct { grid_id: i64, wanted: ?grid_mod.WinFrame = null, sent: ?grid_mod.WinFrame = null, msgid: i64 = 0 };
+
+    fn osResizeIndexLocked(self: *const Core, grid_id: i64) ?usize {
+        for (self.os_resizes[0..self.os_resizes_len], 0..) |e, i| if (e.grid_id == grid_id) return i;
+        return null;
+    }
+
+    /// Move entry `i`'s wanted size out as its request when none is out; an
+    /// entry with neither is dropped. os_resize_mu held.
+    fn takeOsResizeLocked(self: *Core, i: usize) ?OsResize {
+        const e = &self.os_resizes[i];
+        if (e.sent != null) return null;
+        const w = e.wanted orelse {
+            self.os_resizes_len -= 1;
+            self.os_resizes[i] = self.os_resizes[self.os_resizes_len];
+            return null;
+        };
+        e.wanted = null;
+        e.sent = w;
+        e.msgid = self.nextMsgId();
+        self.recordOsResizeForFontLocked(e.grid_id, w);
+        return e.*;
+    }
+
+    fn sendOsResize(self: *Core, s: OsResize) void {
+        self.requestTryResizeGridWithId(s.msgid, s.grid_id, s.sent.?.rows, s.sent.?.cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
+            // No response will come: release what this request held, and
+            // the font must not wait for an answer either.
+            self.os_resize_mu.lockUncancelable(clock.io());
+            self.forgetOsResizeForFontLocked(s.grid_id);
+            self.os_resize_mu.unlock(clock.io());
+            _ = self.osResizeAnswered(s.msgid);
         };
     }
 
+    /// Neovim answered the OS resize request `msgid`: send the size wanted
+    /// since, if any. The grid the request was for, null when `msgid` is not
+    /// one. RPC thread.
+    pub fn osResizeAnswered(self: *Core, msgid: i64) ?i64 {
+        var send: ?OsResize = null;
+        var grid_id: i64 = 0;
+        {
+            self.os_resize_mu.lockUncancelable(clock.io());
+            defer self.os_resize_mu.unlock(clock.io());
+            const i = for (self.os_resizes[0..self.os_resizes_len], 0..) |e, i| {
+                if (e.sent != null and e.msgid == msgid) break i;
+            } else return null;
+            grid_id = self.os_resizes[i].grid_id;
+            self.os_resizes[i].sent = null;
+            send = self.takeOsResizeLocked(i);
+        }
+        if (send) |s| self.sendOsResize(s);
+        return grid_id;
+    }
+
+    /// Whether an OS size other than `rows` x `cols` is queued or unanswered
+    /// for `grid_id`: its window is at a size the grid has not reached, and
+    /// framing it to `rows` x `cols` would make it jump back. Any thread.
+    pub fn osResizeOutstanding(self: *Core, grid_id: i64, rows: u32, cols: u32) bool {
+        const size: grid_mod.WinFrame = .{ .rows = rows, .cols = cols };
+        self.os_resize_mu.lockUncancelable(clock.io());
+        defer self.os_resize_mu.unlock(clock.io());
+        const e = self.os_resizes[(self.osResizeIndexLocked(grid_id) orelse return false)];
+        if (e.wanted) |w| if (!std.meta.eql(w, size)) return true;
+        if (e.sent) |s| if (!std.meta.eql(s, size)) return true;
+        return false;
+    }
+
+    /// Record a request sent for drainOsResizesLocked, which applies it to the
+    /// grid's font on the RPC thread before the batch that can carry the
+    /// answer. When full, the newest entry overwrites the last slot and the
+    /// drain re-reads every external resized grid's font instead.
+    /// os_resize_mu held.
+    fn recordOsResizeForFontLocked(self: *Core, grid_id: i64, size: grid_mod.WinFrame) void {
+        if (!self.perGridFontsEnabled()) return;
+        const pending = self.os_resize_pending[0..self.os_resize_pending_len];
+        const idx = for (pending, 0..) |r, i| {
+            if (r.grid_id == grid_id) break i;
+        } else if (pending.len < self.os_resize_pending.len) blk: {
+            self.os_resize_pending_len += 1;
+            break :blk pending.len;
+        } else blk: {
+            if (!self.os_resize_overflow) self.log.write("per-grid font: OS resize queue full; re-querying external fonts\n", .{});
+            self.os_resize_overflow = true;
+            break :blk self.os_resize_pending.len - 1;
+        };
+        self.os_resize_pending[idx] = .{ .grid_id = grid_id, .rows = size.rows, .cols = size.cols };
+    }
+
     pub fn requestTryResizeGridInternal(self: *Core, grid_id: i64, rows: u32, cols: u32) !void {
-        const id = self.nextMsgId();
+        return self.requestTryResizeGridWithId(self.nextMsgId(), grid_id, rows, cols);
+    }
+
+    fn requestTryResizeGridWithId(self: *Core, id: i64, grid_id: i64, rows: u32, cols: u32) !void {
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
@@ -5415,6 +5518,7 @@ pub const Core = struct {
         self.font_resize_outbox.clearRetainingCapacity();
         self.split_release_outbox.clearRetainingCapacity();
         self.os_resize_mu.lockUncancelable(clock.io());
+        self.os_resizes_len = 0;
         self.os_resize_pending_len = 0;
         self.os_resize_overflow = false;
         self.os_resize_mu.unlock(clock.io());
@@ -5462,23 +5566,35 @@ pub const Core = struct {
         for (pending[0..n]) |r| {
             const gf = self.grid.grid_fonts.getPtr(r.grid_id) orelse continue;
             if (gf.mode != .resize) continue;
-            // An external window is a float: the request is its whole grid,
-            // winbar included (winfloat.c win_config_float).
-            const grid_rows = r.rows;
-            gf.req_rows = r.rows;
-            gf.req_cols = r.cols;
-            gf.os_answer_pending = true;
-            gf.frame_rows = font_slots.footprintCells(grid_rows, gf.cell_h_px, @max(1, self.cell_h_px));
-            gf.frame_cols = font_slots.footprintCells(r.cols, gf.cell_w_px, @max(1, self.cell_w_px));
-            const ext_w = r.cols * gf.cell_w_px;
-            const ext_h = grid_rows * gf.cell_h_px;
-            if (ext_w == gf.extent_w_px and ext_h == gf.extent_h_px) continue;
-            gf.extent_w_px = ext_w;
-            gf.extent_h_px = ext_h;
-            self.notifyGridFont(r.grid_id, gf.*);
-            self.grid.markEverySurfaceDirty();
-            self.grid.cursor_rev +%= 1;
+            // A request at the grid's size gets no grid_resize (ui.c
+            // ui_grid_resize on a float): nothing to wait for.
+            const sg = self.grid.sub_grids.getPtr(r.grid_id);
+            gf.os_answer_pending = sg == null or sg.?.rows != r.rows or sg.?.cols != r.cols;
+            if (grid_mod.grid_font.adoptSize(gf, .{ .rows = r.rows, .cols = r.cols }, self.cell_w_px, self.cell_h_px))
+                self.publishGridFontLocked(r.grid_id, gf.*);
         }
+    }
+
+    /// Neovim refused the OS resize request of `grid_id`: no grid_resize
+    /// answers it. RPC thread, grid_mu NOT held.
+    pub fn osResizeRefused(self: *Core, grid_id: i64) void {
+        self.os_resize_mu.lockUncancelable(clock.io());
+        self.forgetOsResizeForFontLocked(grid_id);
+        self.os_resize_mu.unlock(clock.io());
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
+        if (self.grid.grid_fonts.getPtr(grid_id)) |gf| gf.os_answer_pending = false;
+    }
+
+    /// Drop the font record of `grid_id`'s request before the drain sees it.
+    /// os_resize_mu held.
+    fn forgetOsResizeForFontLocked(self: *Core, grid_id: i64) void {
+        const pending = self.os_resize_pending[0..self.os_resize_pending_len];
+        for (pending, 0..) |r, i| if (r.grid_id == grid_id) {
+            self.os_resize_pending[i] = pending[pending.len - 1];
+            self.os_resize_pending_len -= 1;
+            return;
+        };
     }
 
     /// Send the try_resize_grid requests decided under grid_mu. Call after
@@ -5567,9 +5683,18 @@ pub const Core = struct {
         self.log.write("per-grid font: released split request grid={d} win={d}\n", .{ r.grid_id, r.win });
     }
 
-    fn notifyGridFont(self: *Core, grid_id: i64, gf: ?grid_mod.GridFont) void {
-        const f = self.cb.on_grid_font orelse return;
-        if (gf) |g| f(self.ctx, grid_id, g.font_id, g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px) else f(self.ctx, grid_id, 0, self.cell_w_px, self.cell_h_px, 0, 0);
+    /// Tell the frontend a grid's font, cell or extent changed (null = back
+    /// on the global font) and redraw every surface in it.
+    fn publishGridFontLocked(self: *Core, grid_id: i64, gf: ?grid_mod.GridFont) void {
+        if (self.cb.on_grid_font) |f| {
+            if (gf) |g| f(self.ctx, grid_id, g.font_id, g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px) else f(self.ctx, grid_id, 0, self.cell_w_px, self.cell_h_px, 0, 0);
+        }
+        self.grid.markEverySurfaceDirty();
+        self.grid.cursor_rev +%= 1;
+    }
+
+    fn sendFontRequest(self: *Core, grid_id: i64, size: ?grid_mod.WinFrame) void {
+        if (size) |s| self.sendFontResize(grid_id, s.rows, s.cols);
     }
 
     fn releaseFontSlot(self: *Core, font_id: u32) void {
@@ -5578,57 +5703,40 @@ pub const Core = struct {
         }
     }
 
-    /// An in-window float is never resized: try_resize_grid on a float
-    /// rewrites its config (nvim ui.c:769-773), which plugins would observe.
-    const GridKind = enum { split, float, external };
-
-    fn gridKind(self: *const Core, grid_id: i64) GridKind {
+    fn windowKind(self: *const Core, grid_id: i64) grid_mod.grid_font.WindowKind {
         if (self.grid.isExternalGrid(grid_id)) return .external;
         if (self.grid.win_layer.get(grid_id)) |l| if (l.zindex > 0) return .float;
         return .split;
     }
 
-    /// Drop a grid's font. With `give_back`, a resized window gets its size
-    /// back: 0x0 clears a split's request (ui.c:775-778), sent only while
-    /// the window is a split (on a float it means a 1x1 config); an external
-    /// window is re-requested in global cells for its frame.
+    /// Drop a grid's font. With `give_back`, the window gets back the size
+    /// grid_font.clearRequest names for its kind.
     fn clearGridFontLocked(self: *Core, grid_id: i64, give_back: bool) void {
-        const kind = self.gridKind(grid_id);
+        const kind = self.windowKind(grid_id);
         const held = give_back and kind == .split and self.grid.split_request_held.remove(grid_id);
-        const kv = self.grid.grid_fonts.fetchRemove(grid_id) orelse {
-            if (held) self.sendFontResize(grid_id, 0, 0);
-            return;
-        };
-        const gf = kv.value;
+        const prev = if (self.grid.grid_fonts.fetchRemove(grid_id)) |kv| kv.value else null;
+        if (give_back) self.sendFontRequest(grid_id, grid_mod.grid_font.clearRequest(kind, prev, held));
+        const gf = prev orelse return;
         self.releaseFontSlot(gf.font_id);
         _ = self.grid.grid_metrics.remove(grid_id);
-        if (held or (give_back and kind == .split and gf.mode == .resize)) {
-            self.sendFontResize(grid_id, 0, 0);
-        } else if (give_back and kind == .external and gf.mode == .resize) {
-            self.sendFontResize(grid_id, gf.frame_rows, gf.frame_cols);
-        }
-        self.notifyGridFont(grid_id, null);
-        self.grid.markEverySurfaceDirty();
-        self.grid.cursor_rev +%= 1;
+        self.publishGridFontLocked(grid_id, null);
     }
 
     pub fn applyWindowFontLocked(self: *Core, a: rpc_session.WindowFontAnswer) void {
         const grid_id = self.gridForWin(a.win) orelse return;
         if (!a.valid) return;
+        // Queries are sent only when perGridFontsEnabled(), which requires
+        // every font callback; the unwraps below rely on it.
+        std.debug.assert(self.perGridFontsEnabled());
         // A grid id reused by another window does not inherit its font.
         if (self.grid.grid_fonts.get(grid_id)) |p| {
             if (p.win_id != a.win) self.clearGridFontLocked(grid_id, false);
         }
-        const kind = self.gridKind(grid_id);
-        const floating = kind == .float;
-
-        // zonvie_* wins over neovide_font_scale, which only floats honour.
-        const want_resize = a.guifont != null or a.zonvie_scale != null;
-        const want_view = !want_resize and floating and a.neovide_scale != null;
-        if (!want_resize and !want_view) {
+        const kind = self.windowKind(grid_id);
+        const mode = kind.fontMode(a.guifont != null or a.zonvie_scale != null, a.neovide_scale != null) orelse {
             self.clearGridFontLocked(grid_id, true);
             return;
-        }
+        };
         var arena_buf: [4096]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
         const guifont_key: []const u8 = if (a.guifont) |raw|
@@ -5638,8 +5746,7 @@ pub const Core = struct {
             })
         else
             "";
-        const scale: f32 = if (want_view) font_slots.clampNeovideScale(a.neovide_scale.?) else @floatCast(a.zonvie_scale orelse 1.0);
-        const mode: grid_mod.FontMode = if (want_view) .scale_view else if (floating) .font_view else .resize;
+        const scale: f32 = if (mode == .scale_view) font_slots.clampNeovideScale(a.neovide_scale.?) else @floatCast(a.zonvie_scale orelse 1.0);
 
         const prev = self.grid.grid_fonts.get(grid_id);
         const acq = self.font_slots.acquire(guifont_key, scale) catch |e| {
@@ -5647,9 +5754,6 @@ pub const Core = struct {
             return;
         };
         if (acq.needs_load) {
-            // Queries are sent only when perGridFontsEnabled(), which requires
-            // both slot callbacks; the unwraps below rely on it.
-            std.debug.assert(self.perGridFontsEnabled());
             var w: u32 = 0;
             var h: u32 = 0;
             const ok = self.cb.on_font_slot_load.?(self.ctx, acq.font_id, guifont_key.ptr, guifont_key.len, scale, &w, &h);
@@ -5667,94 +5771,32 @@ pub const Core = struct {
             self.resetGlyphCacheFlags();
             self.resetShapeCache();
         }
-        if (prev) |p| self.releaseFontSlot(p.font_id);
+        if (prev) |old| self.releaseFontSlot(old.font_id);
         const slot = self.font_slots.slot(acq.font_id);
-        const gw = @max(1, self.cell_w_px);
-        const gh = @max(1, self.cell_h_px);
-
-        var gf: grid_mod.GridFont = .{
+        const margins = self.grid.getViewportMargins(grid_id);
+        const p = grid_mod.grid_font.plan(.{
+            .kind = kind,
+            .mode = mode,
             .win_id = a.win,
             .font_id = acq.font_id,
-            .mode = mode,
             .cell_w_px = slot.cell_w_px,
             .cell_h_px = slot.cell_h_px,
-            .frame_rows = 0,
-            .frame_cols = 0,
-        };
-        const logical = gridCells(self.grid.sub_grids.getPtr(grid_id));
-        switch (mode) {
-            .resize => {
-                // Frame in global cells. A split's comes from win_pos. An
-                // external window keeps the frame it had when the font was
-                // applied (its OS window does not move); the first time,
-                // that is its current grid size.
-                const frame: grid_mod.WinFrame = if (kind == .split)
-                    self.grid.win_frames.get(grid_id) orelse logical
-                else if (prev != null and prev.?.mode == .resize)
-                    .{ .rows = prev.?.frame_rows, .cols = prev.?.frame_cols }
-                else
-                    logical;
-                gf.frame_rows = frame.rows;
-                gf.frame_cols = frame.cols;
-                gf.extent_w_px = frame.cols * gw;
-                gf.extent_h_px = frame.rows * gh;
-                if (prev) |p| if (p.mode == .resize) {
-                    gf.req_rows = p.req_rows;
-                    gf.req_cols = p.req_cols;
-                };
-                // A split's request is its view height (window.c
-                // win_set_inner_size); the grid adds the winbar, which the
-                // frame already counts. An external window is a float, whose
-                // request is the whole grid. Width has no such rows to leave.
-                const m = if (kind == .split) self.grid.getViewportMargins(grid_id) else grid_mod.ViewportMargins{};
-                const rows = @max(1, font_slots.requestedCells(frame.rows, gh, gf.cell_h_px, grid_mod.MAX_GRID_ROWS) -| (m.top + m.bottom));
-                const cols = font_slots.requestedCells(frame.cols, gw, gf.cell_w_px, grid_mod.MAX_GRID_COLS);
-                // An external window's request in an unchanged font is the
-                // OS window's own (drainOsResizesLocked). Its frame is that
-                // request rounded up to global cells, so recomputing the
-                // request or extent from the frame would differ from the
-                // window it has.
-                const keep_os_request = kind == .external and gf.req_rows != 0 and
-                    prev.?.cell_w_px == gf.cell_w_px and prev.?.cell_h_px == gf.cell_h_px;
-                if (keep_os_request) {
-                    gf.extent_w_px = prev.?.extent_w_px;
-                    gf.extent_h_px = prev.?.extent_h_px;
-                }
-                if (!keep_os_request and (rows != gf.req_rows or cols != gf.req_cols)) {
-                    gf.req_rows = rows;
-                    gf.req_cols = cols;
-                    self.sendFontResize(grid_id, rows, cols);
-                }
-                if (kind == .split) self.grid.split_request_held.put(self.alloc, grid_id, {}) catch {};
-            },
-            .font_view => {
-                // Logical rows/cols stay Neovim's; clipped to logical size x
-                // global cell px.
-                gf.frame_rows = logical.rows;
-                gf.frame_cols = logical.cols;
-                gf.extent_w_px = logical.cols * gw;
-                gf.extent_h_px = logical.rows * gh;
-            },
-            .scale_view => {
-                gf.frame_rows = font_slots.footprintCells(logical.rows, gf.cell_h_px, gh);
-                gf.frame_cols = font_slots.footprintCells(logical.cols, gf.cell_w_px, gw);
-                gf.extent_w_px = logical.cols * gf.cell_w_px;
-                gf.extent_h_px = logical.rows * gf.cell_h_px;
-            },
-        }
-        const changed = prev == null or prev.?.font_id != gf.font_id or prev.?.cell_w_px != gf.cell_w_px or
-            prev.?.cell_h_px != gf.cell_h_px or prev.?.extent_w_px != gf.extent_w_px or prev.?.extent_h_px != gf.extent_h_px;
-        self.grid.grid_fonts.put(self.alloc, grid_id, gf) catch {
+            .global_w_px = @max(1, self.cell_w_px),
+            .global_h_px = @max(1, self.cell_h_px),
+            .prev = prev,
+            .logical = gridCells(self.grid.sub_grids.getPtr(grid_id)),
+            .win_frame = self.grid.win_frames.get(grid_id),
+            .margin_rows = margins.top + margins.bottom,
+        });
+        self.grid.grid_fonts.put(self.alloc, grid_id, p.font) catch {
             // The reference just taken is not recorded anywhere; drop it.
-            self.releaseFontSlot(gf.font_id);
+            self.releaseFontSlot(p.font.font_id);
             return;
         };
-        self.grid.setGridMetricsPx(grid_id, gf.cell_w_px, gf.cell_h_px) catch {};
-        if (changed) {
-            self.notifyGridFont(grid_id, gf);
-            self.grid.markEverySurfaceDirty();
-            self.grid.cursor_rev +%= 1;
-        }
+        self.sendFontRequest(grid_id, p.request);
+        if (mode == .resize and kind == .split) self.grid.split_request_held.put(self.alloc, grid_id, {}) catch {};
+        self.grid.setGridMetricsPx(grid_id, p.font.cell_w_px, p.font.cell_h_px) catch {};
+        if (grid_mod.grid_font.differs(prev, p.font)) self.publishGridFontLocked(grid_id, p.font);
     }
 
     fn gridCells(sg: ?*const grid_mod.GridBuf) grid_mod.WinFrame {
@@ -5768,28 +5810,36 @@ pub const Core = struct {
         self.grid.font_releases_pending.clearRetainingCapacity();
     }
 
-    /// Take the size Neovim gave an external window on its own as that
-    /// window's request, frame and extent, so the frontend frames the OS
-    /// window to it. Runs before the flush that draws the new size, whose
-    /// end commits on_grid_font. Caller holds grid_mu.
-    pub fn notifyAdoptedGridSizesLocked(self: *Core) void {
-        defer self.grid.font_sizes_adopted.clearRetainingCapacity();
-        for (self.grid.font_sizes_adopted.items) |grid_id| {
+    /// Decide what each grid_resize of a font grid meant
+    /// (grid_font.resizeMeaning) and act on it: a split whose frame moved
+    /// re-reads its font; an external window Neovim resized itself takes
+    /// that size as its frame, so the frontend frames the OS window to it.
+    /// Runs before the flush that draws the new sizes, whose end commits
+    /// on_grid_font, and again after the batch for one with no flush.
+    /// Caller holds grid_mu.
+    pub fn settleFontGridResizesLocked(self: *Core) void {
+        defer self.grid.font_grids_resized.clearRetainingCapacity();
+        for (self.grid.font_grids_resized.items) |grid_id| {
             const gf = self.grid.grid_fonts.getPtr(grid_id) orelse continue;
             const sg = self.grid.sub_grids.getPtr(grid_id) orelse continue;
-            if (gf.mode != .resize or (sg.rows == gf.req_rows and sg.cols == gf.req_cols)) continue;
-            gf.req_rows = sg.rows;
-            gf.req_cols = sg.cols;
-            gf.frame_rows = font_slots.footprintCells(sg.rows, gf.cell_h_px, @max(1, self.cell_h_px));
-            gf.frame_cols = font_slots.footprintCells(sg.cols, gf.cell_w_px, @max(1, self.cell_w_px));
-            const ext_w = sg.cols * gf.cell_w_px;
-            const ext_h = sg.rows * gf.cell_h_px;
-            if (ext_w == gf.extent_w_px and ext_h == gf.extent_h_px) continue;
-            gf.extent_w_px = ext_w;
-            gf.extent_h_px = ext_h;
-            self.notifyGridFont(grid_id, gf.*);
-            self.grid.markEverySurfaceDirty();
-            self.grid.cursor_rev +%= 1;
+            const size: grid_mod.WinFrame = .{ .rows = sg.rows, .cols = sg.cols };
+            const m = if (self.grid.split_request_held.contains(grid_id)) self.grid.getViewportMargins(grid_id) else grid_mod.ViewportMargins{};
+            var meaning = grid_mod.grid_font.resizeMeaning(self.windowKind(grid_id), gf.*, size, m.top + m.bottom);
+            if (meaning == .os_answer) {
+                gf.os_answer_pending = false;
+                // Neovim emits one grid_resize per screen update, with the
+                // size the window ended at: the request's, or one it chose
+                // itself (a WinResized autocmd's `:resize`, a clamp). That
+                // size is the window's unless a newer request is out, whose
+                // own answer follows.
+                meaning = if (!std.meta.eql(size, gf.req.?) and !self.osResizeOutstanding(grid_id, size.rows, size.cols)) .adopt else .none;
+            }
+            switch (meaning) {
+                .none, .os_answer => {},
+                .requery => self.grid.wantFontQuery(gf.win_id),
+                .adopt => if (grid_mod.grid_font.adoptSize(gf, size, self.cell_w_px, self.cell_h_px))
+                    self.publishGridFontLocked(grid_id, gf.*),
+            }
         }
     }
 
@@ -6928,7 +6978,7 @@ test "a rasterize miss and an atlas reset are reported through on_callback_error
     core.cb.on_atlas_create = AtlasFailureTestState.create;
     core.cb.on_callback_error = AtlasFailureTestState.callbackError;
 
-    _ = core.ensureGlyphPhase2('A', 0);
+    _ = core.ensureGlyphPhase2(0, 'A', 0);
     try std.testing.expectEqual(@as(u32, 1), state.error_calls);
     try std.testing.expectEqual(@intFromEnum(c_api.CallbackErrorCode.glyph_rasterize), state.last_error_code);
 
@@ -6946,14 +6996,14 @@ test "aborted atlas upload rolls back shelf allocation" {
     core.cb.on_atlas_upload = AtlasFailureTestState.upload;
     core.cb.on_atlas_create = AtlasFailureTestState.create;
 
-    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'A', 0) == null);
     const after_first = core.atlas_packer.?;
     try std.testing.expectEqual(@as(u32, 1), after_first.next_x);
     try std.testing.expectEqual(@as(u32, 1), after_first.next_y);
     try std.testing.expectEqual(@as(u32, 0), after_first.row_h);
 
     core.flush_aborted = false;
-    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'A', 0) == null);
     const after_second = core.atlas_packer.?;
     try std.testing.expectEqual(after_first.next_x, after_second.next_x);
     try std.testing.expectEqual(after_first.next_y, after_second.next_y);
@@ -6970,7 +7020,7 @@ test "atlas create abort stops raster and retries creation" {
     core.cb.on_atlas_upload = AtlasFailureTestState.upload;
     core.cb.on_atlas_create = AtlasFailureTestState.create;
 
-    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'A', 0) == null);
     try std.testing.expectEqual(@as(u32, 1), state.create_calls);
     try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
     try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
@@ -6979,7 +7029,7 @@ test "atlas create abort stops raster and retries creation" {
 
     state.abort_create = false;
     core.flush_aborted = false;
-    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'A', 0) != null);
     try std.testing.expectEqual(@as(u32, 2), state.create_calls);
     try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
     try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
@@ -6994,7 +7044,7 @@ test "atlas reset create abort stops before upload" {
     core.cb.on_atlas_upload = AtlasFailureTestState.upload;
     core.cb.on_atlas_create = AtlasFailureTestState.create;
 
-    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'A', 0) != null);
     const uploads_before = state.upload_calls;
     core.atlas_w = config.atlas_size_max;
     core.atlas_h = config.atlas_size_max;
@@ -7003,7 +7053,7 @@ test "atlas reset create abort stops before upload" {
     core.atlas_full_resets_this_flush = 0;
     state.abort_create = true;
 
-    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'B', 0) == null);
     try std.testing.expectEqual(uploads_before, state.upload_calls);
     try std.testing.expect(!core.atlas_initialized);
     try std.testing.expect(core.atlas_packer == null);
@@ -7019,11 +7069,11 @@ test "rasterizer miss returns a cacheable blank while explicit abort stays null"
     core.cb.on_atlas_upload = AtlasFailureTestState.upload;
     core.cb.on_atlas_create = AtlasFailureTestState.create;
 
-    const id_blank = core.ensureGlyphByID(123, c_api.STYLE_BOLD).?;
+    const id_blank = core.ensureGlyphByID(0, 123, c_api.STYLE_BOLD).?;
     try std.testing.expectEqual(@as(f32, 0), id_blank.bbox_size_px[0]);
     try std.testing.expect(!core.transient_glyph_has_negative);
 
-    const scalar_blank = core.ensureGlyphPhase2('A', 0).?;
+    const scalar_blank = core.ensureGlyphPhase2(0, 'A', 0).?;
     try std.testing.expectEqual(@as(f32, 0), scalar_blank.bbox_size_px[0]);
     try std.testing.expect(core.transient_glyph_has_negative);
     const first_retry_at = core.transient_glyph_retry_at.?;
@@ -7034,7 +7084,7 @@ test "rasterizer miss returns a cacheable blank while explicit abort stays null"
     core.resetAtlasMaintenanceBackoff();
     state.abort_raster = true;
     core.flush_aborted = false;
-    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expect(core.ensureGlyphPhase2(0, 'B', 0) == null);
     try std.testing.expect(core.flush_aborted);
     try std.testing.expect(!core.transient_glyph_has_negative);
     try std.testing.expect(core.transient_glyph_retry_at == null);
@@ -8964,11 +9014,9 @@ test "glyph rasterization dispatches font 0 to the old callback and others to th
     core.cb.on_rasterize_glyph_ex = S.ex;
     core.cb.on_atlas_upload = S.upload;
     core.cb.on_atlas_create = S.create;
-    _ = core.ensureGlyphPhase2('A', 0);
+    _ = core.ensureGlyphPhase2(0, 'A', 0);
     try std.testing.expectEqual(@as(u32, 1), S.legacy_calls);
-    core.glyph_font_id = 4;
-    _ = core.ensureGlyphPhase2('B', 0);
-    core.glyph_font_id = 0;
+    _ = core.ensureGlyphPhase2(4, 'B', 0);
     try std.testing.expectEqual(@as(u32, 1), S.legacy_calls);
     try std.testing.expectEqual(@as(u32, 4), S.ex_font);
 }
@@ -9064,6 +9112,8 @@ test "a full OS resize queue re-queries every external resize grid" {
     defer core.deinitForTest();
     var s = FontTestState{};
     s.arm(&core);
+    try armTestWriter(&core);
+    defer core.writer_thread = null;
     try core.grid.resizeGrid(1, 24, 80);
     try core.grid.resizeGrid(4, 10, 40);
     try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
@@ -9087,8 +9137,8 @@ test "a font scale on a split requests the cells that fill its frame" {
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
     const gf = core.grid.grid_fonts.get(2).?;
     try std.testing.expectEqual(grid_mod.FontMode.resize, gf.mode);
-    try std.testing.expectEqual(@as(u32, 20), gf.req_rows); // 10*20/10
-    try std.testing.expectEqual(@as(u32, 80), gf.req_cols); // 40*10/5
+    try std.testing.expectEqual(@as(u32, 20), gf.req.?.rows); // 10*20/10
+    try std.testing.expectEqual(@as(u32, 80), gf.req.?.cols); // 40*10/5
     try std.testing.expectEqual(@as(u32, 1), s.loads);
     try std.testing.expect(s.last_grid_font != 0);
 }
@@ -9152,7 +9202,7 @@ test "a failed load on a grid with a font keeps the previous font and sends no r
     try std.testing.expectEqual(@as(u32, 2), s.loads);
     const after = core.grid.grid_fonts.get(2).?;
     try std.testing.expectEqual(before.font_id, after.font_id);
-    try std.testing.expectEqual(before.req_rows, after.req_rows);
+    try std.testing.expectEqual(before.req, after.req);
     try std.testing.expectEqual(sent, core.font_resize_requests);
     try std.testing.expectEqual(@as(u32, 0), s.releases);
     try std.testing.expectEqual(@as(u32, 1), core.font_slots.slot(before.font_id).refcount);
@@ -9167,7 +9217,7 @@ test "a font entry left by another window on a reused grid id is not inherited" 
     // Grid 2 still carries window 999's request for the same size.
     const old = try core.font_slots.acquire("", 0.5);
     core.font_slots.markLoaded(old.font_id, 5, 10);
-    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 999, .font_id = old.font_id, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 10, .frame_cols = 40, .req_rows = 20, .req_cols = 80 });
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 999, .font_id = old.font_id, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 10, .frame_cols = 40, .req = .{ .rows = 20, .cols = 80 } });
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
     const gf = core.grid.grid_fonts.get(2).?;
     try std.testing.expectEqual(@as(i64, 1000), gf.win_id);
@@ -9188,7 +9238,7 @@ test "neovide_font_scale on a float is scale_view, on a split ignored, and zonvi
     core.applyWindowFontLocked(.{ .win = 1001, .valid = true, .neovide_scale = 0.5 });
     const gf = core.grid.grid_fonts.get(3).?;
     try std.testing.expectEqual(grid_mod.FontMode.scale_view, gf.mode);
-    try std.testing.expectEqual(@as(u32, 0), gf.req_rows);
+    try std.testing.expect(gf.req == null);
     try std.testing.expectEqual(@as(u64, 0), core.font_resize_requests);
     try std.testing.expectEqual(@as(u32, 100), gf.extent_w_px); // 20 cols * 5 px
     core.applyWindowFontLocked(.{ .win = 1001, .valid = true, .zonvie_scale = 2.0, .neovide_scale = 0.5 });
@@ -9224,7 +9274,7 @@ test "font_view clips a float to its logical size in global cells and never resi
     try std.testing.expectEqual(@as(u32, 80), gf.extent_h_px);
     try std.testing.expectEqual(@as(u32, 4), gf.frame_rows);
     try std.testing.expectEqual(@as(u32, 20), gf.frame_cols);
-    try std.testing.expectEqual(@as(u32, 0), gf.req_rows);
+    try std.testing.expect(gf.req == null);
     try std.testing.expectEqual(@as(u64, 0), core.font_resize_requests);
     // Clearing a float sends nothing either.
     core.applyWindowFontLocked(.{ .win = 1001, .valid = true });
@@ -9243,8 +9293,8 @@ test "an external window in resize mode clears back to its size in global cells"
     core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
     const gf = core.grid.grid_fonts.get(4).?;
     try std.testing.expectEqual(grid_mod.FontMode.resize, gf.mode);
-    try std.testing.expectEqual(@as(u32, 20), gf.req_rows);
-    try std.testing.expectEqual(@as(u32, 80), gf.req_cols);
+    try std.testing.expectEqual(@as(u32, 20), gf.req.?.rows);
+    try std.testing.expectEqual(@as(u32, 80), gf.req.?.cols);
     // Neovim answered; the OS window still covers 10x40 global cells.
     try core.grid.resizeGrid(4, 20, 80);
     const sent = core.font_resize_requests;
@@ -9259,6 +9309,8 @@ test "an external window OS resize in grid cells is not taken for a frame change
     defer core.deinitForTest();
     var s = FontTestState{};
     s.arm(&core);
+    try armTestWriter(&core);
+    defer core.writer_thread = null;
     try core.grid.resizeGrid(1, 24, 80);
     try core.grid.resizeGrid(4, 10, 40);
     try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
@@ -9270,9 +9322,10 @@ test "an external window OS resize in grid cells is not taken for a frame change
     // only when the RPC thread drains it before the next batch.
     const before = core.grid.grid_fonts.get(4).?;
     core.requestTryResizeGrid(4, 30, 100);
-    try std.testing.expectEqual(before.req_rows, core.grid.grid_fonts.get(4).?.req_rows);
+    try std.testing.expectEqual(before.req, core.grid.grid_fonts.get(4).?.req);
     core.drainOsResizesLocked();
     try core.grid.resizeGrid(4, 30, 100);
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
     const gf = core.grid.grid_fonts.get(4).?;
     try std.testing.expectEqual(@as(u32, 15), gf.frame_rows); // 30*10/20
@@ -9291,6 +9344,8 @@ test "an external window's OS size survives its winbar and a font re-query" {
     defer core.deinitForTest();
     var s = FontTestState{};
     s.arm(&core);
+    try armTestWriter(&core);
+    defer core.writer_thread = null;
     try core.grid.resizeGrid(1, 24, 80);
     try core.grid.resizeGrid(4, 10, 40);
     try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
@@ -9304,9 +9359,10 @@ test "an external window's OS size survives its winbar and a font re-query" {
     // rows (40 font rows).
     core.requestTryResizeGrid(4, 39, 101);
     core.drainOsResizesLocked();
-    try std.testing.expectEqual(@as(u32, 39), core.grid.grid_fonts.get(4).?.req_rows);
+    try std.testing.expectEqual(@as(u32, 39), core.grid.grid_fonts.get(4).?.req.?.rows);
     core.grid.font_query_wanted.clearRetainingCapacity();
     try core.grid.resizeGrid(4, 39, 101);
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
     // The extent covers the whole grid, winbar included.
     try std.testing.expectEqual(@as(u32, 390), core.grid.grid_fonts.get(4).?.extent_h_px);
@@ -9329,15 +9385,15 @@ test "an external window Neovim resizes itself takes that size as its frame" {
     try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
     core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
     try core.grid.resizeGrid(4, 20, 80);
-    core.notifyAdoptedGridSizesLocked();
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqual(@as(u32, 200), s.last_extent_h); // the request answered
     core.grid.font_query_wanted.clearRetainingCapacity();
     // :resize 30 inside the window: no request of ours.
     const sent = core.font_resize_requests;
     try core.grid.resizeGrid(4, 30, 80);
-    core.notifyAdoptedGridSizesLocked();
+    core.settleFontGridResizesLocked();
     const gf = core.grid.grid_fonts.get(4).?;
-    try std.testing.expectEqual(@as(u32, 30), gf.req_rows);
+    try std.testing.expectEqual(@as(u32, 30), gf.req.?.rows);
     try std.testing.expectEqual(@as(u32, 15), gf.frame_rows); // 30*10/20
     try std.testing.expectEqual(@as(u32, 300), gf.extent_h_px);
     try std.testing.expectEqual(@as(u32, 300), s.last_extent_h);
@@ -9426,6 +9482,8 @@ test "the frame reported for a font grid is its footprint in global cells" {
     const info = core.gridInfoLocked(2, 20, 80, core.grid.win_pos.get(2), false);
     try std.testing.expectEqual(@as(i32, 10), info.rows);
     try std.testing.expectEqual(@as(i32, 40), info.cols);
+    // Margins and the scroll rule stay in the grid's own rows.
+    try std.testing.expectEqual(@as(i32, 20), info.grid_rows);
 }
 
 test "font resizes are queued under the lock and sent after it" {
@@ -9477,6 +9535,7 @@ test "a held split that becomes external is released once, and not under ext_win
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
     // Neovim's answer to the font's request.
     try core.grid.resizeGrid(2, 20, 80);
+    core.settleFontGridResizesLocked();
     try std.testing.expect(core.grid.split_request_held.contains(2));
     // Still a split: nothing to release.
     core.takeExternalSplitReleasesLocked();
@@ -9516,6 +9575,7 @@ test "a resized split with a winbar requests a view that leaves room for the win
     // Neovim's answer is view + winbar rows: not a frame change.
     core.grid.font_query_wanted.clearRetainingCapacity();
     try core.grid.resizeGrid(2, 20, 80);
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
 }
 
@@ -9539,8 +9599,10 @@ test "a split grid_resize missing the last request re-reads the font, a matching
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
     core.grid.font_query_wanted.clearRetainingCapacity();
     try core.grid.resizeGrid(2, 20, 80);
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqual(@as(usize, 0), core.grid.font_query_wanted.items.len);
     try core.grid.resizeGrid(2, 18, 80);
+    core.settleFontGridResizesLocked();
     try std.testing.expectEqualSlices(i64, &.{1000}, core.grid.font_query_wanted.items);
     // The re-read recomputes from the frame and asks again.
     const sent = core.font_resize_requests;
@@ -9551,4 +9613,139 @@ test "a split grid_resize missing the last request re-reads the font, a matching
     core.applyWindowFontLocked(.{ .win = 1000, .valid = true, .zonvie_scale = 0.5 });
     try std.testing.expectEqual(sent + 1, core.font_resize_requests);
     try std.testing.expectEqual(@as(u32, 18), core.last_font_resize_rows);
+}
+
+fn countTryResizeRequests(core: *const Core) usize {
+    return std.mem.count(u8, core.write_queue.items, "nvim_ui_try_resize_grid");
+}
+
+/// A writer that accepts requests into `write_queue` (flush.zig
+/// armTestTransport). The test must set `core.writer_thread = null` before
+/// deinit and never call stop().
+fn armTestWriter(core: *Core) !void {
+    const Dummy = struct {
+        fn run() void {}
+    };
+    var t = try std.Thread.spawn(.{}, Dummy.run, .{});
+    t.join();
+    core.writer_thread = t;
+}
+
+test "an external window's OS resizes go out one at a time, the newest after each answer" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    // A writer that accepts the requests (see flush.zig armTestTransport).
+    const Dummy = struct {
+        fn run() void {}
+    };
+    var t = try std.Thread.spawn(.{}, Dummy.run, .{});
+    t.join();
+    core.writer_thread = t;
+    defer core.writer_thread = null;
+
+    core.requestTryResizeGrid(4, 10, 40);
+    core.requestTryResizeGrid(4, 11, 40);
+    core.requestTryResizeGrid(4, 12, 40);
+    try std.testing.expectEqual(@as(usize, 1), countTryResizeRequests(&core));
+    // The window is at 12 rows; framing it to the 10 answered would jump.
+    try std.testing.expect(core.osResizeOutstanding(4, 10, 40));
+    try std.testing.expect(core.osResizeOutstanding(4, 12, 40));
+    try std.testing.expect(!core.osResizeOutstanding(5, 10, 40));
+
+    // The answer sends the newest size only.
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    try std.testing.expectEqual(@as(usize, 2), countTryResizeRequests(&core));
+    try std.testing.expect(!core.osResizeOutstanding(4, 12, 40));
+    try std.testing.expect(core.osResizeOutstanding(4, 10, 40));
+
+    // Its answer leaves nothing outstanding and sends nothing more.
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    try std.testing.expectEqual(@as(usize, 2), countTryResizeRequests(&core));
+    try std.testing.expectEqual(@as(u8, 0), core.os_resizes_len);
+    try std.testing.expect(!core.osResizeOutstanding(4, 10, 40));
+    try std.testing.expect(core.osResizeAnswered(12345) == null);
+}
+
+test "an OS resize that cannot be sent leaves nothing in flight" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.requestTryResizeGrid(4, 10, 40);
+    try std.testing.expectEqual(@as(u8, 0), core.os_resizes_len);
+    try std.testing.expect(!core.osResizeOutstanding(4, 10, 40));
+}
+
+// grid.c win_grid_alloc: one grid_resize per screen update, with the size the
+// window ended at. A WinResized autocmd's `:resize` runs before that update
+// (normal.c normal_check), so the answer to an OS request carries the
+// autocmd's size, not the request's.
+test "an OS request Neovim answers with another size adopts that size, unless a newer request is out" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try armTestWriter(&core);
+    defer core.writer_thread = null;
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(4, 10, 40);
+    try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try core.grid.resizeGrid(4, 20, 80);
+    core.settleFontGridResizesLocked();
+    // Request 30 rows; the window's autocmd settles on 25.
+    core.requestTryResizeGrid(4, 30, 100);
+    core.drainOsResizesLocked();
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    try core.grid.resizeGrid(4, 25, 100);
+    core.settleFontGridResizesLocked();
+    const gf = core.grid.grid_fonts.get(4).?;
+    try std.testing.expect(!gf.os_answer_pending);
+    try std.testing.expectEqual(grid_mod.WinFrame{ .rows = 25, .cols = 100 }, gf.req.?);
+    try std.testing.expectEqual(@as(u32, 250), s.last_extent_h);
+    // Request 40, then 42 before Neovim answers: the answer to 40 (here
+    // clamped to 38) is not the window's size; 42's answer is.
+    core.requestTryResizeGrid(4, 40, 100);
+    core.drainOsResizesLocked();
+    core.requestTryResizeGrid(4, 42, 100);
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    core.drainOsResizesLocked();
+    try core.grid.resizeGrid(4, 38, 100);
+    core.settleFontGridResizesLocked();
+    try std.testing.expectEqual(grid_mod.WinFrame{ .rows = 42, .cols = 100 }, core.grid.grid_fonts.get(4).?.req.?);
+    try std.testing.expectEqual(@as(u32, 420), s.last_extent_h);
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    try core.grid.resizeGrid(4, 42, 100);
+    core.settleFontGridResizesLocked();
+    try std.testing.expect(!core.grid.grid_fonts.get(4).?.os_answer_pending);
+}
+
+test "an OS request at the grid's size, or one Neovim refuses, leaves no answer pending" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var s = FontTestState{};
+    s.arm(&core);
+    try armTestWriter(&core);
+    defer core.writer_thread = null;
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(4, 10, 40);
+    try std.testing.expect(try core.grid.setWinExternalPos(4, 1002));
+    core.applyWindowFontLocked(.{ .win = 1002, .valid = true, .zonvie_scale = 0.5 });
+    try core.grid.resizeGrid(4, 20, 80);
+    core.settleFontGridResizesLocked();
+    // ui.c ui_grid_resize: a float at that size already gets no grid_resize.
+    core.requestTryResizeGrid(4, 20, 80);
+    core.drainOsResizesLocked();
+    try std.testing.expect(!core.grid.grid_fonts.get(4).?.os_answer_pending);
+    try std.testing.expect(core.osResizeAnswered(core.os_resizes[0].msgid) != null);
+    // A refused request: the error response clears what the drain would set.
+    core.requestTryResizeGrid(4, 30, 100);
+    const id = core.os_resizes[0].msgid;
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = id }, .{ .str = "refused" }, .nil };
+    rpc_session.handleRpcResponse(&core, &top);
+    core.drainOsResizesLocked();
+    try std.testing.expect(!core.grid.grid_fonts.get(4).?.os_answer_pending);
+    try std.testing.expectEqual(@as(u8, 0), core.os_resizes_len);
+    // Neovim's own `:resize` afterwards is adopted, not swallowed as an answer.
+    try core.grid.resizeGrid(4, 25, 80);
+    core.settleFontGridResizesLocked();
+    try std.testing.expectEqual(grid_mod.WinFrame{ .rows = 25, .cols = 80 }, core.grid.grid_fonts.get(4).?.req.?);
 }

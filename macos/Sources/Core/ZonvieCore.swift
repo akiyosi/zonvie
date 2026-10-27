@@ -3090,6 +3090,11 @@ final class ZonvieCore {
         zonvie_core_try_resize_grid(core, gridId, rows, cols)
     }
 
+    func externalResizeOutstanding(gridId: Int64, rows: UInt32, cols: UInt32) -> Bool {
+        guard let core else { return false }
+        return zonvie_core_external_resize_outstanding(core, gridId, rows, cols) != 0
+    }
+
     func updateLayoutPx(drawableW: UInt32, drawableH: UInt32, cellW: UInt32, cellH: UInt32) {
         guard let core else { return }
         zonvie_core_update_layout_px(core, drawableW, drawableH, cellW, cellH)
@@ -4846,64 +4851,25 @@ final class ZonvieCore {
             // Skip if rows/cols match the last programmatic resize (from grid_resize).
             // windowDidResize can fire asynchronously after suppressResizeCallback
             // is cleared, so this check prevents overriding Neovim's grid dimensions.
-            // While a request is in flight Neovim will end at its target, not
-            // at lastGridRows/Cols, so even a size equal to the last grid must
-            // be queued: the answer re-frames the window to the in-flight size.
-            if !requestInFlight && rows == lastGridRows && cols == lastGridCols {
-                wantedSize = nil
+            // While another size is out Neovim will end at that one, not at
+            // lastGridRows/Cols, so even a size equal to the last grid must
+            // be sent: the core queues it behind the one out.
+            if rows == lastGridRows && cols == lastGridCols && !resizeOutstanding(rows: rows, cols: cols) {
                 return
             }
 
-            // Only resize if we have valid dimensions
+            // Only resize if we have valid dimensions. The core keeps one
+            // request out per window and sends the newest on each answer.
             if rows > 0 && cols > 0 {
-                wantedSize = (rows, cols)
-                sendWantedSize()
+                ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(rows) cols=\(cols)")
+                core.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
             }
         }
 
-        /// One try_resize_grid in flight per window: a drag reports sizes at
-        /// display rate, faster than Neovim answers a large grid, and every
-        /// queued request would replay the drag after mouse-up. The answer
-        /// (or a timeout, when Neovim sends no grid_resize) releases the next.
-        private var wantedSize: (rows: UInt32, cols: UInt32)?
-        private var inFlightSize: (rows: UInt32, cols: UInt32)?
-        private var inFlightToken = 0
-        private var requestInFlight = false
-
-        private func sendWantedSize() {
-            guard !requestInFlight, let size = wantedSize, let core else { return }
-            wantedSize = nil
-            if size.rows == lastGridRows && size.cols == lastGridCols { return }
-            requestInFlight = true
-            inFlightSize = size
-            inFlightToken += 1
-            let token = inFlightToken
-            ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(size.rows) cols=\(size.cols)")
-            core.tryResizeGrid(gridId: gridId, rows: size.rows, cols: size.cols)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, self.requestInFlight, self.inFlightToken == token else { return }
-                self.requestInFlight = false
-                self.sendWantedSize()
-            }
-        }
-
-        /// True when a user size newer than the in-flight request differs from
-        /// it: framing to that intermediate answer would make the window jump
-        /// back before the queued request re-frames it. Compared with the
-        /// request, not the answer, which Neovim may clamp.
-        /// A user size is out and unanswered: the window is at that size,
-        /// not at any count the grid still reports.
-        var hasRequestInFlight: Bool { requestInFlight }
-
-        func supersedesAnswer() -> Bool {
-            guard requestInFlight, let size = wantedSize, let sent = inFlightSize else { return false }
-            return size.rows != sent.rows || size.cols != sent.cols
-        }
-
-        /// A grid_resize for this window arrived. Main thread only.
-        func gridResizeArrived() {
-            requestInFlight = false
-            sendWantedSize()
+        /// The window is at a user size other than `rows` x `cols` that Neovim
+        /// has not answered yet (zonvie_core_external_resize_outstanding).
+        func resizeOutstanding(rows: UInt32, cols: UInt32) -> Bool {
+            core?.externalResizeOutstanding(gridId: gridId, rows: rows, cols: cols) ?? false
         }
 
         func windowDidEndLiveResize(_ notification: Notification) {
@@ -4985,7 +4951,8 @@ final class ZonvieCore {
     /// fills the core's extent, its frame; the rest is `rows x cols` cells.
     private static func externalContentPx(rows: UInt32, cols: UInt32, font: GridFontPx?,
                                           cellW: CGFloat, cellH: CGFloat) -> CGSize {
-        if let f = font, f.extentWidthPx > 0, f.extentHeightPx > 0 {
+        // on_grid_font: a font grid's extent is its frame (zonvie_core.h).
+        if let f = font {
             return CGSize(width: CGFloat(f.extentWidthPx), height: CGFloat(f.extentHeightPx))
         }
         return CGSize(width: CGFloat(cols) * cellW, height: CGFloat(rows) * cellH)
@@ -5517,23 +5484,22 @@ final class ZonvieCore {
             // tryResizeGrid with stale window dimensions.
             delegate.lastGridRows = rows
             delegate.lastGridCols = cols
-            // A superseded answer is not framed; gridResizeArrived() below
-            // sends the newer size, and that answer frames the window.
-            if !delegate.supersedesAnswer() {
+            // A superseded answer is not framed; the newer size is out, and
+            // its answer frames the window.
+            if !delegate.resizeOutstanding(rows: rows, cols: cols) {
                 frameExternalWindow(window, gridView: gridView, delegate: delegate,
                                     widthPx: content.width, heightPx: content.height, display: true)
             }
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
-            // Only a size change answers a request: row-0 redraws (winbar)
-            // come through here too.
-            delegate.gridResizeArrived()
-        } else if gf != nil, let delegate = window.delegate as? ExternalWindowDelegate,
-                  !window.inLiveResize, !delegate.hasRequestInFlight {
+        } else if gf != nil, let delegate = window.delegate as? ExternalWindowDelegate, !window.inLiveResize {
             // Same counts, other pixels: a font change the grid kept its
             // size through. Every surface is redrawn then, row 0 included.
+            // The core's lock is taken only once the pixels differ: this
+            // branch runs on every row-0 update of a font grid.
             let scale = window.backingScaleFactor
             let current = gridView.frame.size
-            if abs(current.width * scale - content.width) >= 1 || abs(current.height * scale - content.height) >= 1 {
+            if abs(current.width * scale - content.width) >= 1 || abs(current.height * scale - content.height) >= 1,
+               !delegate.resizeOutstanding(rows: rows, cols: cols) {
                 frameExternalWindow(window, gridView: gridView, delegate: delegate,
                                     widthPx: content.width, heightPx: content.height,
                                     applyAnchors: false, display: true)

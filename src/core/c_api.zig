@@ -40,6 +40,7 @@ test {
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");
     _ = @import("font_slots.zig");
+    _ = @import("grid_font.zig");
     _ = damage_bands;
     _ = scroll_ease;
     _ = cell_age_store;
@@ -280,6 +281,10 @@ pub const GridInfo = extern struct {
     // This grid's z in the layer list its surface last published (0 for a
     // surface root or a grid not yet published). Larger is drawn on top.
     layer_z: i64,
+    // The grid's own rows, the unit margin_* and line_count are in. Equal to
+    // `rows` unless the grid has its own font, when `rows` is its footprint
+    // in surface cells.
+    grid_rows: i32 = 0,
 };
 
 /// Viewport info for scrollbar rendering
@@ -1394,6 +1399,11 @@ pub export fn zonvie_core_try_resize_grid(p: ?*zonvie_core, grid_id: i64, rows: 
     if (p == null) return;
     const box = asBox(p.?);
     box.core.requestTryResizeGrid(grid_id, rows, cols);
+}
+
+pub export fn zonvie_core_external_resize_outstanding(p: ?*zonvie_core, grid_id: i64, rows: u32, cols: u32) callconv(.c) c_int {
+    if (p == null) return 0;
+    return @intFromBool(asBox(p.?).core.osResizeOutstanding(grid_id, rows, cols));
 }
 
 pub export fn zonvie_core_update_layout_px(

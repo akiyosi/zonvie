@@ -69,8 +69,10 @@ pub const Table = struct {
 
     /// Drop one reference. True when it was the last one: the caller then
     /// tells the frontend (on_font_slot_release) and the id becomes free.
+    /// A slot with no reference left (one a session reset dropped) is not
+    /// released twice.
     pub fn release(self: *Table, font_id: u32) bool {
-        if (font_id == 0 or font_id >= max_slots) return false;
+        std.debug.assert(font_id != 0 and font_id < max_slots);
         const s = &self.slots[font_id];
         if (s.refcount == 0) return false;
         s.refcount -= 1;
@@ -93,10 +95,10 @@ pub const Table = struct {
 };
 
 /// Cells of `grid_cell_px` that fit in `frame_cells` cells of
-/// `global_cell_px`, at least 1 and at most `max_cells`. 0 means "cannot
-/// compute": a 0 px cell is a failed load, never a divisor.
+/// `global_cell_px`, at least 1 and at most `max_cells`. `grid_cell_px` is a
+/// loaded slot's cell, never 0 (a 0 px load is refused as failed).
 pub fn requestedCells(frame_cells: u32, global_cell_px: u32, grid_cell_px: u32, max_cells: u32) u32 {
-    if (grid_cell_px == 0) return 0;
+    std.debug.assert(grid_cell_px > 0);
     const frame_px: u64 = @as(u64, frame_cells) * @as(u64, global_cell_px);
     const fit: u64 = frame_px / grid_cell_px;
     return @intCast(@max(@as(u64, 1), @min(fit, @as(u64, max_cells))));
@@ -195,9 +197,8 @@ test "requested cells floor the frame pixels and never go below one" {
     try std.testing.expectEqual(@as(u32, 1), requestedCells(0, 10, 7, 20_000));
 }
 
-test "requested cells clamp to the grid ceiling and a zero cell is refused" {
+test "requested cells clamp to the grid ceiling" {
     try std.testing.expectEqual(@as(u32, 20_000), requestedCells(20_000, 10, 1, 20_000));
-    try std.testing.expectEqual(@as(u32, 0), requestedCells(40, 10, 0, 20_000));
 }
 
 test "footprint rounds a scaled extent up to whole global cells" {

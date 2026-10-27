@@ -700,6 +700,12 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
+    // An error answers the request too: Neovim will not resize for it.
+    if (id != 0) if (self.osResizeAnswered(id)) |grid_id| {
+        if (has_err) self.osResizeRefused(grid_id);
+        return;
+    };
+
     if (id != 0 and id == self.font_query_msgid) {
         self.font_query_msgid = 0;
         // An error keeps the current state; the next trigger asks again.
@@ -1976,6 +1982,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
+        self.settleFontGridResizesLocked();
         self.drainFontReleasesLocked();
         self.takeFloatConfigQueriesLocked();
         if (self.perGridFontsEnabled()) self.takeFontQueriesLocked(clock.nowNs()) else self.grid.font_query_wanted.clearRetainingCapacity();

@@ -1243,30 +1243,10 @@ pub const FloatAnchor = struct {
     col: i64,
 };
 
-pub const FontMode = enum { resize, font_view, scale_view };
-
-/// One window's per-grid font (font_slots.zig). Cell sizes are the slot's;
-/// frame cells are global cells; req_* is the last try_resize_grid sent;
-/// extent_* is the pixel box the frontend clips the layer to.
-pub const GridFont = struct {
-    win_id: i64,
-    font_id: u32,
-    mode: FontMode,
-    cell_w_px: u32,
-    cell_h_px: u32,
-    frame_rows: u32,
-    frame_cols: u32,
-    req_rows: u32 = 0,
-    req_cols: u32 = 0,
-    extent_w_px: u32 = 0,
-    extent_h_px: u32 = 0,
-    // An OS resize's request is out and unanswered: the next grid_resize
-    // answers it, whatever size Neovim settled on.
-    os_answer_pending: bool = false,
-};
-
-/// win_pos' width/height: a split's frame in global cells.
-pub const WinFrame = struct { rows: u32, cols: u32 };
+pub const grid_font = @import("grid_font.zig");
+pub const FontMode = grid_font.FontMode;
+pub const GridFont = grid_font.GridFont;
+pub const WinFrame = grid_font.WinFrame;
 
 /// Info for an external grid (displayed in a separate window).
 pub const ExternalGridInfo = struct {
@@ -1468,9 +1448,9 @@ pub const Grid = struct {
     font_query_wanted: std.ArrayListUnmanaged(i64) = .empty,
     // Slots whose grid was destroyed; the core releases them after the batch.
     font_releases_pending: std.ArrayListUnmanaged(u32) = .empty,
-    // External windows whose grid Neovim resized on its own; the core
-    // re-sends their font extent before the flush.
-    font_sizes_adopted: std.ArrayListUnmanaged(i64) = .empty,
+    // Font grids a grid_resize reached during the batch; the core decides
+    // what the size they ended at means (Core.settleFontGridResizesLocked).
+    font_grids_resized: std.ArrayListUnmanaged(i64) = .empty,
 
     // Viewport info per grid (from win_viewport / win_viewport_margins)
     viewport: std.AutoHashMapUnmanaged(i64, Viewport) = .{},
@@ -1651,7 +1631,7 @@ pub const Grid = struct {
         self.split_request_held.deinit(self.alloc);
         self.font_query_wanted.deinit(self.alloc);
         self.font_releases_pending.deinit(self.alloc);
-        self.font_sizes_adopted.deinit(self.alloc);
+        self.font_grids_resized.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
 
@@ -1746,7 +1726,7 @@ pub const Grid = struct {
         self.split_request_held.clearRetainingCapacity();
         self.font_query_wanted.clearRetainingCapacity();
         self.font_releases_pending.clearRetainingCapacity();
-        self.font_sizes_adopted.clearRetainingCapacity();
+        self.font_grids_resized.clearRetainingCapacity();
         self.clearAllOverflow();
         self.layer_order_counter = 0;
         self.subgrid_surface_vertex_count = 0;
@@ -2307,33 +2287,14 @@ pub const Grid = struct {
             if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
-            // Neovim answered a font request with another size (split layout
-            // changed under it): treat it as a frame change. A split's grid
-            // is the requested view plus its winbar rows (ui.c:775). An
-            // external window's frame is its OS window, which no layout
-            // change moves; a re-query would keep the same request.
-            if (self.grid_fonts.getPtr(grid_id)) |gf| {
-                const m = if (self.split_request_held.contains(grid_id)) self.getViewportMargins(grid_id) else ViewportMargins{};
-                if (gf.mode == .resize and gf.req_rows != 0 and !self.external_grids.contains(grid_id) and
-                    (gf.req_rows + m.top + m.bottom != rows or gf.req_cols != cols))
-                {
-                    self.wantFontQuery(gf.win_id);
-                }
-                // An external window Neovim resized itself (:resize in it):
-                // its grid becomes the frame. Not the answer to an OS resize,
-                // which may be a superseded request's size or a clamped one
-                // (a drag sends sizes faster than Neovim answers them).
-                if (gf.mode == .resize and gf.req_rows != 0 and self.external_grids.contains(grid_id)) {
-                    if (gf.os_answer_pending) {
-                        gf.os_answer_pending = false;
-                    } else if ((gf.req_rows != rows or gf.req_cols != cols) and
-                        std.mem.indexOfScalar(i64, self.font_sizes_adopted.items, grid_id) == null)
-                    {
-                        self.font_sizes_adopted.append(self.alloc, grid_id) catch {
-                            std.log.warn("per-grid font: adopted size dropped grid={d}", .{grid_id});
-                        };
-                    }
-                }
+            // What the size means to the grid's font is the core's to decide
+            // (Core.settleFontGridResizesLocked).
+            if (self.grid_fonts.contains(grid_id) and
+                std.mem.indexOfScalar(i64, self.font_grids_resized.items, grid_id) == null)
+            {
+                self.font_grids_resized.append(self.alloc, grid_id) catch {
+                    std.log.warn("per-grid font: resize of grid={d} dropped", .{grid_id});
+                };
             }
             self.invalidateCursorOutside(grid_id, rows, cols);
 
@@ -5876,18 +5837,18 @@ test "destroying a font grid queues its slot release and drops its state" {
     try std.testing.expectEqualSlices(u32, &.{3}, grid.font_releases_pending.items);
 }
 
-test "a grid_resize that misses the last font request queues a re-query" {
+test "a grid_resize of a font grid is recorded once for the core, and of others not at all" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
     try grid.resizeGrid(1, 10, 40);
     try grid.resizeGrid(2, 5, 20);
-    try grid.setWinPos(2, 1000, 0, 0);
-    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1000, .font_id = 3, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 5, .frame_cols = 20, .req_rows = 10, .req_cols = 40 });
-    grid.font_query_wanted.clearRetainingCapacity();
+    try grid.resizeGrid(3, 5, 20);
+    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1000, .font_id = 3, .mode = .resize, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 5, .frame_cols = 20, .req = .{ .rows = 10, .cols = 40 } });
     try grid.resizeGrid(2, 10, 40);
-    try std.testing.expectEqual(@as(usize, 0), grid.font_query_wanted.items.len);
     try grid.resizeGrid(2, 9, 40);
-    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+    try grid.resizeGrid(3, 9, 40);
+    try std.testing.expectEqualSlices(i64, &.{2}, grid.font_grids_resized.items);
+    try std.testing.expectEqual(@as(usize, 0), grid.font_query_wanted.items.len);
 }
 
 test "a win_pos frame change queues one query and a session reset forgets font state" {

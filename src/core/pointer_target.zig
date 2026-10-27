@@ -36,6 +36,9 @@ pub const Candidate = struct {
     start_col: i32,
     rows: i32,
     cols: i32,
+    /// The grid's own rows, the unit `margin_*` and `line_count` are in.
+    /// `rows` is its footprint on the surface when it has its own font.
+    grid_rows: i32,
     margin_top: i32,
     margin_bottom: i32,
     /// Buffer lines this grid holds, or 0 when the viewport has not been
@@ -57,8 +60,10 @@ pub const Hit = extern struct {
 /// Whether a float can scroll its own content: it holds more buffer lines than
 /// its content area shows. A float that already shows every line is
 /// transparent to a wheel event, which then reaches whatever is drawn under it.
+/// Counted in the grid's own rows: a grid in its own font covers `rows`
+/// surface cells but shows `grid_rows` of its lines.
 pub fn capturesScroll(c: anytype) bool {
-    const content_rows: i64 = @max(0, @as(i64, c.rows) - @as(i64, c.margin_top) - @as(i64, c.margin_bottom));
+    const content_rows: i64 = @max(0, @as(i64, c.grid_rows) - @as(i64, c.margin_top) - @as(i64, c.margin_bottom));
     return c.line_count > content_rows;
 }
 
@@ -210,6 +215,7 @@ fn win(grid_id: i64, start_row: i32, start_col: i32, rows: i32, cols: i32) Candi
         .start_col = start_col,
         .rows = rows,
         .cols = cols,
+        .grid_rows = rows,
         .margin_top = 0,
         .margin_bottom = 0,
         .line_count = 10_000,
@@ -318,6 +324,18 @@ test "a float's margins are not content, so a bordered float needs one line more
     // Eight content rows, eight lines: it fits.
     try testing.expect(!capturesScroll(f));
     f.line_count = 9;
+    try testing.expect(capturesScroll(f));
+}
+
+test "a scaled float's scrollability counts its own rows, not its footprint" {
+    // 20 rows at half height cover 10 surface rows; 2 margin rows leave 18
+    // content rows, so 15 lines all fit.
+    var f = float(5, 10, 20, 10, 30, 15);
+    f.grid_rows = 20;
+    f.margin_top = 1;
+    f.margin_bottom = 1;
+    try testing.expect(!capturesScroll(f));
+    f.line_count = 19;
     try testing.expect(capturesScroll(f));
 }
 
