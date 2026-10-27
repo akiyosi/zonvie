@@ -191,6 +191,23 @@ pub fn linesSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8
     return out.toOwnedSlice(alloc);
 }
 
+/// linesSince, counting from a line position (lineMark) instead of a clock.
+pub fn linesAfter(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, after_line: usize) ![]u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        if (n < after_line or std.mem.indexOf(u8, line, marker) == null) continue;
+        try out.appendSlice(alloc, line);
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Grid id of the most recent external window the app opened at or after
 /// `since_ms`, from its `[external_window] open gridId=` line.
 pub fn externalWindowGrid(alloc: std.mem.Allocator, path: []const u8, since_ms: f64) !i64 {

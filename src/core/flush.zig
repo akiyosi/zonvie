@@ -2335,18 +2335,23 @@ pub fn generateRowVertices(
             try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), run_grid_id, run_deco);
             c = end;
         }
-        if (!p.skip_default_bg and (p.margin_right_px > 0 or p.margin_bottom_px > 0)) {
-            const bg_alpha: f32 = if (p.blur_enabled) 0.5 else p.background_opacity;
+        // The frame margin belongs to the window: it takes the row's last
+        // cell's background, the closest the core gets to the window's own
+        // Normal, which Neovim never sends per window.
+        const margin_bg = if (cols > 0) rc.bg_rgbs.items[@intCast(cols - 1)] else p.default_bg;
+        const margin_is_default = margin_bg == p.default_bg;
+        if (!(margin_is_default and p.skip_default_bg) and (p.margin_right_px > 0 or p.margin_bottom_px > 0)) {
+            const bg_alpha: f32 = if (!margin_is_default) 1.0 else if (p.blur_enabled) 0.5 else p.background_opacity;
             const gid = if (cols > 0) rc.grid_ids.items[0] else 0;
             const x_end: f32 = @as(f32, @floatFromInt(cols)) * cellW;
             const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
             if (p.margin_right_px > 0) {
                 try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                try VH.pushSolidQuad(out, core.alloc, x_end, y0, x_end + p.margin_right_px, y0 + cellH, VH.rgba(p.default_bg, bg_alpha), gid, 0);
+                try VH.pushSolidQuad(out, core.alloc, x_end, y0, x_end + p.margin_right_px, y0 + cellH, VH.rgba(margin_bg, bg_alpha), gid, 0);
             }
             if (p.margin_bottom_px > 0) {
                 try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                try VH.pushSolidQuad(out, core.alloc, 0, y0 + cellH, x_end + p.margin_right_px, y0 + cellH + p.margin_bottom_px, VH.rgba(p.default_bg, bg_alpha), gid, 0);
+                try VH.pushSolidQuad(out, core.alloc, 0, y0 + cellH, x_end + p.margin_right_px, y0 + cellH + p.margin_bottom_px, VH.rgba(margin_bg, bg_alpha), gid, 0);
             }
         }
         if (log_enabled) stats.bg_ns = @intCast(@max(0, clock.nowNs() - t_bg_start));
@@ -19809,6 +19814,107 @@ test "frame margins are painted with the default background right of and below t
         .margin_bottom_px = 4,
     }, &out);
     try std.testing.expectEqual(@as(usize, 0), skipped.pass_ends[0]);
+}
+
+test "frame margins take the background of the cells they adjoin, not the default" {
+    // A float or a window with its own Normal (NormalFloat, winhighlight)
+    // fills its cells with a background other than the default; the margin
+    // is part of that window and must not show the editor's Normal. Neovim
+    // never sends a per-window Normal, so the last cell's background is the
+    // per-grid signal the core has: the right margin and the whole bottom
+    // band of a row take it, one colour per row.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 3);
+    core.row_cells.setLen(3);
+    core.row_cells.set(0, ' ', 0xFFFFFF, 0x445566, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.set(1, ' ', 0xFFFFFF, 0x445566, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.set(2, ' ', 0xFFFFFF, 0x778899, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    for (0..3) |col| core.row_cells.grid_ids.items[col] = 2;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 3,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = false,
+        .background_opacity = 0.8,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+
+    // Colour of the one background quad covering (x, y).
+    const S = struct {
+        fn colorAt(bg: []const c_api.Vertex, x: f32, y: f32) ![4]f32 {
+            var found: ?[4]f32 = null;
+            var q: usize = 0;
+            while (q + 6 <= bg.len) : (q += 6) {
+                var x0 = std.math.inf(f32);
+                var y0 = std.math.inf(f32);
+                var x1 = -std.math.inf(f32);
+                var y1 = -std.math.inf(f32);
+                for (bg[q..][0..6]) |v| {
+                    x0 = @min(x0, v.position[0]);
+                    x1 = @max(x1, v.position[0]);
+                    y0 = @min(y0, v.position[1]);
+                    y1 = @max(y1, v.position[1]);
+                }
+                if (x < x0 or x >= x1 or y < y0 or y >= y1) continue;
+                if (found != null) return error.Overlap;
+                found = bg[q].color;
+            }
+            return found orelse error.Uncovered;
+        }
+    };
+    const bg = out.items[0..stats.pass_ends[0]];
+    // Right margin, then the bottom band under each column and the corner.
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 22, 6));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 3, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 10, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 17, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 22, 14));
+}
+
+test "a default-background margin keeps the default background's alpha" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+    core.row_cells.setLen(1);
+    core.row_cells.set(0, ' ', 0xFFFFFF, 0x112233, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    core.row_cells.grid_ids.items[0] = 2;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 1,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = false,
+        .background_opacity = 0.8,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+    const bg = out.items[0..stats.pass_ends[0]];
+    try std.testing.expectEqual(@as(usize, 18), bg.len);
+    try std.testing.expectEqual(bg[0].color, bg[6].color);
+    try std.testing.expectEqual(bg[0].color, bg[12].color);
+    try std.testing.expectEqual(@as(f32, 0.8), bg[6].color[3]);
+    try std.testing.expectEqual(@as(f32, 0.8), bg[12].color[3]);
 }
 
 test "a non-zero font never reads or writes the ASCII direct cache" {
