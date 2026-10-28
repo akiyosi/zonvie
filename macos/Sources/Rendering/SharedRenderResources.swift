@@ -105,6 +105,15 @@ final class SharedRenderResources {
         gridFontsStaged = true
     }
 
+    /// Core thread. A destroyed grid leaves both tables at once; other grids'
+    /// staged changes still wait for their flush's commit.
+    func dropGridFont(_ gridId: Int64) {
+        stagedGridFonts.removeValue(forKey: gridId)
+        os_unfair_lock_lock(&gridFontsLock)
+        gridFonts.removeValue(forKey: gridId)
+        os_unfair_lock_unlock(&gridFontsLock)
+    }
+
     /// Core thread, at a committed flush end.
     func commitGridFonts() {
         guard gridFontsStaged else { return }

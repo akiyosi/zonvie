@@ -5821,8 +5821,9 @@ pub const Core = struct {
     /// (grid_font.resizeMeaning) and act on it: a split whose frame moved
     /// re-reads its font; an external window Neovim resized itself takes
     /// that size as its frame, so the frontend frames the OS window to it.
-    /// Runs before the flush that draws the new sizes, whose end commits
-    /// on_grid_font, and again after the batch for one with no flush.
+    /// Runs before the flush that draws the new sizes (on_grid_font fires
+    /// here; the frontends apply it at that flush's commit), and again after
+    /// the batch for one with no flush.
     /// Caller holds grid_mu.
     pub fn settleFontGridResizesLocked(self: *Core) void {
         defer self.grid.font_grids_resized.clearRetainingCapacity();

@@ -2362,7 +2362,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             // Cell dimensions — integer-rounded, same formula as GridSurfaceRenderer.
             // A root grid in its own font is laid out in that font's cell.
-            let gridFont = core?.gridCellPx(gridId)
+            let gridFont = f.rootFont
             let cw = gridFont.map { Float($0.cellWidthPx) } ?? Float(shared.cellWidthPx)
             f.ch = gridFont.map { Float($0.cellHeightPx) } ?? Float(shared.cellHeightPx)
             f.cellWi = max(1, UInt32(cw.rounded(.up)))
@@ -2807,6 +2807,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         f.retained = retention.snapshotPublished()
         f.commitRevision = commitRevision
         f.committedExtent = committedExtent
+        f.rootFont = committedGridFonts[gridId]
         f.fontIsCurrent = fontResetState.isCurrent(
             committedGeneration: bufferSets[f.csi].fontGeneration
         )
@@ -4048,6 +4049,8 @@ fileprivate struct ExternalSurfaceFrame {
     /// Swapped with `submittedDirtyRowsScratch`, so a frame allocates no row list.
     var submittedDirtyRows: [Int] = []
     var committedExtent = SurfaceCommittedExtent()
+    /// The root's own font, committed with the rows this frame draws.
+    var rootFont: GridFontPx?
     var lastKnownCursorRow = 0
     var cursorBlink = false
     var fontIsCurrent = false

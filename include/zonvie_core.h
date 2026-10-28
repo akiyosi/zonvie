@@ -139,7 +139,13 @@ typedef void (*zonvie_on_font_slot_release_fn)(void* ctx, uint32_t font_id);
    clipped to and framed by (its frame in resize mode, rows x cell in
    scale_view), 0 only for a grid with no rows or columns; a frontend sizes
    the grid's layer from it, not from rows x cell. IMMEDIATE class: core
-   thread, grid_mu held. */
+   thread, grid_mu held. Unlike other IMMEDIATE callbacks it is not applied
+   on the spot: the frontend stages it and makes it visible at the next
+   flush end that commits, together with the rows that flush drew, since the
+   grid's committed rows were laid out in the previous font. It may arrive
+   inside or outside a flush; an aborted flush keeps the staged value for
+   the next commit, and the core does not resend it. on_grid_destroy drops
+   a grid's staged and visible font at once. */
 typedef void (*zonvie_on_grid_font_fn)(
     void* ctx, int64_t grid_id, uint32_t font_id,
     uint32_t cell_w_px, uint32_t cell_h_px,

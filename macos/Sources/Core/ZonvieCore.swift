@@ -7361,9 +7361,7 @@ final class ZonvieCore {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=destroy_release grid=\(gridId)")
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
         terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
-        // Runs after a commit or outside any flush, so publishing is safe.
-        sharedResources?.setGridFont(gridId, nil)
-        sharedResources?.commitGridFonts()
+        sharedResources?.dropGridFont(gridId)
         externalGridViewsLock.lock()
         gridSurfaceOwners.removeValue(forKey: gridId)
         let hosts = externalGridViews.filter { $0.key != gridId }.map { $0.value }

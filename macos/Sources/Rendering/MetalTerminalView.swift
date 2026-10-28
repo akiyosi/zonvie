@@ -776,6 +776,10 @@ final class MetalTerminalView: GridInputView {
 
         let ndcScale: Float = 2.0 / drawableHeight
 
+        // Taken before scrollOffsetLock: the renderer's lock is never nested
+        // inside the scroll model's.
+        let committedFonts = renderer.committedGridFontTable()
+
         scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
         scrollModel.collectFrameOffsets(
             visible: visibleGridIdsScratch,
@@ -790,7 +794,7 @@ final class MetalTerminalView: GridInputView {
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
-            let gridFont = core.gridCellPx(gridId)
+            let gridFont = committedFonts[gridId]
             scrollOffsetInfoScratch.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 grid: info,
                 offsetYPx: Float(clampedOffsetPx),

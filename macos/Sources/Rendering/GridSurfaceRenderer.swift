@@ -2319,6 +2319,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return committedSurfaceLayers.first { $0.gridId == gridId }?.originPx
     }
 
+    /// The per-grid fonts committed with the rows this surface draws, not
+    /// the table the core thread publishes ahead of that commit. One lock
+    /// hold per frame; the copy is COW, so it allocates nothing.
+    func committedGridFontTable() -> [Int64: GridFontPx] {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedGridFonts
+    }
+
     /// The layer's rows and columns in its own cells, as the hit test clamps by.
     func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? {
         lock.lock()
