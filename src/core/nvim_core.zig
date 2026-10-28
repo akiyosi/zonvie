@@ -5801,7 +5801,11 @@ pub const Core = struct {
             return;
         };
         self.sendFontRequest(grid_id, p.request);
-        if (mode == .resize and kind == .split) self.grid.split_request_held.put(self.alloc, grid_id, {}) catch {};
+        if (p.hold_request) self.grid.split_request_held.put(self.alloc, grid_id, {}) catch |e| {
+            // Lost only on OOM: give-back still sends 0x0 in resize mode, but an
+            // external move will not release the request.
+            self.log.write("per-grid font: held request not recorded grid={d}: {any}\n", .{ grid_id, e });
+        };
         self.grid.setGridMetricsPx(grid_id, p.font.cell_w_px, p.font.cell_h_px) catch {};
         if (grid_mod.grid_font.differs(prev, p.font)) self.publishGridFontLocked(grid_id, p.font);
     }

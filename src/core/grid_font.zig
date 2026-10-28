@@ -77,6 +77,9 @@ pub const Plan = struct {
     font: GridFont,
     /// try_resize_grid to send, or null.
     request: ?WinFrame,
+    /// Neovim keeps a split's request until a 0x0 clears it (ui.c:775-778),
+    /// so the core records it for clearRequest's `held`.
+    hold_request: bool,
 };
 
 /// The font a window gets, and the request that makes its grid fill its frame.
@@ -150,7 +153,7 @@ pub fn plan(in: PlanIn) Plan {
             gf.extent_h_px = in.logical.rows * gf.cell_h_px;
         },
     }
-    return .{ .font = gf, .request = request };
+    return .{ .font = gf, .request = request, .hold_request = in.mode == .resize and in.kind == .split };
 }
 
 /// Whether the frontend must be told: the font, its cell or its extent moved.
@@ -258,6 +261,13 @@ test "a split requests the cells that fill its win_pos frame, less its winbar" {
     // The same request is not sent twice.
     in.prev = p.font;
     try testing.expect(plan(in).request == null);
+}
+
+test "only a resize-mode split leaves Neovim holding its request" {
+    try testing.expect(plan(in0(.split, .resize)).hold_request);
+    try testing.expect(!plan(in0(.external, .resize)).hold_request);
+    try testing.expect(!plan(in0(.float, .font_view)).hold_request);
+    try testing.expect(!plan(in0(.float, .scale_view)).hold_request);
 }
 
 test "an external window counts its whole grid and keeps its OS request in the same font" {

@@ -1540,8 +1540,8 @@ pub const RowGenParams = struct {
     /// alpha under blur.
     skip_default_bg: bool = false,
     /// Leftover frame pixels of a per-grid-font window, painted with the
-    /// default background: right of the last column on every row, and below
-    /// the last row on that row only.
+    /// row's last cell background: right of the last column on every row,
+    /// and below the last row on that row only.
     margin_right_px: f32 = 0,
     margin_bottom_px: f32 = 0,
     /// The per-grid font the row is drawn in (0 = global): it keys the glyph
@@ -19823,7 +19823,7 @@ test "a font grid whose last row carries a bottom margin is not row-shifted" {
     try std.testing.expectEqual(@as(u32, 1), S.calls);
 }
 
-test "frame margins are painted with the default background right of and below the cells" {
+test "frame margins are painted right of and below the cells" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try core.row_cells.ensureTotalCapacity(core.alloc, 2);
