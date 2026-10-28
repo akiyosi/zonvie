@@ -310,6 +310,10 @@ test "gui:visual_scrollbind_layers_blit_matches_jump" {
     try gated(can_capture, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
 }
 
+test "gui:visual_per_grid_font_workflow" {
+    try gated(can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
+}
+
 test "gui:visual_proportional_font_support" {
     try gated(can_capture, @import("scenarios/visual/proportional_font_support.zig"));
 }

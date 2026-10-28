@@ -692,3 +692,21 @@ pub fn dumpWindowsForPid(pid: i32) void {
         );
     }
 }
+
+extern "c" fn CTFontManagerCopyAvailableFontFamilyNames() ?*anyopaque;
+extern "c" fn CFEqual(a: *anyopaque, b: *anyopaque) bool;
+
+/// Whether a font family named exactly `family` is installed. Asking
+/// CTFontCreateWithName instead would fall back silently to another font.
+pub fn fontInstalled(family: [:0]const u8) bool {
+    const names = CTFontManagerCopyAvailableFontFamilyNames() orelse return false;
+    defer CFRelease(names);
+    const want = CFStringCreateWithCString(null, family, kCFStringEncodingUTF8) orelse return false;
+    defer CFRelease(want);
+    var i: isize = 0;
+    while (i < CFArrayGetCount(names)) : (i += 1) {
+        const name = CFArrayGetValueAtIndex(names, i) orelse continue;
+        if (CFEqual(name, want)) return true;
+    }
+    return false;
+}
