@@ -720,7 +720,9 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         // another answer in the batch resized.
         var needs_flush = false;
         for (answers[0..n]) |a| {
-            if (!a.valid) _ = self.font_query_last_ns.remove(a.win);
+            // A window not yet placed (opened and given a font in one Lua
+            // chunk) is asked again by its placement, past the throttle.
+            if (!a.valid or self.gridForWin(a.win) == null) _ = self.font_query_last_ns.remove(a.win);
             const rev_before = self.grid.cursor_rev;
             const resizes_before = self.font_resize_outbox.items.len;
             self.applyWindowFontLocked(a);
@@ -4347,6 +4349,22 @@ test "a font answer for a closed window forgets its throttle stamp" {
     var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
     handleRpcResponse(&core, &top);
     try std.testing.expect(!core.font_query_last_ns.contains(1001));
+}
+
+test "a font answer for a window not yet placed lets its placement ask again at once" {
+    // A float opened and given a font in one Lua chunk: the helper's notify
+    // is read before the float's win_float_pos, so the answer finds no grid.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 9;
+    try core.font_query_last_ns.put(core.alloc, 1001, clock.nowNs());
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = true }, .{ .str = "A:h18" }, .nil, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    core.grid.wantFontQuery(1001); // win_float_pos
+    core.takeFontQueriesLocked(clock.nowNs());
+    try std.testing.expectEqualSlices(i64, &.{1001}, core.font_query_outbox.items);
 }
 
 test "a font answer caps zonvie_font_scale to the range a frontend can rasterize" {

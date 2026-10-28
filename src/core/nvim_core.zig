@@ -5868,7 +5868,7 @@ pub const Core = struct {
         }
     }
 
-    fn gridForWin(self: *const Core, win: i64) ?i64 {
+    pub fn gridForWin(self: *const Core, win: i64) ?i64 {
         var it = self.grid.grid_win_ids.iterator();
         while (it.next()) |e| if (e.value_ptr.* == win) return e.key_ptr.*;
         return null;
