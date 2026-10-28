@@ -1400,6 +1400,10 @@ ZONVIE_API int zonvie_core_external_resize_outstanding(zonvie_core *core, int64_
 typedef struct zonvie_grid_info {
     int64_t grid_id;
     int64_t zindex;
+    /* The surface cell holding the layer's drawn top-left corner: its
+     * placement, except an east-anchored scale_view float (on_grid_font)
+     * keeps its placed right edge, so start_col is the column its drawn
+     * left edge falls in. */
     int32_t start_row;
     int32_t start_col;
     int32_t rows;

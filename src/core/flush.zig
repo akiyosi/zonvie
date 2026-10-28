@@ -5905,7 +5905,7 @@ pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 /// placement in surface cells, except that an east-anchored scale_view float
 /// keeps its right edge where Neovim put it. The layout and every position
 /// derived from where a grid is drawn read this one rule.
-fn placedGridOriginPx(g: *const grid_mod.Grid, grid_id: i64, pos: grid_mod.GridPos, placed: grid_mod.SurfacePlacement, cols: u32, cell_w_px: i64, cell_h_px: i64) [2]i64 {
+pub fn placedGridOriginPx(g: *const grid_mod.Grid, grid_id: i64, pos: grid_mod.GridPos, placed: grid_mod.SurfacePlacement, cols: u32, cell_w_px: i64, cell_h_px: i64) [2]i64 {
     const y = placed.row *| cell_h_px;
     if (pos.anchor_east and g.grid_fonts.count() != 0) {
         if (g.grid_fonts.get(grid_id)) |gf| if (gf.mode == .scale_view)

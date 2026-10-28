@@ -3829,7 +3829,14 @@ pub const Core = struct {
         const placed = self.grid.surfacePlacement(p);
         info.zindex = if (self.grid.win_layer.get(gid)) |layer| layer.zindex else 0;
         info.start_row = if (placed) |sp| std.math.lossyCast(i32, sp.row) else grid_mod.saturatingI32FromU32(p.row);
-        info.start_col = if (placed) |sp| std.math.lossyCast(i32, sp.col) else grid_mod.saturatingI32FromU32(p.col);
+        // The global column holding the layer's drawn left edge, so the hit
+        // box [start_col, start_col + cols) is the box the layout draws: an
+        // east-anchored scale_view float ends on its placed right edge.
+        info.start_col = if (placed) |sp| blk: {
+            const gw: i64 = @max(1, self.cell_w_px);
+            const origin = flush.placedGridOriginPx(&self.grid, gid, p, sp, cols, gw, @max(1, self.cell_h_px));
+            break :blk std.math.lossyCast(i32, @divFloor(origin[0], gw));
+        } else grid_mod.saturatingI32FromU32(p.col);
         info.anchor_grid = p.anchor_grid;
         info.follows_scroll = @intFromBool(p.follows_scroll);
         info.mouse_enabled = @intFromBool(p.mouse_enabled);
@@ -9484,6 +9491,22 @@ test "the frame reported for a font grid is its footprint in global cells" {
     try std.testing.expectEqual(@as(i32, 40), info.cols);
     // Margins and the scroll rule stay in the grid's own rows.
     try std.testing.expectEqual(@as(i32, 20), info.grid_rows);
+}
+
+test "an east-anchored scale_view float is hit where the layout draws it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    // 20 columns of 5 px placed at global column 10: the layout keeps its
+    // right edge on global column 30, so it is drawn over x [200, 300).
+    try core.grid.resizeGrid(3, 2, 20);
+    try core.grid.win_pos.put(core.alloc, 3, .{ .row = 1, .col = 10, .anchor_grid = 1, .anchor_east = true });
+    try core.grid.grid_fonts.put(core.alloc, 3, .{ .win_id = 1003, .font_id = 2, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 10 });
+    const info = core.gridInfoLocked(3, 2, 20, core.grid.win_pos.get(3), false);
+    try std.testing.expectEqual(@as(i32, 20), info.start_col);
+    try std.testing.expectEqual(@as(i32, 10), info.cols);
+    try std.testing.expectEqual(@as(i32, 1), info.start_row);
 }
 
 test "font resizes are queued under the lock and sent after it" {
