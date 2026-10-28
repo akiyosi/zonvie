@@ -5693,6 +5693,7 @@ pub const Core = struct {
     /// Tell the frontend a grid's font, cell or extent changed (null = back
     /// on the global font) and redraw every surface in it.
     fn publishGridFontLocked(self: *Core, grid_id: i64, gf: ?grid_mod.GridFont) void {
+        if (gf) |g| self.log.write("per-grid font: publish grid={d} mode={s} cell_w={d} cell_h={d} extent_w={d} extent_h={d}\n", .{ grid_id, @tagName(g.mode), g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px });
         if (self.cb.on_grid_font) |f| {
             if (gf) |g| f(self.ctx, grid_id, g.font_id, g.cell_w_px, g.cell_h_px, g.extent_w_px, g.extent_h_px) else f(self.ctx, grid_id, 0, self.cell_w_px, self.cell_h_px, 0, 0);
         }

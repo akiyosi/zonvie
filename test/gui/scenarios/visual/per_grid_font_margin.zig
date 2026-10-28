@@ -8,17 +8,16 @@
 //
 // The oracle is colour geometry. Each window gets a background far from the
 // others, and the bounding box of that colour is measured:
-//   - a float in `font_view` at half scale keeps its frame (logical size in
-//     global cells), so its box must match an identical float without a font
-//     — a margin in the editor's colour shrinks it to about half;
+//   - a float in `font_view` is drawn as its logical rows and columns in its
+//     own cells, so its box must be the extent the core published for it
+//     (logged as `per-grid font: publish`), not the box of an identical float
+//     without a font;
 //   - a split resized into its own font must fill the same height as its
 //     neighbour without one, and the width its frame gives it.
 //
-// The float check is the reliable detector: `font_view` keeps the frame
-// (logical size x global cell), so a half-scale float's margin is about three
-// quarters of its area. The split is resized into its font, so its margin is
-// less than one font cell and may be narrower than `slack_px` or zero; that
-// check is a regression guard that cannot see such a margin.
+// The split is resized into its font, so its margin is less than one font
+// cell and may be narrower than `slack_px` or zero; that check is a
+// regression guard that cannot see such a margin.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -133,8 +132,16 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (pfloat.w() == 0 or psplit.w() == 0 or ffloat.w() == 0 or fsplit.w() == 0) return error.WindowNotFound;
 
     var failed = false;
-    if (@abs(ffloat.w() - pfloat.w()) > slack_px or @abs(ffloat.h() - pfloat.h()) > slack_px) {
-        std.debug.print("[gui] the font float's background does not cover its frame — its margin is painted in another colour\n", .{});
+    const extent = try floatExtent(alloc, font_mark);
+    std.debug.print("[gui] per_grid_font_margin: font float extent {d}x{d}px, box {d}x{d}px\n", .{ extent.w, extent.h, ffloat.w(), ffloat.h() });
+    if (@abs(ffloat.w() - extent.w) > slack_px or @abs(ffloat.h() - extent.h) > slack_px) {
+        std.debug.print("[gui] the font float's background does not fill its extent\n", .{});
+        failed = true;
+    }
+    // Control: a half-scale font must actually shrink the float, or the
+    // check above compares the plain float with itself.
+    if (extent.w * 3 > pfloat.w() * 2) {
+        std.debug.print("[gui] the font float's extent is not smaller than the plain float's box\n", .{});
         failed = true;
     }
     // The split's frame: the plain split's height, and the width the vsplit
@@ -151,6 +158,23 @@ pub fn run(alloc: std.mem.Allocator) !void {
         failed = true;
     }
     if (failed) return error.FontMarginNotWindowBackground;
+}
+
+const Extent = struct { w: i64, h: i64 };
+
+/// The last extent the core published for a font_view grid since `after_line`.
+fn floatExtent(alloc: std.mem.Allocator, after_line: usize) !Extent {
+    const lines = try app_log.linesAfter(alloc, log_path, "per-grid font: publish grid=", after_line);
+    defer alloc.free(lines);
+    var found: ?Extent = null;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, " mode=font_view ") == null) continue;
+        const w = app_log.field(line, "extent_w") orelse continue;
+        const h = app_log.field(line, "extent_h") orelse continue;
+        found = .{ .w = @intFromFloat(w), .h = @intFromFloat(h) };
+    }
+    return found orelse error.FontFloatExtentNotLogged;
 }
 
 const GridSize = struct { rows: i64, cols: i64 };
