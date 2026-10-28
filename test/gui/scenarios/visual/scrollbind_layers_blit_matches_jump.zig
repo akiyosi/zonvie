@@ -207,8 +207,24 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
 
     try g.exec("execute('1wincmd w')");
-    try g.exec("execute('normal! 100Gzt0')");
-    try g.exec("execute('syncbind')");
+    // The app may still be answering its own startup cell-size change with an
+    // nvim_ui_try_resize; a height change landing after `zt` re-centres the
+    // cursor and leaves it off the topline, which the jump oracle cannot match.
+    var placed = false;
+    var attempt: usize = 0;
+    while (attempt < 10) : (attempt += 1) {
+        try g.exec("execute('normal! 100Gzt0')");
+        try g.exec("execute('syncbind')");
+        gui_io.sleepNs(500 * std.time.ns_per_ms);
+        if (try g.evalInt("line('w0')") == 100) {
+            placed = true;
+            break;
+        }
+    }
+    if (!placed) {
+        std.debug.print("[gui] scrollbind_layers: topline never held at 100\n", .{});
+        return error.SetupDidNotSettle;
+    }
 
     // Warm-up, then back where it started. A commit that places a layer at a
     // rectangle it did not have before drops that layer's staged shift and
@@ -299,6 +315,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
 
     const topline = try g.evalInt("line('w0')");
+    // The jump below puts the cursor on the topline; scrolling with
+    // scrolloff=0 must have dragged it there too, or the oracle compares
+    // cursor positions instead of scroll results.
+    const cursor_line = try g.evalInt("line('.')");
+    if (cursor_line != topline) {
+        std.debug.print(
+            "[gui] scrollbind_layers: cursor on line {d} but topline is {d} — the view moved outside the scroll steps\n",
+            .{ cursor_line, topline },
+        );
+        return error.SetupDidNotSettle;
+    }
     std.debug.print(
         "[gui] scrollbind_layers: topline={d} scroll moved {d:.4} of the frame\n",
         .{ topline, moved },
