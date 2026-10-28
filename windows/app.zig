@@ -7532,7 +7532,7 @@ test "a font grid's last row owns its bottom margin and is clipped to its extent
     // Without the margin rule the same band reaches nothing.
     try std.testing.expectEqual(@as(?[2]u32, null), core.damage_bands.layerRowsForBand(.{ .top_px = 145, .bottom_px = 150 }, 100, 1, 10));
 
-    // font_view: 3 rows of 30 px clipped to 3 x 20 px.
+    // An extent shorter than rows x cell: 3 rows of 30 px clipped to 60 px.
     var viewed = base;
     viewed.font_cell_h_px = 30;
     viewed.font_extent_h_px = 60;

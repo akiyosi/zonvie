@@ -3831,7 +3831,7 @@ pub const Core = struct {
         info.start_row = if (placed) |sp| std.math.lossyCast(i32, sp.row) else grid_mod.saturatingI32FromU32(p.row);
         // The global column holding the layer's drawn left edge, so the hit
         // box [start_col, start_col + cols) is the box the layout draws: an
-        // east-anchored scale_view float ends on its placed right edge.
+        // east-anchored float in a view mode ends on its placed right edge.
         info.start_col = if (placed) |sp| blk: {
             const gw: i64 = @max(1, self.cell_w_px);
             const origin = flush.placedGridOriginPx(&self.grid, gid, p, sp, cols, gw, @max(1, self.cell_h_px));
@@ -9270,7 +9270,7 @@ test "a NaN neovide_font_scale is clamped before it reaches the slot" {
     try std.testing.expectEqual(@as(f32, 1.0), core.font_slots.slot(gf.font_id).scale);
 }
 
-test "font_view clips a float to its logical size in global cells and never resizes it" {
+test "font_view draws a float's logical cells in its font and never resizes it" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     var s = FontTestState{};
@@ -9281,11 +9281,12 @@ test "font_view clips a float to its logical size in global cells and never resi
     core.applyWindowFontLocked(.{ .win = 1001, .valid = true, .zonvie_scale = 0.5 });
     const gf = core.grid.grid_fonts.get(3).?;
     try std.testing.expectEqual(grid_mod.FontMode.font_view, gf.mode);
-    // Logical 4x20 kept; clip = logical x global cell (10x20 px).
-    try std.testing.expectEqual(@as(u32, 200), gf.extent_w_px);
-    try std.testing.expectEqual(@as(u32, 80), gf.extent_h_px);
-    try std.testing.expectEqual(@as(u32, 4), gf.frame_rows);
-    try std.testing.expectEqual(@as(u32, 20), gf.frame_cols);
+    // Logical 4x20 kept; extent = logical x the 5x10 px font cell, a
+    // footprint of 2x10 global cells (10x20 px).
+    try std.testing.expectEqual(@as(u32, 100), gf.extent_w_px);
+    try std.testing.expectEqual(@as(u32, 40), gf.extent_h_px);
+    try std.testing.expectEqual(@as(u32, 2), gf.frame_rows);
+    try std.testing.expectEqual(@as(u32, 10), gf.frame_cols);
     try std.testing.expect(gf.req == null);
     try std.testing.expectEqual(@as(u64, 0), core.font_resize_requests);
     // Clearing a float sends nothing either.

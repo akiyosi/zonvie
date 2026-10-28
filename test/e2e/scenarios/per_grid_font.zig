@@ -152,6 +152,69 @@ pub fn runScaleViewFloat(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u32, 20), sz.cols);
 }
 
+/// The one positioned grid not in `known`, waiting for it.
+fn newPositionedGrid(h: *Harness, alloc: std.mem.Allocator, known: []const i64) !i64 {
+    const Ctx = struct { known: []const i64, alloc: std.mem.Allocator };
+    try h.waitUntil(Ctx{ .known = known, .alloc = alloc }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            const ids = hh.positionedGridsAlloc(c.alloc) catch return false;
+            defer c.alloc.free(ids);
+            return ids.len == c.known.len + 1;
+        }
+    }.check, h.opts.timeout_ms);
+    const ids = try h.positionedGridsAlloc(alloc);
+    defer alloc.free(ids);
+    for (ids) |id| {
+        if (std.mem.indexOfScalar(i64, known, id) == null) return id;
+    }
+    return error.GridNotFound;
+}
+
+/// Neovim paints floats of one zindex in compositor order, the later-opened
+/// one on top (ui_compositor.c ui_comp_put_grid). A float's own font does
+/// not move it in that order.
+pub fn runFontViewFloatKeepsZOrder(alloc: std.mem.Allocator) !void {
+    var h = try Harness.init(alloc, .{ .font_slots = true });
+    defer h.deinit();
+    const before = try h.positionedGridsAlloc(alloc);
+    defer alloc.free(before);
+    try h.command("lua _G.f1 = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, { " ++ float_cfg ++ ", zindex = 50, border = 'single' })");
+    const g1 = try newPositionedGrid(h, alloc, before);
+    const with_f1 = try std.mem.concat(alloc, i64, &.{ before, &.{g1} });
+    defer alloc.free(with_f1);
+    try h.command("lua _G.f2 = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, { relative = 'editor', row = 3, col = 12, width = 20, height = 4, zindex = 50, border = 'single' })");
+    const g2 = try newPositionedGrid(h, alloc, with_f1);
+    try h.command("redraw");
+    const Ctx = struct { g1: i64, g2: i64 };
+    const above = struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            const z1 = hh.layoutZ(1, c.g1) orelse return false;
+            const z2 = hh.layoutZ(1, c.g2) orelse return false;
+            return z2 > z1;
+        }
+    }.check;
+    try h.waitUntil(Ctx{ .g1 = g1, .g2 = g2 }, above, h.opts.timeout_ms);
+
+    try h.command("lua zonvie.set_window_font(_G.f1, { guifont = 'Big:h28' })");
+    try h.command("lua zonvie.set_window_font(_G.f2, { scale = 0.6 })");
+    try h.waitUntil(Ctx{ .g1 = g1, .g2 = g2 }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return hh.gridFont(c.g1) != null and hh.gridFont(c.g2) != null;
+        }
+    }.check, h.opts.timeout_ms);
+    try h.command("redraw");
+    try h.waitUntil(Ctx{ .g1 = g1, .g2 = g2 }, above, h.opts.timeout_ms);
+    // Reconfiguring both, the font float last, does not lift it either.
+    try h.command("lua vim.api.nvim_win_set_config(_G.f2, { relative = 'editor', row = 4, col = 14, width = 22, height = 5 })");
+    try h.command("lua vim.api.nvim_win_set_config(_G.f1, { relative = 'editor', row = 3, col = 11, width = 24, height = 6 })");
+    try h.command("redraw");
+    try h.waitUntil(Ctx{ .g1 = g1, .g2 = g2 }, above, h.opts.timeout_ms);
+    // Nor does a resend of every row (what the GUI does on :mode).
+    try h.command("mode");
+    try h.command("redraw");
+    try h.waitUntil(Ctx{ .g1 = g1, .g2 = g2 }, above, h.opts.timeout_ms);
+}
+
 pub fn runFontViewFloat(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{ .font_slots = true });
     defer h.deinit();

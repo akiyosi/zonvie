@@ -139,14 +139,10 @@ pub fn plan(in: PlanIn) Plan {
                 request = want;
             }
         },
-        .font_view => {
-            // Neovim's rows and columns, clipped to them in global cells.
-            gf.frame_rows = in.logical.rows;
-            gf.frame_cols = in.logical.cols;
-            gf.extent_w_px = in.logical.cols * gw;
-            gf.extent_h_px = in.logical.rows * gh;
-        },
-        .scale_view => {
+        // Neovim's rows and columns, every one drawn in the grid's own cell:
+        // the border Neovim writes into the outer cells stays whole, and the
+        // float's footprint on the global lattice follows the font.
+        .font_view, .scale_view => {
             gf.frame_rows = font_slots.footprintCells(in.logical.rows, gf.cell_h_px, gh);
             gf.frame_cols = font_slots.footprintCells(in.logical.cols, gf.cell_w_px, gw);
             gf.extent_w_px = in.logical.cols * gf.cell_w_px;
@@ -288,14 +284,16 @@ test "an external window counts its whole grid and keeps its OS request in the s
     try testing.expect(again.font.os_answer_pending);
 }
 
-test "a view mode never requests" {
-    const fv = plan(in0(.float, .font_view));
-    try testing.expect(fv.request == null);
-    try testing.expectEqual(@as(u32, 400), fv.font.extent_w_px);
-    const sv = plan(in0(.float, .scale_view));
-    try testing.expect(sv.request == null);
-    try testing.expectEqual(@as(u32, 200), sv.font.extent_w_px);
-    try testing.expectEqual(@as(u32, 20), sv.font.frame_cols);
+test "a view mode never requests and draws every logical cell in its own font" {
+    // Neovim's 10x40 in 5x10 px cells: 200x100 px, a footprint of 5x20 global cells.
+    for ([_]FontMode{ .font_view, .scale_view }) |mode| {
+        const p = plan(in0(.float, mode));
+        try testing.expect(p.request == null);
+        try testing.expectEqual(@as(u32, 200), p.font.extent_w_px);
+        try testing.expectEqual(@as(u32, 100), p.font.extent_h_px);
+        try testing.expectEqual(@as(u32, 20), p.font.frame_cols);
+        try testing.expectEqual(@as(u32, 5), p.font.frame_rows);
+    }
 }
 
 test "clearing gives a split 0x0, an external window its frame, and a float nothing" {

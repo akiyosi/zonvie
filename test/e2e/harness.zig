@@ -790,6 +790,20 @@ pub const Harness = struct {
         return null;
     }
 
+    /// The paint rank of `grid_id` in the layout last published for
+    /// `surface_id`: a larger z is painted later, over a smaller one.
+    pub fn layoutZ(h: *Harness, surface_id: i64, grid_id: i64) ?i64 {
+        h.layout_mu.lockUncancelable(zc.clock.io());
+        defer h.layout_mu.unlock(zc.clock.io());
+        for (h.layouts[0..h.layout_count]) |*rec| {
+            if (rec.surface_id != surface_id) continue;
+            for (rec.layers[0..rec.count]) |l| {
+                if (l.grid_id == grid_id) return l.z;
+            }
+        }
+        return null;
+    }
+
     // ── Dirty-row readback ─────────────────────────────────────────────
     //
     // The dirty set is what a frontend would be asked to repaint. This harness

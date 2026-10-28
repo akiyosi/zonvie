@@ -1804,7 +1804,7 @@ fn gridRowGenParams(core: *const Core, r: Core.GridRender, cols: u32, rows: u32,
     const ch: f32 = @floatFromInt(r.cell_h_px);
     var margin_right: f32 = 0;
     var margin_bottom: f32 = 0;
-    if (r.mode == .resize or r.mode == .font_view) {
+    if (r.mode == .resize) {
         margin_right = @max(0, @as(f32, @floatFromInt(r.extent_w_px)) - @as(f32, @floatFromInt(cols)) * cw);
         if (row + 1 == rows) margin_bottom = @max(0, @as(f32, @floatFromInt(r.extent_h_px)) - @as(f32, @floatFromInt(rows)) * ch);
     }
@@ -3456,7 +3456,7 @@ fn dispatchGridRowScroll(
     // The bottom frame margin is generated with the last row's vertices
     // (gridRowGenParams); a shifted row buffer would carry it off that row.
     const r = core.gridRender(grid_id);
-    if ((r.mode == .resize or r.mode == .font_view) and r.extent_h_px > sg.rows * r.cell_h_px) return false;
+    if (r.mode == .resize and r.extent_h_px > sg.rows * r.cell_h_px) return false;
 
     const op = sg.last_scroll_op orelse return false;
     const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols) orelse return false;
@@ -5902,13 +5902,13 @@ pub fn notifyTablineChanges(self: *Core) void {
 pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 
 /// Where a placed grid's layer starts on its surface, in pixels: its
-/// placement in surface cells, except that an east-anchored scale_view float
-/// keeps its right edge where Neovim put it. The layout and every position
-/// derived from where a grid is drawn read this one rule.
+/// placement in surface cells, except that an east-anchored float in a view
+/// mode keeps its right edge where Neovim put it. The layout and every
+/// position derived from where a grid is drawn read this one rule.
 pub fn placedGridOriginPx(g: *const grid_mod.Grid, grid_id: i64, pos: grid_mod.GridPos, placed: grid_mod.SurfacePlacement, cols: u32, cell_w_px: i64, cell_h_px: i64) [2]i64 {
     const y = placed.row *| cell_h_px;
     if (pos.anchor_east and g.grid_fonts.count() != 0) {
-        if (g.grid_fonts.get(grid_id)) |gf| if (gf.mode == .scale_view)
+        if (g.grid_fonts.get(grid_id)) |gf| if (gf.mode != .resize)
             return .{ font_slots.eastSnappedX(std.math.lossyCast(u32, placed.col), cols, std.math.lossyCast(u32, cell_w_px), gf.cell_w_px), y };
     }
     return .{ placed.col *| cell_w_px, y };

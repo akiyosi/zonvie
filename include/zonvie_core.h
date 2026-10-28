@@ -136,8 +136,8 @@ typedef int (*zonvie_on_font_slot_load_fn)(
 typedef void (*zonvie_on_font_slot_release_fn)(void* ctx, uint32_t font_id);
 /* A grid's font changed. font_id 0 means it is back on the global font, and
    extent_* are then 0. Otherwise extent_* is the pixel box the layer is
-   clipped to and framed by (its frame in resize mode, rows x cell in
-   scale_view), 0 only for a grid with no rows or columns; a frontend sizes
+   clipped to and framed by (its frame in resize mode, rows x cell in a
+   view mode), 0 only for a grid with no rows or columns; a frontend sizes
    the grid's layer from it, not from rows x cell. IMMEDIATE class: core
    thread, grid_mu held. Unlike other IMMEDIATE callbacks it is not applied
    on the spot: the frontend stages it and makes it visible at the next

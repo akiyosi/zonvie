@@ -1231,7 +1231,7 @@ pub const GridPos = struct {
     /// window it is anchored in resizes, so the position is resolved again
     /// from this against the window's new size.
     anchor: ?FloatAnchor = null,
-    /// win_float_pos anchored NE or SE: a scale_view float keeps its right edge.
+    /// win_float_pos anchored NE or SE: a float in a view mode keeps its right edge.
     anchor_east: bool = false,
 };
 
