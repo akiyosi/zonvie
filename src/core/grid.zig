@@ -2405,7 +2405,9 @@ pub const Grid = struct {
                 return @intFromFloat(r);
             }
         };
-        var row = std.math.add(i64, base_row, scale.cells(a.row, anchor_m.cell_h_px, main_m.cell_h_px, false) orelse return null) catch return null;
+        // A float below its anchor starts on the main row holding the anchor's
+        // px edge, one above it ends there, so neither covers the anchor row.
+        var row = std.math.add(i64, base_row, scale.cells(a.row, anchor_m.cell_h_px, main_m.cell_h_px, !a.south) orelse return null) catch return null;
         var col = std.math.add(i64, base_col, scale.cells(a.col, anchor_m.cell_w_px, main_m.cell_w_px, false) orelse return null) catch return null;
 
         if (self.sub_grids.get(grid_id)) |sg| {
@@ -2419,6 +2421,9 @@ pub const Grid = struct {
                     row = @min(row, @as(i64, root.rows) - rows_main);
                     col = @min(col, @as(i64, root.cols) - cols_main);
                 }
+            } else {
+                row = @min(row, @as(i64, self.rows) - rows_main);
+                col = @min(col, @as(i64, self.cols) - cols_main);
             }
         }
         return .{ .row = std.math.lossyCast(u32, @max(row, 0)), .col = std.math.lossyCast(u32, @max(col, 0)) };

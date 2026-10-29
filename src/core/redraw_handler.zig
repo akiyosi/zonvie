@@ -2233,12 +2233,14 @@ fn onWinFloatPos(
         // win_float_pos). An external window is never composited,
         // so for a float it hosts that number is stale: such a
         // float is placed from its anchor instead, in that
-        // window's own cells.
+        // window's own cells. So is a float anchored in a grid
+        // with its own font, whose cells Neovim counts as main
+        // cells.
         const placing_surface = grid.surfaceForGrid(anchor_grid);
         const on_external_surface = placing_surface != null and placing_surface.? != 1;
         var float_anchor: ?grid_mod.FloatAnchor = null;
 
-        if (screen_row_i >= 0 and screen_col_i >= 0 and !on_external_surface) {
+        if (screen_row_i >= 0 and screen_col_i >= 0 and !on_external_surface and !grid.grid_fonts.contains(anchor_grid)) {
             // Let nvim take care of positioning.
             row_i64 = screen_row_i;
             col_i64 = screen_col_i;
@@ -4582,6 +4584,61 @@ test "win_float_pos places each spec anchor corner at anchor_row/anchor_col" {
         t[7] = .{ .int = 50 }; // zindex
         try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
         const p = grid.win_pos.get(3).?;
+        try std.testing.expectEqual(case.row, p.row);
+        try std.testing.expectEqual(case.col, p.col);
+    }
+}
+
+test "win_float_pos anchored in a grid with its own font is placed from the anchor's cells" {
+    // Neovim's screen_row/col counts the anchor's cells as main-grid cells
+    // (window.c win_float_pos); a grid in its own font draws them larger.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(20, 80);
+    try grid.setGridMetricsPx(1, 10, 20);
+    // A split at main row 2 (y 40 px) in a 15x30 px font.
+    try grid.resizeGrid(2, 10, 40);
+    try grid.win_pos.put(grid.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
+    try grid.grid_fonts.put(grid.alloc, 2, .{ .win_id = 1002, .font_id = 1, .mode = .resize, .cell_w_px = 15, .cell_h_px = 30, .frame_rows = 10, .frame_cols = 40 });
+    try grid.setGridMetricsPx(2, 15, 30);
+
+    // The popupmenu (popupmenu.c): below the cursor it is "NW" at the row
+    // after the cursor, above it "SW" at the cursor row.
+    const cases = [_]struct { anchor: []const u8, anchor_row: i64, pum_rows: u32, row: u32, col: u32 }{
+        // Row 4 starts at y 40 + 120 = 160, main row 8; column 6 at x 90,
+        // main column 9.
+        .{ .anchor = "NW", .anchor_row = 4, .pum_rows = 3, .row = 8, .col = 9 },
+        // Row 3 starts at y 130, inside main row 6: the popup starts on
+        // row 7 so it leaves the cursor row (y 100..130) uncovered.
+        .{ .anchor = "NW", .anchor_row = 3, .pum_rows = 3, .row = 7, .col = 9 },
+        // Above cursor row 3 (y 130): the popup ends at main row 6 (y 120).
+        .{ .anchor = "SW", .anchor_row = 3, .pum_rows = 3, .row = 6 - 3, .col = 9 },
+        // Row 9 starts at y 310, main row 16; six rows would pass the
+        // screen's 20, so it is kept on screen as Neovim keeps a float
+        // (window.c win_float_pos).
+        .{ .anchor = "NW", .anchor_row = 9, .pum_rows = 6, .row = 20 - 6, .col = 9 },
+    };
+    for (cases) |case| {
+        try grid.resizeGrid(4, case.pum_rows, 8);
+        const t = try arena.alloc(mp.Value, 11);
+        t[0] = .{ .int = 4 };
+        t[1] = .{ .int = -1 };
+        t[2] = .{ .str = case.anchor };
+        t[3] = .{ .int = 2 }; // anchor_grid
+        t[4] = .{ .int = case.anchor_row };
+        t[5] = .{ .int = 6 }; // anchor_col
+        t[6] = .{ .bool = false };
+        t[7] = .{ .int = 100 };
+        t[8] = .{ .int = 5 };
+        t[9] = .{ .int = 2 + case.anchor_row }; // screen_row in main-grid cells
+        t[10] = .{ .int = 6 }; // screen_col
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        const p = grid.win_pos.get(4).?;
         try std.testing.expectEqual(case.row, p.row);
         try std.testing.expectEqual(case.col, p.col);
     }
