@@ -654,7 +654,8 @@ fn drawNormalExternalSurfaceRowMode(
     restored_scrollbar_rect: ?c.RECT,
 ) !ExternalPresentFacts {
     const log_enabled = applog.isEnabled();
-    const fallback_row_h = row_h_px_snapshot;
+    // A root grid in its own font is laid out in that font's rows.
+    const fallback_row_h: u32 = if (tbs_snap.layers.root()) |l| @intCast(l.rowHeightPx(@intCast(row_h_px_snapshot))) else row_h_px_snapshot;
     const row_h_px: i32 = @intCast(fallback_row_h);
     // Reserve the scrollbar strip in "always" mode, as the main window's paint
     // does. An external window shows a permanently visible scrollbar in that
@@ -778,9 +779,13 @@ fn drawNormalExternalSurfaceRowMode(
         return .{ .force_full_rows = false };
     }
 
+    // A root grid in its own font draws its bottom margin with its last row.
+    const root_extent_h_px: u32 = if (tbs_snap.layers.root()) |l| @min(l.font_extent_h_px, g.height) else 0;
     const draw_params = app_mod.RowModeDrawParams{
-        .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
+        .content_height = @max(app_mod.snappedContentHeight(g.height, fallback_row_h, 0), root_extent_h_px),
+        .root_extent_h_px = root_extent_h_px,
         .row_h_px = row_h_px,
+        .layer_row_h_px = @intCast(row_h_px_snapshot),
         .content_right = content_right,
         .preserve_back = paint_policy.preserve_back,
         .root_rows_may_be_empty = has_layers,
@@ -859,6 +864,10 @@ fn drawNormalExternalSurfaceRowMode(
     // into the rows + 6 slots reserved before the layer plan above, which
     // publishes each drawn layer's rectangle into the same list.
     present.addRowSpans(rows_to_draw.items, 0, @intCast(g.width), row_h_px);
+    if (root_extent_h_px > 0 and ext_rows > 0 and std.mem.indexOfScalar(u32, rows_to_draw.items, ext_rows - 1) != null) {
+        const band = app_mod.rootRowBandPx(ext_rows - 1, ext_rows, row_h_px, root_extent_h_px);
+        present.add(.{ .left = 0, .top = band[0], .right = @intCast(g.width), .bottom = band[1] });
+    }
     present.addOpt(scroll_damage);
     present.addOpt(restored_scrollbar_rect);
 
@@ -877,7 +886,7 @@ fn drawNormalExternalSurfaceRowMode(
         0,
         content_right,
         cursor_layer_y_px,
-        row_h_px,
+        app_mod.layerCellPx(tbs_snap.layers.slice(), tbs_snap.cursor_layer_grid_id, 0, row_h_px)[1],
         @intCast(g.width),
         @intCast(g.height),
     );
@@ -1290,26 +1299,50 @@ pub fn restackMsgShowBelowHistory(app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ pos.x, pos.y });
 }
 
+/// The cell an external window's grid is framed and sized in: its own font's,
+/// else the global one. `cell_h` is the row height, linespace included, as
+/// the core's vertices are laid out. `app.mu` held.
+const FramingCellPx = struct { cell_w: u32, cell_h: u32 };
+
+fn framingCellPxLocked(app: *App, grid_id: i64) FramingCellPx {
+    if (app.gridCellPx(grid_id)) |gf| return .{ .cell_w = gf.cell_w_px, .cell_h = gf.cell_h_px };
+    return .{ .cell_w = app.cell_w_px, .cell_h = app.rowHeightPx() };
+}
+
+pub const ContentPx = struct { w: c_int, h: c_int };
+
+/// A regular external window's client content, insets excluded. A grid in
+/// its own font fills the core's extent, its frame; the rest is `rows x cols`
+/// cells. `app.mu` held.
+pub fn externalContentPxLocked(app: *App, grid_id: i64, rows: u32, cols: u32) ContentPx {
+    // on_grid_font: a font grid's extent is its frame (zonvie_core.h).
+    if (app.gridCellPx(grid_id)) |gf| return .{ .w = @intCast(gf.extent_w_px), .h = @intCast(gf.extent_h_px) };
+    return .{ .w = @intCast(cols * app.cell_w_px), .h = @intCast(rows * app.rowHeightPx()) };
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
     const is_msg_show = req.grid_id == app_mod.MESSAGE_GRID_ID;
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
+    var content_w: c_int = 0;
+    var content_h: c_int = 0;
 
     var current_hwnd: ?c.HWND = null;
     const surface_dpi_scale: f32 = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
+        const content = externalContentPxLocked(app, req.grid_id, req.rows, req.cols);
+        content_w = content.w;
+        content_h = content.h;
         const w = app.external_windows.get(req.grid_id) orelse break :blk app.dpi_scale;
         current_hwnd = w.hwnd;
         break :blk w.dpi_scale;
     };
     const insets = externalSurfaceInsetsPx(app, req.grid_id, surface_dpi_scale);
-    var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
-    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
+    var client_w: c_int = content_w + insets.w;
+    const client_h: c_int = content_h + insets.h;
     // The monitor the cmdline is on, which keeps it there as it grows (below).
     if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, app_mod.monitorWorkArea(current_hwnd orelse app.hwnd), cmdlineScreenMarginPx(app));
 
@@ -1369,6 +1402,10 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     } else {
         flags |= c.SWP_NOMOVE;
     }
+    // A superseded answer is not framed: the window is at a newer user size
+    // that is out, and its answer frames it (as macOS applyExternalGridConfig).
+    if (!is_special_window and app_mod.zonvie_core_external_resize_outstanding(app.corep, req.grid_id, req.rows, req.cols) != 0)
+        flags |= c.SWP_NOSIZE;
 
     var old_rect: c.RECT = undefined;
     const had_old_rect = is_cmdline and c.GetWindowRect(hwnd, &old_rect) != 0;
@@ -1465,12 +1502,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     }
 
-    // Get cell dimensions from main atlas
-    // Note: cell_h must include linespace_px to match core's vertex generation
-    const cell_w: u32 = app.cell_w_px;
-    const cell_h: u32 = app.rowHeightPx();
-    const content_w: c_int = @intCast(req.cols * cell_w);
-    const content_h: c_int = @intCast(req.rows * cell_h);
+    app.mu.lockUncancelable(core.clock.io());
+    const content = externalContentPxLocked(app, req.grid_id, req.rows, req.cols);
+    app.mu.unlock(core.clock.io());
+    const content_w: c_int = content.w;
+    const content_h: c_int = content.h;
 
     // Check if this is a special window (cmdline, popupmenu, msg_show, msg_history)
     const is_cmdline = (req.grid_id == app_mod.CMDLINE_GRID_ID);
@@ -2475,14 +2511,20 @@ pub export fn ExternalWndProc(
                 var grid_id: ?i64 = null;
                 var suppress = false;
                 var surface_dpi_scale: f32 = app.dpi_scale;
+                var grid_rows: u32 = 0;
+                var grid_cols: u32 = 0;
                 if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
                     grid_id = hit.grid_id;
                     suppress = hit.win.suppress_resize_callback;
                     surface_dpi_scale = hit.win.dpi_scale;
+                    grid_rows = hit.win.surf.surface.rows;
+                    grid_cols = hit.win.surf.surface.cols;
                 }
 
-                const cell_w = app.cell_w_px;
-                const cell_h = app.rowHeightPx();
+                // A grid in its own font counts its rows and columns in that font.
+                const cell = framingCellPxLocked(app, grid_id orelse 0);
+                const cell_w = cell.cell_w;
+                const cell_h = cell.cell_h;
                 const corep = app.corep;
                 // Same reservation the paint applies, and the same one the main
                 // window's grid-size derivation has always applied: in "always"
@@ -2504,9 +2546,17 @@ pub export fn ExternalWndProc(
                         const new_rows: u32 = client_h / cell_h;
 
                         if (new_rows > 0 and new_cols > 0) {
+                            // A WM_SIZE at the grid's own size (DPI change,
+                            // restore, frame change) asks Neovim for nothing
+                            // -- unless another size is out, which Neovim
+                            // would end at instead (as macOS windowDidResize).
+                            if (new_rows == grid_rows and new_cols == grid_cols and
+                                app_mod.zonvie_core_external_resize_outstanding(corep, gid, new_rows, new_cols) == 0) return 0;
                             if (applog.isEnabled()) applog.appLog("[win] external WM_SIZE grid_id={d} client=({d},{d}) cell=({d},{d}) -> rows={d} cols={d}\n", .{
                                 gid, client_w, client_h, cell_w, cell_h, new_rows, new_cols,
                             });
+                            // The core keeps one request out per window and
+                            // sends the newest size on each answer.
                             app_mod.zonvie_core_try_resize_grid(corep, gid, new_rows, new_cols);
                         }
                     }
@@ -3161,6 +3211,8 @@ pub const ShaderCursorForward = struct {
     /// A cursor on a grid this surface draws as a LAYER is in that layer's
     /// pixels, and the layer sits at its own origin inside the surface.
     layer_origin: [2]i32,
+    /// The cursor grid's own cell when it has a font; 0 = the surface's.
+    cell_px: [2]u32 = .{ 0, 0 },
 };
 
 /// Put this external renderer's custom shaders in the main window's shader
@@ -3226,6 +3278,7 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
                 )) |cb| {
                     const rect: [4]f32 = .{ cb.left, cb.bottom, cb.width(), cb.height() };
                     main_r2.setCursorShaderState(rect, cur.verts[0].color);
+                    main_r2.shader_cursor_cell_px = cur.cell_px;
                     g_sh.shader_cursor_forwarded = rect;
                 }
             }
@@ -3241,11 +3294,8 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
             g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+            g_sh.shader_cursor_cell_px = main_r3.shader_cursor_cell_px;
         }
-        // iCellSize, which also sizes this window's cell-age grid; the core
-        // stamps it under this window's grid id.
-        g_sh.cell_w_px = app.cell_w_px;
-        g_sh.cell_h_px = app.rowHeightPx();
     }
     g_sh.shader_screen_w = screen_w;
     g_sh.shader_screen_h = screen_h;
@@ -3363,6 +3413,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
+    // iCellSize, which also sizes this window's cell-age grid; the core
+    // stamps it under this window's grid id, in that grid's own cells.
+    const age_cell = framingCellPxLocked(app, g.cell_age_grid);
+    g.cell_w_px = age_cell.cell_w;
+    g.cell_h_px = age_cell.cell_h;
     // A cursor on this surface is forwarded into the main renderer's shader
     // cursor state (see syncExternalShaderFrame).
     syncExternalShaderFrame(app, hwnd, g, .{
@@ -3374,6 +3429,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             tbs_snapshot.cursor_layer_grid_id,
             grid_id,
         ),
+        .cell_px = blk: {
+            const cell = app_mod.layerCellPx(tbs_snapshot.layers.slice(), tbs_snapshot.cursor_layer_grid_id, 0, 0);
+            break :blk .{ @intCast(cell[0]), @intCast(cell[1]) };
+        },
     });
 
     // Determine rendering mode from TBS committed set.

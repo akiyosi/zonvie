@@ -392,6 +392,69 @@ pub fn isSpecialVk(vk: u32) bool {
 /// already has them in hand from the same locked read as the other metrics.
 pub const CellPos = struct { row: i32, col: i32 };
 
+/// The cell a layer-local pixel names in `grid_id`, by the core's rule, with
+/// the grid's size from the committed layers and the sub-row ease this frame
+/// drew it with. `gf` null = the global font, `cell_w` x `row_h`. Call
+/// outside app.mu (UI thread: the ease is UI-thread state).
+pub fn gridCellAt(app: *App, grid_id: i64, gf: ?app_mod.GridFontPx, x: i32, y: i32, cell_w: u32, row_h: u32) CellPos {
+    const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+    var margin_top: i32 = 0;
+    var margin_bottom: i32 = 0;
+    for (grids) |g| {
+        if (g.grid_id != grid_id) continue;
+        margin_top = g.margin_top;
+        margin_bottom = g.margin_bottom;
+        break;
+    }
+    app.mu.lockUncancelable(core.clock.io());
+    const size = committedGridSizeLocked(app, grid_id);
+    const ease_px = drawnEaseOffsetPxLocked(app, grid_id);
+    app.mu.unlock(core.clock.io());
+    const rows: i32 = if (size) |s| @intCast(s.rows) else 0;
+    const cols: i32 = if (size) |s| @intCast(s.cols) else 0;
+    const cw: u32 = if (gf) |f| f.cell_w_px else cell_w;
+    const ch: u32 = if (gf) |f| f.cell_h_px else row_h;
+    // A grid on the global font fills its layer exactly.
+    const ext_w: u32 = if (gf) |f| f.extent_w_px else cw * @as(u32, @intCast(cols));
+    const ext_h: u32 = if (gf) |f| f.extent_h_px else ch * @as(u32, @intCast(rows));
+    var row: i32 = 0;
+    var col: i32 = 0;
+    core.zonvie_core_pointer_cell_in_grid(@floatFromInt(x), @floatFromInt(y), ease_px, cw, ch, ext_w, ext_h, rows, cols, margin_top, margin_bottom, &row, &col);
+    return .{ .row = row, .col = col };
+}
+
+/// The offset the last paint drew `grid_id`'s scrolling band at: a layer's
+/// GridEase on whichever surface draws it, or an external root's own.
+/// `app.mu` held, UI thread.
+fn drawnEaseOffsetPxLocked(app: *App, grid_id: i64) f32 {
+    if (app.surf.paint.layerState(grid_id)) |s| return if (s.ease.easing) s.ease.offset_px else 0;
+    var it = app.external_windows.valueIterator();
+    while (it.next()) |ext| {
+        if (ext.*.surf.paint.layerState(grid_id)) |s| return if (s.ease.easing) s.ease.offset_px else 0;
+    }
+    if (app.external_windows.get(grid_id)) |w| {
+        return if (w.surf.paint.root_ease.easing) w.surf.paint.root_ease.offset_px else 0;
+    }
+    return 0;
+}
+
+/// The rows/cols of `grid_id` in the committed layer lists the hit test reads
+/// (main surface, then external windows), else an external window's own
+/// surface size. `app.mu` held.
+fn committedGridSizeLocked(app: *App, grid_id: i64) ?struct { rows: u32, cols: u32 } {
+    for (app.surf.tbs.committed_layers.slice()) |l| {
+        if (l.grid_id == grid_id) return .{ .rows = l.rows, .cols = l.cols };
+    }
+    var it = app.external_windows.valueIterator();
+    while (it.next()) |ext| {
+        for (ext.*.surf.tbs.committed_layers.slice()) |l| {
+            if (l.grid_id == grid_id) return .{ .rows = l.rows, .cols = l.cols };
+        }
+    }
+    if (app.external_windows.get(grid_id)) |w| return .{ .rows = w.surf.surface.rows, .cols = w.surf.surface.cols };
+    return null;
+}
+
 /// `allow_negative` keeps a position above or left of the grid as a negative
 /// cell instead of clamping it to 0. A drag needs that: Neovim scrolls the
 /// window while the pointer is held past its edge, and row 0 reads as "at the
@@ -814,11 +877,13 @@ pub fn showUrlCursor(app: *App, target: ?MouseTarget) bool {
     };
     if (app.corep) |corep| {
         app.mu.lockUncancelable(core.clock.io());
+        const gf = app.gridCellPx(t.grid_id);
         const cell_w = app.cell_w_px;
         const row_h = app.rowHeightPx();
         app.mu.unlock(core.clock.io());
-        const col: i32 = if (cell_w > 0) @divFloor(t.x, @as(i32, @intCast(cell_w))) else 0;
-        const row: i32 = if (row_h > 0) @divFloor(t.y, @as(i32, @intCast(row_h))) else 0;
+        const cell = gridCellAt(app, t.grid_id, gf, t.x, t.y, cell_w, row_h);
+        const col = cell.col;
+        const row = cell.row;
         const result = core.zonvie_core_try_cell_has_url(corep, t.grid_id, row, col);
         if (result >= 0) {
             app.cursor_is_hand = (result == 1);
@@ -1008,12 +1073,13 @@ pub fn sendMouseButton(
     wParam: c.WPARAM,
 ) void {
     app.mu.lockUncancelable(core.clock.io());
+    const gf = app.gridCellPx(grid_id);
     const cell_w = app.cell_w_px;
     const row_h = app.rowHeightPx();
     app.mu.unlock(core.clock.io());
 
     const drag = action == .drag;
-    const cell = clientPxToCell(app, false, x, y, cell_w, row_h, drag);
+    const cell = gridCellAt(app, grid_id, gf, x, y, cell_w, row_h);
     const mod_buf = buildMouseModifiers(wParam);
 
     core.zonvie_core_send_mouse_input(
@@ -1029,8 +1095,8 @@ pub fn sendMouseButton(
 
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
 /// external windows. `grid_id` is the surface this hwnd draws — 1 for the main
-/// window — and is all the core needs to resolve the target against, so this
-/// no longer reaches for the surface's layer list or takes `app.mu`.
+/// window — which the core resolves the target against; only a target in its
+/// own font needs the surface's layer list, to count the cell as a click does.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -1103,6 +1169,23 @@ pub fn handleMouseWheel(
             target_grid_id = hit.grid_id;
             target_row = hit.row;
             target_col = hit.col;
+        }
+    }
+    // The grid's own cell, as a click computes it (sendMouseButton): the
+    // resolver answers in the surface's global cells, not the grid's font.
+    {
+        app.mu.lockUncancelable(core.clock.io());
+        const origin = surfaceOriginPx(app, is_main_window);
+        const layers: []const app_mod.SurfaceLayer = if (is_main_window)
+            app.surf.tbs.committed_layers.slice()
+        else if (app.external_windows.get(grid_id)) |w| w.surf.tbs.committed_layers.slice() else &.{};
+        const t = rebaseToGrid(layers, grid_id, target_grid_id, px - origin.x, py - origin.y);
+        const gf = app.gridCellPx(t.grid_id);
+        app.mu.unlock(core.clock.io());
+        if (gf != null and t.grid_id == target_grid_id) {
+            const local = gridCellAt(app, t.grid_id, gf, t.x, t.y, cell_w, row_h);
+            target_row = @max(0, local.row);
+            target_col = @max(0, local.col);
         }
     }
 
@@ -1193,18 +1276,33 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
 /// list. The candidate window and the preedit overlay both place against
 /// this. Null when no cursor position is known yet (a cold cache under lock
 /// contention yields (-1,-1)).
-const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT };
+/// `font_id` is the cursor grid's own font, 0 for the global one.
+const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT, font_id: u32 };
 
-fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, cell_w: u32, cell_h: u32, row_h_px: u32) ?ImeCursorPoint {
+fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, global_cell_w: u32, global_cell_h: u32, global_row_h_px: u32) ?ImeCursorPoint {
     var row: i32 = 0;
     var col: i32 = 0;
     const grid_id = getCursorPositionNonBlocking(app, corep, &row, &col, null);
     if (row < 0 or col < 0) return null;
 
+    // The cursor's cell as the pointer measures it (gridCellAt): the grid's
+    // own font, and the ease the last paint drew its rows with.
+    var cell_w = global_cell_w;
+    var cell_h = global_cell_h;
+    var row_h_px = global_row_h_px;
+    var font_id: u32 = 0;
+    var ease_px: i32 = 0;
     var main_layer: [2]i32 = .{ 0, 0 };
     const ext_surface = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
+        if (app.gridCellPx(grid_id)) |gf| {
+            cell_w = gf.cell_w_px;
+            cell_h = gf.cell_h_px;
+            row_h_px = gf.cell_h_px;
+            font_id = gf.font_id;
+        }
+        ease_px = @intFromFloat(@round(drawnEaseOffsetPxLocked(app, grid_id)));
         const es = imeExternalSurfaceLocked(app, grid_id);
         if (es == null) main_layer = render_helpers.layerOriginPx(app_mod.SurfaceLayer, app.surf.tbs.committed_layers.slice(), grid_id, 1);
         break :blk es;
@@ -1223,11 +1321,12 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
         origin_y += origin.y + main_layer[1];
     }
     const x = origin_x + col * @as(c.LONG, @intCast(cell_w));
-    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px));
+    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px)) + ease_px;
     return .{
         .coord_hwnd = coord_hwnd,
         .pt_cursor = .{ .x = x, .y = y },
         .pt_below = .{ .x = x, .y = y + @as(c.LONG, @intCast(cell_h)) },
+        .font_id = font_id,
     };
 }
 
@@ -1315,7 +1414,6 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // Get cursor position and cell metrics
     // Avoid nested mutex acquisition by reading atlas ptr under app.mu, then accessing atlas separately
     var font_name_buf: [64]u16 = [_]u16{0} ** 64;
-    var atlas_cell_w: u32 = 0;
     var atlas_cell_h: u32 = 0;
     var font_em_size: f32 = 14.0;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
@@ -1329,20 +1427,9 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const target_start = app.ime_target_start;
     const target_end = app.ime_target_end;
     atlas_ptr = if (app.atlas) |*a| a else null;
-    atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
-
-    // Access atlas without holding app.mu to avoid nested locking
-    if (atlas_ptr) |atlas| {
-        atlas.mu.lockUncancelable(core.clock.io());
-        defer atlas.mu.unlock(core.clock.io());
-        @memcpy(&font_name_buf, &atlas.font_name);
-        atlas_cell_w = atlas.cell_w_px;
-        atlas_cell_h = atlas.cell_h_px;
-        font_em_size = atlas.font_em_size;
-    }
 
     if (corep == null) {
         if (log_active) applog.appLog("[IME] corep is null\n", .{});
@@ -1358,6 +1445,17 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // No cursor position yet: keep the overlay's previous position rather
     // than drawing off-window.
     const cp = imeCursorClientPoint(app, corep.?, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
+
+    // The face the cells under the composition are drawn in. Read without
+    // app.mu held to avoid nested locking.
+    if (atlas_ptr) |atlas| {
+        atlas.mu.lockUncancelable(core.clock.io());
+        defer atlas.mu.unlock(core.clock.io());
+        const face = atlas.overlayFaceLocked(cp.font_id);
+        font_name_buf = face.font_name;
+        atlas_cell_h = face.cell_h_px;
+        font_em_size = face.em_size;
+    }
 
     // Create a memory DC and font first to measure actual text width
     const screen_dc = c.GetDC(null);

@@ -690,10 +690,13 @@ struct CopyVSOut {
 
 /// Simple vertex shader for fullscreen quad copy.
 /// Takes normalized device coordinates directly (-1 to 1).
-vertex CopyVSOut vs_copy(CopyVertexIn in [[stage_in]]) {
+/// `uvScale` maps the quad onto the defined top-left region of a source whose
+/// allocated extent exceeds its logical size (surfaceUVScale); (1, 1) otherwise.
+vertex CopyVSOut vs_copy(CopyVertexIn in [[stage_in]],
+                         constant float2& uvScale [[buffer(1)]]) {
     CopyVSOut out;
     out.position = float4(in.position, 0.0, 1.0);
-    out.uv = in.texCoord;
+    out.uv = in.texCoord * uvScale;
     return out;
 }
 
@@ -715,10 +718,13 @@ struct CustomPostVSOut {
     float2 vUV [[user(locn0)]];
 };
 
-vertex CustomPostVSOut vs_custom_post(CopyVertexIn in [[stage_in]]) {
+// `uvScale` as in vs_copy. The caller scales iWindowSize by its inverse so
+// the preamble's fragCoord stays in logical pixels.
+vertex CustomPostVSOut vs_custom_post(CopyVertexIn in [[stage_in]],
+                                      constant float2& uvScale [[buffer(1)]]) {
     CustomPostVSOut out;
     out.position = float4(in.position, 0.0, 1.0);
-    out.vUV = in.texCoord;
+    out.vUV = in.texCoord * uvScale;
     return out;
 }
 

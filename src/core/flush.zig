@@ -25,6 +25,7 @@ const msg_view = @import("msg_view.zig");
 const rpc = @import("rpc_encode.zig");
 const Logger = @import("log.zig").Logger;
 const nvim_core = @import("nvim_core.zig");
+const font_slots = @import("font_slots.zig");
 const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
 const block_elements = @import("block_elements.zig");
@@ -1538,6 +1539,14 @@ pub const RowGenParams = struct {
     /// that background itself, and a second premultiplied `over` compounds
     /// alpha under blur.
     skip_default_bg: bool = false,
+    /// Leftover frame pixels of a per-grid-font window, painted with the
+    /// row's last cell background: right of the last column on every row,
+    /// and below the last row on that row only.
+    margin_right_px: f32 = 0,
+    margin_bottom_px: f32 = 0,
+    /// The per-grid font the row is drawn in (0 = global): it keys the glyph
+    /// and shape caches and picks the _ex shape/rasterize callbacks.
+    font_id: u32 = 0,
     max_vertices: usize = MAX_VERTICES_PER_CALLBACK,
 };
 
@@ -1748,6 +1757,8 @@ const GridRowSource = struct {
     is_cmdline: bool,
     /// See RowGenParams.skip_default_bg.
     skip_default_bg: bool,
+    /// Cell size and font this grid is drawn with (Core.gridRender).
+    render: Core.GridRender,
 };
 
 const RowComposeTables = struct {
@@ -1788,6 +1799,32 @@ inline fn composeGridRow(
     );
 }
 
+fn gridRowGenParams(core: *const Core, r: Core.GridRender, cols: u32, rows: u32, row: u32) RowGenParams {
+    const cw: f32 = @floatFromInt(r.cell_w_px);
+    const ch: f32 = @floatFromInt(r.cell_h_px);
+    var margin_right: f32 = 0;
+    var margin_bottom: f32 = 0;
+    if (r.mode == .resize) {
+        margin_right = @max(0, @as(f32, @floatFromInt(r.extent_w_px)) - @as(f32, @floatFromInt(cols)) * cw);
+        if (row + 1 == rows) margin_bottom = @max(0, @as(f32, @floatFromInt(r.extent_h_px)) - @as(f32, @floatFromInt(rows)) * ch);
+    }
+    return .{
+        .row = row,
+        .cols = cols,
+        .cell_w = cw,
+        .cell_h = ch,
+        .top_pad = @floatFromInt(rowTopPadPx(core.linespace_px)),
+        .default_bg = core.hl.default_bg,
+        .blur_enabled = core.blur_enabled,
+        .background_opacity = core.background_opacity,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = margin_right,
+        .margin_bottom_px = margin_bottom,
+        .font_id = r.font_id,
+    };
+}
+
 /// Generate the vertices of the row composeGridRow left in core.row_cells.
 fn generateGridRow(
     core: *Core,
@@ -1796,19 +1833,11 @@ fn generateGridRow(
     glow_enabled: bool,
     out: *std.ArrayListUnmanaged(c_api.Vertex),
 ) !RowGenStats {
-    return generateRowVertices(core, .{
-        .row = row,
-        .cols = src.cols,
-        .cell_w = @floatFromInt(core.cell_w_px),
-        .cell_h = @floatFromInt(core.cell_h_px),
-        .top_pad = @floatFromInt(rowTopPadPx(core.linespace_px)),
-        .default_bg = core.hl.default_bg,
-        .blur_enabled = core.blur_enabled,
-        .background_opacity = core.background_opacity,
-        .is_cmdline = src.is_cmdline,
-        .glow_enabled = glow_enabled,
-        .skip_default_bg = src.skip_default_bg,
-    }, out);
+    var p = gridRowGenParams(core, src.render, src.cols, src.rows, row);
+    p.is_cmdline = src.is_cmdline;
+    p.glow_enabled = glow_enabled;
+    p.skip_default_bg = src.skip_default_bg;
+    return generateRowVertices(core, p, out);
 }
 
 /// Charge a generated row to its surface's vertex ledger and mirror its glyph
@@ -1920,6 +1949,7 @@ fn emitGridPass(
         // regenerateRootsWhoseDefaultBgRuleFlipped; a layer's own flag is
         // never set, which is its answer.
         .skip_default_bg = buf.skip_default_bg_last,
+        .render = core.gridRender(grid_id),
     };
     const pass = emitGridRows(core, row_cb, src, tables, full_regen, perf, log_empty_rows);
     if (pass.atlas_reset) return pass;
@@ -2115,6 +2145,7 @@ const GlyphQuadEmitter = struct {
 /// cluster on a miss. Null on a miss; the caller checks `flush_aborted`.
 fn resolveClusterGlyph(
     core: *Core,
+    font_id: u32,
     rc: *const RenderCells,
     row: u32,
     src_col: u32,
@@ -2128,8 +2159,8 @@ fn resolveClusterGlyph(
     ensure_ns: *i64,
 ) ?c_api.GlyphEntry {
     const extras = getOverflowForCell(core, rc, row, src_col);
-    const key = clusterCacheKey(scalar, style_index, extras);
-    const hash = clusterCacheHash(scalar, style_index, extras);
+    const key = clusterCacheKey(scalar, style_index, font_id, extras);
+    const hash = clusterCacheHash(scalar, style_index, font_id, extras);
     const cacheable = cache != null and keys != null and keys.?.len > 0;
     if (cacheable) {
         const probe = nvim_core.glyphCacheProbe(keys.?, key, hash);
@@ -2138,7 +2169,7 @@ fn resolveClusterGlyph(
     if (set_emoji) setEmojiClusterFromOverflow(core, rc, row, src_col, scalar);
     defer core.emoji_cluster_len = 0;
     const t_ens: i128 = if (timing) clock.nowNs() else 0;
-    const entry_opt = core.ensureGlyphPhase2(scalar, c_style);
+    const entry_opt = core.ensureGlyphPhase2(font_id, scalar, c_style);
     if (timing) ensure_ns.* += @intCast(@max(0, clock.nowNs() - t_ens));
     const entry = entry_opt orelse return null;
     if (cacheable) {
@@ -2245,6 +2276,7 @@ pub fn generateRowVertices(
     core.inflight_row_verts = out;
     defer core.inflight_row_verts = null;
 
+    const font_id = p.font_id;
     const rc = &core.row_cells;
     const out_start = out.items.len;
     const r = p.row;
@@ -2306,6 +2338,25 @@ pub fn generateRowVertices(
             try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
             try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), run_grid_id, run_deco);
             c = end;
+        }
+        // The frame margin belongs to the window: it takes the row's last
+        // cell's background, the closest the core gets to the window's own
+        // Normal, which Neovim never sends per window.
+        const margin_bg = if (cols > 0) rc.bg_rgbs.items[@intCast(cols - 1)] else p.default_bg;
+        const margin_is_default = margin_bg == p.default_bg;
+        if (!(margin_is_default and p.skip_default_bg) and (p.margin_right_px > 0 or p.margin_bottom_px > 0)) {
+            const bg_alpha: f32 = if (!margin_is_default) 1.0 else if (p.blur_enabled) 0.5 else p.background_opacity;
+            const gid = if (cols > 0) rc.grid_ids.items[0] else 0;
+            const x_end: f32 = @as(f32, @floatFromInt(cols)) * cellW;
+            const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
+            if (p.margin_right_px > 0) {
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
+                try VH.pushSolidQuad(out, core.alloc, x_end, y0, x_end + p.margin_right_px, y0 + cellH, VH.rgba(margin_bg, bg_alpha), gid, 0);
+            }
+            if (p.margin_bottom_px > 0) {
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
+                try VH.pushSolidQuad(out, core.alloc, 0, y0 + cellH, x_end + p.margin_right_px, y0 + cellH + p.margin_bottom_px, VH.rgba(margin_bg, bg_alpha), gid, 0);
+            }
         }
         if (log_enabled) stats.bg_ns = @intCast(@max(0, clock.nowNs() - t_bg_start));
     }
@@ -2386,9 +2437,10 @@ pub fn generateRowVertices(
     const shape_text_run = core.cb.on_shape_text_run;
     const has_shaping = shape_text_run != null and core.isPhase2Atlas() and core.cb.on_rasterize_glyph_by_id != null;
 
-    // Local aliases for glyph caches
-    const glyph_cache_ascii = core.glyph_cache_ascii;
-    const glyph_valid_ascii = core.glyph_valid_ascii;
+    // The direct-indexed ASCII cache and the ASCII fast-path tables describe
+    // the global font only; a per-grid font goes through the hashed caches.
+    const glyph_cache_ascii = if (font_id == 0) core.glyph_cache_ascii else null;
+    const glyph_valid_ascii = if (font_id == 0) core.glyph_valid_ascii else null;
     const glyph_cache_non_ascii = core.glyph_cache_non_ascii;
     const glyph_keys_non_ascii = core.glyph_keys_non_ascii;
     const GLYPH_CACHE_ASCII_SIZE = core.glyph_cache_ascii_size;
@@ -2500,7 +2552,7 @@ pub fn generateRowVertices(
                     var used_ascii_fast_path = false;
                     var shape_callback_fallback = false;
 
-                    const ascii_tables_loaded = core.loadAsciiTables();
+                    const ascii_tables_loaded = font_id == 0 and core.loadAsciiTables();
                     if (core.flush_aborted) return error.FlushAborted;
                     if (ascii_tables_loaded) {
                         const is_ascii_safe = ascii_chk: {
@@ -2539,8 +2591,9 @@ pub fn generateRowVertices(
 
                     if (!used_ascii_fast_path) {
                         // Shape cache lookup / callback
-                        const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], c_style);
-                        const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], c_style);
+                        const sc_style = font_slots.shapeStyleKey(c_style, font_id);
+                        const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], sc_style);
+                        const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], sc_style);
                         const sc_set_base = (sc_hash1 & (@as(u64, core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
                         const sc_font_gen = core.font_generation;
 
@@ -2575,8 +2628,8 @@ pub fn generateRowVertices(
                             try bufs.setLen(core.alloc, scalar_count);
 
                             const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                            const glyph_count = shape_text_run.?(
-                                core.ctx,
+                            const glyph_count = core.callShapeTextRun(
+                                font_id,
                                 core.shaping_scalars.items.ptr,
                                 scalar_count,
                                 c_style,
@@ -2602,8 +2655,8 @@ pub fn generateRowVertices(
                                 try bufs.setLen(core.alloc, glyph_count);
                                 {
                                     const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                                    final_glyph_count = shape_text_run.?(
-                                        core.ctx,
+                                    final_glyph_count = core.callShapeTextRun(
+                                        font_id,
                                         core.shaping_scalars.items.ptr,
                                         scalar_count,
                                         c_style,
@@ -2728,7 +2781,7 @@ pub fn generateRowVertices(
                                 ge = ge_cache[cache_key];
                             } else {
                                 const t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                const ge_opt = core.ensureGlyphPhase2(scalar, c_style);
+                                const ge_opt = core.ensureGlyphPhase2(font_id, scalar, c_style);
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens));
                                 if (ge_opt) |entry| {
                                     ge = entry;
@@ -2905,7 +2958,7 @@ pub fn generateRowVertices(
                                 // and rasterizer-input tests at the end of this
                                 // file, and on the glass by the test/gui
                                 // scenario visual/emoji_cluster_cache.
-                                if (resolveClusterGlyph(core, rc, r, fb_src_col, fb_scalar, c_style, style_index, false, glyph_cache_non_ascii, glyph_keys_non_ascii, log_glyph_timing, &atlas_ensure_ns_acc)) |fb_ge| {
+                                if (resolveClusterGlyph(core, font_id, rc, r, fb_src_col, fb_scalar, c_style, style_index, false, glyph_cache_non_ascii, glyph_keys_non_ascii, log_glyph_timing, &atlas_ensure_ns_acc)) |fb_ge| {
                                     try quads.emit(fb_ge, fallback_base_x, null, fb_scalar);
                                 } else {
                                     if (core.flush_aborted) return error.FlushAborted;
@@ -2955,7 +3008,7 @@ pub fn generateRowVertices(
                                 break :gid_blk false;
                             }
                             if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                                const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, font_id);
                                 const key = slot_key.key;
                                 const probe = nvim_core.glyphCacheProbe(glyph_keys_id.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
@@ -2963,7 +3016,7 @@ pub fn generateRowVertices(
                                     break :gid_blk true;
                                 }
                                 const t_ens_gid1: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                const ent1_opt = core.ensureGlyphByID(gid, c_style);
+                                const ent1_opt = core.ensureGlyphByID(font_id, gid, c_style);
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid1));
                                 if (ent1_opt) |entry| {
                                     ge = entry;
@@ -2975,7 +3028,7 @@ pub fn generateRowVertices(
                                 break :gid_blk false;
                             }
                             const t_ens_gid2: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                            const ent2_opt = core.ensureGlyphByID(gid, c_style);
+                            const ent2_opt = core.ensureGlyphByID(font_id, gid, c_style);
                             if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid2));
                             if (ent2_opt) |entry| {
                                 ge = entry;
@@ -2998,7 +3051,7 @@ pub fn generateRowVertices(
                                 // extras, exactly what buildEmojiCluster hands
                                 // the rasterizer, so clusters sharing a first
                                 // scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct entries.
-                                if (resolveClusterGlyph(core, rc, r, src_col, first_scalar, c_style, style_index, cluster_is_emoji, glyph_cache_non_ascii, glyph_keys_non_ascii, false, &atlas_ensure_ns_acc)) |fb_ge| {
+                                if (resolveClusterGlyph(core, font_id, rc, r, src_col, first_scalar, c_style, style_index, cluster_is_emoji, glyph_cache_non_ascii, glyph_keys_non_ascii, false, &atlas_ensure_ns_acc)) |fb_ge| {
                                     ge = fb_ge;
                                     glyph_ok = true;
                                 } else if (core.flush_aborted) {
@@ -3029,7 +3082,7 @@ pub fn generateRowVertices(
                                     continue;
                                 }
                                 const mc_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                const mc_ge_opt = core.ensureGlyphPhase2(mc_scalar, c_style);
+                                const mc_ge_opt = core.ensureGlyphPhase2(font_id, mc_scalar, c_style);
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_ens));
                                 if (mc_ge_opt) |mc_ge| {
                                     try quads.emit(mc_ge, mc_base_x, null, mc_scalar);
@@ -3176,7 +3229,7 @@ pub fn generateRowVertices(
                                 const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                 defer core.emoji_cluster_len = 0;
-                                if (try ensureCachedPhase2Glyph(core, scalar, cs, overflow)) |entry| {
+                                if (try ensureCachedPhase2Glyph(core, font_id, scalar, cs, overflow)) |entry| {
                                     ge = entry;
                                     break :blk true;
                                 }
@@ -3200,7 +3253,7 @@ pub fn generateRowVertices(
                                 }
                             }
                             if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                const slot_key = nvim_core.glyphCacheSlotKey(scalar, style_index);
+                                const slot_key = nvim_core.glyphCacheSlotKey(scalar, style_index, font_id);
                                 const key = slot_key.key;
                                 const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, key, slot_key.hash);
                                 if (probe.hit) |hit_idx| {
@@ -3400,6 +3453,10 @@ fn dispatchGridRowScroll(
     if (!frontendHasSurface(core, surface_id)) return false;
     const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
     if (sg.scroll_fast_path_blocked) return false;
+    // The bottom frame margin is generated with the last row's vertices
+    // (gridRowGenParams); a shifted row buffer would carry it off that row.
+    const r = core.gridRender(grid_id);
+    if (r.mode == .resize and r.extent_h_px > sg.rows * r.cell_h_px) return false;
 
     const op = sg.last_scroll_op orelse return false;
     const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols) orelse return false;
@@ -3428,6 +3485,7 @@ pub const FlushCtx = struct {
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
         ctx.core.grid.assertMainShapeMirrored();
+        ctx.core.settleFontGridResizesLocked();
         // Pre-size the shaping buffers so a run of up to this many glyphs
         // allocates nothing in the row loop; a longer run still grows them
         // there (ShapingBuffers.setLen).
@@ -4060,6 +4118,8 @@ pub const FlushCtx = struct {
         // separate consumer gated on cursor_rev, which no grid dirtying touches.
         ctx.core.grid.markEverySurfaceDirty();
         ctx.core.grid.cursor_rev +%= 1;
+        // A face change at the same cell size still stales scale-only slots.
+        ctx.core.noteGlobalCellChangeLocked();
 
         ctx.core.emitGuiFont(font);
     }
@@ -4287,13 +4347,12 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         const pos = self.grid.win_pos.get(ent.grid_id) orelse continue;
         const sg = self.grid.sub_grids.get(ent.grid_id) orelse continue;
         const placed = self.grid.surfacePlacement(pos) orelse continue;
-        const dx: i64 = placed.col * cell_w;
-        const dy: i64 = placed.row * cell_h;
+        const origin = placedGridOriginPx(&self.grid, ent.grid_id, pos, placed, sg.cols, cell_w, cell_h);
         self.layout_scratch.append(self.alloc, &self.layout_budget, .{
             .grid_id = ent.grid_id,
             .anchor_grid = pos.anchor_grid,
-            .x_px = std.math.cast(i32, dx) orelse continue,
-            .y_px = std.math.cast(i32, dy) orelse continue,
+            .x_px = std.math.cast(i32, origin[0]) orelse continue,
+            .y_px = std.math.cast(i32, origin[1]) orelse continue,
             .rows = sg.rows,
             .cols = sg.cols,
             .z = @intCast(self.layout_scratch.items.len),
@@ -4637,6 +4696,8 @@ pub const CursorCellQuads = struct {
     bg_rgb: u32,
     fg_rgb: u32,
     cell: grid_mod.Cell,
+    /// The grid's per-grid font (0 = global), as RowGenParams.font_id.
+    font_id: u32 = 0,
 };
 
 pub const CursorEmitResult = enum {
@@ -4714,7 +4775,7 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
     var ge: c_api.GlyphEntry = undefined;
     var glyph_ok = false;
     if (core.isPhase2Atlas()) {
-        if (try ensureCachedPhase2Glyph(core, cp, c_style, overflow)) |entry| {
+        if (try ensureCachedPhase2Glyph(core, q.font_id, cp, c_style, overflow)) |entry| {
             ge = entry;
             glyph_ok = true;
         } else if (core.flush_aborted) {
@@ -4779,8 +4840,9 @@ fn sendGridCursor(
     saw_atlas_reset: *bool,
 ) bool {
     const out = &self.row_verts;
-    const cellW: f32 = @floatFromInt(self.cell_w_px);
-    const cellH: f32 = @floatFromInt(self.cell_h_px);
+    const render = self.gridRender(grid_id);
+    const cellW: f32 = @floatFromInt(render.cell_w_px);
+    const cellH: f32 = @floatFromInt(render.cell_h_px);
     const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
     const cursor_col = self.grid.cursor_col;
     if (cursor_on_this_grid) {
@@ -4824,6 +4886,7 @@ fn sendGridCursor(
                 .bg_rgb = if (attr) |a| a.bg else self.hl.default_fg,
                 .fg_rgb = if (attr) |a| a.fg else self.hl.default_bg,
                 .cell = cursor_cell,
+                .font_id = render.font_id,
             }) catch |err| blk: {
                 abortFlushForRowError(self, err);
                 break :blk CursorEmitResult.aborted;
@@ -5838,6 +5901,19 @@ pub fn notifyTablineChanges(self: *Core) void {
 /// the frontend can style the container background without inspecting vertices.
 pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 
+/// Where a placed grid's layer starts on its surface, in pixels: its
+/// placement in surface cells, except that an east-anchored float in a view
+/// mode keeps its right edge where Neovim put it. The layout and every
+/// position derived from where a grid is drawn read this one rule.
+pub fn placedGridOriginPx(g: *const grid_mod.Grid, grid_id: i64, pos: grid_mod.GridPos, placed: grid_mod.SurfacePlacement, cols: u32, cell_w_px: i64, cell_h_px: i64) [2]i64 {
+    const y = placed.row *| cell_h_px;
+    if (pos.anchor_east and g.grid_fonts.count() != 0) {
+        if (g.grid_fonts.get(grid_id)) |gf| if (gf.mode != .resize)
+            return .{ font_slots.eastSnappedX(std.math.lossyCast(u32, placed.col), cols, std.math.lossyCast(u32, cell_w_px), gf.cell_w_px), y };
+    }
+    return .{ placed.col *| cell_w_px, y };
+}
+
 /// Where to publish a buffer-completion popup's anchor: `win` is the window
 /// the frontends position from, and (row, col) the anchor cell inside it.
 /// Both frontends read (row, col) against the external window `win` names
@@ -5849,20 +5925,40 @@ pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 /// that origin put the popup that far away from the cell; a float the window
 /// hosts was published under its own id, found no window, and was placed
 /// against the main window.
-pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
-    if (g.isSurfaceRoot(anchor_grid)) {
-        return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
+///
+/// (row, col) are global cells (zonvie_core.h on_external_window), which a
+/// grid in its own font is not drawn on: its anchor cell is taken to pixels
+/// where the layout draws it and back to the global cell holding its bottom
+/// edge and its left edge, so a popup below the cell never covers it.
+pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, cell_w_px: u32, cell_h_px: u32, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
+    const gw: i64 = @max(1, cell_w_px);
+    const gh: i64 = @max(1, cell_h_px);
+    var win = anchor_grid;
+    var origin_x_px: i64 = 0;
+    var origin_y_px: i64 = 0;
+    const gf = g.grid_fonts.get(anchor_grid);
+    if (!g.isSurfaceRoot(anchor_grid)) {
+        if (g.win_pos.get(anchor_grid)) |pos| {
+            if (g.surfacePlacement(pos)) |placed| {
+                if (placed.surface != 1) win = placed.surface;
+                const cols: u32 = if (g.sub_grids.get(anchor_grid)) |sg| sg.cols else 0;
+                const origin = placedGridOriginPx(g, anchor_grid, pos, placed, cols, gw, gh);
+                origin_x_px = origin[0];
+                origin_y_px = origin[1];
+            } else {
+                origin_y_px = @as(i64, pos.row) *| gh;
+                origin_x_px = @as(i64, pos.col) *| gw;
+            }
+        }
     }
-    const pos = g.win_pos.get(anchor_grid) orelse return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
-    const placed = g.surfacePlacement(pos) orelse return .{
-        .win = anchor_grid,
-        .row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row),
-        .col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col),
-    };
+    const fw: i64 = if (gf) |f| @max(1, f.cell_w_px) else gw;
+    const fh: i64 = if (gf) |f| @max(1, f.cell_h_px) else gh;
+    const bottom_px = origin_y_px +| (@as(i64, anchor_row) +| 1) *| fh;
+    const left_px = origin_x_px +| @as(i64, anchor_col) *| fw;
     return .{
-        .win = if (placed.surface == 1) anchor_grid else placed.surface,
-        .row = anchor_row +| std.math.lossyCast(i32, placed.row),
-        .col = anchor_col +| std.math.lossyCast(i32, placed.col),
+        .win = win,
+        .row = std.math.lossyCast(i32, std.math.divCeil(i64, bottom_px, gh) catch unreachable) -| 1,
+        .col = std.math.lossyCast(i32, std.math.divFloor(i64, left_px, gw) catch unreachable),
     };
 }
 
@@ -6005,7 +6101,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     const placement: PopupmenuAnchorPlacement = if (is_cmdline_completion)
         .{ .win = anchor_grid, .row = -1, .col = anchor_col }
     else
-        popupmenuAnchorPlacement(&self.grid, anchor_grid, anchor_row, anchor_col);
+        popupmenuAnchorPlacement(&self.grid, self.cell_w_px, self.cell_h_px, anchor_grid, anchor_row, anchor_col);
 
     self.grid.putSyntheticExternal(pum_grid_id, .{
         .win = placement.win,
@@ -7639,8 +7735,8 @@ pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, co
 /// Build a cache key for a cell's full cluster (base scalar + overflow extras + style).
 /// Overflow extras are folded into the key so different ZWJ sequences with the same
 /// first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct cache entries.
-pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u64 {
-    var key: u64 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).key;
+pub fn clusterCacheKey(first_scalar: u32, style_index: u32, font_id: u32, overflow: ?[]const u32) u64 {
+    var key: u64 = nvim_core.glyphCacheSlotKey(first_scalar, style_index, font_id).key;
     // Fold in overflow codepoints. Rotate between folds so the key depends
     // on extras ORDER, not just their multiset -- plain XOR-fold alone is
     // commutative, so two different-order sequences of the same codepoints
@@ -7657,8 +7753,8 @@ pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u
 }
 
 /// Build a cache hash index for a cell's full cluster.
-fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u32 {
-    var h: u32 = nvim_core.glyphCacheSlotKey(first_scalar, style_index).hash;
+fn clusterCacheHash(first_scalar: u32, style_index: u32, font_id: u32, overflow: ?[]const u32) u32 {
+    var h: u32 = nvim_core.glyphCacheSlotKey(first_scalar, style_index, font_id).hash;
     if (overflow) |extras| {
         for (extras) |cp| {
             h ^= cp *% 2246822519;
@@ -7673,6 +7769,7 @@ fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32)
 /// atlas entry for a glyph that is already present in the retained row set.
 fn ensureCachedPhase2Glyph(
     core: *Core,
+    font_id: u32,
     scalar: u32,
     style_flags: u32,
     overflow: ?[]const u32,
@@ -7690,7 +7787,7 @@ fn ensureCachedPhase2Glyph(
     var non_ascii_insert: ?usize = null;
     var non_ascii_key: u64 = 0;
 
-    if (scalar < 128 and extras.len == 0) {
+    if (scalar < 128 and extras.len == 0 and font_id == 0) {
         // This is the canonical scalar cache layout used by row generation and
         // ASCII preload. The former style-major index aliased unrelated glyphs.
         const cache_index = @as(usize, scalar) * 4 + @as(usize, style_index);
@@ -7707,8 +7804,8 @@ fn ensureCachedPhase2Glyph(
         if (core.glyph_cache_non_ascii) |cache| {
             if (core.glyph_keys_non_ascii) |keys| {
                 if (cache.len != 0 and cache.len == keys.len) {
-                    const key = clusterCacheKey(scalar, style_index, overflow);
-                    const hash = clusterCacheHash(scalar, style_index, overflow);
+                    const key = clusterCacheKey(scalar, style_index, font_id, overflow);
+                    const hash = clusterCacheHash(scalar, style_index, font_id, overflow);
                     const probe = nvim_core.glyphCacheProbe(keys, key, hash);
                     if (probe.hit) |hit| return cache[hit];
                     non_ascii_insert = probe.insert;
@@ -7734,8 +7831,8 @@ fn ensureCachedPhase2Glyph(
         core.emoji_cluster_buf[0] = scalar;
         for (extras, 0..) |extra, i| core.emoji_cluster_buf[i + 1] = extra;
         core.emoji_cluster_len = @intCast(1 + extras.len);
-        resolved = core.ensureGlyphPhase2(scalar, style_flags);
-    } else if (core.cb.on_shape_text_run) |shape| {
+        resolved = core.ensureGlyphPhase2(font_id, scalar, style_flags);
+    } else if (core.cb.on_shape_text_run != null) {
         if (core.cb.on_rasterize_glyph_by_id != null) {
             var glyph_ids: [8]u32 = undefined;
             var clusters: [8]u32 = undefined;
@@ -7747,8 +7844,8 @@ fn ensureCachedPhase2Glyph(
             var cluster: [1 + grid_mod.OverflowExtras.capacity]u32 = undefined;
             cluster[0] = scalar;
             @memcpy(cluster[1..][0..extras.len], extras);
-            const glyph_count = shape(
-                core.ctx,
+            const glyph_count = core.callShapeTextRun(
+                font_id,
                 &cluster,
                 1 + extras.len,
                 style_flags,
@@ -7769,12 +7866,12 @@ fn ensureCachedPhase2Glyph(
                     if (core.glyph_keys_by_id) |keys| {
                         if (cache.len != 0 and cache.len == keys.len) {
                             const gid = glyph_ids[0];
-                            const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+                            const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, font_id);
                             const key = slot_key.key;
                             const probe = nvim_core.glyphCacheProbe(keys, key, slot_key.hash);
                             if (probe.hit) |hit| {
                                 resolved = cache[hit];
-                            } else if (core.ensureGlyphByID(gid, style_flags)) |entry| {
+                            } else if (core.ensureGlyphByID(font_id, gid, style_flags)) |entry| {
                                 cache[probe.insert] = entry;
                                 keys[probe.insert] = key;
                                 resolved = entry;
@@ -7785,7 +7882,7 @@ fn ensureCachedPhase2Glyph(
                     }
                 }
                 if (resolved == null) {
-                    resolved = core.ensureGlyphByID(glyph_ids[0], style_flags);
+                    resolved = core.ensureGlyphByID(font_id, glyph_ids[0], style_flags);
                     if (core.flush_aborted) return null;
                 }
                 // A shaped glyph-ID may be unsupported by the selected face
@@ -7803,7 +7900,7 @@ fn ensureCachedPhase2Glyph(
     }
 
     if (resolved == null) {
-        resolved = core.ensureGlyphPhase2(scalar, style_flags);
+        resolved = core.ensureGlyphPhase2(font_id, scalar, style_flags);
         if (core.flush_aborted) return null;
     }
 
@@ -10496,15 +10593,15 @@ test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
     core.cb.on_atlas_upload = State.upload;
     core.cb.on_atlas_create = State.create;
 
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'A', 0, null) != null);
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'A', 0, null) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 'A', 0, null) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 'A', 0, null) != null);
     try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
 
     const cluster_a = [_]u32{ 0x200D, 0x1F4BB };
     const cluster_b = [_]u32{ 0x200D, 0x1F52C };
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_a) != null);
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_a) != null);
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_b) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 0x1F469, 0, &cluster_a) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 0x1F469, 0, &cluster_a) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 0x1F469, 0, &cluster_b) != null);
     try std.testing.expectEqual(@as(u32, 3), state.raster_calls);
 }
 
@@ -10585,7 +10682,7 @@ test "a cursor on a combining-mark cluster is shaped by the text font, not the e
     core.cb.on_atlas_create = State.create;
 
     const combining = [_]u32{0x0301};
-    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'e', 0, &combining) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 'e', 0, &combining) != null);
     try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
     try std.testing.expectEqual(@as(usize, 2), state.shaped_len);
     try std.testing.expectEqual(@as(u32, 1), state.by_id_calls);
@@ -10701,7 +10798,7 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
     core.glyph_cache_ascii.?[old_style_major_index] = aliased_entry;
     core.glyph_valid_ascii.?[old_style_major_index] = true;
 
-    const ascii = (try ensureCachedPhase2Glyph(&core, 'A', c_api.STYLE_BOLD, null)).?;
+    const ascii = (try ensureCachedPhase2Glyph(&core, 0, 'A', c_api.STYLE_BOLD, null)).?;
     try std.testing.expectEqual(@as(f32, 11), ascii.bbox_size_px[0]);
 
     var state = State{};
@@ -10714,7 +10811,7 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
 
     const gid: u32 = 77;
     const style_index: u32 = 0;
-    const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, style_index, 0);
     const key = slot_key.key;
     const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     var shaped_entry = std.mem.zeroes(c_api.GlyphEntry);
@@ -10722,8 +10819,8 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
     core.glyph_cache_by_id.?[probe.insert] = shaped_entry;
     core.glyph_keys_by_id.?[probe.insert] = key;
 
-    const first = (try ensureCachedPhase2Glyph(&core, 0x754C, 0, null)).?;
-    const second = (try ensureCachedPhase2Glyph(&core, 0x754C, 0, null)).?;
+    const first = (try ensureCachedPhase2Glyph(&core, 0, 0x754C, 0, null)).?;
+    const second = (try ensureCachedPhase2Glyph(&core, 0, 0x754C, 0, null)).?;
     try std.testing.expectEqual(@as(f32, 7), first.bbox_size_px[0]);
     try std.testing.expectEqual(@as(f32, 7), second.bbox_size_px[0]);
     try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
@@ -10731,7 +10828,7 @@ test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
 
     // A shaped primary-face miss falls back to the scalar/font path without
     // arming a retry storm when the fallback renders successfully.
-    const fallback = (try ensureCachedPhase2Glyph(&core, 0x4E2D, 0, null)).?;
+    const fallback = (try ensureCachedPhase2Glyph(&core, 0, 0x4E2D, 0, null)).?;
     try std.testing.expectEqual(@as(f32, 1), fallback.bbox_size_px[0]);
     try std.testing.expectEqual(@as(u32, 2), state.shape_calls);
     try std.testing.expectEqual(@as(u32, 1), state.by_id_calls);
@@ -11015,7 +11112,7 @@ test "box drawing glyph quads are trimmed to their cell rows" {
     core.cb.on_atlas_upload = State.upload;
     core.cb.on_atlas_create = State.create;
     const gid: u32 = 42;
-    const slot_key = nvim_core.glyphCacheSlotKey(gid, 0);
+    const slot_key = nvim_core.glyphCacheSlotKey(gid, 0, 0);
     const key = slot_key.key;
     const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, slot_key.hash);
     core.glyph_cache_by_id.?[probe.insert] = entry;
@@ -14085,47 +14182,47 @@ const WARNING: u32 = 0x26A0;
 
 test "cluster key separates a bare base from the same base with a ZWJ tail" {
     // 👩 vs 👩‍💻: a key built from the base scalar alone collapses these.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, null) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, null) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }));
 }
 
 test "cluster key separates two ZWJ sequences sharing base and joiner" {
     // 👩‍💻 vs 👩‍🔬 — the pair flush.zig's own key comment names.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE }));
 }
 
 test "cluster key separates text and emoji presentation of one scalar" {
     // ❤ vs ❤️ differ only by a variation selector carried in the overflow map.
-    const text = clusterCacheKey(HEART, 0, null);
-    try std.testing.expect(text != clusterCacheKey(HEART, 0, &.{VS16}));
+    const text = clusterCacheKey(HEART, 0, 0, null);
+    try std.testing.expect(text != clusterCacheKey(HEART, 0, 0, &.{VS16}));
     // An empty tail must agree with no tail: both mean the rasterizer receives
     // the base scalar alone, so they must not occupy separate entries.
-    try std.testing.expectEqual(text, clusterCacheKey(HEART, 0, &.{}));
+    try std.testing.expectEqual(text, clusterCacheKey(HEART, 0, 0, &.{}));
 }
 
 test "cluster key depends on tail order, not just the multiset" {
     // Distinct grapheme clusters can share codepoints in a different order; a
     // commutative fold would hand them one bitmap.
-    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP, ZWJ, MICROSCOPE }) !=
-        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE, ZWJ, LAPTOP }));
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, LAPTOP, ZWJ, MICROSCOPE }) !=
+        clusterCacheKey(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE, ZWJ, LAPTOP }));
 }
 
 test "cluster key separates styles and bases" {
-    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
-        clusterCacheKey(HEART, 0, &.{VS16}));
-    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
-        clusterCacheKey(WARNING, 1, &.{VS16}));
+    try std.testing.expect(clusterCacheKey(WARNING, 0, 0, &.{VS16}) !=
+        clusterCacheKey(HEART, 0, 0, &.{VS16}));
+    try std.testing.expect(clusterCacheKey(WARNING, 0, 0, &.{VS16}) !=
+        clusterCacheKey(WARNING, 1, 0, &.{VS16}));
 }
 
 test "cluster hash tracks the key across the same distinctions" {
     // The hash only picks the probe slot, so a collision costs a miss rather
     // than a wrong glyph — but a hash ignoring the tail would send every
     // sequence sharing a base to one slot and evict them in a loop.
-    try std.testing.expect(clusterCacheHash(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
-        clusterCacheHash(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
-    try std.testing.expect(clusterCacheHash(HEART, 0, null) !=
-        clusterCacheHash(HEART, 0, &.{VS16}));
+    try std.testing.expect(clusterCacheHash(WOMAN, 0, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheHash(WOMAN, 0, 0, &.{ ZWJ, MICROSCOPE }));
+    try std.testing.expect(clusterCacheHash(HEART, 0, 0, null) !=
+        clusterCacheHash(HEART, 0, 0, &.{VS16}));
 }
 
 test "the emoji branch is decided by the tail alone" {
@@ -14170,8 +14267,8 @@ test "clusters that key differently are handed different scalars" {
     for (cases, 0..) |a, i| {
         for (cases, 0..) |b, j| {
             if (i == j) continue;
-            try std.testing.expect(clusterCacheKey(a.base, 0, a.extras) !=
-                clusterCacheKey(b.base, 0, b.extras));
+            try std.testing.expect(clusterCacheKey(a.base, 0, 0, a.extras) !=
+                clusterCacheKey(b.base, 0, 0, b.extras));
             const la = buildEmojiCluster(&buf_a, a.base, a.extras);
             const lb = buildEmojiCluster(&buf_b, b.base, b.extras);
             try std.testing.expect(!std.mem.eql(u32, buf_a[0..la], buf_b[0..lb]));
@@ -18373,31 +18470,69 @@ test "popupmenu anchor is published in the coordinates of the window that shows 
     // origin (10, 20). Both frontends place the popup from the external
     // window's own top-left, so the anchor must stay local to it.
     try g.external_grids.put(g.alloc, 5, .{ .win = 1005, .start_row = 10, .start_col = 20 });
-    var p = popupmenuAnchorPlacement(g, 5, 3, 4);
+    var p = popupmenuAnchorPlacement(g, 10, 20, 5, 3, 4);
     try std.testing.expectEqual(@as(i64, 5), p.win);
     try std.testing.expectEqual(@as(i32, 3), p.row);
     try std.testing.expectEqual(@as(i32, 4), p.col);
 
     // Born external (no position): local as well.
     try g.external_grids.put(g.alloc, 6, .{ .win = 1006, .start_row = -1, .start_col = -1 });
-    p = popupmenuAnchorPlacement(g, 6, 3, 4);
+    p = popupmenuAnchorPlacement(g, 10, 20, 6, 3, 4);
     try std.testing.expectEqual(@as(i64, 6), p.win);
     try std.testing.expectEqual(@as(i32, 3), p.row);
 
     // A float the detached window hosts, at (6, 8) of that window's cells.
     // The popup goes to the HOST window, at the float's place inside it.
     try g.win_pos.put(g.alloc, 7, .{ .row = 6, .col = 8, .anchor_grid = 5 });
-    p = popupmenuAnchorPlacement(g, 7, 1, 2);
+    p = popupmenuAnchorPlacement(g, 10, 20, 7, 1, 2);
     try std.testing.expectEqual(@as(i64, 5), p.win);
     try std.testing.expectEqual(@as(i32, 7), p.row);
     try std.testing.expectEqual(@as(i32, 10), p.col);
 
     // A split on the main window: global coordinates, as before.
     try g.win_pos.put(g.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
-    p = popupmenuAnchorPlacement(g, 2, 3, 4);
+    p = popupmenuAnchorPlacement(g, 10, 20, 2, 3, 4);
     try std.testing.expectEqual(@as(i64, 2), p.win);
     try std.testing.expectEqual(@as(i32, 5), p.row);
     try std.testing.expectEqual(@as(i32, 4), p.col);
+}
+
+test "a popupmenu anchored in a grid with its own font is published in global cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    const g = &core.grid;
+    // Global cell 10x20 px; the anchor grids' font cell 15x30 px (1.5x).
+
+    // An external window in its own font: cell (20, 4) is drawn at
+    // x 60..75, y 600..630 of the window. Its bottom edge lies in global
+    // row 31 (620..640) and its left edge in global column 6.
+    try g.external_grids.put(g.alloc, 5, .{ .win = 1005, .start_row = -1, .start_col = -1 });
+    try g.grid_fonts.put(g.alloc, 5, .{ .win_id = 1005, .font_id = 1, .mode = .resize, .cell_w_px = 15, .cell_h_px = 30, .frame_rows = 40, .frame_cols = 60 });
+    var p = popupmenuAnchorPlacement(g, 10, 20, 5, 20, 4);
+    try std.testing.expectEqual(@as(i64, 5), p.win);
+    try std.testing.expectEqual(@as(i32, 31), p.row);
+    try std.testing.expectEqual(@as(i32, 6), p.col);
+
+    // A split on the main window at global row 2: its cell (3, 4) ends at
+    // y 40 + 4*30 = 160, the bottom of global row 7.
+    try g.win_pos.put(g.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
+    try g.grid_fonts.put(g.alloc, 2, .{ .win_id = 1002, .font_id = 1, .mode = .resize, .cell_w_px = 15, .cell_h_px = 30, .frame_rows = 10, .frame_cols = 40 });
+    p = popupmenuAnchorPlacement(g, 10, 20, 2, 3, 4);
+    try std.testing.expectEqual(@as(i64, 2), p.win);
+    try std.testing.expectEqual(@as(i32, 7), p.row);
+    try std.testing.expectEqual(@as(i32, 6), p.col);
+
+    // An east-anchored scale_view float, 4 columns of 5 px placed at global
+    // column 10: the layout puts its right edge on global column 14, so it
+    // starts at x 140 - 20 = 120 (collectSurfaceLayers). Cell (0, 1) is at
+    // x 125 and ends at y 20 + 10 = 30.
+    try g.resizeGrid(3, 2, 4);
+    try g.win_pos.put(g.alloc, 3, .{ .row = 1, .col = 10, .anchor_grid = 1, .anchor_east = true });
+    try g.grid_fonts.put(g.alloc, 3, .{ .win_id = 1003, .font_id = 2, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 2 });
+    p = popupmenuAnchorPlacement(g, 10, 20, 3, 0, 1);
+    try std.testing.expectEqual(@as(i64, 3), p.win);
+    try std.testing.expectEqual(@as(i32, 1), p.row);
+    try std.testing.expectEqual(@as(i32, 12), p.col);
 }
 
 test "a surface root regenerates every row when it gains or loses its layers under blur" {
@@ -19594,4 +19729,413 @@ test "an aborted flush hands its stamps and clear markers to the flush that comm
     try std.testing.expectEqual(@as(usize, 1), state.deliveries);
     try std.testing.expectEqual(@as(usize, 1), state.got_len);
     try std.testing.expectEqual(grid_mod.CellStamp{ .row = 0, .col = 0, .count = 0, .grid = 1 }, state.got[0]);
+}
+
+test "a scaled float is placed on the global lattice and an east anchor keeps its right edge" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(3, 2, 10);
+    try core.grid.setWinFloatPos(3, 1001, 2, 20, 50, 0, 1, true);
+    try core.grid.grid_fonts.put(core.alloc, 3, .{ .win_id = 1001, .font_id = 1, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 5, .extent_w_px = 50, .extent_h_px = 20 });
+    var layers = collectSurfaceLayers(&core, 1);
+    try std.testing.expectEqual(@as(i32, 200), layers[1].x_px);
+    try std.testing.expectEqual(@as(i32, 40), layers[1].y_px);
+    core.grid.setWinFloatEast(3, true);
+    layers = collectSurfaceLayers(&core, 1);
+    // Right edge (20 + 10) * 10 = 300 px, extent 10 * 5 = 50 px.
+    try std.testing.expectEqual(@as(i32, 250), layers[1].x_px);
+}
+
+test "an east-anchored scaled float keeps its right edge and never goes left of the surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(3, 2, 10);
+    try core.grid.setWinFloatPos(3, 1001, 0, 5, 50, 0, 1, true);
+    core.grid.setWinFloatEast(3, true);
+    try core.grid.grid_fonts.put(core.alloc, 3, .{ .win_id = 1001, .font_id = 1, .mode = .scale_view, .cell_w_px = 30, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 30, .extent_w_px = 300, .extent_h_px = 20 });
+    const layers = collectSurfaceLayers(&core, 1);
+    // Right edge (5 + 10) * 10 = 150 px is narrower than the 300 px extent.
+    try std.testing.expectEqual(@as(i32, 0), layers[1].x_px);
+}
+
+test "a font grid's row uses its own cell size and fills the frame margin" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 3, 13);
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    // Frame 10 cols x 2 rows of 10x20 = 100x40 px; 7x12 cells: 13 cols, 3 rows.
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 1000, .font_id = 1, .mode = .resize, .cell_w_px = 7, .cell_h_px = 12, .frame_rows = 2, .frame_cols = 10, .req = .{ .rows = 3, .cols = 13 }, .extent_w_px = 100, .extent_h_px = 40 });
+    const p = gridRowGenParams(&core, core.gridRender(2), 13, 3, 2);
+    try std.testing.expectEqual(@as(f32, 7), p.cell_w);
+    try std.testing.expectEqual(@as(f32, 12), p.cell_h);
+    try std.testing.expectEqual(@as(f32, 9), p.margin_right_px); // 100 - 13*7
+    try std.testing.expectEqual(@as(f32, 4), p.margin_bottom_px); // 40 - 3*12, last row
+    const mid = gridRowGenParams(&core, core.gridRender(2), 13, 3, 0);
+    try std.testing.expectEqual(@as(f32, 0), mid.margin_bottom_px);
+
+    // Without a grid font the parameters are the global ones, margin-free.
+    const g = gridRowGenParams(&core, core.gridRender(1), 40, 10, 9);
+    try std.testing.expectEqual(@as(f32, 10), g.cell_w);
+    try std.testing.expectEqual(@as(f32, 20), g.cell_h);
+    try std.testing.expectEqual(@as(f32, 0), g.margin_right_px);
+    try std.testing.expectEqual(@as(f32, 0), g.margin_bottom_px);
+}
+
+// zonvie_core.h on_grid_row_scroll: the frontend moves row buffers, so a row
+// moved into or out of the last slot would take or lose the bottom margin
+// quad generated with the last row.
+test "a font grid whose last row carries a bottom margin is not row-shifted" {
+    const S = struct {
+        var calls: u32 = 0;
+        fn onRowScroll(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: i32, _: u32, _: u32) callconv(.c) void {
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 4, 13);
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    // 4 rows of 12 px in a 52 px frame: the last row carries a 4 px margin.
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 1000, .font_id = 1, .mode = .resize, .cell_w_px = 7, .cell_h_px = 12, .frame_rows = 2, .frame_cols = 10, .req = .{ .rows = 4, .cols = 13 }, .extent_w_px = 100, .extent_h_px = 52 });
+    try std.testing.expect(gridRowGenParams(&core, core.gridRender(2), 13, 4, 3).margin_bottom_px > 0);
+    core.grid.scrollGrid(2, 0, 4, 0, 13, -1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, S.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 0), S.calls);
+    // An exact fit carries no margin and keeps the fast path.
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    core.grid.grid_fonts.getPtr(2).?.extent_h_px = 48;
+    core.grid.scrollGrid(2, 0, 4, 0, 13, -1, 0);
+    try std.testing.expect(dispatchGridRowScroll(&core, S.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 1), S.calls);
+}
+
+test "frame margins are painted right of and below the cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 2);
+    core.row_cells.setLen(2);
+    for (0..2) |col| core.row_cells.set(col, ' ', 0xFFFFFF, 0x112233, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    core.row_cells.grid_ids.items[0] = 2;
+    core.row_cells.grid_ids.items[1] = 2;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 1,
+        .cols = 2,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+    const bg = out.items[0..stats.pass_ends[0]];
+    try std.testing.expectEqual(@as(usize, 18), bg.len);
+    const Box = struct { x0: f32, y0: f32, x1: f32, y1: f32 };
+    var boxes: [3]Box = undefined;
+    for (0..3) |q| {
+        var b = Box{ .x0 = std.math.inf(f32), .y0 = std.math.inf(f32), .x1 = -std.math.inf(f32), .y1 = -std.math.inf(f32) };
+        for (bg[q * 6 ..][0..6]) |v| {
+            b.x0 = @min(b.x0, v.position[0]);
+            b.x1 = @max(b.x1, v.position[0]);
+            b.y0 = @min(b.y0, v.position[1]);
+            b.y1 = @max(b.y1, v.position[1]);
+        }
+        boxes[q] = b;
+        try std.testing.expectEqual(@as(i64, 2), bg[q * 6].grid_id);
+        try std.testing.expectEqual(bg[0].color, bg[q * 6].color);
+    }
+    try std.testing.expectEqual(Box{ .x0 = 14, .y0 = 12, .x1 = 17, .y1 = 24 }, boxes[1]);
+    try std.testing.expectEqual(Box{ .x0 = 0, .y0 = 24, .x1 = 17, .y1 = 28 }, boxes[2]);
+
+    // A root that skips its default background skips its margins too.
+    out.clearRetainingCapacity();
+    const skipped = try generateRowVertices(&core, .{
+        .row = 1,
+        .cols = 2,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = true,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .skip_default_bg = true,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+    try std.testing.expectEqual(@as(usize, 0), skipped.pass_ends[0]);
+}
+
+test "frame margins take the background of the cells they adjoin, not the default" {
+    // A float or a window with its own Normal (NormalFloat, winhighlight)
+    // fills its cells with a background other than the default; the margin
+    // is part of that window and must not show the editor's Normal. Neovim
+    // never sends a per-window Normal, so the last cell's background is the
+    // per-grid signal the core has: the right margin and the whole bottom
+    // band of a row take it, one colour per row.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 3);
+    core.row_cells.setLen(3);
+    core.row_cells.set(0, ' ', 0xFFFFFF, 0x445566, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.set(1, ' ', 0xFFFFFF, 0x445566, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.set(2, ' ', 0xFFFFFF, 0x778899, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    for (0..3) |col| core.row_cells.grid_ids.items[col] = 2;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 3,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = false,
+        .background_opacity = 0.8,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+
+    // Colour of the one background quad covering (x, y).
+    const S = struct {
+        fn colorAt(bg: []const c_api.Vertex, x: f32, y: f32) ![4]f32 {
+            var found: ?[4]f32 = null;
+            var q: usize = 0;
+            while (q + 6 <= bg.len) : (q += 6) {
+                var x0 = std.math.inf(f32);
+                var y0 = std.math.inf(f32);
+                var x1 = -std.math.inf(f32);
+                var y1 = -std.math.inf(f32);
+                for (bg[q..][0..6]) |v| {
+                    x0 = @min(x0, v.position[0]);
+                    x1 = @max(x1, v.position[0]);
+                    y0 = @min(y0, v.position[1]);
+                    y1 = @max(y1, v.position[1]);
+                }
+                if (x < x0 or x >= x1 or y < y0 or y >= y1) continue;
+                if (found != null) return error.Overlap;
+                found = bg[q].color;
+            }
+            return found orelse error.Uncovered;
+        }
+    };
+    const bg = out.items[0..stats.pass_ends[0]];
+    // Right margin, then the bottom band under each column and the corner.
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 22, 6));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 3, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 10, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 17, 14));
+    try std.testing.expectEqual(VH.rgba(0x778899, 1.0), try S.colorAt(bg, 22, 14));
+}
+
+test "a default-background margin keeps the default background's alpha" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+    core.row_cells.setLen(1);
+    core.row_cells.set(0, ' ', 0xFFFFFF, 0x112233, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    core.row_cells.grid_ids.items[0] = 2;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 1,
+        .cell_w = 7,
+        .cell_h = 12,
+        .top_pad = 0,
+        .default_bg = 0x112233,
+        .blur_enabled = false,
+        .background_opacity = 0.8,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .margin_right_px = 3,
+        .margin_bottom_px = 4,
+    }, &out);
+    const bg = out.items[0..stats.pass_ends[0]];
+    try std.testing.expectEqual(@as(usize, 18), bg.len);
+    try std.testing.expectEqual(bg[0].color, bg[6].color);
+    try std.testing.expectEqual(bg[0].color, bg[12].color);
+    try std.testing.expectEqual(@as(f32, 0.8), bg[6].color[3]);
+    try std.testing.expectEqual(@as(f32, 0.8), bg[12].color[3]);
+}
+
+test "a non-zero font never reads or writes the ASCII direct cache" {
+    const State = struct {
+        ensure_calls: u32 = 0,
+        raster_calls: u32 = 0,
+        shape_calls: u32 = 0,
+
+        fn ensure(ctx: ?*anyopaque, scalar: u32, out_entry: *c_api.GlyphEntry) callconv(.c) c_int {
+            _ = scalar;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ensure_calls += 1;
+            out_entry.* = std.mem.zeroes(c_api.GlyphEntry);
+            return 1;
+        }
+        fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = .{ scalar, style_flags };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.raster_calls += 1;
+            out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 1, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+            return 1;
+        }
+        fn shape(ctx: ?*anyopaque, scalars: [*]const u32, scalar_count: usize, style_flags: u32, out_glyph_ids: [*]u32, out_clusters: [*]u32, out_x_advance: [*]i32, out_x_offset: [*]i32, out_y_offset: [*]i32, out_cap: usize) callconv(.c) usize {
+            _ = .{ scalars, style_flags };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            const n = @min(scalar_count, out_cap);
+            for (0..n) |i| {
+                out_glyph_ids[i] = 7;
+                out_clusters[i] = @intCast(i);
+                out_x_advance[i] = 64 * 10;
+                out_x_offset[i] = 0;
+                out_y_offset[i] = 0;
+            }
+            return n;
+        }
+        fn upload(ctx: ?*anyopaque, x: u32, y: u32, w: u32, h: u32, bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = .{ ctx, x, y, w, h, bitmap };
+        }
+        fn create(ctx: ?*anyopaque, w: u32, h: u32) callconv(.c) void {
+            _ = .{ ctx, w, h };
+        }
+    };
+
+    const a_index: usize = @as(usize, 'A') * 4;
+    const params = RowGenParams{ .row = 0, .cols = 1, .cell_w = 10, .cell_h = 10, .top_pad = 0, .default_bg = 0, .blur_enabled = false, .background_opacity = 1, .is_cmdline = false, .glow_enabled = false, .font_id = 1 };
+
+    // Legacy row path: the direct cache is neither read nor filled.
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try core.initGlyphCache();
+        try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+        core.row_cells.setLen(1);
+        core.row_cells.set(0, 'A', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+        @memset(core.row_cells.deco_base_flags.items, 0);
+        @memset(core.row_cells.glow_arr.items, 0);
+        var state = State{};
+        core.ctx = &state;
+        core.cb.on_atlas_ensure_glyph = State.ensure;
+        var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+        defer out.deinit(core.alloc);
+        core.glyph_valid_ascii.?[a_index] = true;
+        _ = try generateRowVertices(&core, params, &out);
+        try std.testing.expectEqual(@as(u32, 1), state.ensure_calls);
+        core.glyph_valid_ascii.?[a_index] = false;
+        out.clearRetainingCapacity();
+        _ = try generateRowVertices(&core, params, &out);
+        try std.testing.expect(!core.glyph_valid_ascii.?[a_index]);
+    }
+
+    // Phase 2 cursor lookup.
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        var state = State{};
+        core.ctx = &state;
+        core.cb.on_rasterize_glyph = State.rasterize;
+        core.cb.on_atlas_upload = State.upload;
+        core.cb.on_atlas_create = State.create;
+        try core.initGlyphCache();
+        core.glyph_valid_ascii.?[a_index] = true;
+        _ = try ensureCachedPhase2Glyph(&core, 1, 'A', 0, null);
+        try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
+        core.glyph_valid_ascii.?[a_index] = false;
+        _ = try ensureCachedPhase2Glyph(&core, 1, 'B', 0, null);
+        try std.testing.expect(!core.glyph_valid_ascii.?[@as(usize, 'B') * 4]);
+    }
+
+    // Shaped row: the global ASCII tables are not used for a grid font.
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+        core.row_cells.setLen(1);
+        core.row_cells.set(0, 'A', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+        @memset(core.row_cells.deco_base_flags.items, 0);
+        @memset(core.row_cells.glow_arr.items, 0);
+        var state = State{};
+        core.ctx = &state;
+        core.cb.on_shape_text_run = State.shape;
+        core.cb.on_rasterize_glyph = State.rasterize;
+        core.cb.on_rasterize_glyph_by_id = State.rasterize;
+        core.cb.on_atlas_upload = State.upload;
+        core.cb.on_atlas_create = State.create;
+        for (0..4) |s| {
+            @memset(&core.ascii_glyph_ids[s], 7);
+            @memset(&core.ascii_x_advances[s], 64 * 10);
+            @memset(&core.ascii_lig_triggers[s], 0);
+        }
+        core.ascii_tables_valid = true;
+        var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+        defer out.deinit(core.alloc);
+        _ = try generateRowVertices(&core, params, &out);
+        try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+    }
+}
+
+test "a font grid's cursor uses the grid's cell size" {
+    const State = struct {
+        min_x: f32 = std.math.inf(f32),
+        min_y: f32 = std.math.inf(f32),
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = .{ grid_id, row_start, row_count, flags, total_rows, total_cols };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const v = verts orelse return;
+            for (v[0..vert_count]) |vx| {
+                self.min_x = @min(self.min_x, vx.position[0]);
+                self.min_y = @min(self.min_y, vx.position[1]);
+            }
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 3, 13);
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 1000, .font_id = 1, .mode = .resize, .cell_w_px = 7, .cell_h_px = 12, .frame_rows = 2, .frame_cols = 10, .extent_w_px = 100, .extent_h_px = 40 });
+    core.grid.cursor_row = 1;
+    core.grid.cursor_col = 2;
+    var state = State{};
+    core.ctx = &state;
+    var retry = false;
+    var reset = false;
+    const buf = core.grid.sub_grids.getPtr(2).?;
+    try std.testing.expect(sendGridCursor(&core, State.onRow, 2, buf, true, false, &retry, &reset));
+    try std.testing.expectEqual(@as(f32, 14), state.min_x);
+    try std.testing.expectEqual(@as(f32, 12), state.min_y);
 }

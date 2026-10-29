@@ -873,13 +873,19 @@ final class ZonvieCore {
                             // Size only: a normal grid's background is the
                             // core's default bg (resolveHlGroupBgColor), never
                             // row 0's quads, which the core drops under blur.
+                            // Framed in the font these rows were drawn in: the
+                            // block can run before this flush's
+                            // commitGridFonts, and the committed table then
+                            // still holds the previous font.
+                            let font = core.sharedResources?.flushGridFont(gridId)
                             DispatchQueue.main.async { [weak core] in
                                 guard let core = core else { return }
                                 core.configureExternalGridFromRow(
                                     gridId: gridId,
                                     gridView: gridView,
                                     rows: totalRows,
-                                    cols: totalCols
+                                    cols: totalCols,
+                                    font: font
                                 )
                             }
                         }
@@ -1322,6 +1328,8 @@ final class ZonvieCore {
                 // Neovim's default background, for the viewport-edge clear
                 // colour, published by the commit it came with.
                 let defaultBg = me.core.map { zonvie_core_get_default_bg($0) } ?? 0
+                // Per-grid fonts go out with the rows this flush drew in them.
+                me.sharedResources?.commitGridFonts()
                 // Only a surface that joined commits, the main one as an
                 // external one; the one that did not still draws from the
                 // texture this flush published.
@@ -1623,6 +1631,58 @@ final class ZonvieCore {
                     ? UnsafeBufferPointer(start: stamps!, count: n)
                     : UnsafeBufferPointer<zonvie_cell_stamp>(start: nil, count: 0)
                 shared.cellAge.apply(buf, clear: clear != 0, now: shared.shaderTimeNow())
+            },
+            on_font_slot_load: { ctx, fontId, utf8, len, scale, outW, outH in
+                guard let ctx, let outW, let outH else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                let payload = utf8.map {
+                    String(decoding: UnsafeRawBufferPointer(start: $0, count: len), as: UTF8.self)
+                } ?? ""
+                // Synchronous by contract: the core sizes the grid from the answer.
+                // Runs under grid_mu; a one-time cost per new font.
+                guard let cell = me.loadFontSlot(fontId: fontId, payload: payload, scale: CGFloat(scale)) else { return 0 }
+                outW.pointee = cell.cellWidthPx
+                outH.pointee = cell.cellHeightPx
+                return 1
+            },
+            on_font_slot_release: { ctx, fontId in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.sharedAtlas?.releaseSlot(fontId: fontId)
+            },
+            on_grid_font: { ctx, gridId, fontId, cellW, cellH, extentW, extentH in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.sharedResources?.setGridFont(gridId, fontId == 0 ? nil : GridFontPx(
+                    fontId: fontId, cellWidthPx: cellW, cellHeightPx: cellH,
+                    extentWidthPx: extentW, extentHeightPx: extentH))
+            },
+            on_shape_text_run_ex: { ctx, fontId, scalars, scalarCount, styleFlags, outGlyphIDs, outClusters, outXAdvance, outXOffset, outYOffset, outCap in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.shapeTextRun(
+                    fontId: fontId,
+                    scalars: scalars!, scalarCount: scalarCount,
+                    styleFlags: styleFlags,
+                    outGlyphIDs: outGlyphIDs!, outClusters: outClusters!,
+                    outXAdvance: outXAdvance!, outXOffset: outXOffset!, outYOffset: outYOffset!,
+                    outCap: outCap
+                )
+            },
+            on_rasterize_glyph_ex: { ctx, fontId, scalar, styleFlags, outBitmap in
+                guard let ctx, let outBitmap else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.rasterizeOnly(fontId: fontId, scalar: scalar, styleFlags: styleFlags,
+                                           corePtr: me.core, outBitmap: outBitmap) ? 1 : 0
+            },
+            on_rasterize_glyph_by_id_ex: { ctx, fontId, glyphID, styleFlags, outBitmap in
+                guard let ctx, let outBitmap else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.sharedAtlas else { return 0 }
+                return atlas.rasterizeByGlyphID(fontId: fontId, glyphID: glyphID, styleFlags: styleFlags,
+                                                outBitmap: outBitmap) ? 1 : 0
             }
         )
 
@@ -2995,10 +3055,44 @@ final class ZonvieCore {
         zonvie_core_resize(core, rows, cols)
     }
 
+    /// The font a grid is drawn in when it is not the global one.
+    func gridCellPx(_ gridId: Int64) -> GridFontPx? {
+        sharedResources?.gridFont(gridId)
+    }
+
+    /// on_font_slot_load: the first available candidate of `payload` (the
+    /// guifont list format; empty = the global font), sizes defaulting to the
+    /// global font's. Core thread; loads synchronously.
+    fileprivate func loadFontSlot(fontId: UInt32, payload: String, scale: CGFloat) -> (cellWidthPx: UInt32, cellHeightPx: UInt32)? {
+        guard let shared = sharedResources else { return nil }
+        var face: (name: String, pointSize: CGFloat, features: String)? = nil
+        if !payload.isEmpty {
+            let defaultSize = Double(shared.atlas.currentPointSize)
+            for line in payload.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let parsed = Self.parseFontCandidate(String(line), defaultSize: defaultSize, sizeExplicit: false) else { continue }
+                // CTFontCreateWithName substitutes a missing family silently.
+                if Self.isFontAvailable(parsed.name) {
+                    face = (parsed.name, CGFloat(parsed.size), parsed.features)
+                    break
+                }
+            }
+            guard face != nil else {
+                Self.appLog("[font_slot] font_id=\(fontId) no available font in '\(payload)'")
+                return nil
+            }
+        }
+        return shared.atlas.loadSlot(fontId: fontId, face: face, scale: scale, lineSpacePx: shared.lineSpacePx)
+    }
+
     /// Request resize of a specific grid (for external windows).
     func tryResizeGrid(gridId: Int64, rows: UInt32, cols: UInt32) {
         guard let core else { return }
         zonvie_core_try_resize_grid(core, gridId, rows, cols)
+    }
+
+    func externalResizeOutstanding(gridId: Int64, rows: UInt32, cols: UInt32) -> Bool {
+        guard let core else { return false }
+        return zonvie_core_external_resize_outstanding(core, gridId, rows, cols) != 0
     }
 
     func updateLayoutPx(drawableW: UInt32, drawableH: UInt32, cellW: UInt32, cellH: UInt32) {
@@ -4031,6 +4125,13 @@ final class ZonvieCore {
     /// Main thread only (touches NSWindow), and grid_mu must NOT be held —
     /// setFrame can trigger windowDidResize synchronously. No-op when the window
     /// already holds the target size, so steady-state user resizes are safe.
+    /// A user drag leaves `clientPx % cellPx` uncovered just as a cell change
+    /// does, so the end of a live resize snaps too. maybeResizeCoreGrid has
+    /// already taken the dragged size as desiredTermPx. Main thread only.
+    func snapMainWindowAfterLiveResize() {
+        snapMainWindowContentToCell()
+    }
+
     private func snapMainWindowContentToCell() {
         guard let view = terminalView else { return }
         guard let window = view.window else { return }
@@ -4740,21 +4841,35 @@ final class ZonvieCore {
             let widthPx = contentSize.width * scale
             let heightPx = contentSize.height * scale
 
-            let cols = UInt32(widthPx / cellWidthPx)
-            let rows = UInt32(heightPx / cellHeightPx)
+            // A grid in its own font counts its rows and columns in that font.
+            let gf = core.gridCellPx(gridId)
+            let cols = UInt32(widthPx / (gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx))
+            let rows = UInt32(heightPx / (gf.map { CGFloat($0.cellHeightPx) } ?? cellHeightPx))
 
             ZonvieCore.appLog("[external_window] windowDidResize gridId=\(gridId) contentSize=\(contentSize) scale=\(scale) cellH=\(cellHeightPx) cellW=\(cellWidthPx) heightPx=\(heightPx) widthPx=\(widthPx) rows=\(rows) cols=\(cols) lastGridRows=\(lastGridRows) lastGridCols=\(lastGridCols) suppress=\(suppressResizeCallback)")
 
             // Skip if rows/cols match the last programmatic resize (from grid_resize).
             // windowDidResize can fire asynchronously after suppressResizeCallback
             // is cleared, so this check prevents overriding Neovim's grid dimensions.
-            if rows == lastGridRows && cols == lastGridCols { return }
+            // While another size is out Neovim will end at that one, not at
+            // lastGridRows/Cols, so even a size equal to the last grid must
+            // be sent: the core queues it behind the one out.
+            if rows == lastGridRows && cols == lastGridCols && !resizeOutstanding(rows: rows, cols: cols) {
+                return
+            }
 
-            // Only resize if we have valid dimensions
+            // Only resize if we have valid dimensions. The core keeps one
+            // request out per window and sends the newest on each answer.
             if rows > 0 && cols > 0 {
                 ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(rows) cols=\(cols)")
                 core.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
             }
+        }
+
+        /// The window is at a user size other than `rows` x `cols` that Neovim
+        /// has not answered yet (zonvie_core_external_resize_outstanding).
+        func resizeOutstanding(rows: UInt32, cols: UInt32) -> Bool {
+            core?.externalResizeOutstanding(gridId: gridId, rows: rows, cols: cols) ?? false
         }
 
         func windowDidEndLiveResize(_ notification: Notification) {
@@ -4822,15 +4937,28 @@ final class ZonvieCore {
                 // surface's rows for the new metrics (invalidate_glyph_cache),
                 // as Windows relies on. Asking Neovim for rows+1 then rows made
                 // every window grow a row and shrink, with two WinResized.
+                let content = Self.externalContentPx(rows: rows, cols: cols, font: self.gridCellPx(gridId),
+                                                     cellW: cellWidthPx, cellH: cellHeightPx)
                 self.frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                         rows: rows, cols: cols, cellW: cellWidthPx, cellH: cellHeightPx,
+                                         widthPx: content.width, heightPx: content.height,
                                          applyAnchors: false)
                 ZonvieCore.appLog("[resizeExternalWindows] gridId=\(gridId) rows=\(rows) cols=\(cols)")
             }
         }
     }
 
-    /// Size a regular external window to `rows x cols` of `cellW x cellH`
+    /// A regular external window's content in pixels. A grid in its own font
+    /// fills the core's extent, its frame; the rest is `rows x cols` cells.
+    private static func externalContentPx(rows: UInt32, cols: UInt32, font: GridFontPx?,
+                                          cellW: CGFloat, cellH: CGFloat) -> CGSize {
+        // on_grid_font: a font grid's extent is its frame (zonvie_core.h).
+        if let f = font {
+            return CGSize(width: CGFloat(f.extentWidthPx), height: CGFloat(f.extentHeightPx))
+        }
+        return CGSize(width: CGFloat(cols) * cellW, height: CGFloat(rows) * cellH)
+    }
+
+    /// Size a regular external window's content to `widthPx x heightPx`
     /// pixels, in the window's own scale (the main window's put a window on a
     /// different-DPI screen at a size whose drawable no longer matched the
     /// viewport). The resize callback is suppressed across setFrame. Anchors:
@@ -4838,12 +4966,12 @@ final class ZonvieCore {
     /// bottom or right edge; a font change always keeps the top-left.
     private func frameExternalWindow(
         _ window: NSWindow, gridView: ExternalGridView, delegate: ExternalWindowDelegate,
-        rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat,
+        widthPx: CGFloat, heightPx: CGFloat,
         applyAnchors: Bool = true, display: Bool = false
     ) {
         let scale = window.backingScaleFactor
-        let contentWidth = CGFloat(cols) * cellW / scale
-        let contentHeight = CGFloat(rows) * cellH / scale
+        let contentWidth = widthPx / scale
+        let contentHeight = heightPx / scale
         delegate.suppressResizeCallback = true
         let oldFrame = window.frame
         let anchorsApply = applyAnchors && (window.inLiveResize || delegate.anchorsDescribeCurrentGesture)
@@ -5290,7 +5418,8 @@ final class ZonvieCore {
         gridId: Int64,
         gridView: ExternalGridView,
         rows: UInt32,
-        cols: UInt32
+        cols: UInt32,
+        font: GridFontPx?
     ) {
         precondition(Thread.isMainThread, "configureExternalGridFromRow must be called on the main thread")
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) rows=\(rows) cols=\(cols)")
@@ -5309,19 +5438,23 @@ final class ZonvieCore {
             gridView: gridView,
             bgColor: nil,
             rows: rows,
-            cols: cols
+            cols: cols,
+            font: font
         )
     }
 
     /// Apply background color and layout configuration to an external grid.
     /// Called from configureExternalGridFromRow (normal path) and onExternalWindow (pending config path).
+    /// `font` is the font the grid's rows were drawn in, when the caller
+    /// knows it; omitted, the committed table answers.
     private func applyExternalGridConfig(
         gridId: Int64,
         window: NSWindow,
         gridView: ExternalGridView,
         bgColor: NSColor?,
         rows: UInt32,
-        cols: UInt32
+        cols: UInt32,
+        font: GridFontPx?? = nil
     ) {
         if classifyExternalGridKind(gridId) != .normal {
             updateDecoratedExternalGrid(
@@ -5335,8 +5468,11 @@ final class ZonvieCore {
         }
 
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
-        let cellW = CGFloat(renderer.cellWidthPx)
-        let cellH = CGFloat(renderer.cellHeightPx)
+        // A grid in its own font is framed in that font's cells.
+        let gf = font ?? gridCellPx(gridId)
+        let content = Self.externalContentPx(rows: rows, cols: cols, font: gf,
+                                             cellW: CGFloat(renderer.cellWidthPx),
+                                             cellH: CGFloat(renderer.cellHeightPx))
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
         // Resize the OS window to match the grid size. Integer row/col counts
         // on the delegate, not the frame, so floating-point drift cannot
@@ -5348,9 +5484,26 @@ final class ZonvieCore {
             // tryResizeGrid with stale window dimensions.
             delegate.lastGridRows = rows
             delegate.lastGridCols = cols
-            frameExternalWindow(window, gridView: gridView, delegate: delegate,
-                                rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
+            // A superseded answer is not framed; the newer size is out, and
+            // its answer frames the window.
+            if !delegate.resizeOutstanding(rows: rows, cols: cols) {
+                frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                    widthPx: content.width, heightPx: content.height, display: true)
+            }
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
+        } else if gf != nil, let delegate = window.delegate as? ExternalWindowDelegate, !window.inLiveResize {
+            // Same counts, other pixels: a font change the grid kept its
+            // size through. Every surface is redrawn then, row 0 included.
+            // The core's lock is taken only once the pixels differ: this
+            // branch runs on every row-0 update of a font grid.
+            let scale = window.backingScaleFactor
+            let current = gridView.frame.size
+            if abs(current.width * scale - content.width) >= 1 || abs(current.height * scale - content.height) >= 1,
+               !delegate.resizeOutstanding(rows: rows, cols: cols) {
+                frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                    widthPx: content.width, heightPx: content.height,
+                                    applyAnchors: false, display: true)
+            }
         }
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).
@@ -7208,6 +7361,7 @@ final class ZonvieCore {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=destroy_release grid=\(gridId)")
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
         terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
+        sharedResources?.dropGridFont(gridId)
         externalGridViewsLock.lock()
         gridSurfaceOwners.removeValue(forKey: gridId)
         let hosts = externalGridViews.filter { $0.key != gridId }.map { $0.value }

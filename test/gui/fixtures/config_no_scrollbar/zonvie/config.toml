@@ -1,0 +1,4 @@
+# The scrollbar takes a press on a window's right edge for itself, so a
+# scenario about which cell a click there names runs without it.
+[scrollbar]
+enabled = false

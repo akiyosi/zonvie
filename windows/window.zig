@@ -1490,6 +1490,12 @@ fn makeCoreCbs() core.Callbacks {
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,
         .on_callback_error = callbacks.onCallbackError,
+        .on_font_slot_load = callbacks.onFontSlotLoad,
+        .on_font_slot_release = callbacks.onFontSlotRelease,
+        .on_grid_font = callbacks.onGridFont,
+        .on_shape_text_run_ex = callbacks.onShapeTextRunEx,
+        .on_rasterize_glyph_ex = callbacks.onRasterizeGlyphEx,
+        .on_rasterize_glyph_by_id_ex = callbacks.onRasterizeGlyphByIdEx,
     };
 }
 
@@ -2577,6 +2583,8 @@ fn planMainCursor(app: *App, in: MainFrameInputs, geom: MainContentGeom) MainCur
                 .{ cb.left, cb.bottom, cb.width(), cb.height() },
                 cursor_verts_snapshot[0].color,
             );
+            const cell = app_mod.layerCellPx(tbs_snapshot.layers.slice(), tbs_snapshot.cursor_layer_grid_id, 0, 0);
+            r_sh.shader_cursor_cell_px = .{ @intCast(cell[0]), @intCast(cell[1]) };
         }
     }
 
@@ -2825,7 +2833,7 @@ fn drawMainRowFrame(
         geom.content_y_offset_i32,
         geom.content_right_i32,
         cursor.layer_origin_px[1],
-        row_h_px,
+        app_mod.layerCellPx(tbs_snapshot.layers.slice(), cursor.grid, 0, row_h_px)[1],
         client.right,
         client.bottom,
     );

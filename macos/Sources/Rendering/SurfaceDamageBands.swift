@@ -24,7 +24,8 @@ final class SurfaceDamageBands {
     func addPlacementChanges(_ frames: [SurfaceLayerFrame], rowHeightPx: Int) {
         func placement(_ layer: SurfaceLayer) -> (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int) {
             let top = Int(layer.originPx.y.rounded(.down))
-            return (layer.gridId, top, top + layer.rows * rowHeightPx, Int(layer.originPx.x.rounded(.down)), layer.cols)
+            let bottom = top + layer.drawHeightPx(rows: layer.rows, surfaceCellHeightPx: rowHeightPx)
+            return (layer.gridId, top, bottom, Int(layer.originPx.x.rounded(.down)), layer.cols)
         }
         func same(_ a: (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int),
                   _ b: (gridId: Int64, topPx: Int, bottomPx: Int, leftPx: Int, cols: Int)) -> Bool {
@@ -81,6 +82,40 @@ final class SurfaceDamageBands {
             guard let r = Self.rows(in: band, originYPx: originYPx, rowCount: rowCount, rowHeightPx: rowHeightPx) else { continue }
             rows.append(contentsOf: r)
         }
+    }
+
+    /// `layerRows` for a layer that may be drawn in its own font.
+    func layerRows(_ layer: SurfaceLayer, originYPx: Int, rowCount: Int, surfaceCellHeightPx: Int, into rows: inout [Int]) {
+        guard layer.cellHeightPx > 0 else {
+            layerRows(originYPx: originYPx, rowCount: rowCount, rowHeightPx: surfaceCellHeightPx, into: &rows)
+            return
+        }
+        rows.removeAll(keepingCapacity: true)
+        for band in bands {
+            guard let r = Self.rows(in: band, layer: layer, originYPx: originYPx, rowCount: rowCount,
+                                    surfaceCellHeightPx: surfaceCellHeightPx) else { continue }
+            if let prev = rows.last, prev >= r.lowerBound {
+                // A margin band repeats the last row the band above it drew.
+                if r.upperBound > prev { rows.append(contentsOf: (prev + 1)...r.upperBound) }
+                continue
+            }
+            rows.append(contentsOf: r)
+        }
+    }
+
+    /// The rows of `layer` one band repaints, in the layer's own row height.
+    /// The bottom margin of a font grid is drawn with its last row, so a band
+    /// that reaches only the margin still repaints that row.
+    static func rows(in band: zonvie_damage_band, layer: SurfaceLayer, originYPx: Int, rowCount: Int,
+                     surfaceCellHeightPx: Int) -> ClosedRange<Int>? {
+        let rowHeightPx = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHeightPx)
+        let r = rows(in: band, originYPx: originYPx, rowCount: rowCount, rowHeightPx: rowHeightPx)
+        let rowsBottomPx = originYPx + rowCount * rowHeightPx
+        let layerBottomPx = originYPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: surfaceCellHeightPx)
+        guard rowCount > 0, layerBottomPx > rowsBottomPx,
+              Int(band.top_px) < layerBottomPx, Int(band.bottom_px) > rowsBottomPx else { return r }
+        let last = rowCount - 1
+        return r.map { min($0.lowerBound, last)...last } ?? last...last
     }
 
     /// The rows of a layer at `originYPx` one band repaints.

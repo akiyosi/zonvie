@@ -429,12 +429,18 @@ final class ScrollRetention {
     /// surface displaces: an external surface asked it of its root only, so a
     /// float it hosts stretched its edge row over the rows it had retained.
     func releaseCoveredPins(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], cellHeightNDC: Float) {
+        releaseCoveredPins(&offsets) { _ in cellHeightNDC }
+    }
+
+    /// `cellHeightNDC` answers per grid: a grid drawn in its own font has
+    /// its band measured in its own row height.
+    func releaseCoveredPins(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], cellHeightNDC: (Int32) -> Float) {
         for i in offsets.indices {
             let retained = publishedCount(gridId: Int64(offsets[i].grid_id))
             if retained > 0, Self.coversBand(
                 retainedRows: retained,
                 offsetNDC: offsets[i].offset_y,
-                cellHeightNDC: cellHeightNDC
+                cellHeightNDC: cellHeightNDC(offsets[i].grid_id)
             ) {
                 offsets[i].pin_edges = 0
             }
@@ -445,20 +451,6 @@ final class ScrollRetention {
         lock.lock()
         defer { lock.unlock() }
         return published.reduce(0) { $0 + ($1.gridId == gridId ? 1 : 0) }
-    }
-
-    /// Drop everything on screen: a retained row is only meaningful while its
-    /// grid is displaced.
-    ///
-    /// Deliberately leaves the STAGED set alone. Called from the draw side
-    /// while the core thread may be mid-bracket, and discarding its staged rows
-    /// would make `commit()` report that nothing was staged — dropping the step
-    /// and with it the caller's per-step state (the main surface's ease seed),
-    /// so the picture snaps instead of easing.
-    func clearPublished() {
-        lock.lock()
-        published.removeAll(keepingCapacity: true)
-        lock.unlock()
     }
 
     // MARK: - Planning
@@ -1164,6 +1156,28 @@ struct SurfaceLayer {
     /// A floating window (Neovim zindex > 0), not a split; `z` is the paint
     /// rank and is > 0 for both.
     var isFloat: Bool = false
+    /// A grid drawn in its own font (on_grid_font): its cell and the pixel
+    /// box the core clips it to, margin included. 0 = the surface's cell.
+    var cellWidthPx: Int = 0
+    var cellHeightPx: Int = 0
+    var extentWidthPx: Int = 0
+    var extentHeightPx: Int = 0
+
+    func rowHeightPx(surfaceCellHeightPx: Int) -> Int {
+        cellHeightPx > 0 ? cellHeightPx : surfaceCellHeightPx
+    }
+
+    func drawWidthPx(surfaceCellWidthPx: Int) -> Int {
+        extentWidthPx > 0 ? extentWidthPx : cols * surfaceCellWidthPx
+    }
+
+    /// The first `rows` rows; all of them reach the extent, whose bottom
+    /// margin the core emits with the last row.
+    func drawHeightPx(rows n: Int, surfaceCellHeightPx: Int) -> Int {
+        let h = n * rowHeightPx(surfaceCellHeightPx: surfaceCellHeightPx)
+        guard extentHeightPx > 0 else { return h }
+        return n >= rows ? extentHeightPx : min(h, extentHeightPx)
+    }
 }
 
 /// One published cursor, and the buffers the frames reading it need.
@@ -1338,10 +1352,8 @@ func surfaceLayerScissorPadY(topPx: Float) -> Int {
 func makeSurfaceLayerScissor(
     originPx: simd_float2,
     viewportOriginPx: simd_float2 = simd_float2(0, 0),
-    cols: Int,
-    rows: Int,
-    cellWidthPx: Int,
-    cellHeightPx: Int,
+    widthPx: Int,
+    heightPx: Int,
     scale: Float = 1,
     targetWidth: Int,
     targetHeight: Int
@@ -1350,8 +1362,8 @@ func makeSurfaceLayerScissor(
     return clampScissor(
         x: Int(((viewportOriginPx.x + originPx.x) * scale).rounded(.down)),
         y: Int(topPx.rounded(.down)),
-        width: Int(Float(cols * cellWidthPx) * scale),
-        height: Int(Float(rows * cellHeightPx) * scale) + surfaceLayerScissorPadY(topPx: topPx),
+        width: Int(Float(widthPx) * scale),
+        height: Int(Float(heightPx) * scale) + surfaceLayerScissorPadY(topPx: topPx),
         targetWidth: targetWidth,
         targetHeight: targetHeight
     )
@@ -3269,54 +3281,9 @@ struct HorizontalScrollAccumulator {
     }
 }
 
-/// The rows of a grid a pixel may be mapped into, and the band of them the
-/// sub-row ease actually moves.
-struct GridRowBand: Equatable {
-    var startRow: Int32
-    var rows: Int32
-    var marginTop: Int32
-    var marginBottom: Int32
-}
-
-/// The grid-local row a pixel names, with the sub-row ease undone only where
-/// the ease moved that pixel.
-///
-/// Content rows carry DECO_SCROLLABLE and the shader displaces them by the
-/// grid's scroll offset. Margin rows — a winbar, a border, the fixed bands a
-/// float keeps — do not (Shaders.metal), so the shader left them where they
-/// statically belong while the content eased past them. Undoing an ease such a
-/// row never took names a content row for a pixel the user clicked on a margin:
-/// measured at marginTop=1, cell 20px, offset -20px, y=10px giving row 1
-/// instead of 0.
-///
-/// Both rows have to be content rows — the drawn one because that is where the
-/// pixel is, the adjusted one because that is where the answer would land.
-///
-/// One function because there were two: `hitTestGrid` carried this rule and the
-/// drag path applied the offset with no band check at all, so a press and the
-/// drag that followed it disagreed about the same pixel.
-func scrollAdjustedLocalRow(
-    pointPxY: CGFloat,
-    cellHeightPx: CGFloat,
-    band: GridRowBand,
-    scrollOffsetPx: CGFloat
-) -> Int32 {
-    guard cellHeightPx > 0 else { return 0 }
-    // Floored: a point above the grid is a negative row, not row 0.
-    let drawnLocal = Int32((pointPxY / cellHeightPx).rounded(.down)) - band.startRow
-    guard abs(scrollOffsetPx) > 0.001 else { return drawnLocal }
-    let adjustedLocal = Int32(((pointPxY - scrollOffsetPx) / cellHeightPx).rounded(.down)) - band.startRow
-    let contentTop = band.marginTop
-    let contentBottom = band.rows - band.marginBottom
-    guard drawnLocal >= contentTop, drawnLocal < contentBottom,
-          adjustedLocal >= contentTop, adjustedLocal < contentBottom
-    else { return drawnLocal }
-    return adjustedLocal
-}
-
 /// Where a press lands among floats that follow their anchor, which are drawn
 /// displaced bodily (the anchor's offset plus their debt) and have no offset
-/// of their own for `scrollAdjustedLocalRow` to undo.
+/// of their own for the ease rule (the core's cellInGridEased) to undo.
 ///
 /// Each follower is tested where it is drawn: the pixel is moved back by its
 /// displacement and the core's resolver, with every other grid left out, is
@@ -3755,6 +3722,12 @@ final class SurfaceFixedFloatMask {
         return false
     }
 
+    /// A layer's bottom-right corner; a grid in its own font ends at its extent.
+    static func layerEnd(_ l: SurfaceLayer, cellW: Float, cellH: Float) -> (x1: Float, y1: Float) {
+        (l.originPx.x + (l.extentWidthPx > 0 ? Float(l.extentWidthPx) : Float(l.cols) * cellW),
+         l.originPx.y + (l.extentHeightPx > 0 ? Float(l.extentHeightPx) : Float(l.rows) * cellH))
+    }
+
     /// Whether a fixed float at `rect` can receive a scrolled fragment at
     /// all: the fragment shader clips scrolled content to its own grid's
     /// rectangle (`content_top_y`/`content_bottom_y`), so a float that meets
@@ -3774,8 +3747,7 @@ final class SurfaceFixedFloatMask {
             // it reaches nothing; a placed one reaches its own rectangle.
             guard let entry = layers.first(where: { $0.layer.gridId == gridId }) else { continue }
             let l = entry.layer
-            let x1 = l.originPx.x + Float(l.cols) * cellW
-            let y1 = l.originPx.y + Float(l.rows) * cellH
+            let (x1, y1) = Self.layerEnd(l, cellW: cellW, cellH: cellH)
             if l.originPx.x < rect.x1 && x1 > rect.x0 && l.originPx.y < rect.bottom && y1 > rect.top {
                 return true
             }
@@ -3801,11 +3773,12 @@ final class SurfaceFixedFloatMask {
         if smoothScrolling {
             for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) {
                 let layer = entry.layer
+                let (x1, y1) = Self.layerEnd(layer, cellW: cellW, cellH: cellH)
                 let rect = GridSurfaceRenderer.FixedFloatRect(
                     x0: layer.originPx.x,
-                    x1: layer.originPx.x + Float(layer.cols) * cellW,
+                    x1: x1,
                     top: layer.originPx.y,
-                    bottom: layer.originPx.y + Float(layer.rows) * cellH,
+                    bottom: y1,
                     zindex: Int32(clamping: layer.z)
                 )
                 if !rootScrolled && !Self.reachable(rect, offsets: offsets, layers: layers, rootGridId: rootGridId, cellW: cellW, cellH: cellH) {
@@ -4032,6 +4005,9 @@ func encodeSurfaceBloomPasses(
     else { return false }
 
     intensityBuf.contents().storeBytes(of: intensity, as: Float.self)
+    // The glow chain is planned over the back buffer's whole allocated
+    // extent, so its passes sample every texture whole.
+    var fullUVScale = SIMD2<Float>(1, 1)
 
     let halfW = max(1, Int(viewportSize.width / 2.0))
     let halfH = max(1, Int(viewportSize.height / 2.0))
@@ -4078,6 +4054,7 @@ func encodeSurfaceBloomPasses(
                                          width: Double(pass.dstWidthPx), height: Double(pass.dstHeightPx),
                                          znear: 0, zfar: 1))
             enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+            enc.setVertexBytes(&fullUVScale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
             enc.setFragmentTexture(srcTex, index: 0)
             enc.setFragmentSamplerState(bilinearSampler, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
@@ -4096,6 +4073,7 @@ func encodeSurfaceBloomPasses(
     // No explicit viewport: default = full backBuffer so blur bleed
     // extends naturally into margin areas beyond the grid viewport.
     compositeEnc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+    compositeEnc.setVertexBytes(&fullUVScale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
     compositeEnc.setFragmentTexture(extractTex, index: 0)
     compositeEnc.setFragmentSamplerState(bilinearSampler, index: 0)
     compositeEnc.setFragmentBuffer(intensityBuf, offset: 0, index: 0)
@@ -4143,12 +4121,15 @@ func accumulateSurfaceLayerPlacementTravel(
     staged: [SurfaceLayer],
     committed: [SurfaceLayer],
     rootGridId: Int64,
-    cellHeightPx: Float,
+    rowHeightPx: (Int64) -> Float,
     into rowsUp: inout [Int64: Int]
 ) {
-    guard cellHeightPx > 0 else { return }
     for layer in staged where layer.gridId != rootGridId {
         guard let previous = committed.first(where: { $0.gridId == layer.gridId }) else { continue }
+        // Counted in the ANCHOR's rows, as its compensation is: a font grid's
+        // rows are not the global cell height.
+        let cellHeightPx = rowHeightPx(layer.anchorGrid)
+        guard cellHeightPx > 0 else { continue }
         let travelled = Int(((previous.originPx.y - layer.originPx.y) / cellHeightPx).rounded())
         if travelled != 0 { rowsUp[layer.gridId, default: 0] += travelled }
     }
@@ -4434,6 +4415,8 @@ func encodeSurfaceDrawableCopy(
     pipeline: MTLRenderPipelineState,
     copyVertexBuffer: MTLBuffer,
     sampler: MTLSamplerState,
+    /// `input`'s defined region, which `output` covers exactly.
+    uvScale: SIMD2<Float>,
     prepare: (MTLRenderPassDescriptor) -> Void
 ) -> Bool {
     let rpd = MTLRenderPassDescriptor()
@@ -4444,6 +4427,8 @@ func encodeSurfaceDrawableCopy(
     guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
     enc.setRenderPipelineState(pipeline)
     enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+    var scale = uvScale
+    enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
     enc.setFragmentTexture(input, index: 0)
     enc.setFragmentSamplerState(sampler, index: 0)
     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
@@ -4587,6 +4572,40 @@ func makeSurfaceTextureDescriptor(
     return desc
 }
 
+/// The allocated extent of a surface's back buffer for a drawable of
+/// `logicalSize`. Every other off-screen texture a surface owns is sized from
+/// the back buffer's allocated extent, so this is the one capacity rule.
+///
+/// During a live resize the capacity only grows, with 25% headroom per axis, so
+/// a drag allocates a handful of textures instead of one set per size tick
+/// (each is an IOAccelerator resource). Outside a live resize it is the exact
+/// size, which is also how a drag's slack is given back: the first draw after
+/// the drag ends reallocates once at the final size. While capacity exceeds
+/// the logical size, only the top-left logical region is defined and every
+/// pass that samples these textures with normalized UVs scales them by
+/// `surfaceUVScale`.
+func surfaceTextureCapacity(current: MTLTexture?, logicalSize: CGSize, inLiveResize: Bool) -> (widthPx: Int, heightPx: Int) {
+    let wantW = max(1, Int(logicalSize.width))
+    let wantH = max(1, Int(logicalSize.height))
+    guard inLiveResize, let current else { return (wantW, wantH) }
+    if wantW <= current.width, wantH <= current.height { return (current.width, current.height) }
+    // 16384 is the 2D texture limit of every Mac GPU this app runs on.
+    let maxPx = 16384
+    func grow(_ want: Int, _ have: Int) -> Int {
+        want <= have ? have : max(want, min(maxPx, have + have / 4))
+    }
+    return (grow(wantW, current.width), grow(wantH, current.height))
+}
+
+/// Normalized-UV scale that maps a full-target quad onto the defined
+/// `logicalSize` region of a texture of `capacity` extent.
+func surfaceUVScale(logicalSize: CGSize, capacity: MTLTexture) -> SIMD2<Float> {
+    SIMD2<Float>(
+        Float(max(1, Int(logicalSize.width))) / Float(capacity.width),
+        Float(max(1, Int(logicalSize.height))) / Float(capacity.height)
+    )
+}
+
 /// The off-screen texture pair a multi-pass custom shader chain ping-pongs
 /// between. Both surfaces size it from their own drawable, so the pair lives
 /// with this holder rather than being restated per surface class.
@@ -4678,6 +4697,8 @@ final class SurfaceScrollScratchTexture {
         size = .zero
     }
 
+    /// `drawableSize` is the back buffer's allocated extent: a blit may span
+    /// all of it.
     func ensure(device: MTLDevice, drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if texture != nil, size == drawableSize { return }
         // `.shaderRead` alone, matching the descriptor default this used to

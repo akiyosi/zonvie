@@ -256,6 +256,89 @@ pub const Renderer = struct {
     // Invalidated on font/DPI/device changes.
     gsub_cache: [4]GsubCacheEntry = [_]GsubCacheEntry{.{}} ** 4,
 
+    /// Per-grid font faces by font_id (on_font_slot_load); slot 0 is the
+    /// global font above and stays null.
+    slot_faces: [MAX_FONT_SLOTS]?FaceSet = [_]?FaceSet{null} ** MAX_FONT_SLOTS,
+
+    pub const MAX_FONT_SLOTS = core.font_slots.max_slots;
+
+    /// The font-dependent fields one shaping or raster call reads. A per-grid
+    /// font is drawn by swapping its set in under `mu` and back out after, so
+    /// the lazily filled ones (styled faces, colour tables, emoji size) land
+    /// in the set they were computed for.
+    pub const FaceSet = struct {
+        text_format: ?*c.IDWriteTextFormat = null,
+        font_face: ?*c.IDWriteFontFace = null,
+        bold_font_face: ?*c.IDWriteFontFace = null,
+        italic_font_face: ?*c.IDWriteFontFace = null,
+        bold_italic_font_face: ?*c.IDWriteFontFace = null,
+        styled_fonts_initialized: bool = false,
+        has_color_tables: ?bool = null,
+        font_em_size: f32 = 0,
+        emoji_font_size: f32 = 0,
+        emoji_text_format: ?*c.IDWriteTextFormat = null,
+        ascent_px: f32 = 0,
+        descent_px: f32 = 0,
+        cell_w_px: u32 = 0,
+        cell_h_px: u32 = 0,
+        font_name: [64]u16 = [_]u16{0} ** 64,
+        base_face_varied: bool = false,
+        font_features: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = std.mem.zeroes([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE),
+        font_feature_count: u32 = 0,
+        font_axis_values: [MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = std.mem.zeroes([MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE),
+        font_axis_count: u32 = 0,
+    };
+
+    fn swapFaceSet(self: *Renderer, set: *FaceSet) void {
+        std.mem.swap(?*c.IDWriteTextFormat, &self.text_format, &set.text_format);
+        std.mem.swap(?*c.IDWriteFontFace, &self.font_face, &set.font_face);
+        std.mem.swap(?*c.IDWriteFontFace, &self.bold_font_face, &set.bold_font_face);
+        std.mem.swap(?*c.IDWriteFontFace, &self.italic_font_face, &set.italic_font_face);
+        std.mem.swap(?*c.IDWriteFontFace, &self.bold_italic_font_face, &set.bold_italic_font_face);
+        std.mem.swap(bool, &self.styled_fonts_initialized, &set.styled_fonts_initialized);
+        std.mem.swap(?bool, &self.has_color_tables, &set.has_color_tables);
+        std.mem.swap(f32, &self.font_em_size, &set.font_em_size);
+        std.mem.swap(f32, &self.emoji_font_size, &set.emoji_font_size);
+        std.mem.swap(?*c.IDWriteTextFormat, &self.emoji_text_format, &set.emoji_text_format);
+        std.mem.swap(f32, &self.ascent_px, &set.ascent_px);
+        std.mem.swap(f32, &self.descent_px, &set.descent_px);
+        std.mem.swap(u32, &self.cell_w_px, &set.cell_w_px);
+        std.mem.swap(u32, &self.cell_h_px, &set.cell_h_px);
+        std.mem.swap([64]u16, &self.font_name, &set.font_name);
+        std.mem.swap(bool, &self.base_face_varied, &set.base_face_varied);
+        std.mem.swap([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE, &self.font_features, &set.font_features);
+        std.mem.swap(u32, &self.font_feature_count, &set.font_feature_count);
+        std.mem.swap([MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE, &self.font_axis_values, &set.font_axis_values);
+        std.mem.swap(u32, &self.font_axis_count, &set.font_axis_count);
+    }
+
+    fn releaseFaceSet(s: *FaceSet) void {
+        safeRelease(s.text_format);
+        safeRelease(s.font_face);
+        safeRelease(s.bold_font_face);
+        safeRelease(s.italic_font_face);
+        safeRelease(s.bold_italic_font_face);
+        safeRelease(s.emoji_text_format);
+        s.* = .{};
+    }
+
+    /// The loaded slot for a non-zero font_id. Caller holds mu.
+    fn slotFaceSet(self: *Renderer, font_id: u32) ?*FaceSet {
+        if (font_id == 0 or font_id >= self.slot_faces.len) return null;
+        if (self.slot_faces[font_id]) |*set| return set;
+        return null;
+    }
+
+    pub const OverlayFace = struct { font_name: [64]u16, em_size: f32, cell_h_px: u32 };
+
+    /// The face text drawn over a grid in `font_id` outside the atlas (the
+    /// IME overlay) is set in: the slot's, else the global font's. Caller
+    /// holds mu.
+    pub fn overlayFaceLocked(self: *Renderer, font_id: u32) OverlayFace {
+        if (self.slotFaceSet(font_id)) |s| return .{ .font_name = s.font_name, .em_size = s.font_em_size, .cell_h_px = s.cell_h_px };
+        return .{ .font_name = self.font_name, .em_size = self.font_em_size, .cell_h_px = self.cell_h_px };
+    }
+
     /// Phase 1 of two-phase init: creates D2D/DWrite factories, sets font, and
     /// computes cellW/cellH. Does NOT create the D2D render target (~30ms).
     /// Call initRenderTarget() to complete initialization before rendering.
@@ -525,6 +608,7 @@ pub const Renderer = struct {
         safeRelease(self.bold_font_face);
         safeRelease(self.italic_font_face);
         safeRelease(self.bold_italic_font_face);
+        for (&self.slot_faces) |*slot| if (slot.*) |*s| releaseFaceSet(s);
         safeRelease(self.rt);
         safeRelease(self.d2d_device_ctx);
         safeRelease(self.d2d_device);
@@ -1054,7 +1138,20 @@ pub const Renderer = struct {
     pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
+        return self.rasterizeScalarLocked(scalar, style_flags, corep, out_bitmap);
+    }
 
+    /// rasterizeGlyphOnly in a per-grid font (font_id != 0).
+    pub fn rasterizeScalarFont(self: *Renderer, font_id: u32, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        const set = self.slotFaceSet(font_id) orelse return error.NoFont;
+        self.swapFaceSet(set);
+        defer self.swapFaceSet(set);
+        return self.rasterizeScalarLocked(scalar, style_flags, corep, out_bitmap);
+    }
+
+    fn rasterizeScalarLocked(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
         var face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
 
         // scalar -> glyph_index (feature-aware via IDWriteTextAnalyzer when features set)
@@ -1390,40 +1487,8 @@ pub const Renderer = struct {
         const name_w = try utf8ToUtf16Alloc(self.alloc, name_utf8);
         defer self.alloc.free(name_w);
 
-        const factory = self.dwrite_factory orelse return error.NotInitialized;
-
-        // --- build new resources into locals first (transaction) ---
-        var new_fmt: ?*c.IDWriteTextFormat = null;
-        var new_face: ?*c.IDWriteFontFace = null;
-
-        // If we fail after creating something, release locals.
-        errdefer safeRelease(new_fmt);
-        errdefer safeRelease(new_face);
-
-        // CreateTextFormat (scaled for DPI)
-        new_fmt = createTextFormat(factory, @ptrCast(name_w.ptr), bold, italic, scaled_size) orelse
-            return error.DWriteCreateTextFormatFailed;
-
-        // Build font_face from system font collection using the same family name.
-        new_face = matchFontFace(factory, @ptrCast(name_w.ptr), bold, italic) orelse
-            return error.DWriteFontFaceNotFound;
-
-        // NOTE: Bold/Italic/Bold+Italic font variants are created eagerly
-        // via ensureStyledFontFaces() at the end of this function.
-
-        // Compute ascent/descent in pixels from design units.
-        var fm: c.DWRITE_FONT_METRICS = undefined;
-        const get_metrics_face_fn = new_face.?.lpVtbl.*.GetMetrics orelse return error.DWriteFontFaceMissingGetMetrics;
-        get_metrics_face_fn(new_face.?, &fm);
-
-        var new_ascent_px: f32 = 0.0;
-        var new_descent_px: f32 = 0.0;
-
-        const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
-        if (du_per_em > 0.0) {
-            new_ascent_px = scaled_size * (@as(f32, @floatFromInt(fm.ascent)) / du_per_em);
-            new_descent_px = scaled_size * (@as(f32, @floatFromInt(fm.descent)) / du_per_em);
-        }
+        // Built into a set first (transaction); self is touched only below.
+        const built = try self.buildFaceSetLocked(name_w, bold, italic, scaled_size);
 
         // --- commit (only here we touch self.*) ---
         safeRelease(self.text_format);
@@ -1432,16 +1497,14 @@ pub const Renderer = struct {
         safeRelease(self.italic_font_face);
         safeRelease(self.bold_italic_font_face);
 
-        self.text_format = new_fmt;
-        self.font_face = new_face;
+        self.text_format = built.text_format;
+        self.font_face = built.font_face;
         // Reset styled fonts (will be lazy-loaded on first use)
         self.bold_font_face = null;
         self.italic_font_face = null;
         self.bold_italic_font_face = null;
         self.styled_fonts_initialized = false;
         self.has_color_tables = null; // reset — new font may differ
-        new_fmt = null;
-        new_face = null;
 
         self.font_em_size = scaled_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
@@ -1450,13 +1513,11 @@ pub const Renderer = struct {
         self.base_point_size = point_size;
         self.base_bold = bold;
         self.base_italic = italic;
-        self.ascent_px = new_ascent_px;
-        self.descent_px = new_descent_px;
+        self.ascent_px = built.ascent_px;
+        self.descent_px = built.descent_px;
 
         // Store font name for IME overlay (copy up to 63 chars + null)
-        @memset(&self.font_name, 0);
-        const copy_len = @min(name_w.len, self.font_name.len - 1);
-        @memcpy(self.font_name[0..copy_len], name_w[0..copy_len]);
+        self.font_name = built.font_name;
 
         // Update font change tracking (UTF-8 name + generation counter)
         const utf8_copy_len = @min(name_utf8.len, self.font_name_utf8.len);
@@ -1484,6 +1545,95 @@ pub const Renderer = struct {
         // Eagerly create Bold/Italic/BoldItalic font faces now instead of deferring
         // to the first flush. Moves ~4ms of DWrite font matching out of the hot path.
         self.ensureStyledFontFaces();
+    }
+
+    /// The regular face, text format, vertical metrics and name of `name_w`
+    /// at `em_size_px`, built without touching self. Caller holds mu.
+    fn buildFaceSetLocked(self: *Renderer, name_w: [:0]const u16, bold: bool, italic: bool, em_size_px: f32) !FaceSet {
+        const factory = self.dwrite_factory orelse return error.NotInitialized;
+        var set: FaceSet = .{ .font_em_size = em_size_px };
+        errdefer releaseFaceSet(&set);
+
+        set.text_format = createTextFormat(factory, name_w.ptr, bold, italic, em_size_px) orelse
+            return error.DWriteCreateTextFormatFailed;
+        // The face from the system collection by the same family name.
+        set.font_face = matchFontFace(factory, name_w.ptr, bold, italic) orelse
+            return error.DWriteFontFaceNotFound;
+
+        // Ascent/descent in pixels from design units.
+        var fm: c.DWRITE_FONT_METRICS = undefined;
+        const get_metrics_face_fn = set.font_face.?.lpVtbl.*.GetMetrics orelse return error.DWriteFontFaceMissingGetMetrics;
+        get_metrics_face_fn(set.font_face.?, &fm);
+        const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
+        if (du_per_em > 0.0) {
+            set.ascent_px = em_size_px * (@as(f32, @floatFromInt(fm.ascent)) / du_per_em);
+            set.descent_px = em_size_px * (@as(f32, @floatFromInt(fm.descent)) / du_per_em);
+        }
+
+        // Copy up to 63 chars + null.
+        const copy_len = @min(name_w.len, set.font_name.len - 1);
+        @memcpy(set.font_name[0..copy_len], name_w[0..copy_len]);
+        return set;
+    }
+
+    /// on_font_slot_load: the first candidate of `payload` (the core's
+    /// "<name>\t<size>[\t<features>]" lines; an empty name or size is the
+    /// global font's) that loads, at its size times `scale`, as `font_id`'s
+    /// faces. Returns its cell, or null when none loads.
+    pub fn loadSlot(self: *Renderer, font_id: u32, payload: []const u8, scale: f32) ?struct { cell_w_px: u32, cell_h_px: u32 } {
+        if (font_id == 0 or font_id >= self.slot_faces.len) return null;
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        if (self.dwrite_factory == null) return null;
+
+        var lines = std.mem.splitScalar(u8, payload, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.splitScalar(u8, line, '\t');
+            const name = fields.next() orelse "";
+            const size_pt = std.fmt.parseFloat(f32, fields.next() orelse "") catch 0;
+            const features = fields.rest();
+            const use_name = if (name.len == 0) self.font_name_utf8[0..self.font_name_utf8_len] else name;
+            const use_pt = (if (size_pt > 0) size_pt else self.base_point_size) * scale;
+            if (use_name.len == 0 or !(use_pt > 0)) continue;
+
+            const name_w = utf8ToUtf16Alloc(self.alloc, use_name) catch continue;
+            defer self.alloc.free(name_w);
+            var set = self.buildFaceSetLocked(name_w, false, false, emSizePxForPointSize(self.dpi, use_pt)) catch continue;
+
+            // Its own features and axes, then measured, axis-varied and given
+            // its styled faces on the swapped-in set by the routines the
+            // global font uses.
+            self.swapFaceSet(&set);
+            if (features.len > 0) self.parseFontFeatures(features);
+            if (self.font_face) |face| {
+                self.font_face = self.withUserAxes(face);
+                self.base_face_varied = self.font_face != face;
+            }
+            const measured = if (self.recomputeCellMetrics()) |_| true else |_| false;
+            if (measured) self.ensureStyledFontFaces();
+            self.swapFaceSet(&set);
+            if (!measured or set.cell_w_px == 0 or set.cell_h_px == 0) {
+                releaseFaceSet(&set);
+                continue;
+            }
+
+            if (self.slot_faces[font_id]) |*old| releaseFaceSet(old);
+            self.slot_faces[font_id] = set;
+            // Keyed by face address, which a released face can hand on.
+            self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
+            return .{ .cell_w_px = set.cell_w_px, .cell_h_px = set.cell_h_px };
+        }
+        return null;
+    }
+
+    /// on_font_slot_release.
+    pub fn releaseSlot(self: *Renderer, font_id: u32) void {
+        if (font_id == 0 or font_id >= self.slot_faces.len) return;
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        if (self.slot_faces[font_id]) |*s| releaseFaceSet(s);
+        self.slot_faces[font_id] = null;
+        self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
     }
 
     /// Parse comma-separated features string into font_features array.
@@ -1875,7 +2025,45 @@ pub const Renderer = struct {
 
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
+        return self.shapeTextRunLocked(scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+    }
 
+    /// shapeTextRunDWrite in a per-grid font (font_id != 0).
+    pub fn shapeTextRunDWriteFont(
+        self: *Renderer,
+        font_id: u32,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        if (scalar_count == 0) return 0;
+
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        const set = self.slotFaceSet(font_id) orelse return 0;
+        self.swapFaceSet(set);
+        defer self.swapFaceSet(set);
+        return self.shapeTextRunLocked(scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+    }
+
+    fn shapeTextRunLocked(
+        self: *Renderer,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
         const face = self.selectFontFace(style_flags) orelse return 0;
 
         // Runs longer than the stack shaping buffers are shaped in chunks cut
@@ -2107,7 +2295,20 @@ pub const Renderer = struct {
     pub fn rasterizeGlyphByIdDWrite(self: *Renderer, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
+        return self.rasterizeGlyphByIdLocked(glyph_id, style_flags, out_bitmap);
+    }
 
+    /// rasterizeGlyphByIdDWrite in a per-grid font (font_id != 0).
+    pub fn rasterizeGlyphByIdDWriteFont(self: *Renderer, font_id: u32, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
+        const set = self.slotFaceSet(font_id) orelse return error.NoFont;
+        self.swapFaceSet(set);
+        defer self.swapFaceSet(set);
+        return self.rasterizeGlyphByIdLocked(glyph_id, style_flags, out_bitmap);
+    }
+
+    fn rasterizeGlyphByIdLocked(self: *Renderer, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
         const face = self.selectFontFace(style_flags) orelse return error.NoFont;
 
         // A colour font's empty ClearType bound cannot be rescued by the

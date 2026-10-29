@@ -142,8 +142,8 @@ func layerOverBlitRows(
         Int32(clamping: Int(layer.originPx.y.rounded(.down))),
         UInt32(clamping: layer.rows),
         UInt32(clamping: layer.cols),
-        Int32(clamping: cellWidthPx),
-        Int32(clamping: rowHeightPx),
+        Int32(clamping: layer.cellWidthPx > 0 ? layer.cellWidthPx : cellWidthPx),
+        Int32(clamping: layer.rowHeightPx(surfaceCellHeightPx: rowHeightPx)),
         &over
     ) else { return nil }
     return over
@@ -151,7 +151,8 @@ func layerOverBlitRows(
 
 extension GridSurfaceRenderer.ScrollOffsetInfo {
     /// One grid's entry, with its rows and margins from the core's grid info.
-    init(grid: ZonvieCore.GridInfo, offsetYPx: Float, gridTopYNDC: Float, zindex: Int32) {
+    init(grid: ZonvieCore.GridInfo, offsetYPx: Float, gridTopYNDC: Float, zindex: Int32,
+         rowHeightPx: Float = 0, extentHeightPx: Float = 0) {
         self.init(
             gridId: grid.gridId,
             offsetYPx: offsetYPx,
@@ -159,7 +160,9 @@ extension GridSurfaceRenderer.ScrollOffsetInfo {
             gridRows: grid.rows,
             marginTop: grid.marginTop,
             marginBottom: grid.marginBottom,
-            zindex: zindex
+            zindex: zindex,
+            rowHeightPx: rowHeightPx,
+            extentHeightPx: extentHeightPx
         )
     }
 }
@@ -448,8 +451,12 @@ func encodeSurfaceBackBufferToDrawable(
         // the NEXT frame can sample it as iPrevFrame, and a copy then moves it
         // onto the drawable. Frame 0 has nothing in the read slot yet; the
         // shader gets the current composite instead of uninitialized memory.
+        // Every texture the chain samples shares the back buffer's allocated
+        // extent, of which `pongSize` (the drawable) is the defined region.
+        let capacitySize = CGSize(width: backTex.width, height: backTex.height)
+        let uvScale = surfaceUVScale(logicalSize: pongSize, capacity: backTex)
         let feedback = editInputs?.feedback
-        feedback?.ensure(device: drawableTexture.device, size: pongSize, pixelFormat: drawableTexture.pixelFormat)
+        feedback?.ensure(device: drawableTexture.device, size: capacitySize, pixelFormat: drawableTexture.pixelFormat)
         let feedbackWrite = feedback?.write
         let prevFrame = feedbackWrite == nil ? nil : (feedback!.primed ? feedback!.read : backTex)
         if encodeSurfaceCustomShaderChain(
@@ -458,10 +465,12 @@ func encodeSurfaceBackBufferToDrawable(
             input: backTex,
             output: feedbackWrite ?? drawableTexture,
             pong: customShaderPong,
-            pongSize: pongSize,
+            pongSize: capacitySize,
+            viewportSize: pongSize,
+            uvScale: uvScale,
             copyVertexBuffer: copyVB,
             sampler: bilinSamp,
-            uniforms: makeUniforms(),
+            uniforms: scaledWindowSize(makeUniforms(), by: uvScale),
             prevFrame: prevFrame,
             cellAge: editInputs?.cellAge
         ) {
@@ -472,6 +481,7 @@ func encodeSurfaceBackBufferToDrawable(
                encodeSurfaceDrawableCopy(
                    cmd: cmd, input: feedbackWrite, output: drawableTexture,
                    pipeline: copyPipe, copyVertexBuffer: copyVB, sampler: samp,
+                   uvScale: uvScale,
                    prepare: { _ in }
                )
             {
@@ -490,9 +500,21 @@ func encodeSurfaceBackBufferToDrawable(
         pipeline: copyPipe,
         copyVertexBuffer: copyVB,
         sampler: samp,
+        uvScale: surfaceUVScale(logicalSize: pongSize, capacity: backTex),
         prepare: prepareCopy
     )
     return copied ? .plainCopy : .notEncoded
+}
+
+/// The preamble derives fragCoord as `iWindowOffset + vUV * iWindowSize` and
+/// samples at `local_px / iWindowSize`. With vUV scaled into the textures'
+/// defined region, iWindowSize must be their allocated extent for fragCoord to
+/// stay in logical pixels and the samples to land on it.
+private func scaledWindowSize(_ uniforms: zonvie_shader_uniforms, by uvScale: SIMD2<Float>) -> zonvie_shader_uniforms {
+    var u = uniforms
+    u.iWindowSize.0 /= uvScale.x
+    u.iWindowSize.1 /= uvScale.y
+    return u
 }
 
 /// The bloom pass, taking its resources from where they live rather than from
@@ -532,7 +554,10 @@ func encodeSurfaceBloom(
           let compositePipe = shared.glowCompositePipeline,
           let copyVB = shared.copyVertexBuffer,
           let bilinSamp = shared.bilinearSampler else { return false }
-    let key = (widthPx: Int(drawableSize.width), heightPx: Int(drawableSize.height), radiusScale: radiusScale)
+    // Planned over the back buffer's allocated extent rather than the
+    // drawable, so the glow textures follow its capacity and the composite's
+    // full-target quad lines up with it (surfaceTextureCapacity).
+    let key = (widthPx: backTex.width, heightPx: backTex.height, radiusScale: radiusScale)
     let chain: SurfaceGlowChain
     if let cached = glowTextures.chain, glowTextures.chainKey == key {
         chain = cached
@@ -811,6 +836,9 @@ func encodeSurfaceCustomShaderChain(
     output: MTLTexture,
     pong: SurfacePingPongTextures,
     pongSize: CGSize,
+    /// The logical region every pass renders and samples (surfaceUVScale).
+    viewportSize: CGSize,
+    uvScale: SIMD2<Float>,
     copyVertexBuffer: MTLBuffer,
     sampler: MTLSamplerState,
     uniforms: zonvie_shader_uniforms,
@@ -830,6 +858,8 @@ func encodeSurfaceCustomShaderChain(
             cmd: cmd,
             input: inputTex,
             output: outputTex,
+            viewportSize: viewportSize,
+            uvScale: uvScale,
             copyVertexBuffer: copyVertexBuffer,
             sampler: sampler,
             uniforms: uniforms,
@@ -1692,6 +1722,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Committed layer list for the main surface, back-to-front. Replaced
     /// wholesale by on_surface_layout and promoted at commitFlush.
     private var pendingSurfaceLayers: [SurfaceLayer]?   // Written under lock; read on the core thread
+    /// The per-grid fonts the committed rows were drawn in, published with
+    /// them under `lock`: the shared table moves before this commit does.
+    private var committedGridFonts: [Int64: GridFontPx] = [:]
     private var committedSurfaceLayers: [SurfaceLayer] = [
         SurfaceLayer(gridId: GridSurfaceRenderer.rootGridId, anchorGrid: GridSurfaceRenderer.rootGridId, originPx: simd_float2(0, 0), rows: 0, cols: 0, z: 0, followsScroll: false)
     ]                                                    // Protected by lock
@@ -2020,6 +2053,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Cell height in drawable pixel coordinates, `linespace` included.
     var cellHeightPx: Float { shared.cellHeightPx }
 
+    /// `gridId`'s row height: its own font's, else `cellHeightPx`.
+    func rowHeightPx(_ gridId: Int64) -> Float { shared.rowHeightPx(gridId) }
+
     /// The integer cell size the core lays out with and the window snaps to.
     var coreCellPx: (w: Int, h: Int) {
         (max(1, Int(cellWidthPx.rounded(.toNearestOrAwayFromZero))),
@@ -2081,6 +2117,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// the resulting grid_scroll arrives. Armed at send time, not at draw
     /// time: Neovim's response can land within a millisecond, before any
     /// frame is drawn, which left every gesture's first row uncaptured.
+    /// Never disarmed wholesale: a span survives a layout change and is only
+    /// re-armed by the next precise scroll, so a keyboard scroll between a
+    /// window MOVING and that gesture captures against the old span, and a
+    /// grid id another window reuses inherits the old window's span until
+    /// its own next precise scroll re-arms it.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
     /// grid_scroll steps consumed by a bracket that has not committed yet.
     /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
@@ -2190,6 +2231,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// A cell's height in the NDC the offsets above were built in, so the
     /// debt, which is counted in rows, can be paid in them.
     private var scrollDebtCellHeightNDC: Float = 0
+    /// Each follower anchor's row height in the same NDC: the debt counts the
+    /// ANCHOR's rows, and a font grid's rows are not the global cell height.
+    private var scrollDebtRowHeightNDC: [Int32: Float] = [:]
     /// The viewport height those NDC were built against. Written under `lock`
     /// with them; draw recovers the shader cursor's pixels from it.
     private var scrollOffsetViewportHeight: Float = 0
@@ -2221,7 +2265,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             guard debtRows != 0 else { continue }
             // offset_y is NDC and negated against the pixel offset the view
             // built (see computeScrollOffset), so withholding pixels adds here.
-            snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
+            snapshot[i].offset_y += Float(debtRows) * (scrollDebtRowHeightNDC[snapshot[i].grid_id] ?? scrollDebtCellHeightNDC)
         }
     }
 
@@ -2252,7 +2296,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         guard scrollOffsetViewportHeight > 0 else { return [:] }
         var result: [Int64: CGFloat] = [:]
         for entry in scrollOffsetData where entry.move_all != 0 {
-            let debtNDC = Float(floatDebtRows(for: entry.grid_id, seeding: false)) * scrollDebtCellHeightNDC
+            let debtNDC = Float(floatDebtRows(for: entry.grid_id, seeding: false)) * (scrollDebtRowHeightNDC[entry.grid_id] ?? scrollDebtCellHeightNDC)
             let px = -(entry.offset_y + debtNDC) * scrollOffsetViewportHeight / 2
             if px.isFinite { result[Int64(entry.grid_id)] = CGFloat(px) }
         }
@@ -2266,6 +2310,29 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         var ranks: [Int64: Int] = [:]
         for layer in committedSurfaceLayers where ranks[layer.gridId] == nil { ranks[layer.gridId] = layer.z }
         return ranks
+    }
+
+    /// Where the committed layout places `gridId`, for the pointer.
+    func committedLayerOriginPx(_ gridId: Int64) -> simd_float2? {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedSurfaceLayers.first { $0.gridId == gridId }?.originPx
+    }
+
+    /// The per-grid fonts committed with the rows this surface draws, not
+    /// the table the core thread publishes ahead of that commit. One lock
+    /// hold per frame; the copy is COW, so it allocates nothing.
+    func committedGridFontTable() -> [Int64: GridFontPx] {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedGridFonts
+    }
+
+    /// The layer's rows and columns in its own cells, as the hit test clamps by.
+    func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedSurfaceLayers.first { $0.gridId == gridId }.map { (Int32($0.rows), Int32($0.cols)) }
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -2361,19 +2428,24 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// this frame's idle gate. Draw thread only.
     private var shaderCursorMovedThisFrame = false
 
-    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
-        if backBuffer != nil, backBufferSize == drawableSize { return }
+    /// `backBufferSize` is the LOGICAL size (the drawable's); the texture may
+    /// be larger during a live resize (surfaceTextureCapacity).
+    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat, inLiveResize: Bool) {
+        let capacity = surfaceTextureCapacity(current: backBuffer, logicalSize: drawableSize, inLiveResize: inLiveResize)
+        let reallocate = backBuffer?.width != capacity.widthPx || backBuffer?.height != capacity.heightPx
+        if !reallocate, backBufferSize == drawableSize { return }
 
         let oldSize = backBufferSize
         let wasPresented = hasPresentedOnce
 
-        let desc = makeSurfaceTextureDescriptor(
-            size: drawableSize,
-            pixelFormat: pixelFormat,
-            usage: [.renderTarget, .shaderRead]
-        )
-
-        backBuffer = shared.device.makeTexture(descriptor: desc)
+        if reallocate {
+            let desc = makeSurfaceTextureDescriptor(
+                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                pixelFormat: pixelFormat,
+                usage: [.renderTarget, .shaderRead]
+            )
+            backBuffer = shared.device.makeTexture(descriptor: desc)
+        }
         // backBufferSize is read from updateCursorShaderStateFromVerts() on
         // the core/RPC thread (to convert cursor NDC coords to pixels) —
         // guard the write with `lock` so that read never sees a stale size
@@ -2381,12 +2453,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // no longer matches it.
         lock.lock()
         backBufferSize = drawableSize
-        // After resize, we must clear once (contents undefined).
+        // After resize, we must clear once: a new texture is undefined, and
+        // a reused one is stale outside the old logical region.
         hasPresentedOnce = false
         lock.unlock()
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
-        ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+        ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) capacity=\(capacity.widthPx)x\(capacity.heightPx) reallocated=\(reallocate) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
     }
 
     init?(view: MTKView, collectsGpuPerfSamples: Bool = true) {
@@ -2719,10 +2792,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // registry has its own lock and the established order is
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
-        // Read here rather than inside the region below for symmetry with the
-        // line above, not out of necessity: the accessor takes a leaf lock
-        // inside `shared`, so reading it under `lock` would be safe.
-        let ledgerCellHeightPx = shared.cellHeightPx
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -2757,6 +2826,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             committedCursorSetIndex = cursorWriteSetIndex
         }
         // Layers and the vertices they place become visible together.
+        committedGridFonts = shared.flushGridFonts()
         if let staged = pendingSurfaceLayers {
             // A layer that is new, or that moved or changed size, cannot reuse
             // anything the back texture holds for it: its rows are somewhere
@@ -2766,7 +2836,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 staged: staged,
                 committed: committedSurfaceLayers,
                 rootGridId: Self.rootGridId,
-                cellHeightPx: ledgerCellHeightPx,
+                rowHeightPx: { shared.rowHeightPx($0) },
                 into: &layerPlacementRowsUp
             )
             // The pixels a move, resize, restack or removal exposes are this
@@ -3003,6 +3073,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // The grid those rows were counted on, which can change from frame to
         // frame for an editor-anchored float (see floatDebtBaselineFollowing).
         var debtAnchorGridId: Int64 = 0
+        // The grid's own row height when it is drawn in its own font; 0 =
+        // the surface cell height. The content clip and the band coverage
+        // are measured in it.
+        var rowHeightPx: Float = 0
+        // That grid's clip box height (on_grid_font extent_h_px). gridRows is
+        // its footprint in SURFACE cells, so the content bottom comes from
+        // here, not from gridRows x rowHeightPx.
+        var extentHeightPx: Float = 0
     }
 
     /// draw()'s cell-snapped viewport height: the committed extent, else the
@@ -3041,12 +3119,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         scrollOffsetData.reserveCapacity(offsets.count)
         scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
         scrollDebtAnchorGridId.removeAll(keepingCapacity: true)
+        scrollDebtRowHeightNDC.removeAll(keepingCapacity: true)
         scrollDebtCellHeightNDC = cellHeightNDC
         scrollOffsetViewportHeight = drawableHeight
         for info in offsets {
             if let anchorRowsUp = info.debtAnchorRowsUp {
                 scrollDebtAnchorRowsUp[Int32(clamping: info.gridId)] = anchorRowsUp
                 scrollDebtAnchorGridId[Int32(clamping: info.gridId)] = info.debtAnchorGridId
+                scrollDebtRowHeightNDC[Int32(clamping: info.gridId)] = shared.rowHeightPx(info.debtAnchorGridId) * scale
             }
             scrollOffsetData.append(Self.computeScrollOffset(
                 info: info,
@@ -3064,7 +3144,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // again on the frames this function does not run at all — which is
         // every frame once nothing is easing.
         retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
-        retention.releaseCoveredPins(&scrollOffsetData, cellHeightNDC: cellHeightNDC)
+        retention.releaseCoveredPins(&scrollOffsetData) { gid in
+            for info in offsets where info.gridId == Int64(gid) && info.rowHeightPx > 0 {
+                return info.rowHeightPx * scale
+            }
+            return cellHeightNDC
+        }
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
             // Logged AFTER the pin decision so pin/retained carry the values
@@ -3092,25 +3177,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    func clearScrollOffsets() {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Unreachable: its one caller, MetalTerminalView.clearAllScrollOffsets,
-        // has no callers of its own. See that function's note before relying on
-        // any of this running.
-        scrollOffsetData = []
-        scrollOffsetLatch.setActive(false)
-        // The spans describe the layout this reset abandons.
-        gridScrollCaptureBounds.removeAll(keepingCapacity: true)
-        // A parked step describes the same abandoned layout, and would be
-        // replayed against post-reset bounds and a post-reset source set.
-        pendingRetentionReplay.removeAll()
-        bracketSourceShift.removeAll(keepingCapacity: true)
-        // Retained rows were built for the layout being abandoned.
-        retention.clearPublished()
-    }
-
     /// Compute ScrollOffset from ScrollOffsetInfo (shared logic for main window and external grids).
     /// - Parameters:
     ///   - info: Scroll offset info with margin data
@@ -3119,7 +3185,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// - Returns: ScrollOffset struct ready for shader
     static func computeScrollOffset(info: ScrollOffsetInfo, viewportHeight: Float, cellHeightPx: Float) -> ScrollOffset {
         let scale: Float = viewportHeight > 0 ? 2.0 / viewportHeight : 0
-        let cellHeightNDC: Float = cellHeightPx * scale
+        let cellHeightNDC: Float = (info.rowHeightPx > 0 ? info.rowHeightPx : cellHeightPx) * scale
         let ndc = -info.offsetYPx * scale
 
         // Content bounds in NDC, used only for fragment-level clipping of
@@ -3128,7 +3194,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // (clipToContent == false) translates bodily, so widen the bounds past
         // the screen and clip nothing.
         let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
-        let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
+        let contentBottomY: Float
+        if !info.clipToContent {
+            contentBottomY = -2.0
+        } else if info.rowHeightPx > 0 {
+            contentBottomY = info.gridTopYNDC - info.extentHeightPx * scale + Float(info.marginBottom) * cellHeightNDC
+        } else {
+            contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
+        }
 
         return ScrollOffset(
             grid_id: Int32(truncatingIfNeeded: info.gridId),
@@ -3245,16 +3318,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
-                host?.didDrawFrame()
-                return
-            }
-
-            // Keep the last exact-size frame while AppKit is live-resizing.
-            // Recreating back/scratch/ping-pong textures for every size tick
-            // creates a stream of IOAccelerator resources. Do this before the
-            // committed/dirty snapshots below so no render state is consumed;
-            // viewDidEndLiveResize requests one exact-size full redraw.
-            if view.inLiveResize, backBuffer != nil, backBufferSize != view.drawableSize {
                 host?.didDrawFrame()
                 return
             }
@@ -3547,7 +3610,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_backbuf_start = CFAbsoluteTimeGetCurrent()
             }
-            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
+            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
             if ZonvieCore.appLogEnabled {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
@@ -3896,7 +3959,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             f.anyLayerWork = true
         }
         swap(&f.bgClear, &bgClearPending)
-        for layer in committedSurfaceLayers {
+        for var layer in committedSurfaceLayers {
+            SharedRenderResources.applyGridFont(from: committedGridFonts, to: &layer)
             // Only a grid the committed layout places is consumed. Work
             // staged for one not on screen yet waits for the layout that
             // places it, which marks it fully dirty (see commitFlush).
@@ -3991,12 +4055,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Retained rows of this layer at the current cell height, collected
     /// into `retainedIndexScratch`; the draw loop refills it per layer.
-    private func collectLayerRetainedRows(_ gridId: Int64, _ f: inout MainSurfaceFrame) -> Int {
+    private func collectLayerRetainedRows(_ layer: SurfaceLayer, _ f: inout MainSurfaceFrame) -> Int {
         collectSurfaceLayerRetainedRows(
-            gridId: gridId,
+            gridId: layer.gridId,
             retained: f.retained,
-            hasScrollOffset: surfaceScrollOffset(gridId: gridId, offsets: f.scrollOffsets) != nil,
-            cellHeightPx: Float(f.cellHi),
+            hasScrollOffset: surfaceScrollOffset(gridId: layer.gridId, offsets: f.scrollOffsets) != nil,
+            cellHeightPx: Float(layer.rowHeightPx(surfaceCellHeightPx: Int(f.cellHi))),
             into: &retainedIndexScratch
         )
     }
@@ -4076,6 +4140,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // Staged against a grid size the committed layout no longer
                 // places, so its rows do not name this rectangle's rows.
                 refusalReason = "size"
+            } else if layer.cellHeightPx > 0 {
+                // A grid in its own font: its rows and margin are not on the
+                // surface's row lattice the blit and its overlap rules assume.
+                refusalReason = "font"
             } else {
                 plan = RowScrollBlitPlan.make(
                     rowStart: scroll.rowStart,
@@ -4084,8 +4152,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     originXPx: originXPx,
                     originYPx: originYPx,
                     widthPx: layer.cols * cellWi,
-                    textureWidthPx: backTex.width,
-                    textureHeightPx: backTex.height,
+                    textureWidthPx: Int(backBufferSize.width),
+                    textureHeightPx: Int(backBufferSize.height),
                     rowHeightPx: cellHi
                 )
                 if plan == nil {
@@ -4123,7 +4191,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // the rungs above already passed
                 // SurfaceFrameDecision answers .load.
                 let rowCount = f.layerResolvableRowCount(entry)
-                let retainedRowCount = collectLayerRetainedRows(layer.gridId, &f)
+                let retainedRowCount = collectLayerRetainedRows(layer, &f)
                 if f.layerNeedsAllRows(
                     state: state,
                     rowCount: rowCount,
@@ -4143,7 +4211,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     backTexture: backTex,
                     scratch: scrollScratch,
                     device: shared.device,
-                    backBufferSize: backBufferSize,
                     commandBuffer: cmd,
                     encoder: &scrollBlitEncoder
                 ) {
@@ -4174,8 +4241,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 rowStart: scroll.rowStart,
                 rowEnd: scroll.rowEnd,
                 originYPx: originYPx,
-                textureHeightPx: backTex.height,
-                rowHeightPx: cellHi
+                textureHeightPx: Int(backBufferSize.height),
+                rowHeightPx: layer.rowHeightPx(surfaceCellHeightPx: cellHi)
             ) else { continue }
             state.drawRows.append(contentsOf: refusedRows)
         }
@@ -4211,20 +4278,27 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // ladder passes it: a frame that does clear redraws every
             // layer whole anyway, so the disagreement cannot lose a row.
             if let state = entry.state {
-                let retainedRowCount = collectLayerRetainedRows(layer.gridId, &f)
+                let retainedRowCount = collectLayerRetainedRows(layer, &f)
                 if !f.layerNeedsAllRows(
                     state: state,
                     rowCount: rowCount,
                     retainedRowCount: retainedRowCount,
                     loadActionIsClear: false
                 ) {
-                    damageBands.addRows(state.drawRows, originYPx: topPx, rowHeightPx: bandRowHeightPx)
+                    let layerRowHeightPx = layer.rowHeightPx(surfaceCellHeightPx: bandRowHeightPx)
+                    damageBands.addRows(state.drawRows, originYPx: topPx, rowHeightPx: layerRowHeightPx)
+                    // The core emits a font grid's bottom margin with its last row.
+                    let rowsBottomPx = topPx + rowCount * layerRowHeightPx
+                    let layerBottomPx = topPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: bandRowHeightPx)
+                    if layerBottomPx > rowsBottomPx, state.drawRows.contains(rowCount - 1) {
+                        damageBands.addSpan(topPx: rowsBottomPx, bottomPx: layerBottomPx)
+                    }
                     continue
                 }
             }
-            damageBands.addSpan(topPx: topPx, bottomPx: topPx + rowCount * bandRowHeightPx)
+            damageBands.addSpan(topPx: topPx, bottomPx: topPx + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: bandRowHeightPx))
         }
-        damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: backTex.height)
+        damageBands.resolve(rowHeightPx: bandRowHeightPx, surfaceHeightPx: Int(backBufferSize.height))
         if f.rowMode {
             damageBands.layerRows(
                 originYPx: rootOriginYPx, rowCount: f.safeRowCount,
@@ -4233,9 +4307,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         for entry in layerSnapshot.dropFirst() {
             guard let state = entry.state else { continue }
             damageBands.layerRows(
+                entry.layer,
                 originYPx: Int(entry.layer.originPx.y.rounded(.down)),
                 rowCount: f.layerResolvableRowCount(entry),
-                rowHeightPx: bandRowHeightPx, into: &state.drawRows)
+                surfaceCellHeightPx: bandRowHeightPx, into: &state.drawRows)
         }
     }
 
@@ -4385,11 +4460,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         backTex: MTLTexture,
         loadActionIsClear: Bool
     ) {
-        let cellHi = Int(f.cellHi)
+        let surfaceCellHi = Int(f.cellHi)
         let use2Pass = f.use2Pass
         enc.setRenderPipelineState(shared.pipeline!)
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
+            let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rowCount = f.layerResolvableRowCount(entry)
             guard rowCount > 0 else { continue }
@@ -4409,13 +4485,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let bodilyMoved = placed.bodilyMoved
             let originX = Int(drawOriginPx.x.rounded(.down))
             let originY = Int(drawOriginPx.y.rounded(.down))
-            let widthPx = layer.cols * Int(f.cellWi)
+            let widthPx = layer.drawWidthPx(surfaceCellWidthPx: Int(f.cellWi))
             let scissorPadY = surfaceLayerScissorPadY(topPx: drawOriginPx.y)
 
             // This layer's rows, then the rows its own smooth scroll
             // retained; both in its grid-local space. The index list is
             // reused so a layer costs no allocation per frame.
-            let retainedForLayerCount = collectLayerRetainedRows(layer.gridId, &f)
+            let retainedForLayerCount = collectLayerRetainedRows(layer, &f)
 
             // What one row of this layer owes the encoder. Shared by both
             // arms below so the gated path resolves rows the same way.
@@ -4513,10 +4589,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // there. A row the band only reaches through its extra
                 // row is cleared and drawn under the same clip: outside
                 // the band nothing of it lands.
-                let layerBottomPx = originY + rowCount * cellHi + scissorPadY
+                let layerBottomPx = originY + layer.drawHeightPx(rows: rowCount, surfaceCellHeightPx: surfaceCellHi) + scissorPadY
                 for band in damageBands.bands {
                     guard let rows = SurfaceDamageBands.rows(
-                        in: band, originYPx: originY, rowCount: rowCount, rowHeightPx: cellHi
+                        in: band, layer: layer, originYPx: originY, rowCount: rowCount,
+                        surfaceCellHeightPx: surfaceCellHi
                     ) else { continue }
                     let top = max(Int(band.top_px), originY)
                     let bottom = min(Int(band.bottom_px), layerBottomPx)
@@ -4622,8 +4699,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // a row missing here has no previous frame and no
                 // root-side extraction to fall back on: the root
                 // pass takes only gridId == 1 retained rows.
-                let retainedForGlowCount = collectLayerRetainedRows(layer.gridId, &f)
-                let cellHi = Float(f.cellHi)
+                let retainedForGlowCount = collectLayerRetainedRows(layer, &f)
+                let cellHi = Float(layer.rowHeightPx(surfaceCellHeightPx: Int(f.cellHi)))
                 encodeSurfaceLayerGlowRows(
                     encoder: enc,
                     rows: 0..<(rowCount + retainedForGlowCount),
@@ -5049,7 +5126,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             retention: retention,
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
-            cellHeightPx: shared.cellHeightPx
+            cellHeightPx: shared.rowHeightPx(gridId)
         )
         if !captured {
             ZonvieCore.appLog(
@@ -5097,7 +5174,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
             stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
-            cellHeightPx: shared.cellHeightPx
+            cellHeightPx: shared.rowHeightPx(gridId)
         )
     }
 
@@ -5454,8 +5531,8 @@ fileprivate struct MainSurfaceFrame {
             : layer.originPx
         guard let scissor = makeSurfaceLayerScissor(
             originPx: drawOriginPx,
-            cols: layer.cols, rows: rows,
-            cellWidthPx: Int(cellWi), cellHeightPx: Int(cellHi),
+            widthPx: layer.drawWidthPx(surfaceCellWidthPx: Int(cellWi)),
+            heightPx: layer.drawHeightPx(rows: rows, surfaceCellHeightPx: Int(cellHi)),
             scale: scale,
             targetWidth: targetWidth, targetHeight: targetHeight
         ) else { return nil }

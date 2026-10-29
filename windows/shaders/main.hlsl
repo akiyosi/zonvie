@@ -396,23 +396,35 @@ SamplerState glowSamp : register(s1);
 // Bound for every bloom pass after extract. `glowRadiusScale` stretches the
 // Kawase tap offsets: the chain's depth is fixed, so reach per tap is the only
 // thing a radius can change. 1.0 is the default radius.
+//
+// The glow textures are capacity-sized: a pass's source region is the
+// top-left `glowSrcUvScale` of glowTex, and taps are clamped to
+// `glowSrcUvMax` (half a texel inside it) so the stale margin beyond is
+// never sampled. Tap offsets stay in texels of the allocated texture.
 cbuffer GlowParams : register(b0) {
     float glowIntensity;
     float glowRadiusScale;
     float2 _pad;
+    float2 glowSrcUvScale;
+    float2 glowSrcUvMax;
 };
+
+float4 glowTap(float2 uv) {
+    return glowTex.Sample(glowSamp, min(uv, glowSrcUvMax));
+}
 
 // Dual Kawase downsample (5 taps)
 float4 PSKawaseDown(FSQuadVSOut i) : SV_Target {
     uint w, h;
     glowTex.GetDimensions(w, h);
     float2 halfpixel = (0.5 * glowRadiusScale) / float2(w, h);
+    float2 uv = i.uv * glowSrcUvScale;
 
-    float4 sum = glowTex.Sample(glowSamp, i.uv) * 4.0;
-    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x, -halfpixel.y));
-    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x, -halfpixel.y));
-    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x,  halfpixel.y));
-    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x,  halfpixel.y));
+    float4 sum = glowTap(uv) * 4.0;
+    sum += glowTap(uv + float2(-halfpixel.x, -halfpixel.y));
+    sum += glowTap(uv + float2( halfpixel.x, -halfpixel.y));
+    sum += glowTap(uv + float2(-halfpixel.x,  halfpixel.y));
+    sum += glowTap(uv + float2( halfpixel.x,  halfpixel.y));
     return sum / 8.0;
 }
 
@@ -421,20 +433,21 @@ float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
     uint w, h;
     glowTex.GetDimensions(w, h);
     float2 halfpixel = (0.5 * glowRadiusScale) / float2(w, h);
+    float2 uv = i.uv * glowSrcUvScale;
 
     float4 sum = 0;
-    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x * 2.0, 0.0));
-    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x,  halfpixel.y)) * 2.0;
-    sum += glowTex.Sample(glowSamp, i.uv + float2(0.0,  halfpixel.y * 2.0));
-    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x,  halfpixel.y)) * 2.0;
-    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x * 2.0, 0.0));
-    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x, -halfpixel.y)) * 2.0;
-    sum += glowTex.Sample(glowSamp, i.uv + float2(0.0, -halfpixel.y * 2.0));
-    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x, -halfpixel.y)) * 2.0;
+    sum += glowTap(uv + float2(-halfpixel.x * 2.0, 0.0));
+    sum += glowTap(uv + float2(-halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += glowTap(uv + float2(0.0,  halfpixel.y * 2.0));
+    sum += glowTap(uv + float2( halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += glowTap(uv + float2( halfpixel.x * 2.0, 0.0));
+    sum += glowTap(uv + float2( halfpixel.x, -halfpixel.y)) * 2.0;
+    sum += glowTap(uv + float2(0.0, -halfpixel.y * 2.0));
+    sum += glowTap(uv + float2(-halfpixel.x, -halfpixel.y)) * 2.0;
     return sum / 12.0;
 }
 
 
 float4 PSGlowComposite(FSQuadVSOut i) : SV_Target {
-    return glowTex.Sample(glowSamp, i.uv) * glowIntensity;
+    return glowTap(i.uv * glowSrcUvScale) * glowIntensity;
 }

@@ -310,6 +310,10 @@ test "gui:visual_scrollbind_layers_blit_matches_jump" {
     try gated(can_capture, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
 }
 
+test "gui:visual_per_grid_font_workflow" {
+    try gated(can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
+}
+
 test "gui:visual_proportional_font_support" {
     try gated(can_capture, @import("scenarios/visual/proportional_font_support.zig"));
 }
@@ -365,6 +369,11 @@ test "gui:extwin_float_stack_scroll_continuity" {
     try gated(is_macos, @import("scenarios/macos/extwin_float_stack_scroll_continuity.zig"));
 }
 
+test "gui:extwin_font_grid_click" {
+    // macOS only: ExternalGridView's hit test is macOS frontend code.
+    try gated(is_macos, @import("scenarios/macos/extwin_font_grid_click.zig"));
+}
+
 test "gui:extwin_hosted_float_phantom_hit" {
     // macOS only: the main window's hit test and ExternalGridView are macOS
     // frontend code.
@@ -391,6 +400,10 @@ test "gui:cmdline_does_not_stall_extwin" {
 
 test "gui:visual_extwin_split_with_float_background" {
     try gated(can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
+}
+
+test "gui:visual_per_grid_font_margin" {
+    try gated(can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {

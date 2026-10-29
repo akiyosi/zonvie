@@ -648,6 +648,20 @@ pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
     return n;
 }
 
+/// The newline-separated "<name>\t<size>[...]" list on_guifont receives, for
+/// a raw 'guifont' value. Shared by the global option and zonvie_guifont.
+pub fn resolveGuiFontList(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const list = try parseGuiFontList(arena, raw);
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    for (list.items, 0..) |cand, idx| {
+        const resolved = try parseGuiFontCandidate(arena, cand);
+        const msg = try formatResolvedGuiFont(arena, resolved);
+        if (idx > 0) try combined.append(arena, '\n');
+        try combined.appendSlice(arena, msg);
+    }
+    return combined.items;
+}
+
 pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
@@ -2060,6 +2074,11 @@ fn onWinPos(
         if (log.cb != null and grid.bufForConst(grid_id) == null) log.write("[win_pos] grid {d} before its grid_resize\n", .{grid_id});
 
         try applyExtWindowSurface(grid, log, .win_pos, grid_id, win_id, startrow, startcol);
+        if (t[4] == .int and t[5] == .int and t[4].int > 0 and t[5].int > 0) {
+            const width = checkedGridCoord(t[4].int) orelse continue;
+            const height = checkedGridCoord(t[5].int) orelse continue;
+            grid.noteWinFrame(grid_id, win_id, height, width);
+        }
     }
 }
 
@@ -2291,6 +2310,8 @@ fn onWinFloatPos(
         if (on_external_surface) {
             if (float_anchor) |fa| grid.setWinFloatAnchor(grid_id, fa);
         }
+        if (t[2] == .str) grid.setWinFloatEast(grid_id, t[2].str.len == 2 and t[2].str[1] == 'E');
+        grid.wantFontQuery(win_id);
     }
 }
 
@@ -2329,6 +2350,7 @@ fn onWinExternalPos(
         // The external window's own texture is in its own coordinates and
         // keeps its stamps either way.
         if (is_new) grid.noteNonEditRedraw(1);
+        grid.wantFontQuery(win);
     }
 }
 
@@ -2602,18 +2624,11 @@ fn onOptionSet(
             const list = try parseGuiFontList(arena, raw);
             if (log.cb != null) log.write("guifont: {d} candidate(s)\n", .{list.items.len});
 
-            // Build a single newline-separated string of all resolved
-            // candidates and notify the frontend once.  The frontend
-            // tries each entry in order and uses the first loadable font.
-            var combined: std.ArrayListUnmanaged(u8) = .empty;
-            for (list.items, 0..) |cand, idx| {
-                const resolved = try parseGuiFontCandidate(arena, cand);
-                const msg = try formatResolvedGuiFont(arena, resolved);
-                if (log.cb != null) log.write("guifont resolved: '{s}'\n", .{msg});
-                if (idx > 0) try combined.append(arena, '\n');
-                try combined.appendSlice(arena, msg);
-            }
-            try guifont_fn(opt_ctx, combined.items);
+            // The frontend tries each entry in order and uses the first
+            // loadable font.
+            const combined = try resolveGuiFontList(arena, raw);
+            if (log.cb != null) log.write("guifont resolved: '{s}'\n", .{combined});
+            try guifont_fn(opt_ctx, combined);
         }
 
         if (std.mem.eql(u8, opt_name, "linespace")) {
@@ -2956,8 +2971,12 @@ fn onGridLine(
             // on any screen and stamps nothing.
             const is_external = grid_id != 1 and grid.external_grids.contains(grid_id);
             const stamp_grid: i64 = if (is_external) grid_id else 1;
+            // A composited grid in its own font has cells off the global
+            // lattice the main texture is indexed by: no screen cell.
             const origin: ?grid_mod.GridPos = if (grid_id == 1 or is_external)
                 grid_mod.GridPos{ .row = 0, .col = 0 }
+            else if (grid.grid_fonts.contains(grid_id))
+                null
             else
                 grid.win_pos.get(grid_id);
 
@@ -4950,6 +4969,23 @@ fn testIntEvent(arena: std.mem.Allocator, name: []const u8, args: []const i64) !
     return testEvent(arena, name, t);
 }
 
+test "win_pos records the split frame and queues a font query" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(20, 10);
+
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 2, 20, 10 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_pos", &.{ 2, 1000, 0, 0, 20, 10 }));
+    try std.testing.expectEqual(@as(u32, 10), grid.win_frames.get(2).?.rows);
+    try std.testing.expectEqual(@as(u32, 20), grid.win_frames.get(2).?.cols);
+    try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+}
+
 // window.c win_setheight_win/win_setwidth_win send win_resize for any
 // non-floating window under ext_windows, including the first window, which
 // no win_split ever named (`:resize`, CTRL-W _, 'winheight' on win_enter).
@@ -5397,6 +5433,39 @@ test "gate 2: a sub-grid with no screen position stamps nothing" {
     try runRedrawEvents(&grid, &hl, arena, &events);
 
     try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+}
+
+test "a composited grid in its own font stamps nothing on the main texture" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 1, 5);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 3;
+    grid.cursor_row = 1;
+
+    // In global cells it stamps the main texture at its win_pos offset.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var ev1 = [_]mp.Value{try testGridLineEvent(arena, 3, 1, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &ev1);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+
+    // In its own font its cells are not on the lattice the main texture is
+    // indexed by.
+    grid.resetCellStamps();
+    try grid.grid_fonts.put(grid.alloc, 3, .{ .win_id = 1000, .font_id = 2, .mode = .scale_view, .cell_w_px = 5, .cell_h_px = 10, .frame_rows = 1, .frame_cols = 5 });
+    const cells2 = [_]mp.Value{try testCell(arena, "b", 0, null)};
+    var ev2 = [_]mp.Value{try testGridLineEvent(arena, 3, 1, 3, &cells2)};
+    try runRedrawEvents(&grid, &hl, arena, &ev2);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
 }
 
 test "gate 3: a full-row rewrite clears instead of stamping" {

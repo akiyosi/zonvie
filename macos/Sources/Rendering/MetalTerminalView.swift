@@ -467,64 +467,35 @@ final class MetalTerminalView: GridInputView {
 
     // MARK: - Mouse Input
 
-    override func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
-        hitTestGrid(at: convert(event.locationInWindow, from: nil))
+    // This surface's committed frame, as the pointer reads it: the renderer
+    // holds the layers, the follower map and the ease.
+
+    override var frameDroppedScrollTransform: Bool {
+        drewWithoutScrollTransform || renderer.drewWithoutScrollTransform
     }
 
-    override func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64) -> (gridId: Int64, row: Int32, col: Int32)? {
-        guard let core, let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
-        // The pinned grid closed mid-drag: the surface's root grid in
-        // global cells, as Windows' rebaseToGrid, never the window under
-        // the pointer.
-        guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
-            return (1, g.globalRow, g.globalCol)
-        }
-        let localRow: Int32
-        if let followerOffsetPx = drawnFollowerOffsetsPx()[pinned] {
-            // A follower is drawn displaced bodily and has no ease of its
-            // own to undo.
-            localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - current.startRow
-        } else {
-            localRow = scrollAdjustedLocalRow(
-                pointPxY: g.pointPx.y,
-                cellHeightPx: g.cellH,
-                band: GridRowBand(of: current),
-                scrollOffsetPx: drawnScrollOffsetPx(pinned, cellH: g.cellH)
-            )
-        }
-        return (pinned, localRow, g.globalCol - current.startCol)
+    /// The renderer's follower map, skipped while nothing is displaced: the
+    /// answer would be empty, and asking costs its lock and a Dictionary on
+    /// every pointer move.
+    override func drawnFollowerOffsetsPx(cellH: CGFloat) -> [Int64: CGFloat] {
+        guard scrollModel?.hasOffsets == true, let renderer else { return [:] }
+        return renderer.drawnFollowerOffsetsPx()
+    }
+
+    override func committedPaintRanks() -> [Int64: Int] { renderer?.paintRanks() ?? [:] }
+
+    override func committedLayerOriginPx(_ gridId: Int64) -> CGPoint? {
+        renderer?.committedLayerOriginPx(gridId).map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
+    }
+
+    override func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? {
+        renderer?.committedLayerCells(gridId)
     }
 
     override func layout() {
         super.layout()
         ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
-    }
-
-    // The cell a click here would name, ease undone: hovering read the drawn
-    // row, so mid-ease the hand showed over a row a click missed.
-    override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
-        hitTestGrid(at: location)
-    }
-
-    /// Another surface's start_row and start_col are in that surface's space,
-    /// so only a cursor this window draws has a rect here.
-    override func imeCursorRectInView() -> NSRect? {
-        guard let core else { return nil }
-        let cursor = core.getCursorPositionNonBlocking()
-        guard cursor.row >= 0, cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 else { return nil }
-        // Cursor is grid-local; add the grid's screen offset.
-        var screenRow = Int(cursor.row)
-        var screenCol = Int(cursor.col)
-        for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
-            screenRow = Int(grid.startRow) + Int(cursor.row)
-            screenCol = Int(grid.startCol) + Int(cursor.col)
-            break
-        }
-        let cell = imePreeditCellSize
-        return NSRect(x: CGFloat(screenCol) * cell.width,
-                      y: bounds.height - CGFloat(screenRow + 1) * cell.height,
-                      width: cell.width, height: cell.height)
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -662,9 +633,10 @@ final class MetalTerminalView: GridInputView {
             // own snap setFrame produces: it matches the size the snap recorded
             // in lastSnappedTermPx. Gated on the >= 1 cell check above so the
             // transient 1×N / N×1 placeholder layout never becomes the
-            // reference. Main-thread only, same as the snap.
+            // reference. A size seen during a live resize is the user's drag
+            // even when it equals the last snap. Main-thread only, same as the snap.
             let curTermPt = bounds.size
-            if let snapped = core.lastSnappedTermPx,
+            if !inLiveResize, let snapped = core.lastSnappedTermPx,
                abs(curTermPt.width - snapped.width) < 0.5,
                abs(curTermPt.height - snapped.height) < 0.5 {
                 // Echo from our own snap; leave desiredTermPx untouched.
@@ -749,20 +721,7 @@ final class MetalTerminalView: GridInputView {
 
     // MARK: - Smooth Scrolling
 
-    private var scrollTargetLock = ScrollTargetLock()
-
     private var scrollModel: SessionScrollModel? { core?.scrollModel }
-
-    override func scrollWheel(with event: NSEvent) {
-        let location = convert(event.locationInWindow, from: nil)
-        scrollModel?.handleGridScrollWheel(
-            event, lock: &scrollTargetLock, scale: window?.backingScaleFactor ?? 2.0, logTag: "scroll",
-            resolve: { hitTestGrid(at: location, requireScrollable: $0) },
-            // Shader uniforms are propagated in onPreDraw (which always runs
-            // updateScrollShaderOffset before draw); calling it here too would
-            // re-do the same work and fire markAllRowsDirty twice per input.
-            afterPrecise: { _ in requestRedraw() })
-    }
 
     /// Whether the MAIN window composites this grid.
     ///
@@ -817,6 +776,10 @@ final class MetalTerminalView: GridInputView {
 
         let ndcScale: Float = 2.0 / drawableHeight
 
+        // Taken before scrollOffsetLock: the renderer's lock is never nested
+        // inside the scroll model's.
+        let committedFonts = renderer.committedGridFontTable()
+
         scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
         scrollModel.collectFrameOffsets(
             visible: visibleGridIdsScratch,
@@ -831,12 +794,15 @@ final class MetalTerminalView: GridInputView {
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
+            let gridFont = committedFonts[gridId]
             scrollOffsetInfoScratch.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 grid: info,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
                 // The paint rank is written at draw (rankOffsets).
-                zindex: 0
+                zindex: 0,
+                rowHeightPx: gridFont.map { Float($0.cellHeightPx) } ?? 0,
+                extentHeightPx: gridFont.map { Float($0.extentHeightPx) } ?? 0
             ))
         }
 
@@ -885,187 +851,6 @@ final class MetalTerminalView: GridInputView {
         if !scrollOffsetInfoScratch.isEmpty {
             renderer.markAllRowsDirty()
         }
-    }
-
-    /// Clear all scroll offsets.
-    ///
-    /// UNREACHABLE: nothing calls this, and it is the only caller of the
-    /// renderer's clearScrollOffsets — so none of that reset happens on any
-    /// surface (an external grid view has no GridSurfaceRenderer of its own).
-    ///
-    /// What it would reset is handled elsewhere: pendingRetentionReplay by
-    /// commitFlush, bracketSourceShift by beginFlush, published rows by
-    /// the draw path's prune. scrollOffsetData is rebuilt whenever
-    /// anything is displaced — updateScrollShaderOffset takes an idle early-out
-    /// once nothing is, having pushed one empty state through first.
-    ///
-    /// The capture spans are the exception. They survive a layout change and
-    /// are only re-armed by a precise scroll event, so a keyboard scroll
-    /// between a window MOVING and the next gesture captures against the old
-    /// span. Handles are never reused, so a span cannot be misapplied to a
-    /// different window — but that also means the dictionary only grows.
-    ///
-    /// Left in place rather than deleted; do not write code that relies on it
-    /// running.
-    private func clearAllScrollOffsets() {
-        scrollModel?.clearAllOffsets()
-        renderer.clearScrollOffsets()
-    }
-
-    /// A view point in the drawable's pixel space, with the cell grid it is
-    /// read against and the cell it lands in.
-    private struct PointerGeometry {
-        var pointPx: CGPoint
-        var cellW: CGFloat
-        var cellH: CGFloat
-        var globalRow: Int32
-        var globalCol: Int32
-    }
-
-    /// Where a view point lands in the core's cell grid.
-    ///
-    /// Shared by the hit test and the drag, so a press and the drag that
-    /// follows it agree about the column of the same pixel.
-    ///
-    /// nil before the renderer has cell metrics, which is what both call sites
-    /// bailed on separately.
-    private func pointerGeometry(at point: CGPoint) -> PointerGeometry? {
-        guard renderer.cellWidthPx > 0, renderer.cellHeightPx > 0 else { return nil }
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        // The integer cell size the core receives through updateLayoutPx.
-        let (cellWi, cellHi) = renderer.coreCellPx
-        let cellW = CGFloat(cellWi)
-        let cellH = CGFloat(cellHi)
-        // From the current bounds, the same formula updateDrawableSizeIfPossible
-        // uses: the stored drawableSize can lag behind bounds during a resize.
-        let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
-        // NSView is bottom-origin; the drawable is top-origin.
-        let pointPx = isFlipped
-            ? CGPoint(x: point.x * scale, y: point.y * scale)
-            : CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
-        return PointerGeometry(
-            pointPx: pointPx,
-            cellW: cellW,
-            cellH: cellH,
-            // Floored, not truncated: a drag a fraction of a cell above or left
-            // of the grid names row/column -1, which starts Neovim's drag
-            // autoscroll, as Windows' floor division does.
-            globalRow: Int32((pointPx.y / cellH).rounded(.down)),
-            globalCol: Int32((pointPx.x / cellW).rounded(.down))
-        )
-    }
-
-    /// The ease offset the last frame drew `grid` with: none at all on a frame
-    /// that dropped the scroll transform, as on the external surface.
-    private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat) -> CGFloat {
-        if drewWithoutScrollTransform || renderer.drewWithoutScrollTransform { return 0 }
-        return scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
-    }
-
-    /// The renderer's follower map, skipped while nothing is displaced: the
-    /// answer would be empty, and asking costs its lock and a Dictionary on
-    /// every pointer move.
-    private func drawnFollowerOffsetsPx() -> [Int64: CGFloat] {
-        guard scrollModel?.hasOffsets == true, let renderer else { return [:] }
-        return renderer.drawnFollowerOffsetsPx()
-    }
-
-    /// `requireScrollable`: a non-scrollable float is transparent to a wheel,
-    /// which falls through to the scrollable grid beneath it.
-    private func hitTestGrid(at point: CGPoint, requireScrollable: Bool = false) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let core else { return (1, 0, 0) }
-        // Early return when renderer is uninitialized (cellMetrics not yet available).
-        guard let g = pointerGeometry(at: point) else { return (1, 0, 0) }
-        let cellH = g.cellH
-        let pointPx = g.pointPx
-        let globalCol = g.globalCol
-        let globalRow = g.globalRow
-
-        let grids = core.getVisibleGridsCached()
-
-        ZonvieCore.appLog("[hitTest] point=\(point) pointPx=\(pointPx) globalRow=\(globalRow) globalCol=\(globalCol) gridsCount=\(grids.count)")
-        for grid in grids {
-            ZonvieCore.appLog("[hitTest]   grid: id=\(grid.gridId) zindex=\(grid.zindex) startRow=\(grid.startRow) startCol=\(grid.startCol) rows=\(grid.rows) cols=\(grid.cols) marginTop=\(grid.marginTop) marginBottom=\(grid.marginBottom)")
-        }
-
-        // Find grid with highest zindex containing this point
-        var bestGridId: Int64 = 1  // default to global grid
-        var localRow: Int32 = globalRow
-        var localCol: Int32 = globalCol
-
-        if let hit = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: requireScrollable) {
-            bestGridId = hit.gridId
-            localRow = hit.row
-            localCol = hit.col
-        }
-
-        // A float that follows its anchor is drawn displaced bodily and has no
-        // offset of its own for the correction below: during an ease or a held
-        // bounce a press landed rows from where it is drawn, or in the window
-        // behind. See resolveDisplacedFollowerHit.
-        let followers = drawnFollowerOffsetsPx()
-        let ranks = followers.isEmpty ? [:] : (renderer?.paintRanks() ?? [:])
-        switch resolveDisplacedFollowerHit(
-            pointPxY: pointPx.y,
-            cellHeightPx: cellH,
-            globalCol: globalCol,
-            staticGridId: bestGridId,
-            followers: followers,
-            paintRankOf: { ranks[$0] },
-            resolveExcluding: { row, col, excluded in
-                core.resolvePointerGrid(surfaceId: 1, row: row, col: col,
-                                        requireScrollable: requireScrollable, excluding: excluded)
-            }
-        ) {
-        case let .follower(gridId, row, col)?:
-            ZonvieCore.appLog("[hitTest] result: displaced follower gridId=\(gridId) row=\(row) col=\(col)")
-            return (gridId, row, col)
-        case let .uncovered(under)?:
-            bestGridId = under?.gridId ?? 1
-            localRow = under?.row ?? globalRow
-            localCol = under?.col ?? globalCol
-        case nil:
-            break
-        }
-
-        // Adjust for smooth scroll offset: during scrolling, content rows are
-        // visually shifted by scrollOffsetPx. Without this adjustment, clicking
-        // on visually-shifted content selects the wrong row.
-        let offsetPx = drawnScrollOffsetPx(bestGridId, cellH: cellH)
-
-        if let grid = grids.first(where: { $0.gridId == bestGridId }) {
-            localRow = scrollAdjustedLocalRow(
-                pointPxY: pointPx.y,
-                cellHeightPx: cellH,
-                band: GridRowBand(of: grid),
-                scrollOffsetPx: offsetPx
-            )
-        }
-
-        ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol) scrollOffset=\(offsetPx)")
-        return (bestGridId, localRow, localCol)
-    }
-
-    /// The grid a cell position names.
-    ///
-    /// The rule is the core's (`zonvie_core_resolve_pointer_grid`). It used to
-    /// be here, and the Windows frontend had its own copy; between them they
-    /// held different parts of it, so a float another surface hosts was
-    /// hit-testable on one side and the mouse flag was ignored on the other.
-    ///
-    /// nil when nothing matches, which leaves the caller on the container grid
-    /// with the position it was given.
-    private func pointerTargetGrid(
-        globalRow: Int32,
-        globalCol: Int32,
-        requireScrollable: Bool
-    ) -> (gridId: Int64, row: Int32, col: Int32)? {
-        core?.resolvePointerGrid(
-            surfaceId: 1,
-            row: globalRow,
-            col: globalCol,
-            requireScrollable: requireScrollable
-        )
     }
 
     /// Give float windows the sub-cell scroll offset of the window they sit over,
@@ -1264,6 +1049,161 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     var imeCore: ZonvieCore? { core }
 
+    /// The cell a grid-local pixel names, by the core's rule
+    /// (zonvie_core_pointer_cell_in_grid): the sub-row ease the frame drew the
+    /// grid with is undone only inside its scrolling band, and the layer's
+    /// leftover margin names the last cell.
+    func gridCellAt(
+        localX: CGFloat, localY: CGFloat, scrollOffsetPx: CGFloat,
+        cellW: UInt32, cellH: UInt32, extentW: UInt32, extentH: UInt32,
+        rows: Int32, cols: Int32, marginTop: Int32, marginBottom: Int32
+    ) -> (row: Int32, col: Int32) {
+        var r: Int32 = 0
+        var c: Int32 = 0
+        zonvie_core_pointer_cell_in_grid(
+            Float(localX), Float(localY), Float(scrollOffsetPx),
+            cellW, cellH, extentW, extentH, rows, cols, marginTop, marginBottom, &r, &c)
+        return (r, c)
+    }
+
+    /// A grid on the global font: its layer is exactly its rows x cols of
+    /// the surface's cells, and GridInfo's size and margins are its own.
+    func gridCellAt(
+        localX: CGFloat, localY: CGFloat, scrollOffsetPx: CGFloat,
+        cellW: CGFloat, cellH: CGFloat, grid: ZonvieCore.GridInfo
+    ) -> (row: Int32, col: Int32) {
+        let w = UInt32(max(0, cellW.rounded()))
+        let h = UInt32(max(0, cellH.rounded()))
+        return gridCellAt(
+            localX: localX, localY: localY, scrollOffsetPx: scrollOffsetPx,
+            cellW: w, cellH: h, extentW: w * UInt32(max(grid.cols, 0)), extentH: h * UInt32(max(grid.rows, 0)),
+            rows: grid.rows, cols: grid.cols, marginTop: grid.marginTop, marginBottom: grid.marginBottom)
+    }
+
+    /// A grid drawn in its own font. `cells` is the grid's own size, the
+    /// committed layer's: GridInfo carries the footprint in global cells.
+    func fontGridCellAt(
+        localX: CGFloat, localY: CGFloat, scrollOffsetPx: CGFloat, font gf: GridFontPx,
+        cells: (rows: Int32, cols: Int32)?, margins: (top: Int32, bottom: Int32)
+    ) -> (row: Int32, col: Int32) {
+        gridCellAt(
+            localX: localX, localY: localY, scrollOffsetPx: scrollOffsetPx,
+            cellW: gf.cellWidthPx, cellH: gf.cellHeightPx, extentW: gf.extentWidthPx, extentH: gf.extentHeightPx,
+            rows: cells?.rows ?? 0, cols: cells?.cols ?? 0, marginTop: margins.top, marginBottom: margins.bottom)
+    }
+
+    // What a pointer hit test reads from the surface that draws the grids.
+    // Every lookup is the COMMITTED frame -- the ease a grid was drawn with,
+    // where a follower float is drawn, where a layer sits -- never the core's
+    // current state, so the pointer lands where the rows are on the glass.
+    // The two surfaces keep those facts in different places and answer the
+    // four hooks below; the rule that reads them follows, once.
+
+    /// The last frame drew every grid cell-aligned, with no ease at all:
+    /// more fixed floats than the mask holds, or more offsets than the
+    /// shader takes.
+    var frameDroppedScrollTransform: Bool { false }
+
+    /// Followers drawn displaced bodily this frame, with no ease of their own.
+    func drawnFollowerOffsetsPx(cellH: CGFloat) -> [Int64: CGFloat] { [:] }
+
+    /// Every committed layer's paint rank.
+    func committedPaintRanks() -> [Int64: Int] { [:] }
+
+    func committedLayerOriginPx(_ gridId: Int64) -> CGPoint? { nil }
+
+    /// The layer's rows and columns in its own cells, as the hit test clamps by.
+    func committedLayerCells(_ gridId: Int64) -> (rows: Int32, cols: Int32)? { nil }
+
+    /// The ease offset the last frame drew `grid` with, in its own row height.
+    func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat) -> CGFloat {
+        if frameDroppedScrollTransform { return 0 }
+        guard let scroll = core?.scrollModel else { return 0 }
+        return scroll.visualScrollOffsetPx(
+            gridId: grid, cellHeightPx: sharedResources.gridFont(grid).map { CGFloat($0.cellHeightPx) } ?? cellH)
+    }
+
+    /// The grid a pointer at `pointPx` (surface pixels, top-origin) names and
+    /// the cell inside it: the core's answer (zonvie_core_resolve_pointer_grid)
+    /// with two corrections. A follower is found where it is DRAWN
+    /// (resolveDisplacedFollowerHit), and the cell is measured in the grid's
+    /// own cells with its ease undone (gridCellAt). `requireScrollable` is the
+    /// wheel's rule: a non-scrollable float is transparent to it.
+    func resolvePointerTarget(
+        pointPx: CGPoint, cellW: CGFloat, cellH: CGFloat, requireScrollable: Bool
+    ) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let core, cellW > 0, cellH > 0 else { return (surfaceId, 0, 0) }
+        let latticeRow = Int32((pointPx.y / cellH).rounded(.down))
+        let latticeCol = Int32((pointPx.x / cellW).rounded(.down))
+        // Refreshes the snapshot resolvePointerGrid reads.
+        let grids = core.getVisibleGridsCached()
+        var hit = core.resolvePointerGrid(surfaceId: surfaceId, row: latticeRow, col: latticeCol,
+                                          requireScrollable: requireScrollable)
+        let followers = drawnFollowerOffsetsPx(cellH: cellH)
+        let ranks = followers.isEmpty ? [:] : committedPaintRanks()
+        switch resolveDisplacedFollowerHit(
+            pointPxY: pointPx.y, cellHeightPx: cellH, globalCol: latticeCol,
+            staticGridId: hit?.gridId ?? surfaceId, followers: followers,
+            paintRankOf: { ranks[$0] },
+            resolveExcluding: { row, col, excluded in
+                core.resolvePointerGrid(surfaceId: self.surfaceId, row: row, col: col,
+                                        requireScrollable: requireScrollable, excluding: excluded)
+            }
+        ) {
+        case let .follower(gridId, row, col)?:
+            ZonvieCore.appLog("[hitTest] surface=\(surfaceId) displaced follower gridId=\(gridId) row=\(row) col=\(col)")
+            return (gridId, row, col)
+        case let .uncovered(under)?:
+            hit = under
+        case nil:
+            break
+        }
+        let target = hit?.gridId ?? surfaceId
+        guard let info = grids.first(where: { $0.gridId == target }) else {
+            return hit.map { ($0.gridId, $0.row, $0.col) } ?? (surfaceId, latticeRow, latticeCol)
+        }
+        let cell = pointerCell(pointPx: pointPx, cellW: cellW, cellH: cellH, grid: info,
+                               scrollOffsetPx: drawnScrollOffsetPx(target, cellH: cellH))
+        ZonvieCore.appLog("[hitTest] surface=\(surfaceId) gridId=\(target) row=\(cell.row) col=\(cell.col)")
+        return (target, cell.row, cell.col)
+    }
+
+    /// The pinned grid at its CURRENT drawn placement, for the drag and
+    /// release after a press, so a float that moves mid-drag keeps receiving
+    /// the cells under the pointer. A follower is drawn displaced bodily and
+    /// has no ease of its own to undo. A grid that has gone falls back to this
+    /// surface's root in surface cells, never the window under the pointer.
+    func rebasePointerTarget(
+        pointPx: CGPoint, cellW: CGFloat, cellH: CGFloat, pinned: Int64
+    ) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let core, cellW > 0, cellH > 0 else { return (surfaceId, 0, 0) }
+        guard let info = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
+            return (surfaceId, Int32((pointPx.y / cellH).rounded(.down)), Int32((pointPx.x / cellW).rounded(.down)))
+        }
+        let displacedPx = drawnFollowerOffsetsPx(cellH: cellH)[pinned] ?? 0
+        let cell = pointerCell(pointPx: CGPoint(x: pointPx.x, y: pointPx.y - displacedPx), cellW: cellW, cellH: cellH,
+                               grid: info, scrollOffsetPx: displacedPx != 0 ? 0 : drawnScrollOffsetPx(pinned, cellH: cellH))
+        return (pinned, cell.row, cell.col)
+    }
+
+    /// The cell `pointPx` names in `grid`. In its own font it is measured from
+    /// the committed layer's origin (a scale_view float may sit off the global
+    /// lattice); on the global font, from the cell position the core reports.
+    private func pointerCell(
+        pointPx: CGPoint, cellW: CGFloat, cellH: CGFloat, grid: ZonvieCore.GridInfo,
+        scrollOffsetPx: CGFloat
+    ) -> (row: Int32, col: Int32) {
+        let lattice = CGPoint(x: CGFloat(grid.startCol) * cellW, y: CGFloat(grid.startRow) * cellH)
+        if let gf = core?.gridCellPx(grid.gridId) {
+            let origin = committedLayerOriginPx(grid.gridId) ?? lattice
+            return fontGridCellAt(localX: pointPx.x - origin.x, localY: pointPx.y - origin.y,
+                                  scrollOffsetPx: scrollOffsetPx, font: gf, cells: committedLayerCells(grid.gridId),
+                                  margins: (grid.marginTop, grid.marginBottom))
+        }
+        return gridCellAt(localX: pointPx.x - lattice.x, localY: pointPx.y - lattice.y,
+                          scrollOffsetPx: scrollOffsetPx, cellW: cellW, cellH: cellH, grid: grid)
+    }
+
     /// The GPU objects and font every surface shares.
     var sharedResources: SharedRenderResources {
         preconditionFailure("GridInputView subclasses provide their shared resources")
@@ -1271,8 +1211,18 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     var backingScale: CGFloat { window?.backingScaleFactor ?? surfaceFallbackBackingScale }
 
+    /// The cursor grid's own font, when it has one: the preedit is drawn over
+    /// that grid's cells and must match them.
+    private var imeCursorGridFont: GridFontPx? {
+        guard let core else { return nil }
+        return core.gridCellPx(core.getCursorPositionNonBlocking().gridId)
+    }
+
     var imePreeditFont: NSFont {
         let shared = sharedResources
+        if let gf = imeCursorGridFont, let font = shared.atlas.slotFont(fontId: gf.fontId) {
+            return font as NSFont
+        }
         return NSFont(name: shared.currentFontName, size: shared.currentPointSize)
             ?? NSFont.monospacedSystemFont(ofSize: shared.currentPointSize, weight: .regular)
     }
@@ -1280,8 +1230,9 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     var imePreeditCellSize: CGSize {
         let shared = sharedResources
         let scale = backingScale
-        return CGSize(width: CGFloat(shared.cellWidthPx) / scale,
-                      height: CGFloat(shared.cellHeightPx) / scale)
+        let gf = imeCursorGridFont
+        return CGSize(width: (gf.map { CGFloat($0.cellWidthPx) } ?? CGFloat(shared.cellWidthPx)) / scale,
+                      height: (gf.map { CGFloat($0.cellHeightPx) } ?? CGFloat(shared.cellHeightPx)) / scale)
     }
 
     var imePreeditContainer: NSView { self }
@@ -1289,12 +1240,38 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// The cursor's cell in view points, or nil when this surface does not
     /// draw the cursor. The overlay and the candidate window both come from
     /// here, so they cannot disagree about whose cursor it is.
-    func imeCursorRectInView() -> NSRect? { nil }
+    ///
+    /// Measured as the pointer measures a cell (pointerCell): from the
+    /// committed layer's origin in the grid's own font, else the lattice cell
+    /// the core reports, displaced by what the frame drew the grid with. The
+    /// candidate window then sits on the row the pointer would name.
+    func imeCursorRectInView() -> NSRect? {
+        guard let core else { return nil }
+        let cursor = core.getCursorPositionNonBlocking()
+        guard cursor.row >= 0, cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == surfaceId,
+              let g = pointerGeometry(at: .zero) else { return nil }
+        let grid = cursor.gridId
+        let gf = core.gridCellPx(grid)
+        let cellW = gf.map { CGFloat($0.cellWidthPx) } ?? g.cellW
+        let cellH = gf.map { CGFloat($0.cellHeightPx) } ?? g.cellH
+        var origin = committedLayerOriginPx(grid)
+        if origin == nil, let info = core.getVisibleGridsCached().first(where: { $0.gridId == grid }) {
+            origin = CGPoint(x: CGFloat(info.startCol) * g.cellW, y: CGFloat(info.startRow) * g.cellH)
+        }
+        guard let origin else { return nil }
+        // A follower is drawn displaced bodily and has no ease of its own.
+        let drawnDy = drawnFollowerOffsetsPx(cellH: g.cellH)[grid] ?? drawnScrollOffsetPx(grid, cellH: g.cellH)
+        return viewRect(
+            contentTopLeftPx: CGPoint(x: origin.x + CGFloat(cursor.col) * cellW,
+                                      y: origin.y + CGFloat(cursor.row) * cellH + drawnDy),
+            cellW: cellW, cellH: cellH)
+    }
 
-    /// The candidate-window cell when the cursor is not on this surface.
+    /// The candidate-window cell when the cursor is not on this surface: the
+    /// content's top-left cell.
     func imeFallbackRectInView() -> NSRect {
-        let cell = imePreeditCellSize
-        return NSRect(x: 0, y: bounds.height - cell.height, width: cell.width, height: cell.height)
+        guard let g = pointerGeometry(at: .zero) else { return .zero }
+        return viewRect(contentTopLeftPx: .zero, cellW: g.cellW, cellH: g.cellH)
     }
 
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
@@ -1429,6 +1406,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
+        if core?.terminalView === self { core?.snapMainWindowAfterLiveResize() }
         activateSurfaceDrawLoop()
         requestRedraw()
     }
@@ -1491,19 +1469,68 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     // MARK: - Pointer
 
-    /// An event's position in surface pixels from the top-left.
-    func surfacePointPx(_ event: NSEvent) -> CGPoint {
-        surfacePointPx(atViewPoint: convert(event.locationInWindow, from: nil))
+    /// Where this surface's grid content begins, in view points from the
+    /// top-left: a decorated surface's inset (the cmdline icon and padding),
+    /// zero otherwise. The draw maps content through
+    /// MTLViewport(origin: this * scale); the pointer and the IME measure
+    /// from the same point, so they name the same cell.
+    var contentOriginPt: CGPoint { .zero }
+
+    /// The drawable's height from the current bounds, the same formula the
+    /// drawable is sized with: the stored drawableSize can lag behind bounds
+    /// during a resize.
+    private var drawableHeightPx: CGFloat {
+        CGFloat(max(1, Int((bounds.height * backingScale).rounded(.toNearestOrAwayFromZero))))
     }
 
+    /// A view point's position in content pixels from the top-left.
     func surfacePointPx(atViewPoint location: CGPoint) -> CGPoint {
         let scale = backingScale
-        return CGPoint(x: location.x * scale, y: bounds.height * scale - location.y * scale)
+        let origin = contentOriginPt
+        // NSView is bottom-origin; the drawable is top-origin.
+        return CGPoint(x: (location.x - origin.x) * scale,
+                       y: drawableHeightPx - (location.y + origin.y) * scale)
     }
 
-    /// The cell a click at `location` (view points) would name, or nil where
-    /// this surface shows no URL hover. Each surface resolves it its own way.
-    func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? { nil }
+    /// The inverse of surfacePointPx for a cell: the view rect of the cell
+    /// whose top-left is `topLeftPx` in content pixels.
+    func viewRect(contentTopLeftPx topLeftPx: CGPoint, cellW: CGFloat, cellH: CGFloat) -> NSRect {
+        let scale = backingScale
+        let origin = contentOriginPt
+        return NSRect(x: origin.x + topLeftPx.x / scale,
+                      y: (drawableHeightPx - topLeftPx.y - cellH) / scale - origin.y,
+                      width: cellW / scale, height: cellH / scale)
+    }
+
+    /// A view point in the drawable's pixel space, with the cell grid it is
+    /// read against.
+    struct PointerGeometry {
+        var pointPx: CGPoint
+        var cellW: CGFloat
+        var cellH: CGFloat
+    }
+
+    /// Where a view point lands in the core's cell grid: the integer cell size
+    /// the core lays out with, so every surface divides the same pixel by the
+    /// same cell. Shared by the hit test and the drag, so a press and the drag
+    /// that follows it agree about the column. nil before the font has metrics.
+    func pointerGeometry(at point: CGPoint) -> PointerGeometry? {
+        let shared = sharedResources
+        let cw = shared.cellWidthPx
+        let ch = shared.cellHeightPx
+        guard cw > 0, ch > 0 else { return nil }
+        return PointerGeometry(
+            pointPx: surfacePointPx(atViewPoint: point),
+            cellW: CGFloat(max(1, Int(cw.rounded(.toNearestOrAwayFromZero)))),
+            cellH: CGFloat(max(1, Int(ch.rounded(.toNearestOrAwayFromZero)))))
+    }
+
+    /// The cell a click at `location` (view points) would name, ease undone:
+    /// hovering read the drawn row, so mid-ease the hand showed over a row a
+    /// click missed.
+    func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
+        hitTestGrid(at: location)
+    }
 
     /// One area over the bounds serves the URL hand and the scrollbar hover;
     /// AppKit asks for it on geometry changes, so it is not rebuilt per layout.
@@ -1687,15 +1714,41 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
         }
     }
 
-    /// The grid an event's point names, resolved this surface's way.
+    /// The grid and cell a view point names. A float this surface hosts is
+    /// drawn above the root, so a press inside it has to name that grid;
+    /// naming the root applies the press to the window underneath instead.
+    /// `requireScrollable`: a non-scrollable float is transparent to a wheel,
+    /// which falls through to the scrollable grid beneath it.
+    func hitTestGrid(at location: CGPoint, requireScrollable: Bool = false) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let g = pointerGeometry(at: location) else { return (surfaceId, 0, 0) }
+        return resolvePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH,
+                                    requireScrollable: requireScrollable)
+    }
+
+    /// The grid an event's point names.
     func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
-        (surfaceId, 0, 0)
+        hitTestGrid(at: convert(event.locationInWindow, from: nil), requireScrollable: requireScrollable)
     }
 
     /// The pinned grid at its CURRENT placement, so a grid that moves
     /// mid-drag keeps receiving the cells under the pointer; nil sends nothing.
     func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64) -> (gridId: Int64, row: Int32, col: Int32)? {
-        resolvePointerTarget(event, requireScrollable: false)
+        guard let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
+        return rebasePointerTarget(pointPx: g.pointPx, cellW: g.cellW, cellH: g.cellH, pinned: pinned)
+    }
+
+    private var scrollTargetLock = ScrollTargetLock()
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let scroll = core?.scrollModel else { return }
+        let location = convert(event.locationInWindow, from: nil)
+        scroll.handleGridScrollWheel(
+            event, lock: &scrollTargetLock, scale: backingScale, logTag: "scroll surface=\(surfaceId)",
+            resolve: { hitTestGrid(at: location, requireScrollable: $0) },
+            // The draw propagates the shader uniforms (updateScrollShaderOffset
+            // runs before every draw), and handleScrollInput wakes the draw
+            // loop of the view showing the target grid.
+            afterPrecise: { _ in requestRedraw() })
     }
 
     /// Send one button event to Neovim: a press resolves and pins its grid,
@@ -2233,19 +2286,5 @@ final class PreeditOverlayView: NSView {
             underlinePath.line(to: NSPoint(x: endX, y: yPos))
             underlinePath.stroke()
         }
-    }
-}
-
-/// The band a grid's sub-row ease actually moves, from the grid the core
-/// reports. Lives here rather than beside GridRowBand because MetalTypes.swift
-/// is compiled standalone by the Swift test steps and must not name ZonvieCore.
-extension GridRowBand {
-    init(of grid: ZonvieCore.GridInfo) {
-        self.init(
-            startRow: grid.startRow,
-            rows: grid.rows,
-            marginTop: grid.marginTop,
-            marginBottom: grid.marginBottom
-        )
     }
 }

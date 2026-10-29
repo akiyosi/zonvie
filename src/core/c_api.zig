@@ -21,6 +21,7 @@ pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const damage_bands = @import("damage_bands.zig");
+pub const font_slots = @import("font_slots.zig");
 pub const scroll_ease = @import("scroll_ease.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
@@ -38,6 +39,8 @@ test {
     _ = @import("abi_header_test.zig");
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");
+    _ = @import("font_slots.zig");
+    _ = @import("grid_font.zig");
     _ = damage_bands;
     _ = scroll_ease;
     _ = cell_age_store;
@@ -175,6 +178,26 @@ pub const RasterizeGlyphByIdFn = *const fn (
     out_bitmap: *GlyphBitmap,
 ) callconv(.c) c_int;
 
+pub const FontSlotLoadFn = *const fn (ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize, scale: f32, out_cell_w_px: *u32, out_cell_h_px: *u32) callconv(.c) c_int;
+pub const FontSlotReleaseFn = *const fn (ctx: ?*anyopaque, font_id: u32) callconv(.c) void;
+pub const GridFontFn = *const fn (ctx: ?*anyopaque, grid_id: i64, font_id: u32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) callconv(.c) void;
+pub const ShapeTextRunExFn = *const fn (
+    ctx: ?*anyopaque,
+    font_id: u32,
+    scalars: [*]const u32,
+    scalar_count: usize,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_clusters: [*]u32,
+    out_x_advance: [*]i32,
+    out_x_offset: [*]i32,
+    out_y_offset: [*]i32,
+    out_cap: usize,
+) callconv(.c) usize;
+/// Shared by on_rasterize_glyph_ex (key = scalar) and
+/// on_rasterize_glyph_by_id_ex (key = glyph id).
+pub const RasterizeGlyphExFn = *const fn (ctx: ?*anyopaque, font_id: u32, key: u32, style_flags: u32, out_bitmap: *GlyphBitmap) callconv(.c) c_int;
+
 // ASCII fast path table retrieval callback
 pub const GetAsciiTableFn = *const fn (
     ctx: ?*anyopaque,
@@ -258,6 +281,10 @@ pub const GridInfo = extern struct {
     // This grid's z in the layer list its surface last published (0 for a
     // surface root or a grid not yet published). Larger is drawn on top.
     layer_z: i64,
+    // The grid's own rows, the unit margin_* and line_count are in. Equal to
+    // `rows` unless the grid has its own font, when `rows` is its footprint
+    // in surface cells.
+    grid_rows: i32 = 0,
 };
 
 /// Viewport info for scrollbar rendering
@@ -584,6 +611,13 @@ pub const Callbacks = extern struct {
         clear: i32,
     ) callconv(.c) void = null,
 
+    on_font_slot_load: ?FontSlotLoadFn = null,
+    on_font_slot_release: ?FontSlotReleaseFn = null,
+    on_grid_font: ?GridFontFn = null,
+    on_shape_text_run_ex: ?ShapeTextRunExFn = null,
+    on_rasterize_glyph_ex: ?RasterizeGlyphExFn = null,
+    on_rasterize_glyph_by_id_ex: ?RasterizeGlyphExFn = null,
+
     // Field layout is checked against include/zonvie_core.h in
     // abi_header_test.zig; the version must stay readable at offset 0.
     comptime {
@@ -768,6 +802,12 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
 
         .on_callback_error = box.cb.on_callback_error,
+        .on_font_slot_load = box.cb.on_font_slot_load,
+        .on_font_slot_release = box.cb.on_font_slot_release,
+        .on_grid_font = box.cb.on_grid_font,
+        .on_shape_text_run_ex = box.cb.on_shape_text_run_ex,
+        .on_rasterize_glyph_ex = box.cb.on_rasterize_glyph_ex,
+        .on_rasterize_glyph_by_id_ex = box.cb.on_rasterize_glyph_by_id_ex,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);
@@ -1361,6 +1401,11 @@ pub export fn zonvie_core_try_resize_grid(p: ?*zonvie_core, grid_id: i64, rows: 
     box.core.requestTryResizeGrid(grid_id, rows, cols);
 }
 
+pub export fn zonvie_core_external_resize_outstanding(p: ?*zonvie_core, grid_id: i64, rows: u32, cols: u32) callconv(.c) c_int {
+    if (p == null) return 0;
+    return @intFromBool(asBox(p.?).core.osResizeOutstanding(grid_id, rows, cols));
+}
+
 pub export fn zonvie_core_update_layout_px(
     p: ?*zonvie_core,
     drawable_w_px: u32,
@@ -1731,6 +1776,37 @@ pub export fn zonvie_core_resolve_pointer_grid(
     ) orelse return 0;
     out.?.* = hit;
     return 1;
+}
+
+pub const GridGeometry = pointer_target.GridGeometry;
+
+pub export fn zonvie_core_pointer_cell_in_grid(
+    local_x_px: f32,
+    local_y_px: f32,
+    scroll_offset_px: f32,
+    cell_w_px: u32,
+    cell_h_px: u32,
+    extent_w_px: u32,
+    extent_h_px: u32,
+    rows: i32,
+    cols: i32,
+    margin_top: i32,
+    margin_bottom: i32,
+    out_row: ?*i32,
+    out_col: ?*i32,
+) callconv(.c) void {
+    const hit = pointer_target.cellInGridEased(local_x_px, local_y_px, scroll_offset_px, .{
+        .cell_w_px = cell_w_px,
+        .cell_h_px = cell_h_px,
+        .extent_w_px = extent_w_px,
+        .extent_h_px = extent_h_px,
+        .rows = rows,
+        .cols = cols,
+        .margin_top = margin_top,
+        .margin_bottom = margin_bottom,
+    });
+    if (out_row) |r| r.* = hit.row;
+    if (out_col) |c| c.* = hit.col;
 }
 
 pub const zonvie_scrollbar_metrics = scrollbar_metrics.Metrics;

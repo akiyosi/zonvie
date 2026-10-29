@@ -468,9 +468,9 @@ test "cellIsEmojiCluster detects ZWJ in overflow" {
 test "different ZWJ sequences get different cache keys" {
     // 👩‍💻 overflow = [U+200D, U+1F4BB]
     // 👩‍🔬 overflow = [U+200D, U+1F52C]
-    const key1 = flush_mod.clusterCacheKey(0x1F469, 0, &[_]u32{ 0x200D, 0x1F4BB });
-    const key2 = flush_mod.clusterCacheKey(0x1F469, 0, &[_]u32{ 0x200D, 0x1F52C });
-    const key_no_overflow = flush_mod.clusterCacheKey(0x1F469, 0, null);
+    const key1 = flush_mod.clusterCacheKey(0x1F469, 0, 0, &[_]u32{ 0x200D, 0x1F4BB });
+    const key2 = flush_mod.clusterCacheKey(0x1F469, 0, 0, &[_]u32{ 0x200D, 0x1F52C });
+    const key_no_overflow = flush_mod.clusterCacheKey(0x1F469, 0, 0, null);
 
     try std.testing.expect(key1 != key2);
     try std.testing.expect(key1 != key_no_overflow);

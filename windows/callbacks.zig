@@ -1435,7 +1435,9 @@ pub fn onGridRowScroll(
     }
 
     // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
-    const row_h: i32 = @intCast(app.rowHeightPx());
+    // In this grid's own row height as of this flush: the staged table, since
+    // the published one lags a flush that changes the grid's font.
+    const row_h: i32 = if (app.grid_fonts_staged.get(grid_id)) |gf| @intCast(gf.cell_h_px) else @intCast(app.rowHeightPx());
     const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
     const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
     const delta_px: i32 = -rows_delta * row_h;
@@ -1557,7 +1559,11 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         if (retryable) core.zonvie_core_force_resend_locked(app.corep);
     } else {
         // Each surface publishes its root rows, layer rows, placement and
-        // cursor in one commit.
+        // cursor in one commit; per-grid fonts go out with the rows this
+        // flush drew in them.
+        const fonts_changed = app.grid_fonts_dirty;
+        app.commitGridFonts();
+        if (fonts_changed) queueExternalFontReframes(app);
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
             entry.value_ptr.*.surf.tbs.commitFlush(app.alloc);
@@ -1902,6 +1908,85 @@ pub fn onGetAsciiTable(
         return if (a.getAsciiTableDWrite(style_flags, out_glyph_ids, out_x_advances, out_lig_triggers)) 1 else 0;
     }
     return 0;
+}
+
+// =========================================================================
+// Per-grid font callbacks
+// =========================================================================
+
+/// Synchronous by contract: the core sizes the grid from the answer. The row
+/// height folds in 'linespace' as App.rowHeightPx does for the global cell.
+pub fn onFontSlotLoad(ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize, scale: f32, out_cell_w_px: *u32, out_cell_h_px: *u32) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
+    const a = atlasForCoreCallback(app) orelse return 0;
+    const cell = a.loadSlot(font_id, utf8[0..len], scale) orelse return 0;
+    app.mu.lockUncancelable(core.clock.io());
+    const linespace_px = app.linespace_px;
+    app.mu.unlock(core.clock.io());
+    out_cell_w_px.* = cell.cell_w_px;
+    out_cell_h_px.* = app_mod.rowHeightWithLinespacePx(cell.cell_h_px, linespace_px);
+    return 1;
+}
+
+pub fn onFontSlotRelease(ctx: ?*anyopaque, font_id: u32) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+    if (atlasForCoreCallback(app)) |a| a.releaseSlot(font_id);
+}
+
+/// Staged here; onFlushEnd publishes it with the commit that drew the grid's
+/// rows in that font.
+pub fn onGridFont(ctx: ?*anyopaque, grid_id: i64, font_id: u32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    if (font_id == 0) {
+        _ = app.grid_fonts_staged.remove(grid_id);
+    } else {
+        app.grid_fonts_staged.put(app.alloc, grid_id, .{
+            .font_id = font_id,
+            .cell_w_px = cell_w_px,
+            .cell_h_px = cell_h_px,
+            .extent_w_px = extent_w_px,
+            .extent_h_px = extent_h_px,
+        }) catch {
+            if (applog.isEnabled()) applog.appLog("[font_slot] grid_font dropped grid={d}: out of memory\n", .{grid_id});
+            return;
+        };
+    }
+    app.grid_fonts_dirty = true;
+}
+
+pub fn onShapeTextRunEx(
+    ctx: ?*anyopaque,
+    font_id: u32,
+    scalars: [*]const u32,
+    scalar_count: usize,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_clusters: [*]u32,
+    out_x_advance: [*]i32,
+    out_x_offset: [*]i32,
+    out_y_offset: [*]i32,
+    out_cap: usize,
+) callconv(.c) usize {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
+    const a = atlasForCoreCallback(app) orelse return 0;
+    return a.shapeTextRunDWriteFont(font_id, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+}
+
+pub fn onRasterizeGlyphEx(ctx: ?*anyopaque, font_id: u32, scalar: u32, style_flags: u32, out_bitmap: *app_mod.GlyphBitmap) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
+    const corep = app.corep;
+    const a = atlasForCoreCallback(app) orelse return 0;
+    a.rasterizeScalarFont(font_id, scalar, style_flags, corep, out_bitmap) catch return 0;
+    return 1;
+}
+
+pub fn onRasterizeGlyphByIdEx(ctx: ?*anyopaque, font_id: u32, glyph_id: u32, style_flags: u32, out_bitmap: *app_mod.GlyphBitmap) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
+    const a = atlasForCoreCallback(app) orelse return 0;
+    a.rasterizeGlyphByIdDWriteFont(font_id, glyph_id, style_flags, out_bitmap) catch return 0;
+    return 1;
 }
 
 // =========================================================================
@@ -2607,8 +2692,15 @@ pub fn queueExternalWindowResizes(
         if (ext_win.is_pending_close) continue;
 
         const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
-        var content_w: c_int = @as(c_int, @intCast(ext_win.surf.surface.cols * cell_w)) + insets.w;
-        const content_h: c_int = @as(c_int, @intCast(ext_win.surf.surface.rows * cell_h)) + insets.h;
+        const rows = ext_win.surf.surface.rows;
+        const cols = ext_win.surf.surface.cols;
+        // A grid in its own font is framed by its font, the rest by the new cell.
+        const content: external_windows.ContentPx = if (app.gridCellPx(grid_id) != null)
+            external_windows.externalContentPxLocked(app, grid_id, rows, cols)
+        else
+            .{ .w = @as(c_int, @intCast(cols * cell_w)), .h = @as(c_int, @intCast(rows * cell_h)) };
+        var content_w: c_int = content.w + insets.w;
+        const content_h: c_int = content.h + insets.h;
         if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd), external_windows.cmdlineScreenMarginPx(app));
 
         // This window's actual style and DPI: WS_OVERLAPPEDWINDOW has a frame
@@ -2625,6 +2717,30 @@ pub fn queueExternalWindowResizes(
         if (hwnd) |mh| {
             _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
         }
+    }
+}
+
+/// Re-frame each external window whose font moved its extent while its grid
+/// kept its size: no grid_resize comes to do it. Caller holds `app.mu`.
+fn queueExternalFontReframes(app: *App) void {
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr.*;
+        if (ext_win.is_pending_close or app.gridCellPx(grid_id) == null) continue;
+        const content = external_windows.externalContentPxLocked(app, grid_id, ext_win.surf.surface.rows, ext_win.surf.surface.cols);
+        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
+        var client: c.RECT = undefined;
+        if (c.GetClientRect(ext_win.hwnd, &client) == 0) continue;
+        const want_w = content.w + insets.w;
+        const want_h = content.h + insets.h;
+        if (client.right - client.left == want_w and client.bottom - client.top == want_h) continue;
+        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, want_w, want_h);
+        ext_win.pending_window_w = outer.w;
+        ext_win.pending_window_h = outer.h;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+        if (app.hwnd) |mh| _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
     }
 }
 
@@ -2710,6 +2826,9 @@ pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     // no such window, so release it here or it lives until shutdown.
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
+    // Outside any flush; the layout that drops the grid prunes its layer.
+    _ = app.grid_fonts_staged.remove(grid_id);
+    _ = app.grid_fonts.remove(grid_id);
     var i: usize = 0;
     while (i < app.pending_external_verts.items.len) {
         if (app.pending_external_verts.items[i].grid_id == grid_id) {

@@ -121,6 +121,51 @@ typedef int (*zonvie_rasterize_glyph_by_id_fn)(
     zonvie_glyph_bitmap* out_bitmap
 );
 
+/* Per-grid fonts. font_id 0 is the global font and is never loaded or
+   released through these. `utf8` is the same "<name>\t<size>[\t<features>]"
+   candidate list (newline-separated) on_guifont receives; empty means "the
+   current global font". The size is multiplied by `scale`. The frontend
+   loads the face synchronously, writes the cell width and the row height
+   ('linespace' included, the unit it passes to zonvie_core_update_layout_px
+   as cell_h_px), and returns 1; 0 means the load failed. Called on the core
+   thread with grid_mu held, like every IMMEDIATE callback: a lock it takes
+   must never be held by a thread that waits for grid_mu. */
+typedef int (*zonvie_on_font_slot_load_fn)(
+    void* ctx, uint32_t font_id, const char* utf8, size_t len, float scale,
+    uint32_t* out_cell_w_px, uint32_t* out_cell_h_px);
+typedef void (*zonvie_on_font_slot_release_fn)(void* ctx, uint32_t font_id);
+/* A grid's font changed. font_id 0 means it is back on the global font, and
+   extent_* are then 0. Otherwise extent_* is the pixel box the layer is
+   clipped to and framed by (its frame in resize mode, rows x cell in a
+   view mode), 0 only for a grid with no rows or columns; a frontend sizes
+   the grid's layer from it, not from rows x cell. IMMEDIATE class: core
+   thread, grid_mu held. Unlike other IMMEDIATE callbacks it is not applied
+   on the spot: the frontend stages it and makes it visible at the next
+   flush end that commits, together with the rows that flush drew, since the
+   grid's committed rows were laid out in the previous font. It may arrive
+   inside or outside a flush; an aborted flush keeps the staged value for
+   the next commit, and the core does not resend it. on_grid_destroy drops
+   a grid's staged and visible font at once. */
+typedef void (*zonvie_on_grid_font_fn)(
+    void* ctx, int64_t grid_id, uint32_t font_id,
+    uint32_t cell_w_px, uint32_t cell_h_px,
+    uint32_t extent_w_px, uint32_t extent_h_px);
+/* font_id-taking variants of on_shape_text_run, on_rasterize_glyph and
+   on_rasterize_glyph_by_id. Called only with font_id != 0. */
+typedef size_t (*zonvie_shape_text_run_ex_fn)(
+    void* ctx, uint32_t font_id,
+    const uint32_t* scalars, size_t scalar_count,
+    uint32_t style_flags,
+    uint32_t* out_glyph_ids, uint32_t* out_clusters,
+    int32_t* out_x_advance, int32_t* out_x_offset, int32_t* out_y_offset,
+    size_t out_cap);
+typedef int (*zonvie_rasterize_glyph_ex_fn)(
+    void* ctx, uint32_t font_id, uint32_t scalar, uint32_t style_flags,
+    zonvie_glyph_bitmap* out_bitmap);
+typedef int (*zonvie_rasterize_glyph_by_id_ex_fn)(
+    void* ctx, uint32_t font_id, uint32_t glyph_id, uint32_t style_flags,
+    zonvie_glyph_bitmap* out_bitmap);
+
 /* ASCII fast path: retrieve pre-computed shaping tables for a style variant.
    Frontend fills out_glyph_ids[128], out_x_advances[128], out_lig_triggers[128]
    from its HarfBuzz font handle for the given style.
@@ -1034,6 +1079,16 @@ typedef struct zonvie_callbacks {
        struct for ABI compat. */
     void (*on_cell_age_stamps)(void* ctx, const zonvie_cell_stamp* stamps,
                                size_t n, int clear);
+
+    /* Per-grid fonts (vim.w.zonvie_guifont / zonvie_font_scale /
+       neovide_font_scale). All six must be set, or the core ignores the
+       window variables. Appended at the end for ABI compat. */
+    zonvie_on_font_slot_load_fn on_font_slot_load;
+    zonvie_on_font_slot_release_fn on_font_slot_release;
+    zonvie_on_grid_font_fn on_grid_font;
+    zonvie_shape_text_run_ex_fn on_shape_text_run_ex;
+    zonvie_rasterize_glyph_ex_fn on_rasterize_glyph_ex;
+    zonvie_rasterize_glyph_by_id_ex_fn on_rasterize_glyph_by_id_ex;
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1331,9 +1386,19 @@ ZONVIE_API void zonvie_core_send_key_event(
 
 ZONVIE_API void zonvie_core_resize(zonvie_core *core, unsigned rows, unsigned cols);
 
-/* Request resize of a specific grid (for external windows).
- * Calls nvim_ui_try_resize_grid RPC. */
+/* An external window's OS size, in its grid's cells: call on every OS resize.
+ * The core keeps one nvim_ui_try_resize_grid out per window and sends the
+ * newest size when Neovim answers the last, so a drag never queues stale
+ * sizes. Up to 8 windows are coalesced at once; a 9th resizing at the same
+ * time is sent as is, and zonvie_core_external_resize_outstanding answers 0
+ * for it. Any thread; takes no core lock the core thread holds across a batch. */
 ZONVIE_API void zonvie_core_try_resize_grid(zonvie_core *core, int64_t grid_id, unsigned rows, unsigned cols);
+
+/* 1 when an OS size other than rows x cols is queued or unanswered for
+ * grid_id: the window is at a size its grid has not reached, and framing it
+ * to rows x cols (a grid_resize that answered an older request) would make it
+ * jump back. Pass the grid's current size to ask "is any resize pending". */
+ZONVIE_API int zonvie_core_external_resize_outstanding(zonvie_core *core, int64_t grid_id, unsigned rows, unsigned cols);
 
 /* --- Smooth scrolling support --- */
 
@@ -1341,6 +1406,10 @@ ZONVIE_API void zonvie_core_try_resize_grid(zonvie_core *core, int64_t grid_id, 
 typedef struct zonvie_grid_info {
     int64_t grid_id;
     int64_t zindex;
+    /* The surface cell holding the layer's drawn top-left corner: its
+     * placement, except an east-anchored scale_view float (on_grid_font)
+     * keeps its placed right edge, so start_col is the column its drawn
+     * left edge falls in. */
     int32_t start_row;
     int32_t start_col;
     int32_t rows;
@@ -1382,6 +1451,12 @@ typedef struct zonvie_grid_info {
      * published). Larger is drawn on top: the one answer to which of two
      * grids is in front, so no consumer re-derives the draw order. */
     int64_t layer_z;
+    /* The grid's own rows: the unit margin_* and the scrollability rule
+     * (line_count > grid_rows - margins) are in. Equal to `rows` unless the
+     * grid is drawn in its own font (on_grid_font), when `rows`/`cols` are its
+     * footprint in surface cells, the unit start_row/start_col and hit tests
+     * use. */
+    int32_t grid_rows;
 } zonvie_grid_info;
 
 /* Where message boxes (ext-float messages, the toast, the minis) are placed.

@@ -291,3 +291,47 @@ pub fn dumpWindowsForPid(pid: i32) void {
     var ctx = DumpCtx{ .pid = @intCast(pid) };
     _ = EnumWindows(dumpCb, @bitCast(@intFromPtr(&ctx)));
 }
+
+const LOGFONTW = extern struct {
+    lfHeight: i32 = 0,
+    lfWidth: i32 = 0,
+    lfEscapement: i32 = 0,
+    lfOrientation: i32 = 0,
+    lfWeight: i32 = 0,
+    lfItalic: u8 = 0,
+    lfUnderline: u8 = 0,
+    lfStrikeOut: u8 = 0,
+    lfCharSet: u8 = 1, // DEFAULT_CHARSET: every charset
+    lfOutPrecision: u8 = 0,
+    lfClipPrecision: u8 = 0,
+    lfQuality: u8 = 0,
+    lfPitchAndFamily: u8 = 0,
+    lfFaceName: [32]u16 = [_]u16{0} ** 32,
+};
+extern "user32" fn GetDC(hwnd: ?W.HWND) callconv(.winapi) ?*anyopaque;
+extern "user32" fn ReleaseDC(hwnd: ?W.HWND, hdc: *anyopaque) callconv(.winapi) i32;
+extern "gdi32" fn EnumFontFamiliesExW(
+    hdc: *anyopaque,
+    lf: *LOGFONTW,
+    cb: *const fn (?*const anyopaque, ?*const anyopaque, W.DWORD, W.LPARAM) callconv(.winapi) i32,
+    lparam: W.LPARAM,
+    flags: W.DWORD,
+) callconv(.winapi) i32;
+
+fn fontFoundCb(_: ?*const anyopaque, _: ?*const anyopaque, _: W.DWORD, lparam: W.LPARAM) callconv(.winapi) i32 {
+    const found: *bool = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    found.* = true;
+    return 0;
+}
+
+/// Whether a font family named exactly `family` is installed.
+pub fn fontInstalled(family: []const u8) bool {
+    var lf = LOGFONTW{};
+    const n = std.unicode.utf8ToUtf16Le(lf.lfFaceName[0 .. lf.lfFaceName.len - 1], family) catch return false;
+    lf.lfFaceName[n] = 0;
+    const hdc = GetDC(null) orelse return false;
+    defer _ = ReleaseDC(null, hdc);
+    var found = false;
+    _ = EnumFontFamiliesExW(hdc, &lf, fontFoundCb, @bitCast(@intFromPtr(&found)), 0);
+    return found;
+}

@@ -201,6 +201,10 @@ final class CustomShaderPipeline {
         cmd: MTLCommandBuffer,
         input: MTLTexture,
         output: MTLTexture,
+        /// The logical region rendered; `output` may be larger.
+        viewportSize: CGSize,
+        /// Maps the quad onto the inputs' defined region (surfaceUVScale).
+        uvScale: SIMD2<Float>,
         copyVertexBuffer: MTLBuffer,
         sampler: MTLSamplerState,
         uniforms: zonvie_shader_uniforms,
@@ -214,7 +218,12 @@ final class CustomShaderPipeline {
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
         enc.label = "CustomShader.encode"
         enc.setRenderPipelineState(pipelineState)
+        enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: viewportSize.width, height: viewportSize.height,
+                                    znear: 0, zfar: 1))
         enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+        var scale = uvScale
+        enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
         enc.setFragmentTexture(input, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
         if let prevFrame {

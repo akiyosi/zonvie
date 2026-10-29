@@ -507,6 +507,21 @@ pub fn dragResizeWindowByMouse(
     return true;
 }
 
+/// One left click at (x, y), CGWindowList coordinates. Every event is
+/// ownership-checked like the drag above, and the press and release are at
+/// the same point, so nothing is dragged. The pointer is put back.
+pub fn clickAt(pid: i32, x: f64, y: f64) bool {
+    const restore = cursorLocation();
+    defer _ = CGWarpMouseCursorPosition(restore);
+    if (!postMouseChecked(pid, kCGEventMouseMoved, x, y)) return false;
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    if (!postMouseChecked(pid, kCGEventLeftMouseDown, x, y)) return false;
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    if (!postMouseChecked(pid, kCGEventLeftMouseUp, x, y)) return false;
+    gui_io.sleepNs(100 * std.time.ns_per_ms);
+    return true;
+}
+
 /// Trackpad-style pixel-precise scrolling, split so a caller can observe
 /// the surface WHILE the gesture is open.
 ///
@@ -676,4 +691,22 @@ pub fn dumpWindowsForPid(pid: i32) void {
             .{ layer, rect.x, rect.y, rect.w, rect.h },
         );
     }
+}
+
+extern "c" fn CTFontManagerCopyAvailableFontFamilyNames() ?*anyopaque;
+extern "c" fn CFEqual(a: *anyopaque, b: *anyopaque) bool;
+
+/// Whether a font family named exactly `family` is installed. Asking
+/// CTFontCreateWithName instead would fall back silently to another font.
+pub fn fontInstalled(family: [:0]const u8) bool {
+    const names = CTFontManagerCopyAvailableFontFamilyNames() orelse return false;
+    defer CFRelease(names);
+    const want = CFStringCreateWithCString(null, family, kCFStringEncodingUTF8) orelse return false;
+    defer CFRelease(want);
+    var i: isize = 0;
+    while (i < CFArrayGetCount(names)) : (i += 1) {
+        const name = CFArrayGetValueAtIndex(names, i) orelse continue;
+        if (CFEqual(name, want)) return true;
+    }
+    return false;
 }

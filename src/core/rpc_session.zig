@@ -13,6 +13,7 @@ const log_mod = @import("log.zig");
 const Logger = log_mod.Logger;
 const flush = @import("flush.zig");
 const nvim_core = @import("nvim_core.zig");
+const font_slots = @import("font_slots.zig");
 const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
 const rpc_transport = @import("rpc_transport.zig");
@@ -699,6 +700,43 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
+    // An error answers the request too: Neovim will not resize for it.
+    if (id != 0) if (self.osResizeAnswered(id)) |grid_id| {
+        if (has_err) self.osResizeRefused(grid_id);
+        return;
+    };
+
+    if (id != 0 and id == self.font_query_msgid) {
+        self.font_query_msgid = 0;
+        // An error keeps the current state; the next trigger asks again.
+        if (has_err) return;
+        var answers: [max_font_answers]WindowFontAnswer = undefined;
+        const n = parseWindowFontAnswers(top[3], &answers);
+        self.grid_mu.lockUncancelable(clock.io());
+        self.drainOsResizesLocked();
+        // Frontends commit on_grid_font at flush end. A resize brings its
+        // own grid_resize batch and flush; a float, or a font that needs no
+        // resize, has nothing else coming and is flushed here, even when
+        // another answer in the batch resized.
+        var needs_flush = false;
+        for (answers[0..n]) |a| {
+            // A window not yet placed (opened and given a font in one Lua
+            // chunk) is asked again by its placement, past the throttle.
+            if (!a.valid or self.gridForWin(a.win) == null) _ = self.font_query_last_ns.remove(a.win);
+            const rev_before = self.grid.cursor_rev;
+            const resizes_before = self.font_resize_outbox.items.len;
+            self.applyWindowFontLocked(a);
+            if (self.grid.cursor_rev != rev_before and self.font_resize_outbox.items.len == resizes_before) needs_flush = true;
+        }
+        // Windows queued while this query was in flight go out now.
+        self.takeFontQueriesLocked(clock.nowNs());
+        self.grid_mu.unlock(clock.io());
+        self.sendFontResizes();
+        self.sendFontQueries();
+        if (needs_flush) forceGlowFlush(self);
+        return;
+    }
+
     if (takeTrackedRequest(&self.glow_request_msgid, id)) {
         if (has_err) {
             // The next redraw re-requests it.
@@ -708,6 +746,52 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
         applyGlowConfig(self, top[3]);
     }
+}
+
+/// Windows per font query; the reply is parsed into a stack array this size.
+pub const max_font_answers = 64;
+
+pub const WindowFontAnswer = struct {
+    win: i64,
+    valid: bool,
+    guifont: ?[]const u8 = null,
+    zonvie_scale: ?f64 = null,
+    neovide_scale: ?f64 = null,
+};
+
+fn numberOf(v: mp.Value) ?f64 {
+    return switch (v) {
+        .int => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+/// Rows of font_query_lua's result. A malformed row is skipped.
+pub fn parseWindowFontAnswers(result: mp.Value, out: []WindowFontAnswer) usize {
+    if (result != .arr) return 0;
+    var n: usize = 0;
+    for (result.arr) |row| {
+        if (n == out.len) break;
+        if (row != .arr or row.arr.len < 2 or row.arr[0] != .int or row.arr[1] != .bool) continue;
+        const r = row.arr;
+        if (!r[1].bool) {
+            out[n] = .{ .win = r[0].int, .valid = false };
+            n += 1;
+            continue;
+        }
+        if (r.len < 5) continue;
+        out[n] = .{
+            .win = r[0].int,
+            .valid = true,
+            .guifont = if (r[2] == .str and r[2].str.len > 0) r[2].str else null,
+            // NaN would defeat slot dedup; a non-finite or non-positive scale is unset.
+            .zonvie_scale = if (numberOf(r[3])) |s| (if (std.math.isFinite(s) and s > 0) font_slots.clampZonvieScale(s) else null) else null,
+            .neovide_scale = numberOf(r[4]),
+        };
+        n += 1;
+    }
+    return n;
 }
 
 /// Whether an nvim_win_get_config result describes a float that tracks the
@@ -738,7 +822,8 @@ fn takeTrackedRequest(slot: *std.atomic.Value(i64), id: i64) bool {
 }
 
 /// Force full vertex regeneration (dirty_all + onFlush).
-/// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
+/// Used when glow state changes to ensure DECO_GLOW flags are set/cleared,
+/// and when a font answer changes a grid no redraw batch will follow.
 fn forceGlowFlush(self: *Core) void {
     self.lockGridAsRedrawOwner();
     defer self.unlockGridAsRedrawOwner();
@@ -1460,6 +1545,26 @@ pub fn setupAgentStatus(self: *Core) void {
 /// Every platform: the message float's wheel (shared core code) reads it too,
 /// and without the reporter Windows scrolled it 3 lines whatever 'mousescroll'
 /// said, 'ver:0' included.
+/// zonvie.set_window_font(winid, { guifont = ?, scale = ? }): write the
+/// window variables and ask the core to read them now. Writing the variables
+/// directly also works; they are picked up on the next trigger.
+pub fn setupWindowFontHelper(self: *Core) void {
+    const lua_code =
+        \\_G.zonvie = _G.zonvie or {}
+        \\function _G.zonvie.set_window_font(win, spec)
+        \\  if win == nil or win == 0 then win = vim.api.nvim_get_current_win() end
+        \\  spec = spec or {}
+        \\  vim.w[win].zonvie_guifont = spec.guifont
+        \\  vim.w[win].zonvie_font_scale = spec.scale
+        \\  pcall(vim.rpcnotify, vim.g.zonvie_channel or 0, 'zonvie_window_font', win)
+        \\end
+    ;
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupWindowFontHelper: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+}
+
 pub fn setupMouseScrollReporter(self: *Core) void {
     const lua_code =
         \\local function report()
@@ -1698,6 +1803,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // execute while grid_mu is held. Callbacks MUST NOT call
         // zonvie_core_get_* or other APIs that acquire grid_mu.
         self.lockGridAsRedrawOwner();
+        self.drainOsResizesLocked();
 
         var fctx = flush.FlushCtx{ .core = self };
         var redraw_error: ?anyerror = null;
@@ -1878,9 +1984,16 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
+        self.settleFontGridResizesLocked();
+        self.drainFontReleasesLocked();
         self.takeFloatConfigQueriesLocked();
+        if (self.perGridFontsEnabled()) self.takeFontQueriesLocked(clock.nowNs()) else self.grid.font_query_wanted.clearRetainingCapacity();
+        self.takeExternalSplitReleasesLocked();
         self.unlockGridAsRedrawOwner();
         self.sendFloatConfigQueries();
+        self.sendFontResizes();
+        self.sendSplitReleases();
+        self.sendFontQueries();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -1889,6 +2002,18 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         {
             // Only send if no request already pending (avoid burning retries)
             self.requestGlowConfig();
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_window_font")) {
+        // The helper wrote the variables; read them now, past the throttle.
+        if (!self.perGridFontsEnabled()) return;
+        if (params.len > 0 and params[0] == .int and params[0].int > 0) {
+            const win = params[0].int;
+            self.grid_mu.lockUncancelable(clock.io());
+            self.grid.wantFontQuery(win);
+            self.font_query_forced.append(self.alloc, win) catch {};
+            self.takeFontQueriesLocked(clock.nowNs());
+            self.grid_mu.unlock(clock.io());
+            self.sendFontQueries();
         }
     } else if (std.mem.eql(u8, method, "zonvie_ime_off")) {
         // Custom RPC notification for IME off (user-invokable)
@@ -2518,6 +2643,7 @@ pub fn runLoop(self: *Core) void {
         // Report 'mousescroll' so the trackpad path and the message float's
         // wheel know how many rows one wheel event is worth.
         setupMouseScrollReporter(self);
+        if (self.perGridFontsEnabled()) setupWindowFontHelper(self);
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
@@ -4088,4 +4214,220 @@ test "only a window-relative float at a buffer position follows the scroll" {
     try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &win_rowcol }));
     try std.testing.expect(!floatConfigFollowsScroll(.{ .map = &editor }));
     try std.testing.expect(!floatConfigFollowsScroll(.nil));
+}
+
+test "a font answer parses the three variables and an invalid window" {
+    var row_ok = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .{ .str = "Menlo:h18" }, .{ .float = 0.5 }, .nil };
+    var row_gone = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = false } };
+    var rows = [_]mp.Value{ .{ .arr = &row_ok }, .{ .arr = &row_gone } };
+    var out: [4]WindowFontAnswer = undefined;
+    const n = parseWindowFontAnswers(.{ .arr = &rows }, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(out[0].valid);
+    try std.testing.expectEqualStrings("Menlo:h18", out[0].guifont.?);
+    try std.testing.expectEqual(@as(f64, 0.5), out[0].zonvie_scale.?);
+    try std.testing.expect(out[0].neovide_scale == null);
+    try std.testing.expect(!out[1].valid);
+}
+
+// A NaN scale would never compare equal in slot dedup.
+test "a font answer treats a non-finite or non-positive zonvie_font_scale as unset" {
+    const bad = [_]f64{ std.math.nan(f64), std.math.inf(f64), 0, -1 };
+    for (bad) |s| {
+        var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .nil, .{ .float = s }, .nil };
+        var rows = [_]mp.Value{.{ .arr = &row }};
+        var out: [1]WindowFontAnswer = undefined;
+        try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+        try std.testing.expect(out[0].zonvie_scale == null);
+    }
+}
+
+test "a font answer for a window no longer mapped is dropped, and a session reset forgets the in-flight query" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 77;
+    try core.grid.resizeGrid(1, 10, 40);
+    try core.grid.resizeGrid(2, 5, 20);
+    try core.grid.setWinPos(2, 2000, 0, 0); // grid 2 now shows a different window
+    const seeded: @import("grid.zig").GridFont = .{ .win_id = 2000, .font_id = 3, .mode = .resize, .cell_w_px = 9, .cell_h_px = 18, .frame_rows = 5, .frame_cols = 20 };
+    try core.grid.grid_fonts.put(core.alloc, 2, seeded);
+    var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .{ .str = "X:h30" }, .nil, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 77 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expectEqual(seeded, core.grid.grid_fonts.get(2).?);
+    try std.testing.expectEqual(@as(i64, 0), core.font_query_msgid);
+    core.font_query_msgid = 78;
+    try core.font_query_last_ns.put(core.alloc, 2000, 5);
+    core.resetFontSlotsForNewSession();
+    try std.testing.expectEqual(@as(i64, 0), core.font_query_msgid);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_last_ns.count());
+}
+
+test "a session reset releases loaded font slots only" {
+    const S = struct {
+        var released: [4]u32 = undefined;
+        var n: usize = 0;
+        fn release(_: ?*anyopaque, id: u32) callconv(.c) void {
+            released[n] = id;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cb.on_font_slot_release = S.release;
+    const loaded = try core.font_slots.acquire("A:h10", 1.0);
+    core.font_slots.markLoaded(loaded.font_id, 8, 16);
+    _ = try core.font_slots.acquire("B:h10", 1.0); // load never succeeded
+    core.resetFontSlotsForNewSession();
+    try std.testing.expectEqualSlices(u32, &.{loaded.font_id}, S.released[0..S.n]);
+    try std.testing.expect(!core.font_slots.slot(loaded.font_id).loaded);
+}
+
+test "an unset window is re-queried at most once a second unless forced" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+    core.noteFontQueriesSent(10 * std.time.ns_per_s);
+    core.font_query_outbox.clearRetainingCapacity();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_outbox.items.len);
+    core.grid.wantFontQuery(1000);
+    try core.font_query_forced.append(core.alloc, 1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + 600 * std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "a window taken but never sent is not throttled" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    core.font_query_outbox.clearRetainingCapacity();
+    core.grid.wantFontQuery(1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "a window queued while a query is in flight waits for the reply and keeps its forced flag" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 5;
+    try core.font_query_last_ns.put(core.alloc, 1000, 10 * std.time.ns_per_s);
+    core.grid.wantFontQuery(1000);
+    try core.font_query_forced.append(core.alloc, 1000);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), core.font_query_outbox.items.len);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.grid.font_query_wanted.items);
+    core.font_query_msgid = 0;
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s + std.time.ns_per_ms);
+    try std.testing.expectEqualSlices(i64, &.{1000}, core.font_query_outbox.items);
+}
+
+test "one font query carries at most the answers one reply can hold; the rest wait" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var w: i64 = 1000;
+    while (w < 1070) : (w += 1) core.grid.wantFontQuery(w);
+    core.takeFontQueriesLocked(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, max_font_answers), core.font_query_outbox.items.len);
+    try std.testing.expectEqual(@as(usize, 70 - max_font_answers), core.grid.font_query_wanted.items.len);
+    try std.testing.expectEqual(@as(i64, 1000 + max_font_answers), core.grid.font_query_wanted.items[0]);
+}
+
+test "a font answer for a closed window forgets its throttle stamp" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 9;
+    try core.font_query_last_ns.put(core.alloc, 1001, 5);
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = false } };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expect(!core.font_query_last_ns.contains(1001));
+}
+
+test "a font answer for a window not yet placed lets its placement ask again at once" {
+    // A float opened and given a font in one Lua chunk: the helper's notify
+    // is read before the float's win_float_pos, so the answer finds no grid.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.font_query_msgid = 9;
+    try core.font_query_last_ns.put(core.alloc, 1001, clock.nowNs());
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = true }, .{ .str = "A:h18" }, .nil, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    core.grid.wantFontQuery(1001); // win_float_pos
+    core.takeFontQueriesLocked(clock.nowNs());
+    try std.testing.expectEqualSlices(i64, &.{1001}, core.font_query_outbox.items);
+}
+
+test "a font answer caps zonvie_font_scale to the range a frontend can rasterize" {
+    var row = [_]mp.Value{ .{ .int = 1000 }, .{ .bool = true }, .nil, .{ .float = 1e30 }, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var out: [1]WindowFontAnswer = undefined;
+    try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+    try std.testing.expectEqual(@as(f64, @import("font_slots.zig").max_zonvie_scale), out[0].zonvie_scale.?);
+    row[3] = .{ .float = 1e-30 };
+    try std.testing.expectEqual(@as(usize, 1), parseWindowFontAnswers(.{ .arr = &rows }, &out));
+    try std.testing.expectEqual(@as(f64, @import("font_slots.zig").min_zonvie_scale), out[0].zonvie_scale.?);
+}
+
+test "throttle stamps past the throttle window are dropped when a query is sent" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.font_query_last_ns.put(core.alloc, 1001, 0);
+    try core.font_query_outbox.append(core.alloc, 1002);
+    core.noteFontQueriesSent(5 * std.time.ns_per_s);
+    try std.testing.expect(!core.font_query_last_ns.contains(1001));
+    try std.testing.expect(core.font_query_last_ns.contains(1002));
+}
+
+test "a font answer for a float flushes so the frontend commits the font" {
+    const S = struct {
+        var flushes: u32 = 0;
+        fn load(_: ?*anyopaque, _: u32, _: [*]const u8, _: usize, _: f32, w: *u32, h: *u32) callconv(.c) c_int {
+            w.* = 5;
+            h.* = 10;
+            return 1;
+        }
+        fn release(_: ?*anyopaque, _: u32) callconv(.c) void {}
+        fn begin(_: ?*anyopaque) callconv(.c) void {
+            flushes += 1;
+        }
+        fn gridFont(_: ?*anyopaque, _: i64, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+        fn shape(_: ?*anyopaque, _: u32, _: [*]const u32, _: usize, _: u32, _: [*]u32, _: [*]u32, _: [*]i32, _: [*]i32, _: [*]i32, _: usize) callconv(.c) usize {
+            return 0;
+        }
+        fn raster(_: ?*anyopaque, _: u32, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    S.flushes = 0;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cb.on_font_slot_load = S.load;
+    core.cb.on_font_slot_release = S.release;
+    core.cb.on_grid_font = S.gridFont;
+    core.cb.on_shape_text_run_ex = S.shape;
+    core.cb.on_rasterize_glyph_ex = S.raster;
+    core.cb.on_rasterize_glyph_by_id_ex = S.raster;
+    core.cb.on_flush_begin = S.begin;
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resizeGrid(1, 24, 80);
+    try core.grid.resizeGrid(3, 4, 20);
+    try core.grid.setWinFloatPos(3, 1001, 1, 1, 50, 0, 1, true);
+    core.font_query_msgid = 9;
+    var row = [_]mp.Value{ .{ .int = 1001 }, .{ .bool = true }, .nil, .{ .float = 0.5 }, .nil };
+    var rows = [_]mp.Value{.{ .arr = &row }};
+    var top = [_]mp.Value{ .{ .int = 1 }, .{ .int = 9 }, .nil, .{ .arr = &rows } };
+    handleRpcResponse(&core, &top);
+    try std.testing.expect(core.grid.grid_fonts.contains(3));
+    try std.testing.expectEqual(@as(u32, 1), S.flushes);
 }
