@@ -120,6 +120,11 @@ test "e2e:highlight_change" {
     try @import("scenarios/highlight_change.zig").run(testing.allocator);
 }
 
+test "e2e:special_color_matches" {
+    try requireNvim();
+    try @import("scenarios/special_color_matches.zig").run(testing.allocator);
+}
+
 test "e2e:external_window_cursor" {
     try requireNvim();
     try @import("scenarios/external_window_cursor.zig").run(testing.allocator);

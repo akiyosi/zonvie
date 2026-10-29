@@ -2465,7 +2465,10 @@ pub fn runLoop(self: *Core) void {
                     };
                     self.child_reaper = r;
                     self.child_reaper_thread = std.Thread.spawn(.{
-                        .stack_size = 128 * 1024,
+                        // glibc rejects a stack too small for its own
+                        // minimum plus guard and static TLS; on aarch64 that
+                        // floor is above 256 KiB (pthread_create EINVAL).
+                        .stack_size = 512 * 1024,
                         .allocator = reaper_alloc,
                     }, ChildReaper.run, .{r}) catch blk: {
                         reaper_alloc.destroy(r);
