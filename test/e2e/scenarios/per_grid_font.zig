@@ -230,3 +230,40 @@ pub fn runFontViewFloat(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u32, 20), sz.cols);
     try std.testing.expectEqual(@as(u64, 0), h.fontResizeStats().requests);
 }
+
+/// A right click opens the PopUp menu below the clicked cell
+/// (popupmenu.c pum_position_at_mouse: "NW" at the next row of the
+/// clicked grid), its text column on the clicked column with one space
+/// column of the menu's own cells left of it (pum_redraw: col_off = 1).
+/// In a split in its own font the clicked cell is drawn larger than a
+/// global cell, so the menu must start on the first global row past the
+/// cell's bottom edge, and its text on the global column holding the
+/// cell's left edge.
+pub fn runRightClickMenu(alloc: std.mem.Allocator) !void {
+    var h = try Harness.init(alloc, .{ .font_slots = true });
+    defer h.deinit();
+    try h.command("set mouse=a mousemodel=popup_setpos");
+    const pair = try vsplitPair(h);
+    const frame = h.subGridSize(pair.left) orelse return error.GridNotFound;
+    try h.command("lua zonvie.set_window_font(0, { guifont = 'Big:h28' })");
+    // Slot cell 20x40: half the rows and cols.
+    try waitGridSize(h, pair.left, requestedCells(frame.rows, global_cell_h_px, 40), requestedCells(frame.cols, global_cell_w_px, 20));
+    const font = h.gridFont(pair.left) orelse return error.GridNotFound;
+    const split = h.gridPos(pair.left) orelse return error.GridNotFound;
+
+    const before = try h.positionedGridsAlloc(alloc);
+    defer alloc.free(before);
+    const click_row: u32 = 1;
+    const click_col: u32 = 2;
+    h.core.sendMouseInput("right", "press", "", pair.left, click_row, click_col);
+    h.core.sendMouseInput("right", "release", "", pair.left, click_row, click_col);
+    const menu = try newPositionedGrid(h, alloc, before);
+    const pos = h.gridPos(menu) orelse return error.GridNotFound;
+    try std.testing.expectEqual(pair.left, pos.anchor_grid);
+
+    const bottom_px = (click_row + 1) * font.cell_h_px;
+    const left_px = click_col * font.cell_w_px;
+    try std.testing.expectEqual(split.row + (bottom_px + global_cell_h_px - 1) / global_cell_h_px, pos.row);
+    try std.testing.expectEqual(split.col + left_px / global_cell_w_px - 1, pos.col);
+    try h.input("<Esc>");
+}

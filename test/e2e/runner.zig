@@ -110,6 +110,11 @@ test "e2e:per_grid_font_font_view_float_z_order" {
     try @import("scenarios/per_grid_font.zig").runFontViewFloatKeepsZOrder(testing.allocator);
 }
 
+test "e2e:per_grid_font_right_click_menu" {
+    try requireNvim();
+    try @import("scenarios/per_grid_font.zig").runRightClickMenu(testing.allocator);
+}
+
 test "e2e:wide_chars" {
     try requireNvim();
     try @import("scenarios/wide_chars.zig").run(testing.allocator);

@@ -1241,6 +1241,9 @@ pub const FloatAnchor = struct {
     east: bool,
     row: i64,
     col: i64,
+    /// The popupmenu: its first column is a pad of its own cells and its
+    /// text starts on anchor column + 1 (popupmenu.c pum_redraw col_off).
+    pum_pad: bool = false,
 };
 
 pub const grid_font = @import("grid_font.zig");
@@ -2408,7 +2411,11 @@ pub const Grid = struct {
         // A float below its anchor starts on the main row holding the anchor's
         // px edge, one above it ends there, so neither covers the anchor row.
         var row = std.math.add(i64, base_row, scale.cells(a.row, anchor_m.cell_h_px, main_m.cell_h_px, !a.south) orelse return null) catch return null;
-        var col = std.math.add(i64, base_col, scale.cells(a.col, anchor_m.cell_w_px, main_m.cell_w_px, false) orelse return null) catch return null;
+        // The popupmenu's pad is one of its own cells, not the anchor's: its
+        // text lands on the anchor's column, the pad one main cell before.
+        const pad: i64 = @intFromBool(a.pum_pad);
+        var col = std.math.add(i64, base_col, scale.cells(a.col + pad, anchor_m.cell_w_px, main_m.cell_w_px, false) orelse return null) catch return null;
+        col -= pad;
 
         if (self.sub_grids.get(grid_id)) |sg| {
             const rows_main = scale.cells(sg.rows, float_m.cell_h_px, main_m.cell_h_px, true) orelse return null;

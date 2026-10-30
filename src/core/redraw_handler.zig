@@ -2278,6 +2278,9 @@ fn onWinFloatPos(
                 .east = std.mem.indexOfScalar(u8, anchor, 'E') != null,
                 .row = anchor_row_i,
                 .col = anchor_col_i,
+                // win -1 is the popupmenu. It has a pad only right of
+                // column 0; at column 0 the two cases are not told apart.
+                .pum_pad = win_id == -1 and anchor_col_i > 0,
             };
             const at = grid.resolveAnchoredFloat(grid_id, anchor_grid, parsed_anchor) orelse continue;
             row_i64 = at.row;
