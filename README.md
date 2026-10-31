@@ -12,6 +12,9 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Wi
 - **Remote Development**:
   - SSH connection to remote hosts
   - Devcontainer support for containerized development environments
+- **Per-window Fonts**: give any window or float its own `guifont` / scale (`zonvie.set_window_font`)
+- **Smooth Scrolling**: wheel and trackpad scrolls eased per grid, on the main window and external windows
+- **Custom Shaders**: Shadertoy / Ghostty GLSL post-process chains, plus edit-effect inputs (`iCellAge`, `iPrevFrame`) for Thymer-style effects
 - **Customizable**: TOML configuration file
 
 ## Roadmap
@@ -42,7 +45,7 @@ xcodebuild -project macos/zonvie.xcodeproj -scheme zonvie -configuration Release
 
 ### Windows
 
-Build from source (requires Zig 0.15.x):
+Build from source (requires Zig 0.16.x):
 
 ```bash
 zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
@@ -388,8 +391,19 @@ Supported uniforms (Shadertoy + Ghostty 1.1+):
 `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iSampleRate`,
 `iDate`, `iWindowOffset`, `iWindowSize` (drop-in for ext windows),
 `iCurrentCursor`, `iPreviousCursor`, `iCurrentCursorColor`,
-`iPreviousCursorColor`, `iTimeCursorChange`. `iMouse` is reserved but
+`iPreviousCursorColor`, `iTimeCursorChange`, `iCursorVisible`,
+`iCurrentCursorStyle`, `iPreviousCursorStyle`. `iMouse` is reserved but
 currently unimplemented (always zero).
+
+Zonvie additions for edit effects:
+`iCellSize` / `iGridOrigin` (main grid cell size and top-left, drawable px),
+`iTimeLastEdit` (`iTime` of the most recent cell edit), `iPrevFrame` (the
+previous frame's final output, sampled like `iChannel0`) and `iCellAge`,
+read through the helper `zonvieCellAge(fragCoord)` — seconds since the
+cell under a pixel was last edited, or a large value if never. A shader
+containing the comment token `@zonvie-owns-cursor` draws the cursor itself;
+the native cursor pass is skipped. With `preserve_alpha = true` a shader
+owns its output alpha.
 
 `iChannel0` aliases the terminal contents (back buffer) so existing
 Ghostty / Shadertoy shaders that sample `texture(iChannel0, uv)`
@@ -402,6 +416,23 @@ Zonvie exposes several Neovim-side variables and RPC notifications for runtime c
 ### vim.g.zonvie_channel
 
 Set automatically on startup. Contains the RPC channel ID for communication with Zonvie.
+
+### Per-window fonts
+
+Any window can use its own font or scale:
+
+```lua
+zonvie.set_window_font(0, { guifont = "Iosevka:h18" })  -- 0 = current window
+zonvie.set_window_font(win, { scale = 1.5 })
+zonvie.set_window_font(win, {})                          -- back to the global font
+```
+
+The helper writes `vim.w.zonvie_guifont` / `vim.w.zonvie_font_scale` and
+asks Zonvie to apply them; setting those window variables directly also
+works and is picked up on the next update. A split keeps its frame and
+Neovim resizes its grid to fit the new cell; a float keeps its rows and
+columns and grows or shrinks on screen. `vim.w.neovide_font_scale` is
+honored on floats, and `zonvie_*` wins when both are set.
 
 ### vim.g.zonvie_glow (Neon Glow Effect)
 
