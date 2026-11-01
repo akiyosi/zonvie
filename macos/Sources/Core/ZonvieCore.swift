@@ -2081,7 +2081,6 @@ final class ZonvieCore {
                 guard let base = buf.baseAddress else { return -1 }
                 return zonvie_core_start_connect(core, base, buf.count, rows, cols)
             }
-            applyCoreLogOptions()
             noteStarted(result == 0)
             return result
         }
@@ -2200,8 +2199,6 @@ final class ZonvieCore {
         // drawable update, which is what unblocks ui_attach. This mirrors the
         // Windows doEarlyCoreInit() / WM_SIZE flow where notify_layout_ready
         // also fires after the actual window dimensions settle.
-
-        applyCoreLogOptions()
 
         return result
     }
@@ -2546,7 +2543,6 @@ final class ZonvieCore {
         // call is idempotent: first writer wins). Trust the
         // MetalTerminalView path to deliver the actual rows/cols computed
         // from the post-layout drawable size, exactly like the native path.
-        applyCoreLogOptions()
 
         // Note: Progress dialog will be closed by neovimReadyNotification observer
         // Don't close it here - nvim may not be ready yet
@@ -2566,6 +2562,9 @@ final class ZonvieCore {
         // band crosses.
         setBlurEnabled(true)
         setInheritCwd(noforkMode)
+        // The run thread logs from its first instruction, so its logger
+        // must already be in its final state.
+        applyCoreLogOptions()
         // [performance] sizes and option_as_meta: zonvie_core_load_config.
     }
 

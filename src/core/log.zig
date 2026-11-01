@@ -42,7 +42,9 @@ pub const Logger = struct {
     scroll_only: bool = false,
 
     pub fn write(self: *Logger, comptime fmt: []const u8, args: anytype) void {
-        if (self.cb == null) return;
+        // Read once: zonvie_core_set_log_enabled may clear `cb` from another
+        // thread between a check and the call.
+        const cb = self.cb orelse return;
         // Match the closed forms only ("[perf]" / "[perf_xxx]") so a future
         // unrelated tag like "[performance_audit]" doesn't accidentally pass
         // the perf-only filter.
@@ -57,7 +59,7 @@ pub const Logger = struct {
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
         enterCallback();
         defer leaveCallback();
-        self.cb.?(self.ctx, msg.ptr, msg.len);
+        cb(self.ctx, msg.ptr, msg.len);
     }
 
     /// True when callers should pay the cost of building a [perf] line.
