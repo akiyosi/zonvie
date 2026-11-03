@@ -1984,6 +1984,8 @@ typedef struct zonvie_config_values {
     // read directly from the parsed config by the Windows frontend, so it is
     // not exposed here.
     const char* server_open_mode;  // "tab" or "current"
+    // scroll
+    uint8_t scroll_large_jump;  // ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

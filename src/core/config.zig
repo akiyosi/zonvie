@@ -1000,12 +1000,10 @@ else "") ++
     \\        delay           Seconds before hiding in "scroll" mode
     \\
     \\
-    ++ (if (is_windows)
     \\    [scroll]
     \\        large_jump_behavior  "snap" or "partial" (default: "snap")
     \\
     \\
-else "") ++
     \\    [cmdline]
     \\        external        Enable external command line UI
     \\        copy_button     Copy button on the external cmdline (default: true)

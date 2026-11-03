@@ -1382,7 +1382,7 @@ final class SessionScrollModel {
             let capVer = abs(rowsDelta) <= ver ? max(ver, ScrollRetention.minDepthRows) : ver
             guard zonvie_scroll_spring_seed(&spring, nowNs, Int32(clamping: rowsDelta),
                                             Int32(clamping: Int(CGFloat(renderer.rowHeightPx(gridId)).rounded())), Int32(clamping: capVer),
-                                            UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { continue }
+                                            ZonvieConfig.shared.scroll.largeJump) else { continue }
             easeSprings[gridId] = spring
             scrollOffsetPx[gridId] = CGFloat(spring.offset_px)
             smoothScrollGrids.insert(gridId)

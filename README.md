@@ -268,7 +268,7 @@ paths = [
 | `opacity` | Scrollbar opacity (0.0-1.0) |
 | `delay` | Delay in seconds before hiding (0.1-10.0, for "scroll" mode) |
 
-#### [scroll] (Windows)
+#### [scroll]
 | Key | Description |
 |-----|-------------|
 | `large_jump_behavior` | A scroll of up to one wheel event (`mousescroll` ver) rows is eased. A larger one (CTRL-D, page keys): "snap" lands it at once, "partial" eases its last rows (default "snap") |

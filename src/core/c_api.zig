@@ -3107,6 +3107,8 @@ pub const zonvie_config_values = extern struct {
     // read directly from config.Config by the Windows frontend, so it is not
     // mirrored here.
     server_open_mode: [*:0]const u8 = "tab", // "tab" or "current"
+    // scroll: ZONVIE_LARGE_JUMP_PARTIAL / ZONVIE_LARGE_JUMP_SNAP
+    scroll_large_jump: u8 = @intFromEnum(cfg_defaults.scroll.large_jump_behavior),
 };
 
 const ConfigHandle = struct {
@@ -3225,6 +3227,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .input_swap_colon_semicolon = cfg.input.swap_colon_semicolon,
         // server
         .server_open_mode = dupeZForC(alloc, cfg.server.open_mode, "tab"),
+        // scroll
+        .scroll_large_jump = @intFromEnum(cfg.scroll.large_jump_behavior),
     };
 }
 

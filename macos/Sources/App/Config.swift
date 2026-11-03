@@ -6,6 +6,7 @@ struct ZonvieConfig {
     var font: FontConfig = FontConfig()
     var window: WindowConfig = WindowConfig()
     var scrollbar: ScrollbarConfig = ScrollbarConfig()
+    var scroll: ScrollConfig = ScrollConfig()
     var cmdline: CmdlineConfig = CmdlineConfig()
     var popup: PopupConfig = PopupConfig()
     var messages: MessagesConfig = MessagesConfig()
@@ -89,6 +90,11 @@ struct ZonvieConfig {
         var isAlways: Bool { hasMode("always") }
         var isHover: Bool { hasMode("hover") }
         var isScroll: Bool { hasMode("scroll") }
+    }
+
+    struct ScrollConfig {
+        /// ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
+        var largeJump: UInt8 = UInt8(ZONVIE_LARGE_JUMP_SNAP)
     }
 
     struct CmdlineConfig {
@@ -278,6 +284,7 @@ struct ZonvieConfig {
         if let s = v.scrollbar_show_mode { config.scrollbar.showMode = String(cString: s) }
         config.scrollbar.opacity = Double(v.scrollbar_opacity)
         config.scrollbar.delay = Double(v.scrollbar_delay)
+        config.scroll.largeJump = v.scroll_large_jump
 
         // Ext features
         config.cmdline.external = v.cmdline_external

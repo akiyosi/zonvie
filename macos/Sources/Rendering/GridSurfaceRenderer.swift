@@ -741,7 +741,7 @@ func stageSurfaceEaseSeed(
     stagedSmoothScrollSeeds: inout [(gridId: Int64, rowsDelta: Int)]
 ) {
     guard zonvie_scroll_ease_admits(Int32(clamping: rowsDelta), Int32(clamping: mousescrollVer),
-                                    UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { return }
+                                    ZonvieConfig.shared.scroll.largeJump) else { return }
     lock.lock()
     stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
     lock.unlock()
