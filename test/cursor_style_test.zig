@@ -25,7 +25,7 @@ const Stub = struct {
     fn onLinespace(_: *Stub, _: i32) anyerror!void {}
     fn onSetTitle(_: *Stub, _: []const u8) anyerror!void {}
     fn onDefaultColors(_: *Stub, _: u32, _: u32) anyerror!void {}
-    fn onRestart(_: *Stub, _: []const u8) anyerror!void {}
+    fn onRestart(_: *Stub, _: []const u8, _: ?bool) anyerror!void {}
     fn onConnect(_: *Stub, _: []const u8) anyerror!void {}
 };
 

@@ -1686,7 +1686,7 @@ pub fn handleRedraw(
     linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
     set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
-    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
+    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8, detach: ?bool) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
@@ -3484,12 +3484,15 @@ fn onRestart(
     log: *Logger,
     tuples: []mp.Value,
     opt_ctx: anytype,
-    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
+    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8, detach: ?bool) anyerror!void,
 ) !void {
-    // restart: [listen_addr]
+    // restart: [listen_addr, chan_config]
     // Nvim invoked :restart and started a new server. The current
     // channel is about to close; the UI should attach to the new
-    // server at listen_addr after the close is observed.
+    // server at listen_addr after the close is observed. chan_config
+    // (Neovim 0.12+) carries this channel's `detach`, which the new
+    // socket channel does not inherit on its own. Older servers send
+    // [listen_addr] alone.
     if (restart_fn) |fn_ptr| {
         for (tuples) |tv| {
             if (tv != .arr) continue;
@@ -3497,8 +3500,9 @@ fn onRestart(
             if (t.len < 1 or t[0] != .str) continue;
 
             const listen_addr = t[0].str;
-            if (log.cb != null) log.write("restart: listen_addr={s}\n", .{listen_addr});
-            try fn_ptr(opt_ctx, listen_addr);
+            const detach: ?bool = if (t.len > 1 and t[1] == .map) mapGetBool(t[1].map, "detach") else null;
+            if (log.cb != null) log.write("restart: listen_addr={s} detach={?}\n", .{ listen_addr, detach });
+            try fn_ptr(opt_ctx, listen_addr, detach);
         }
     }
 }
@@ -3577,6 +3581,72 @@ fn testEvent(arena: std.mem.Allocator, name: []const u8, tuple: []mp.Value) ![]m
     const events = try arena.alloc(mp.Value, 1);
     events[0] = .{ .arr = ev };
     return events;
+}
+
+/// Runs one `restart` event through handleRedraw and reports what the
+/// restart callback received.
+const RestartProbe = struct {
+    calls: u32 = 0,
+    addr: []const u8 = "",
+    detach: ?bool = null,
+
+    fn onRestart(self: *RestartProbe, listen_addr: []const u8, detach: ?bool) anyerror!void {
+        self.calls += 1;
+        self.addr = listen_addr;
+        self.detach = detach;
+    }
+
+    fn run(self: *RestartProbe, grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, tuple: []mp.Value) !void {
+        const noop = struct {
+            fn preFlush(_: *RestartProbe) anyerror!void {}
+            fn flush(_: *RestartProbe, _: u32, _: u32) anyerror!void {}
+            fn guifont(_: *RestartProbe, _: []const u8) anyerror!void {}
+            fn linespace(_: *RestartProbe, _: i32) anyerror!void {}
+        };
+        var log = Logger{};
+        try handleRedraw(grid, hl, arena, try testEvent(arena, "restart", tuple), &log, self, noop.preFlush, noop.flush, self, noop.guifont, self, noop.linespace, null, null, RestartProbe.onRestart, null);
+    }
+};
+
+// Neovim 0.12 broadcasts `restart` as [listen_addr, chan_config]; the dict
+// carries the channel's `detach` so the UI can restore it on the new server
+// (api/ui.c remote_ui_restart). Older servers send [listen_addr] alone.
+test "a restart event passes the chan_config detach flag, or null without the dict" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    var hl = Highlights.init(alloc);
+    defer hl.deinit();
+
+    var probe = RestartProbe{};
+
+    const cfg = try arena.alloc(mp.Pair, 1);
+    cfg[0] = .{ .key = .{ .str = "detach" }, .val = .{ .bool = false } };
+    const with_dict = try arena.alloc(mp.Value, 2);
+    with_dict[0] = .{ .str = "/tmp/nvim.sock" };
+    with_dict[1] = .{ .map = cfg };
+    try probe.run(&grid, &hl, arena, with_dict);
+    try std.testing.expectEqual(@as(u32, 1), probe.calls);
+    try std.testing.expectEqualStrings("/tmp/nvim.sock", probe.addr);
+    try std.testing.expectEqual(@as(?bool, false), probe.detach);
+
+    const bare = try arena.alloc(mp.Value, 1);
+    bare[0] = .{ .str = "/tmp/old.sock" };
+    try probe.run(&grid, &hl, arena, bare);
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+    try std.testing.expectEqualStrings("/tmp/old.sock", probe.addr);
+    try std.testing.expectEqual(@as(?bool, null), probe.detach);
+
+    // A dict without the key is the same as no dict.
+    const empty_dict = try arena.alloc(mp.Value, 2);
+    empty_dict[0] = .{ .str = "/tmp/x.sock" };
+    empty_dict[1] = .{ .map = &[_]mp.Pair{} };
+    probe.detach = true;
+    try probe.run(&grid, &hl, arena, empty_dict);
+    try std.testing.expectEqual(@as(?bool, null), probe.detach);
 }
 
 /// cmdline_show tuple: [content, pos, firstc, prompt, indent]

@@ -2238,10 +2238,13 @@ pub fn runLoop(self: *Core) void {
         // Consumed below so a subsequent fall-through to spawn doesn't
         // see stale state.
         var was_connect_hotswap: bool = false;
-        if (self.restart_pending_addr) |a| {
-            self.restart_pending_addr = null;
-            was_connect_hotswap = self.restart_pending_is_connect_hotswap;
-            self.restart_pending_is_connect_hotswap = false;
+        // The old channel's `detach`, restored only on the socket session a
+        // restart reconnects to; a spawned fallback gets the embed default.
+        var chan_detach: ?bool = null;
+        if (self.takePendingReconnect()) |pending| {
+            const a = pending.addr;
+            was_connect_hotswap = pending.hotswap;
+            chan_detach = pending.chan_detach;
             if (is_remote_for_restart) {
                 if (was_connect_hotswap) {
                     // Remote-mode `:connect` hot-swap: the new server's
@@ -2612,7 +2615,7 @@ pub fn runLoop(self: *Core) void {
                 self.desired_resize_cols
             else
                 self.ui_attach_cols;
-            self.requestUiAttach(attach_rows, attach_cols) catch |e| {
+            self.requestSessionAttach(attach_rows, attach_cols, use_connect, chan_detach) catch |e| {
                 self.log.write("ui_attach send failed: {any}\n", .{e});
                 attach_failed = true;
             };

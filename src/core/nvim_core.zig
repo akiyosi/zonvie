@@ -799,6 +799,13 @@ pub const Core = struct {
     /// restart_pending_addr.
     restart_pending_is_connect_hotswap: bool = false,
 
+    /// The `detach` the `restart` event's chan_config broadcast for this
+    /// channel, restored on the new socket session with nvim_chan_set before
+    /// nvim_ui_attach (as Neovim's TUI does). Null when the server sent no
+    /// dict (pre-0.12 event shape) or the pending reconnect is a `:connect`.
+    /// Consumed by the run loop together with restart_pending_addr.
+    restart_chan_detach: ?bool = null,
+
     /// Set by handleConnectEvent. When true, the run loop's cleanup must
     /// NOT wait on or kill the spawned child — `:connect` is a hot-swap
     /// where the old nvim stays alive headless and would otherwise make
@@ -1419,6 +1426,7 @@ pub const Core = struct {
             self.restart_pending_addr = null;
         }
         self.restart_pending_is_connect_hotswap = false;
+        self.restart_chan_detach = null;
 
         // Shaping buffers.
         self.shaping_bufs.deinit(self.alloc);
@@ -4429,11 +4437,11 @@ pub const Core = struct {
     /// session iteration instead of firing on_exit.
     ///
     /// Called from the redraw thread (grid_mu held).
-    pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
+    pub fn handleRestartEvent(self: *Core, listen_addr: []const u8, detach: ?bool) !void {
         // :restart is NOT a hot-swap (the old nvim dies), so spawn fallback on
         // connect failure is the desired recovery. Resetting the flags also
         // clears one a prior :connect queued (then aborted).
-        self.queueReconnect(listen_addr, false) catch |e| {
+        self.queueReconnect(listen_addr, false, detach) catch |e| {
             self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
             return e;
         };
@@ -4458,7 +4466,7 @@ pub const Core = struct {
     /// (`:connect`, old server stays alive headless) from a server
     /// replacement (`:restart`, old server dies).
     pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
-        self.queueReconnect(server_addr, true) catch |e| {
+        self.queueReconnect(server_addr, true, null) catch |e| {
             self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
             return e;
         };
@@ -4468,13 +4476,36 @@ pub const Core = struct {
         self.emitOnConnect(server_addr);
     }
 
+    pub const PendingReconnect = struct {
+        /// Owned by the caller.
+        addr: []u8,
+        hotswap: bool,
+        chan_detach: ?bool,
+    };
+
+    /// Take the reconnect queued by restart/connect, clearing it so a later
+    /// session never reuses its address or detach value.
+    pub fn takePendingReconnect(self: *Core) ?PendingReconnect {
+        const addr = self.restart_pending_addr orelse return null;
+        const taken: PendingReconnect = .{
+            .addr = addr,
+            .hotswap = self.restart_pending_is_connect_hotswap,
+            .chan_detach = self.restart_chan_detach,
+        };
+        self.restart_pending_addr = null;
+        self.restart_pending_is_connect_hotswap = false;
+        self.restart_chan_detach = null;
+        return taken;
+    }
+
     /// Record the server the run loop reconnects to once this session ends,
     /// with its cleanup policy. On OOM nothing changes.
-    fn queueReconnect(self: *Core, addr: []const u8, hotswap: bool) !void {
+    fn queueReconnect(self: *Core, addr: []const u8, hotswap: bool, detach: ?bool) !void {
         const owned = try self.alloc.dupe(u8, addr);
         const old = self.restart_pending_addr;
         self.restart_pending_is_connect_hotswap = hotswap;
         self.connect_keeps_child_alive = hotswap;
+        self.restart_chan_detach = detach;
         // Published last so any observer that sees a pending reconnect also
         // sees its cleanup policy above.
         self.restart_pending_addr = owned;
@@ -4859,6 +4890,35 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_attach (notification, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
+    }
+
+    /// nvim_chan_set(0, {detach}) on the current channel. Sent before
+    /// nvim_ui_attach on a restarted session so a `:detach!` in the user's
+    /// config still wins.
+    pub fn requestChanSetDetach(self: *Core, detach: bool) !void {
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendNotificationHeader(&buf, "nvim_chan_set");
+        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packInt(&buf, self.alloc, 0);
+        try rpc.packMap(&buf, self.alloc, 1);
+        try rpc.packStr(&buf, self.alloc, "detach");
+        try rpc.packBool(&buf, self.alloc, detach);
+        try self.sendRaw(buf.items);
+
+        self.log.write("rpc send: nvim_chan_set (notification, detach={})\n", .{detach});
+    }
+
+    /// Attach a new session's UI. On a socket session a restart reconnected
+    /// to, the old channel's `detach` goes first; a spawned session keeps the
+    /// embed default. A failed chan_set is only logged: the channel then keeps
+    /// its socket default, which is no worse than not restoring it.
+    pub fn requestSessionAttach(self: *Core, rows: u32, cols: u32, over_socket: bool, chan_detach: ?bool) !void {
+        if (over_socket) if (chan_detach) |d| self.requestChanSetDetach(d) catch |e| {
+            self.log.write("nvim_chan_set send failed: {any}\n", .{e});
+        };
+        try self.requestUiAttach(rows, cols);
     }
 
     /// Tracked variants are used only by redraw recovery. Neovim flushes any
@@ -7473,11 +7533,95 @@ test "restart replaces connect cleanup policy before notifying observers" {
     try std.testing.expect(core.restart_pending_is_connect_hotswap);
     try std.testing.expect(core.connect_keeps_child_alive);
 
-    try core.handleRestartEvent("new-server");
+    try core.handleRestartEvent("new-server", null);
     try std.testing.expectEqual(@as(u32, 1), state.restart_calls);
     try std.testing.expect(state.saw_pending_restart);
     try std.testing.expect(!state.saw_connect_hotswap);
     try std.testing.expect(!state.saw_keep_child_alive);
+}
+
+// The restarted server is reached over a socket, whose channel defaults to
+// detach=true on Neovim master (channel.c). The embed channel it replaces was
+// detach=false, so without restoring the broadcast value a GUI crash after
+// :restart would leave the server running. Neovim's own TUI restores it with
+// nvim_chan_set before attaching (ui_client.c).
+test "restart keeps the chan_config detach flag until the socket session sends nvim_chan_set" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.handleRestartEvent("new-server", false);
+    try std.testing.expectEqual(@as(?bool, false), core.restart_chan_detach);
+
+    // A :connect hot-swap carries no dict and must not inherit a stale value.
+    try core.handleConnectEvent("other-server");
+    try std.testing.expectEqual(@as(?bool, null), core.restart_chan_detach);
+
+    try core.handleRestartEvent("new-server", true);
+    try std.testing.expectEqual(@as(?bool, true), core.restart_chan_detach);
+    try core.handleRestartEvent("legacy-server", null);
+    try std.testing.expectEqual(@as(?bool, null), core.restart_chan_detach);
+}
+
+test "taking a pending restart hands over its detach value exactly once" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.handleRestartEvent("new-server", false);
+    const first = core.takePendingReconnect().?;
+    defer std.testing.allocator.free(first.addr);
+    try std.testing.expectEqualStrings("new-server", first.addr);
+    try std.testing.expect(!first.hotswap);
+    try std.testing.expectEqual(@as(?bool, false), first.chan_detach);
+    // The next session iteration finds nothing to restore.
+    try std.testing.expect(core.takePendingReconnect() == null);
+    try std.testing.expectEqual(@as(?bool, null), core.restart_chan_detach);
+
+    try core.handleConnectEvent("other-server");
+    const second = core.takePendingReconnect().?;
+    defer std.testing.allocator.free(second.addr);
+    try std.testing.expect(second.hotswap);
+    try std.testing.expectEqual(@as(?bool, null), second.chan_detach);
+}
+
+/// nvim_chan_set notification as Neovim's TUI sends it (ui_client.c):
+/// [2, "nvim_chan_set", [0, {"detach": <bool>}]].
+fn expectedChanSetBytes(comptime detach: bool) []const u8 {
+    return "\x93\x02\xadnvim_chan_set" ++ "\x92\x00\x81\xa6detach" ++ (if (detach) "\xc3" else "\xc2");
+}
+const ui_attach_header = "\x93\x02\xaenvim_ui_attach";
+
+test "a restarted socket session restores detach before nvim_ui_attach" {
+    inline for (.{ false, true }) |detach| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try armTestWriter(&core);
+        defer core.writer_thread = null;
+
+        try core.requestSessionAttach(24, 80, true, detach);
+        const q = core.write_queue.items;
+        const chan_set = expectedChanSetBytes(detach);
+        try std.testing.expect(std.mem.startsWith(u8, q, chan_set));
+        try std.testing.expect(std.mem.startsWith(u8, q[chan_set.len..], ui_attach_header));
+    }
+}
+
+test "a spawned session or a restart without chan_config attaches without nvim_chan_set" {
+    const cases = [_]struct { over_socket: bool, detach: ?bool }{
+        // Connect failed and the loop fell back to spawning: embed default.
+        .{ .over_socket = false, .detach = false },
+        // Pre-0.12 restart event: nothing to restore.
+        .{ .over_socket = true, .detach = null },
+    };
+    for (cases) |c| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try armTestWriter(&core);
+        defer core.writer_thread = null;
+
+        try core.requestSessionAttach(24, 80, c.over_socket, c.detach);
+        try std.testing.expect(std.mem.startsWith(u8, core.write_queue.items, ui_attach_header));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, core.write_queue.items, "nvim_chan_set"));
+    }
 }
 
 fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
@@ -7486,7 +7630,7 @@ fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
 
     try core.handleConnectEvent("old-connect");
     const old = core.restart_pending_addr.?;
-    core.handleRestartEvent("new-restart") catch |err| {
+    core.handleRestartEvent("new-restart", null) catch |err| {
         try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);
         try std.testing.expectEqualSlices(u8, "old-connect", core.restart_pending_addr.?);
         try std.testing.expect(core.restart_pending_is_connect_hotswap);
@@ -7511,7 +7655,7 @@ fn checkConnectReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
 
-    try core.handleRestartEvent("old-restart");
+    try core.handleRestartEvent("old-restart", null);
     const old = core.restart_pending_addr.?;
     core.handleConnectEvent("new-connect") catch |err| {
         try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);

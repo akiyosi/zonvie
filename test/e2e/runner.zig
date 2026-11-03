@@ -225,6 +225,11 @@ test "e2e:restart_preedit_cleanup" {
     try @import("scenarios/restart_preedit_cleanup.zig").run(testing.allocator);
 }
 
+test "e2e:restart_chan_detach" {
+    try requireNvim();
+    try @import("scenarios/restart_chan_detach.zig").run(testing.allocator);
+}
+
 test "e2e:float_lifecycle" {
     try requireNvim();
     try @import("scenarios/float_lifecycle.zig").run(testing.allocator);

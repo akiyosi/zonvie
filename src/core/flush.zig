@@ -4148,8 +4148,8 @@ pub const FlushCtx = struct {
         ctx.core.emitDefaultColors(fg, bg);
     }
 
-    pub fn onRestart(ctx: *FlushCtx, listen_addr: []const u8) !void {
-        try ctx.core.handleRestartEvent(listen_addr);
+    pub fn onRestart(ctx: *FlushCtx, listen_addr: []const u8, detach: ?bool) !void {
+        try ctx.core.handleRestartEvent(listen_addr, detach);
     }
 
     pub fn onConnect(ctx: *FlushCtx, server_addr: []const u8) !void {
