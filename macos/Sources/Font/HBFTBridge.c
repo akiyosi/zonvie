@@ -22,6 +22,9 @@ struct zonvie_ft_hb_font {
   int owns_font_bytes;
   size_t font_len;
   uint32_t pixel_size;  // stored for hb_font_set_scale re-apply after variation changes
+  // The fixed strike a bitmap-only face was opened at (y ppem in px), or 0
+  // for a scalable face. Glyphs then come out at this size, not pixel_size.
+  uint32_t strike_px;
 
   // OpenType features for shaping (set via zonvie_ft_hb_font_set_features).
   hb_feature_t features[ZONVIE_MAX_FONT_FEATURES];
@@ -171,13 +174,29 @@ static zonvie_ft_hb_font* zonvie_ft_hb_font_create_impl(const uint8_t* font_byte
   f->pixel_size = pixel_size;
 
   // Use pixel size directly (already scaled by backingScale on Swift side).
-  if (FT_Set_Pixel_Sizes(f->ft_face, 0, pixel_size) != 0) goto fail;
+  if (FT_Set_Pixel_Sizes(f->ft_face, 0, pixel_size) != 0) {
+    // A bitmap-only face (CBDT/sbix colour emoji) has fixed strikes and no
+    // other size: take the nearest one. The caller scales its bitmaps
+    // (zonvie_ft_hb_font_strike_px).
+    if (!FT_HAS_FIXED_SIZES(f->ft_face) || f->ft_face->num_fixed_sizes <= 0) goto fail;
+    int best = 0;
+    long best_diff = -1;
+    for (int i = 0; i < f->ft_face->num_fixed_sizes; i++) {
+      long ppem = f->ft_face->available_sizes[i].y_ppem >> 6;
+      long diff = ppem > (long)pixel_size ? ppem - (long)pixel_size : (long)pixel_size - ppem;
+      if (best_diff < 0 || diff < best_diff) { best = i; best_diff = diff; }
+    }
+    if (FT_Select_Size(f->ft_face, best) != 0) goto fail;
+    f->strike_px = (uint32_t)(f->ft_face->available_sizes[best].y_ppem >> 6);
+  }
 
   f->hb_font = hb_ft_font_create_referenced(f->ft_face);
   if (!f->hb_font) goto fail;
 
-  // Make HarfBuzz positions come out in 26.6 pixel units.
-  hb_font_set_scale(f->hb_font, (int)(pixel_size * 64), (int)(pixel_size * 64));
+  // Make HarfBuzz positions come out in 26.6 pixel units: the strike's for a
+  // fixed-size face, so they match its bitmaps.
+  const uint32_t scale_px = f->strike_px ? f->strike_px : pixel_size;
+  hb_font_set_scale(f->hb_font, (int)(scale_px * 64), (int)(scale_px * 64));
   hb_ft_font_set_load_flags(f->hb_font, FT_LOAD_DEFAULT);
 
   f->hb_buf = hb_buffer_create();
@@ -190,6 +209,10 @@ static zonvie_ft_hb_font* zonvie_ft_hb_font_create_impl(const uint8_t* font_byte
 fail:
   zonvie_ft_hb_font_destroy(f);
   return NULL;
+}
+
+uint32_t zonvie_ft_hb_font_strike_px(const zonvie_ft_hb_font* f) {
+  return f ? f->strike_px : 0;
 }
 
 zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index) {

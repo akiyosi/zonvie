@@ -158,8 +158,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // window's screen column into the x the band must land on.
     const cell_w = blk: {
         // macOS logs the cell size when it resizes external windows to it;
-        // Windows when it applies a font.
-        const metrics_marker = if (builtin.os.tag == .windows) "[cell_metrics]" else "[resizeExternalWindows]";
+        // Windows and Linux when they apply a font.
+        const metrics_marker = if (builtin.os.tag == .macos) "[resizeExternalWindows]" else "[cell_metrics]";
         const line = (try app_log.lastLineSince(alloc, log_path, metrics_marker, 0)) orelse
             return error.CellMetricsUnknown;
         defer alloc.free(line);
