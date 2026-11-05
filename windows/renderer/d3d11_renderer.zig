@@ -4373,7 +4373,8 @@ fn isDeviceLost(hr: c.HRESULT) bool {
 /// this build (LF-normalized SHA-256). Stale bytecode is never used; every
 /// entry point then compiles at runtime instead.
 const main_hlsl_bytecode_current = blk: {
-    @setEvalBranchQuota(1_000_000);
+    // Comptime SHA-256 costs branches in proportion to main.hlsl's size.
+    @setEvalBranchQuota(2_000_000);
     if (compiled_shaders.hlsl_sha256.len == 0) break :blk true; // no hash recorded — trust the bytecode
     const hlsl = @embedFile("../shaders/main.hlsl");
     var normalized: [hlsl.len]u8 = undefined;

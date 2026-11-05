@@ -98,9 +98,32 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64, dpi_scale: f32) External
         0;
 
     return .{
-        .w = cmdline_icon_w + cmdline_padding + msg_padding + scrollbar_strip + copyButtonReservedPx(app, kind),
+        .w = cmdline_icon_w + cmdline_padding + msg_padding + scrollbar_strip + copyButtonReservedPx(app, kind) + closeBadgeReservePx(app, kind),
         .h = cmdline_padding + msg_padding,
     };
+}
+
+/// Leading width the msg_show close badge reserves, in client pixels. Zero on
+/// every other surface.
+fn closeBadgeReservePx(app: *const App, kind: ExternalSurfaceKind) c_int {
+    if (kind != .msg_show) return 0;
+    return @intFromFloat(core.frontend_rules.msgCloseBadgeReservePx(app.dpi_scale));
+}
+
+/// The msg_show close badge's box in client pixels, or null on another
+/// surface or a client too small for it (frontend_rules.msgCloseBadgeRect).
+fn closeBadgeRectPx(app: *const App, kind: ExternalSurfaceKind, client_w: c_int, client_h: c_int) ?c.RECT {
+    if (kind != .msg_show) return null;
+    const r = core.frontend_rules.msgCloseBadgeRect(@floatFromInt(client_w), @floatFromInt(client_h), app.dpi_scale) orelse return null;
+    return .{ .left = @intFromFloat(r.left), .top = @intFromFloat(r.top), .right = @intFromFloat(r.right), .bottom = @intFromFloat(r.bottom) };
+}
+
+/// True when (x, y) in client coordinates falls on the msg_show close badge.
+fn hitTestCloseBadge(hwnd: c.HWND, app: *App, grid_id: i64, x: i32, y: i32) bool {
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(hwnd, &client) == 0) return false;
+    const rect = closeBadgeRectPx(app, classifyExternalSurface(grid_id), client.right, client.bottom) orelse return false;
+    return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
 
 /// Client-pixel origin of a decorated external surface's content inside its own
@@ -123,7 +146,7 @@ pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedC
         },
         .msg_show, .msg_history => blk: {
             const pad: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            break :blk .{ .x = pad, .y = pad };
+            break :blk .{ .x = pad + @as(f32, @floatFromInt(closeBadgeReservePx(app, kind))), .y = pad };
         },
         .normal, .popupmenu => .{ .x = 0, .y = 0 },
     };
@@ -430,6 +453,38 @@ fn appendCopyIconVerts(
     return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id, copied);
 }
 
+/// Append the msg_show close badge in `look` (nothing while hidden or on
+/// another surface). Returns the new vertex index. Reserve
+/// app_mod.CLOSE_BADGE_VERTS in the scratch buffer before calling.
+fn appendCloseBadgeVerts(
+    app: *App,
+    kind: ExternalSurfaceKind,
+    grid_id: i64,
+    verts: []app_mod.Vertex,
+    idx: usize,
+    window_w: f32,
+    window_h: f32,
+    tint: [4]f32,
+    look: core.frontend_rules.MsgCloseBadgeLook,
+) usize {
+    if (look == .hidden) return idx;
+    const rect = closeBadgeRectPx(app, kind, @intFromFloat(window_w), @intFromFloat(window_h)) orelse return idx;
+    const paint = core.frontend_rules.msgCloseBadgePaint(look, app.dpi_scale);
+    const half_w = window_w / 2.0;
+    const half_h = window_h / 2.0;
+    return app_mod.addCloseBadgeVerts(
+        verts,
+        idx,
+        @as(f32, @floatFromInt(rect.left)) / half_w - 1.0,
+        1.0 - @as(f32, @floatFromInt(rect.top)) / half_h,
+        @as(f32, @floatFromInt(rect.right - rect.left)) / half_w,
+        @as(f32, @floatFromInt(rect.bottom - rect.top)) / half_h,
+        tint,
+        paint.fill_alpha,
+        grid_id,
+    );
+}
+
 /// Copy core content into `dst` at `start` through `ndc`. A bg quad within
 /// 0.005 of `match_bg` turns transparent so the window's own bg rect (blur, a
 /// shader) shows through; cursor quads are exempt, and `hide_cursor` hides
@@ -489,6 +544,7 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup) |ew| ew.surf.surface.cols else 0;
             const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
             const copy_copied = if (ext_win_relookup) |ew| ew.copy_button_copied else false;
+            const badge_look: core.frontend_rules.MsgCloseBadgeLook = if (ext_win_relookup) |ew| ew.msg_chrome.look() else .hidden;
             const cell_w = app.cell_w_px;
             const cell_h = app.rowHeightPx();
             const hide_cursor_for_ime = kind == .cmdline and app.ime_composing;
@@ -502,7 +558,7 @@ fn drawDecoratedExternalSurface(
             const content_origin = decoratedContentOriginPx(app, kind);
             const ndc = decoratedContentNdcTransform(content_origin.x, content_origin.y, window_w, window_h);
 
-            const extra_verts: usize = if (kind == .cmdline) 6 + 24 + 20 + app_mod.COPY_ICON_VERTS else 6 + app_mod.COPY_ICON_VERTS;
+            const extra_verts: usize = if (kind == .cmdline) 6 + 24 + 20 + app_mod.COPY_ICON_VERTS else 6 + app_mod.COPY_ICON_VERTS + app_mod.CLOSE_BADGE_VERTS;
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const out = scratch.items;
@@ -526,7 +582,8 @@ fn drawDecoratedExternalSurface(
                     idx = app_mod.addChevronIconVerts(out, idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
                 }
             }
-            break :blk appendCopyIconVerts(app, kind, grid_id, out, idx, window_w, window_h, icon_color, copy_hover, copy_copied);
+            idx = appendCopyIconVerts(app, kind, grid_id, out, idx, window_w, window_h, icon_color, copy_hover, copy_copied);
+            break :blk appendCloseBadgeVerts(app, kind, grid_id, out, idx, window_w, window_h, icon_color, badge_look);
         },
         .popupmenu => blk: {
             if (!(window_w > 0 and window_h > 0)) return false;
@@ -1281,6 +1338,16 @@ pub fn centredOnWorkArea(work: c.RECT, w: c_int, h: c_int, y_divisor: c_int) cor
     };
 }
 
+/// Whether placement may move msg_show back to its top-right slot: false once
+/// the user dragged it, until it closes (frontend_rules.MsgShowChrome).
+/// Takes `app.mu`: callers must not hold it.
+pub fn msgShowFollowsAnchor(app: *App) bool {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const ew = app.external_windows.get(app_mod.MESSAGE_GRID_ID) orelse return true;
+    return ew.msg_chrome.followsAnchor();
+}
+
 /// Keep msg_show below msg_history after msg_history is created or changes
 /// size, as macOS's linkedMsgShowFrame does. `app.mu` NOT held.
 pub fn restackMsgShowBelowHistory(app: *App) void {
@@ -1290,6 +1357,7 @@ pub fn restackMsgShowBelowHistory(app: *App) void {
     app.mu.unlock(core.clock.io());
     const hh = history_hwnd orelse return;
     const sh = show_hwnd orelse return;
+    if (!msgShowFollowsAnchor(app)) return;
     var history_rect: c.RECT = undefined;
     var show_rect: c.RECT = undefined;
     if (c.GetWindowRect(hh, &history_rect) == 0 or c.GetWindowRect(sh, &show_rect) == 0) return;
@@ -1371,6 +1439,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
             x = pos.x;
             y = pos.y;
         } else flags |= c.SWP_NOMOVE;
+    } else if (is_msg_show and !msgShowFollowsAnchor(app)) {
+        // Dragged by the user: resize in place, top-left kept.
+        flags |= c.SWP_NOMOVE;
     } else if (is_msg_show or is_msg_history) {
         const pos = msgFloatTopRight(app, is_msg_history, window_w);
         x = pos.x;
@@ -2599,7 +2670,20 @@ pub export fn ExternalWndProc(
                     if (msg == c.WM_LBUTTONDOWN and app.press_claim.held_mask == 0) {
                         ext_window.?.copy_button_pressed = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
                         if (ext_window.?.copy_button_pressed) return 0;
+                        ext_window.?.close_badge_pressed = hitTestCloseBadge(hwnd, app, grid_id.?, x, y);
+                        if (ext_window.?.close_badge_pressed) return 0;
                         if (scrollbar.mouseDown(app, scrollbar.externalSurface(ext_window.?, grid_id.?), x, y)) {
+                            return 0;
+                        }
+                        // Anywhere else on msg_show drags the window. The OS
+                        // move loop rather than HTCAPTION from WM_NCHITTEST:
+                        // that would turn every mouse message into its NC
+                        // variant and lose the hover the badge and the
+                        // auto-hide pause both read.
+                        // WM_MOVING pins the window once it actually moves.
+                        if (classifyExternalSurface(grid_id.?) == .msg_show) {
+                            _ = c.ReleaseCapture();
+                            _ = c.SendMessageW(hwnd, c.WM_NCLBUTTONDOWN, c.HTCAPTION, 0);
                             return 0;
                         }
                     }
@@ -2700,6 +2784,13 @@ pub export fn ExternalWndProc(
                         scrollbar.mouseUp(app, scrollbar.externalSurface(ext_window.?, grid_id.?));
                         return 0;
                     }
+                    const badge_pressed = ext_window.?.close_badge_pressed;
+                    ext_window.?.close_badge_pressed = false;
+                    if (badge_pressed) {
+                        if (!hitTestCloseBadge(hwnd, app, grid_id.?, x, y)) return 0;
+                        if (app.hwnd) |main_hwnd| _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_DISMISS, 0, 0);
+                        return 0;
+                    }
                     const copy_pressed = ext_window.?.copy_button_pressed;
                     ext_window.?.copy_button_pressed = false;
                     if (copy_pressed) {
@@ -2742,6 +2833,11 @@ pub export fn ExternalWndProc(
                     const copy_hover = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
                     if (copy_hover != ext_win.copy_button_hover) {
                         ext_win.copy_button_hover = copy_hover;
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+                    if (classifyExternalSurface(grid_id.?) == .msg_show and
+                        ext_win.msg_chrome.pointer(true, hitTestCloseBadge(hwnd, app, grid_id.?, x, y)))
+                    {
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
 
@@ -2791,6 +2887,9 @@ pub export fn ExternalWndProc(
                     setMsgHover(app, ext_win, grid_id.?, false);
                     if (ext_win.copy_button_hover) {
                         ext_win.copy_button_hover = false;
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+                    if (ext_win.msg_chrome.pointer(false, false)) {
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
                     scrollbar.leave(app, scrollbar.externalSurface(ext_win, grid_id.?));
@@ -2939,6 +3038,19 @@ pub export fn ExternalWndProc(
                 }
             }
             // For other windows, use default behavior
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        // Sent only while the user moves a window (the move loop the msg_show
+        // press starts), never for SetWindowPos: the first one pins msg_show,
+        // so a re-layout during the drag cannot pull it back, and a press that
+        // moves nothing never pins it.
+        c.WM_MOVING => {
+            if (app_mod.getApp(hwnd)) |app| {
+                if (findExternalWindowByHwnd(app, hwnd)) |h| {
+                    if (h.grid_id == app_mod.MESSAGE_GRID_ID) h.win.msg_chrome.dragEnded(true);
+                }
+            }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 

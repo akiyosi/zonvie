@@ -76,6 +76,7 @@ pub const zonvie_core_set_ext_tabline = core.zonvie_core_set_ext_tabline;
 pub const zonvie_core_tick_msg_throttle = core.zonvie_core_tick_msg_throttle;
 pub const zonvie_core_try_next_msg_timeout_ms = core.zonvie_core_try_next_msg_timeout_ms;
 pub const zonvie_core_set_msg_hover = core.zonvie_core_set_msg_hover;
+pub const zonvie_core_dismiss_msg_show = core.zonvie_core_dismiss_msg_show;
 pub const zonvie_core_set_blur_enabled = core.zonvie_core_set_blur_enabled;
 pub const zonvie_core_set_inherit_cwd = core.zonvie_core_set_inherit_cwd;
 pub const zonvie_core_set_glyph_cache_size = core.zonvie_core_set_glyph_cache_size;
@@ -248,6 +249,9 @@ pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
 /// which runs while the core's grid lock is held — taking that lock from the
 /// handler directly would self-deadlock.
 pub const WM_APP_MSG_HOVER: c.UINT = c.WM_APP + 42;
+/// The msg_show close badge was clicked. Posted to the main window for the
+/// reason WM_APP_MSG_HOVER is: the dismiss takes the core's grid lock.
+pub const WM_APP_MSG_DISMISS: c.UINT = c.WM_APP + 44;
 /// Test only (ZONVIE_TEST_FULL_REDRAW=1): repaint the main window whole, so a
 /// gui-test can compare it with the partial frame before it.
 pub const WM_APP_TEST_FULL_REDRAW: c.UINT = c.WM_APP + 43;
@@ -2938,6 +2942,12 @@ pub const ExternalWindow = struct {
     copy_button_copied: bool = false,
     // Reads left for the pending copy click (TIMER_COPY_BUTTON_RETRY).
     copy_attempts_left: u8 = 0,
+    // msg_show only: the close badge's pointer state and whether the user
+    // dragged the window off its slot (shared rule, frontend_rules).
+    msg_chrome: core.frontend_rules.MsgShowChrome = .{},
+    // The left press landed on the close badge; only then does its release
+    // close the window.
+    close_badge_pressed: bool = false,
     // Pointer is over a message surface, reported to the core so it holds the
     // view's auto-hide countdown. Tracked here so an ordinary mouse move does
     // not take the core's grid lock on every WM_MOUSEMOVE.
@@ -6912,6 +6922,36 @@ pub fn addRoundFillVerts(
     }
 
     return idx;
+}
+
+/// Vertices addCloseBadgeVerts appends: a disc quad and a cross quad.
+pub const CLOSE_BADGE_VERTS: usize = 12;
+
+/// One quad spanning top-left (x, y), bottom-right (x + w, y - h) that the
+/// shader draws as the SDF icon `marker` (an ICON_* value of main.hlsl).
+fn addSdfQuad(verts: []core.Vertex, start_idx: usize, marker: f32, x: f32, y: f32, w: f32, h: f32, color: [4]f32, grid_id: i64) usize {
+    const corners = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    for (corners, start_idx..) |uv, i| {
+        verts[i] = .{
+            .position = .{ x + w * uv[0], y - h * uv[1] },
+            .texCoord = .{ marker, uv[0] }, // uv.y = local_x
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = uv[1], // local_y
+        };
+    }
+    return start_idx + corners.len;
+}
+
+/// The msg_show close badge over the area top-left (x, y), bottom-right
+/// (x + w, y - h): a disc of `tint` at `fill_alpha`, and over it a cross at
+/// full tint (frontend_rules.msgCloseBadgePaint). Appends CLOSE_BADGE_VERTS.
+pub fn addCloseBadgeVerts(verts: []core.Vertex, start_idx: usize, x: f32, y: f32, w: f32, h: f32, tint: [4]f32, fill_alpha: f32, grid_id: i64) usize {
+    const disc: [4]f32 = .{ tint[0], tint[1], tint[2], fill_alpha };
+    const cross: [4]f32 = .{ tint[0], tint[1], tint[2], 1.0 };
+    const idx = addSdfQuad(verts, start_idx, -9.0, x, y, w, h, disc, grid_id); // ICON_DISC
+    return addSdfQuad(verts, idx, -10.0, x, y, w, h, cross, grid_id); // ICON_CROSS
 }
 
 /// Add the copy button's icon using SDF: two overlapping rounded squares, or

@@ -88,6 +88,8 @@ SamplerState samp0 : register(s0);
 #define ICON_COPY        (-6.0)
 #define ICON_ROUND_FILL  (-7.0)  // filled rounded rect (button hover wash)
 #define ICON_CHECK       (-8.0)  // post-copy acknowledgement checkmark
+#define ICON_DISC        (-9.0)  // filled disc spanning the quad (close badge)
+#define ICON_CROSS       (-10.0) // close badge cross
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -221,6 +223,19 @@ float4 PSMain(VSOut i) : SV_Target {
                 float dShort = sdOrientedBox(localUV, float2(0.20, 0.52), float2(0.42, 0.74), thickness);
                 float dLong = sdOrientedBox(localUV, float2(0.42, 0.74), float2(0.80, 0.28), thickness);
                 return renderIconSDF(i.col, min(dShort, dLong));
+            }
+            // msg_show close badge: the disc, then the cross over it.
+            if (i.uv.x >= ICON_DISC - 0.1 && i.uv.x <= ICON_DISC + 0.1) {
+                return renderIconSDF(i.col, sdCircle(localUV - float2(0.5, 0.5), 0.5));
+            }
+            if (i.uv.x >= ICON_CROSS - 0.1 && i.uv.x <= ICON_CROSS + 0.1) {
+                // frontend_rules: arms end msg_close_badge_cross_inset (0.32)
+                // in from each edge; the stroke is cross_stroke_pt over
+                // size_pt (1.25 / 13), so its half-width is 0.048.
+                float halfStroke = 0.048;
+                float d1 = sdSegment(localUV, float2(0.32, 0.32), float2(0.68, 0.68)) - halfStroke;
+                float d2 = sdSegment(localUV, float2(0.32, 0.68), float2(0.68, 0.32)) - halfStroke;
+                return renderIconSDF(i.col, min(d1, d2));
             }
             // Filled rounded rect spanning the quad (copy button hover wash)
             if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {

@@ -1170,6 +1170,13 @@ ZONVIE_API int64_t zonvie_core_try_next_msg_timeout_ms(zonvie_core *core);
  * re-arm its one-shot timer from zonvie_core_try_next_msg_timeout_ms afterwards. */
 ZONVIE_API void zonvie_core_set_msg_hover(zonvie_core *core, int64_t grid_id, int hovered);
 
+/* The msg_show float's close button: hide it now, through the same path as
+ * an expired auto-hide (on_external_window_close, on_msg_clear), including a
+ * float with timeout 0 or one whose countdown the hovering pointer holds.
+ * Runs the tick itself, so the callbacks fire inside this call under the
+ * same rules as zonvie_core_tick_msg_throttle. No-op while nothing shows. */
+ZONVIE_API void zonvie_core_dismiss_msg_show(zonvie_core *core);
+
 /* Blur mode for the default background. When enabled:
  *  - default-background cells get alpha 0.5 (0 on the cmdline grid) instead
  *    of the zonvie_core_set_background_opacity value;

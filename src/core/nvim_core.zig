@@ -1019,6 +1019,11 @@ pub const Core = struct {
     msg_show_hovered: bool = false,
     msg_history_hovered: bool = false,
 
+    // The msg_show close button was clicked and the float has not hidden yet.
+    // Held apart from msg_show_auto_hide_at, which a show cycle, a scroll
+    // pause and a flush abort all rewrite. Cleared only by hideChannelView.
+    msg_show_dismiss_requested: bool = false,
+
     // Scroll state for msg_show ext-float (Zonvie's own grid)
     msg_scroll_offset: u32 = 0, // Current scroll offset (lines from top)
     msg_history_scroll_offset: u32 = 0, // The msg_history float's, likewise
@@ -1806,6 +1811,7 @@ pub const Core = struct {
         self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
         self.msg_show_auto_hide_at = null;
         self.msg_history_auto_hide_at = null;
+        self.msg_show_dismiss_requested = false;
         self.msg_scroll_offset = 0;
         self.msg_history_scroll_offset = 0;
         self.msg_total_lines = 0;

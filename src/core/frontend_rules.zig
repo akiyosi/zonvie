@@ -1115,6 +1115,204 @@ test "a message float wider than the target overhangs the left, never the right"
     try std.testing.expect(p.x < msg_test_screen.left);
 }
 
+// The msg_show close badge: a small disc with a cross in the window's top-left
+// corner, shown while the pointer is on the window and filled in while it is
+// on the badge, as a macOS notification's. Lengths are in points; a frontend
+// passes its own scale (1 on macOS, the DPI factor on Windows) and gets its
+// own pixels back, rounded as Windows rounds every other chrome length.
+
+pub const msg_close_badge_size_pt: f32 = 13.0;
+pub const msg_close_badge_inset_pt: f32 = 2.0;
+/// Extra leading width the window reserves so the badge clears the text.
+pub const msg_close_badge_reserve_pt: f32 = 10.0;
+/// Where the cross's arms end, as a fraction of the badge from each edge.
+pub const msg_close_badge_cross_inset: f32 = 0.32;
+pub const msg_close_badge_cross_stroke_pt: f32 = 1.25;
+
+pub const RectF = extern struct { left: f32, top: f32, right: f32, bottom: f32 };
+
+fn scaledPt(pt: f32, scale: f32) f32 {
+    return @round(pt * scale);
+}
+
+/// Leading width the msg_show window adds for the badge, in scaled pixels.
+/// Pre: scale > 0.
+pub fn msgCloseBadgeReservePx(scale: f32) f32 {
+    std.debug.assert(scale > 0);
+    return scaledPt(msg_close_badge_reserve_pt, scale);
+}
+
+/// The badge's box in a container of `container_w` x `container_h` scaled
+/// pixels, top-left origin, y down. Null when the container cannot hold it.
+/// Pre: scale > 0. Post: a square of the scaled badge size, `inset` in from
+/// the top and leading edges, inside the container.
+pub fn msgCloseBadgeRect(container_w: f32, container_h: f32, scale: f32) ?RectF {
+    std.debug.assert(scale > 0);
+    const size = scaledPt(msg_close_badge_size_pt, scale);
+    const inset = scaledPt(msg_close_badge_inset_pt, scale);
+    if (container_w < size + inset or container_h < size + inset) return null;
+    return .{ .left = inset, .top = inset, .right = inset + size, .bottom = inset + size };
+}
+
+pub const MsgCloseBadgeLook = enum(u8) { hidden = 0, resting = 1, active = 2 };
+
+/// How the badge is painted in one look, in scaled pixels.
+pub const MsgCloseBadgePaint = extern struct {
+    /// The disc's alpha over the tint; 0 when hidden.
+    fill_alpha: f32,
+    /// The cross is drawn at full tint alpha, arms `cross_inset_px` in from
+    /// each edge of the badge, `cross_stroke_px` wide. Zero when hidden.
+    cross_inset_px: f32,
+    cross_stroke_px: f32,
+};
+
+/// Pre: scale > 0. Post: hidden paints nothing; active fills more than resting.
+pub fn msgCloseBadgePaint(look: MsgCloseBadgeLook, scale: f32) MsgCloseBadgePaint {
+    std.debug.assert(scale > 0);
+    if (look == .hidden) return .{ .fill_alpha = 0, .cross_inset_px = 0, .cross_stroke_px = 0 };
+    return .{
+        .fill_alpha = if (look == .active) 0.6 else 0.2,
+        .cross_inset_px = msg_close_badge_cross_inset * scaledPt(msg_close_badge_size_pt, scale),
+        .cross_stroke_px = msg_close_badge_cross_stroke_pt * scale,
+    };
+}
+
+/// The msg_show window's chrome state: where the pointer is, and whether the
+/// user has dragged the window off its top-right slot. One per msg_show
+/// window; zero it to start.
+///
+/// Invariant: `on_badge` implies `on_surface` -- the badge is part of the
+/// window. Every transition preserves it.
+pub const MsgShowChrome = extern struct {
+    on_surface: bool = false,
+    on_badge: bool = false,
+    user_placed: bool = false,
+
+    pub fn invariant(self: MsgShowChrome) bool {
+        return !self.on_badge or self.on_surface;
+    }
+
+    /// The badge's look, from the pointer alone.
+    pub fn look(self: MsgShowChrome) MsgCloseBadgeLook {
+        std.debug.assert(self.invariant());
+        if (self.on_badge) return .active;
+        return if (self.on_surface) .resting else .hidden;
+    }
+
+    /// Whether placement may move the window back to its top-right slot.
+    /// While false, every re-placement -- a resize included -- keeps the
+    /// window's top-left corner where the user left it.
+    pub fn followsAnchor(self: MsgShowChrome) bool {
+        return !self.user_placed;
+    }
+
+    /// The pointer is now on the window (`on_surface`) and on the badge
+    /// (`on_badge`). Returns whether the badge's look changed, so a caller
+    /// repaints only then.
+    /// Pre: on_badge implies on_surface.
+    pub fn pointer(self: *MsgShowChrome, on_surface: bool, on_badge: bool) bool {
+        std.debug.assert(!on_badge or on_surface);
+        const before = self.look();
+        self.on_surface = on_surface;
+        self.on_badge = on_badge;
+        std.debug.assert(self.invariant());
+        return self.look() != before;
+    }
+
+    /// A press on the window ended; `moved` says whether it moved the window.
+    /// Only a real move makes placement leave the window alone until it
+    /// closes: a click that moved nothing must not unpin it from its anchor.
+    /// A later still click does not re-anchor a moved window either.
+    pub fn dragEnded(self: *MsgShowChrome, moved: bool) void {
+        if (moved) self.user_placed = true;
+    }
+
+    /// The window closed. A window gone under a still pointer gets no leave
+    /// event, so the pointer is forgotten too; the next show starts anchored.
+    pub fn reset(self: *MsgShowChrome) void {
+        self.* = .{};
+    }
+};
+
+test "the close badge sits in the top-left corner at every scale" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const r = msgCloseBadgeRect(400, 40, scale).?;
+        const size = @round(msg_close_badge_size_pt * scale);
+        const inset = @round(msg_close_badge_inset_pt * scale);
+        try std.testing.expectEqual(inset, r.left);
+        try std.testing.expectEqual(inset, r.top);
+        try std.testing.expectEqual(size, r.right - r.left);
+        try std.testing.expectEqual(size, r.bottom - r.top);
+    }
+}
+
+test "the close badge never leaves a container too small for it" {
+    try std.testing.expect(msgCloseBadgeRect(14, 40, 1.0) == null);
+    try std.testing.expect(msgCloseBadgeRect(400, 14, 1.0) == null);
+    const fits = msgCloseBadgeRect(15, 15, 1.0).?;
+    try std.testing.expect(fits.right <= 15 and fits.bottom <= 15);
+}
+
+test "the close badge cross matches the one windows/shaders/main.hlsl hardcodes" {
+    // ICON_CROSS cannot read these constants: a change here must be made in
+    // the shader too (arm inset 0.32, half-stroke 0.048 of the badge).
+    try std.testing.expectEqual(@as(f32, 0.32), msg_close_badge_cross_inset);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.048), msg_close_badge_cross_stroke_pt / msg_close_badge_size_pt / 2, 0.0005);
+}
+
+test "the reserve scales with the badge" {
+    try std.testing.expectEqual(@as(f32, 10), msgCloseBadgeReservePx(1.0));
+    try std.testing.expectEqual(@as(f32, 15), msgCloseBadgeReservePx(1.5));
+}
+
+test "a hidden badge paints nothing and the active one fills in" {
+    const hidden = msgCloseBadgePaint(.hidden, 1.0);
+    try std.testing.expectEqual(@as(f32, 0), hidden.fill_alpha);
+    try std.testing.expectEqual(@as(f32, 0), hidden.cross_stroke_px);
+    const resting = msgCloseBadgePaint(.resting, 1.0);
+    const active = msgCloseBadgePaint(.active, 1.0);
+    try std.testing.expect(resting.fill_alpha > 0);
+    try std.testing.expect(active.fill_alpha > resting.fill_alpha);
+    try std.testing.expectEqual(resting.cross_stroke_px, active.cross_stroke_px);
+    try std.testing.expect(resting.cross_inset_px * 2 < @round(msg_close_badge_size_pt));
+}
+
+test "the badge shows with the pointer on the window and fills in on the badge" {
+    var c = MsgShowChrome{};
+    try std.testing.expectEqual(MsgCloseBadgeLook.hidden, c.look());
+    try std.testing.expect(c.pointer(true, false));
+    try std.testing.expectEqual(MsgCloseBadgeLook.resting, c.look());
+    try std.testing.expect(!c.pointer(true, false)); // no change, no repaint
+    try std.testing.expect(c.pointer(true, true));
+    try std.testing.expectEqual(MsgCloseBadgeLook.active, c.look());
+    try std.testing.expect(c.pointer(false, false));
+    try std.testing.expectEqual(MsgCloseBadgeLook.hidden, c.look());
+}
+
+test "a click that moves nothing leaves msg_show anchored" {
+    var c = MsgShowChrome{};
+    _ = c.pointer(true, false);
+    c.dragEnded(false);
+    try std.testing.expect(c.followsAnchor());
+}
+
+test "a dragged msg_show stays put until it closes" {
+    var c = MsgShowChrome{};
+    try std.testing.expect(c.followsAnchor());
+    _ = c.pointer(true, false);
+    c.dragEnded(true);
+    try std.testing.expect(!c.followsAnchor());
+    // A later click that moves nothing does not re-anchor it.
+    c.dragEnded(false);
+    try std.testing.expect(!c.followsAnchor());
+    // Pointer moves do not release the placement.
+    _ = c.pointer(false, false);
+    try std.testing.expect(!c.followsAnchor());
+    c.reset();
+    try std.testing.expect(c.followsAnchor());
+    try std.testing.expectEqual(MsgCloseBadgeLook.hidden, c.look());
+}
+
 // ---------------------------------------------------------------------------
 // Cmdline
 

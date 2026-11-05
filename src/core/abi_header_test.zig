@@ -48,6 +48,9 @@ const pairs = .{
     .{ c.zonvie_saved_origin, frontend_rules.SavedOrigin },
     .{ c.zonvie_placement_memory, frontend_rules.PlacementMemory },
     .{ c.zonvie_blink, frontend_rules.Blink },
+    .{ c.zonvie_rectf, frontend_rules.RectF },
+    .{ c.zonvie_msg_badge_paint, frontend_rules.MsgCloseBadgePaint },
+    .{ c.zonvie_msg_show_chrome, frontend_rules.MsgShowChrome },
     .{ c.zonvie_scroll_spring, scroll_ease.Spring },
     .{ c.zonvie_viewport_info, c_api.ViewportInfo },
     .{ c.zonvie_glow_pass, glow_chain.Pass },
@@ -220,6 +223,9 @@ const constant_pairs = .{
     .{ c.ZONVIE_ROW_PASS_ALL_ROWS, @intFromEnum(frontend_rules.RowPassPlan.all_rows) },
     .{ c.ZONVIE_SHADER_TARGET_MSL, @intFromEnum(c_api.zonvie_shader_target.msl) },
     .{ c.ZONVIE_SHADER_TARGET_HLSL, @intFromEnum(c_api.zonvie_shader_target.hlsl) },
+    .{ c.ZONVIE_MSG_BADGE_HIDDEN, @intFromEnum(frontend_rules.MsgCloseBadgeLook.hidden) },
+    .{ c.ZONVIE_MSG_BADGE_RESTING, @intFromEnum(frontend_rules.MsgCloseBadgeLook.resting) },
+    .{ c.ZONVIE_MSG_BADGE_ACTIVE, @intFromEnum(frontend_rules.MsgCloseBadgeLook.active) },
 };
 
 fn isZonvieFn(comptime M: type, comptime name: []const u8) bool {

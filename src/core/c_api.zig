@@ -1655,7 +1655,10 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     // on Windows) instead.
     box.core.lockGridAsRedrawOwner();
     defer box.core.unlockGridAsRedrawOwner();
+    tickMsgLocked(box);
+}
 
+fn tickMsgLocked(box: *CoreBox) void {
     box.core.processPendingMsgScroll();
 
     // The timeout can create/remove external grids. onFlush runs vertex
@@ -1665,6 +1668,19 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     flush_mod.FlushCtx.onFlush(&fctx, box.core.grid.rows, box.core.grid.cols) catch |reason| {
         if (nvim_core.Core.isHardRenderFailure(reason)) box.core.failHardRender(reason);
     };
+}
+
+/// The msg_show float's close button. Hides the float through the auto-hide
+/// path and runs the tick under the same lock hold, so a hover update queued
+/// behind this call cannot pause the deadline before it fires. Same callback
+/// rules as zonvie_core_tick_msg_throttle.
+pub export fn zonvie_core_dismiss_msg_show(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.lockGridAsRedrawOwner();
+    defer box.core.unlockGridAsRedrawOwner();
+    flush_mod.dismissMsgShow(&box.core);
+    tickMsgLocked(box);
 }
 
 /// Milliseconds until the next armed message deadline, or -1 when none is
@@ -2037,6 +2053,58 @@ pub export fn zonvie_core_press_claim_press(claim: ?*frontend_rules.PressClaim, 
 pub export fn zonvie_core_press_claim_release(claim: ?*frontend_rules.PressClaim, button: u8) callconv(.c) u8 {
     const r = (claim orelse return 0).release(button);
     return @as(u8, @intFromBool(r.send)) | (@as(u8, @intFromBool(r.ends)) << 1);
+}
+
+// The msg_show close badge and chrome state (frontend_rules). At this
+// boundary a broken precondition is refused -- false or 0, state untouched --
+// rather than asserted: the caller is another language's release build.
+
+pub export fn zonvie_msg_close_badge_reserve_px(scale: f32) callconv(.c) f32 {
+    if (!(scale > 0)) return 0;
+    return frontend_rules.msgCloseBadgeReservePx(scale);
+}
+
+pub export fn zonvie_msg_close_badge_rect(
+    container_w: f32,
+    container_h: f32,
+    scale: f32,
+    out: ?*frontend_rules.RectF,
+) callconv(.c) bool {
+    if (!(scale > 0)) return false;
+    const dst = out orelse return false;
+    dst.* = frontend_rules.msgCloseBadgeRect(container_w, container_h, scale) orelse return false;
+    return true;
+}
+
+pub export fn zonvie_msg_close_badge_paint(look: u8, scale: f32, out: ?*frontend_rules.MsgCloseBadgePaint) callconv(.c) bool {
+    if (!(scale > 0)) return false;
+    const l = std.enums.fromInt(frontend_rules.MsgCloseBadgeLook, look) orelse return false;
+    (out orelse return false).* = frontend_rules.msgCloseBadgePaint(l, scale);
+    return true;
+}
+
+pub export fn zonvie_msg_show_chrome_pointer(chrome: ?*frontend_rules.MsgShowChrome, on_surface: bool, on_badge: bool) callconv(.c) bool {
+    const c = chrome orelse return false;
+    if (on_badge and !on_surface) return false;
+    return c.pointer(on_surface, on_badge);
+}
+
+pub export fn zonvie_msg_show_chrome_drag_ended(chrome: ?*frontend_rules.MsgShowChrome, moved: bool) callconv(.c) void {
+    (chrome orelse return).dragEnded(moved);
+}
+
+pub export fn zonvie_msg_show_chrome_reset(chrome: ?*frontend_rules.MsgShowChrome) callconv(.c) void {
+    (chrome orelse return).reset();
+}
+
+pub export fn zonvie_msg_show_chrome_look(chrome: ?*const frontend_rules.MsgShowChrome) callconv(.c) u8 {
+    const c = chrome orelse return @intFromEnum(frontend_rules.MsgCloseBadgeLook.hidden);
+    if (!c.invariant()) return @intFromEnum(frontend_rules.MsgCloseBadgeLook.hidden);
+    return @intFromEnum(c.look());
+}
+
+pub export fn zonvie_msg_show_chrome_follows_anchor(chrome: ?*const frontend_rules.MsgShowChrome) callconv(.c) bool {
+    return (chrome orelse return true).followsAnchor();
 }
 
 pub export fn zonvie_core_clamp_mini_content(

@@ -4850,6 +4850,16 @@ pub export fn WndProc(
             return 0;
         },
 
+        app_mod.WM_APP_MSG_DISMISS => {
+            if (getApp(hwnd)) |app| {
+                if (app.corep) |corep| {
+                    app_mod.zonvie_core_dismiss_msg_show(corep);
+                    armMsgThrottleTimer(hwnd, app);
+                }
+            }
+            return 0;
+        },
+
         app_mod.WM_APP_MSG_THROTTLE_ARM => {
             if (getApp(hwnd)) |app| {
                 app.msg_throttle_arm_posted.store(false, .release);

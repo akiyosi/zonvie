@@ -4639,6 +4639,32 @@ final class ZonvieCore {
     private var cmdlineFirstc: UInt8 = 0
     /// Cmdline icon view (for search/command icons)
     private var cmdlineIconView: NSImageView?
+    /// Close badge in the msg_show window's top-left corner. One window,
+    /// parked and reused between shows, so one badge.
+    private var msgShowCloseButton: MsgCloseBadgeButton?
+    /// The msg_show window's pointer and placement state (frontend_rules,
+    /// shared with Windows). Main thread only.
+    private var msgShowChrome = zonvie_msg_show_chrome()
+
+    /// The msg_show close badge: reports the pointer entering and leaving it.
+    /// Its look is drawn from the shared chrome state, not from NSButton's.
+    final class MsgCloseBadgeButton: NSButton {
+        var onHoverChange: ((Bool) -> Void)?
+        private var hoverTrackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+            // .activeAlways: these windows never become key.
+            let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+            addTrackingArea(area)
+            hoverTrackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) { onHoverChange?(true) }
+        override func mouseExited(with event: NSEvent) { onHoverChange?(false) }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    }
 
     /// Copy-content button installed on decorated external windows
     /// (ext_cmdline / ext_messages). Carries the grid it copies from so the
@@ -5015,7 +5041,7 @@ final class ZonvieCore {
     // should insert a path into the cmdline instead of opening the file.
     static let cmdlineGridId = Int64(ZONVIE_GRID_ID_CMDLINE)
     static let popupmenuGridId = Int64(ZONVIE_GRID_ID_POPUPMENU)
-    private static let messageGridId = Int64(ZONVIE_GRID_ID_MESSAGE)
+    static let messageGridId = Int64(ZONVIE_GRID_ID_MESSAGE)
     private static let msgHistoryGridId = Int64(ZONVIE_GRID_ID_MSG_HISTORY)
     private static let specialWindowCornerRadius: CGFloat = 4.0
     private static let specialWindowBorderLayerName = "ZonvieSpecialWindowBorder"
@@ -5611,6 +5637,10 @@ final class ZonvieCore {
             let removedView = self.externalGridViews[gridId]
             self.externalGridViewsLock.unlock()
             let removedWindow = self.removeInstalledExternalWindow(gridId: gridId)
+            if gridId == ZonvieCore.messageGridId {
+                zonvie_msg_show_chrome_reset(&self.msgShowChrome)
+                self.applyMsgCloseBadgeLook()
+            }
 
             // Drop config stashed before window creation for this grid.
             if closeIsLatestAction {
@@ -6032,6 +6062,7 @@ final class ZonvieCore {
         let iconFrame: NSRect?
         let linkedMsgShowFrame: NSRect?
         var copyButtonFrame: NSRect? = nil
+        var closeButtonFrame: NSRect? = nil
     }
 
     /// Copy button position: trailing edge of the container. The single-row
@@ -6266,7 +6297,7 @@ final class ZonvieCore {
             contentWidth = min(contentWidth, maxContentWidth)
         }
 
-        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind)
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind) + closeButtonReservedWidth(for: kind)
         let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
         let windowWidth = containerWidth + (shadowMargin * 2)
         let windowHeight = containerHeight + (shadowMargin * 2)
@@ -6823,6 +6854,11 @@ final class ZonvieCore {
             let hoverContainer = MsgHoverContainerView(frame: containerFrame)
             hoverContainer.onHoverChange = { [weak self] hovered in
                 self?.setMsgHover(gridId: gridId, hovered: hovered)
+                // The close badge shows only under the pointer, as a macOS
+                // notification's does.
+                if kind == .msgShow, let self {
+                    self.updateMsgShowPointer(onSurface: hovered, onBadge: hovered && self.msgShowChrome.on_badge)
+                }
             }
             containerView = hoverContainer
         } else {
@@ -6871,6 +6907,16 @@ final class ZonvieCore {
             copyButton = button
         }
 
+        var closeButton: MsgCloseBadgeButton? = nil
+        if kind == .msgShow {
+            let button = makeCloseMessageButton()
+            button.frame = closeButtonFrame(containerWidth: containerWidth, containerHeight: containerHeight) ?? .zero
+            containerView.addSubview(button)
+            self.msgShowCloseButton = button
+            applyMsgCloseBadgeLook()
+            closeButton = button
+        }
+
         gridView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
         containerView.addSubview(gridView)
         // Re-stack the cmdline firstc icon above the MTKView so it is not
@@ -6885,6 +6931,9 @@ final class ZonvieCore {
         // hit-testable above the MTKView.
         if let copyButton {
             containerView.addSubview(copyButton, positioned: .above, relativeTo: gridView)
+        }
+        if let closeButton {
+            containerView.addSubview(closeButton, positioned: .above, relativeTo: gridView)
         }
         window.contentView = containerView
         window.backgroundColor = Self.transparentShadowedWindowBackground
@@ -7155,6 +7204,9 @@ final class ZonvieCore {
            let button = context.containerView.subviews.compactMap({ $0 as? CopyContentButton }).first {
             button.frame = copyButtonFrame
         }
+        if let closeButtonFrame = layout.closeButtonFrame, let button = msgShowCloseButton {
+            button.frame = closeButtonFrame
+        }
         // A cmdline re-centred as it grows is not a drag: saving that origin
         // reopened the next, shorter cmdline off to the left.
         let cmdlineWindow = context.window as? CmdlineWindow
@@ -7176,7 +7228,7 @@ final class ZonvieCore {
                 pumWindow.setFrameOrigin(NSPoint(x: pumWindow.frame.minX + dx, y: pumWindow.frame.minY + dy))
             }
         }
-        if let linkedMsgShowFrame = layout.linkedMsgShowFrame,
+        if let linkedMsgShowFrame = layout.linkedMsgShowFrame, zonvie_msg_show_chrome_follows_anchor(&msgShowChrome),
            let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
             msgShowWindow.setFrame(linkedMsgShowFrame, display: true)
         }
@@ -7284,16 +7336,23 @@ final class ZonvieCore {
         let cellH = CGFloat(context.renderer.cellHeightPx)
         let msgPadding: CGFloat = 8.0
         let copyButtonWidth = copyButtonReservedWidth(for: kind)
+        let closeButtonWidth = closeButtonReservedWidth(for: kind)
         let contentWidth = CGFloat(cols) * cellW / context.scale
         let contentHeight = CGFloat(rows) * cellH / context.scale
-        let containerWidth = contentWidth + (msgPadding * 2) + copyButtonWidth
+        let containerWidth = contentWidth + (msgPadding * 2) + copyButtonWidth + closeButtonWidth
         let containerHeight = contentHeight + (msgPadding * 2)
 
         // The same history test as creation: only a visible msg_history
-        // pushes msg_show down (a hidden one used to, here only).
-        let windowFrame = messageFloatFrame(
-            size: NSSize(width: containerWidth, height: containerHeight),
-            below: kind == .msgShow ? visibleMessageHistoryFrame() : nil)
+        // pushes msg_show down (a hidden one used to, here only). A msg_show
+        // the user dragged resizes in place, its top-left corner kept.
+        let size = NSSize(width: containerWidth, height: containerHeight)
+        let windowFrame: NSRect
+        if kind == .msgShow, !zonvie_msg_show_chrome_follows_anchor(&msgShowChrome) {
+            let current = context.window.frame
+            windowFrame = NSRect(x: current.minX, y: current.maxY - size.height, width: size.width, height: size.height)
+        } else {
+            windowFrame = messageFloatFrame(size: size, below: kind == .msgShow ? visibleMessageHistoryFrame() : nil)
+        }
         var linkedMsgShowFrame: NSRect? = nil
         if kind == .msgHistory, let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
             linkedMsgShowFrame = messageFloatFrame(size: msgShowWindow.frame.size, below: windowFrame)
@@ -7301,13 +7360,14 @@ final class ZonvieCore {
 
         return DecoratedExternalLayout(
             containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
-            gridFrame: NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight),
+            gridFrame: NSRect(x: msgPadding + closeButtonWidth, y: msgPadding, width: contentWidth, height: contentHeight),
             windowFrame: windowFrame,
             iconFrame: nil,
             linkedMsgShowFrame: linkedMsgShowFrame,
             copyButtonFrame: copyButtonWidth > 0
                 ? copyButtonFrame(containerWidth: containerWidth, containerHeight: containerHeight, alignTop: true)
-                : nil
+                : nil,
+            closeButtonFrame: closeButtonWidth > 0 ? closeButtonFrame(containerWidth: containerWidth, containerHeight: containerHeight) : nil
         )
     }
 
@@ -7625,6 +7685,114 @@ final class ZonvieCore {
     /// Width the copy button reserves on the trailing edge of the container.
     private func copyButtonReservedWidth(for kind: ExternalGridKind) -> CGFloat {
         copyButtonEnabled(for: kind) ? ZonvieConfig.copyButtonTotalWidth : 0.0
+    }
+
+    /// Width the close badge reserves on the leading edge: msg_show only.
+    private func closeButtonReservedWidth(for kind: ExternalGridKind) -> CGFloat {
+        kind == .msgShow ? CGFloat(zonvie_msg_close_badge_reserve_px(1)) : 0.0
+    }
+
+    /// The badge's frame in a container, from the shared top-left-origin rect
+    /// flipped into AppKit's bottom-left origin. Nil when it does not fit.
+    private func closeButtonFrame(containerWidth: CGFloat, containerHeight: CGFloat) -> NSRect? {
+        var r = zonvie_rectf()
+        guard zonvie_msg_close_badge_rect(Float(containerWidth), Float(containerHeight), 1, &r) else { return nil }
+        return NSRect(x: CGFloat(r.left), y: containerHeight - CGFloat(r.bottom),
+                      width: CGFloat(r.right - r.left), height: CGFloat(r.bottom - r.top))
+    }
+
+    private func makeCloseMessageButton() -> MsgCloseBadgeButton {
+        let button = MsgCloseBadgeButton()
+        button.isBordered = false
+        button.bezelStyle = .regularSquare
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
+        button.toolTip = "Close"
+        button.target = self
+        button.action = #selector(dismissMsgShowFloat(_:))
+        button.onHoverChange = { [weak self] onBadge in
+            guard let self else { return }
+            // Entering the badge enters the window too (the shared invariant).
+            // Leaving it says nothing about the window: AppKit may deliver
+            // the window's exit first, and that must stand.
+            self.updateMsgShowPointer(onSurface: onBadge || self.msgShowChrome.on_surface, onBadge: onBadge)
+        }
+        return button
+    }
+
+    /// Feed a pointer change to the shared chrome state, and repaint the badge
+    /// only when its look changed. Main thread only.
+    private func updateMsgShowPointer(onSurface: Bool, onBadge: Bool) {
+        if zonvie_msg_show_chrome_pointer(&msgShowChrome, onSurface, onBadge) {
+            applyMsgCloseBadgeLook()
+        }
+    }
+
+    /// Draw the badge in its current look. The hidden look paints an empty
+    /// image rather than hiding the view: AppKit does not fire the tracking
+    /// area of a hidden view, so a badge unhidden later never saw the pointer
+    /// arrive. Nothing can press it unseen: a pointer on the window makes the
+    /// look at least resting.
+    private func applyMsgCloseBadgeLook() {
+        guard let button = msgShowCloseButton else { return }
+        var paint = zonvie_msg_badge_paint()
+        guard zonvie_msg_close_badge_paint(zonvie_msg_show_chrome_look(&msgShowChrome), 1, &paint) else { return }
+        button.image = Self.makeCloseBadgeImage(size: button.frame.size, paint: paint, color: getCommentHighlightColor())
+    }
+
+    /// The disc and cross frontend_rules describes for one look.
+    private static func makeCloseBadgeImage(size: NSSize, paint: zonvie_msg_badge_paint, color: NSColor) -> NSImage {
+        NSImage(size: size, flipped: false) { rect in
+            // AppKit strokes a zero lineWidth as a hairline, not as nothing.
+            guard paint.cross_stroke_px > 0 else { return true }
+            color.withAlphaComponent(CGFloat(paint.fill_alpha)).setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            let inset = CGFloat(paint.cross_inset_px)
+            let cross = NSBezierPath()
+            cross.move(to: NSPoint(x: inset, y: inset))
+            cross.line(to: NSPoint(x: rect.width - inset, y: rect.height - inset))
+            cross.move(to: NSPoint(x: inset, y: rect.height - inset))
+            cross.line(to: NSPoint(x: rect.width - inset, y: inset))
+            cross.lineWidth = CGFloat(paint.cross_stroke_px)
+            cross.lineCapStyle = .round
+            color.setStroke()
+            cross.stroke()
+            return true
+        }
+    }
+
+    /// The msg_show close badge. Async for the same reason as setMsgHover:
+    /// the dismiss takes the grid lock and fires the close callbacks inside.
+    @objc private func dismissMsgShowFloat(_ sender: MsgCloseBadgeButton) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let core = self.core else { return }
+            zonvie_core_dismiss_msg_show(core)
+            self.scheduleMsgTimer()
+        }
+    }
+
+    /// A press on the msg_show window drags it until release. Tracked here
+    /// rather than with performDrag, which returns before the drag happens and
+    /// so cannot say whether it moved. The first real move pins the window:
+    /// main-queue work still runs while this loop tracks, and a re-layout in
+    /// it must not pull the window back. A press that moves nothing pins
+    /// nothing. Main thread only.
+    func beginMsgShowDrag(with event: NSEvent) {
+        guard let window = externalWindows[ZonvieCore.messageGridId] else { return }
+        let startPointer = NSEvent.mouseLocation
+        let startOrigin = window.frame.origin
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: NSEvent.foreverDuration, mode: .eventTracking) { tracked, stop in
+            guard let tracked, tracked.type == .leftMouseDragged else {
+                stop.pointee = true
+                return
+            }
+            let pointer = NSEvent.mouseLocation
+            let origin = NSPoint(x: startOrigin.x + pointer.x - startPointer.x,
+                                 y: startOrigin.y + pointer.y - startPointer.y)
+            guard origin != window.frame.origin else { return }
+            zonvie_msg_show_chrome_drag_ended(&self.msgShowChrome, true)
+            window.setFrameOrigin(origin)
+        }
     }
 
     private func makeCopyContentButton(gridId: Int64) -> CopyContentButton {
@@ -8769,7 +8937,7 @@ final class ZonvieCore {
             history.setFrame(messageFloatFrame(size: history.frame.size, below: nil), display: false)
             historyFrame = history.frame
         }
-        if let msgShow = externalWindows[ZonvieCore.messageGridId], msgShow.isVisible {
+        if let msgShow = externalWindows[ZonvieCore.messageGridId], msgShow.isVisible, zonvie_msg_show_chrome_follows_anchor(&msgShowChrome) {
             msgShow.setFrame(messageFloatFrame(size: msgShow.frame.size, below: historyFrame), display: false)
         }
         if let toast = extFloatWindow, toast.isVisible {

@@ -220,7 +220,7 @@ fn planAbortRetime(core: *const Core, now: i128) AbortRetimePlan {
     }
     return .{
         .throttle = throttle_due,
-        .show_hide = if (core.msg_show_auto_hide_at) |hide_at| now >= hide_at else false,
+        .show_hide = msgShowHideDue(core, now),
         .history_hide = if (core.msg_history_auto_hide_at) |hide_at| now >= hide_at else false,
         .atlas_retry = if (core.atlas_negative_retry_at) |retry_at| now >= retry_at else false,
         .transient_retry = if (core.transient_glyph_retry_at) |retry_at| now >= retry_at else false,
@@ -6312,15 +6312,36 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
     checkMsgAutoHideTimeoutAt(self, clock.nowNs());
 }
 
+/// The msg_show float's close button: request a hide, which the next tick
+/// carries out exactly as an expired timeout (window diff, msg_clear, hover
+/// flag). Covers floats that never expire (timeout 0) and ones whose
+/// countdown the hovering pointer is holding. A no-op while nothing shows, or
+/// a click would request a hide that hides nothing but still sends msg_clear.
+/// Post: the request stands until hideChannelView carries it out -- a batch
+/// shown in the same tick, a scroll pause or a flush abort cannot drop it.
+/// IMPORTANT: Caller must hold grid_mu.
+pub fn dismissMsgShow(self: *Core) void {
+    if (!self.msg_views.state(.ext_float).visible) return;
+    self.msg_show_dismiss_requested = true;
+}
+
+/// Whether msg_show hides at `now`: its countdown ran out, or the close
+/// button asked.
+fn msgShowHideDue(self: *const Core, now: i128) bool {
+    if (self.msg_show_dismiss_requested) return true;
+    const hide_at = self.msg_show_auto_hide_at orelse return false;
+    return now >= hide_at;
+}
+
 fn checkMsgAutoHideTimeoutAt(self: *Core, now: i128) void {
     if (!self.ext_messages_enabled) return;
     var hid_message = false;
 
     // msg_show (grid -102) auto-hide
-    if (self.msg_show_auto_hide_at) |hide_at| {
-        if (now >= hide_at) {
+    {
+        if (msgShowHideDue(self, now)) {
             hid_message = true;
-            self.log.write("[msg] auto-hide: msg_show timeout expired\n", .{});
+            self.log.write("[msg] auto-hide: msg_show timeout expired or dismissed\n", .{});
             self.grid.message_state.clearMessages(self.grid.alloc);
             // The window closes through notifyExternalWindowChanges, later in
             // the same flush, as every other synthetic grid does.
@@ -6366,6 +6387,11 @@ pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
         }
         if (self.msg_show_auto_hide_at) |hide_at| {
             consider(&earliest, hide_at);
+        } else if (self.msg_show_dismiss_requested) {
+            // A scroll paused the deadline away; the request still needs a
+            // tick. An abort's backoff rewrites the deadline, so this does
+            // not spin while flushes keep failing.
+            consider(&earliest, clock.nowNs());
         }
         if (self.msg_history_auto_hide_at) |hide_at| {
             consider(&earliest, hide_at);
@@ -6901,6 +6927,7 @@ pub fn hideChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType) vo
         }
         channelAutoHideSlot(self, ch).* = null;
         channelAutoHideNsSlot(self, ch).* = null;
+        if (ch == .show) self.msg_show_dismiss_requested = false;
         // The window can close under a stationary pointer, and AppKit/Win32
         // deliver no leave event for a window that is gone. Dropping the flag
         // here keeps a stale hover from suppressing the next view's countdown.
@@ -13264,6 +13291,103 @@ test "an auto-hidden message float closes once, through the flush's window diff"
     try flush_ctx.onFlush(24, 80);
     try std.testing.expectEqualSlices(i64, &.{grid_mod.MESSAGE_GRID_ID}, closed.items);
     try std.testing.expect(!core.known_external_grids.contains(grid_mod.MESSAGE_GRID_ID));
+}
+
+test "the close button dismisses a hovered, never-expiring message float" {
+    const Recorder = struct {
+        fn close(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const ids: *std.ArrayListUnmanaged(i64) = @ptrCast(@alignCast(ctx.?));
+            ids.append(std.testing.allocator, grid_id) catch unreachable;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.ext_messages_enabled = true;
+    var closed: std.ArrayListUnmanaged(i64) = .empty;
+    defer closed.deinit(std.testing.allocator);
+    core.ctx = &closed;
+    core.cb.on_external_window_close = Recorder.close;
+
+    // Nothing visible: a stray click must not request a hide.
+    dismissMsgShow(&core);
+    try std.testing.expect(!core.msg_show_dismiss_requested);
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+
+    try appendTestMessage(&core, 1, "echo", "in the way");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+    notifyExternalWindowChanges(&core);
+    // An error-style message (timeout 0) has no deadline, and the pointer
+    // resting on the close button holds any that existed.
+    core.msg_show_auto_hide_at = null;
+    setChannelHover(&core, .show, true);
+
+    dismissMsgShow(&core);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqualSlices(i64, &.{grid_mod.MESSAGE_GRID_ID}, closed.items);
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expect(!core.known_external_grids.contains(grid_mod.MESSAGE_GRID_ID));
+    try std.testing.expect(!core.msg_show_dismiss_requested);
+}
+
+fn showTestMsgFloat(core: *Core) !void {
+    try core.grid.resize(24, 80);
+    core.ext_messages_enabled = true;
+    try appendTestMessage(core, 1, "echo", "in the way");
+    _ = sendMsgShow(core);
+    core.grid.message_state.msg_dirty = false;
+    notifyExternalWindowChanges(core);
+}
+
+test "a close click wins over a throttled batch shown in the same tick" {
+    // The throttle check runs before the auto-hide check in one tick, and
+    // showing the batch re-arms the deadline -- to null under the hovering
+    // pointer. A click recorded only as a deadline was lost there.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try showTestMsgFloat(&core);
+    setChannelHover(&core, .show, true);
+
+    try appendTestMessage(&core, 2, "echo", "arrived before the throttle fired");
+    core.msg_show_pending_since = clock.nowNs() - core.msg_show_throttle_ns - 1;
+    dismissMsgShow(&core);
+    core.checkMsgShowThrottleTimeout();
+
+    try std.testing.expect(core.msg_show_pending_since == null); // the batch was shown...
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible); // ...and the click still hid it
+}
+
+test "a close click survives a scroll that pauses the auto-hide before its tick" {
+    // A flush that aborts leaves the hide for a later tick; scrolling the
+    // float meanwhile pauses the auto-hide, which nulls the deadline.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try showTestMsgFloat(&core);
+
+    dismissMsgShow(&core);
+    pauseChannelAutoHide(&core, .show);
+
+    const due = nextMsgTimeoutNs(&core) orelse return error.NoTickScheduled;
+    try std.testing.expect(due <= clock.nowNs());
+    checkMsgAutoHideTimeout(&core);
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+}
+
+test "a close click that a flush abort defers is retried with backoff" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try showTestMsgFloat(&core);
+    core.msg_show_auto_hide_at = null; // timeout 0: no deadline of its own
+
+    dismissMsgShow(&core);
+    const now = clock.nowNs();
+    const plan = planAbortRetime(&core, now);
+    try std.testing.expect(plan.show_hide);
+    applyAbortRetime(&core, plan, now);
+    try std.testing.expect(core.msg_show_auto_hide_at.? > now);
+    try std.testing.expect(core.msg_show_dismiss_requested);
 }
 
 test "scrolling the message float pauses its auto-hide" {

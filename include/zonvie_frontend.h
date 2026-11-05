@@ -520,6 +520,67 @@ ZONVIE_API void zonvie_core_msg_float_origin(
     int32_t margin, int32_t gap,
     int32_t *out_x, int32_t *out_y);
 
+/* ---------------------------------------------------------------------------
+   The msg_show close badge: a small disc with a cross in the window's top-left
+   corner, shown while the pointer is on the window and filled in while it is
+   on the badge. Lengths are scaled pixels: `scale` is 1 on macOS (points) and
+   the DPI factor on Windows. Every function refuses a broken precondition
+   (scale <= 0, a NULL pointer, an unknown look, on_badge without on_surface)
+   by returning false / 0 and leaving its state untouched.
+
+   Pure — no core pointer, no lock. */
+
+/* Leading width the msg_show window adds so the badge clears the text. */
+ZONVIE_API float zonvie_msg_close_badge_reserve_px(float scale);
+
+/* Top-left origin, y down. */
+typedef struct zonvie_rectf {
+    float left, top, right, bottom;
+} zonvie_rectf;
+
+/* The badge's box in a container of the given size, top-left origin, y down.
+   False when the container cannot hold it. */
+ZONVIE_API bool zonvie_msg_close_badge_rect(
+    float container_w, float container_h, float scale, zonvie_rectf *out);
+
+#define ZONVIE_MSG_BADGE_HIDDEN  0u
+#define ZONVIE_MSG_BADGE_RESTING 1u
+#define ZONVIE_MSG_BADGE_ACTIVE  2u
+
+/* How one look is painted: the disc at fill_alpha over the tint, the cross at
+   full tint alpha with arms cross_inset_px in from each badge edge,
+   cross_stroke_px wide. HIDDEN is all zeros. */
+typedef struct zonvie_msg_badge_paint {
+    float fill_alpha;
+    float cross_inset_px;
+    float cross_stroke_px;
+} zonvie_msg_badge_paint;
+
+ZONVIE_API bool zonvie_msg_close_badge_paint(uint8_t look, float scale, zonvie_msg_badge_paint *out);
+
+/* The msg_show window's chrome state. Zero it to start. Invariant: on_badge
+   implies on_surface. Read the fields only through the functions below. */
+typedef struct zonvie_msg_show_chrome {
+    bool on_surface;
+    bool on_badge;
+    bool user_placed;
+} zonvie_msg_show_chrome;
+
+/* The pointer moved: returns true when the badge's look changed (repaint). */
+ZONVIE_API bool zonvie_msg_show_chrome_pointer(zonvie_msg_show_chrome *chrome, bool on_surface, bool on_badge);
+/* A press on the window ended; `moved` says whether it moved the window. Only
+   a real move makes placement leave the window where it is until reset; a
+   click that moved nothing changes nothing. */
+ZONVIE_API void zonvie_msg_show_chrome_drag_ended(zonvie_msg_show_chrome *chrome, bool moved);
+/* The window closed: forget the pointer and the placement. */
+ZONVIE_API void zonvie_msg_show_chrome_reset(zonvie_msg_show_chrome *chrome);
+/* ZONVIE_MSG_BADGE_*. */
+ZONVIE_API uint8_t zonvie_msg_show_chrome_look(const zonvie_msg_show_chrome *chrome);
+/* Whether placement may move the window back to its top-right slot. While
+   false, every re-placement (a resize included) keeps the window's top-left
+   corner where the user left it. */
+ZONVIE_API bool zonvie_msg_show_chrome_follows_anchor(const zonvie_msg_show_chrome *chrome);
+
 /* Whether a key code from send_key_event's encoding (a macOS virtual key
    code, or 0x10000 | Windows VK) is a special key the core names (<Left>,
    <CR>, <F1>, ...): such keys go straight to send_key_event rather than

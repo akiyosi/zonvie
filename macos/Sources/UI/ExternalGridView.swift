@@ -803,6 +803,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
+    /// The msg_show grid is synthetic: a press on it means nothing to Neovim,
+    /// so it drags the window instead.
+    override func mouseDown(with event: NSEvent) {
+        if gridId == ZonvieCore.messageGridId, let core {
+            core.beginMsgShowDrag(with: event)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
 
 
     // Use GridSurfaceRenderer.ScrollOffset for shader data (shared with main window)

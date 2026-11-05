@@ -705,6 +705,10 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         const pos = external_windows.centredOnWorkArea(app_mod.monitorWorkArea(ext_hwnd), window_w, window_h, 3);
         pos_x = pos.x;
         pos_y = pos.y;
+    } else if (grid_id == app_mod.MESSAGE_GRID_ID and !external_windows.msgShowFollowsAnchor(app)) {
+        // Dragged by the user: resize in place, top-left kept.
+        pos_x = current_rect.left;
+        pos_y = current_rect.top;
     } else if (grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID) {
         // The message floats keep their top-right anchor, as on every other
         // re-layout; the top-left one grew them past the right margin.
@@ -797,6 +801,7 @@ pub fn updateExtFloatPositions(app: *App) void {
     }
 
     if (msg_show_hwnd) |hwnd| {
+        if (!external_windows.msgShowFollowsAnchor(app)) return;
         const size = windowSize(hwnd) orelse return;
         const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, history_bottom);
 
