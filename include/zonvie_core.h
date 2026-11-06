@@ -1993,6 +1993,8 @@ typedef struct zonvie_config_values {
     const char* server_open_mode;  // "tab" or "current"
     // scroll
     uint8_t scroll_large_jump;  // ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
+    // window (macOS only): 0 = native titlebar, 1 = transparent
+    uint8_t window_titlebar_style;
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

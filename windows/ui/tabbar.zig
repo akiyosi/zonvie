@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const window_mod = @import("../window.zig");
 const input = @import("../input.zig");
+const sidebar_caption = @import("sidebar_caption.zig");
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 
@@ -474,7 +475,9 @@ fn trackExternalDrag(app: *App, hwnd: c.HWND, strip: c.RECT, x: c_int, y: c_int)
 /// Whether client x is in the sidebar strip.
 pub fn pointInSidebar(app: *App, hwnd: c.HWND, x: c_int) bool {
     const r = sidebarRectPx(app, hwnd);
-    return x >= r.left and x < r.right;
+    var client: c.RECT = std.mem.zeroes(c.RECT);
+    _ = c.GetClientRect(hwnd, &client);
+    return x >= @max(0, r.left) and x < @min(client.right, r.right);
 }
 
 /// The main window's sidebar strip, in client pixels.
@@ -482,10 +485,12 @@ pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
     var client: c.RECT = std.mem.zeroes(c.RECT);
     _ = c.GetClientRect(hwnd, &client);
     const w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+    // Mid-slide (or closed) the strip is partly (or wholly) past the edge.
+    const covered = sidebar_caption.coveredPx(app);
     return if (app.sidebar_position_right)
-        .{ .left = client.right - w, .top = 0, .right = client.right, .bottom = client.bottom }
+        .{ .left = client.right - covered, .top = 0, .right = client.right - covered + w, .bottom = client.bottom }
     else
-        .{ .left = 0, .top = 0, .right = w, .bottom = client.bottom };
+        .{ .left = covered - w, .top = 0, .right = covered, .bottom = client.bottom };
 }
 
 /// Drop the tab bar's (or sidebar's) hover and repaint its band. For every
@@ -905,7 +910,7 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
 
                 // Match the active OS theme so the drag preview blends with
                 // the titlebar palette regardless of light/dark mode.
-                const preview_pal = currentTitlebarPalette();
+                const preview_pal = osTitlebarPalette();
 
                 // Fill with theme background
                 const bg_brush = c.CreateSolidBrush(preview_pal.bar_bg);
@@ -978,6 +983,11 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
     h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
+    // `titlebar_style = "transparent"` paints the bar from the colorscheme.
+    h.update(std.mem.asBytes(&app.drag_bar_revealed));
+    h.update(std.mem.asBytes(&app.sidebar_position_right));
+    h.update(std.mem.asBytes(&app.colorscheme_bg));
+    h.update(std.mem.asBytes(&app.colorscheme_fg));
     h.update(std.mem.asBytes(&ts.tab_count));
     h.update(std.mem.asBytes(&ts.current_tab));
     for (ts.tabs[0..ts.tab_count]) |*tab| {
@@ -1049,7 +1059,10 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
         switch (surface) {
-            .tabline => drawTablineContent(app, mem_dc, @intCast(width)),
+            .tabline => if (sidebar_caption.enabled(app))
+                sidebar_caption.drawOverlayContent(app, mem_dc, @intCast(width))
+            else
+                drawTablineContent(app, mem_dc, @intCast(width)),
             .sidebar => drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height)),
         }
     }
@@ -1060,6 +1073,20 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
     var i: u32 = 0;
     while (i < pixel_count) : (i += 1) {
         pixels[i * 4 + 3] = 255;
+    }
+    // The captionless overlay keeps only what it drew over its bar colour,
+    // fully transparent elsewhere (premultiplied: zero colour too). Binary
+    // alpha, so redrawing it over retained rows never accumulates.
+    if (surface == .tabline and sidebar_caption.enabled(app)) {
+        const key = currentTitlebarPalette(app).bar_bg;
+        const kr: u8 = @intCast(key & 0xFF);
+        const kg: u8 = @intCast((key >> 8) & 0xFF);
+        const kb: u8 = @intCast((key >> 16) & 0xFF);
+        i = 0;
+        while (i < pixel_count) : (i += 1) {
+            const p = pixels[i * 4 ..][0..4];
+            if (p[0] == kb and p[1] == kg and p[2] == kr) p.* = .{ 0, 0, 0, 0 };
+        }
     }
 
     const pixel_data = pixels[0 .. width * height * 4];
@@ -1148,7 +1175,7 @@ fn sidebarRenderSignature(app: *App, width: u32, height: u32) u64 {
 /// → Colors) so the titlebar tracks the system light/dark mode regardless
 /// of the active Neovim colorscheme. Approximates the Windows 11 native
 /// titlebar palette.
-const TitlebarPalette = struct {
+pub const TitlebarPalette = struct {
     bar_bg: c.COLORREF,
     tab_selected: c.COLORREF,
     tab_hover: c.COLORREF,
@@ -1166,7 +1193,13 @@ const TitlebarPalette = struct {
     accent: c.COLORREF, // drop indicator / float-tab border
 };
 
-fn currentTitlebarPalette() TitlebarPalette {
+pub fn currentTitlebarPalette(app: *const App) TitlebarPalette {
+    if (app.config.window.titlebar_style == .transparent and app.colorscheme_bg != 0xFFFFFFFF)
+        return colorschemeTitlebarPalette(app.colorscheme_bg, app.colorscheme_fg);
+    return osTitlebarPalette();
+}
+
+fn osTitlebarPalette() TitlebarPalette {
     // Read the cached dark-mode flag (UI-thread only). The cache is
     // refreshed by window.applyOsTitlebarTheme() / handleThemeReread() on
     // initial bring-up and on theme-change notifications, so no registry
@@ -1209,8 +1242,49 @@ fn currentTitlebarPalette() TitlebarPalette {
     };
 }
 
+/// `titlebar_style = "transparent"`: the bar is the editor's default bg, so it
+/// reads as part of the editor (the post shader runs over it too); tab states
+/// are that bg shifted toward the text side.
+fn colorschemeTitlebarPalette(bg: u32, fg_or_none: u32) TitlebarPalette {
+    const bg_r: i32 = @intCast((bg >> 16) & 0xFF);
+    const bg_g: i32 = @intCast((bg >> 8) & 0xFF);
+    const bg_b: i32 = @intCast(bg & 0xFF);
+    const dark = bg_r * 299 + bg_g * 587 + bg_b * 114 < 128 * 1000;
+    const fg: u32 = if (fg_or_none != 0xFFFFFFFF) fg_or_none else if (dark) 0xFFFFFF else 0x000000;
+    const Mix = struct {
+        fn rgb(a: u32, b: u32, t_pct: i32) c.COLORREF {
+            var out: [3]i32 = undefined;
+            inline for (0..3) |i| {
+                const sh: u5 = @intCast(16 - 8 * i);
+                const av: i32 = @intCast((a >> sh) & 0xFF);
+                const bv: i32 = @intCast((b >> sh) & 0xFF);
+                out[i] = av + @divTrunc((bv - av) * t_pct, 100);
+            }
+            return c.RGB(@as(u8, @intCast(out[0])), @as(u8, @intCast(out[1])), @as(u8, @intCast(out[2])));
+        }
+    };
+    const toward: u32 = if (dark) 0xFFFFFF else 0x000000;
+    return .{
+        .bar_bg = Mix.rgb(bg, bg, 0),
+        .tab_selected = Mix.rgb(bg, toward, 12),
+        .tab_hover = Mix.rgb(bg, toward, 6),
+        .tab_normal = Mix.rgb(bg, bg, 0),
+        .tab_placeholder = Mix.rgb(bg, toward, 8),
+        .tab_dragging = Mix.rgb(bg, 0x0078D7, 30),
+        .text_selected = Mix.rgb(fg, fg, 0),
+        .text_normal = Mix.rgb(fg, bg, 35),
+        .glyph_pen = Mix.rgb(fg, bg, 25),
+        .glyph_hover_bg = Mix.rgb(bg, toward, 18),
+        .wbtn_icon = Mix.rgb(fg, bg, 15),
+        .wbtn_hover_bg = Mix.rgb(bg, toward, 10),
+        .wbtn_close_hover_bg = c.RGB(232, 17, 35),
+        .wbtn_close_hover_icon = c.RGB(255, 255, 255),
+        .accent = c.RGB(0, 120, 215),
+    };
+}
+
 /// The minimize, maximize and close buttons at the right end of the titlebar.
-fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytype) void {
+pub fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytype) void {
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
@@ -1317,7 +1391,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const plus_icon_inset = app.scalePx(5);
     const is_dragging = app.tabline_state.dragging_tab != null;
 
-    const pal = currentTitlebarPalette();
+    const pal = currentTitlebarPalette(app);
 
     // Background
     const bg_brush = c.CreateSolidBrush(pal.bar_bg);
@@ -1709,10 +1783,19 @@ const SidebarColors = struct {
         const luminance = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
         const is_dark = luminance < 0.5;
 
-        // Sidebar background: slightly darker (dark theme) or lighter (light theme) than bg
-        const sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
-        const sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
-        const sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
+        // Sidebar background: slightly darker (dark theme) or lighter (light theme) than bg.
+        // Captionless, it is macOS's translucent tint over the editor bg: the
+        // bg with its OKLab lightness moved, at the overlay's alpha.
+        var sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
+        var sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
+        var sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
+        if (sidebar_caption.enabled(app)) {
+            const tint = lightnessShifted(bgR, bgG, bgB, !is_dark);
+            const overlay_alpha: f32 = 0.55;
+            sb_bgR = bgR + (tint[0] - bgR) * overlay_alpha;
+            sb_bgG = bgG + (tint[1] - bgG) * overlay_alpha;
+            sb_bgB = bgB + (tint[2] - bgB) * overlay_alpha;
+        }
 
         // Selected tab: brighter (dark) or darker (light) than bg
         const sel_R = if (is_dark) bgR + 0.06 else @max(@as(f32, 0.0), bgR - 0.06);
@@ -1781,6 +1864,38 @@ const SidebarColors = struct {
         };
     }
 
+    /// `rgb` (sRGB 0-1) with its OKLab L moved by the sidebar delta, hue and
+    /// chroma kept. Same constants as macOS TabSidebarView.lightnessShifted.
+    fn lightnessShifted(r: f32, g: f32, b: f32, darker: bool) [3]f32 {
+        const lr = srgbToLinear(r);
+        const lg = srgbToLinear(g);
+        const lb = srgbToLinear(b);
+        const l_ = std.math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+        const m_ = std.math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+        const s_ = std.math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+        var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+        const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+        const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+        L = std.math.clamp(L + (if (darker) @as(f32, -0.07) else 0.04), 0.0, 1.0);
+        const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
+        const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
+        const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
+        return .{
+            linearToSrgb(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
+            linearToSrgb(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
+            linearToSrgb(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
+        };
+    }
+
+    fn srgbToLinear(v: f32) f32 {
+        return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+    }
+
+    fn linearToSrgb(v_in: f32) f32 {
+        const v = std.math.clamp(v_in, 0.0, 1.0);
+        return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+    }
+
     fn f2u8(v: f32) u8 {
         const clamped = @max(@as(f32, 0.0), @min(@as(f32, 1.0), v));
         return @intFromFloat(clamped * 255.0);
@@ -1800,6 +1915,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
     // Compute colors from colorscheme
     const colors = SidebarColors.compute(app);
+    const captionless = sidebar_caption.enabled(app);
 
     // Background
     const bg_brush = c.CreateSolidBrush(c.RGB(colors.bg_r, colors.bg_g, colors.bg_b));
@@ -1816,7 +1932,10 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
     } else {
         sep_rect = .{ .left = width - sep_w, .top = 0, .right = width, .bottom = height };
     }
-    _ = c.FillRect(hdc, &sep_rect, sep_brush);
+    if (!captionless) _ = c.FillRect(hdc, &sep_rect, sep_brush);
+    // The list starts below the band that drags the window.
+    _ = c.SetViewportOrgEx(hdc, 0, sidebarTopInsetPx(app), null);
+    defer _ = c.SetViewportOrgEx(hdc, 0, 0, null);
 
     // Brushes for tab states
     const selected_brush = c.CreateSolidBrush(c.RGB(colors.selected_r, colors.selected_g, colors.selected_b));
@@ -2048,8 +2167,15 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
     }
 }
 
+/// Where the tab list starts in the sidebar: below the window-drag band of
+/// a captionless sidebar. The sidebar handlers work in list coordinates.
+fn sidebarTopInsetPx(app: *const App) c_int {
+    return if (sidebar_caption.enabled(app)) sidebar_caption.bandPx(app) else 0;
+}
+
 /// Handle mouse down in sidebar area
-pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, client_y: c_int) void {
+    const y = client_y - sidebarTopInsetPx(app);
     app.mu.lockUncancelable(core.clock.io());
     const pressed = pressedTabHit(&app.tabline_state, sidebarHitTest(app, hwnd, app.tabline_state.tab_count, x, y));
     app.mu.unlock(core.clock.io());
@@ -2090,13 +2216,15 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 }
 
 /// Handle mouse up in sidebar area
-pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, client_y: c_int) void {
+    const y = client_y - sidebarTopInsetPx(app);
     if (releaseTabButton(app, hwnd)) return;
-    finishTabDrag(app, hwnd, x, y, absDelta(y, app.tabline_state.drag_start_y));
+    finishTabDrag(app, hwnd, x, client_y, absDelta(y, app.tabline_state.drag_start_y));
 }
 
 /// Handle mouse move in sidebar area
-pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, client_y: c_int) void {
+    const y = client_y - sidebarTopInsetPx(app);
     // Track mouse leave
     input.trackMouseLeave(hwnd);
 
@@ -2135,7 +2263,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         app.tabline_state.drag_current_x = x;
         app.tabline_state.drag_current_y = y;
 
-        trackExternalDrag(app, hwnd, sidebarRectPx(app, hwnd), x, y);
+        trackExternalDrag(app, hwnd, sidebarRectPx(app, hwnd), x, client_y);
         if (!app.tabline_state.is_external_drag) {
             // Internal reorder: calculate drop target from Y position
             if (tabDragPastThreshold(absDelta(y, app.tabline_state.drag_start_y), app.scalePx(TablineState.DRAG_THRESHOLD))) {

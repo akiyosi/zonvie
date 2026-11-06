@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const render_helpers = @import("render_pipeline_helpers.zig");
 const callbacks = @import("callbacks.zig");
 const external_windows = @import("ui/external_windows.zig");
+const sidebar_caption = @import("ui/sidebar_caption.zig");
 
 /// The external window that shows the cursor's grid, and where that grid
 /// sits inside it: zero for the window's own root, the layer's origin for a
@@ -494,7 +495,7 @@ pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOr
         .style_is_sidebar = app.tabline_style == .sidebar,
         .style_is_titlebar = app.tabline_style == .titlebar,
         .sidebar_on_right = app.sidebar_position_right,
-        .sidebar_width_px = @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))),
+        .sidebar_width_px = sidebar_caption.gridInsetsPx(app).left,
         .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
     });
 }
@@ -509,8 +510,7 @@ pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
     if (app.tabline_style == .sidebar and app.sidebar_position_right) {
         var client: c.RECT = undefined;
         if (c.GetClientRect(hwnd, &client) == 0) return false;
-        const sidebar_w: i32 = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-        return px >= client.right - sidebar_w;
+        return px >= client.right - sidebar_caption.gridInsetsPx(app).right;
     }
     return false;
 }

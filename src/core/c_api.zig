@@ -3177,6 +3177,7 @@ pub const zonvie_config_values = extern struct {
     server_open_mode: [*:0]const u8 = "tab", // "tab" or "current"
     // scroll: ZONVIE_LARGE_JUMP_PARTIAL / ZONVIE_LARGE_JUMP_SNAP
     scroll_large_jump: u8 = @intFromEnum(cfg_defaults.scroll.large_jump_behavior),
+    window_titlebar_style: u8 = @intFromEnum(cfg_defaults.window.titlebar_style),
 };
 
 const ConfigHandle = struct {
@@ -3297,6 +3298,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .server_open_mode = dupeZForC(alloc, cfg.server.open_mode, "tab"),
         // scroll
         .scroll_large_jump = @intFromEnum(cfg.scroll.large_jump_behavior),
+        .window_titlebar_style = @intFromEnum(cfg.window.titlebar_style),
     };
 }
 

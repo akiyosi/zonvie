@@ -225,14 +225,27 @@ final class SurfaceScrollbarController {
 }
 
 final class MetalTerminalView: GridInputView {
+    override func gridInsetsDidChange() {
+        applyGridInsets()
+        maybeResizeCoreGrid()
+        requestRedraw()
+    }
+
+    private func applyGridInsets() {
+        renderer.setGridInsets(leftPx: (gridInsetsPt.left * backingScale).rounded(),
+                               rightPx: (gridInsetsPt.right * backingScale).rounded(),
+                               topPx: (gridInsetsPt.top * backingScale).rounded())
+    }
+
     var renderer: GridSurfaceRenderer!
 
     override var sharedResources: SharedRenderResources { renderer.shared }
 
     override var dropInsertsPath: Bool { bufferDropInsertsPath }
 
-    /// Expose drawable size without requiring MetalKit import at call site.
-    var currentDrawableSize: CGSize { drawableSize }
+    /// The size the grid is laid out in (the drawable minus the sidebar or
+    /// titlebar-tab insets), without requiring MetalKit at the call site.
+    var currentDrawableSize: CGSize { renderer.gridDrawableSize(self) }
 
     override weak var core: ZonvieCore? {
         didSet {
@@ -515,6 +528,7 @@ final class MetalTerminalView: GridInputView {
 
         let generationBefore = renderer.glyphAtlas.fontGenerationSnapshot()
         renderer.setBackingScale(scale)
+        applyGridInsets()
         // A backing-scale change rebuilds the font and clears the atlas caches,
         // bumping the same generation guifont bumps. The external surfaces gate
         // their committed rows on it, so without this fan-out they kept naming
@@ -551,8 +565,8 @@ final class MetalTerminalView: GridInputView {
 
         let (cellWi, cellHi) = renderer.coreCellPx
 
-        let pxWi = max(1, Int(drawableSize.width))
-        let pxHi = max(1, Int(drawableSize.height))
+        let pxWi = max(1, Int(renderer.gridDrawableSize(self).width))
+        let pxHi = max(1, Int(renderer.gridDrawableSize(self).height))
 
         // The cmdline's width budget in cells. Must match the contentWidth
         // constraint in buildDecoratedCmdlineLayout to keep NDC viewport ==
@@ -635,7 +649,8 @@ final class MetalTerminalView: GridInputView {
             // transient 1×N / N×1 placeholder layout never becomes the
             // reference. A size seen during a live resize is the user's drag
             // even when it equals the last snap. Main-thread only, same as the snap.
-            let curTermPt = bounds.size
+            let curTermPt = CGSize(width: bounds.width - gridInsetsPt.left - gridInsetsPt.right,
+                                   height: bounds.height - gridInsetsPt.top)
             if !inLiveResize, let snapped = core.lastSnappedTermPx,
                abs(curTermPt.width - snapped.width) < 0.5,
                abs(curTermPt.height - snapped.height) < 0.5 {
@@ -1277,7 +1292,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
         if let rect = imeCursorRectInView() { return rect.origin }
         let cell = imePreeditCellSize
-        return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
+        return CGPoint(x: contentOriginPt.x + cell.width, y: bounds.height - cell.height - preeditHeight)
     }
 
     /// A grid another surface shows is placed by that surface, in its own
@@ -1474,7 +1489,26 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// zero otherwise. The draw maps content through
     /// MTLViewport(origin: this * scale); the pointer and the IME measure
     /// from the same point, so they name the same cell.
-    var contentOriginPt: CGPoint { .zero }
+    var contentOriginPt: CGPoint { CGPoint(x: gridInsetsPt.left, y: gridInsetsPt.top) }
+
+    /// Points of the drawable left of, right of and above the grid, covered
+    /// by a translucent sidebar or titlebar tabs. The drawable (and the custom shader) spans the
+    /// whole view; Neovim's grid gets the rest.
+    var gridInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat) = (0, 0, 0) {
+        didSet {
+            guard gridInsetsPt != oldValue else { return }
+            gridInsetsDidChange()
+        }
+    }
+
+    /// Points the sidebar covers at the right edge: the scrollbar stays beside
+    /// the visible sidebar, not the grid, which keeps a fixed width mid-slide.
+    var scrollbarInsetRightPt: CGFloat = 0 {
+        didSet { if scrollbarInsetRightPt != oldValue { layoutScrollbarFrame() } }
+    }
+
+    /// The main surface relays the insets to its renderer and Neovim.
+    func gridInsetsDidChange() {}
 
     /// The drawable's height from the current bounds, the same formula the
     /// drawable is sized with: the stored drawableSize can lag behind bounds
@@ -1933,7 +1967,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     func layoutScrollbarFrame() {
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
         verticalScroller.frame = NSRect(
-            x: bounds.width - scrollerWidth,
+            x: bounds.width - scrollbarInsetRightPt - scrollerWidth,
             y: 0,
             width: scrollerWidth,
             height: bounds.height
@@ -1961,7 +1995,8 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
         let locationInView = convert(event.locationInWindow, from: nil)
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        return locationInView.x >= bounds.width - scrollerWidth
+        let right = bounds.width - scrollbarInsetRightPt
+        return locationInView.x >= right - scrollerWidth && locationInView.x < right
     }
 
     /// Show and hide only on the pointer crossing the strip, and never hide a

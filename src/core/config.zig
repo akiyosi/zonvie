@@ -135,7 +135,12 @@ pub const Config = struct {
         // 0..100. 0 keeps the translucent window but applies no backdrop
         // blur (used to separate blur cost from translucency cost).
         blur_radius: i32 = 20,
+        /// macOS only. transparent: no native titlebar chrome; the content
+        /// extends under the traffic lights.
+        titlebar_style: TitlebarStyle = .native,
     };
+
+    pub const TitlebarStyle = enum(u8) { native = 0, transparent = 1 };
 
     pub const ScrollbarConfig = struct {
         enabled: bool = true,
@@ -382,6 +387,13 @@ pub const Config = struct {
             if (w.opacity) |o| self.window.opacity = @max(0.0, @min(1.0, o));
             if (w.blur) |b| self.window.blur = b;
             if (w.blur_radius) |r| self.window.blur_radius = @max(0, @min(100, r));
+            if (w.titlebar_style) |v| {
+                if (std.mem.eql(u8, v, "native")) {
+                    self.window.titlebar_style = .native;
+                } else if (std.mem.eql(u8, v, "transparent")) {
+                    self.window.titlebar_style = .transparent;
+                }
+            }
         }
 
         if (cfg.scrollbar) |s| {
@@ -858,6 +870,7 @@ const TomlWindow = struct {
     opacity: ?f32 = null,
     blur: ?bool = null,
     blur_radius: ?i32 = null,
+    titlebar_style: ?[]const u8 = null,
 };
 
 const TomlScroll = struct {
@@ -991,6 +1004,8 @@ else "") ++
     \\        opacity         Background opacity (0.0-1.0, default: {d:.1})
     ++ (if (is_windows) "" else std.fmt.comptimePrint(
     "\n        blur_radius     Blur radius (0-100, default: {d})", .{defaults.window.blur_radius})) ++
+    (if (builtin.os.tag == .macos or is_windows)
+    "\n        titlebar_style  \"native\" or \"transparent\" (default: \"native\")" else "") ++
     \\
     \\
     \\    [scrollbar]
@@ -1097,6 +1112,7 @@ pub const default_config_toml: [:0]const u8 = std.fmt.comptimePrint(
     \\# opacity = {d:.1}
     \\# blur = {}
     ++ (if (is_windows) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
+    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\" or \"transparent\"" else "") ++
     \\
     \\
     \\[server]
@@ -1162,6 +1178,22 @@ test "scroll.large_jump_behavior parses both values and ignores unknown ones" {
     );
     defer unknown.deinit();
     try std.testing.expectEqual(Config.LargeJumpBehavior.snap, unknown.scroll.large_jump_behavior);
+}
+
+test "window.titlebar_style parses both values and ignores unknown ones" {
+    var transparent = try parseForTest(std.testing.allocator,
+        \\[window]
+        \\titlebar_style = "transparent"
+    );
+    defer transparent.deinit();
+    try std.testing.expectEqual(Config.TitlebarStyle.transparent, transparent.window.titlebar_style);
+
+    var unknown = try parseForTest(std.testing.allocator,
+        \\[window]
+        \\titlebar_style = "bogus"
+    );
+    defer unknown.deinit();
+    try std.testing.expectEqual(Config.TitlebarStyle.native, unknown.window.titlebar_style);
 }
 
 test "declaring one route keeps the defaults for other events" {

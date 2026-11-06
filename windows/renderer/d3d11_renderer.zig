@@ -1103,6 +1103,9 @@ pub const Renderer = struct {
         // If non-null and content_y_offset is set, draws a solid rect in the tabbar area.
         tabbar_bg_color: ?[4]f32 = null,
 
+        // Left edge of the sidebar strip in client pixels, null without one.
+        sidebar_x_px: ?i32 = null,
+
         // Post-process bloom (neon glow)
         glow_enabled: bool = false,
         glow_intensity: f32 = 0.8,
@@ -1282,11 +1285,11 @@ pub const Renderer = struct {
             bindContentViewport(ctx, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height, effective_dirty);
         }
 
-        // ---- Sidebar (if content_x_offset or sidebar_right_width is set) ----
-        if (opts.content_x_offset != null or opts.sidebar_right_width != null) {
+        // ---- Sidebar ----
+        if (opts.sidebar_x_px) |sidebar_x| {
             if (self.sidebar_strip.srv != null) {
                 self.setFullViewport();
-                try self.drawSidebarTexture(opts.sidebar_right_width != null);
+                try self.drawSidebarTexture(sidebar_x);
                 bindContentViewport(ctx, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height, effective_dirty);
             }
         }
@@ -1526,12 +1529,12 @@ pub const Renderer = struct {
         try self.drawStripTexture(&self.tabline_strip, -1.0, 1.0, 1.0, ndc_bottom);
     }
 
-    /// Draw sidebar texture as a vertical strip at left or right of window.
-    pub fn drawSidebarTexture(self: *Renderer, is_right: bool) !void {
+    /// Draw sidebar texture as a full-height strip whose left edge is `x_px`.
+    pub fn drawSidebarTexture(self: *Renderer, x_px: i32) !void {
         const sb_width = self.sidebar_strip.width;
         if (sb_width == 0 or self.sidebar_strip.height == 0 or self.width == 0 or self.height == 0) return;
         const w_ratio: f32 = 2.0 * @as(f32, @floatFromInt(sb_width)) / @as(f32, @floatFromInt(self.width));
-        const ndc_left: f32 = if (is_right) 1.0 - w_ratio else -1.0;
+        const ndc_left: f32 = -1.0 + 2.0 * @as(f32, @floatFromInt(x_px)) / @as(f32, @floatFromInt(self.width));
         try self.drawStripTexture(&self.sidebar_strip, ndc_left, ndc_left + w_ratio, 1.0, -1.0);
     }
 

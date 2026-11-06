@@ -5,6 +5,7 @@ const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const input = @import("../input.zig");
+const sidebar_caption = @import("sidebar_caption.zig");
 
 pub const ViewportRead = enum { fresh, cached, none };
 
@@ -98,7 +99,7 @@ pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
         .root_grid = 1,
         .dpi_scale = app.dpi_scale,
         .top_offset_px = @floatFromInt(input.surfaceOriginPx(app, true).y),
-        .right_inset_px = if (right_sidebar) @floatFromInt(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))) else 0,
+        .right_inset_px = if (right_sidebar) @floatFromInt(sidebar_caption.coveredPx(app)) else 0,
         .knob_inset_px = 0,
     };
 }

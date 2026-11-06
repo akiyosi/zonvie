@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 const input = @import("../input.zig");
+const sidebar_caption = @import("sidebar_caption.zig");
 const render_helpers = @import("../render_pipeline_helpers.zig");
 
 /// The main window's grid area in screen pixels: the client rect less its
@@ -54,7 +55,7 @@ pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
     const host_hwnd: ?c.HWND = if (surface_id != 1) (if (app.external_windows.get(surface_id)) |w| w.hwnd else null) else null;
     const origin = input.surfaceOriginPx(app, true);
     const right_chrome_px: c_int = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
-        app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))
+        sidebar_caption.coveredPx(app)
     else
         0;
     const cell_w = app.cell_w_px;

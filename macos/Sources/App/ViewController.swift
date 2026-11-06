@@ -12,8 +12,22 @@ final class ViewController: NSViewController {
     private var tabBarView: TabBarView?
     private var sidebarView: TabSidebarView?
 
-    // Height of the Chrome-style tab bar
-    private let tabBarHeight: CGFloat = 36
+    // Transparent titlebar (`[window] titlebar_style = "transparent"`). Menu
+    // or no tabline: the editor clears the traffic-light band; sidebar or
+    // titlebar tabs: the editor surface runs under them.
+    private let transparentTitlebar = ZonvieConfig.shared.window.transparentTitlebar
+    private var terminalTopConstraint: NSLayoutConstraint?
+    private var sidebarEdgeConstraint: NSLayoutConstraint?
+    private var dragBar: TitlebarDragBar?
+    private var sidebarToggleCenterYConstraint: NSLayoutConstraint?
+    private var dragBarHeightConstraint: NSLayoutConstraint?
+    private var sidebarCollapsed = false
+    private var sidebarSliding = false
+    private var tablineShown = false
+    private var bandObserver: Any?
+
+    // Height of the Chrome-style tab bar; over the editor it is the shared band.
+    private var tabBarHeight: CGFloat { transparentTitlebar ? TitlebarBand.heightPt : 36 }
 
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
@@ -64,7 +78,7 @@ final class ViewController: NSViewController {
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: tabBarHeight),
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: transparentTitlebar ? 0 : tabBarHeight),
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
 
@@ -76,19 +90,23 @@ final class ViewController: NSViewController {
             // Menu mode: no tab UI in the window, full-size terminal.
             // Notification observers (set up below, once the core exists)
             // keep currentTabs tracking.
+            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
+            terminalTopConstraint = top
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                top,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
 
         case nil:
             // No ext_tabline: full-size terminal
+            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
+            terminalTopConstraint = top
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                top,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
@@ -103,6 +121,18 @@ final class ViewController: NSViewController {
             setupTablineNotificationObservers()
         }
         sidebarView?.observeColorschemeChanges(of: core)
+        if transparentTitlebar && !config.blurEnabled {
+            // The band above the editor shows the root view: paint it the
+            // editor's default background.
+            bandObserver = NotificationCenter.default.addObserver(
+                forName: ZonvieCore.colorschemeDidChangeNotification, object: core, queue: .main
+            ) { [weak self] note in
+                guard let rgb = note.userInfo?["bgRGB"] as? UInt32, rgb != 0xFFFF_FFFF else { return }
+                self?.view.layer?.backgroundColor = CGColor(
+                    srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                    blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
+            }
+        }
 
         // Wire both directions
         core.terminalView = terminalView
@@ -311,7 +341,7 @@ final class ViewController: NSViewController {
     }
 
     deinit {
-        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver] {
+        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver, bandObserver] {
             if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
@@ -324,6 +354,142 @@ final class ViewController: NSViewController {
             connectDialogShown = true
             presentConnectionDialog()
         }
+    }
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        // Before the window shows, so the first layout already has the
+        // toolbar's titlebar height.
+        installSidebarToggleIfNeeded()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        updateTitlebarLayout()
+    }
+
+    // MARK: - Transparent titlebar
+
+    /// Height of the titlebar the content extends under.
+    private var titlebarBandHeight: CGFloat {
+        guard transparentTitlebar, let window = view.window else { return 0 }
+        if window is SidebarTitlebarWindow { return TitlebarBand.heightPt }
+        return max(0, window.frame.height - window.contentLayoutRect.height)
+    }
+
+    private func updateTitlebarLayout() {
+        guard transparentTitlebar else { return }
+        let band = titlebarBandHeight
+        sidebarView?.topInset = band
+        // Sidebar mode: the editor always starts at the window top, so
+        // toggling the sidebar never moves it vertically.
+        let top: CGFloat = sidebarView != nil ? 0 : band
+        if terminalTopConstraint?.constant != top { terminalTopConstraint?.constant = top }
+        if dragBarHeightConstraint?.constant != band { dragBarHeightConstraint?.constant = band }
+        if sidebarToggleCenterYConstraint?.constant != band / 2 { sidebarToggleCenterYConstraint?.constant = band / 2 }
+        updateGridInsets()
+    }
+
+    /// The editor spans the window under a translucent sidebar; its grid
+    /// starts beside the sidebar's visible part, which follows the slide.
+    private func updateGridInsets() {
+        if tabBarView != nil, transparentTitlebar {
+            // Titlebar tabs float over the editor surface; the grid starts below them.
+            terminalView.gridInsetsPt = (0, 0, tabBarHeight)
+            return
+        }
+        guard let sidebar = sidebarView else { return }
+        // From the laid-out frame, hidden or not: the sidebar's room is held
+        // from launch (as the side-by-side layout did), so the grid never
+        // starts full width and the window snap never records that width.
+        let covered = view.bounds.intersection(sidebar.frame).width
+        terminalView.scrollbarInsetRightPt = sidebar.isRightSide ? covered : 0
+        if sidebarSliding {
+            // Mid-slide the grid keeps the open-sidebar width and only moves,
+            // so Neovim is resized once (before opening, after closing) and
+            // opening and closing are mirror images.
+            let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width, 0) : (covered, width - covered, 0)
+        } else {
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered, 0) : (covered, 0, 0)
+        }
+    }
+
+    private var sidebarToggleInstalled = false
+    /// Where the toggle sits past the traffic lights (left sidebar) or in
+    /// from the right edge (right sidebar).
+    private static let sidebarToggleMarginPt: CGFloat = TitlebarBand.controlsWidthPt
+    private static let sidebarToggleSizePt: CGFloat = 22
+
+    /// No NSToolbar: on Tahoe a toolbar window gets the larger corner radius
+    /// and the band grows. A plain button in the band keeps the window frame
+    /// as it is.
+    private func installSidebarToggleIfNeeded() {
+        guard transparentTitlebar, let sidebar = sidebarView, !sidebarToggleInstalled,
+              view.window != nil else { return }
+        sidebarToggleInstalled = true
+
+        let bar = TitlebarDragBar(frame: .zero)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(bar, positioned: .above, relativeTo: terminalView)
+        let height = bar.heightAnchor.constraint(equalToConstant: titlebarBandHeight)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: terminalView.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: terminalView.trailingAnchor),
+            bar.topAnchor.constraint(equalTo: view.topAnchor),
+            height,
+        ])
+        bar.isEnabled = sidebarCollapsed || !tablineShown
+        dragBar = bar
+        dragBarHeightConstraint = height
+
+        let symbol = sidebar.isRightSide ? "sidebar.right" : "sidebar.left"
+        let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: "Toggle Sidebar")!,
+                              target: self, action: #selector(toggleSidebar(_:)))
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.translatesAutoresizingMaskIntoConstraints = false
+        // Topmost: the sidebar slides under it.
+        view.addSubview(button, positioned: .above, relativeTo: nil)
+        sidebar.toggleButton = button
+        let side = sidebar.isRightSide
+            ? button.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -Self.sidebarToggleMarginPt)
+            : button.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: Self.sidebarToggleMarginPt)
+        let centerY = button.centerYAnchor.constraint(equalTo: view.topAnchor, constant: titlebarBandHeight / 2)
+        NSLayoutConstraint.activate([
+            side, centerY,
+            button.widthAnchor.constraint(equalToConstant: Self.sidebarToggleSizePt),
+            button.heightAnchor.constraint(equalToConstant: Self.sidebarToggleSizePt),
+        ])
+        sidebarToggleCenterYConstraint = centerY
+    }
+
+    @objc private func toggleSidebar(_ sender: Any?) {
+        guard let sidebar = sidebarView, let window = view.window else { return }
+        sidebarCollapsed.toggle()
+        let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
+        var minSize = window.contentMinSize
+        minSize.width += sidebarCollapsed ? -width : width
+        window.contentMinSize = minSize
+        // Visible for the whole slide; hidden once it has fully closed.
+        if !sidebarCollapsed { sidebar.isHidden = !tablineShown }
+        let collapsing = sidebarCollapsed
+        sidebarSliding = true
+        updateGridInsets()
+        dragBar?.isEnabled = collapsing || !tablineShown
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.4
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.allowsImplicitAnimation = true
+            let offset: CGFloat = collapsing ? width : 0
+            sidebarEdgeConstraint?.animator().constant = sidebar.isRightSide ? offset : -offset
+            view.layoutSubtreeIfNeeded()
+        }, completionHandler: { [weak self] in
+            guard let self, self.sidebarCollapsed == collapsing else { return }
+            if collapsing { sidebar.isHidden = true }
+            self.sidebarSliding = false
+            self.updateGridInsets()
+        })
     }
 
     // MARK: - Tabline Notification Observers (shared across modes)
@@ -364,7 +530,10 @@ final class ViewController: NSViewController {
     private func handleTablineUpdate(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
         self.currentTabs = tabs
         tabBarView?.isHidden = false
-        sidebarView?.isHidden = false
+        sidebarView?.isHidden = sidebarCollapsed
+        tablineShown = true
+        updateGridInsets()
+        dragBar?.isEnabled = sidebarCollapsed
         tabBarView?.updateTabs(tabs, currentTab: currentTab)
         sidebarView?.updateTabs(tabs, currentTab: currentTab)
     }
@@ -372,6 +541,9 @@ final class ViewController: NSViewController {
     private func handleTablineHide() {
         tabBarView?.isHidden = true
         sidebarView?.isHidden = true
+        tablineShown = false
+        updateGridInsets()
+        dragBar?.isEnabled = true
     }
 
     // MARK: - Tab Bar (titlebar mode)
@@ -379,6 +551,7 @@ final class ViewController: NSViewController {
     private func setupTabBar() {
         let tabBar = TabBarView(frame: NSRect(x: 0, y: 0, width: view.bounds.width, height: tabBarHeight))
         tabBar.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.transparentBackground = transparentTitlebar
         view.addSubview(tabBar)
 
         NSLayoutConstraint.activate([
@@ -440,28 +613,36 @@ final class ViewController: NSViewController {
 
         self.sidebarView = sidebar
 
+        let topConstraint = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
+        terminalTopConstraint = topConstraint
+        // Collapsing slides the sidebar off its window edge at full width.
+        let edgeConstraint = isRight
+            ? sidebar.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            : sidebar.leadingAnchor.constraint(equalTo: view.leadingAnchor)
+        sidebarEdgeConstraint = edgeConstraint
+
         if isRight {
             NSLayoutConstraint.activate([
-                sidebar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                edgeConstraint,
                 sidebar.topAnchor.constraint(equalTo: view.topAnchor),
                 sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
                 sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
 
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                terminalView.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                terminalView.trailingAnchor.constraint(equalTo: transparentTitlebar ? view.trailingAnchor : sidebar.leadingAnchor),
+                topConstraint,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         } else {
             NSLayoutConstraint.activate([
-                sidebar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                edgeConstraint,
                 sidebar.topAnchor.constraint(equalTo: view.topAnchor),
                 sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
                 sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
 
-                terminalView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+                terminalView.leadingAnchor.constraint(equalTo: transparentTitlebar ? view.leadingAnchor : sidebar.trailingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                topConstraint,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }

@@ -173,14 +173,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let tablineStyle = ZonvieConfig.shared.effectiveTablineStyle
         ZonvieCore.appLog("[AppDelegate] effectiveTablineStyle=\(String(describing: tablineStyle)) tabline.style=\(ZonvieConfig.shared.tabline.style)")
 
-        // Only titlebar mode needs fullSizeContentView and TabBarWindow
-        if tablineStyle == .titlebar {
+        // Titlebar tabs draw their own titlebar; a transparent titlebar lets
+        // the content (sidebar or editor) extend under the traffic lights.
+        let transparentTitlebar = tablineStyle != .titlebar && ZonvieConfig.shared.window.transparentTitlebar
+        if tablineStyle == .titlebar || transparentTitlebar {
             style.insert(.fullSizeContentView)
         }
 
         let win: NSWindow
         if tablineStyle == .titlebar {
             win = TabBarWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
+        } else if transparentTitlebar && tablineStyle == .sidebar {
+            win = SidebarTitlebarWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
         } else {
             win = NSWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
         }
@@ -193,6 +197,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             win.titleVisibility = .hidden
             win.isMovableByWindowBackground = false
             win.isMovable = false  // Completely disable window dragging - TabBarView handles it manually
+        }
+        if transparentTitlebar {
+            win.titlebarAppearsTransparent = true
+            win.titleVisibility = .hidden
         }
 
         // Make window transparent for blur effect (required for CGSSetWindowBackgroundBlurRadius)

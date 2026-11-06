@@ -71,6 +71,7 @@ struct ZonvieConfig {
         var blur: Bool = true
         var opacity: Double = 0.5  // Only used when blur=true
         var blurRadius: Int = 20   // Blur radius (0-100), only used when blur=true; 0 = translucent without blur
+        var transparentTitlebar: Bool = false
     }
 
     struct ScrollbarConfig {
@@ -278,6 +279,7 @@ struct ZonvieConfig {
         config.window.blur = v.window_blur
         config.window.opacity = Double(v.window_opacity)
         config.window.blurRadius = Int(v.window_blur_radius)
+        config.window.transparentTitlebar = v.window_titlebar_style == 1
 
         // Scrollbar
         config.scrollbar.enabled = v.scrollbar_enabled
