@@ -83,10 +83,25 @@ def remote_expr(expr):
         capture_output=True, text=True, timeout=20)
 
 
+# Lua expression producing the text of stress-buffer cell `i`.
+STRESS_CELLS = {
+    # Distinct CJK ideographs (multibyte, double-width).
+    "atlas": "vim.fn.nr2char(0x4E00 + (i % 20902))",
+    # Distinct color emoji from the Supplemental Symbols and Pictographs and
+    # Emoticons blocks (double-width, color rasterization).
+    "emoji": "vim.fn.nr2char(i % 2 == 0 and 0x1F900 + math.floor(i / 2) % 256 "
+             "or 0x1F600 + math.floor(i / 2) % 80)",
+    # Dense single-width text mixing ASCII, Latin-1, Greek and Cyrillic.
+    "dense": "vim.fn.nr2char(({0x21, 0xC0, 0x391, 0x410})[i % 4 + 1] "
+             "+ (i * 7 % 64))",
+}
+
+
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "buffer"
-    if scenario not in ("buffer", "atlas", "tig"):
-        sys.exit(f"unknown scenario: {scenario} (expected buffer, atlas, or tig)")
+    if scenario not in ("buffer", "tig", *STRESS_CELLS):
+        sys.exit(f"unknown scenario: {scenario} "
+                 f"(expected buffer, tig, or one of {', '.join(STRESS_CELLS)})")
     secs = float(sys.argv[2]) if len(sys.argv) > 2 else 15.0
     out = sys.argv[3] if len(sys.argv) > 3 else str(WORK / "trace.csv")
     # Producer period in ms. The display consumes at 60Hz; driving the producer
@@ -134,7 +149,7 @@ def main():
     # Let the UI attach, size itself and settle.
     time.sleep(5)
 
-    if scenario == "atlas":
+    if scenario in STRESS_CELLS:
         # Keep every visible row full through the right edge while exceeding
         # the fixed non-ASCII glyph cache working set. Sparse scrolling should
         # shape/rasterize only the entering row; a begin-abort recovery that
@@ -143,9 +158,8 @@ def main():
         setup_lua = (
             "(function() local lines = {}; "
             "for row = 0, 3999 do local chars = {}; "
-            "for col = 0, 159 do "
-            "chars[#chars + 1] = vim.fn.nr2char("
-            "0x4E00 + ((row * 160 + col) % 20902)); "
+            "for col = 0, 159 do local i = row * 160 + col; "
+            f"chars[#chars + 1] = {STRESS_CELLS[scenario]}; "
             "end; lines[#lines + 1] = table.concat(chars); end; "
             "vim.api.nvim_buf_set_lines(0, 0, -1, false, lines); "
             "vim.api.nvim_win_set_cursor(0, {1, 0}); "

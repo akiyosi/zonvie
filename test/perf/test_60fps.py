@@ -5,14 +5,15 @@ The test drives a full-width, high-cardinality CJK buffer at 60 updates/s,
 then checks both the producer and consumer sides of the frame budget:
 
   * committed core flush p95 <= 16.67 ms
-  * committed content rate >= 58 flushes/s
-  * effective on-glass rate >= 58 fps
-  * on-glass slips <= 1/s
+  * committed content rate >= 60 flushes/s
+  * effective on-glass rate >= 60.00 fps (rounded to 0.01)
+  * no on-glass slips
   * visually stalled frames <= 10%
 
 Usage:
     test/perf/test_60fps.py
     test/perf/test_60fps.py --seconds 20
+    test/perf/test_60fps.py --scenario emoji
     test/perf/test_60fps.py --trace tmp/scrollperf/existing.csv
 """
 
@@ -27,11 +28,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_TRACE = REPO / "tmp" / "scrollperf" / "60fps.csv"
 FRAME_BUDGET_NS = 1_000_000_000 / 60
-MIN_EFFECTIVE_FPS = 58.0
-MIN_COMMITTED_FPS = 58.0
-MAX_SLIPS_PER_SECOND = 1.0
+MIN_EFFECTIVE_FPS = 60.0
+MIN_COMMITTED_FPS = 60.0
+MAX_SLIPS_PER_SECOND = 0.0
 MAX_VISUAL_STALL_RATIO = 0.10
 MIN_ACTIVE_SECONDS = 5.0
+# run_trace.py stress buffers: CJK ideographs, color emoji, dense text.
+SCENARIOS = ("atlas", "emoji", "dense")
 MIN_COMMITTED_FLUSHES = 100
 
 DRAW_BEGIN = 1
@@ -201,7 +204,7 @@ def check_trace(path):
                 if interval > FRAME_BUDGET_NS * 1.5
             ]
             slip_rate = len(slips) / display_seconds
-        if effective_fps < MIN_EFFECTIVE_FPS:
+        if round(effective_fps, 2) < MIN_EFFECTIVE_FPS:
             failures.append(
                 f"effective on-glass rate {effective_fps:.2f}fps "
                 f"< {MIN_EFFECTIVE_FPS:.2f}fps"
@@ -257,14 +260,14 @@ def check_trace(path):
     return 0
 
 
-def capture_trace(path, seconds, floats):
+def capture_trace(path, seconds, floats, scenario):
     env = dict(os.environ)
     env.setdefault("ZONVIE_TRACE_CONFIG", "Release")
     env["ZONVIE_TRACE_FLOATS"] = str(floats)
     command = [
         sys.executable,
         str(REPO / "test" / "perf" / "run_trace.py"),
-        "atlas",
+        scenario,
         str(seconds),
         str(path),
         "16",
@@ -298,16 +301,34 @@ def main():
         default=0,
         help="fixed 20x10 floats over the scrolling area (default: 0)",
     )
+    parser.add_argument(
+        "--scenario",
+        choices=("all", *SCENARIOS),
+        default="all",
+        help="buffer content to scroll (default: all, one capture each)",
+    )
     args = parser.parse_args()
 
-    trace = args.trace.resolve() if args.trace else args.output.resolve()
-    if args.trace is None:
-        if capture_trace(trace, args.seconds, args.floats) != 0:
+    if args.trace is not None:
+        trace = args.trace.resolve()
+        if not trace.exists():
+            print(f"FAIL: trace not found: {trace}", file=sys.stderr)
             return 1
-    if not trace.exists():
-        print(f"FAIL: trace not found: {trace}", file=sys.stderr)
+        return check_trace(trace)
+
+    scenarios = SCENARIOS if args.scenario == "all" else (args.scenario,)
+    output = args.output.resolve()
+    failed = []
+    for scenario in scenarios:
+        trace = output.with_name(f"{output.stem}-{scenario}{output.suffix}")
+        print(f"### scenario: {scenario}", flush=True)
+        if (capture_trace(trace, args.seconds, args.floats, scenario) != 0
+                or not trace.exists() or check_trace(trace) != 0):
+            failed.append(scenario)
+    if failed:
+        print(f"FAIL: scenarios {', '.join(failed)}", file=sys.stderr)
         return 1
-    return check_trace(trace)
+    return 0
 
 
 if __name__ == "__main__":
