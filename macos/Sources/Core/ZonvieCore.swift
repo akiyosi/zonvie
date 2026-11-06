@@ -4151,7 +4151,9 @@ final class ZonvieCore {
         // many intermediate snaps ran or how far apart they arrived, which is
         // what removes the timing dependency of the scheduleWindowSnap debounce
         // (LIMITATION #1 there): even if the burst splits, correctness holds.
-        let actualContentPt = view.bounds.size
+        let actualContentPt = CGSize(
+            width: view.bounds.width - view.gridInsetsPt.left - view.gridInsetsPt.right,
+            height: view.bounds.height - view.gridInsetsPt.top)
         if desiredTermPx == nil { desiredTermPx = actualContentPt }
         let baseContentPt = desiredTermPx ?? actualContentPt
 
@@ -8415,8 +8417,12 @@ final class ZonvieCore {
         // Ensure Auto Layout has resolved before reading the frame.
         // Prevents stale coordinates after window resize or tabline toggle.
         mainView.layoutSubtreeIfNeeded()
-        let viewBoundsInWindow = mainView.convert(mainView.bounds, to: nil)
-        return window.convertToScreen(viewBoundsInWindow)
+        // The grid, not the drawable: a translucent sidebar covers the insets.
+        var grid = mainView.bounds
+        grid.origin.x += mainView.gridInsetsPt.left
+        grid.size.width -= mainView.gridInsetsPt.left + mainView.gridInsetsPt.right
+        grid.size.height -= mainView.gridInsetsPt.top
+        return window.convertToScreen(mainView.convert(grid, to: nil))
     }
 
     /// Cells `rows` x `cols` from (`row`, `col`) of a grid whose content

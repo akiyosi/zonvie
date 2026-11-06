@@ -2394,6 +2394,46 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // --- Persistent back buffer (for correct partial redraw) ---
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
+
+    /// Pixels between the drawable's left/right edges and the grid's (a
+    /// translucent sidebar over the drawable). The grid and every pass up to
+    /// the back buffer use the drawable minus both; only the final composite,
+    /// and so the custom shader chain, spans the whole drawable. Under `lock`:
+    /// the core thread reads the left one to place the shader cursor.
+    private var gridInsetLeftPx: CGFloat = 0
+    private var gridInsetRightPx: CGFloat = 0
+    private var gridInsetTopPx: CGFloat = 0
+    /// Full-drawable texture the back buffer is composited into at the inset.
+    private var insetPadTexture: MTLTexture?
+
+    func setGridInsets(leftPx: CGFloat, rightPx: CGFloat, topPx: CGFloat) {
+        lock.lock()
+        let changed = gridInsetLeftPx != leftPx || gridInsetRightPx != rightPx || gridInsetTopPx != topPx
+        gridInsetLeftPx = leftPx
+        gridInsetRightPx = rightPx
+        gridInsetTopPx = topPx
+        // A moved grid is a whole new composite: a frame with no dirty row
+        // would present nothing and leave the grid at its old place.
+        if changed { invalidatePresentedLocked() }
+        lock.unlock()
+        if changed {
+            markAllRowsDirty()
+            markAllLayersDirty()
+        }
+    }
+
+    var gridInsetsPx: (left: CGFloat, right: CGFloat, top: CGFloat) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (gridInsetLeftPx, gridInsetRightPx, gridInsetTopPx)
+    }
+
+    /// The drawable minus the grid insets: the size the grid is laid out in.
+    func gridDrawableSize(_ view: MTKView) -> CGSize {
+        let inset = gridInsetsPx
+        return CGSize(width: max(1, view.drawableSize.width - inset.left - inset.right),
+                      height: max(1, view.drawableSize.height - inset.top))
+    }
     private let scrollScratch = SurfaceScrollScratchTexture()
 
     // --- Blur transparency support ---
@@ -3007,10 +3047,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // backBufferSize is written under `lock` by ensureBackBuffer() (main
         // thread); read it under the same lock here since this runs on the
         // core/RPC thread and a resize can race with this cursor update.
-        let (bufW, bufH): (CGFloat, CGFloat) = {
+        let (bufW, bufH, insetPx, insetTopPx): (CGFloat, CGFloat, CGFloat, CGFloat) = {
             lock.lock()
             defer { lock.unlock() }
-            return (backBufferSize.width, backBufferSize.height)
+            return (backBufferSize.width, backBufferSize.height, gridInsetLeftPx, gridInsetTopPx)
         }()
         // Before the first ensureBackBuffer() call, backBufferSize is still
         // .zero — skip computing nonsensical (0,0,0,0) cursor-shader uniforms;
@@ -3030,8 +3070,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // edge of the cursor rect (center = y - h/2, rect = y-h..y).
         // Pass bottom-edge so the SDF renders over the actual cursor.
         let c0 = verts[0].color
+        // The shader runs over the whole drawable, the grid starts at the inset.
+        let shaderLeft = rect.left + Float(insetPx)
         shared.shaderCursor.stage(
-            rect: (rect.left, rect.bottom, rect.right - rect.left, rect.bottom - rect.top),
+            rect: (shaderLeft, rect.bottom + Float(insetTopPx), rect.right - rect.left, rect.bottom - rect.top),
             color: (c0.x, c0.y, c0.z, c0.w),
             gridId: verts[0].grid_id,
             by: self
@@ -3461,7 +3503,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // otherwise macOS stretches the old frame to the new window size.
             f.drawableSizeChanged = surfaceDrawableSizeChanged(
                 backBufferSize: backBuffer == nil ? nil : backBufferSize,
-                drawableSize: view.drawableSize
+                drawableSize: gridDrawableSize(view)
             )
 
             // If nothing changed, do not encode/present a new frame.
@@ -3557,8 +3599,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             f.cellWi = max(1, UInt32(cw.rounded(.up)))
             f.cellHi = max(1, UInt32(ch.rounded(.up)))
             let (drawableWi, drawableHi) = f.committedExtent.resolved(
-                liveWidth: max(1, UInt32(view.drawableSize.width)),
-                liveHeight: max(1, UInt32(view.drawableSize.height))
+                liveWidth: max(1, UInt32(gridDrawableSize(view).width)),
+                liveHeight: max(1, UInt32(gridDrawableSize(view).height))
             )
             f.drawableHi = drawableHi
             let vpWidth = Double((drawableWi / f.cellWi) * f.cellWi)
@@ -3568,7 +3610,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             f.viewportMetrics = SurfaceViewportMetrics(
                 viewportWidth: vpWidth,
                 viewportHeight: vpHeight,
-                drawableSize: view.drawableSize,
+                drawableSize: gridDrawableSize(view),
                 layerOriginPx: f.rootLayerOrigin
             )
 
@@ -3610,7 +3652,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_backbuf_start = CFAbsoluteTimeGetCurrent()
             }
-            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
+            ensureBackBuffer(drawableSize: gridDrawableSize(view), pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
             if ZonvieCore.appLogEnabled {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
@@ -3726,7 +3768,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 backTex: backTex,
                 pixelFormat: view.colorPixelFormat,
                 viewportMetrics: f.viewportMetrics,
-                drawableSize: view.drawableSize,
+                drawableSize: gridDrawableSize(view),
                 glowTextures: glowTextures,
                 intensity: host?.core?.getGlowIntensity() ?? 0.8,
                 // One read, for both the chain's depth and the taps' reach.
@@ -4418,7 +4460,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             cellHeightPx: Int(f.cellHi),
             renderTarget: backTex,
             viewportMetrics: f.viewportMetrics,
-            drawableSize: view.drawableSize
+            drawableSize: gridDrawableSize(view)
         )
         // Shared with ExternalGridView; this surface's root is grid 1.
         func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
@@ -4780,9 +4822,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 grid: 1, cols: Int(cols), rows: Int(rows), device: shared.device)
         }
         let cursorVisible = f.cursorBlink && f.cursorCount > 0
+        var source = backTex
+        let inset = gridInsetsPx
+        if gridDrawableSize(view) != view.drawableSize {
+            guard let padded = encodeGridInsetPad(f, cmd: cmd, backTex: backTex, view: view, inset: inset) else {
+                return .notEncoded
+            }
+            source = padded
+        }
         return encodeSurfaceBackBufferToDrawable(
             cmd: cmd,
-            backTex: backTex,
+            backTex: source,
             drawableTexture: drawable.texture,
             customShaderPipelines: shared.customShaderChain(decorated: false),
             runsCustomShaderChain: runsChain,
@@ -4801,6 +4851,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     backingScale: backingScale,
                     cursorVisible: cursorVisible,
                     cmdlineCursorVisible: f.cursorBlink,
+                    gridOrigin: CGPoint(x: inset.left, y: inset.top),
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
             },
@@ -4812,6 +4863,43 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 gpuSampler.attachStats(to: copyRPD, label: "copy")
             }
         )
+    }
+
+    /// The back buffer placed at the left/top insets of a full-drawable
+    /// texture whose remainder is the default background. Persistent texture,
+    /// reallocated only when its capacity changes.
+    private func encodeGridInsetPad(
+        _ f: MainSurfaceFrame, cmd: MTLCommandBuffer, backTex: MTLTexture, view: MTKView, inset: (left: CGFloat, right: CGFloat, top: CGFloat)
+    ) -> MTLTexture? {
+        guard let copyPipe = shared.copyPipeline, let copyVB = shared.copyVertexBuffer,
+              let samp = shared.sampler else { return nil }
+        let full = view.drawableSize
+        let capacity = surfaceTextureCapacity(current: insetPadTexture, logicalSize: full, inLiveResize: view.inLiveResize)
+        if insetPadTexture?.width != capacity.widthPx || insetPadTexture?.height != capacity.heightPx {
+            insetPadTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
+                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                pixelFormat: view.colorPixelFormat,
+                usage: [.renderTarget, .shaderRead]))
+        }
+        guard let padded = insetPadTexture else { return nil }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = padded
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(bgRGB: f.bgRGB, blurEnabled: blurEnabled)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return nil }
+        let grid = gridDrawableSize(view)
+        enc.setViewport(MTLViewport(originX: Double(inset.left), originY: Double(inset.top),
+                                    width: Double(grid.width), height: Double(grid.height), znear: 0, zfar: 1))
+        enc.setRenderPipelineState(copyPipe)
+        enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+        var scale = surfaceUVScale(logicalSize: grid, capacity: backTex)
+        enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
+        enc.setFragmentTexture(backTex, index: 0)
+        enc.setFragmentSamplerState(samp, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        enc.endEncoding()
+        return padded
     }
 
     /// Copy-pass dirty-region opportunity: characterizes how much of the
@@ -4879,6 +4967,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         committedCursor: SurfaceCursorSlot
     ) -> Bool {
         guard f.cursorBlink, f.cursorCount > 0, let cvb = committedCursor.vertexBuffer else { return true }
+        let inset = gridInsetsPx
+        let insetPx = Double(inset.left), insetTopPx = Double(inset.top)
+        // The composite put the grid at the inset; the cursor goes there too.
+        let vm = f.viewportMetrics
+        let viewportMetrics = insetPx == 0 && insetTopPx == 0 ? vm : SurfaceViewportMetrics(
+            viewportWidth: vm.viewportWidth, viewportHeight: vm.viewportHeight,
+            drawableSize: CGSize(width: Double(vm.fragmentWidth), height: Double(vm.fragmentHeight)),
+            originX: vm.originX + insetPx, originY: vm.originY + insetTopPx, layerOriginPx: vm.layerOriginPx)
         // Shared with ExternalGridView. The two closures below are the
         // only places the surfaces differ: perf samples, and an array
         // of per-grid offsets where an external surface binds one.
@@ -4888,7 +4984,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             pipeline: shared.pipeline!,
             atlasTexture: f.atlasTex,
             sampler: shared.sampler!,
-            viewportMetrics: f.viewportMetrics,
+            viewportMetrics: viewportMetrics,
             cursorVertexBuffer: cvb,
             cursorVertexCount: f.cursorCount,
             layerOriginPx: f.cursorLayerOrigin,

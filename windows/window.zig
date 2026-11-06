@@ -15,10 +15,17 @@ const tabline_mod = @import("ui/tabbar.zig");
 const messages = @import("ui/messages.zig");
 const external_windows = @import("ui/external_windows.zig");
 const scrollbar = @import("ui/scrollbar.zig");
+const sidebar_caption = @import("ui/sidebar_caption.zig");
 const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
 const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
+
+/// The window draws its own caption (WM_NCCALCSIZE drops the native one):
+/// the titlebar tabline, or the captionless sidebar.
+fn customFrame(app: *const App) bool {
+    return app.ext_tabline_enabled and (app.tabline_style == .titlebar or sidebar_caption.enabled(app));
+}
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
 /// single-instance forwarding and the WM_COPYDATA handler below). 'ZONP': the
@@ -1705,7 +1712,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     app.d3d_init_thread = std.Thread.spawn(.{}, d3dInitThreadFn, .{app}) catch null;
 
     // 8. Tabline titlebar mode: trigger SWP_FRAMECHANGED immediately
-    if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
+    if (customFrame(app)) {
         _ = c.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE);
         if (log_enabled) applog.appLog("[win] WM_CREATE: SWP_FRAMECHANGED applied (overlaps nvim spawn ~50ms)\n", .{});
     }
@@ -2198,6 +2205,9 @@ const MainContentGeom = struct {
     content_x_offset: ?u32,
     content_y_offset: ?u32,
     sidebar_right_width: ?u32,
+    sidebar_x_px: ?i32,
+    /// The captionless sidebar's overlay band, 0 without one.
+    caption_band_px: i32,
     tabbar_bg_color: ?[4]f32,
     content_x_offset_i32: i32,
     content_y_offset_i32: i32,
@@ -2223,9 +2233,12 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
     const content_y_offset: ?u32 = if (origin.y > 0) @intCast(origin.y) else null;
     const content_x_offset: ?u32 = if (origin.x > 0) @intCast(origin.x) else null;
 
-    // Sidebar right width (reduces content area from right edge)
-    const sidebar_right_width: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
-        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    // Pixels the grid leaves at the right: a right sidebar's, or the room a
+    // left sidebar gives up mid-slide.
+    const right_inset = sidebar_caption.gridInsetsPx(app).right;
+    const sidebar_right_width: ?u32 = if (right_inset > 0) @intCast(right_inset) else null;
+    const sidebar_x_px: ?i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and sidebar_caption.coveredPx(app) > 0)
+        tabline_mod.sidebarRectPx(app, hwnd).left
     else
         null;
 
@@ -2235,7 +2248,14 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
     // the fallback matches currentTitlebarPalette().bar_bg
     // (RGB(32,32,32) dark / RGB(240,240,240) light).
     const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
-        (if (g_os_dark_theme_cached)
+        (if (app.config.window.titlebar_style == .transparent and app.colorscheme_bg != 0xFFFFFFFF)
+            [4]f32{
+                @as(f32, @floatFromInt((app.colorscheme_bg >> 16) & 0xFF)) / 255.0,
+                @as(f32, @floatFromInt((app.colorscheme_bg >> 8) & 0xFF)) / 255.0,
+                @as(f32, @floatFromInt(app.colorscheme_bg & 0xFF)) / 255.0,
+                1.0,
+            }
+        else if (g_os_dark_theme_cached)
             [4]f32{ 32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0 }
         else
             [4]f32{ 240.0 / 255.0, 240.0 / 255.0, 240.0 / 255.0, 1.0 })
@@ -2248,6 +2268,8 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
         .content_x_offset = content_x_offset,
         .content_y_offset = content_y_offset,
         .sidebar_right_width = sidebar_right_width,
+        .sidebar_x_px = sidebar_x_px,
+        .caption_band_px = if (sidebar_caption.enabled(app)) sidebar_caption.bandPx(app) else 0,
         .tabbar_bg_color = tabbar_bg_color,
         .content_x_offset_i32 = if (content_x_offset) |off| @intCast(off) else 0,
         .content_y_offset_i32 = if (content_y_offset) |off| @intCast(off) else 0,
@@ -2278,6 +2300,9 @@ fn renderMainChromeTextures(app: *App, client: c.RECT) void {
             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
         } else if (app.tabline_style == .sidebar) {
+            if (sidebar_caption.enabled(app)) {
+                tabline_mod.renderTablineToD3D(app, @intCast(@max(1, client.right)), @intCast(sidebar_caption.bandPx(app)));
+            }
             // Called unconditionally: unlike the tabline, the sidebar
             // has no tab_count gate, and it draws an empty strip rather
             // than releasing anything when there are no tabs.
@@ -2344,10 +2369,18 @@ fn drawMainFlatFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameI
     // Do NOT hold app.mu here: Present can pump
     // Win32 messages, and a re-entrant handler taking
     // app.mu would self-deadlock.
-    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
+    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .sidebar_x_px = geom.sidebar_x_px, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
         if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
         return .failed;
     };
+    if (geom.caption_band_px > 0) {
+        sidebar_caption.drawOverlay(g) catch |e| {
+            if (log_enabled) applog.appLog("caption overlay failed: {any}\n", .{e});
+            return .failed;
+        };
+        const band: c.RECT = .{ .left = 0, .top = 0, .right = geom.client.right, .bottom = geom.caption_band_px };
+        if (dirty) |old| dirty = callbacks.unionRect(old, band);
+    }
     var dirty_rects: [1]c.RECT = undefined;
     if (dirty) |r| dirty_rects[0] = r;
     g.presentFromBack(dirty_rects[0..@intFromBool(dirty != null)], dirty == null) catch |e| {
@@ -2679,6 +2712,9 @@ fn addMainGutterAndChromeBands(present: *app_mod.PresentRectBuilder, geom: MainC
     // is enough), the present went partial and the newly drawn
     // hover was left in back_tex.
     if (present.list.items.len != 0) {
+        if (geom.caption_band_px > 0) {
+            present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = geom.caption_band_px });
+        }
         if (geom.content_y_offset_i32 > 0) {
             present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = geom.content_y_offset_i32 });
         }
@@ -2886,6 +2922,7 @@ fn drawMainRowFrame(
         .content_y_offset = geom.content_y_offset,
         .content_x_offset = geom.content_x_offset,
         .sidebar_right_width = geom.sidebar_right_width,
+        .sidebar_x_px = geom.sidebar_x_px,
         .tabbar_bg_color = geom.tabbar_bg_color,
         // The root layer drives the pixel space core
         // vertices arrive in. It sits at the surface origin
@@ -2938,6 +2975,12 @@ fn drawMainRowFrame(
         recoverMainPaintFailure(hwnd, app);
         return .abort;
     };
+    if (geom.caption_band_px > 0) {
+        sidebar_caption.drawOverlay(g) catch {
+            recoverMainPaintFailure(hwnd, app);
+            return .abort;
+        };
+    }
     addMainGutterAndChromeBands(&present, geom, client);
 
     // The client rect can be a resize ahead of the buffer.
@@ -3288,7 +3331,7 @@ pub export fn WndProc(
         // DWM custom titlebar: extend client area into titlebar
         c.WM_NCCALCSIZE => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and wParam != 0) {
+                if (customFrame(app) and wParam != 0) {
                     // When wParam is TRUE, return 0 to use entire window as client area.
                     // This removes the standard titlebar/frame.
                     if (c.IsZoomed(hwnd) != 0) {
@@ -3315,7 +3358,7 @@ pub export fn WndProc(
         // DWM custom titlebar: hit testing for resize borders and caption dragging
         c.WM_NCHITTEST => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
+                if (customFrame(app)) {
                     // Get cursor position in screen coordinates
                     const x = @as(i16, @truncate(lParam & 0xFFFF));
                     const y = @as(i16, @truncate((lParam >> 16) & 0xFFFF));
@@ -3370,6 +3413,9 @@ pub export fn WndProc(
                     const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
                     var client_pt: c.POINT = .{ .x = x, .y = y };
                     _ = c.ScreenToClient(hwnd, &client_pt);
+                    if (client_pt.y < tabbar_height and sidebar_caption.enabled(app)) {
+                        return sidebar_caption.bandHitTest(app, hwnd, client_pt.x, client_pt.y);
+                    }
                     if (client_pt.y < tabbar_height) {
                         // In tabbar area - check if clicking on interactive elements or empty space
                         var client_rect: c.RECT = undefined;
@@ -3400,7 +3446,7 @@ pub export fn WndProc(
         // titlebar has no standard frame for the OS to attach that menu to.
         c.WM_NCRBUTTONUP => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and wParam == c.HTCAPTION) {
+                if (customFrame(app) and wParam == c.HTCAPTION) {
                     if (c.GetSystemMenu(hwnd, 0)) |sysmenu| {
                         // lParam holds screen coordinates for non-client clicks.
                         const sx = @as(i16, @truncate(lParam & 0xFFFF));
@@ -4504,7 +4550,13 @@ pub export fn WndProc(
         },
 
         c.WM_TIMER => {
-            if (wParam == TIMER_MSG_AUTOHIDE) {
+            if (wParam == app_mod.TIMER_SIDEBAR_SLIDE or wParam == app_mod.TIMER_DRAG_BAR_REVEAL) {
+                if (getApp(hwnd)) |app| {
+                    _ = sidebar_caption.onTimer(hwnd, app, wParam);
+                } else {
+                    _ = c.KillTimer(hwnd, wParam);
+                }
+            } else if (wParam == TIMER_MSG_AUTOHIDE) {
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: message window auto-hide\n", .{});
                 // The stack expires; the statuses stay.
                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
@@ -5545,7 +5597,7 @@ pub export fn WndProc(
                     }
 
                     // DWM custom titlebar: post SWP_FRAMECHANGED (fallback path only)
-                    if (!app.early_core_init_done and app.ext_tabline_enabled and app.tabline_style == .titlebar) {
+                    if (!app.early_core_init_done and customFrame(app)) {
                         _ = c.PostMessageW(hwnd, app_mod.WM_APP_SWP_FRAMECHANGED, 0, 0);
                         if (deferred_log_enabled) applog.appLog("[win] deferred_init: SWP_FRAMECHANGED posted (fallback path)\n", .{});
                     }
@@ -5830,6 +5882,9 @@ pub export fn WndProc(
                 // Mid editor drag the press is the editor's, as on macOS: the
                 // chrome's own ReleaseCapture would cancel the held button's claim.
                 if (app.press_claim.held_mask == 0) {
+                    if (sidebar_caption.onMouseDown(hwnd, app, msg, @as(c_int, x), @as(c_int, y))) {
+                        return input.mouseButtonResult(msg);
+                    }
                     // Check tabline/sidebar area first (when ext_tabline enabled).
                     // X buttons too: they had a handler of their own that skipped
                     // the chrome and the scrollbar and reached Neovim at a clamped
@@ -5901,6 +5956,9 @@ pub export fn WndProc(
                     return 0;
                 }
 
+                if (msg == c.WM_LBUTTONUP and !press_reached_editor and
+                    sidebar_caption.onMouseUp(hwnd, app, @as(c_int, x_up), @as(c_int, y_up))) return 0;
+
                 // Check tabline/sidebar drag end or area click
                 if (app.ext_tabline_enabled and !press_reached_editor) {
                     if (app.tabline_style == .titlebar) {
@@ -5945,7 +6003,15 @@ pub export fn WndProc(
         c.WM_NCMOUSEMOVE => {
             // Handle non-client mouse move (e.g., in HTCAPTION area of tabline)
             // Into the NC area (empty tabline region): the tabs are left.
-            if (getApp(hwnd)) |app| tabline_mod.clearTablineHover(app, hwnd);
+            if (getApp(hwnd)) |app| {
+                tabline_mod.clearTablineHover(app, hwnd);
+                sidebar_caption.onNcMouseMove(hwnd, app);
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_NCMOUSELEAVE => {
+            if (getApp(hwnd)) |app| sidebar_caption.onLeave(hwnd, app);
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
@@ -5980,6 +6046,10 @@ pub export fn WndProc(
                 // consumes the move nor lights a hover under it.
                 const editor_drag = app.surf.scrollbar.dragging or
                     (app.press_claim.owner != 0 and app.mouse_press_grid_id != 0);
+                if (!editor_drag and sidebar_caption.onMouseMove(hwnd, app, @as(c_int, x), @as(c_int, y))) {
+                    tabline_mod.clearTablineHover(app, hwnd);
+                    return 0;
+                }
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
                         if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
@@ -6205,7 +6275,7 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 if (app.config.window.blur) {
                     applyWindowBackdrop(hwnd);
-                } else if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.config.window.opacity >= 1.0) {
+                } else if (customFrame(app) and app.config.window.opacity >= 1.0) {
                     const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
                     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
                 }
@@ -6300,6 +6370,7 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
                 tabline_mod.clearTablineHover(app, hwnd);
+                sidebar_caption.onLeave(hwnd, app);
             }
             return 0;
         },

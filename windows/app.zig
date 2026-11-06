@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 const external_windows = @import("ui/external_windows.zig");
+const sidebar_caption = @import("ui/sidebar_caption.zig");
 const scroll_ease = core.scroll_ease;
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
@@ -340,6 +341,10 @@ pub const TIMER_COPY_BUTTON_RETRY: c.UINT_PTR = 23;
 /// invisible.
 pub const TIMER_EXTERNAL_UNCLOAK: c.UINT_PTR = 24;
 pub const EXTERNAL_UNCLOAK_TIMEOUT_MS: c.UINT = 250;
+/// Frames of the captionless sidebar's open/close slide.
+pub const TIMER_SIDEBAR_SLIDE: c.UINT_PTR = 25;
+/// The hover delay before the collapsed sidebar's drag bar appears.
+pub const TIMER_DRAG_BAR_REVEAL: c.UINT_PTR = 26;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 /// Tray icon init delay in milliseconds
@@ -3639,6 +3644,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             .content_y_offset = params.content_y_offset,
             .content_x_offset = params.content_x_offset,
             .sidebar_right_width = params.sidebar_right_width,
+            .sidebar_x_px = params.sidebar_x_px,
             .tabbar_bg_color = params.tabbar_bg_color,
         },
     );
@@ -3997,6 +4003,7 @@ pub const RowModeDrawParams = struct {
     content_y_offset: ?u32 = null,
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
+    sidebar_x_px: ?i32 = null,
     tabbar_bg_color: ?[4]f32 = null,
     /// The root grid's smooth scroll, when this frame draws it eased.
     root_ease: ?*const GridEase = null,
@@ -6247,6 +6254,15 @@ pub const App = struct {
     tabline_style: TablineStyle = .titlebar,
     sidebar_position_right: bool = false, // false = left, true = right
     sidebar_width_px: u32 = 200,
+    // Captionless sidebar (ui/sidebar_caption.zig): the toggle state, the
+    // slide (its start and the clock sampled once per tick, GetTickCount64)
+    // and the top-edge drag bar.
+    sidebar_collapsed: bool = false,
+    sidebar_sliding: bool = false,
+    sidebar_slide_start_ms: u64 = 0,
+    sidebar_slide_now_ms: u64 = 0,
+    drag_bar_revealed: bool = false,
+    drag_bar_timer_armed: bool = false,
 
     // ext_popupmenu: Pmenu bg color (0x00RRGGBB) from on_popupmenu_show callback
     popupmenu_bg_rgb: u32 = 0xFFFFFFFF,
@@ -7107,10 +7123,8 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const client_h: u32 = @intCast(@max(1, rc.bottom - rc.top));
 
     // Subtract sidebar width for sidebar mode
-    const sidebar_w: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar)
-        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-    else
-        0;
+    const insets = sidebar_caption.gridInsetsPx(app);
+    const sidebar_w: u32 = @intCast(insets.left + insets.right);
 
     // In "always" mode, reserve space for scrollbar
     const w_after_scrollbar = getEffectiveContentWidth(app, client_w);

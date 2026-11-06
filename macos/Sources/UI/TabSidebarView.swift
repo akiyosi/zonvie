@@ -3,6 +3,123 @@ import AppKit
 /// Sidebar view displaying Neovim tabs as a vertical list.
 /// Colors are derived from the loaded Neovim colorscheme background.
 /// When blur is enabled, the sidebar is transparent to let window blur show through.
+/// Window for sidebar mode under a transparent titlebar. AppKit's titlebar
+/// swallows mouse-downs across the whole band; here only the sidebar's part
+/// moves the window, the editor's part reaches the editor, and titlebar
+/// controls (traffic lights, sidebar toggle) keep their normal handling.
+final class SidebarTitlebarWindow: NSWindow {
+    private weak var forwardedView: NSView?
+
+    override func layoutIfNeeded() {
+        super.layoutIfNeeded()
+        placeTrafficLights(leftPt: TitlebarBand.lightsLeftPt, bandHeightPt: TitlebarBand.heightPt)
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            if let target = bandTarget(for: event) {
+                if target is TabSidebarView || target is TitlebarDragBar {
+                    // The band acts as the titlebar: drag moves, double-click zooms.
+                    if event.type == .leftMouseDown {
+                        if event.clickCount == 2 { performZoom(nil) } else { performDrag(with: event) }
+                    }
+                } else {
+                    forwardedView = target
+                    forward(event, to: target)
+                }
+                return
+            }
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            if let target = forwardedView { forward(event, to: target); return }
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            if let target = forwardedView {
+                forwardedView = nil
+                forward(event, to: target)
+                return
+            }
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
+
+    /// The sidebar or editor view under a mouse-down in the titlebar band;
+    /// nil leaves the event to AppKit.
+    private func bandTarget(for event: NSEvent) -> NSView? {
+        let p = event.locationInWindow
+        guard p.y >= frame.height - TitlebarBand.heightPt, let content = contentView, let frameView = content.superview,
+              let top = frameView.hitTest(frameView.convert(p, from: nil)) else { return nil }
+        if sequence(first: top, next: { $0.superview }).contains(where: { $0 is NSControl }) { return nil }
+        guard let hit = content.hitTest(content.convert(p, from: nil)) else { return nil }
+        for view in sequence(first: hit, next: { $0.superview }) {
+            if view is TabSidebarView || view is TitlebarDragBar { return view }
+            if view is MetalTerminalView { return hit }
+        }
+        return nil
+    }
+
+    private func forward(_ event: NSEvent, to view: NSView) {
+        switch event.type {
+        case .leftMouseDown: view.mouseDown(with: event)
+        case .rightMouseDown: view.rightMouseDown(with: event)
+        case .otherMouseDown: view.otherMouseDown(with: event)
+        case .leftMouseDragged: view.mouseDragged(with: event)
+        case .rightMouseDragged: view.rightMouseDragged(with: event)
+        case .otherMouseDragged: view.otherMouseDragged(with: event)
+        case .leftMouseUp: view.mouseUp(with: event)
+        case .rightMouseUp: view.rightMouseUp(with: event)
+        case .otherMouseUp: view.otherMouseUp(with: event)
+        default: break
+        }
+    }
+}
+
+/// Faint grab bar over the top of the editor: it fades in after the pointer
+/// rests in the band and then moves the window (see SidebarTitlebarWindow).
+/// Until revealed it is click-through.
+final class TitlebarDragBar: NSView {
+    private static let revealDelay: TimeInterval = 2
+    private var revealWork: DispatchWorkItem?
+    private var revealed = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.gray.withAlphaComponent(0.25).cgColor
+        alphaValue = 0
+        // Not `isHidden`: a hidden view's tracking area never fires.
+        addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { revealed ? super.hitTest(point) : nil }
+
+    override func mouseEntered(with event: NSEvent) {
+        revealWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.revealed = true
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.2; self.animator().alphaValue = 1 }
+        }
+        revealWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.revealDelay, execute: work)
+    }
+
+    override func mouseExited(with event: NSEvent) { conceal() }
+
+    private func conceal() {
+        revealWork?.cancel()
+        revealWork = nil
+        guard revealed else { return }
+        revealed = false
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.2; self.animator().alphaValue = 0 }
+    }
+}
+
 final class TabSidebarView: NSView {
 
     struct Tab {
@@ -34,6 +151,26 @@ final class TabSidebarView: NSView {
 
     // Whether the sidebar is on the right side of the window
     var isRightSide: Bool = false
+
+    /// Height left empty above the first tab row (the traffic-light band of a
+    /// transparent titlebar). Applied as a negative bounds origin so every
+    /// row-space computation keeps y = 0 at the first row.
+    var topInset: CGFloat = 0 {
+        didSet { setBoundsOrigin(NSPoint(x: 0, y: -topInset)); needsDisplay = true }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        setBoundsOrigin(NSPoint(x: 0, y: -topInset))
+    }
+
+    private var transparentTitlebar: Bool { ZonvieConfig.shared.window.transparentTitlebar }
+
+    /// The sidebar toggle in the titlebar band; it takes this view's tab
+    /// text colour and follows the colorscheme with it.
+    weak var toggleButton: NSButton? {
+        didSet { toggleButton?.contentTintColor = tabTextSelectedColor }
+    }
 
     // Appearance constants
     private let tabRowHeight: CGFloat = 28
@@ -70,12 +207,50 @@ final class TabSidebarView: NSView {
             // Subtle tint over the blur effect
             return NSColor(red: bgR, green: bgG, blue: bgB, alpha: 0.25)
         }
+        if transparentTitlebar {
+            // An editor-style panel: the bg a small lightness step away,
+            // nearly opaque so the shader under it only shows faintly.
+            return Self.lightnessShifted(r: bgR, g: bgG, b: bgB, darker: !isDarkBackground)
+                .withAlphaComponent(Self.overlayAlpha)
+        }
         if isDarkBackground {
             return NSColor(red: bgR * 0.85, green: bgG * 0.85, blue: bgB * 0.85, alpha: 1.0)
         }
         let lighten: CGFloat = 0.03
         return NSColor(
             red: min(1, bgR + lighten), green: min(1, bgG + lighten), blue: min(1, bgB + lighten), alpha: 1.0
+        )
+    }
+
+    /// OKLab lightness gap between the sidebar and the editor. Dark
+    /// backgrounds need a smaller step for the same perceived contrast.
+    private static let sidebarLightnessDeltaLight: CGFloat = 0.07
+    private static let sidebarLightnessDeltaDark: CGFloat = 0.04
+    private static let overlayAlpha: CGFloat = 0.9
+
+    /// `bg` with its OKLab L moved by the sidebar delta, hue and chroma kept.
+    static func lightnessShifted(r: CGFloat, g: CGFloat, b: CGFloat, darker: Bool) -> NSColor {
+        func toLinear(_ c: CGFloat) -> CGFloat { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
+        func toSRGB(_ c: CGFloat) -> CGFloat {
+            let v = max(0, min(1, c))
+            return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1 / 2.4) - 0.055
+        }
+        let lr = toLinear(r), lg = toLinear(g), lb = toLinear(b)
+        let l_ = cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb)
+        let m_ = cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb)
+        let s_ = cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb)
+        var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        let A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        let B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+        L = max(0, min(1, L + (darker ? -sidebarLightnessDeltaLight : sidebarLightnessDeltaDark)))
+        let l2 = pow(L + 0.3963377774 * A + 0.2158037573 * B, 3)
+        let m2 = pow(L - 0.1055613458 * A - 0.0638541728 * B, 3)
+        let s2 = pow(L - 0.0894841775 * A - 1.2914855480 * B, 3)
+        return NSColor(
+            red: toSRGB(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
+            green: toSRGB(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
+            blue: toSRGB(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
+            alpha: 1.0
         )
     }
 
@@ -168,7 +343,7 @@ final class TabSidebarView: NSView {
     // When blur is enabled, the sidebar must be non-opaque so the
     // window-level CGSSetWindowBackgroundBlurRadius blur shows through
     // (same approach as MetalTerminalView).
-    override var isOpaque: Bool { !blurEnabled }
+    override var isOpaque: Bool { !blurEnabled && !transparentTitlebar }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -183,7 +358,7 @@ final class TabSidebarView: NSView {
     private func commonInit() {
         wantsLayer = true
         // Configure layer transparency for blur (same pattern as MetalTerminalView)
-        if blurEnabled {
+        if blurEnabled || transparentTitlebar {
             self.layer?.isOpaque = false
             self.layer?.backgroundColor = NSColor.clear.cgColor
         }
@@ -194,7 +369,7 @@ final class TabSidebarView: NSView {
         super.viewDidMoveToWindow()
         // Re-apply layer settings after window attachment
         // (layer may not exist during commonInit)
-        if blurEnabled {
+        if blurEnabled || transparentTitlebar {
             self.layer?.isOpaque = false
             self.layer?.backgroundColor = NSColor.clear.cgColor
         }
@@ -230,6 +405,7 @@ final class TabSidebarView: NSView {
                 self.fgG = CGFloat((fgRGB >> 8) & 0xFF) / 255.0
                 self.fgB = CGFloat(fgRGB & 0xFF) / 255.0
             }
+            self.toggleButton?.contentTintColor = self.tabTextSelectedColor
             self.needsDisplay = true
         }
     }
@@ -263,12 +439,15 @@ final class TabSidebarView: NSView {
         sidebarBackgroundColor.setFill()
         bounds.fill()
 
-        // Separator line on the edge adjacent to terminal
-        separatorColor.setFill()
-        if isRightSide {
-            NSRect(x: 0, y: 0, width: separatorWidth, height: bounds.height).fill()
-        } else {
-            NSRect(x: bounds.maxX - separatorWidth, y: 0, width: separatorWidth, height: bounds.height).fill()
+        // Separator line on the edge adjacent to terminal. A transparent
+        // titlebar separates the panes by the lightness gap alone.
+        if !transparentTitlebar {
+            separatorColor.setFill()
+            if isRightSide {
+                NSRect(x: 0, y: 0, width: separatorWidth, height: bounds.height).fill()
+            } else {
+                NSRect(x: bounds.maxX - separatorWidth, y: 0, width: separatorWidth, height: bounds.height).fill()
+            }
         }
 
         // Determine if we're in an active internal drag (threshold exceeded)

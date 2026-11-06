@@ -71,7 +71,39 @@ final class AgentIndicator {
 import AppKit
 
 /// Custom window that allows TabBarView to receive mouse events in titlebar area
+/// The band under a transparent titlebar, the same in titlebar and sidebar
+/// mode: the editor runs under it, the traffic lights sit at the same spot,
+/// and the tabs or the sidebar toggle start after them.
+enum TitlebarBand {
+    static let heightPt: CGFloat = 44
+    static let lightsLeftPt: CGFloat = 20
+    static let controlsWidthPt: CGFloat = 90
+    /// Tabs start further out than the sidebar toggle does.
+    static let tabsLeftPt: CGFloat = 104
+}
+
+extension NSWindow {
+    /// Move the traffic lights to `leftPt` and the vertical centre of the top
+    /// `bandHeightPt`. AppKit lays them out for its own titlebar on every
+    /// layout pass, so call this after `super.layoutIfNeeded()`.
+    func placeTrafficLights(leftPt: CGFloat, bandHeightPt: CGFloat) {
+        guard let first = standardWindowButton(.closeButton), let container = first.superview else { return }
+        let dx = leftPt - first.frame.minX
+        let y = container.bounds.height - (bandHeightPt + first.frame.height) / 2
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let b = standardWindowButton(type) else { continue }
+            b.setFrameOrigin(NSPoint(x: b.frame.minX + dx, y: y))
+        }
+    }
+}
+
 final class TabBarWindow: NSWindow {
+    override func layoutIfNeeded() {
+        super.layoutIfNeeded()
+        guard ZonvieConfig.shared.window.transparentTitlebar else { return }
+        placeTrafficLights(leftPt: TitlebarBand.lightsLeftPt, bandHeightPt: TitlebarBand.heightPt)
+    }
+
     override func sendEvent(_ event: NSEvent) {
         // For mouse down events in the titlebar area, check if TabBarView should handle it
         if event.type == .leftMouseDown {
@@ -124,13 +156,17 @@ final class TabBarView: NSView {
 
     // Tab appearance constants
     private let tabHeight: CGFloat = 30
+    /// Tabs are centred in the bar, level with the traffic lights.
+    private var tabTop: CGFloat { (bounds.height - (tabHeight - 6)) / 2 }
     private let tabMinWidth: CGFloat = 100
     private let tabMaxWidth: CGFloat = 200
     private let tabSpacing: CGFloat = 1
     private let tabCornerRadius: CGFloat = 8
     private let tabCloseButtonSize: CGFloat = 14
     private let tabPadding: CGFloat = 12
-    private let windowControlsWidth: CGFloat = 78  // Space for traffic lights
+    private var windowControlsWidth: CGFloat {
+        transparentBackground ? TitlebarBand.tabsLeftPt : 78
+    }
 
     // Colors - Chrome-style appearance with dark mode support
     private var isDarkMode: Bool {
@@ -140,8 +176,13 @@ final class TabBarView: NSView {
         return false
     }
 
+    /// The bar floats over the editor surface (transparent titlebar): no bar
+    /// fill, and tab states are tints over whatever the surface draws.
+    var transparentBackground = false
+
     // Bar background: slightly blue-tinted gray
     private var barBackgroundColor: NSColor {
+        if transparentBackground { return .clear }
         if isDarkMode {
             return NSColor(calibratedRed: 0.176, green: 0.180, blue: 0.192, alpha: 1.0)  // #2D2E31
         }
@@ -153,6 +194,7 @@ final class TabBarView: NSView {
 
     // Selected tab: white in light mode, darker gray in dark mode
     private var tabSelectedColor: NSColor {
+        if transparentBackground { return tabTextColor.withAlphaComponent(0.12) }
         if isDarkMode {
             return NSColor(calibratedRed: 0.235, green: 0.247, blue: 0.275, alpha: 1.0)  // #3C3F46
         }
@@ -161,6 +203,7 @@ final class TabBarView: NSView {
 
     // Hover tab: slightly lighter than bar background
     private var tabHoverColor: NSColor {
+        if transparentBackground { return tabTextColor.withAlphaComponent(0.06) }
         if isDarkMode {
             return NSColor(calibratedRed: 0.251, green: 0.267, blue: 0.282, alpha: 1.0)  // #404448
         }
@@ -258,14 +301,14 @@ final class TabBarView: NSView {
             let isHovered = hoveredTabIndex == index && !isSelected
             let isBeingDragged = isDragging && draggingTabIndex == index
 
-            let tabRect = NSRect(x: x, y: 6, width: tabWidth, height: tabHeight - 6)
+            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabHeight - 6)
             drawTab(tab, in: tabRect, isSelected: isSelected, isHovered: isHovered, isBeingDragged: isBeingDragged, index: index)
 
             x += tabWidth + tabSpacing
         }
 
         // Draw new tab button (+)
-        drawNewTabButton(at: NSPoint(x: x + 8, y: 10))
+        drawNewTabButton(at: NSPoint(x: x + 8, y: tabTop + 2))
 
         // Draw drop indicator when dragging
         if isDragging, let targetIdx = dropTargetIndex, let dragIdx = draggingTabIndex {
@@ -273,7 +316,7 @@ final class TabBarView: NSView {
             if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
                 let indicatorX = tabX(targetIdx)
                 NSColor.controlAccentColor.setFill()
-                NSRect(x: indicatorX - 1, y: 4, width: 2, height: tabHeight - 6).fill()
+                NSRect(x: indicatorX - 1, y: tabTop - 2, width: 2, height: tabHeight - 6).fill()
             }
 
             // Draw floating tab at cursor position. A tabline_update can
@@ -281,7 +324,7 @@ final class TabBarView: NSView {
             guard dragIdx < tabs.count else { return }
             let tab = tabs[dragIdx]
             let floatX = dragCurrentX - dragOffsetX
-            let floatRect = NSRect(x: floatX, y: 6, width: tabWidth, height: tabHeight - 6)
+            let floatRect = NSRect(x: floatX, y: tabTop, width: tabWidth, height: tabHeight - 6)
             let floatPath = NSBezierPath(roundedRect: floatRect, xRadius: tabCornerRadius, yRadius: tabCornerRadius)
 
             // Light blue background with border
@@ -299,7 +342,7 @@ final class TabBarView: NSView {
             ]
             let textRect = NSRect(
                 x: floatX + tabPadding,
-                y: 6 + (tabHeight - 6 - 16) / 2,
+                y: tabTop + (tabHeight - 6 - 16) / 2,
                 width: tabWidth - tabPadding * 2,
                 height: 16
             )
@@ -460,7 +503,7 @@ final class TabBarView: NSView {
         var x = windowControlsWidth
 
         for index in 0..<tabs.count {
-            let tabRect = NSRect(x: x, y: 6, width: tabWidth, height: tabHeight - 6)
+            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabHeight - 6)
             if tabRect.contains(point) {
                 return index
             }
@@ -478,7 +521,7 @@ final class TabBarView: NSView {
     private func isCloseButton(at point: NSPoint, tabIndex: Int) -> Bool {
         guard tabIndex < tabs.count else { return false }
 
-        let tabRect = NSRect(x: tabX(tabIndex), y: 6, width: tabWidth, height: tabHeight - 6)
+        let tabRect = NSRect(x: tabX(tabIndex), y: tabTop, width: tabWidth, height: tabHeight - 6)
 
         let closeRect = NSRect(
             x: tabRect.maxX - tabCloseButtonSize - 8,
@@ -492,7 +535,7 @@ final class TabBarView: NSView {
 
     private func isNewTabButton(at point: NSPoint) -> Bool {
         let x = tabX(tabs.count) + 8
-        let rect = NSRect(x: x, y: 10, width: 20, height: 20)
+        let rect = NSRect(x: x, y: tabTop + 2, width: 20, height: 20)
 
         return rect.contains(point)
     }

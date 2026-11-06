@@ -145,6 +145,7 @@ linespace = 2
 blur = true
 opacity = 0.85
 blur_radius = 20
+titlebar_style = "native"  # "native" or "transparent" (macOS, Windows)
 
 [scrollbar]
 enabled = true
@@ -259,6 +260,7 @@ paths = [
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true) |
+| `titlebar_style` | macOS and Windows: `"transparent"` hides the native titlebar and extends the content under the traffic lights; with `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights. with `style = "titlebar"` the tabs float over the editor surface, which runs to the window top. On Windows the window buttons and the sidebar toggle sit at the top-right (default: `"native"`) |
 
 #### [scrollbar]
 | Key | Description |
