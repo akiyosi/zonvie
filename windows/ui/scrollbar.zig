@@ -304,6 +304,10 @@ fn scrollbarVerticesFrom(
     out_verts[4] = .{ .position = .{ tr, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[5] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
 
+    // Nothing to scroll ("always" mode keeps the bar): the track alone, no
+    // knob, as a native scrollbar draws it.
+    if (!geom.is_scrollable) return 6;
+
     const kl = to_ndc_x(geom.track_left + knob_inset_px, cw);
     const kr = to_ndc_x(geom.track_right - knob_inset_px, cw);
     const kt = to_ndc_y(geom.knob_top, ch);

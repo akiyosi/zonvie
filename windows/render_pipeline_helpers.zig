@@ -1011,7 +1011,7 @@ pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
 }
 
 /// Width of the content viewport drawEx binds at x_offset. `base_w` is a right
-/// edge measured from x=0 (the client width, less an "always" scrollbar).
+/// edge measured from x=0 (the client width, less a "column" scrollbar).
 pub fn contentViewportWidthPx(base_w: u32, x_offset: u32, sidebar_right_w: u32) u32 {
     return if (base_w > x_offset + sidebar_right_w) base_w - x_offset - sidebar_right_w else 1;
 }

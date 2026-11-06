@@ -1078,7 +1078,7 @@ pub const Renderer = struct {
         // we must NOT clear. (Row-mode present step uses this.)
         preserve_on_null_dirty: bool = false,
 
-        // Content width for viewport (used in "always" scrollbar mode to reserve space).
+        // Content width for viewport (used by the "column" scrollbar layout to reserve space).
         // If null, uses full window width.
         content_width: ?u32 = null,
 
@@ -1207,7 +1207,7 @@ pub const Renderer = struct {
         }
 
         // ---- Viewport ----
-        // Use content_width if specified (for "always" scrollbar mode)
+        // Use content_width if specified (for the "column" scrollbar layout)
         // Use content_y_offset if specified (for tabline)
         // Use content_x_offset if specified (for left sidebar)
         const viewport_x_offset = opts.content_x_offset orelse 0;

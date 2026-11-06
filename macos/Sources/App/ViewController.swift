@@ -64,6 +64,9 @@ final class ViewController: NSViewController {
 
         terminalView = MetalTerminalView(frame: .zero, device: MTLCreateSystemDefaultDevice())
         terminalView.translatesAutoresizingMaskIntoConstraints = false
+        // A "column" scrollbar keeps its strip from launch, chrome or not;
+        // updateGridInsets re-adds it whenever the chrome moves the grid.
+        terminalView.gridInsetsPt = (0, ZonvieConfig.shared.scrollbar.columnWidthPt, 0)
 
         view.addSubview(terminalView)
 
@@ -393,9 +396,12 @@ final class ViewController: NSViewController {
     /// The editor spans the window under a translucent sidebar; its grid
     /// starts beside the sidebar's visible part, which follows the slide.
     private func updateGridInsets() {
+        // The "column" scrollbar's strip sits at the right edge of whatever
+        // the chrome leaves, left of a right sidebar.
+        let column = ZonvieConfig.shared.scrollbar.columnWidthPt
         if tabBarView != nil, transparentTitlebar {
             // Titlebar tabs float over the editor surface; the grid starts below them.
-            terminalView.gridInsetsPt = (0, 0, tabBarHeight)
+            terminalView.gridInsetsPt = (0, column, tabBarHeight)
             return
         }
         guard let sidebar = sidebarView else { return }
@@ -409,9 +415,9 @@ final class ViewController: NSViewController {
             // so Neovim is resized once (before opening, after closing) and
             // opening and closing are mirror images.
             let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width, 0) : (covered, width - covered, 0)
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width + column, 0) : (covered, width - covered + column, 0)
         } else {
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered, 0) : (covered, 0, 0)
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered + column, 0) : (covered, column, 0)
         }
     }
 

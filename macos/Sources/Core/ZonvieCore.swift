@@ -28,7 +28,8 @@ extension NSScroller {
     /// Show this scroller for `metrics`, or hide it when nothing scrolls.
     ///
     /// `alwaysVisible` is the config's "always" mode, which keeps the scroller
-    /// on screen with a full-size knob instead of hiding it.
+    /// on screen instead of hiding it. With nothing to scroll it is disabled,
+    /// which draws the track and no knob, as a native scroll view's does.
     ///
     /// Both surfaces had this written out, identical but for one comment, and
     /// both had to be edited together when the arithmetic behind `metrics`
@@ -37,12 +38,14 @@ extension NSScroller {
         guard metrics.is_scrollable != 0 else {
             isHidden = !alwaysVisible
             if alwaysVisible {
+                isEnabled = false
                 doubleValue = 0
                 knobProportion = 1.0
             }
             return
         }
         isHidden = false
+        isEnabled = true
         doubleValue = metrics.scroll_position
         knobProportion = metrics.knob_proportion
     }
@@ -4869,8 +4872,10 @@ final class ZonvieCore {
             let heightPx = contentSize.height * scale
 
             // A grid in its own font counts its rows and columns in that font.
+            // The "column" scrollbar's strip is the window's, not the grid's.
             let gf = core.gridCellPx(gridId)
-            let cols = UInt32(widthPx / (gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx))
+            let gridWidthPx = max(0, widthPx - ZonvieConfig.shared.scrollbar.columnWidthPt * scale)
+            let cols = UInt32(gridWidthPx / (gf.map { CGFloat($0.cellWidthPx) } ?? cellWidthPx))
             let rows = UInt32(heightPx / (gf.map { CGFloat($0.cellHeightPx) } ?? cellHeightPx))
 
             ZonvieCore.appLog("[external_window] windowDidResize gridId=\(gridId) contentSize=\(contentSize) scale=\(scale) cellH=\(cellHeightPx) cellW=\(cellWidthPx) heightPx=\(heightPx) widthPx=\(widthPx) rows=\(rows) cols=\(cols) lastGridRows=\(lastGridRows) lastGridCols=\(lastGridCols) suppress=\(suppressResizeCallback)")
@@ -4965,7 +4970,8 @@ final class ZonvieCore {
                 // as Windows relies on. Asking Neovim for rows+1 then rows made
                 // every window grow a row and shrink, with two WinResized.
                 let content = Self.externalContentPx(rows: rows, cols: cols, font: self.gridCellPx(gridId),
-                                                     cellW: cellWidthPx, cellH: cellHeightPx)
+                                                     cellW: cellWidthPx, cellH: cellHeightPx,
+                                                     columnPx: ZonvieConfig.shared.scrollbar.columnWidthPt * window.backingScaleFactor)
                 self.frameExternalWindow(window, gridView: gridView, delegate: delegate,
                                          widthPx: content.width, heightPx: content.height,
                                          applyAnchors: false)
@@ -4976,13 +4982,15 @@ final class ZonvieCore {
 
     /// A regular external window's content in pixels. A grid in its own font
     /// fills the core's extent, its frame; the rest is `rows x cols` cells.
+    /// `columnPx` is the "column" scrollbar strip beside the grid, in the
+    /// window's pixels; windowDidResize takes the same strip off before counting.
     private static func externalContentPx(rows: UInt32, cols: UInt32, font: GridFontPx?,
-                                          cellW: CGFloat, cellH: CGFloat) -> CGSize {
+                                          cellW: CGFloat, cellH: CGFloat, columnPx: CGFloat) -> CGSize {
         // on_grid_font: a font grid's extent is its frame (zonvie_core.h).
         if let f = font {
-            return CGSize(width: CGFloat(f.extentWidthPx), height: CGFloat(f.extentHeightPx))
+            return CGSize(width: CGFloat(f.extentWidthPx) + columnPx, height: CGFloat(f.extentHeightPx))
         }
-        return CGSize(width: CGFloat(cols) * cellW, height: CGFloat(rows) * cellH)
+        return CGSize(width: CGFloat(cols) * cellW + columnPx, height: CGFloat(rows) * cellH)
     }
 
     /// Size a regular external window's content to `widthPx x heightPx`
@@ -5499,7 +5507,8 @@ final class ZonvieCore {
         let gf = font ?? gridCellPx(gridId)
         let content = Self.externalContentPx(rows: rows, cols: cols, font: gf,
                                              cellW: CGFloat(renderer.cellWidthPx),
-                                             cellH: CGFloat(renderer.cellHeightPx))
+                                             cellH: CGFloat(renderer.cellHeightPx),
+                                             columnPx: ZonvieConfig.shared.scrollbar.columnWidthPt * window.backingScaleFactor)
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
         // Resize the OS window to match the grid size. Integer row/col counts
         // on the delegate, not the frame, so floating-point drift cannot
@@ -6299,7 +6308,10 @@ final class ZonvieCore {
             contentWidth = min(contentWidth, maxContentWidth)
         }
 
-        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind) + closeButtonReservedWidth(for: kind)
+        // Only a normal window has a scrollbar (hostsScrollbar), so only it
+        // carries the "column" strip.
+        let scrollbarColumn: CGFloat = kind == .normal ? ZonvieConfig.shared.scrollbar.columnWidthPt : 0.0
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind) + closeButtonReservedWidth(for: kind) + scrollbarColumn
         let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
         let windowWidth = containerWidth + (shadowMargin * 2)
         let windowHeight = containerHeight + (shadowMargin * 2)

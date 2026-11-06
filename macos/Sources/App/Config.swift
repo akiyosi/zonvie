@@ -82,6 +82,21 @@ struct ZonvieConfig {
         var opacity: Double = 0.7
         /// Delay in seconds before hiding (for "scroll" mode)
         var delay: Double = 1.0
+        /// "column" layout: the bar owns a strip beside the grid instead of
+        /// covering its rightmost cells.
+        var column: Bool = false
+
+        /// The scroller's width: what it is laid out at, hit-tested over and,
+        /// in "column" layout, what the grid gives up.
+        static var scrollerWidthPt: CGFloat {
+            NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        }
+
+        /// Points the "column" layout takes off the grid's right edge; 0 when
+        /// the bar overlays the grid or is disabled.
+        var columnWidthPt: CGFloat {
+            enabled && column ? Self.scrollerWidthPt : 0
+        }
 
         /// Check if a specific mode is enabled
         func hasMode(_ mode: String) -> Bool {
@@ -286,6 +301,7 @@ struct ZonvieConfig {
         if let s = v.scrollbar_show_mode { config.scrollbar.showMode = String(cString: s) }
         config.scrollbar.opacity = Double(v.scrollbar_opacity)
         config.scrollbar.delay = Double(v.scrollbar_delay)
+        config.scrollbar.column = v.scrollbar_layout == 1
         config.scroll.largeJump = v.scroll_large_jump
 
         // Ext features

@@ -7092,7 +7092,7 @@ pub fn addChevronIconVerts(
 // Layout helpers (shared by main.zig and callbacks.zig)
 // =========================================================================
 
-/// Get effective content width (subtracts scrollbar width in "always" mode).
+/// Get effective content width (subtracts the scrollbar strip in "column" layout).
 ///
 /// `dpi_scale` is an argument because the two surfaces answer it differently:
 /// the main window uses `app.dpi_scale`, an external one uses its own
@@ -7101,7 +7101,7 @@ pub fn addChevronIconVerts(
 /// external window drew a permanently visible scrollbar over its own rightmost
 /// text column.
 pub fn effectiveContentWidthAt(app: *App, client_width: u32, dpi_scale: f32) u32 {
-    if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways()) {
+    if (app.config.scrollbar.isColumn()) {
         const scrollbar_reserved: u32 = @intFromFloat(scrollbarReservedWidth(dpi_scale));
         if (client_width > scrollbar_reserved) {
             return client_width - scrollbar_reserved;
@@ -7126,7 +7126,7 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const insets = sidebar_caption.gridInsetsPx(app);
     const sidebar_w: u32 = @intCast(insets.left + insets.right);
 
-    // In "always" mode, reserve space for scrollbar
+    // In "column" layout, reserve space for the scrollbar
     const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
     const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 

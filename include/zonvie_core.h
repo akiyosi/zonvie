@@ -1995,6 +1995,8 @@ typedef struct zonvie_config_values {
     uint8_t scroll_large_jump;  // ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
     // window (macOS only): 0 = native titlebar, 1 = transparent
     uint8_t window_titlebar_style;
+    // scrollbar: 0 = overlay (drawn over the grid), 1 = column (a strip beside it)
+    uint8_t scrollbar_layout;
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

@@ -142,11 +142,16 @@ pub const Config = struct {
 
     pub const TitlebarStyle = enum(u8) { native = 0, transparent = 1 };
 
+    pub const ScrollbarLayout = enum(u8) { overlay = 0, column = 1 };
+
     pub const ScrollbarConfig = struct {
         enabled: bool = true,
         show_mode: []const u8 = "scroll",
         opacity: f32 = 0.7,
         delay: f32 = 1.0,
+        /// `column` reserves a strip beside the grid for the bar; `overlay`
+        /// draws it over the rightmost cells.
+        layout: ScrollbarLayout = .overlay,
 
         pub fn hasMode(self: ScrollbarConfig, mode: []const u8) bool {
             var it = std.mem.splitScalar(u8, self.show_mode, ',');
@@ -167,6 +172,11 @@ pub const Config = struct {
 
         pub fn isScroll(self: ScrollbarConfig) bool {
             return self.hasMode("scroll");
+        }
+
+        /// Whether the bar owns a strip of its own beside the grid.
+        pub fn isColumn(self: ScrollbarConfig) bool {
+            return self.enabled and self.layout == .column;
         }
     };
 
@@ -401,6 +411,13 @@ pub const Config = struct {
             if (s.show_mode) |m| self.scrollbar.show_mode = alloc.dupe(u8, m) catch self.scrollbar.show_mode;
             if (s.opacity) |o| self.scrollbar.opacity = @max(0.0, @min(1.0, o));
             if (s.delay) |d| self.scrollbar.delay = @max(0.1, @min(10.0, d));
+            if (s.layout) |v| {
+                if (std.mem.eql(u8, v, "overlay")) {
+                    self.scrollbar.layout = .overlay;
+                } else if (std.mem.eql(u8, v, "column")) {
+                    self.scrollbar.layout = .column;
+                }
+            }
         }
 
         if (cfg.scroll) |s| {
@@ -882,6 +899,7 @@ const TomlScrollbar = struct {
     show_mode: ?[]const u8 = null,
     opacity: ?f32 = null,
     delay: ?f32 = null,
+    layout: ?[]const u8 = null,
 };
 
 const TomlCmdline = struct {
@@ -1013,6 +1031,7 @@ else "") ++
     \\        show_mode       "always", "hover", "scroll" or a combination (default: "scroll")
     \\        opacity         Scrollbar opacity (0.0-1.0)
     \\        delay           Seconds before hiding in "scroll" mode
+    \\        layout          "overlay" (over the grid) or "column" (a strip beside it) (default: "overlay")
     \\
     \\
     \\    [scroll]
@@ -1194,6 +1213,32 @@ test "window.titlebar_style parses both values and ignores unknown ones" {
     );
     defer unknown.deinit();
     try std.testing.expectEqual(Config.TitlebarStyle.native, unknown.window.titlebar_style);
+}
+
+test "scrollbar.layout parses both values, ignores unknown ones, and needs the bar enabled" {
+    var column = try parseForTest(std.testing.allocator,
+        \\[scrollbar]
+        \\layout = "column"
+    );
+    defer column.deinit();
+    try std.testing.expectEqual(Config.ScrollbarLayout.column, column.scrollbar.layout);
+    try std.testing.expect(column.scrollbar.isColumn());
+
+    var unknown = try parseForTest(std.testing.allocator,
+        \\[scrollbar]
+        \\layout = "bogus"
+    );
+    defer unknown.deinit();
+    try std.testing.expectEqual(Config.ScrollbarLayout.overlay, unknown.scrollbar.layout);
+    try std.testing.expect(!unknown.scrollbar.isColumn());
+
+    var disabled = try parseForTest(std.testing.allocator,
+        \\[scrollbar]
+        \\enabled = false
+        \\layout = "column"
+    );
+    defer disabled.deinit();
+    try std.testing.expect(!disabled.scrollbar.isColumn());
 }
 
 test "declaring one route keeps the defaults for other events" {

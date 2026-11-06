@@ -1965,7 +1965,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     /// Pin the scroller to the right edge, full height.
     func layoutScrollbarFrame() {
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
         verticalScroller.frame = NSRect(
             x: bounds.width - scrollbarInsetRightPt - scrollerWidth,
             y: 0,
@@ -1994,7 +1994,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// Whether the pointer is over the strip the scrollbar occupies.
     private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
         let locationInView = convert(event.locationInWindow, from: nil)
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
         let right = bounds.width - scrollbarInsetRightPt
         return locationInView.x >= right - scrollerWidth && locationInView.x < right
     }

@@ -2217,11 +2217,11 @@ const MainContentGeom = struct {
 };
 
 fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
-    // Calculate content width for "always" scrollbar mode
+    // Calculate content width for the "column" scrollbar layout
     var client_for_content: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client_for_content);
     const client_width_u32: u32 = @intCast(@max(1, client_for_content.right - client_for_content.left));
-    const content_width: ?u32 = if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+    const content_width: ?u32 = if (app.config.scrollbar.isColumn())
         getEffectiveContentWidth(app, client_width_u32)
     else
         null;
@@ -4414,7 +4414,7 @@ pub export fn WndProc(
 
         WM_APP_SNAP_MAIN_WINDOW => {
             // Snap the main window's terminal content area (the client rect
-            // minus sidebar, titlebar tabs and an "always" scrollbar) down to
+            // minus sidebar, titlebar tabs and a "column" scrollbar) down to
             // a multiple of the current cell size in both axes. Posted from the RPC thread by
             // onGuiFont/onLineSpace after cell metrics change. The actual
             // SetWindowPos must run on the UI thread because it triggers a
@@ -4445,7 +4445,7 @@ pub export fn WndProc(
                 if (cell_w == 0 or cell_h == 0) return 0;
 
                 // The terminal area, not the whole client: sidebar, titlebar
-                // tabs and an "always" scrollbar keep their size, as in
+                // tabs and a "column" scrollbar keep their size, as in
                 // WM_APP_RESIZE_TO_GRID.
                 const content = app_mod.contentSizePx(hwnd, app);
                 const snap = render_helpers.snapMainWindowOuterSize(

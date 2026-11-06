@@ -62,7 +62,7 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
 /// Client-pixel padding an external surface adds around its grid: the
 /// cmdline's icon strip and padding, a message surface's padding, the
 /// copy-content button's trailing reservation, and a normal window's
-/// "always" scrollbar strip.
+/// "column" scrollbar strip.
 ///
 /// Every site that sizes an external window must go through this. The two
 /// resize paths in callbacks.zig used to re-derive the first two terms and
@@ -89,10 +89,10 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64, dpi_scale: f32) External
     const cmdline_padding: c_int = if (is_cmdline) cmdlinePaddingPx(app) * 2 else 0;
     const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
     // WM_SIZE reads a normal window's columns back through
-    // effectiveContentWidthAt, which takes the "always" scrollbar strip off;
+    // effectiveContentWidthAt, which takes the "column" scrollbar strip off;
     // sizing without it lost columns under the strip and shrank the grid on
     // the next user resize.
-    const scrollbar_strip: c_int = if (kind == .normal and app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+    const scrollbar_strip: c_int = if (kind == .normal and app.config.scrollbar.isColumn())
         @intFromFloat(app_mod.scrollbarReservedWidth(dpi_scale))
     else
         0;
@@ -714,11 +714,8 @@ fn drawNormalExternalSurfaceRowMode(
     // A root grid in its own font is laid out in that font's rows.
     const fallback_row_h: u32 = if (tbs_snap.layers.root()) |l| @intCast(l.rowHeightPx(@intCast(row_h_px_snapshot))) else row_h_px_snapshot;
     const row_h_px: i32 = @intCast(fallback_row_h);
-    // Reserve the scrollbar strip in "always" mode, as the main window's paint
-    // does. An external window shows a permanently visible scrollbar in that
-    // mode too (scrollbar.zig's isAlways branches are on the external helpers),
-    // but its content width was the raw client width, so the rightmost column
-    // was drawn under the track.
+    // Reserve the scrollbar strip in "column" layout, as the main window's
+    // paint does; without it the rightmost column was drawn under the track.
     const content_right: i32 = @intCast(app_mod.effectiveContentWidthAt(app, g.width, ext_win.dpi_scale));
 
     // back_tex is persistent, so we only need to redraw dirty rows. Present
@@ -1751,7 +1748,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // The insets and frame above were sized at the main window's DPI, before
     // this window existed. One created on a monitor of another density gets no
-    // WM_DPICHANGED for it, so its "always" scrollbar strip stayed the wrong
+    // WM_DPICHANGED for it, so its "column" scrollbar strip stayed the wrong
     // width (covering the last column or leaving a gap) and its frame the
     // wrong height.
     {

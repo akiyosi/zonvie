@@ -152,6 +152,7 @@ enabled = true
 show_mode = "scroll"  # "always", "hover", "scroll", or combinations like "hover,scroll"
 opacity = 0.7
 delay = 1.0
+layout = "overlay"  # "overlay" (over the grid) or "column" (a strip beside it)
 
 [cmdline]
 external = true
@@ -269,6 +270,7 @@ paths = [
 | `show_mode` | When to show: "always", "hover", "scroll", or combinations like "hover,scroll" |
 | `opacity` | Scrollbar opacity (0.0-1.0) |
 | `delay` | Delay in seconds before hiding (0.1-10.0, for "scroll" mode) |
+| `layout` | `"overlay"` draws the bar over the rightmost cells; `"column"` reserves a strip beside the grid for it (default: `"overlay"`). On Windows `show_mode = "always"` used to reserve that strip by itself; set `layout = "column"` to keep it |
 
 #### [scroll]
 | Key | Description |
