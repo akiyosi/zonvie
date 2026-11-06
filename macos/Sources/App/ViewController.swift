@@ -416,9 +416,10 @@ final class ViewController: NSViewController {
     }
 
     private var sidebarToggleInstalled = false
-    /// Where the toggle sits past the traffic lights (left sidebar) or in
-    /// from the right edge (right sidebar).
-    private static let sidebarToggleMarginPt: CGFloat = TitlebarBand.controlsWidthPt
+    /// Where the toggle sits: past the traffic lights for a left sidebar, or
+    /// as far in from the right edge as the lights are from the left.
+    private static let sidebarToggleLeftMarginPt: CGFloat = TitlebarBand.controlsWidthPt
+    private static let sidebarToggleRightMarginPt: CGFloat = TitlebarBand.lightsLeftPt
     private static let sidebarToggleSizePt: CGFloat = 22
 
     /// No NSToolbar: on Tahoe a toolbar window gets the larger corner radius
@@ -439,7 +440,6 @@ final class ViewController: NSViewController {
             bar.topAnchor.constraint(equalTo: view.topAnchor),
             height,
         ])
-        bar.isEnabled = sidebarCollapsed || !tablineShown
         dragBar = bar
         dragBarHeightConstraint = height
 
@@ -453,8 +453,8 @@ final class ViewController: NSViewController {
         view.addSubview(button, positioned: .above, relativeTo: nil)
         sidebar.toggleButton = button
         let side = sidebar.isRightSide
-            ? button.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -Self.sidebarToggleMarginPt)
-            : button.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: Self.sidebarToggleMarginPt)
+            ? button.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -Self.sidebarToggleRightMarginPt)
+            : button.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: Self.sidebarToggleLeftMarginPt)
         let centerY = button.centerYAnchor.constraint(equalTo: view.topAnchor, constant: titlebarBandHeight / 2)
         NSLayoutConstraint.activate([
             side, centerY,
@@ -476,7 +476,6 @@ final class ViewController: NSViewController {
         let collapsing = sidebarCollapsed
         sidebarSliding = true
         updateGridInsets()
-        dragBar?.isEnabled = collapsing || !tablineShown
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.4
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -533,7 +532,6 @@ final class ViewController: NSViewController {
         sidebarView?.isHidden = sidebarCollapsed
         tablineShown = true
         updateGridInsets()
-        dragBar?.isEnabled = sidebarCollapsed
         tabBarView?.updateTabs(tabs, currentTab: currentTab)
         sidebarView?.updateTabs(tabs, currentTab: currentTab)
     }
@@ -543,7 +541,6 @@ final class ViewController: NSViewController {
         sidebarView?.isHidden = true
         tablineShown = false
         updateGridInsets()
-        dragBar?.isEnabled = true
     }
 
     // MARK: - Tab Bar (titlebar mode)

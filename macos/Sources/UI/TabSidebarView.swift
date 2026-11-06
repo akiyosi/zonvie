@@ -75,18 +75,13 @@ final class SidebarTitlebarWindow: NSWindow {
     }
 }
 
-/// Faint grab bar over the top of the editor while the sidebar is collapsed:
-/// it fades in after the pointer rests in the band and then moves the window
-/// (see SidebarTitlebarWindow). Until revealed it is click-through.
+/// Faint grab bar over the top of the editor: it fades in after the pointer
+/// rests in the band and then moves the window (see SidebarTitlebarWindow).
+/// Until revealed it is click-through.
 final class TitlebarDragBar: NSView {
     private static let revealDelay: TimeInterval = 2
     private var revealWork: DispatchWorkItem?
     private var revealed = false
-
-    /// Off while the sidebar is open: the sidebar top is the drag handle then.
-    var isEnabled = false {
-        didSet { if !isEnabled { conceal() } }
-    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -104,10 +99,9 @@ final class TitlebarDragBar: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { revealed ? super.hitTest(point) : nil }
 
     override func mouseEntered(with event: NSEvent) {
-        guard isEnabled else { return }
         revealWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isEnabled else { return }
+            guard let self else { return }
             self.revealed = true
             NSAnimationContext.runAnimationGroup { $0.duration = 0.2; self.animator().alphaValue = 1 }
         }
@@ -175,7 +169,7 @@ final class TabSidebarView: NSView {
     /// The sidebar toggle in the titlebar band; it takes this view's tab
     /// text colour and follows the colorscheme with it.
     weak var toggleButton: NSButton? {
-        didSet { toggleButton?.contentTintColor = tabTextColor }
+        didSet { toggleButton?.contentTintColor = tabTextSelectedColor }
     }
 
     // Appearance constants
@@ -411,7 +405,7 @@ final class TabSidebarView: NSView {
                 self.fgG = CGFloat((fgRGB >> 8) & 0xFF) / 255.0
                 self.fgB = CGFloat(fgRGB & 0xFF) / 255.0
             }
-            self.toggleButton?.contentTintColor = self.tabTextColor
+            self.toggleButton?.contentTintColor = self.tabTextSelectedColor
             self.needsDisplay = true
         }
     }

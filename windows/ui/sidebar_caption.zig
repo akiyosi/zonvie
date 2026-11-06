@@ -1,9 +1,10 @@
 //! Captionless sidebar window: `[window] titlebar_style = "transparent"` with
 //! `[tabline] style = "sidebar"`. The native caption is gone and the sidebar
 //! reaches the window top; its top band drags the window. The window buttons
-//! and a sidebar toggle float over the top-right corner. The toggle slides
-//! the sidebar closed and open; while it is closed, hovering the top edge for
-//! a while reveals a bar that drags the window.
+//! float over the top-right corner and a sidebar toggle over the sidebar's
+//! corner: top-left, or left of the window buttons for a right sidebar.
+//! The toggle slides the sidebar closed and open. Hovering the top edge of
+//! the editor for a while reveals a bar that drags the window.
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -74,11 +75,19 @@ fn buttonWidthPx(app: *const App) c_int {
 pub fn buttonAt(app: *const App, client_w: c_int, x: c_int, y: c_int) ?u8 {
     if (y < 0 or y >= bandPx(app)) return null;
     const w = buttonWidthPx(app);
+    if (!app.sidebar_position_right and x >= 0 and x < w) return TOGGLE_BTN;
     const from_right = client_w - x;
-    if (from_right <= 0 or from_right > w * 4) return null;
-    const slot: u8 = @intCast(@divTrunc(from_right - 1, w));
-    // Slots count from the right: close, maximize, minimize, toggle.
-    return if (slot == 3) TOGGLE_BTN else 2 - slot;
+    if (from_right <= 0) return null;
+    // Slots count from the right: close, maximize, minimize, then the toggle
+    // for a right sidebar.
+    const slot = @divTrunc(from_right - 1, w);
+    if (slot < 3) return 2 - @as(u8, @intCast(slot));
+    return if (app.sidebar_position_right and slot == 3) TOGGLE_BTN else null;
+}
+
+/// Left edge of the toggle's slot.
+fn toggleLeftPx(app: *const App, width: c_int) c_int {
+    return if (app.sidebar_position_right) width - buttonWidthPx(app) * 4 else 0;
 }
 
 /// What the band at client (x, y) is for WM_NCHITTEST: the buttons take the
@@ -100,7 +109,7 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
     const pal = tabline_mod.currentTitlebarPalette(app);
     const band = bandPx(app);
     const btn_w = buttonWidthPx(app);
-    const group_left = width - btn_w * 4;
+    const group_left = width - btn_w * 3;
 
     const bg_brush = c.CreateSolidBrush(pal.bar_bg);
     defer _ = c.DeleteObject(bg_brush);
@@ -110,7 +119,10 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
     if (app.drag_bar_revealed) {
         const bar_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
         defer _ = c.DeleteObject(bar_brush);
-        var bar = c.RECT{ .left = 0, .top = 0, .right = group_left, .bottom = band };
+        // Over the editor only: the sidebar's own top already drags the window.
+        const inset = gridInsetsPx(app);
+        const bar_right = if (app.sidebar_position_right) @min(toggleLeftPx(app, width), width - inset.right) else group_left;
+        var bar = c.RECT{ .left = @max(btn_w, inset.left), .top = 0, .right = bar_right, .bottom = band };
         _ = c.FillRect(hdc, &bar, bar_brush);
     }
 
@@ -118,12 +130,13 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
     if (app.tabline_state.hovered_window_btn == TOGGLE_BTN) {
         const hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
         defer _ = c.DeleteObject(hover_brush);
-        var r = c.RECT{ .left = group_left, .top = 0, .right = group_left + btn_w, .bottom = band };
+        const tl = toggleLeftPx(app, width);
+        var r = c.RECT{ .left = tl, .top = 0, .right = tl + btn_w, .bottom = band };
         _ = c.FillRect(hdc, &r, hover_brush);
     }
     const icon_w = app.scalePx(14);
     const icon_h = app.scalePx(11);
-    const ix = group_left + @divTrunc(btn_w - icon_w, 2);
+    const ix = toggleLeftPx(app, width) + @divTrunc(btn_w - icon_w, 2);
     const iy = @divTrunc(band - icon_h, 2);
     const pen = c.CreatePen(c.PS_SOLID, @max(1, app.scalePx(1)), pal.wbtn_icon);
     defer _ = c.DeleteObject(pen);
@@ -192,7 +205,7 @@ pub fn onTimer(hwnd: c.HWND, app: *App, id: usize) bool {
 }
 
 fn dragBarAllowed(app: *const App) bool {
-    return enabled(app) and app.sidebar_collapsed and !sliding(app);
+    return enabled(app) and !sliding(app);
 }
 
 fn concealDragBar(hwnd: c.HWND, app: *App) void {
@@ -299,14 +312,28 @@ pub fn onMouseUp(hwnd: c.HWND, app: *App, x: c_int, y: c_int) bool {
     return true;
 }
 
-test "buttonAt numbers the slots from the right edge" {
+test "buttonAt: window buttons from the right edge, toggle at the left" {
     var app: App = undefined;
     app.dpi_scale = 1.0;
+    app.sidebar_position_right = false;
     try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, 400, 399, 5));
     try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, 400, 354, 5));
     try std.testing.expectEqual(@as(?u8, 1), buttonAt(&app, 400, 353, 5));
     try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, 400, 262, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 261, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 46, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 45, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 0, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 399, 40));
+}
+
+test "buttonAt: a right sidebar puts the toggle left of the window buttons" {
+    var app: App = undefined;
+    app.dpi_scale = 1.0;
+    app.sidebar_position_right = true;
+    try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, 400, 262, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 261, 5));
     try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 216, 5));
     try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 215, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 399, 40));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 0, 5));
 }
