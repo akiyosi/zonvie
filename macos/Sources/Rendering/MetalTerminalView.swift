@@ -53,6 +53,10 @@ final class SurfaceScrollbarController {
     private let core: () -> ZonvieCore?
 
     private var hideTimer: Timer?
+    /// When the "scroll" mode delay expires; extended by every show().
+    private var hideDeadline: CFTimeInterval = 0
+    /// Whether the bar is faded in, so show() animates only on the edge.
+    private var shown = false
     private var lastViewportTopline: Int64 = -1
     private var lastViewportLineCount: Int64 = -1
     private var lastViewportBotline: Int64 = -1
@@ -139,15 +143,31 @@ final class SurfaceScrollbarController {
     func show() {
         let config = ZonvieConfig.shared.scrollbar
         guard config.enabled, let scroller else { return }
-        hideTimer?.invalidate()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            scroller.animator().alphaValue = CGFloat(config.opacity)
+        // A scroll calls this every frame, so a visible bar only moves its
+        // deadline instead of re-running the fade-in and replacing the timer.
+        if !shown {
+            shown = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                scroller.animator().alphaValue = CGFloat(config.opacity)
+            }
         }
         // Auto-hide after the delay, only in "scroll" mode.
         if config.isScroll && !config.isAlways {
-            hideTimer = Timer.scheduledTimer(withTimeInterval: config.delay, repeats: false) { [weak self] _ in
-                self?.hide()
+            hideDeadline = CACurrentMediaTime() + config.delay
+            if hideTimer == nil { scheduleHide(after: config.delay) }
+        }
+    }
+
+    private func scheduleHide(after delay: TimeInterval) {
+        hideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.hideTimer = nil
+            let remaining = self.hideDeadline - CACurrentMediaTime()
+            if remaining > 0 {
+                self.scheduleHide(after: remaining)
+            } else {
+                self.hide()
             }
         }
     }
@@ -156,6 +176,7 @@ final class SurfaceScrollbarController {
         let config = ZonvieConfig.shared.scrollbar
         if config.isAlways { return }
         guard let scroller else { return }
+        shown = false
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.3
             scroller.animator().alphaValue = 0.0
