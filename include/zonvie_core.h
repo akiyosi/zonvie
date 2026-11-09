@@ -204,6 +204,10 @@ typedef int (*zonvie_atlas_ensure_glyph_styled_fn)(
    cell, and fades them to the window's background alpha under blur while
    the atlas glyphs beside them stay opaque. */
 #define ZONVIE_DECO_SOLID_GLYPH   (1u << 11)
+/* Box-drawing glyph (U+2500..U+257F) on the default grid (grid 1): window
+   separators under ext_multigrid. A frontend may fade these where the grid
+   runs under window chrome; any other use may ignore the bit. */
+#define ZONVIE_DECO_SEPARATOR     (1u << 12)
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     /* Grid-local pixels: the origin is the top-left of the grid this vertex
@@ -1993,10 +1997,15 @@ typedef struct zonvie_config_values {
     const char* server_open_mode;  // "tab" or "current"
     // scroll
     uint8_t scroll_large_jump;  // ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
-    // window (macOS only): 0 = native titlebar, 1 = transparent
+    // window: 0 = native titlebar, 1 = transparent (no band, buttons on hover),
+    // 2 = unified (band kept, painted the editor default bg)
     uint8_t window_titlebar_style;
     // scrollbar: 0 = overlay (drawn over the grid), 1 = column (a strip beside it)
     uint8_t scrollbar_layout;
+    // window separators under a transparent/unified titlebar band:
+    // 0 = fade in across the band, 1 = hairline at the band bottom with
+    // separators hidden above it, 2 = unchanged
+    uint8_t window_titlebar_edge;
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

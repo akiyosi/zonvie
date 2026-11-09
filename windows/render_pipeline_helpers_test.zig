@@ -1643,6 +1643,23 @@ test "the two styles are exclusive, so only one axis ever shifts" {
     try std.testing.expectEqual(@as(i32, 0), sidebar.y);
 }
 
+test "the unified title band shifts a sidebar surface down as well" {
+    const banded = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+        .tab_bar_height_px = 30,
+        .title_band = true,
+    });
+    try std.testing.expectEqual(@as(i32, 120), banded.x);
+    try std.testing.expectEqual(@as(i32, 30), banded.y);
+
+    // Never for an external window: the band is the main window's.
+    const external = helpers.surfaceOriginPx(.{ .is_main_window = false, .title_band = true, .tab_bar_height_px = 30 });
+    try std.testing.expectEqual(@as(i32, 0), external.y);
+}
+
 test "a blink-off frame draws no cursor vertices" {
     const V = struct { x: f32 };
     const cursor = [_]V{ .{ .x = 1 }, .{ .x = 2 } };

@@ -16,15 +16,27 @@ const messages = @import("ui/messages.zig");
 const external_windows = @import("ui/external_windows.zig");
 const scrollbar = @import("ui/scrollbar.zig");
 const sidebar_caption = @import("ui/sidebar_caption.zig");
+const caption_reveal = @import("ui/caption_reveal.zig");
 const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
 const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
 
 /// The window draws its own caption (WM_NCCALCSIZE drops the native one):
-/// the titlebar tabline, or the captionless sidebar.
+/// the titlebar tabline, or a captionless window (sidebar_caption.zig).
 fn customFrame(app: *const App) bool {
-    return app.ext_tabline_enabled and (app.tabline_style == .titlebar or sidebar_caption.enabled(app));
+    return sidebar_caption.layout(app).removesNativeCaption();
+}
+
+/// Hover reveal of the main window's self-drawn buttons. `source` is the
+/// mouse message's kind, null for a leave notice. While a right sidebar pins
+/// the buttons the state still follows the pointer, so it is current when
+/// the pin lifts, but the unchanged band is not repainted.
+fn updateMainCaptionReveal(hwnd: c.HWND, app: *App, source: ?caption_reveal.Source) void {
+    if (!sidebar_caption.captionless(app)) return;
+    const band_px = sidebar_caption.bandPx(app);
+    const changed = caption_reveal.update(hwnd, &app.caption_buttons_revealed, band_px, source);
+    if (changed and sidebar_caption.captionButtonsHoverGated(app)) sidebar_caption.repaint(hwnd, app);
 }
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
@@ -289,6 +301,20 @@ pub fn applyOsTitlebarTheme(hwnd: c.HWND) void {
         &dark_mode,
         @sizeOf(c.BOOL),
     );
+}
+
+// Windows 11 22000+ caption colours; older builds return E_INVALIDARG and
+// keep the theme colours, so the HRESULT is discarded like the one above.
+const DWMWA_CAPTION_COLOR: c.DWORD = 35;
+const DWMWA_TEXT_COLOR: c.DWORD = 36;
+
+/// Applies caption_reveal.captionColors to a captioned top-level window.
+/// External windows draw no title band yet: where the layout asks for one,
+/// their native caption takes the band's colours instead. UI thread only.
+pub fn applyCaptionColors(hwnd: c.HWND, app: *const App, layout: config_mod.Config.TitlebarLayout) void {
+    var colors = caption_reveal.captionColors(layout.titleBand(), app.colorscheme_bg, app.colorscheme_fg);
+    _ = c.DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &colors.caption, @sizeOf(c.COLORREF));
+    _ = c.DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &colors.text, @sizeOf(c.COLORREF));
 }
 
 // Win11 22H2+ system backdrop. Setting an acrylic backdrop makes window
@@ -2065,6 +2091,11 @@ fn snapshotMainPaint(hwnd: c.HWND, app: *App, tbs_snapshot: *const app_mod.Paint
     // init, device-lost recovery), which then cleared black.
     if (gpu_ptr) |g| {
         if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
+        // Fixed by config and the band height; a DPI change that moves the
+        // band repaints every row anyway.
+        const edge = sidebar_caption.separatorEdge(app);
+        g.separator_fade_px = edge.fade_px;
+        g.separator_hard_edge = edge.hard;
     }
     var atlas_reset_consumed = false;
     var atlas_generation: u64 = 0;
@@ -2248,7 +2279,7 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
     // the fallback matches currentTitlebarPalette().bar_bg
     // (RGB(32,32,32) dark / RGB(240,240,240) light).
     const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
-        (if (app.config.window.titlebar_style == .transparent and app.colorscheme_bg != 0xFFFFFFFF)
+        (if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
             [4]f32{
                 @as(f32, @floatFromInt((app.colorscheme_bg >> 16) & 0xFF)) / 255.0,
                 @as(f32, @floatFromInt((app.colorscheme_bg >> 8) & 0xFF)) / 255.0,
@@ -2269,7 +2300,7 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
         .content_y_offset = content_y_offset,
         .sidebar_right_width = sidebar_right_width,
         .sidebar_x_px = sidebar_x_px,
-        .caption_band_px = if (sidebar_caption.enabled(app)) sidebar_caption.bandPx(app) else 0,
+        .caption_band_px = if (sidebar_caption.drawsBand(app)) sidebar_caption.bandPx(app) else 0,
         .tabbar_bg_color = tabbar_bg_color,
         .content_x_offset_i32 = if (content_x_offset) |off| @intCast(off) else 0,
         .content_y_offset_i32 = if (content_y_offset) |off| @intCast(off) else 0,
@@ -2294,15 +2325,17 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
 /// Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
 /// This avoids DWM composition issues by keeping GDI rendering offscreen
 fn renderMainChromeTextures(app: *App, client: c.RECT) void {
+    // A captionless window's overlay (buttons, drag bar) uses the tabline
+    // strip, with or without a tabline.
+    if (sidebar_caption.drawsBand(app)) {
+        tabline_mod.renderTablineToD3D(app, @intCast(@max(1, client.right)), @intCast(sidebar_caption.bandPx(app)));
+    }
     if (app.ext_tabline_enabled) {
         if (app.tabline_style == .titlebar) {
             const tabline_width: u32 = @intCast(@max(1, client.right));
             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
         } else if (app.tabline_style == .sidebar) {
-            if (sidebar_caption.enabled(app)) {
-                tabline_mod.renderTablineToD3D(app, @intCast(@max(1, client.right)), @intCast(sidebar_caption.bandPx(app)));
-            }
             // Called unconditionally: unlike the tabline, the sidebar
             // has no tab_count gate, and it draws an empty strip rather
             // than releasing anything when there are no tabs.
@@ -3413,7 +3446,7 @@ pub export fn WndProc(
                     const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
                     var client_pt: c.POINT = .{ .x = x, .y = y };
                     _ = c.ScreenToClient(hwnd, &client_pt);
-                    if (client_pt.y < tabbar_height and sidebar_caption.enabled(app)) {
+                    if (client_pt.y < tabbar_height and sidebar_caption.drawsBand(app)) {
                         return sidebar_caption.bandHitTest(app, hwnd, client_pt.x, client_pt.y);
                     }
                     if (client_pt.y < tabbar_height) {
@@ -4388,6 +4421,13 @@ pub export fn WndProc(
             // deadlock when calling zonvie_core_get_hl_by_name from callback context.
             if (getApp(hwnd)) |app| {
                 external_windows.updateExternalWindowColors(app);
+                // The border hairline takes WinSeparator's new colour.
+                if (sidebar_caption.separatorEdge(app).hard) sidebar_caption.repaint(hwnd, app);
+                // Posted after every colorscheme change: the unified caption
+                // follows it. The table decides the colours; a removed caption
+                // only skips two DWM calls that would set the theme default.
+                if (!customFrame(app)) applyCaptionColors(hwnd, app, sidebar_caption.layout(app));
+                external_windows.applyCaptionColorsToAll(app);
             }
             return 0;
         },
@@ -4407,6 +4447,8 @@ pub export fn WndProc(
                 if (len > 0) {
                     local_buf[len] = 0; // null terminate
                     _ = c.SetWindowTextW(hwnd, &local_buf);
+                    // The title band draws the title itself.
+                    if (sidebar_caption.titleBand(app)) sidebar_caption.repaint(hwnd, app);
                 }
             }
             return 0;
@@ -6006,12 +6048,16 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 tabline_mod.clearTablineHover(app, hwnd);
                 sidebar_caption.onNcMouseMove(hwnd, app);
+                updateMainCaptionReveal(hwnd, app, .nonclient);
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
         c.WM_NCMOUSELEAVE => {
-            if (getApp(hwnd)) |app| sidebar_caption.onLeave(hwnd, app);
+            if (getApp(hwnd)) |app| {
+                sidebar_caption.onLeave(hwnd, app);
+                updateMainCaptionReveal(hwnd, app, null);
+            }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
@@ -6038,14 +6084,14 @@ pub export fn WndProc(
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
                 const y = pos.y;
+                updateMainCaptionReveal(hwnd, app, .client);
 
                 // Handle tabline/sidebar drag or hover (when ext_tabline enabled).
                 // An editor or scrollbar-knob drag keeps going over the chrome,
                 // as its release does (press_reached_editor, and the scrollbar
                 // release ahead of the chrome branches): the chrome neither
                 // consumes the move nor lights a hover under it.
-                const editor_drag = app.surf.scrollbar.dragging or
-                    (app.press_claim.owner != 0 and app.mouse_press_grid_id != 0);
+                const editor_drag = sidebar_caption.editorDrag(app);
                 if (!editor_drag and sidebar_caption.onMouseMove(hwnd, app, @as(c_int, x), @as(c_int, y))) {
                     tabline_mod.clearTablineHover(app, hwnd);
                     return 0;
@@ -6371,6 +6417,7 @@ pub export fn WndProc(
                 scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
                 tabline_mod.clearTablineHover(app, hwnd);
                 sidebar_caption.onLeave(hwnd, app);
+                updateMainCaptionReveal(hwnd, app, null);
             }
             return 0;
         },

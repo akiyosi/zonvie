@@ -97,10 +97,146 @@ extension NSWindow {
     }
 }
 
+/// `[window] titlebar_style`; raw values match `zonvie_config_values.window_titlebar_style`.
+/// What each value yields depends on the tabline: see `TitlebarLayout`.
+enum TitlebarStyle: UInt8 {
+    case native = 0
+    case transparent = 1
+    case unified = 2
+}
+
+/// The window chrome one titlebar style yields with one tabline placement.
+/// Mirrors `Config.TitlebarLayout` in src/core/config.zig, whose test holds
+/// the table; every main- and external-window titlebar decision derives
+/// from here.
+///
+///                 native        transparent         unified
+///   titlebar      tabs          tabs, editor bg     tabs, editor bg
+///   sidebar       native        captionless         title band
+///   other         native        captionless         title band
+struct TitlebarLayout: Equatable {
+    /// `other` is a menu, no ext_tabline, or an external window.
+    enum Tabline { case titlebar, sidebar, other }
+    enum WindowKind { case tabBar, captionless, standard }
+
+    let style: TitlebarStyle
+    let tabline: Tabline
+
+    /// No caption band: the window buttons show only while the pointer is in
+    /// the top band, and resting there reveals a drag bar.
+    var captionless: Bool {
+        switch style {
+        case .native, .unified: return false
+        case .transparent: return tabline != .titlebar
+        }
+    }
+
+    /// A self-drawn band with the title in the editor's colours; the editor
+    /// starts below it and a sidebar still reaches the top.
+    var titleBand: Bool {
+        switch style {
+        case .native, .transparent: return false
+        case .unified: return tabline != .titlebar
+        }
+    }
+
+    var drawsBand: Bool { captionless || titleBand }
+    /// The native caption is gone: titlebar tabs or a drawn band hold it.
+    var removesNativeCaption: Bool { tabline == .titlebar || drawsBand }
+    /// The editor's grid starts below the top band (tabs or title band).
+    var editorBelowBand: Bool { tabline == .titlebar || titleBand }
+
+    /// The editor surface reaches the window top under the chrome: titlebar
+    /// tabs float over it, or a captionless band lies over it. Its gaps take
+    /// the editor's default bg.
+    var editorRunsUnderBand: Bool {
+        switch style {
+        case .native: return false
+        case .transparent: return true
+        case .unified: return tabline == .titlebar
+        }
+    }
+
+    /// The window class to create. `.captionless` means "the frontend draws
+    /// the band" (`drawsBand`: captionless or title band), not the
+    /// `captionless` predicate: a title band window is made the same way.
+    var windowKind: WindowKind {
+        if tabline == .titlebar { return .tabBar }
+        return drawsBand ? .captionless : .standard
+    }
+
+    func styleMask(_ base: NSWindow.StyleMask) -> NSWindow.StyleMask {
+        windowKind == .standard ? base : base.union(.fullSizeContentView)
+    }
+
+    /// Sets the titlebar flags of a window made with `styleMask(_:)`.
+    /// Background paint and hover reveal are the caller's: they depend on
+    /// blur and on lifetime.
+    func apply(to window: NSWindow) {
+        precondition(window.styleMask.contains(.titled), "titlebar layout needs a titled window")
+        precondition(window.styleMask.contains(.fullSizeContentView) == (windowKind != .standard),
+                     "window not made with TitlebarLayout.styleMask")
+        window.titlebarAppearsTransparent = removesNativeCaption
+        window.titleVisibility = removesNativeCaption ? .hidden : .visible
+    }
+}
+
+/// Keeps a window's standard buttons, and an optional companion control in
+/// the band (the sidebar toggle), hidden until the pointer is over the
+/// titlebar, unless pinned shown. Lives as long as its owner holds it; the
+/// controls stay as last shown after that.
+final class WindowButtonHoverReveal: NSObject {
+    private static let buttonTypes: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+    private weak var window: NSWindow?
+    private weak var companion: NSView?
+    /// The titlebar view holding the buttons; its visible rect is the hover zone.
+    private weak var trackedView: NSView?
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false
+
+    /// Shown regardless of the pointer (a left sidebar open under the lights).
+    var pinned = false {
+        didSet { if pinned != oldValue { apply(animated: true) } }
+    }
+
+    /// nil when the window has no standard buttons to reveal.
+    init?(window: NSWindow, companion: NSView? = nil) {
+        guard let container = window.standardWindowButton(.closeButton)?.superview else { return nil }
+        self.window = window
+        self.companion = companion
+        self.trackedView = container
+        super.init()
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        container.addTrackingArea(area)
+        trackingArea = area
+        apply(animated: false)
+    }
+
+    deinit {
+        if let trackingArea { trackedView?.removeTrackingArea(trackingArea) }
+    }
+
+    // A plain NSObject owner: the selectors must be AppKit's `mouseEntered:`,
+    // not the Swift-derived `mouseEnteredWith:`.
+    @objc(mouseEntered:) func mouseEntered(with event: NSEvent) { hovered = true; apply(animated: true) }
+    @objc(mouseExited:) func mouseExited(with event: NSEvent) { hovered = false; apply(animated: true) }
+
+    private func apply(animated: Bool) {
+        guard let window else { return }
+        let alpha: CGFloat = pinned || hovered ? 1 : 0
+        let views = Self.buttonTypes.compactMap { window.standardWindowButton($0) } + [companion].compactMap { $0 }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = animated ? 0.15 : 0
+            for view in views { (animated ? view.animator() : view).alphaValue = alpha }
+        }
+    }
+}
+
 final class TabBarWindow: NSWindow {
     override func layoutIfNeeded() {
         super.layoutIfNeeded()
-        guard ZonvieConfig.shared.window.transparentTitlebar else { return }
+        guard ZonvieConfig.shared.titlebarLayout.editorRunsUnderBand else { return }
         placeTrafficLights(leftPt: TitlebarBand.lightsLeftPt, bandHeightPt: TitlebarBand.heightPt)
     }
 

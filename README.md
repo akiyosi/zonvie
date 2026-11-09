@@ -145,7 +145,8 @@ linespace = 2
 blur = true
 opacity = 0.85
 blur_radius = 20
-titlebar_style = "native"  # "native" or "transparent" (macOS, Windows)
+titlebar_style = "native"  # "native", "transparent" or "unified" (macOS, Windows)
+titlebar_edge = "fade"     # "fade", "border" or "none" (macOS, Windows)
 
 [scrollbar]
 enabled = true
@@ -261,7 +262,8 @@ paths = [
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true) |
-| `titlebar_style` | macOS and Windows: `"transparent"` hides the native titlebar and extends the content under the traffic lights; with `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights. with `style = "titlebar"` the tabs float over the editor surface, which runs to the window top. On Windows the window buttons and the sidebar toggle sit at the top-right (default: `"native"`) |
+| `titlebar_style` | macOS and Windows, main and external windows: `"transparent"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. `"unified"` replaces the native titlebar with a self-drawn band in the editor's background showing the window title; the editor starts below it (default: `"native"`) |
+| `titlebar_edge` | macOS and Windows, main window, with a transparent or unified titlebar band: how window separators meet the band. `"fade"` fades them in across the band; `"border"` draws a one-pixel line in `WinSeparator`'s colour along the band's bottom and starts the separators there (a captionless window shows no band and fades instead); `"none"` leaves them as Neovim draws them (default: `"fade"`) |
 
 #### [scrollbar]
 | Key | Description |

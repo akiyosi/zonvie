@@ -1401,6 +1401,10 @@ final class ZonvieCore {
                         // in the core's hl_group_set name table.
                         if colors.bg != 0xFFFF_FFFF { me.defaultColors.bg = colors.bg }
                         if colors.fg != 0xFFFF_FFFF { me.defaultColors.fg = colors.fg }
+                        // Only .normal external windows have a delegate (and a title band).
+                        for gridId in me.externalWindowDelegates.keys {
+                            if let w = me.externalWindows[gridId] { me.applyExternalTitleBandColors(w) }
+                        }
                         NotificationCenter.default.post(
                             name: ZonvieCore.colorschemeDidChangeNotification,
                             object: me,
@@ -4809,6 +4813,8 @@ final class ZonvieCore {
         let gridId: Int64
         var cellWidthPx: CGFloat
         var cellHeightPx: CGFloat
+        /// Transparent titlebar: shows the window buttons on hover while the window lives.
+        var titlebarReveal: WindowButtonHoverReveal?
         /// When true, suppress tryResizeGrid in windowDidResize (programmatic resize from grid_resize).
         var suppressResizeCallback = false
         /// Last grid rows/cols set by applyExternalGridConfig (for exact change detection).
@@ -4869,7 +4875,7 @@ final class ZonvieCore {
 
             // Calculate rows/cols from window size
             let widthPx = contentSize.width * scale
-            let heightPx = contentSize.height * scale
+            let heightPx = (contentSize.height - ZonvieCore.externalTitleBandPt) * scale
 
             // A grid in its own font counts its rows and columns in that font.
             // The "column" scrollbar's strip is the window's, not the grid's.
@@ -5012,7 +5018,7 @@ final class ZonvieCore {
         let anchorsApply = applyAnchors && (window.inLiveResize || delegate.anchorsDescribeCurrentGesture)
         let anchorBottom = anchorsApply && delegate.userResizeAnchorsBottom
         let anchorRight = anchorsApply && delegate.userResizeAnchorsRight
-        let frameRect = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight))
+        let frameRect = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight + Self.externalTitleBandPt))
         window.setFrame(NSRect(
             x: anchorRight ? oldFrame.maxX - frameRect.width : oldFrame.origin.x,
             y: anchorBottom ? oldFrame.origin.y : oldFrame.maxY - frameRect.height,
@@ -6124,6 +6130,14 @@ final class ZonvieCore {
             cmdlineWindow.suppressPositionSave = (self.promptWindow?.isVisible == true)
             return cmdlineWindow
 
+        case .normal where ZonvieConfig.shared.externalTitlebarLayout.windowKind == .captionless:
+            return CaptionlessWindow(
+                contentRect: contentRect,
+                styleMask: styleMask,
+                backing: .buffered,
+                defer: false
+            )
+
         case .normal, .popupmenu, .msgShow, .msgHistory:
             return NSWindow(
                 contentRect: contentRect,
@@ -6281,9 +6295,25 @@ final class ZonvieCore {
 
         case .normal:
             window.title = "Window \(win)"
+            ZonvieConfig.shared.externalTitlebarLayout.apply(to: window)
         }
 
         window.isReleasedWhenClosed = false
+    }
+
+    /// The self-drawn title band over a normal external window's grid
+    /// (`TitlebarLayout.titleBand`); 0 when the window has none.
+    private static var externalTitleBandPt: CGFloat {
+        ZonvieConfig.shared.externalTitlebarLayout.titleBand ? TitlebarBand.heightPt : 0
+    }
+
+    /// The band takes the editor's default colours; blur keeps it clear.
+    private func applyExternalTitleBandColors(_ window: NSWindow) {
+        guard let band = window.contentView?.subviews.first(where: { $0 is TitleBandView }) as? TitleBandView else { return }
+        let bg = ZonvieConfig.shared.blurEnabled ? NSColor.clear
+            : defaultColors.bg == 0xFFFF_FFFF ? NSColor.windowBackgroundColor : Self.rgbColor(defaultColors.bg)
+        band.setColors(background: bg,
+                       foreground: defaultColors.fg == 0xFFFF_FFFF ? .labelColor : Self.rgbColor(defaultColors.fg))
     }
 
     private func buildExternalWindowGeometry(
@@ -6314,7 +6344,8 @@ final class ZonvieCore {
         let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind) + closeButtonReservedWidth(for: kind) + scrollbarColumn
         let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
         let windowWidth = containerWidth + (shadowMargin * 2)
-        let windowHeight = containerHeight + (shadowMargin * 2)
+        let titleBand: CGFloat = kind == .normal ? Self.externalTitleBandPt : 0.0
+        let windowHeight = containerHeight + (shadowMargin * 2) + titleBand
 
         return ExternalWindowGeometry(
             contentWidth: contentWidth,
@@ -6329,7 +6360,10 @@ final class ZonvieCore {
     private func styleMaskForExternalWindow(kind: ExternalGridKind) -> NSWindow.StyleMask {
         switch kind {
         case .normal:
-            return [.titled, .closable, .resizable]
+            // Transparent adds .fullSizeContentView: frame and content rects
+            // then coincide, so the grid fills the window and the frame math
+            // in frameExternalWindow still holds.
+            return ZonvieConfig.shared.externalTitlebarLayout.styleMask([.titled, .closable, .resizable])
         case .cmdline, .popupmenu, .msgShow, .msgHistory:
             return [.borderless]
         }
@@ -6354,8 +6388,36 @@ final class ZonvieCore {
             return
         }
 
-        gridView.frame = NSRect(x: 0, y: 0, width: geometry.windowWidth, height: geometry.windowHeight)
-        window.contentView = gridView
+        let bandPt = Self.externalTitleBandPt
+        if bandPt > 0 {
+            // The band sits above the grid; the grid keeps the rest.
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: geometry.windowWidth, height: geometry.windowHeight))
+            gridView.frame = NSRect(x: 0, y: 0, width: geometry.windowWidth, height: geometry.windowHeight - bandPt)
+            gridView.autoresizingMask = [.width, .height]
+            container.addSubview(gridView)
+            let band = TitleBandView(leadingReservePt: TitlebarBand.controlsWidthPt)
+            band.frame = NSRect(x: 0, y: geometry.windowHeight - bandPt, width: geometry.windowWidth, height: bandPt)
+            band.autoresizingMask = [.width, .minYMargin]
+            band.title = window.title
+            container.addSubview(band)
+            window.contentView = container
+            applyExternalTitleBandColors(window)
+        } else {
+            gridView.frame = NSRect(x: 0, y: 0, width: geometry.windowWidth, height: geometry.windowHeight)
+            window.contentView = gridView
+        }
+        if kind == .normal, ZonvieConfig.shared.externalTitlebarLayout.captionless {
+            // The grid reaches the window top: the band's drag bar moves the window.
+            let bar = TitlebarDragBar(frame: .zero)
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            gridView.addSubview(bar)
+            NSLayoutConstraint.activate([
+                bar.leadingAnchor.constraint(equalTo: gridView.leadingAnchor),
+                bar.trailingAnchor.constraint(equalTo: gridView.trailingAnchor),
+                bar.topAnchor.constraint(equalTo: gridView.topAnchor),
+                bar.heightAnchor.constraint(equalToConstant: TitlebarBand.heightPt),
+            ])
+        }
         if ZonvieConfig.shared.blurEnabled {
             window.isOpaque = false
             window.backgroundColor = Self.transparentShadowedWindowBackground
@@ -6378,6 +6440,9 @@ final class ZonvieCore {
             cellHeightPx: cellH
         )
         window.delegate = delegate
+        if ZonvieConfig.shared.externalTitlebarLayout.captionless {
+            delegate.titlebarReveal = WindowButtonHoverReveal(window: window)
+        }
         self.externalWindowDelegates[gridId] = delegate
     }
 
@@ -7557,6 +7622,12 @@ final class ZonvieCore {
         var bg: UInt32 = 0
         guard zonvie_core_get_hl_by_name(corePtr, name, &fg, &bg) != 0 else { return fallback }
         return Self.rgbColor(foreground ? fg : bg)
+    }
+
+    /// WinSeparator's foreground: the titlebar hairline meets the window
+    /// separators in their own colour.
+    func separatorColor() -> NSColor {
+        hlColor("WinSeparator", foreground: true, fallback: .separatorColor)
     }
 
     /// Get the Search highlight color (background) for cmdline border.

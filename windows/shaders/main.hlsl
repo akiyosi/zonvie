@@ -16,6 +16,12 @@ cbuffer LayerTransform : register(b0) {
     // margins (winbar, float borders) stay put. Zero when nothing eases.
     float layer_scroll_offset_px;
     float layer_pad;
+    // `[window] titlebar_edge`: DECO_SEPARATOR glyphs within this many px of
+    // the layer top fade in (separator_hard_edge 0) or are hidden (1). 0 px
+    // leaves them alone.
+    float separator_fade_px;
+    float separator_hard_edge;
+    float2 separator_pad;
 };
 
 struct VSIn {
@@ -36,6 +42,9 @@ struct VSOut {
     // Layer origin in surface pixels, so pattern decorations can phase from
     // the layer's own left edge instead of the window's.
     float2 layer_origin : TEXCOORD2;
+    // Layer-local y in px, and the separator edge (fade px, hard edge).
+    float layer_y : TEXCOORD3;
+    nointerpolation float2 separator_edge : TEXCOORD4;
 };
 
 VSOut VSMain(VSIn i) {
@@ -44,6 +53,8 @@ VSOut VSMain(VSIn i) {
     if (i.deco_flags & (1u << 7)) p.y += layer_scroll_offset_px;  // DECO_SCROLLABLE
     o.pos = float4(p * layer_scale + layer_offset, 0.0, 1.0);
     o.layer_origin = layer_origin_px;
+    o.layer_y = p.y;
+    o.separator_edge = float2(separator_fade_px, separator_hard_edge);
     o.uv  = i.uv;
     o.col = i.col;
     o.deco_flags = i.deco_flags;
@@ -74,6 +85,17 @@ SamplerState samp0 : register(s0);
 // this frontend never fades foreground quads. Declared so the flag is not
 // mistaken for an unknown bit by the next reader.
 #define DECO_SOLID_GLYPH   (1u << 11)
+// Window separators on the default grid: faded or hidden under the titlebar
+// band (separatorEdge).
+#define DECO_SEPARATOR     (1u << 12)
+
+// Alpha factor for a DECO_SEPARATOR glyph: 0 at the layer top, 1 below the
+// band, so a separator reaching under the titlebar does not start abruptly.
+float separatorEdge(VSOut i) {
+    if (!(i.deco_flags & DECO_SEPARATOR) || i.separator_edge.x <= 0.0) return 1.0;
+    if (i.separator_edge.y > 0.5) return step(i.separator_edge.x, i.layer_y);
+    return smoothstep(0.0, i.separator_edge.x, i.layer_y);
+}
 
 // Visual decoration flags, excluding the transport-only ones (SCROLLABLE) and
 // the ones that only pick a sampling mode (GLOW, COLOR_EMOJI). Mirrors
@@ -317,7 +339,7 @@ float4 PSMain(VSOut i) : SV_Target {
     float glyph_a = dot(tex.rgb, float3(0.299, 0.587, 0.114));
     float contrasted = DWrite_EnhanceContrast(glyph_a, blendEnhancedContrast);
     float alphaCorrected = DWrite_ApplyAlphaCorrection(contrasted, intensity, gammaRatios);
-    return alphaCorrected * foreground;
+    return alphaCorrected * foreground * separatorEdge(i);
 }
 
 // ============================================================================

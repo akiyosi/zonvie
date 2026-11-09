@@ -12,11 +12,9 @@ final class ViewController: NSViewController {
     private var tabBarView: TabBarView?
     private var sidebarView: TabSidebarView?
 
-    // Transparent titlebar (`[window] titlebar_style = "transparent"`). Menu
-    // or no tabline: the editor clears the traffic-light band; sidebar or
-    // titlebar tabs: the editor surface runs under them.
-    private let transparentTitlebar = ZonvieConfig.shared.window.transparentTitlebar
-    private var terminalTopConstraint: NSLayoutConstraint?
+    private let titlebarLayout = ZonvieConfig.shared.titlebarLayout
+    // The editor surface starts at the window top, under the chrome.
+    private var editorRunsUnderBand: Bool { titlebarLayout.editorRunsUnderBand }
     private var sidebarEdgeConstraint: NSLayoutConstraint?
     private var dragBar: TitlebarDragBar?
     private var sidebarToggleCenterYConstraint: NSLayoutConstraint?
@@ -25,9 +23,18 @@ final class ViewController: NSViewController {
     private var sidebarSliding = false
     private var tablineShown = false
     private var bandObserver: Any?
+    private var titlebarReveal: WindowButtonHoverReveal?
+    // A self-drawn band over the editor's side (TitlebarLayout.titleBand).
+    private var drawsTitleBand: Bool { titlebarLayout.titleBand }
+    private var titleBand: TitleBandView?
+    private var titleBandObserver: Any?
+    private var titleObservation: NSKeyValueObservation?
+    // `titlebar_edge = "border"`: the line along the band's bottom.
+    private var edgeHairline: EdgeHairlineView?
+    private var edgeHairlineObserver: Any?
 
     // Height of the Chrome-style tab bar; over the editor it is the shared band.
-    private var tabBarHeight: CGFloat { transparentTitlebar ? TitlebarBand.heightPt : 36 }
+    private var tabBarHeight: CGFloat { editorRunsUnderBand ? TitlebarBand.heightPt : 36 }
 
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
@@ -81,7 +88,7 @@ final class ViewController: NSViewController {
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: transparentTitlebar ? 0 : tabBarHeight),
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: editorRunsUnderBand ? 0 : tabBarHeight),
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
 
@@ -89,27 +96,17 @@ final class ViewController: NSViewController {
             setupSidebar()
             // Constraints are set up inside setupSidebar()
 
-        case .menu:
-            // Menu mode: no tab UI in the window, full-size terminal.
-            // Notification observers (set up below, once the core exists)
-            // keep currentTabs tracking.
-            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
-            terminalTopConstraint = top
+        case .menu, nil:
+            // A menu or no ext_tabline: no tab UI in the window. Notification
+            // observers (set up below, once the core exists) keep currentTabs
+            // tracking in menu mode.
+            if drawsTitleBand { installTitleBand(beside: nil) }
+            // The surface reaches the top; a title band's height comes off
+            // the grid (titleBandInsetPt), not the view.
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                top,
-                terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            ])
-
-        case nil:
-            // No ext_tabline: full-size terminal
-            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
-            terminalTopConstraint = top
-            NSLayoutConstraint.activate([
-                terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                top,
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
@@ -124,16 +121,26 @@ final class ViewController: NSViewController {
             setupTablineNotificationObservers()
         }
         sidebarView?.observeColorschemeChanges(of: core)
-        if transparentTitlebar && !config.blurEnabled {
-            // The band above the editor shows the root view: paint it the
-            // editor's default background.
+        // A title band paints itself (titleBandObserver below).
+        if editorRunsUnderBand && !config.blurEnabled {
+            // Under the band: chrome gaps show the root view, in the editor bg.
             bandObserver = NotificationCenter.default.addObserver(
                 forName: ZonvieCore.colorschemeDidChangeNotification, object: core, queue: .main
             ) { [weak self] note in
-                guard let rgb = note.userInfo?["bgRGB"] as? UInt32, rgb != 0xFFFF_FFFF else { return }
-                self?.view.layer?.backgroundColor = CGColor(
-                    srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
-                    blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
+                guard let self, let rgb = note.userInfo?["bgRGB"] as? UInt32, rgb != 0xFFFF_FFFF else { return }
+                self.view.layer?.backgroundColor = Self.rgbColor(rgb).cgColor
+            }
+        }
+
+        if let band = titleBand {
+            // The band is clear over the editor surface; only the title takes
+            // the editor's fg.
+            titleBandObserver = NotificationCenter.default.addObserver(
+                forName: ZonvieCore.colorschemeDidChangeNotification, object: core, queue: .main
+            ) { [weak band] note in
+                guard let band else { return }
+                let fg = note.userInfo?["fgRGB"] as? UInt32 ?? 0xFFFF_FFFF
+                band.setTitleColor(fg == 0xFFFF_FFFF ? .labelColor : Self.rgbColor(fg))
             }
         }
 
@@ -344,7 +351,7 @@ final class ViewController: NSViewController {
     }
 
     deinit {
-        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver, bandObserver] {
+        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver, bandObserver, titleBandObserver, edgeHairlineObserver] {
             if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
@@ -363,48 +370,134 @@ final class ViewController: NSViewController {
         super.viewWillAppear()
         // Before the window shows, so the first layout already has the
         // toolbar's titlebar height.
-        installSidebarToggleIfNeeded()
+        installTitlebarChromeIfNeeded()
+        if let band = titleBand, titleObservation == nil, let window = view.window {
+            titleObservation = window.observe(\.title, options: [.initial, .new]) { [weak band] window, _ in
+                band?.title = window.title
+            }
+        }
+        if titlebarLayout.captionless, titlebarReveal == nil, let window = view.window {
+            titlebarReveal = WindowButtonHoverReveal(window: window, companion: sidebarView?.toggleButton)
+            updateTitlebarRevealPin()
+        }
     }
 
     override func viewDidLayout() {
         super.viewDidLayout()
         updateTitlebarLayout()
+        updateTitlebarEdge()
+    }
+
+    // MARK: - Titlebar edge
+
+    /// Where window separators meet the band (`[window] titlebar_edge`).
+    private func updateTitlebarEdge() {
+        let band = titlebarBandHeight
+        let scale = terminalView.backingScale
+        guard band > 0, let renderer = terminalView.renderer else {
+            terminalView.renderer?.separatorFadePx = 0
+            edgeHairline?.isHidden = true
+            return
+        }
+        // Only the part of the band that lies over the grid hides separators;
+        // under titlebar tabs or a self-drawn title band the grid already
+        // starts below the band.
+        let gridTopPt = view.bounds.height - terminalView.frame.maxY + terminalView.gridInsetsPt.top
+        let coveredPt = max(0, band - gridTopPt)
+        // A captionless window shows no band, so there is no edge to border:
+        // its separators fade under the hidden caption instead.
+        let configured = ZonvieConfig.shared.window.titlebarEdge
+        let edge = configured == .border && titlebarLayout.captionless ? .fade : configured
+        if edge != .border { edgeHairline?.isHidden = true }
+        switch edge {
+        case .fade:
+            renderer.separatorHardEdge = false
+            renderer.separatorFadePx = Float(coveredPt * scale)
+        case .none:
+            renderer.separatorFadePx = 0
+        case .border:
+            renderer.separatorHardEdge = true
+            renderer.separatorFadePx = Float((coveredPt * scale).rounded())
+            let hairline = edgeHairline ?? installEdgeHairline()
+            let insets = terminalView.gridInsetsPt
+            let thicknessPt = 1 / scale
+            hairline.frame = NSRect(x: terminalView.frame.minX + insets.left,
+                                    y: view.bounds.height - band - thicknessPt,
+                                    width: max(0, terminalView.frame.width - insets.left - insets.right),
+                                    height: thicknessPt)
+            hairline.isHidden = false
+        }
+    }
+
+    private func installEdgeHairline() -> EdgeHairlineView {
+        let hairline = EdgeHairlineView(frame: .zero)
+        hairline.color = core.separatorColor()
+        view.addSubview(hairline, positioned: .above, relativeTo: terminalView)
+        edgeHairline = hairline
+        edgeHairlineObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.colorschemeDidChangeNotification, object: core, queue: .main
+        ) { [weak self, weak hairline] _ in
+            guard let self, let hairline else { return }
+            hairline.color = self.core.separatorColor()
+        }
+        return hairline
     }
 
     // MARK: - Transparent titlebar
 
-    /// Height of the titlebar the content extends under.
+    /// Height of the chrome band at the window top: the tab row under
+    /// titlebar tabs, else the band the frontend draws.
     private var titlebarBandHeight: CGFloat {
-        guard transparentTitlebar, let window = view.window else { return 0 }
-        if window is SidebarTitlebarWindow { return TitlebarBand.heightPt }
-        return max(0, window.frame.height - window.contentLayoutRect.height)
+        guard editorRunsUnderBand || drawsTitleBand, view.window != nil else { return 0 }
+        switch titlebarLayout.windowKind {
+        case .tabBar: return tabBarHeight
+        case .captionless: return TitlebarBand.heightPt
+        case .standard: preconditionFailure("a standard window has no band under the editor")
+        }
     }
 
     private func updateTitlebarLayout() {
-        guard transparentTitlebar else { return }
+        // A title band also lies over the editor surface: its height comes
+        // off the grid (titleBandInsetPt), whatever the tabline.
+        guard editorRunsUnderBand || drawsTitleBand else { return }
         let band = titlebarBandHeight
         sidebarView?.topInset = band
-        // Sidebar mode: the editor always starts at the window top, so
-        // toggling the sidebar never moves it vertically.
-        let top: CGFloat = sidebarView != nil ? 0 : band
-        if terminalTopConstraint?.constant != top { terminalTopConstraint?.constant = top }
         if dragBarHeightConstraint?.constant != band { dragBarHeightConstraint?.constant = band }
         if sidebarToggleCenterYConstraint?.constant != band / 2 { sidebarToggleCenterYConstraint?.constant = band / 2 }
         updateGridInsets()
     }
 
+    /// A title band is transparent over the editor surface, so the band shows
+    /// the very bg Metal draws (blur included); the grid starts below it.
+    private var titleBandInsetPt: CGFloat { drawsTitleBand ? TitlebarBand.heightPt : 0 }
+
     /// The editor spans the window under a translucent sidebar; its grid
     /// starts beside the sidebar's visible part, which follows the slide.
     private func updateGridInsets() {
+        // The edge's covered height depends on the grid top this sets.
+        defer { updateTitlebarEdge() }
         // The "column" scrollbar's strip sits at the right edge of whatever
         // the chrome leaves, left of a right sidebar.
         let column = ZonvieConfig.shared.scrollbar.columnWidthPt
-        if tabBarView != nil, transparentTitlebar {
+        if tabBarView != nil, editorRunsUnderBand {
             // Titlebar tabs float over the editor surface; the grid starts below them.
             terminalView.gridInsetsPt = (0, column, tabBarHeight)
             return
         }
-        guard let sidebar = sidebarView else { return }
+        guard let sidebar = sidebarView else {
+            // Native titlebar tabs, a menu or no tabline: the grid starts at
+            // the editor top, under a captionless band.
+            terminalView.gridInsetsPt = (0, column, titleBandInsetPt)
+            return
+        }
+        guard editorRunsUnderBand else {
+            // The editor sits beside the sidebar (its constraints), not under
+            // it: only the column strip comes off the grid.
+            terminalView.scrollbarInsetRightPt = 0
+            terminalView.gridInsetsPt = (0, column, titleBandInsetPt)
+            return
+        }
+        // Under a transparent titlebar the editor spans the window under the sidebar.
         // From the laid-out frame, hidden or not: the sidebar's room is held
         // from launch (as the side-by-side layout did), so the grid never
         // starts full width and the window snap never records that width.
@@ -415,27 +508,29 @@ final class ViewController: NSViewController {
             // so Neovim is resized once (before opening, after closing) and
             // opening and closing are mirror images.
             let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width + column, 0) : (covered, width - covered + column, 0)
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width + column, titleBandInsetPt) : (covered, width - covered + column, titleBandInsetPt)
         } else {
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered + column, 0) : (covered, column, 0)
+            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered + column, titleBandInsetPt) : (covered, column, titleBandInsetPt)
         }
     }
 
-    private var sidebarToggleInstalled = false
+    private var titlebarChromeInstalled = false
     /// Where the toggle sits: past the traffic lights for a left sidebar, or
     /// as far in from the right edge as the lights are from the left.
     private static let sidebarToggleLeftMarginPt: CGFloat = TitlebarBand.controlsWidthPt
     private static let sidebarToggleRightMarginPt: CGFloat = TitlebarBand.lightsLeftPt
     private static let sidebarToggleSizePt: CGFloat = 22
 
-    /// No NSToolbar: on Tahoe a toolbar window gets the larger corner radius
-    /// and the band grows. A plain button in the band keeps the window frame
-    /// as it is.
-    private func installSidebarToggleIfNeeded() {
-        guard transparentTitlebar, let sidebar = sidebarView, !sidebarToggleInstalled,
-              view.window != nil else { return }
-        sidebarToggleInstalled = true
+    /// The drag bar over a captionless window's band (titlebar tabs drag
+    /// the window themselves), and the sidebar toggle when there is a sidebar.
+    private func installTitlebarChromeIfNeeded() {
+        guard titlebarLayout.drawsBand, !titlebarChromeInstalled, view.window != nil else { return }
+        titlebarChromeInstalled = true
+        if titlebarLayout.captionless { installDragBar() }
+        if let sidebar = sidebarView { installSidebarToggle(sidebar) }
+    }
 
+    private func installDragBar() {
         let bar = TitlebarDragBar(frame: .zero)
         bar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(bar, positioned: .above, relativeTo: terminalView)
@@ -448,7 +543,12 @@ final class ViewController: NSViewController {
         ])
         dragBar = bar
         dragBarHeightConstraint = height
+    }
 
+    /// No NSToolbar: on Tahoe a toolbar window gets the larger corner radius
+    /// and the band grows. A plain button in the band keeps the window frame
+    /// as it is.
+    private func installSidebarToggle(_ sidebar: TabSidebarView) {
         let symbol = sidebar.isRightSide ? "sidebar.right" : "sidebar.left"
         let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: "Toggle Sidebar")!,
                               target: self, action: #selector(toggleSidebar(_:)))
@@ -479,6 +579,7 @@ final class ViewController: NSViewController {
         window.contentMinSize = minSize
         // Visible for the whole slide; hidden once it has fully closed.
         if !sidebarCollapsed { sidebar.isHidden = !tablineShown }
+        updateTitlebarRevealPin()
         let collapsing = sidebarCollapsed
         sidebarSliding = true
         updateGridInsets()
@@ -537,6 +638,7 @@ final class ViewController: NSViewController {
         tabBarView?.isHidden = false
         sidebarView?.isHidden = sidebarCollapsed
         tablineShown = true
+        updateTitlebarRevealPin()
         updateGridInsets()
         tabBarView?.updateTabs(tabs, currentTab: currentTab)
         sidebarView?.updateTabs(tabs, currentTab: currentTab)
@@ -546,15 +648,26 @@ final class ViewController: NSViewController {
         tabBarView?.isHidden = true
         sidebarView?.isHidden = true
         tablineShown = false
+        updateTitlebarRevealPin()
         updateGridInsets()
+    }
+
+    /// An open left sidebar sits under the traffic lights, so they and the
+    /// toggle stay shown; otherwise both show on hover.
+    private func updateTitlebarRevealPin() {
+        guard let sidebar = sidebarView else { return }
+        titlebarReveal?.pinned = !sidebar.isRightSide && tablineShown && !sidebarCollapsed
     }
 
     // MARK: - Tab Bar (titlebar mode)
 
     private func setupTabBar() {
+        // The grid starts below the tabs: by the view's top constraint, or by
+        // its inset when the surface runs under them (updateGridInsets).
+        precondition(titlebarLayout.editorBelowBand, "titlebar tabs without editorBelowBand")
         let tabBar = TabBarView(frame: NSRect(x: 0, y: 0, width: view.bounds.width, height: tabBarHeight))
         tabBar.translatesAutoresizingMaskIntoConstraints = false
-        tabBar.transparentBackground = transparentTitlebar
+        tabBar.transparentBackground = editorRunsUnderBand
         view.addSubview(tabBar)
 
         NSLayoutConstraint.activate([
@@ -616,8 +729,14 @@ final class ViewController: NSViewController {
 
         self.sidebarView = sidebar
 
+        // A self-drawn band lies clear over the top of the editor's side (its
+        // height comes off the grid, titleBandInsetPt); the sidebar still
+        // reaches the window top, its list below the same band height.
+        if drawsTitleBand {
+            installTitleBand(beside: sidebar)
+            sidebar.topInset = TitlebarBand.heightPt
+        }
         let topConstraint = terminalView.topAnchor.constraint(equalTo: view.topAnchor)
-        terminalTopConstraint = topConstraint
         // Collapsing slides the sidebar off its window edge at full width.
         let edgeConstraint = isRight
             ? sidebar.trailingAnchor.constraint(equalTo: view.trailingAnchor)
@@ -632,7 +751,7 @@ final class ViewController: NSViewController {
                 sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
 
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                terminalView.trailingAnchor.constraint(equalTo: transparentTitlebar ? view.trailingAnchor : sidebar.leadingAnchor),
+                terminalView.trailingAnchor.constraint(equalTo: editorRunsUnderBand ? view.trailingAnchor : sidebar.leadingAnchor),
                 topConstraint,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
@@ -643,12 +762,42 @@ final class ViewController: NSViewController {
                 sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
                 sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
 
-                terminalView.leadingAnchor.constraint(equalTo: transparentTitlebar ? view.leadingAnchor : sidebar.trailingAnchor),
+                terminalView.leadingAnchor.constraint(equalTo: editorRunsUnderBand ? view.leadingAnchor : sidebar.trailingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
                 topConstraint,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
+    }
+
+    /// The band spans the editor's side, following the sidebar's slide; a
+    /// closed sidebar, or none, leaves it the full width, under the lights
+    /// (and toggle).
+    private func installTitleBand(beside sidebar: TabSidebarView?) {
+        let reservePt = sidebar == nil
+            ? TitlebarBand.controlsWidthPt
+            : Self.sidebarToggleLeftMarginPt + Self.sidebarToggleSizePt + 8
+        let band = TitleBandView(leadingReservePt: reservePt)
+        band.translatesAutoresizingMaskIntoConstraints = false
+        band.setTitleColor(.labelColor)
+        view.addSubview(band)
+        var leading = view.leadingAnchor
+        var trailing = view.trailingAnchor
+        if let sidebar {
+            if sidebar.isRightSide { trailing = sidebar.leadingAnchor } else { leading = sidebar.trailingAnchor }
+        }
+        NSLayoutConstraint.activate([
+            band.leadingAnchor.constraint(equalTo: leading),
+            band.trailingAnchor.constraint(equalTo: trailing),
+            band.topAnchor.constraint(equalTo: view.topAnchor),
+            band.heightAnchor.constraint(equalToConstant: TitlebarBand.heightPt),
+        ])
+        titleBand = band
+    }
+
+    private static func rgbColor(_ rgb: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
     }
 
     // MARK: - Public Tab Bar Control
@@ -709,4 +858,22 @@ final class ViewController: NSViewController {
         // opens its only window externally in one go.
         core.externalizeTab(index: index)
     }
+}
+
+/// One-pixel line along the titlebar band's bottom; clicks pass through to
+/// the editor and drag bar under it.
+final class EdgeHairlineView: NSView {
+    var color: NSColor = .separatorColor {
+        didSet { layer?.backgroundColor = color.cgColor }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = color.cgColor
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

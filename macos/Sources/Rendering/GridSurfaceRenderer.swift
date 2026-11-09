@@ -2422,6 +2422,19 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Height of the window chrome over the grid's top edge, in drawable px:
+    /// window separators fade in across it. Main thread only, like draw.
+    var separatorFadePx: Float = 0 {
+        didSet {
+            // The fade is baked into backTex rows; redraw them all.
+            if separatorFadePx != oldValue { markAllRowsDirty() }
+        }
+    }
+    /// Cut separators off at `separatorFadePx` instead of fading them in.
+    var separatorHardEdge = false {
+        didSet { if separatorHardEdge != oldValue { markAllRowsDirty() } }
+    }
+
     var gridInsetsPx: (left: CGFloat, right: CGFloat, top: CGFloat) {
         lock.lock()
         defer { lock.unlock() }
@@ -4410,6 +4423,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             backgroundAlpha: f.backgroundAlpha,
             fixedFloatBands: f.fixedFloatBands,
             fixedFloatIntervals: f.fixedFloatIntervals,
+            separatorFadePx: separatorFadePx,
+            separatorHardEdge: separatorHardEdge,
             bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: f.scrollOffsets) }
         )
 

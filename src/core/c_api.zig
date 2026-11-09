@@ -62,6 +62,8 @@ pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, 
 // geometrically rather than rasterized. Tells the frontend not to treat them
 // as background, which would fade them under a translucent/blurred window.
 pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
+// Box-drawing glyph on the default grid: window separators under multigrid.
+pub const DECO_SEPARATOR: u32 = 1 << 12;
 
 /// One grid placed on one surface. Mirrors `zonvie_layer` in
 /// include/zonvie_core.h.
@@ -3180,6 +3182,8 @@ pub const zonvie_config_values = extern struct {
     window_titlebar_style: u8 = @intFromEnum(cfg_defaults.window.titlebar_style),
     // scrollbar: 0 = overlay, 1 = column
     scrollbar_layout: u8 = @intFromEnum(cfg_defaults.scrollbar.layout),
+    // window: 0 = fade, 1 = border, 2 = none
+    window_titlebar_edge: u8 = @intFromEnum(cfg_defaults.window.titlebar_edge),
 };
 
 const ConfigHandle = struct {
@@ -3302,6 +3306,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .scroll_large_jump = @intFromEnum(cfg.scroll.large_jump_behavior),
         .window_titlebar_style = @intFromEnum(cfg.window.titlebar_style),
         .scrollbar_layout = @intFromEnum(cfg.scrollbar.layout),
+        .window_titlebar_edge = @intFromEnum(cfg.window.titlebar_edge),
     };
 }
 

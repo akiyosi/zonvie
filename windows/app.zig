@@ -14,6 +14,7 @@ pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 const external_windows = @import("ui/external_windows.zig");
 const sidebar_caption = @import("ui/sidebar_caption.zig");
+const caption_reveal = @import("ui/caption_reveal.zig");
 const scroll_ease = core.scroll_ease;
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
@@ -2697,6 +2698,9 @@ pub const SurfacePaintState = struct {
     cursor_vb_bytes: usize = 0,
     scrollbar_vb: ?*c.ID3D11Buffer = null,
     scrollbar_vb_bytes: usize = 0,
+    // A captionless external window's window buttons and drag bar.
+    caption_vb: ?*c.ID3D11Buffer = null,
+    caption_vb_bytes: usize = 0,
     // Per-paint lists, reused so a paint does not allocate.
     dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
     rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
@@ -2788,6 +2792,9 @@ pub const SurfacePaintState = struct {
         if (self.scrollbar_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
         self.scrollbar_vb = null;
         self.scrollbar_vb_bytes = 0;
+        if (self.caption_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        self.caption_vb = null;
+        self.caption_vb_bytes = 0;
     }
 };
 
@@ -2895,6 +2902,11 @@ pub const WindowSurface = struct {
             self.paint.scrollbar_vb_bytes = 0;
             return .{ .buffer = vb, .row_bytes = 0 };
         }
+        if (self.paint.caption_vb) |vb| {
+            self.paint.caption_vb = null;
+            self.paint.caption_vb_bytes = 0;
+            return .{ .buffer = vb, .row_bytes = 0 };
+        }
         return null;
     }
 };
@@ -2939,6 +2951,9 @@ pub const ExternalWindow = struct {
 
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // `titlebar_style = "transparent"` on a normal window: its self-drawn
+    // caption (ui/caption_reveal.zig).
+    caption: caption_reveal.ExternalCaption = .{},
     // The left press landed on the copy button; only then does its release
     // copy (a press on the message text slid onto the button did not).
     copy_button_pressed: bool = false,
@@ -6237,6 +6252,8 @@ pub const App = struct {
     // 0xFFFFFFFF = not set (fall back to colorscheme_bg).
     cached_msg_area_bg: u32 = 0xFFFFFFFF,
     cached_pmenu_bg: u32 = 0xFFFFFFFF,
+    // WinSeparator fg for the titlebar hairline; 0xFFFFFFFF = not set.
+    cached_separator_fg: u32 = 0xFFFFFFFF,
 
     // ext_cmdline enabled flag (set from --extcmdline command line arg)
     ext_cmdline_enabled: bool = false,
@@ -6261,8 +6278,10 @@ pub const App = struct {
     sidebar_sliding: bool = false,
     sidebar_slide_start_ms: u64 = 0,
     sidebar_slide_now_ms: u64 = 0,
-    drag_bar_revealed: bool = false,
-    drag_bar_timer_armed: bool = false,
+    drag_bar: caption_reveal.DragBar = .{},
+    // `titlebar_style = "transparent"` (ui/caption_reveal.zig): the pointer is
+    // in the main window's caption band, so its window buttons are drawn.
+    caption_buttons_revealed: bool = false,
 
     // ext_popupmenu: Pmenu bg color (0x00RRGGBB) from on_popupmenu_show callback
     popupmenu_bg_rgb: u32 = 0xFFFFFFFF,
@@ -7130,12 +7149,9 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
     const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
-    // The DWM custom titlebar is inside the client area: the tab bar's rows
-    // are not Neovim's.
-    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar)
-        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
-    else
-        0;
+    // The DWM custom titlebar is inside the client area: the tab bar's or the
+    // title band's rows are not Neovim's.
+    const tabbar_height: u32 = @intCast(sidebar_caption.editorTopPx(app));
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
 
     return .{ .w = w, .h = h };
@@ -7805,6 +7821,9 @@ test {
     _ = @import("ui/scrollbar.zig");
     // The tab drag threshold rule shared by the titlebar and the sidebar.
     _ = @import("ui/tabbar.zig");
+    // Caption band rules: hover reveal, drag bar, caption colours, slots.
+    _ = @import("ui/caption_reveal.zig");
+    _ = @import("ui/sidebar_caption.zig");
     // DirectWrite shaping with [font] family features (skips without the font).
     _ = @import("renderer/dwrite_d2d_renderer.zig");
 }

@@ -152,6 +152,8 @@ let surfaceFallbackBackingScale: CGFloat = 2.0
 struct DrawableSize {
     var width: Float
     var height: Float
+    var separatorFadePx: Float = 0
+    var separatorHardEdge: Float = 0
 }
 
 final class SurfaceRowBufferState {
@@ -3839,9 +3841,12 @@ func bindSurfaceFragmentState(
     viewportMetrics: SurfaceViewportMetrics,
     backgroundAlpha: Float,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand] = [],
-    fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval] = []
+    fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval] = [],
+    separatorFadePx: Float = 0,
+    separatorHardEdge: Bool = false
 ) {
-    var size = DrawableSize(width: viewportMetrics.fragmentWidth, height: viewportMetrics.fragmentHeight)
+    var size = DrawableSize(width: viewportMetrics.fragmentWidth, height: viewportMetrics.fragmentHeight,
+                            separatorFadePx: separatorFadePx, separatorHardEdge: separatorHardEdge ? 1 : 0)
     encoder.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
 
     var alpha = backgroundAlpha
@@ -4296,6 +4301,8 @@ func beginSurfaceRowPass(
     backgroundAlpha: Float,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand],
     fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval],
+    separatorFadePx: Float = 0,
+    separatorHardEdge: Bool = false,
     bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
 ) {
     viewportMetrics.applyViewport(to: enc)
@@ -4310,7 +4317,9 @@ func beginSurfaceRowPass(
         viewportMetrics: viewportMetrics,
         backgroundAlpha: backgroundAlpha,
         fixedFloatBands: fixedFloatBands,
-        fixedFloatIntervals: fixedFloatIntervals
+        fixedFloatIntervals: fixedFloatIntervals,
+        separatorFadePx: separatorFadePx,
+        separatorHardEdge: separatorHardEdge
     )
     var zeroTranslation: Float = 0
     enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)

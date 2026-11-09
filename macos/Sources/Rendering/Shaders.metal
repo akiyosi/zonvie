@@ -17,6 +17,9 @@ using namespace metal;
 // they belong in the glyph pass at full alpha like any other glyph, not in
 // the background pass where backgroundAlpha would fade them.
 #define DECO_SOLID_GLYPH   (1u << 11)
+// Box-drawing glyph on the default grid (window separators): fades in over
+// DrawableSize.separatorFadePx from the surface top.
+#define DECO_SEPARATOR     (1u << 12)
 
 // Mask for visual decoration flags (excludes transport-only flags like SCROLLABLE)
 #define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE | DECO_SOLID_GLYPH)
@@ -74,7 +77,24 @@ struct LayerTransform {
 struct DrawableSize {
     float width;
     float height;
+    // Height of window chrome over the grid top; 0 leaves separators alone.
+    float separatorFadePx;
+    // 1: hide separators above separatorFadePx outright (titlebar_edge
+    // "border", where a hairline marks the edge); 0: fade them in.
+    float separatorHardEdge;
 };
+
+// Alpha factor for a DECO_SEPARATOR glyph: 0 at the surface top, 1 below the
+// chrome, so a separator reaching under the titlebar does not start abruptly.
+static inline float separatorFade(VSOut in, constant DrawableSize& drawableSize) {
+    if ((in.deco_flags & DECO_SEPARATOR) == 0u || drawableSize.separatorFadePx <= 0.0) {
+        return 1.0;
+    }
+    if (drawableSize.separatorHardEdge > 0.5) {
+        return step(drawableSize.separatorFadePx, in.position.y);
+    }
+    return smoothstep(0.0, drawableSize.separatorFadePx, in.position.y);
+}
 
 vertex VSOut vs_main(VertexIn in [[stage_in]],
                      constant ScrollOffset* scrollOffsets [[buffer(1)]],
@@ -396,7 +416,7 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     float cov = tex.sample(samp, uv).r;
 
     // Multiply alpha by coverage (text keeps full alpha)
-    return float4(in.color.rgb, in.color.a * cov);
+    return float4(in.color.rgb, in.color.a * cov * separatorFade(in, drawableSize));
 }
 
 // ============================================================================
@@ -546,7 +566,7 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
 
     // Grayscale glyph: coverage in .r
     float cov = tex.sample(samp, uv).r;
-    return float4(in.color.rgb, in.color.a * cov);
+    return float4(in.color.rgb, in.color.a * cov * separatorFade(in, drawableSize));
 }
 
 // ============================================================================
@@ -664,7 +684,7 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         src = float4(saturate(emoji.rgb / max(emoji.a, 1e-4)), emoji.a);
     } else {
         float cov = tex.sample(samp, uv).r;
-        src = float4(in.color.rgb, in.color.a * cov);
+        src = float4(in.color.rgb, in.color.a * cov * separatorFade(in, drawableSize));
     }
     float a = src.a;
     return float4(mix(current.rgb, src.rgb, a), a + current.a * (1.0 - a));

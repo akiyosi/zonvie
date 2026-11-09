@@ -1,28 +1,125 @@
-//! Captionless sidebar window: `[window] titlebar_style = "transparent"` with
-//! `[tabline] style = "sidebar"`. The native caption is gone and the sidebar
-//! reaches the window top; its top band drags the window. The window buttons
-//! float over the top-right corner and a sidebar toggle over the sidebar's
+//! Captionless main window: `[window] titlebar_style = "transparent"` with
+//! any tabline but the titlebar one (which draws its own caption). The
+//! native caption is gone and the editor reaches the window top. The window
+//! buttons float over the top-right corner while the pointer is in the band
+//! (caption_reveal.zig). Hovering the top edge of the editor for a while
+//! reveals a bar that drags the window.
+//! With `[tabline] style = "sidebar"` the sidebar also reaches the top; its
+//! top band drags the window, and a sidebar toggle sits over the sidebar's
 //! corner: top-left, or left of the window buttons for a right sidebar.
-//! The toggle slides the sidebar closed and open. Hovering the top edge of
-//! the editor for a while reveals a bar that drags the window.
+//! The toggle slides the sidebar closed and open.
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const Config = app_mod.config_mod.Config;
 const c = app_mod.c;
 const TablineState = app_mod.TablineState;
 const tabline_mod = @import("tabbar.zig");
+const caption_reveal = @import("caption_reveal.zig");
 const input = @import("../input.zig");
 
 const SLIDE_MS: u64 = 400;
 const SLIDE_TICK_MS: c.UINT = 16;
-const DRAG_BAR_REVEAL_MS: c.UINT = 2000;
 /// The toggle's number among the caption buttons; 0-2 are minimize, maximize
 /// and close, as `TablineState.hovered_window_btn` numbers them.
 const TOGGLE_BTN: u8 = 3;
 
+/// The main window's chrome for its titlebar style and tabline placement.
+pub fn layout(app: *const App) Config.TitlebarLayout {
+    const tabline: Config.TablinePlacement = if (!app.ext_tabline_enabled) .other else switch (app.tabline_style) {
+        .titlebar => .titlebar,
+        .sidebar => .sidebar,
+    };
+    return .{ .style = app.config.window.titlebar_style, .tabline = tabline };
+}
+
+/// No native caption and no titlebar tabline drawing one; the editor runs
+/// under the band.
+pub fn captionless(app: *const App) bool {
+    return layout(app).captionless();
+}
+
+/// The band is drawn over the editor's side with the title, the editor
+/// starts below it, and the sidebar still reaches the window top.
+pub fn titleBand(app: *const App) bool {
+    return layout(app).titleBand();
+}
+
+/// The main window draws this module's band overlay instead of a caption.
+pub fn drawsBand(app: *const App) bool {
+    return layout(app).drawsBand();
+}
+
+/// Where the main window's editor starts: below titlebar tabs or the title
+/// band, else at the client top.
+pub fn editorTopPx(app: *const App) c_int {
+    return if (layout(app).editorBelowBand()) bandPx(app) else 0;
+}
+
+/// Whether the band's buttons follow the pointer. Off while an open right
+/// sidebar sits under them: it pins them shown.
+pub fn captionButtonsHoverGated(app: *const App) bool {
+    const pinned = enabled(app) and app.sidebar_position_right and coveredPx(app) > 0;
+    return captionless(app) and !pinned;
+}
+
+/// Whether the main window's buttons (and a captionless sidebar's toggle)
+/// are drawn: under hover reveal only while the pointer is in the band.
+pub fn captionButtonsShown(app: *const App) bool {
+    return caption_reveal.buttonsShown(captionButtonsHoverGated(app), app.caption_buttons_revealed, app.tabline_state.pressed_window_btn != null);
+}
+
+pub const Columns = struct { lo: c_int, hi: c_int };
+
+/// Columns of a `width` px band overlay where its bar colour is see-through:
+/// all of a captionless band (the editor runs under it), only the sidebar's
+/// part of the title band (the sidebar is drawn under it; over the editor the
+/// band is chrome itself).
+pub fn seeThroughColumnsPx(app: *const App, width: c_int) Columns {
+    // coveredPx reports the full width without a sidebar; a title band
+    // without one has nothing under it to show.
+    const covered = if (enabled(app)) coveredPx(app) else 0;
+    return seeThroughColumns(titleBand(app), app.sidebar_position_right, covered, width);
+}
+
+/// seeThroughColumnsPx's rule. `covered_px` is clamped to the band, so the
+/// range always lies within [0, width].
+fn seeThroughColumns(title_band: bool, sidebar_right: bool, covered_px: c_int, width: c_int) Columns {
+    std.debug.assert(width >= 0);
+    if (!title_band) return .{ .lo = 0, .hi = width };
+    const covered = std.math.clamp(covered_px, 0, width);
+    return if (sidebar_right) .{ .lo = width - covered, .hi = width } else .{ .lo = 0, .hi = covered };
+}
+
+test "seeThroughColumns: the whole band, or only the sidebar's side of a title band" {
+    try std.testing.expectEqual(Columns{ .lo = 0, .hi = 800 }, seeThroughColumns(false, false, 200, 800));
+    try std.testing.expectEqual(Columns{ .lo = 0, .hi = 200 }, seeThroughColumns(true, false, 200, 800));
+    try std.testing.expectEqual(Columns{ .lo = 600, .hi = 800 }, seeThroughColumns(true, true, 200, 800));
+    try std.testing.expectEqual(Columns{ .lo = 0, .hi = 0 }, seeThroughColumns(true, false, 0, 800));
+    try std.testing.expectEqual(Columns{ .lo = 0, .hi = 800 }, seeThroughColumns(true, true, 900, 800));
+}
+
+/// A band with the sidebar: the toggle, the slide and the sidebar's top band.
 pub fn enabled(app: *const App) bool {
-    return app.ext_tabline_enabled and app.tabline_style == .sidebar and
-        app.config.window.titlebar_style == .transparent;
+    return drawsBand(app) and app.ext_tabline_enabled and app.tabline_style == .sidebar;
+}
+
+pub const SeparatorEdge = struct { fade_px: f32 = 0, hard: bool = false };
+
+/// How window separators meet the band (`[window] titlebar_edge`), in the
+/// root grid's own pixels: they fade in across the band, or, with a border,
+/// are hidden where the band lies over the grid.
+pub fn separatorEdge(app: *const App) SeparatorEdge {
+    if (!drawsBand(app)) return .{};
+    const band: f32 = @floatFromInt(bandPx(app));
+    return switch (app.config.window.titlebar_edge) {
+        .fade => .{ .fade_px = band },
+        .none => .{},
+        // A captionless window shows no band, so there is no edge to border:
+        // its separators fade under the hidden caption instead. The title
+        // band is chrome above the editor, which starts below it.
+        .border => if (captionless(app)) .{ .fade_px = band } else .{ .hard = true },
+    };
 }
 
 /// Height of the band the caption used to occupy.
@@ -72,17 +169,18 @@ fn buttonWidthPx(app: *const App) c_int {
 }
 
 /// The caption button under client (x, y), or null.
-pub fn buttonAt(app: *const App, client_w: c_int, x: c_int, y: c_int) ?u8 {
+/// `with_toggle`: the sidebar toggle has a slot (a captionless sidebar).
+pub fn buttonAt(app: *const App, with_toggle: bool, client_w: c_int, x: c_int, y: c_int) ?u8 {
     if (y < 0 or y >= bandPx(app)) return null;
     const w = buttonWidthPx(app);
-    if (!app.sidebar_position_right and x >= 0 and x < w) return TOGGLE_BTN;
+    if (with_toggle and !app.sidebar_position_right and x >= 0 and x < w) return TOGGLE_BTN;
     const from_right = client_w - x;
     if (from_right <= 0) return null;
     // Slots count from the right: close, maximize, minimize, then the toggle
     // for a right sidebar.
     const slot = @divTrunc(from_right - 1, w);
     if (slot < 3) return 2 - @as(u8, @intCast(slot));
-    return if (app.sidebar_position_right and slot == 3) TOGGLE_BTN else null;
+    return if (with_toggle and app.sidebar_position_right and slot == 3) TOGGLE_BTN else null;
 }
 
 /// Left edge of the toggle's slot.
@@ -96,9 +194,11 @@ fn toggleLeftPx(app: *const App, width: c_int) c_int {
 pub fn bandHitTest(app: *App, hwnd: c.HWND, x: c_int, y: c_int) c.LRESULT {
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    if (buttonAt(app, client.right, x, y) != null) return c.HTCLIENT;
-    if (coveredPx(app) > 0 and tabline_mod.pointInSidebar(app, hwnd, x)) return c.HTCAPTION;
-    if (app.drag_bar_revealed) return c.HTCAPTION;
+    if (buttonAt(app, enabled(app), client.right, x, y) != null) return c.HTCLIENT;
+    // The title band is chrome across the window: all of it moves the window.
+    if (titleBand(app)) return c.HTCAPTION;
+    if (enabled(app) and coveredPx(app) > 0 and tabline_mod.pointInSidebar(app, hwnd, x)) return c.HTCAPTION;
+    if (app.drag_bar.revealed) return c.HTCAPTION;
     return c.HTCLIENT;
 }
 
@@ -116,17 +216,65 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
     var all = c.RECT{ .left = 0, .top = 0, .right = width, .bottom = band };
     _ = c.FillRect(hdc, &all, bg_brush);
 
-    if (app.drag_bar_revealed) {
+    const with_toggle = enabled(app);
+    if (app.drag_bar.revealed) {
         const bar_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
         defer _ = c.DeleteObject(bar_brush);
         // Over the editor only: the sidebar's own top already drags the window.
         const inset = gridInsetsPx(app);
-        const bar_right = if (app.sidebar_position_right) @min(toggleLeftPx(app, width), width - inset.right) else group_left;
-        var bar = c.RECT{ .left = @max(btn_w, inset.left), .top = 0, .right = bar_right, .bottom = band };
+        const toggle_right = with_toggle and app.sidebar_position_right;
+        const toggle_left = with_toggle and !app.sidebar_position_right;
+        const bar_right = if (toggle_right) @min(toggleLeftPx(app, width), width - inset.right) else group_left;
+        var bar = c.RECT{ .left = if (toggle_left) @max(btn_w, inset.left) else inset.left, .top = 0, .right = bar_right, .bottom = band };
         _ = c.FillRect(hdc, &bar, bar_brush);
     }
 
-    // The sidebar toggle: a window outline with the sidebar's divider.
+    if (separatorEdge(app).hard) drawHairline(app, hdc, width, pal);
+    if (titleBand(app)) drawTitle(app, hdc, width);
+    if (with_toggle and captionButtonsShown(app)) drawToggle(app, hdc, width, pal);
+    tabline_mod.drawWindowButtons(app, hdc, width, pal);
+}
+
+/// `titlebar_edge = "border"`: a one-pixel line in WinSeparator's colour
+/// along the band's bottom, over the editor's columns.
+fn drawHairline(app: *App, hdc: c.HDC, width: c_int, pal: tabline_mod.TitlebarPalette) void {
+    const inset = gridInsetsPx(app);
+    const fg = app.cached_separator_fg;
+    var color: c.COLORREF = if (fg == 0xFFFFFFFF) pal.wbtn_icon else c.RGB(@as(u8, @intCast((fg >> 16) & 0xFF)), @as(u8, @intCast((fg >> 8) & 0xFF)), @as(u8, @intCast(fg & 0xFF)));
+    // The bar colour is the overlay's transparency key; the line must not vanish into it.
+    if (color == pal.bar_bg) color ^= 1;
+    const brush = c.CreateSolidBrush(color);
+    defer _ = c.DeleteObject(brush);
+    const band = bandPx(app);
+    var r = c.RECT{ .left = inset.left, .top = band - 1, .right = width - inset.right, .bottom = band };
+    _ = c.FillRect(hdc, &r, brush);
+}
+
+/// The title band's window title, centered over the editor's side in the
+/// editor's default fg. Reads `pending_title`, which the caller's app.mu
+/// hold keeps stable.
+fn drawTitle(app: *App, hdc: c.HDC, width: c_int) void {
+    const len = app.pending_title_len;
+    if (len == 0) return;
+    const inset = gridInsetsPx(app);
+    // Clear of the window buttons on the right and the toggle on the left.
+    const btn_w = buttonWidthPx(app);
+    var r = c.RECT{ .left = inset.left + btn_w, .top = 0, .right = width - inset.right - btn_w * 4, .bottom = bandPx(app) };
+    if (r.right <= r.left) return;
+    const font = tabline_mod.createTabFont(app, -12);
+    defer _ = c.DeleteObject(font);
+    const old_font = c.SelectObject(hdc, font);
+    defer _ = c.SelectObject(hdc, old_font);
+    _ = c.SetBkMode(hdc, c.TRANSPARENT);
+    const fg = app.colorscheme_fg;
+    _ = c.SetTextColor(hdc, if (fg == 0xFFFFFFFF) tabline_mod.currentTitlebarPalette(app).wbtn_icon else c.RGB(@as(u8, @intCast((fg >> 16) & 0xFF)), @as(u8, @intCast((fg >> 8) & 0xFF)), @as(u8, @intCast(fg & 0xFF))));
+    _ = c.DrawTextW(hdc, &app.pending_title, @intCast(len), &r, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS | c.DT_NOPREFIX);
+}
+
+/// The sidebar toggle: a window outline with the sidebar's divider.
+fn drawToggle(app: *App, hdc: c.HDC, width: c_int, pal: tabline_mod.TitlebarPalette) void {
+    const band = bandPx(app);
+    const btn_w = buttonWidthPx(app);
     if (app.tabline_state.hovered_window_btn == TOGGLE_BTN) {
         const hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
         defer _ = c.DeleteObject(hover_brush);
@@ -148,8 +296,6 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
     const div_x = if (app.sidebar_position_right) ix + icon_w - @divTrunc(icon_w, 3) else ix + @divTrunc(icon_w, 3);
     _ = c.MoveToEx(hdc, div_x, iy, null);
     _ = c.LineTo(hdc, div_x, iy + icon_h);
-
-    tabline_mod.drawWindowButtons(app, hdc, width, pal);
 }
 
 /// The overlay over the editor, drawn into back_tex after the rows so the
@@ -159,7 +305,7 @@ pub fn drawOverlay(g: *app_mod.d3d11.Renderer) !void {
     try g.drawTablineTexture();
 }
 
-fn repaint(hwnd: c.HWND, app: *App) void {
+pub fn repaint(hwnd: c.HWND, app: *App) void {
     // The overlay is drawn over retained rows with transparent pixels, which
     // cannot erase a hover or bar that went away: redraw everything under it.
     app_mod.requestMainFullPaint(app);
@@ -192,31 +338,36 @@ pub fn onTimer(hwnd: c.HWND, app: *App, id: usize) bool {
         return true;
     }
     if (id == app_mod.TIMER_DRAG_BAR_REVEAL) {
-        _ = c.KillTimer(hwnd, app_mod.TIMER_DRAG_BAR_REVEAL);
-        app.drag_bar_timer_armed = false;
-        const p = input.cursorClientPos(hwnd);
-        if (dragBarAllowed(app) and p.y >= 0 and p.y < bandPx(app)) {
-            app.drag_bar_revealed = true;
-            repaint(hwnd, app);
-        }
+        const in_band = caption_reveal.pointerInBand(hwnd, bandPx(app));
+        stepDragBar(hwnd, app, app.drag_bar.onTimer(in_band, dragBarAllowed(app), c.GetTickCount64()));
         return true;
     }
     return false;
 }
 
+/// An editor selection or scrollbar-knob drag on the main window owns the
+/// pointer: the chrome neither consumes its moves nor reveals under it.
+pub fn editorDrag(app: *const App) bool {
+    return app.surf.scrollbar.dragging or editorPressHeld(app);
+}
+
+/// A press that reached an editor grid is held. The claim is app-wide, so it
+/// covers the external windows' grids too.
+pub fn editorPressHeld(app: *const App) bool {
+    return app.press_claim.owner != 0 and app.mouse_press_grid_id != 0;
+}
+
+/// The one gate for both DragBar inputs: a pointer move and the timer fire.
 fn dragBarAllowed(app: *const App) bool {
-    return enabled(app) and !sliding(app);
+    return captionless(app) and !sliding(app) and !editorDrag(app);
+}
+
+fn stepDragBar(hwnd: c.HWND, app: *App, step: caption_reveal.DragBar.Step) void {
+    if (caption_reveal.applyDragBar(hwnd, &app.drag_bar, step)) repaint(hwnd, app);
 }
 
 fn concealDragBar(hwnd: c.HWND, app: *App) void {
-    if (app.drag_bar_timer_armed) {
-        _ = c.KillTimer(hwnd, app_mod.TIMER_DRAG_BAR_REVEAL);
-        app.drag_bar_timer_armed = false;
-    }
-    if (app.drag_bar_revealed) {
-        app.drag_bar_revealed = false;
-        repaint(hwnd, app);
-    }
+    stepDragBar(hwnd, app, app.drag_bar.onPointer(false, false, false, 0));
 }
 
 fn setHover(hwnd: c.HWND, app: *App, btn: ?u8) void {
@@ -228,10 +379,10 @@ fn setHover(hwnd: c.HWND, app: *App, btn: ?u8) void {
 /// WM_MOUSEMOVE. True when the pointer is on a caption button (the move is
 /// the button's, not the editor's).
 pub fn onMouseMove(hwnd: c.HWND, app: *App, x: c_int, y: c_int) bool {
-    if (!enabled(app)) return false;
+    if (!drawsBand(app)) return false;
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    const btn = buttonAt(app, client.right, x, y);
+    const btn = buttonAt(app, enabled(app), client.right, x, y);
     if (app.tabline_state.pressed_window_btn) |pressed| {
         if (btn != pressed) {
             app.tabline_state.pressed_window_btn = null;
@@ -241,22 +392,18 @@ pub fn onMouseMove(hwnd: c.HWND, app: *App, x: c_int, y: c_int) bool {
     setHover(hwnd, app, btn);
     if (btn != null) input.trackMouseLeave(hwnd);
 
-    if (y >= 0 and y < bandPx(app) and btn == null and dragBarAllowed(app)) {
-        if (!app.drag_bar_revealed and !app.drag_bar_timer_armed) {
-            _ = c.SetTimer(hwnd, app_mod.TIMER_DRAG_BAR_REVEAL, DRAG_BAR_REVEAL_MS, null);
-            app.drag_bar_timer_armed = true;
-            input.trackMouseLeave(hwnd);
-        }
-    } else if (btn == null) {
-        concealDragBar(hwnd, app);
-    }
+    // Same coordinates as `btn`: a captured move outside the client is off the band.
+    const in_band = caption_reveal.inBand(bandPx(app), client.right, x, y);
+    const step = app.drag_bar.onPointer(in_band, btn != null, dragBarAllowed(app), c.GetTickCount64());
+    if (step.timer == .set) input.trackMouseLeave(hwnd);
+    stepDragBar(hwnd, app, step);
     return btn != null;
 }
 
 /// WM_NCMOUSEMOVE: a revealed bar is caption, so leaving the window from it
 /// sends WM_NCMOUSELEAVE only when asked for.
 pub fn onNcMouseMove(hwnd: c.HWND, app: *App) void {
-    if (!enabled(app) or !app.drag_bar_revealed) return;
+    if (!captionless(app) or !app.drag_bar.revealed) return;
     var tme: c.TRACKMOUSEEVENT = .{
         .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
         .dwFlags = c.TME_LEAVE | c.TME_NONCLIENT,
@@ -270,23 +417,17 @@ pub fn onNcMouseMove(hwnd: c.HWND, app: *App) void {
 /// revealed (caption) bar also "leaves", so the bar stays while the pointer
 /// is still in the band.
 pub fn onLeave(hwnd: c.HWND, app: *App) void {
-    if (!enabled(app)) return;
+    if (!drawsBand(app)) return;
     setHover(hwnd, app, null);
-    var pt: c.POINT = undefined;
-    _ = c.GetCursorPos(&pt);
-    var wr: c.RECT = undefined;
-    _ = c.GetWindowRect(hwnd, &wr);
-    const inside = pt.x >= wr.left and pt.x < wr.right and pt.y >= wr.top and pt.y < wr.bottom;
-    _ = c.ScreenToClient(hwnd, &pt);
-    if (!inside or pt.y < 0 or pt.y >= bandPx(app)) concealDragBar(hwnd, app);
+    if (!caption_reveal.pointerInBand(hwnd, bandPx(app))) concealDragBar(hwnd, app);
 }
 
 /// A press on a caption button. True when it was one.
 pub fn onMouseDown(hwnd: c.HWND, app: *App, msg: c.UINT, x: c_int, y: c_int) bool {
-    if (!enabled(app)) return false;
+    if (!drawsBand(app)) return false;
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    const btn = buttonAt(app, client.right, x, y) orelse return false;
+    const btn = buttonAt(app, enabled(app), client.right, x, y) orelse return false;
     if (msg == c.WM_LBUTTONDOWN) {
         app.tabline_state.pressed_window_btn = btn;
         _ = c.SetCapture(hwnd);
@@ -296,13 +437,13 @@ pub fn onMouseDown(hwnd: c.HWND, app: *App, msg: c.UINT, x: c_int, y: c_int) boo
 
 /// The release of a pressed caption button. True when one was pressed.
 pub fn onMouseUp(hwnd: c.HWND, app: *App, x: c_int, y: c_int) bool {
-    if (!enabled(app)) return false;
+    if (!drawsBand(app)) return false;
     const pressed = app.tabline_state.pressed_window_btn orelse return false;
     app.tabline_state.pressed_window_btn = null;
     _ = c.ReleaseCapture();
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    if (buttonAt(app, client.right, x, y) != pressed) return true;
+    if (buttonAt(app, enabled(app), client.right, x, y) != pressed) return true;
     switch (pressed) {
         0 => _ = c.ShowWindow(hwnd, c.SW_MINIMIZE),
         1 => _ = c.ShowWindow(hwnd, if (c.IsZoomed(hwnd) != 0) c.SW_RESTORE else c.SW_MAXIMIZE),
@@ -316,24 +457,24 @@ test "buttonAt: window buttons from the right edge, toggle at the left" {
     var app: App = undefined;
     app.dpi_scale = 1.0;
     app.sidebar_position_right = false;
-    try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, 400, 399, 5));
-    try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, 400, 354, 5));
-    try std.testing.expectEqual(@as(?u8, 1), buttonAt(&app, 400, 353, 5));
-    try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, 400, 262, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 261, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 46, 5));
-    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 45, 5));
-    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 0, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 399, 40));
+    try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, true, 400, 399, 5));
+    try std.testing.expectEqual(@as(?u8, 2), buttonAt(&app, true, 400, 354, 5));
+    try std.testing.expectEqual(@as(?u8, 1), buttonAt(&app, true, 400, 353, 5));
+    try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, true, 400, 262, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, true, 400, 261, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, true, 400, 46, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, true, 400, 45, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, true, 400, 0, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, true, 400, 399, 40));
 }
 
 test "buttonAt: a right sidebar puts the toggle left of the window buttons" {
     var app: App = undefined;
     app.dpi_scale = 1.0;
     app.sidebar_position_right = true;
-    try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, 400, 262, 5));
-    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 261, 5));
-    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, 400, 216, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 215, 5));
-    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, 400, 0, 5));
+    try std.testing.expectEqual(@as(?u8, 0), buttonAt(&app, true, 400, 262, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, true, 400, 261, 5));
+    try std.testing.expectEqual(@as(?u8, TOGGLE_BTN), buttonAt(&app, true, 400, 216, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, true, 400, 215, 5));
+    try std.testing.expectEqual(@as(?u8, null), buttonAt(&app, true, 400, 0, 5));
 }

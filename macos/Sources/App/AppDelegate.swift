@@ -173,34 +173,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let tablineStyle = ZonvieConfig.shared.effectiveTablineStyle
         ZonvieCore.appLog("[AppDelegate] effectiveTablineStyle=\(String(describing: tablineStyle)) tabline.style=\(ZonvieConfig.shared.tabline.style)")
 
-        // Titlebar tabs draw their own titlebar; a transparent titlebar lets
-        // the content (sidebar or editor) extend under the traffic lights.
-        let transparentTitlebar = tablineStyle != .titlebar && ZonvieConfig.shared.window.transparentTitlebar
-        if tablineStyle == .titlebar || transparentTitlebar {
-            style.insert(.fullSizeContentView)
-        }
+        // Titlebar tabs draw their own titlebar; a captionless window or a
+        // title band lets the content extend under the traffic lights.
+        let layout = ZonvieConfig.shared.titlebarLayout
+        style = layout.styleMask(style)
 
         let win: NSWindow
-        if tablineStyle == .titlebar {
+        switch layout.windowKind {
+        case .tabBar:
             win = TabBarWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
-        } else if transparentTitlebar && tablineStyle == .sidebar {
-            win = SidebarTitlebarWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
-        } else {
+        case .captionless:
+            win = CaptionlessWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
+        case .standard:
             win = NSWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
         }
         win.title = "zonvie"
         win.isReleasedWhenClosed = false
+        layout.apply(to: win)
 
-        // Configure titlebar for Chrome-style tabs (titlebar mode only)
-        if tablineStyle == .titlebar {
-            win.titlebarAppearsTransparent = true
-            win.titleVisibility = .hidden
+        if layout.windowKind == .tabBar {
             win.isMovableByWindowBackground = false
             win.isMovable = false  // Completely disable window dragging - TabBarView handles it manually
-        }
-        if transparentTitlebar {
-            win.titlebarAppearsTransparent = true
-            win.titleVisibility = .hidden
         }
 
         // Make window transparent for blur effect (required for CGSSetWindowBackgroundBlurRadius)

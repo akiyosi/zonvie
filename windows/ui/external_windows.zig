@@ -11,6 +11,9 @@ const messages = @import("messages.zig");
 const dialogs = @import("dialogs.zig");
 const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
+const caption_reveal = @import("caption_reveal.zig");
+const sidebar_caption = @import("sidebar_caption.zig");
+const tabline_mod = @import("tabbar.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const callbacks = @import("../callbacks.zig");
 const core = @import("zonvie_core");
@@ -678,6 +681,7 @@ fn drawNormalExternalSurface(
     // Before the first row commit: background and chrome only.
     ext_win.surf.dropRowVBs(app);
     try g.drawEx(&.{}, &.{}, null, .{ .glow_enabled = glow.enabled, .glow_intensity = glow.intensity });
+    _ = try drawCaptionOverlay(g, app, ext_win, grid_id);
     _ = try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.surf.paint.scrollbar_vb, &ext_win.surf.paint.scrollbar_vb_bytes);
     // drawEx redraws/clears the complete retained back texture.
     return .{ .force_full_rows = true };
@@ -949,6 +953,8 @@ fn drawNormalExternalSurfaceRowMode(
     // Scrollbar overlay. Capture the clean, fully-composited strip after
     // bloom so restoring it on the next fade tick does not punch a no-glow
     // seam through the right edge.
+    // Before the scrollbar, whose underlay capture then holds the buttons.
+    present.addOpt(try drawCaptionOverlay(g, app, ext_win, grid_id));
     present.addOpt(try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.surf.paint.scrollbar_vb, &ext_win.surf.paint.scrollbar_vb_bytes));
 
     // The producers above can name rows past the surface -- a stale
@@ -1420,7 +1426,7 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     } else null;
     app.mu.unlock(core.clock.io());
     const hwnd = target_hwnd orelse return false;
-    const outer = outerSizePx(externalWindowStyles(is_special_window), client_w, client_h, window_mod.GetDpiForWindow(hwnd));
+    const outer = outerSizePx(externalWindowStyles(app, is_special_window), client_w, client_h, window_mod.GetDpiForWindow(hwnd));
     const window_w = outer.w;
     const window_h = outer.h;
 
@@ -1590,7 +1596,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    const styles = externalWindowStyles(is_special_window);
+    const styles = externalWindowStyles(app, is_special_window);
     const dwStyle = styles.style;
     const dwExStyle = styles.ex_style;
 
@@ -1725,6 +1731,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         // children (cmdline/popupmenu/msg_show/msg_history) have no caption
         // so we skip them.
         window_mod.applyOsTitlebarTheme(hwnd);
+        window_mod.applyCaptionColors(hwnd, app, caption_reveal.externalLayout(app));
     }
 
     if (hwnd == null) {
@@ -1965,6 +1972,12 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         ext_window_ptr.surf.drop_target = drop_target.register(app, hwnd, is_cmdline);
     }
 
+    // WM_NCCALCSIZE could not see the App during CreateWindowExW, so the
+    // caption is given to the client now; the outer size already assumed it.
+    if (styles.captionless) {
+        _ = c.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    }
+
     // Now call SetWindowPos outside the lock to avoid deadlock
     if (is_msg_history) restackMsgShowBelowHistory(app);
     if (deferred_setpos_cmdline) |sp| {
@@ -2104,35 +2117,53 @@ pub fn closePendingExternalWindowsOnUIThread(app: *App) void {
 /// tool window: an ownerless popup without WS_EX_TOOLWINDOW gets a taskbar
 /// button and an Alt-Tab entry, so typing `:` flashed one up. Always
 /// WS_EX_NOREDIRECTIONBITMAP: all rendering goes via DXGI + DirectComposition.
-fn externalWindowStyles(is_special_window: bool) WindowStyles {
+fn externalWindowStyles(app: *const App, is_special_window: bool) WindowStyles {
     const special_ex: c.DWORD = @intCast(c.WS_EX_TOPMOST | c.WS_EX_TOOLWINDOW);
     return .{
         .style = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW,
         .ex_style = (if (is_special_window) special_ex else @as(c.DWORD, 0)) |
             @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP)),
+        .captionless = !is_special_window and caption_reveal.externalLayout(app).captionless(),
     };
 }
 
-const WindowStyles = struct { style: c.DWORD, ex_style: c.DWORD };
+/// `captionless`: WM_NCCALCSIZE gives the caption to the client (see
+/// captionlessFrame), keeping the side and bottom frame.
+const WindowStyles = struct { style: c.DWORD, ex_style: c.DWORD, captionless: bool };
 pub const OuterSizePx = struct { w: c_int, h: c_int };
 
 /// The window size whose client area is `client_w` x `client_h` at `dpi`.
 /// Not AdjustWindowRectEx: it measures the frame at the system DPI, short for
-/// a captioned window on a monitor of another density.
+/// a captioned window on a monitor of another density. Captionless, the
+/// client starts at the window top, so only the bottom frame is added.
 fn outerSizePx(styles: WindowStyles, client_w: c_int, client_h: c_int, dpi: c.UINT) OuterSizePx {
     var r: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
     _ = AdjustWindowRectExForDpi(&r, styles.style, 0, styles.ex_style, dpi);
-    return .{ .w = r.right - r.left, .h = r.bottom - r.top };
+    return .{ .w = r.right - r.left, .h = if (styles.captionless) r.bottom else r.bottom - r.top };
 }
 
-/// outerSizePx with `hwnd`'s current styles and DPI. GetWindowLongW, not the
-/// Ptr variant: that sign-extends WS_POPUP's bit 31 and @bitCast would not fit.
-pub fn windowOuterSizePx(hwnd: c.HWND, client_w: c_int, client_h: c_int) OuterSizePx {
-    const styles: WindowStyles = .{
-        .style = @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE)),
+/// The styles `hwnd` has now. GetWindowLongW, not the Ptr variant: that
+/// sign-extends WS_POPUP's bit 31 and @bitCast would not fit.
+fn currentWindowStyles(app: *const App, hwnd: c.HWND) WindowStyles {
+    const style: c.DWORD = @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE));
+    return .{
+        .style = style,
         .ex_style = @bitCast(c.GetWindowLongW(hwnd, c.GWL_EXSTYLE)),
+        .captionless = captionlessFrame(app, style),
     };
-    return outerSizePx(styles, client_w, client_h, window_mod.GetDpiForWindow(hwnd));
+}
+
+/// outerSizePx with `hwnd`'s current styles and DPI.
+pub fn windowOuterSizePx(app: *const App, hwnd: c.HWND, client_w: c_int, client_h: c_int) OuterSizePx {
+    return outerSizePx(currentWindowStyles(app, hwnd), client_w, client_h, window_mod.GetDpiForWindow(hwnd));
+}
+
+/// A normal (captioned) external window under `titlebar_style =
+/// "transparent"`: no native caption, its own buttons on hover. Decided from
+/// the style alone so WM_NCCALCSIZE can answer before the window is mapped
+/// to its grid.
+fn captionlessFrame(app: *const App, style: c.DWORD) bool {
+    return caption_reveal.externalLayout(app).captionless() and (style & c.WS_CAPTION) == c.WS_CAPTION;
 }
 
 const DWMWA_CLOAK: c.DWORD = 13;
@@ -2357,6 +2388,230 @@ pub fn ensureExternalWindowClassRegistered() bool {
     return true;
 }
 
+// --- Captionless normal window (`titlebar_style = "transparent"`) ---
+// The grid reaches the window top. The window buttons are drawn over its
+// top-right corner while the pointer is in the band, and resting in the band
+// for a while reveals a bar that drags the window (as on the main window).
+
+fn captionlessGrid(app: *const App, grid_id: i64) bool {
+    return caption_reveal.externalLayout(app).captionless() and classifyExternalSurface(grid_id) == .normal;
+}
+
+const CaptionMetrics = struct { band_px: c_int, btn_w: c_int };
+
+fn captionMetrics(ext_win: *const app_mod.ExternalWindow) CaptionMetrics {
+    const s = ext_win.dpi_scale;
+    return .{
+        .band_px = @intFromFloat(@round(@as(f32, @floatFromInt(app_mod.TablineState.TAB_BAR_HEIGHT)) * s)),
+        .btn_w = @intFromFloat(@round(@as(f32, @floatFromInt(app_mod.TablineState.WINDOW_BTN_WIDTH)) * s)),
+    };
+}
+
+/// The caption's pixels change: the overlay is drawn over retained rows, so
+/// what it leaves behind is only erased by redrawing every row.
+fn repaintCaption(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow) void {
+    app.mu.lockUncancelable(core.clock.io());
+    ext_win.back_tex_valid = false;
+    app.mu.unlock(core.clock.io());
+    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+}
+
+/// WM_NCCALCSIZE: the caption becomes client area; the side and bottom
+/// frame stay native (they resize the window). Maximized, the window
+/// overhangs the monitor by its frame, so the top is inset by it.
+fn captionlessCalcSize(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) c.LRESULT {
+    const params: *c.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lParam)));
+    const top = params.rgrc[0].top;
+    const result = c.DefWindowProcW(hwnd, msg, wParam, lParam);
+    const frame_y = c.GetSystemMetrics(c.SM_CYFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
+    params.rgrc[0].top = if (c.IsZoomed(hwnd) != 0) top + frame_y else top;
+    return result;
+}
+
+/// WM_NCHITTEST: the native frame first; then the top edge resizes, the
+/// buttons are client (drawn and pressed here), a revealed drag bar is
+/// caption and the rest is the grid's.
+fn captionlessHitTest(hwnd: c.HWND, app: *App, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) c.LRESULT {
+    const native = c.DefWindowProcW(hwnd, msg, wParam, lParam);
+    if (native != c.HTCLIENT) return native;
+    const ext_win = (findExternalWindowByHwnd(app, hwnd) orelse return native).win;
+    const lp: usize = @bitCast(lParam);
+    var pt: c.POINT = .{
+        .x = @as(i16, @bitCast(@as(u16, @truncate(lp)))),
+        .y = @as(i16, @bitCast(@as(u16, @truncate(lp >> 16)))),
+    };
+    _ = c.ScreenToClient(hwnd, &pt);
+    const frame_y = c.GetSystemMetrics(c.SM_CYFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
+    if (c.IsZoomed(hwnd) == 0 and pt.y < frame_y) return c.HTTOP;
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    const m = captionMetrics(ext_win);
+    if (caption_reveal.buttonAt(m.btn_w, m.band_px, client.right, pt.x, pt.y) != null) return c.HTCLIENT;
+    if (ext_win.caption.drag_bar.revealed and caption_reveal.inBand(m.band_px, client.right, pt.x, pt.y)) return c.HTCAPTION;
+    return c.HTCLIENT;
+}
+
+/// Recompute reveal, hover and the drag-bar timer from the cursor, and
+/// repaint on a change. `source` is the mouse message's kind, null for a
+/// leave notice.
+fn updateCaptionPointer(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, source: ?caption_reveal.Source) void {
+    const m = captionMetrics(ext_win);
+    const cap = &ext_win.caption;
+    var changed = caption_reveal.update(hwnd, &cap.revealed, m.band_px, source);
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    const p = input.cursorClientPos(hwnd);
+    const btn = if (cap.revealed) caption_reveal.buttonAt(m.btn_w, m.band_px, client.right, p.x, p.y) else null;
+    if (btn != cap.hovered_btn) {
+        cap.hovered_btn = btn;
+        changed = true;
+    }
+    const step = cap.drag_bar.onPointer(cap.revealed, btn != null, dragBarAllowed(app, ext_win), c.GetTickCount64());
+    if (caption_reveal.applyDragBar(hwnd, &cap.drag_bar, step)) changed = true;
+    if (changed) repaintCaption(hwnd, app, ext_win);
+}
+
+/// TIMER_DRAG_BAR_REVEAL: the pointer rested in the band; reveal the bar if
+/// it is still there.
+fn onCaptionDragBarTimer(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow) void {
+    const cap = &ext_win.caption;
+    const in_band = caption_reveal.pointerInBand(hwnd, captionMetrics(ext_win).band_px);
+    const step = cap.drag_bar.onTimer(in_band, dragBarAllowed(app, ext_win), c.GetTickCount64());
+    if (caption_reveal.applyDragBar(hwnd, &cap.drag_bar, step)) repaintCaption(hwnd, app, ext_win);
+}
+
+/// The one gate for both DragBar inputs: an editor selection drag or this
+/// window's scrollbar-knob drag keeps the bar down.
+fn dragBarAllowed(app: *const App, ext_win: *const app_mod.ExternalWindow) bool {
+    return !sidebar_caption.editorPressHeld(app) and !ext_win.surf.scrollbar.dragging;
+}
+
+/// A left press on a window button. True when it was one.
+fn captionMouseDown(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, x: c_int, y: c_int) bool {
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    const m = captionMetrics(ext_win);
+    const btn = caption_reveal.buttonAt(m.btn_w, m.band_px, client.right, x, y) orelse return false;
+    ext_win.caption.pressed_btn = btn;
+    _ = c.SetCapture(hwnd);
+    repaintCaption(hwnd, app, ext_win);
+    return true;
+}
+
+/// The release of a pressed window button. True when one was pressed; it
+/// acts only when released over the same button.
+fn captionMouseUp(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, x: c_int, y: c_int) bool {
+    const pressed = ext_win.caption.pressed_btn orelse return false;
+    ext_win.caption.pressed_btn = null;
+    _ = c.ReleaseCapture();
+    repaintCaption(hwnd, app, ext_win);
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    const m = captionMetrics(ext_win);
+    if (caption_reveal.buttonAt(m.btn_w, m.band_px, client.right, x, y) != pressed) return true;
+    switch (pressed) {
+        0 => _ = c.ShowWindow(hwnd, c.SW_MINIMIZE),
+        1 => _ = c.ShowWindow(hwnd, if (c.IsZoomed(hwnd) != 0) c.SW_RESTORE else c.SW_MAXIMIZE),
+        else => _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0),
+    }
+    return true;
+}
+
+/// Vertices captionVerts appends at most: drag bar, hover wash, minimize
+/// bar, maximize outline (4 bars), close cross (CLOSE_BADGE_VERTS).
+const CAPTION_MAX_VERTS: usize = 6 + 6 + 6 + 24 + app_mod.CLOSE_BADGE_VERTS;
+
+fn colorrefRgba(cr: c.COLORREF) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt(cr & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((cr >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((cr >> 16) & 0xFF)) / 255.0,
+        1.0,
+    };
+}
+
+/// The caption overlay of a `width_px` x `height_px` window in clip space:
+/// the drag bar when revealed, and the buttons while shown, the hovered (or
+/// pressed) one washed. Returns the count written to `out`.
+fn captionVerts(
+    out: *[CAPTION_MAX_VERTS]app_mod.Vertex,
+    cap: caption_reveal.ExternalCaption,
+    m: CaptionMetrics,
+    icon_px: c_int,
+    pal: tabline_mod.TitlebarPalette,
+    width_px: f32,
+    height_px: f32,
+    grid_id: i64,
+) usize {
+    const Ndc = struct {
+        w: f32,
+        h: f32,
+        fn x(self: @This(), px: f32) f32 {
+            return px / (self.w / 2.0) - 1.0;
+        }
+        fn y(self: @This(), px: f32) f32 {
+            return 1.0 - px / (self.h / 2.0);
+        }
+        fn dx(self: @This(), px: f32) f32 {
+            return px / (self.w / 2.0);
+        }
+        fn dy(self: @This(), px: f32) f32 {
+            return px / (self.h / 2.0);
+        }
+    };
+    const n: Ndc = .{ .w = width_px, .h = height_px };
+    const solid: [2]f32 = .{ -1.0, -1.0 };
+    const band: f32 = @floatFromInt(m.band_px);
+    const btn_w: f32 = @floatFromInt(m.btn_w);
+    const group_left = width_px - btn_w * 3;
+    var idx: usize = 0;
+
+    if (cap.drag_bar.revealed) {
+        idx = app_mod.addRectVerts(out, idx, n.x(0), n.y(0), n.dx(@max(0, group_left)), n.dy(band), colorrefRgba(pal.wbtn_hover_bg), solid, grid_id);
+    }
+    if (!caption_reveal.buttonsShown(true, cap.revealed, cap.pressed_btn != null)) return idx;
+
+    const lit = cap.pressed_btn orelse cap.hovered_btn;
+    if (lit) |b| {
+        const wash = if (b == 2) pal.wbtn_close_hover_bg else pal.wbtn_hover_bg;
+        const left = group_left + btn_w * @as(f32, @floatFromInt(b));
+        idx = app_mod.addRectVerts(out, idx, n.x(left), n.y(0), n.dx(btn_w), n.dy(band), colorrefRgba(wash), solid, grid_id);
+    }
+
+    const icon: f32 = @floatFromInt(icon_px);
+    const stroke: f32 = @max(1.0, @round(icon / 10.0));
+    const top = @round((band - icon) / 2.0);
+    const color = colorrefRgba(pal.wbtn_icon);
+    // Minimize: a bar across the icon box's middle.
+    const min_left = group_left + @round((btn_w - icon) / 2.0);
+    idx = app_mod.addRectVerts(out, idx, n.x(min_left), n.y(top + @round(icon / 2.0)), n.dx(icon), n.dy(stroke), color, solid, grid_id);
+    // Maximize: the box's outline.
+    const max_left = group_left + btn_w + @round((btn_w - icon) / 2.0);
+    idx = app_mod.addRectVerts(out, idx, n.x(max_left), n.y(top), n.dx(icon), n.dy(stroke), color, solid, grid_id);
+    idx = app_mod.addRectVerts(out, idx, n.x(max_left), n.y(top + icon - stroke), n.dx(icon), n.dy(stroke), color, solid, grid_id);
+    idx = app_mod.addRectVerts(out, idx, n.x(max_left), n.y(top), n.dx(stroke), n.dy(icon), color, solid, grid_id);
+    idx = app_mod.addRectVerts(out, idx, n.x(max_left + icon - stroke), n.y(top), n.dx(stroke), n.dy(icon), color, solid, grid_id);
+    // Close: a cross, white on the red wash when lit.
+    const close_left = group_left + btn_w * 2 + @round((btn_w - icon) / 2.0);
+    const close_color = if (lit == 2) colorrefRgba(pal.wbtn_close_hover_icon) else color;
+    return app_mod.addCloseBadgeVerts(out, idx, n.x(close_left), n.y(top), n.dx(icon), n.dy(icon), close_color, 0.0, grid_id);
+}
+
+/// Draw the caption overlay over the rows of a captionless normal window
+/// and return the band it covers, for the present damage.
+fn drawCaptionOverlay(g: *d3d11.Renderer, app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64) !?c.RECT {
+    if (!caption_reveal.externalLayout(app).captionless()) return null;
+    const cap = ext_win.caption;
+    if (!cap.drag_bar.revealed and !caption_reveal.buttonsShown(true, cap.revealed, cap.pressed_btn != null)) return null;
+    if (g.width == 0 or g.height == 0) return null;
+    const m = captionMetrics(ext_win);
+    var verts: [CAPTION_MAX_VERTS]app_mod.Vertex = undefined;
+    const icon_px: c_int = @intFromFloat(@round(10.0 * ext_win.dpi_scale));
+    const n = captionVerts(&verts, cap, m, icon_px, tabline_mod.currentTitlebarPalette(app), @floatFromInt(g.width), @floatFromInt(g.height), grid_id);
+    try app_mod.drawScrollbarOverlay(g, &ext_win.surf.paint.caption_vb, &ext_win.surf.paint.caption_vb_bytes, verts[0..n]);
+    return .{ .left = 0, .top = 0, .right = @intCast(g.width), .bottom = @min(m.band_px, @as(c_int, @intCast(g.height))) };
+}
+
 pub export fn ExternalWndProc(
     hwnd: c.HWND,
     msg: c.UINT,
@@ -2439,18 +2694,10 @@ pub export fn ExternalWndProc(
             if (c.GetClientRect(hwnd, &client) == 0) return 0;
             const old_in = externalSurfaceInsetsPx(app, gid, old_scale);
             const new_in = externalSurfaceInsetsPx(app, gid, new_scale);
-            var r: c.RECT = .{
-                .left = 0,
-                .top = 0,
-                .right = client.right - old_in.w + new_in.w,
-                .bottom = client.bottom - old_in.h + new_in.h,
-            };
-            const style: c.DWORD = @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE));
-            const ex_style: c.DWORD = @bitCast(c.GetWindowLongW(hwnd, c.GWL_EXSTYLE));
-            if (AdjustWindowRectExForDpi(&r, style, 0, ex_style, new_dpi) == 0) return 0;
+            const outer = outerSizePx(currentWindowStyles(app, hwnd), client.right - old_in.w + new_in.w, client.bottom - old_in.h + new_in.h, new_dpi);
             const size: *c.SIZE = @ptrFromInt(@as(usize, @bitCast(lParam)));
-            size.cx = r.right - r.left;
-            size.cy = r.bottom - r.top;
+            size.cx = outer.w;
+            size.cy = outer.h;
             return 1;
         },
         c.WM_PAINT => {
@@ -2665,6 +2912,7 @@ pub export fn ExternalWndProc(
                     // editor drag the press is the editor's too (see the main
                     // window's press handler).
                     if (msg == c.WM_LBUTTONDOWN and app.press_claim.held_mask == 0) {
+                        if (captionlessGrid(app, grid_id.?) and captionMouseDown(hwnd, app, ext_window.?, x, y)) return 0;
                         ext_window.?.copy_button_pressed = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
                         if (ext_window.?.copy_button_pressed) return 0;
                         ext_window.?.close_badge_pressed = hitTestCloseBadge(hwnd, app, grid_id.?, x, y);
@@ -2781,6 +3029,7 @@ pub export fn ExternalWndProc(
                         scrollbar.mouseUp(app, scrollbar.externalSurface(ext_window.?, grid_id.?));
                         return 0;
                     }
+                    if (captionMouseUp(hwnd, app, ext_window.?, x, y)) return 0;
                     const badge_pressed = ext_window.?.close_badge_pressed;
                     ext_window.?.close_badge_pressed = false;
                     if (badge_pressed) {
@@ -2823,6 +3072,12 @@ pub export fn ExternalWndProc(
                     if (ext_win.surf.scrollbar.dragging) {
                         scrollbar.mouseMove(app, scrollbar.externalSurface(ext_win, grid_id.?), y);
                         return 0;
+                    }
+
+                    if (captionlessGrid(app, grid_id.?)) {
+                        updateCaptionPointer(hwnd, app, ext_win, .client);
+                        // A held window button keeps the moves; they are not the editor's drag.
+                        if (ext_win.caption.pressed_btn != null) return 0;
                     }
 
                     // Copy-button hover: repaint only on a state change so an
@@ -2890,8 +3145,30 @@ pub export fn ExternalWndProc(
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
                     scrollbar.leave(app, scrollbar.externalSurface(ext_win, grid_id.?));
+                    if (captionlessGrid(app, grid_id.?)) updateCaptionPointer(hwnd, app, ext_win, null);
                 }
             }
+        },
+
+        // A revealed drag bar is caption: over it the pointer sends the
+        // non-client messages, and leaving the window from it only the
+        // non-client leave.
+        c.WM_NCMOUSEMOVE, c.WM_NCMOUSELEAVE => {
+            if (app_mod.getApp(hwnd)) |app| {
+                if (findExternalWindowByHwnd(app, hwnd)) |h| {
+                    if (captionlessGrid(app, h.grid_id)) updateCaptionPointer(hwnd, app, h.win, if (msg == c.WM_NCMOUSEMOVE) .nonclient else null);
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_NCCALCSIZE => {
+            if (wParam != 0) {
+                if (app_mod.getApp(hwnd)) |app| {
+                    if (captionlessFrame(app, @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE)))) return captionlessCalcSize(hwnd, msg, wParam, lParam);
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
         app_mod.WM_APP_PAINT_RETRY_FALLBACK => {
@@ -2955,6 +3232,10 @@ pub export fn ExternalWndProc(
                         uncloakAfterPresent(ext_win);
                         return 0;
                     }
+                    if (timer_id == app_mod.TIMER_DRAG_BAR_REVEAL) {
+                        onCaptionDragBarTimer(hwnd, app, ext_win);
+                        return 0;
+                    }
                     if (scrollbar.onTimer(app, scrollbar.externalSurface(ext_win, grid_id.?), timer_id)) {
                         return 0;
                     } else if (timer_id == app_mod.TIMER_COPY_BUTTON_REVERT) {
@@ -3005,6 +3286,7 @@ pub export fn ExternalWndProc(
         // Enable drag-to-move for cmdline window (entire window acts as title bar)
         c.WM_NCHITTEST => {
             if (app_mod.getApp(hwnd)) |app| {
+                if (captionlessFrame(app, @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE)))) return captionlessHitTest(hwnd, app, msg, wParam, lParam);
                 app.mu.lockUncancelable(core.clock.io());
                 const is_cmdline_window = if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw|
                     cw.hwnd == hwnd
@@ -3278,15 +3560,16 @@ pub fn updateExternalWindowColors(app: *App) void {
     // Read during WM_PAINT (setExternalWindowClearColor) where grid_mu is unsafe.
     var msg_area_bg: u32 = 0xFFFFFFFF;
     var pmenu_bg: u32 = 0xFFFFFFFF;
+    // The titlebar hairline (`titlebar_edge = "border"`), read in WM_PAINT.
+    var separator_fg: u32 = 0xFFFFFFFF;
 
-    // All 4 highlight groups in one grid_mu acquisition instead of 4
-    // separate lock round-trips (was: Search, Comment each own call, then
-    // MsgArea/Pmenu each own call).
+    // Every highlight group in one grid_mu acquisition instead of a lock
+    // round-trip per group.
     if (app.corep) |corep| {
-        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu" };
-        var fg: [4]u32 = undefined;
-        var bg: [4]u32 = undefined;
-        var found: [4]i32 = undefined;
+        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu", "WinSeparator" };
+        var fg: [names.len]u32 = undefined;
+        var bg: [names.len]u32 = undefined;
+        var found: [names.len]i32 = undefined;
         _ = app_mod.zonvie_core_get_hl_by_names_batch(corep, &names, &fg, &bg, &found, names.len);
 
         if (found[0] != 0) {
@@ -3301,6 +3584,7 @@ pub fn updateExternalWindowColors(app: *App) void {
         }
         if (found[2] != 0) msg_area_bg = bg[2];
         if (found[3] != 0) pmenu_bg = bg[3];
+        if (found[4] != 0) separator_fg = fg[4];
     }
 
     app.mu.lockUncancelable(core.clock.io());
@@ -3308,7 +3592,31 @@ pub fn updateExternalWindowColors(app: *App) void {
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
+    app.cached_separator_fg = separator_fg;
     app.mu.unlock(core.clock.io());
+}
+
+/// Re-applies `titlebar_style` caption colours to every regular external
+/// window. UI thread only: the HWNDs collected under `app.mu` stay valid
+/// because only this thread destroys them, and DWM is called unlocked since
+/// it may repaint the frame synchronously through our window procedure.
+pub fn applyCaptionColorsToAll(app: *App) void {
+    var hwnds: std.ArrayList(c.HWND) = .empty;
+    defer hwnds.deinit(app.alloc);
+    app.mu.lockUncancelable(core.clock.io());
+    // Reserved up front so the collection cannot drop windows halfway.
+    hwnds.ensureTotalCapacity(app.alloc, app.external_windows.count()) catch {
+        app.mu.unlock(core.clock.io());
+        if (applog.isEnabled()) applog.appLog("[win] caption colours: allocation failed, external windows not updated\n", .{});
+        return;
+    };
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        if (classifyExternalSurface(entry.key_ptr.*) != .normal) continue;
+        hwnds.appendAssumeCapacity(entry.value_ptr.*.hwnd);
+    }
+    app.mu.unlock(core.clock.io());
+    for (hwnds.items) |hwnd| window_mod.applyCaptionColors(hwnd, app, caption_reveal.externalLayout(app));
 }
 
 /// Paint an external window (simpler rendering path than main window)

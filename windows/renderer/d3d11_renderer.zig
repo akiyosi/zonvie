@@ -381,7 +381,12 @@ pub const Renderer = struct {
     /// LayerTransform in windows/shaders/main.hlsl.
     layer_cb: ?*c.ID3D11Buffer = null,
     /// Last value written to layer_cb, so redundant updates are skipped.
-    layer_cb_value: [8]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+    layer_cb_value: [12]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    /// `[window] titlebar_edge`, folded into every layer transform: window
+    /// separators within this many px of the layer top fade in, or with
+    /// `separator_hard_edge` are hidden. Set by the paint, UI thread.
+    separator_fade_px: f32 = 0,
+    separator_hard_edge: bool = false,
     /// The next present waits for vblank. A smooth-scroll frame asks for it,
     /// so the paint loop that drives the ease runs at the display rate
     /// instead of spinning; every other present stays unthrottled.
@@ -4283,12 +4288,12 @@ pub const Renderer = struct {
             self.glow_cb = gcb;
         }
 
-        // --- Layer transform constant buffer (32 bytes: 4 x float2) ---
+        // --- Layer transform constant buffer (48 bytes: 6 x float2) ---
         {
             const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVSCBFailed;
 
             var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
-            cbd.ByteWidth = 32;
+            cbd.ByteWidth = 48;
             cbd.Usage = c.D3D11_USAGE_DYNAMIC;
             cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
             cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
@@ -4328,8 +4333,9 @@ pub const Renderer = struct {
         scroll_offset_px: f32,
     ) error{LayerTransformMapFailed}!void {
         self.assertContextLocked();
-        const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
-            .{ 1, 1, 0, 0, 0, 0, 0, 0 }
+        const hard_edge: f32 = if (self.separator_hard_edge) 1 else 0;
+        const value: [12]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
+            .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
         else .{
             2.0 / extent_w_px,
             -2.0 / extent_h_px,
@@ -4338,6 +4344,10 @@ pub const Renderer = struct {
             origin_x_px,
             origin_y_px,
             scroll_offset_px,
+            0,
+            self.separator_fade_px,
+            hard_edge,
+            0,
             0,
         };
         const ctx = self.ctx orelse return;
@@ -4351,7 +4361,7 @@ pub const Renderer = struct {
             var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
             const hr = mapDiscard(ctx, res, &mapped);
             if (c.FAILED(hr)) return error.LayerTransformMapFailed;
-            const dst: *[8]f32 = @ptrCast(@alignCast(mapped.pData));
+            const dst: *[12]f32 = @ptrCast(@alignCast(mapped.pData));
             dst.* = value;
             unmap0(ctx, res);
             self.layer_cb_value = value;

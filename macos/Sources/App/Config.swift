@@ -71,7 +71,15 @@ struct ZonvieConfig {
         var blur: Bool = true
         var opacity: Double = 0.5  // Only used when blur=true
         var blurRadius: Int = 20   // Blur radius (0-100), only used when blur=true; 0 = translucent without blur
-        var transparentTitlebar: Bool = false
+        var titlebarStyle: TitlebarStyle = .native
+        var titlebarEdge: TitlebarEdge = .fade
+    }
+
+    /// `[window] titlebar_edge`; raw values match `zonvie_config_values.window_titlebar_edge`.
+    enum TitlebarEdge: UInt8 {
+        case fade = 0    // separators fade in across the band
+        case border = 1  // hairline at the band bottom; separators start there
+        case none = 2
     }
 
     struct ScrollbarConfig {
@@ -294,7 +302,8 @@ struct ZonvieConfig {
         config.window.blur = v.window_blur
         config.window.opacity = Double(v.window_opacity)
         config.window.blurRadius = Int(v.window_blur_radius)
-        config.window.transparentTitlebar = v.window_titlebar_style == 1
+        config.window.titlebarStyle = TitlebarStyle(rawValue: v.window_titlebar_style) ?? .native
+        config.window.titlebarEdge = TitlebarEdge(rawValue: v.window_titlebar_edge) ?? .fade
 
         // Scrollbar
         config.scrollbar.enabled = v.scrollbar_enabled
@@ -425,6 +434,22 @@ extension ZonvieConfig {
             return nil
         }
         return TablineStyle(rawValue: tabline.style) ?? .titlebar
+    }
+
+    /// The main window's titlebar chrome.
+    var titlebarLayout: TitlebarLayout {
+        let tabline: TitlebarLayout.Tabline
+        switch effectiveTablineStyle {
+        case .titlebar: tabline = .titlebar
+        case .sidebar: tabline = .sidebar
+        case .menu, nil: tabline = .other
+        }
+        return TitlebarLayout(style: window.titlebarStyle, tabline: tabline)
+    }
+
+    /// A normal external window's titlebar chrome: it has no tabline.
+    var externalTitlebarLayout: TitlebarLayout {
+        TitlebarLayout(style: window.titlebarStyle, tabline: .other)
     }
 }
 

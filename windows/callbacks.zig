@@ -846,7 +846,7 @@ fn storeLiveExternalRowLocked(app: *App, ext_win: *app_mod.ExternalWindow, call:
         const content_w: c_int = @intCast(total_cols * cell_w);
         const content_h: c_int = @intCast(total_rows * cell_h);
 
-        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
+        const outer = external_windows.windowOuterSizePx(app, ext_win.hwnd, content_w, content_h);
         const window_w: c_int = outer.w;
         const window_h: c_int = outer.h;
 
@@ -2705,7 +2705,7 @@ pub fn queueExternalWindowResizes(
 
         // This window's actual style and DPI: WS_OVERLAPPEDWINDOW has a frame
         // WS_POPUP does not, and its height depends on the window's monitor.
-        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
+        const outer = external_windows.windowOuterSizePx(app, ext_win.hwnd, content_w, content_h);
         ext_win.pending_window_w = outer.w;
         ext_win.pending_window_h = outer.h;
         ext_win.needs_window_resize = true;
@@ -2735,7 +2735,7 @@ fn queueExternalFontReframes(app: *App) void {
         const want_w = content.w + insets.w;
         const want_h = content.h + insets.h;
         if (client.right - client.left == want_w and client.bottom - client.top == want_h) continue;
-        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, want_w, want_h);
+        const outer = external_windows.windowOuterSizePx(app, ext_win.hwnd, want_w, want_h);
         ext_win.pending_window_w = outer.w;
         ext_win.pending_window_h = outer.h;
         ext_win.needs_window_resize = true;

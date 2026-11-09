@@ -990,6 +990,9 @@ pub const SurfaceOriginInputs = struct {
     sidebar_width_px: i32 = 0,
     /// Already DPI-scaled.
     tab_bar_height_px: i32 = 0,
+    /// `titlebar_style = "unified"` without titlebar tabs: a band of
+    /// `tab_bar_height_px` above the editor.
+    title_band: bool = false,
 };
 
 pub const SurfaceOrigin = struct { x: i32 = 0, y: i32 = 0 };
@@ -1003,7 +1006,7 @@ pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
             in.sidebar_width_px
         else
             0,
-        .y = if (in.ext_tabline_enabled and in.style_is_titlebar)
+        .y = if ((in.ext_tabline_enabled and in.style_is_titlebar) or in.title_band)
             in.tab_bar_height_px
         else
             0,

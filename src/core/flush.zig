@@ -2096,7 +2096,7 @@ const GlyphQuadEmitter = struct {
     timing: bool,
     emit_ns: *i64,
 
-    const Quad = struct { gx0: f32, gx1: f32, gy0: f32, gy1: f32, uv: [4][2]f32 };
+    const Quad = struct { gx0: f32, gx1: f32, gy0: f32, gy1: f32, uv: [4][2]f32, separator: bool };
 
     /// `offsets` is the shaper's (x, y) offset in px. `trim_scalar` names the
     /// box-drawing scalar whose span is trimmed to the row; 0 trims nothing.
@@ -2122,11 +2122,15 @@ const GlyphQuadEmitter = struct {
                 .{ ge.uv_min[0], span.v1 },
                 .{ ge.uv_max[0], span.v1 },
             },
+            // Under multigrid the default grid holds the window separators.
+            .separator = e.grid_id == 1 and trim_scalar >= 0x2500 and trim_scalar <= 0x257F,
         };
     }
 
     fn push(e: *const GlyphQuadEmitter, q: Quad, color_emoji: bool) !void {
-        const deco: u32 = e.deco | (if (color_emoji) c_api.DECO_COLOR_EMOJI else 0);
+        const deco: u32 = e.deco |
+            (if (color_emoji) c_api.DECO_COLOR_EMOJI else 0) |
+            (if (q.separator) c_api.DECO_SEPARATOR else 0);
         const t_emit: i128 = if (e.timing) clock.nowNs() else 0;
         try ensureRowQuadCapacity(e.core, e.out, e.max_vertices, 1);
         VH.pushGlyphQuadAssumeCapacity(e.out, q.gx0, q.gy0, q.gx1, q.gy1, q.uv[0], q.uv[1], q.uv[2], q.uv[3], e.fg, e.grid_id, deco);
@@ -11093,6 +11097,20 @@ test "box drawing glyph quads are trimmed to their cell rows" {
             }
             return span;
         }
+
+        fn allSeparator(vertices: []const c_api.Vertex) bool {
+            for (vertices) |vertex| {
+                if ((vertex.deco_flags & c_api.DECO_SEPARATOR) == 0) return false;
+            }
+            return vertices.len > 0;
+        }
+
+        fn anySeparator(vertices: []const c_api.Vertex) bool {
+            for (vertices) |vertex| {
+                if ((vertex.deco_flags & c_api.DECO_SEPARATOR) != 0) return true;
+            }
+            return false;
+        }
     };
 
     // Row 1 of 10px cells spans y 10..20. The glyph spans 9..22 with v
@@ -11164,6 +11182,8 @@ test "box drawing glyph quads are trimmed to their cell rows" {
         try std.testing.expectApproxEqAbs(@as(f32, 20), box[1], 0.001);
         try std.testing.expectApproxEqAbs(@as(f32, 0.1), box[2], 0.001);
         try std.testing.expectApproxEqAbs(@as(f32, 1.1), box[3], 0.001);
+        // On the default grid a box-drawing glyph is a window separator.
+        try std.testing.expect(State.allSeparator(out.items[box_stats.pass_ends[1]..box_stats.pass_ends[2]]));
 
         // Only box drawing: any other glyph keeps the ink it overhangs with.
         core.row_cells.set(0, 0x2190, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
@@ -11172,6 +11192,7 @@ test "box drawing glyph quads are trimmed to their cell rows" {
         const arrow = State.glyphSpan(out.items[arrow_stats.pass_ends[1]..arrow_stats.pass_ends[2]]);
         try std.testing.expectApproxEqAbs(@as(f32, 9), arrow[0], 0.001);
         try std.testing.expectApproxEqAbs(@as(f32, 22), arrow[1], 0.001);
+        try std.testing.expect(!State.anySeparator(out.items[arrow_stats.pass_ends[1]..arrow_stats.pass_ends[2]]));
     }
 }
 

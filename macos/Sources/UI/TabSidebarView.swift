@@ -3,12 +3,21 @@ import AppKit
 /// Sidebar view displaying Neovim tabs as a vertical list.
 /// Colors are derived from the loaded Neovim colorscheme background.
 /// When blur is enabled, the sidebar is transparent to let window blur show through.
-/// Window for sidebar mode under a transparent titlebar. AppKit's titlebar
-/// swallows mouse-downs across the whole band; here only the sidebar's part
-/// moves the window, the editor's part reaches the editor, and titlebar
-/// controls (traffic lights, sidebar toggle) keep their normal handling.
-final class SidebarTitlebarWindow: NSWindow {
+/// Window whose band the frontend draws (`TitlebarLayout.drawsBand`: a
+/// captionless window, main or external, or the unified title band).
+/// AppKit's titlebar swallows mouse-downs across the whole band;
+/// here only the sidebar's part and a revealed drag bar move the window, the
+/// editor's part reaches the editor, and titlebar controls (traffic lights,
+/// sidebar toggle) keep their normal handling.
+final class CaptionlessWindow: NSWindow {
     private weak var forwardedView: NSView?
+
+    /// The band is part of the content view: hit tests below assume it.
+    override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask,
+                  backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
+        precondition(style.contains(.fullSizeContentView), "CaptionlessWindow needs .fullSizeContentView")
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+    }
 
     override func layoutIfNeeded() {
         super.layoutIfNeeded()
@@ -19,7 +28,7 @@ final class SidebarTitlebarWindow: NSWindow {
         switch event.type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             if let target = bandTarget(for: event) {
-                if target is TabSidebarView || target is TitlebarDragBar {
+                if target is TabSidebarView || target is TitlebarDragBar || target is TitleBandView {
                     // The band acts as the titlebar: drag moves, double-click zooms.
                     if event.type == .leftMouseDown {
                         if event.clickCount == 2 { performZoom(nil) } else { performDrag(with: event) }
@@ -53,8 +62,8 @@ final class SidebarTitlebarWindow: NSWindow {
         if sequence(first: top, next: { $0.superview }).contains(where: { $0 is NSControl }) { return nil }
         guard let hit = content.hitTest(content.convert(p, from: nil)) else { return nil }
         for view in sequence(first: hit, next: { $0.superview }) {
-            if view is TabSidebarView || view is TitlebarDragBar { return view }
-            if view is MetalTerminalView { return hit }
+            if view is TabSidebarView || view is TitlebarDragBar || view is TitleBandView { return view }
+            if view is MetalTerminalView || view is ExternalGridView { return hit }
         }
         return nil
     }
@@ -76,7 +85,7 @@ final class SidebarTitlebarWindow: NSWindow {
 }
 
 /// Faint grab bar over the top of the editor: it fades in after the pointer
-/// rests in the band and then moves the window (see SidebarTitlebarWindow).
+/// rests in the band and then moves the window (see CaptionlessWindow).
 /// Until revealed it is click-through.
 final class TitlebarDragBar: NSView {
     private static let revealDelay: TimeInterval = 2
@@ -117,6 +126,55 @@ final class TitlebarDragBar: NSView {
         guard revealed else { return }
         revealed = false
         NSAnimationContext.runAnimationGroup { $0.duration = 0.2; self.animator().alphaValue = 0 }
+    }
+}
+
+/// The self-drawn titlebar band (`TitlebarLayout.titleBand`): the
+/// editor's default bg and the window title in its fg, centered. It moves
+/// the window and zooms on a double-click (see CaptionlessWindow).
+final class TitleBandView: NSView {
+    private let label = NSTextField(labelWithString: "")
+
+    /// `leadingReservePt`: the traffic lights and the sidebar toggle; the
+    /// title keeps the same distance from the right edge so it stays centered.
+    init(leadingReservePt: CGFloat) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .titleBarFont(ofSize: 0)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: leadingReservePt),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -leadingReservePt),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    // The label is an NSControl, which CaptionlessWindow leaves to AppKit:
+    // the whole band answers as itself so every part of it moves the window.
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+
+    var title: String {
+        get { label.stringValue }
+        set { label.stringValue = newValue }
+    }
+
+    /// The main window's band has no fill: it lies over the editor surface,
+    /// which draws the editor's bg under it.
+    func setTitleColor(_ color: NSColor) {
+        label.textColor = color
+    }
+
+    /// An external window's band sits above its grid, so it paints the bg.
+    func setColors(background: NSColor, foreground: NSColor) {
+        layer?.backgroundColor = background.cgColor
+        label.textColor = foreground
     }
 }
 
@@ -164,7 +222,7 @@ final class TabSidebarView: NSView {
         setBoundsOrigin(NSPoint(x: 0, y: -topInset))
     }
 
-    private var transparentTitlebar: Bool { ZonvieConfig.shared.window.transparentTitlebar }
+    private var transparentTitlebar: Bool { ZonvieConfig.shared.titlebarLayout.editorRunsUnderBand }
 
     /// The sidebar toggle in the titlebar band; it takes this view's tab
     /// text colour and follows the colorscheme with it.

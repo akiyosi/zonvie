@@ -19,7 +19,7 @@ const TabEntry = app_mod.TabEntry;
 const tab_font_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
 
 /// The tab label font at `height_pt` (negative: character height), DPI-scaled.
-fn createTabFont(app: *App, height_pt: c_int) c.HFONT {
+pub fn createTabFont(app: *App, height_pt: c_int) c.HFONT {
     return c.CreateFontW(
         app.scalePx(height_pt),
         0,
@@ -984,7 +984,20 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&app.dpi_scale));
     h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
     // `titlebar_style = "transparent"` paints the bar from the colorscheme.
-    h.update(std.mem.asBytes(&app.drag_bar_revealed));
+    h.update(std.mem.asBytes(&app.drag_bar.revealed));
+    // What is drawn, not the raw hover state: a pinned band does not change.
+    const buttons_shown = sidebar_caption.captionButtonsShown(app);
+    h.update(std.mem.asBytes(&buttons_shown));
+    h.update(std.mem.asBytes(&app.sidebar_collapsed));
+    // The `titlebar_edge = "border"` hairline takes WinSeparator's colour.
+    h.update(std.mem.asBytes(&app.config.window.titlebar_edge));
+    h.update(std.mem.asBytes(&app.cached_separator_fg));
+    // The title band: its text, and the see-through sidebar part mid-slide.
+    if (sidebar_caption.titleBand(app)) {
+        h.update(std.mem.sliceAsBytes(app.pending_title[0..app.pending_title_len]));
+        const covered = sidebar_caption.coveredPx(app);
+        h.update(std.mem.asBytes(&covered));
+    }
     h.update(std.mem.asBytes(&app.sidebar_position_right));
     h.update(std.mem.asBytes(&app.colorscheme_bg));
     h.update(std.mem.asBytes(&app.colorscheme_fg));
@@ -1059,7 +1072,7 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
         switch (surface) {
-            .tabline => if (sidebar_caption.enabled(app))
+            .tabline => if (sidebar_caption.drawsBand(app))
                 sidebar_caption.drawOverlayContent(app, mem_dc, @intCast(width))
             else
                 drawTablineContent(app, mem_dc, @intCast(width)),
@@ -1077,13 +1090,16 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
     // The captionless overlay keeps only what it drew over its bar colour,
     // fully transparent elsewhere (premultiplied: zero colour too). Binary
     // alpha, so redrawing it over retained rows never accumulates.
-    if (surface == .tabline and sidebar_caption.enabled(app)) {
+    if (surface == .tabline and sidebar_caption.drawsBand(app)) {
         const key = currentTitlebarPalette(app).bar_bg;
         const kr: u8 = @intCast(key & 0xFF);
         const kg: u8 = @intCast((key >> 8) & 0xFF);
         const kb: u8 = @intCast((key >> 16) & 0xFF);
+        const cols = sidebar_caption.seeThroughColumnsPx(app, @intCast(width));
         i = 0;
         while (i < pixel_count) : (i += 1) {
+            const x: c_int = @intCast(i % width);
+            if (x < cols.lo or x >= cols.hi) continue;
             const p = pixels[i * 4 ..][0..4];
             if (p[0] == kb and p[1] == kg and p[2] == kr) p.* = .{ 0, 0, 0, 0 };
         }
@@ -1194,7 +1210,7 @@ pub const TitlebarPalette = struct {
 };
 
 pub fn currentTitlebarPalette(app: *const App) TitlebarPalette {
-    if (app.config.window.titlebar_style == .transparent and app.colorscheme_bg != 0xFFFFFFFF)
+    if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
         return colorschemeTitlebarPalette(app.colorscheme_bg, app.colorscheme_fg);
     return osTitlebarPalette();
 }
@@ -1242,7 +1258,7 @@ fn osTitlebarPalette() TitlebarPalette {
     };
 }
 
-/// `titlebar_style = "transparent"`: the bar is the editor's default bg, so it
+/// `titlebar_style = "transparent"` or `"unified"`: the bar is the editor's default bg, so it
 /// reads as part of the editor (the post shader runs over it too); tab states
 /// are that bg shifted toward the text side.
 fn colorschemeTitlebarPalette(bg: u32, fg_or_none: u32) TitlebarPalette {
@@ -1283,8 +1299,11 @@ fn colorschemeTitlebarPalette(bg: u32, fg_or_none: u32) TitlebarPalette {
     };
 }
 
-/// The minimize, maximize and close buttons at the right end of the titlebar.
+/// The minimize, maximize and close buttons at the right end of the main
+/// window's titlebar; a captionless window under hover reveal draws them
+/// only while the pointer is in the band.
 pub fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytype) void {
+    if (!sidebar_caption.captionButtonsShown(app)) return;
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
@@ -1789,7 +1808,7 @@ const SidebarColors = struct {
         var sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
         var sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
         var sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
-        if (sidebar_caption.enabled(app)) {
+        if (sidebar_caption.captionless(app)) {
             const tint = lightnessShifted(bgR, bgG, bgB, !is_dark);
             const overlay_alpha: f32 = 0.55;
             sb_bgR = bgR + (tint[0] - bgR) * overlay_alpha;
@@ -1915,7 +1934,9 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
     // Compute colors from colorscheme
     const colors = SidebarColors.compute(app);
-    const captionless = sidebar_caption.enabled(app);
+    // Under the editor (captionless) the sidebar is a tinted overlay with no
+    // separator; beside it (the title band) it keeps the plain look.
+    const captionless = sidebar_caption.captionless(app);
 
     // Background
     const bg_brush = c.CreateSolidBrush(c.RGB(colors.bg_r, colors.bg_g, colors.bg_b));
