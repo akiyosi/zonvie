@@ -5946,7 +5946,11 @@ pub export fn WndProc(
                                 // Left button: handle sidebar interaction
                                 // Right/middle button: consume event to prevent Neovim input
                                 if (msg == c.WM_LBUTTONDOWN) {
-                                    tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                                    if (tabline_mod.sidebarResizeEdgeHit(app, hwnd, @as(c_int, x), @as(c_int, y))) {
+                                        tabline_mod.beginSidebarResize(app, hwnd, @as(c_int, x));
+                                    } else {
+                                        tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                                    }
                                 }
                                 return input.mouseButtonResult(msg);
                             }
@@ -6011,6 +6015,10 @@ pub export fn WndProc(
                             return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
+                        if (msg == c.WM_LBUTTONUP and app.tabline_state.sidebar_resize_grab_px != null) {
+                            tabline_mod.endSidebarResize(app);
+                            return 0;
+                        }
                         if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or
                             app.tabline_state.close_button_pressed != null or
                             app.tabline_state.new_tab_button_pressed))
@@ -6068,6 +6076,10 @@ pub export fn WndProc(
                     // WM_SETCURSOR fires before WM_MOUSEMOVE, so the URL test
                     // runs here.
                     const p = input.cursorClientPos(hwnd);
+                    if (tabline_mod.sidebarResizeEdgeHit(app, hwnd, p.x, p.y)) {
+                        tabline_mod.setSidebarResizeCursor();
+                        return 1;
+                    }
                     const target: ?input.MouseTarget = if (input.pointInMainChrome(app, hwnd, p.x, p.y))
                         null
                     else
@@ -6092,6 +6104,12 @@ pub export fn WndProc(
                 // release ahead of the chrome branches): the chrome neither
                 // consumes the move nor lights a hover under it.
                 const editor_drag = sidebar_caption.editorDrag(app);
+                // A sidebar width drag owns the pointer until its release,
+                // over the caption buttons too.
+                if (app.tabline_state.sidebar_resize_grab_px != null) {
+                    tabline_mod.updateSidebarResize(app, hwnd, @as(c_int, x));
+                    return 0;
+                }
                 if (!editor_drag and sidebar_caption.onMouseMove(hwnd, app, @as(c_int, x), @as(c_int, y))) {
                     tabline_mod.clearTablineHover(app, hwnd);
                     return 0;

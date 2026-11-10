@@ -493,6 +493,82 @@ pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
         .{ .left = covered - w, .top = 0, .right = covered, .bottom = client.bottom };
 }
 
+/// The sidebar width a width drag asks for, both in logical px: at most half
+/// the client, but never below SIDEBAR_MIN_WIDTH even in a narrow client.
+pub fn clampSidebarWidth(want_px: c_int, client_w_px: c_int) u32 {
+    const max_px = @max(TablineState.SIDEBAR_MIN_WIDTH, @divTrunc(client_w_px, 2));
+    return @intCast(std.math.clamp(want_px, TablineState.SIDEBAR_MIN_WIDTH, max_px));
+}
+
+test "clampSidebarWidth: min 120, max half the client, min wins in a narrow client" {
+    try std.testing.expectEqual(@as(u32, 200), clampSidebarWidth(200, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(50, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(-30, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(900, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(500, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(300, 200));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(10, 200));
+}
+
+/// Whether client (x, y) is on the open sidebar's inner edge: the strip
+/// SIDEBAR_RESIZE_EDGE wide just inside the edge facing the editor, so it
+/// never takes a point from the editor or the scrollbar. Off while the
+/// sidebar is closed or sliding, and in the caption band, whose points move
+/// the window or press its buttons (a right sidebar's toggle can reach it).
+pub fn sidebarResizeEdgeHit(app: *App, hwnd: c.HWND, x: c_int, y: c_int) bool {
+    if (!(app.ext_tabline_enabled and app.tabline_style == .sidebar)) return false;
+    if (app.sidebar_sliding or sidebar_caption.coveredPx(app) <= 0) return false;
+    if (sidebar_caption.drawsBand(app) and y < sidebar_caption.bandPx(app)) return false;
+    if (!pointInSidebar(app, hwnd, x)) return false;
+    const r = sidebarRectPx(app, hwnd);
+    const edge_px = app.scalePx(TablineState.SIDEBAR_RESIZE_EDGE);
+    return if (app.sidebar_position_right) x < r.left + edge_px else x >= r.right - edge_px;
+}
+
+pub fn setSidebarResizeCursor() void {
+    _ = c.SetCursor(input.loadSystemCursor(32644)); // IDC_SIZEWE
+}
+
+/// Start a width drag from a press at client x on the inner edge.
+pub fn beginSidebarResize(app: *App, hwnd: c.HWND, x: c_int) void {
+    const r = sidebarRectPx(app, hwnd);
+    app.tabline_state.sidebar_resize_grab_px = if (app.sidebar_position_right) x - r.left else r.right - x;
+    setSidebarResizeCursor();
+    _ = c.SetCapture(hwnd);
+}
+
+/// Follow a width drag to client x. The new width is session-only: nothing
+/// writes it back to the config. The grid is resized as a window resize
+/// does (outside app.mu: the core can re-enter through callbacks); the
+/// window keeps its size.
+pub fn updateSidebarResize(app: *App, hwnd: c.HWND, x: c_int) void {
+    const grab_px = app.tabline_state.sidebar_resize_grab_px orelse return;
+    var client: c.RECT = std.mem.zeroes(c.RECT);
+    _ = c.GetClientRect(hwnd, &client);
+    const want_px = if (app.sidebar_position_right) client.right - x + grab_px else x + grab_px;
+    const width = clampSidebarWidth(logicalPx(app, want_px), logicalPx(app, client.right));
+    if (width == app.sidebar_width_px) return;
+    // The core thread reads the width under app.mu (contentSizePx from its
+    // font and linespace callbacks).
+    app.mu.lockUncancelable(core.clock.io());
+    app.sidebar_width_px = width;
+    app.mu.unlock(core.clock.io());
+    app_mod.updateLayoutToCore(hwnd, app);
+    // A left sidebar moves the grid: redraw everything, as the toggle does.
+    sidebar_caption.repaint(hwnd, app);
+}
+
+/// End a width drag. The state is dropped before ReleaseCapture, whose
+/// WM_CAPTURECHANGED arrives synchronously.
+pub fn endSidebarResize(app: *App) void {
+    app.tabline_state.sidebar_resize_grab_px = null;
+    _ = c.ReleaseCapture();
+}
+
+fn logicalPx(app: *const App, px: c_int) c_int {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(px)) / app.dpi_scale));
+}
+
 /// Drop the tab bar's (or sidebar's) hover and repaint its band. For every
 /// way the pointer can leave it: into the non-client area, into the editor,
 /// or out of the window altogether.
@@ -537,10 +613,13 @@ pub fn tablineBandRect(app: *App, hwnd: c.HWND) c.RECT {
 pub fn cancelTablinePointer(app: *App, hwnd: c.HWND) void {
     const st = &app.tabline_state;
     if (st.dragging_tab == null and st.close_button_pressed == null and
-        !st.new_tab_button_pressed and st.pressed_window_btn == null) return;
+        !st.new_tab_button_pressed and st.pressed_window_btn == null and
+        st.sidebar_resize_grab_px == null) return;
     if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
     destroyDragPreviewWindow(app);
     st.cancelDrag();
+    // The width already dragged to stays: each step was laid out live.
+    st.sidebar_resize_grab_px = null;
     st.close_button_pressed = null;
     st.new_tab_button_pressed = false;
     st.pressed_window_btn = null;

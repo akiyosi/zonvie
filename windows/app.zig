@@ -2160,6 +2160,11 @@ pub const TablineState = struct {
     // Window button pressed state (for proper click handling on min/max/close)
     pressed_window_btn: ?u8 = null, // 0=min, 1=max, 2=close
 
+    // Sidebar width drag: the pointer's distance (physical px) inside the
+    // sidebar's inner edge at the press, so the edge does not jump to the
+    // pointer. Non-null only while the drag holds capture.
+    sidebar_resize_grab_px: ?c_int = null,
+
     // AI-agent indicator state, keyed by tab handle (set via on_agent_status).
     // state: 1=idle (agent present)→●, 2=working/claude, 3=working/braille.
     agent_handles: [32]i64 = [_]i64{0} ** 32,
@@ -2206,6 +2211,8 @@ pub const TablineState = struct {
     pub const SIDEBAR_NEW_TAB_HEIGHT: c_int = 32;
     pub const SIDEBAR_SEPARATOR_WIDTH: c_int = 1;
     pub const SIDEBAR_INDICATOR_WIDTH: c_int = 3;
+    pub const SIDEBAR_MIN_WIDTH: c_int = 120; // Narrowest a width drag goes (logical)
+    pub const SIDEBAR_RESIZE_EDGE: c_int = 5; // Width-drag strip inside the inner edge (logical)
 
     pub fn clear(self: *TablineState) void {
         self.tab_count = 0;

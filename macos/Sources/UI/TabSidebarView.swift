@@ -178,7 +178,36 @@ final class TitleBandView: NSView {
     }
 }
 
+/// A strip just inside the sidebar's inner edge that resizes the sidebar by
+/// drag. It reports the proposed width; the owner clamps and applies it.
+final class SidebarResizeHandle: NSView {
+    var isRightSide = false
+    var currentWidthPt: () -> CGFloat = { 0 }
+    var onWidthChange: ((CGFloat) -> Void)?
+
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+
+    override func mouseDown(with event: NSEvent) {
+        let startX = event.locationInWindow.x
+        let startWidthPt = currentWidthPt()
+        window?.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: .infinity,
+                            mode: .eventTracking) { [weak self] ev, stop in
+            guard let self, let ev else { return }
+            if ev.type == .leftMouseUp { stop.pointee = true; return }
+            let dx = ev.locationInWindow.x - startX
+            self.onWidthChange?(startWidthPt + (self.isRightSide ? -dx : dx))
+        }
+    }
+}
+
 final class TabSidebarView: NSView {
+
+    /// Follows this view's visibility, so a closed sidebar's edge does not
+    /// react.
+    weak var resizeHandle: NSView?
+    override var isHidden: Bool {
+        didSet { resizeHandle?.isHidden = isHidden }
+    }
 
     struct Tab {
         let handle: Int64
@@ -231,6 +260,8 @@ final class TabSidebarView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         setBoundsOrigin(NSPoint(x: 0, y: -topInset))
+        // Rows are laid out against the width at draw time.
+        needsDisplay = true
     }
 
     private var transparentTitlebar: Bool { ZonvieConfig.shared.titlebarLayout.editorRunsUnderBand }
