@@ -294,6 +294,8 @@ pub const Config = struct {
         // AI-agent status: per-tab indicator icon and completion OS notification.
         agent_indicator: bool = true,
         agent_notification: bool = true,
+        cards: bool = true,
+        card_provider: bool = true,
     };
 
     pub const WindowsConfig = struct {
@@ -643,6 +645,8 @@ pub const Config = struct {
             if (t.sidebar_width) |w| self.tabline.sidebar_width = @max(100, @min(500, w));
             if (t.agent_indicator) |b| self.tabline.agent_indicator = b;
             if (t.agent_notification) |b| self.tabline.agent_notification = b;
+            if (t.cards) |b| self.tabline.cards = b;
+            if (t.card_provider) |b| self.tabline.card_provider = b;
         }
 
         if (cfg.windows) |w| {
@@ -1030,6 +1034,8 @@ const TomlTabline = struct {
     sidebar_width: ?u32 = null,
     agent_indicator: ?bool = null,
     agent_notification: ?bool = null,
+    cards: ?bool = null,
+    card_provider: ?bool = null,
 };
 
 const TomlWindows = struct {
@@ -1148,6 +1154,8 @@ else
     \\        sidebar_width       Sidebar width in pixels (100-500, default: 200)
     \\        agent_indicator     AI-agent status icon on terminal tabs (default: true)
     \\        agent_notification  Notify when an AI agent finishes (default: true)
+    \\        cards               Sidebar draws each tab as a multi-line card from 'guitablabel' (default: true)
+    \\        card_provider       Fill 'guitablabel' with the default card when unset (default: true)
     \\
     \\    [windows]
     \\        external        Each Neovim window as its own OS window
@@ -1392,6 +1400,22 @@ test "scrollbar.layout parses both values, ignores unknown ones, and needs the b
     );
     defer disabled.deinit();
     try std.testing.expect(!disabled.scrollbar.isColumn());
+}
+
+test "tabline cards and card_provider default on and parse false" {
+    var def = try parseForTest(std.testing.allocator, "");
+    defer def.deinit();
+    try std.testing.expect(def.tabline.cards);
+    try std.testing.expect(def.tabline.card_provider);
+
+    var off = try parseForTest(std.testing.allocator,
+        \\[tabline]
+        \\cards = false
+        \\card_provider = false
+    );
+    defer off.deinit();
+    try std.testing.expect(!off.tabline.cards);
+    try std.testing.expect(!off.tabline.card_provider);
 }
 
 test "declaring one route keeps the defaults for other events" {

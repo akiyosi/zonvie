@@ -47,9 +47,10 @@ final class TabMenuManager {
                 ZonvieCore.appLog("[Tabline] WARNING: menu notification payload cast failed: \(String(describing: notification.userInfo))")
                 return
             }
-            self.tablinesByCore[ObjectIdentifier(sender)] = (info.tabs, info.currentTab)
+            let tabs = info.tabs.map { (handle: $0.handle, name: $0.name) }
+            self.tablinesByCore[ObjectIdentifier(sender)] = (tabs, info.currentTab)
             if sender === self.viewController?.core {
-                self.updateMenu(tabs: info.tabs, currentTab: info.currentTab)
+                self.updateMenu(tabs: tabs, currentTab: info.currentTab)
             }
         }
 

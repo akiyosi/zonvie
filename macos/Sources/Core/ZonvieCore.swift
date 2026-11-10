@@ -8782,7 +8782,7 @@ final class ZonvieCore {
         buffers: UnsafePointer<zonvie_buffer_entry>?,
         bufferCount: Int
     ) {
-        var parsedTabs: [(handle: Int64, name: String)] = []
+        var parsedTabs: [(handle: Int64, name: String, chunks: [TabChunk])] = []
         if let tabs {
             for i in 0..<tabCount {
                 let tab = tabs[i]
@@ -8792,7 +8792,32 @@ final class ZonvieCore {
                 } else {
                     name = ""
                 }
-                parsedTabs.append((handle: tab.tab_handle, name: name))
+                // Chunk pointers live only for this callback: copy them out here.
+                var chunks: [TabChunk] = []
+                if let chunkPtr = tab.chunks {
+                    chunks.reserveCapacity(Int(tab.chunk_count))
+                    for c in 0..<Int(tab.chunk_count) {
+                        let ch = chunkPtr[c]
+                        let text = ch.text.map {
+                            String(decoding: UnsafeBufferPointer(start: $0, count: Int(ch.text_len)), as: UTF8.self)
+                        } ?? ""
+                        func color(_ rgb: UInt32, _ bit: UInt32) -> NSColor? {
+                            guard ch.flags & bit != 0 else { return nil }
+                            return NSColor(srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255.0,
+                                           green: CGFloat((rgb >> 8) & 0xFF) / 255.0,
+                                           blue: CGFloat(rgb & 0xFF) / 255.0, alpha: 1.0)
+                        }
+                        chunks.append(TabChunk(
+                            text: text,
+                            fg: color(ch.fg_rgb, UInt32(ZONVIE_TAB_CHUNK_HAS_FG)),
+                            bg: color(ch.bg_rgb, UInt32(ZONVIE_TAB_CHUNK_HAS_BG)),
+                            bold: ch.flags & UInt32(ZONVIE_TAB_CHUNK_BOLD) != 0,
+                            italic: ch.flags & UInt32(ZONVIE_TAB_CHUNK_ITALIC) != 0,
+                            underline: ch.flags & UInt32(ZONVIE_TAB_CHUNK_UNDERLINE) != 0,
+                            strikethrough: ch.flags & UInt32(ZONVIE_TAB_CHUNK_STRIKETHROUGH) != 0))
+                    }
+                }
+                parsedTabs.append((handle: tab.tab_handle, name: name, chunks: chunks))
             }
         }
 
@@ -8941,9 +8966,9 @@ final class ZonvieCore {
     /// Container for tabline update data passed via NSNotification.object.
     /// Uses a reference type to avoid Obj-C bridging issues with named tuples in userInfo.
     final class TablineUpdateInfo {
-        let tabs: [(handle: Int64, name: String)]
+        let tabs: [(handle: Int64, name: String, chunks: [TabChunk])]
         let currentTab: Int64
-        init(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
+        init(tabs: [(handle: Int64, name: String, chunks: [TabChunk])], currentTab: Int64) {
             self.tabs = tabs
             self.currentTab = currentTab
         }

@@ -491,9 +491,11 @@ final class TabBarView: NSView {
 
     let agentIndicator = AgentIndicator()
 
-    /// Beautified tab label (basename of the term:// or file path).
+    /// Beautified tab label (basename of the term:// or file path), single
+    /// line: a multi-line 'guitablabel' shows only its first line.
     static func baseLabel(_ name: String) -> String {
-        return name.isEmpty ? "[No Name]" : (name as NSString).lastPathComponent
+        let line = TabCardLayout.firstLine(name)
+        return line.isEmpty ? "[No Name]" : (line as NSString).lastPathComponent
     }
 
     /// Update one tab's agent state; drives the animation timer + repaint.
@@ -755,7 +757,7 @@ final class TabBarView: NSView {
                     // Entering external drag mode
                     isExternalDrag = true
                     ZonvieCore.appLog("[TAB-DRAG] Entering external drag mode for tab \(tabIndex)")
-                    dragPreviewHelper.create(tabName: draggedTab.name, at: screenLocation)
+                    dragPreviewHelper.create(tabName: TabCardLayout.firstLine(draggedTab.name), at: screenLocation)
                 } else if !isOutsideTabBar && isExternalDrag {
                     // Returning to normal drag mode
                     isExternalDrag = false

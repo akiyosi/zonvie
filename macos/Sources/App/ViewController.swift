@@ -42,7 +42,7 @@ final class ViewController: NSViewController {
     private var agentStatusObserver: Any?
 
     // Current tab list for lookup
-    private var currentTabs: [(handle: Int64, name: String)] = []
+    private var currentTabs: [(handle: Int64, name: String, chunks: [TabChunk])] = []
 
     // `--dialog` startup dialog: deferred to viewDidAppear (needs a window to
     // host the sheet). `pendingConnectDialog` is armed in viewDidLoad when the
@@ -633,14 +633,14 @@ final class ViewController: NSViewController {
         }
     }
 
-    private func handleTablineUpdate(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
+    private func handleTablineUpdate(tabs: [(handle: Int64, name: String, chunks: [TabChunk])], currentTab: Int64) {
         self.currentTabs = tabs
         tabBarView?.isHidden = false
         sidebarView?.isHidden = sidebarCollapsed
         tablineShown = true
         updateTitlebarRevealPin()
         updateGridInsets()
-        tabBarView?.updateTabs(tabs, currentTab: currentTab)
+        tabBarView?.updateTabs(tabs.map { (handle: $0.handle, name: $0.name) }, currentTab: currentTab)
         sidebarView?.updateTabs(tabs, currentTab: currentTab)
     }
 

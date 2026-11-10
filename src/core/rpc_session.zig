@@ -1284,12 +1284,59 @@ pub fn setupClipboard(self: *Core) void {
 /// currently shows the buffer when a notify-worthy edge fires, buftab[]
 /// (the last tab seen showing it) is used as a fallback delivery target.
 /// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
+///
+/// The same chunk carries the default sidebar card provider: the global Lua
+/// function __zonvie_card_label(), installed into 'guitablabel' only when the
+/// option is empty (or already holds the provider's own expression, i.e. a
+/// re-injection). It reads the reporter's per-tab state directly, so the
+/// reporter's state tables exist whenever the provider is on; the reporter's
+/// autocmds, exit poll and notifications are installed only when an agent
+/// feature is on.
+///
+/// The provider is enabled only on macOS with `cards`, `card_provider` and
+/// the sidebar tabline style: the macOS sidebar is the only frontend that
+/// draws cards, and 'guitablabel' is a global Neovim option shared by every
+/// attached UI, so writing it anywhere else would only change other UIs.
 pub fn setupAgentStatus(self: *Core) void {
-    // Skip the reporter entirely when both the indicator and the completion
-    // notification are disabled -- nothing would consume the status updates.
-    if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
-    const lua_code =
+    const agent_on = self.msg_config.tabline.agent_indicator or self.msg_config.tabline.agent_notification;
+    const card_on = cardProviderEnabled(self.msg_config.tabline, builtin.os.tag);
+    // Nothing would consume the status updates or the card label.
+    if (!agent_on and !card_on) return;
+    const prefix = if (agent_on)
+        (if (card_on) "local agent_on, card_on = true, true\n" else "local agent_on, card_on = true, false\n")
+    else
+        "local agent_on, card_on = false, true\n";
+    const lua_code = std.mem.concat(self.alloc, u8, &.{ prefix, lua_body }) catch |e| {
+        self.log.write("setupAgentStatus: concat failed: {any}\n", .{e});
+        return;
+    };
+    defer self.alloc.free(lua_code);
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupAgentStatus: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+    self.log.write("agent status reporter installed (agent={any} card={any})\n", .{ agent_on, card_on });
+}
+
+fn cardProviderEnabled(t: config.Config.TablineConfig, os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .macos and t.cards and t.card_provider and std.mem.eql(u8, t.style, "sidebar");
+}
+
+test "card provider gate: macOS sidebar with cards and card_provider only" {
+    const on: config.Config.TablineConfig = .{ .style = "sidebar" };
+    try std.testing.expect(cardProviderEnabled(on, .macos));
+    try std.testing.expect(!cardProviderEnabled(on, .windows));
+    try std.testing.expect(!cardProviderEnabled(.{}, .macos));
+    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .cards = false }, .macos));
+    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .card_provider = false }, .macos));
+}
+
+const lua_body =
         \\local present, kind, last, bufstate, buftitle = {}, {}, {}, {}, {}
+        \\-- changed_at: per-tab os.time() of the last reported state change, for
+        \\-- the card's elapsed time. card_changed is assigned by the card
+        \\-- provider below (nil until then).
+        \\local changed_at, card_changed = {}, nil
         \\-- prevb: per-buffer previous state, used to edge-detect a completion
         \\-- worth an OS notification. Per-buffer (not per-tab) because a buffer
         \\-- keeps its identity while hidden, unlike a tab's derived state.
@@ -1366,6 +1413,10 @@ pub fn setupAgentStatus(self: *Core) void {
         \\-- equals the base state.
         \\local function report(tab, state, title, notify)
         \\  if not notify and last[tab] == state then return end
+        \\  if last[tab] ~= state then
+        \\    changed_at[tab] = os.time()
+        \\    if card_changed then card_changed(tab, state) end
+        \\  end
         \\  last[tab] = state
         \\  -- zonvie's own channel (set by setupClipboard on this pipe, ahead of
         \\  -- us). Channel 0 would broadcast to every RPC client, and coc.nvim
@@ -1458,6 +1509,109 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  end, 800)
         \\end
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
+        \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
+        \\_G.__zonvie_agent_timer = nil
+        \\-- Default sidebar card provider. 'guitablabel' is evaluated per tab
+        \\-- (v:lnum = tab number); the label is three lines joined by %{"\n"}:
+        \\-- title, cwd and branch, status with elapsed minutes and a dirty dot.
+        \\-- Ownership: written only when empty at injection, or reclaimed when
+        \\-- it already holds this expression (re-injection). Any OptionSet from
+        \\-- anyone else ends ownership for good. Stock Neovim rejects setting
+        \\-- 'guitablabel', hence the pcall.
+        \\local CARD_EXPR = '%{%v:lua.__zonvie_card_label()%}'
+        \\local card_owned = false
+        \\-- git[cwd] = { out, branch, dirty }; one async status per cwd at a time.
+        \\local git, git_busy = {}, {}
+        \\-- unread[tab]: the agent finished while another tab was current; cleared
+        \\-- when the tab is entered or its state moves on.
+        \\local unread = {}
+        \\local function esc(s) return (s:gsub('%%', '%%%%')) end
+        \\local function tab_cwd(tab) return vim.fn.getcwd(-1, vim.api.nvim_tabpage_get_number(tab)) end
+        \\local function git_refresh(cwd)
+        \\  if not card_owned or git_busy[cwd] then return end
+        \\  git_busy[cwd] = true
+        \\  local ok = pcall(vim.system, { 'git', '-C', cwd, 'status', '--porcelain=v2', '--branch' },
+        \\    { text = true }, function(r)
+        \\      local out = (r.code == 0 and r.stdout) or ''
+        \\      vim.schedule(function()
+        \\        git_busy[cwd] = nil
+        \\        if git[cwd] and git[cwd].out == out then return end
+        \\        local branch = out:match('# branch%.head ([^\n]+)')
+        \\        if branch == '(detached)' then branch = nil end
+        \\        git[cwd] = { out = out, branch = branch, dirty = ('\n' .. out):find('\n[^#\n]') ~= nil }
+        \\        pcall(vim.cmd.redrawtabline)
+        \\      end)
+        \\    end)
+        \\  -- Spawn failure (git missing): cache an empty result so label
+        \\  -- evaluation does not reschedule git on every redraw.
+        \\  if not ok then git_busy[cwd] = nil; git[cwd] = git[cwd] or { out = '' } end
+        \\end
+        \\card_changed = function(tab, state)
+        \\  if not card_owned then return end
+        \\  unread[tab] = (state == 1 and tab ~= vim.api.nvim_get_current_tabpage()) or nil
+        \\  vim.schedule(function()
+        \\    if not vim.api.nvim_tabpage_is_valid(tab) then return end
+        \\    git_refresh(tab_cwd(tab))
+        \\    pcall(vim.cmd.redrawtabline)
+        \\  end)
+        \\end
+        \\local STATUS = {
+        \\  [2] = { 'Working', 'DiagnosticWarn' }, [3] = { 'Working', 'DiagnosticWarn' },
+        \\  [4] = { 'Needs input', 'DiagnosticError' }, [1] = { 'Done', 'DiagnosticOk' },
+        \\}
+        \\_G.__zonvie_card_label = function()
+        \\  local nr = vim.v.lnum
+        \\  local tab = vim.api.nvim_list_tabpages()[nr]
+        \\  if not tab then return '' end
+        \\  local s, title = tab_agent_state(tab)
+        \\  local cwd = vim.fn.getcwd(-1, nr)
+        \\  local g = git[cwd]
+        \\  if not g then vim.schedule(function() if not git[cwd] then git_refresh(cwd) end end) end
+        \\  -- Neovim combines each group over TabLine / TabLineSel, so a part
+        \\  -- shows the base's colours and bold wherever its group sets none.
+        \\  local l1 = '%#Bold#' .. ((s ~= 0 and title ~= '') and esc(title) or '%t')
+        \\  local l2 = '%#Comment#' .. esc(vim.fn.fnamemodify(cwd, ':~'))
+        \\    .. ((g and g.branch) and (' · ' .. esc(g.branch)) or '')
+        \\  -- No agent: no status, only the dirty dot. A read Done is greyed.
+        \\  local st, l3 = STATUS[s], ''
+        \\  if st then
+        \\    local min = math.floor((os.time() - (changed_at[tab] or os.time())) / 60)
+        \\    local hl = (s == 1 and not unread[tab]) and 'Comment' or st[2]
+        \\    l3 = '%#' .. hl .. '#' .. st[1] .. '%#Comment# ' .. min .. 'm'
+        \\  end
+        \\  if g and g.dirty then l3 = l3 .. (l3 == '' and '' or ' ') .. '%#Changed#●' end
+        \\  return l1 .. '%{"\\n"}' .. l2 .. '%{"\\n"}' .. l3
+        \\end
+        \\local gok, cur = pcall(function() return vim.o.guitablabel end)
+        \\if card_on and gok and (cur == '' or cur:find('__zonvie_card_label', 1, true)) then
+        \\  card_owned = cur ~= '' or pcall(function() vim.o.guitablabel = CARD_EXPR end)
+        \\end
+        \\if card_owned then
+        \\  -- Created after our own write above, so only others' writes land here.
+        \\  vim.api.nvim_create_autocmd('OptionSet', {
+        \\    group = grp, pattern = 'guitablabel',
+        \\    callback = function() card_owned = false end,
+        \\  })
+        \\  -- OptionSet does not fire while Neovim is starting, so a user init
+        \\  -- that sets the option after injection is caught here instead.
+        \\  if vim.v.vim_did_enter == 0 then
+        \\    vim.api.nvim_create_autocmd('VimEnter', {
+        \\      group = grp, once = true,
+        \\      callback = function()
+        \\        if vim.o.guitablabel ~= CARD_EXPR then card_owned = false end
+        \\      end,
+        \\    })
+        \\  end
+        \\  vim.api.nvim_create_autocmd('TabEnter', {
+        \\    group = grp,
+        \\    callback = function() unread[vim.api.nvim_get_current_tabpage()] = nil end,
+        \\  })
+        \\  vim.api.nvim_create_autocmd({ 'TabEnter', 'DirChanged', 'BufWritePost', 'TermClose' }, {
+        \\    group = grp,
+        \\    callback = function() vim.schedule(function() git_refresh(vim.fn.getcwd()) end) end,
+        \\  })
+        \\end
+        \\if not agent_on then return end
         \\vim.api.nvim_create_autocmd('TermRequest', {
         \\  group = grp,
         \\  callback = function(ev)
@@ -1496,6 +1650,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\-- terminal title to "" but fires NO TermRequest, so poll present
         \\-- buffers and drop the indicator when the title goes empty.
         \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
+        \\local card_tick = 0
         \\_G.__zonvie_agent_timer = vim.fn.timer_start(500, function()
         \\  for buf in pairs(present) do
         \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
@@ -1516,15 +1671,21 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      prevb[buf] = nil; buftab[buf] = nil
         \\    end
         \\  end
+        \\  -- Card upkeep rides this poll, so it costs nothing without an agent:
+        \\  -- every 10 s re-read git for tabs whose agent is working, every 30 s
+        \\  -- redraw so the elapsed minutes advance.
+        \\  card_tick = card_tick + 1
+        \\  if card_owned and next(present) then
+        \\    if card_tick % 20 == 0 then
+        \\      for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+        \\        local s = tab_agent_state(t)
+        \\        if s == 2 or s == 3 then git_refresh(tab_cwd(t)) end
+        \\      end
+        \\    end
+        \\    if card_tick % 60 == 0 then pcall(vim.cmd.redrawtabline) end
+        \\  end
         \\end, { ['repeat'] = -1 })
-    ;
-
-    self.requestExecLua(lua_code) catch |e| {
-        self.log.write("setupAgentStatus: requestExecLua failed: {any}\n", .{e});
-        return;
-    };
-    self.log.write("agent status reporter installed\n", .{});
-}
+;
 
 /// Report the 'ver' component of 'mousescroll' — how many rows one wheel
 /// event scrolls — and keep reporting it when the option changes.

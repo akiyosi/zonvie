@@ -5858,11 +5858,32 @@ pub fn notifyTablineChanges(self: *Core) void {
         defer c_tabs.deinit(self.alloc);
         c_tabs.ensureTotalCapacity(self.alloc, state.tabs.items.len) catch return;
 
+        // One chunk list for all tabs; each tab points at its own slice.
+        var total_chunks: usize = 0;
+        for (state.tabs.items) |tab| total_chunks += tab.chunks.len;
+        var c_chunks: std.ArrayListUnmanaged(c_api.TabChunk) = .empty;
+        defer c_chunks.deinit(self.alloc);
+        c_chunks.ensureTotalCapacity(self.alloc, total_chunks) catch return;
+
         for (state.tabs.items) |tab| {
+            const first = c_chunks.items.len;
+            for (tab.chunks) |chunk| {
+                const colors = self.hl.resolveTabChunk(chunk.attr_id);
+                c_chunks.appendAssumeCapacity(.{
+                    .fg_rgb = colors.fg_rgb,
+                    .bg_rgb = colors.bg_rgb,
+                    .flags = colors.flags,
+                    .text = chunk.text.ptr,
+                    .text_len = chunk.text.len,
+                });
+            }
+            // Slices are taken only after the list stops growing (capacity is reserved above).
             c_tabs.appendAssumeCapacity(.{
                 .tab_handle = tab.tab_handle,
                 .name = tab.name.ptr,
                 .name_len = tab.name.len,
+                .chunks = if (tab.chunks.len > 0) c_chunks.items[first..].ptr else null,
+                .chunk_count = tab.chunks.len,
             });
         }
 

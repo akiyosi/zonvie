@@ -359,7 +359,43 @@ pub const Highlights = struct {
             .style_flags = style_flags,
         };
     }
+
+    /// Resolves a tabline chunk attr from the raw Attr, without substituting
+    /// default colours: a colour the attr does not set stays unset so the
+    /// frontend's own card colours apply. Unknown ids resolve to no colours
+    /// and no style.
+    pub fn resolveTabChunk(self: *const Highlights, id: u32) TabChunkColors {
+        const raw = self.map.get(id) orelse Attr{};
+        var fg_rgb: u32 = raw.fg orelse 0;
+        var bg_rgb: u32 = raw.bg orelse 0;
+        var flags: u32 = 0;
+        if (raw.fg != null) flags |= TAB_CHUNK_HAS_FG;
+        if (raw.bg != null) flags |= TAB_CHUNK_HAS_BG;
+        if (raw.reverse) {
+            // Swap the colours and their HAS bits together.
+            std.mem.swap(u32, &fg_rgb, &bg_rgb);
+            const has_fg = flags & TAB_CHUNK_HAS_FG != 0;
+            const has_bg = flags & TAB_CHUNK_HAS_BG != 0;
+            flags &= ~(TAB_CHUNK_HAS_FG | TAB_CHUNK_HAS_BG);
+            if (has_bg) flags |= TAB_CHUNK_HAS_FG;
+            if (has_fg) flags |= TAB_CHUNK_HAS_BG;
+        }
+        if (raw.bold) flags |= TAB_CHUNK_BOLD;
+        if (raw.italic) flags |= TAB_CHUNK_ITALIC;
+        if (raw.underline) flags |= TAB_CHUNK_UNDERLINE;
+        if (raw.strikethrough) flags |= TAB_CHUNK_STRIKETHROUGH;
+        return .{ .fg_rgb = fg_rgb, .bg_rgb = bg_rgb, .flags = flags };
+    }
 };
+
+/// Per-chunk colours and style for tabline labels. Flag values cross the C ABI.
+pub const TabChunkColors = struct { fg_rgb: u32, bg_rgb: u32, flags: u32 };
+pub const TAB_CHUNK_HAS_FG: u32 = 1 << 0;
+pub const TAB_CHUNK_HAS_BG: u32 = 1 << 1;
+pub const TAB_CHUNK_BOLD: u32 = 1 << 2;
+pub const TAB_CHUNK_ITALIC: u32 = 1 << 3;
+pub const TAB_CHUNK_UNDERLINE: u32 = 1 << 4;
+pub const TAB_CHUNK_STRIKETHROUGH: u32 = 1 << 5;
 
 test "colour resolution blends before it reverses, and both paths agree" {
     // highlight.zig had no tests at all, and get() and getWithStyles()
@@ -437,4 +473,56 @@ test "the packed style byte keeps its wire values" {
     // Overline has no bit -- nine booleans, eight bits -- and travels
     // separately. Its presence must not have set one.
     try std.testing.expect(a.overline);
+}
+
+test "resolveTabChunk reports fg and bg only when the attr sets them" {
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    hl.setDefaults(0x111111, 0x222222, null);
+    try hl.define(5, 0xff0000, null, null, false, 0, .{}, false);
+
+    const c = hl.resolveTabChunk(5);
+    try std.testing.expect(c.flags & TAB_CHUNK_HAS_FG != 0);
+    try std.testing.expect(c.flags & TAB_CHUNK_HAS_BG == 0);
+    try std.testing.expectEqual(@as(u32, 0xff0000), c.fg_rgb);
+}
+
+test "resolveTabChunk honours reverse by swapping the set colours" {
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    hl.setDefaults(0x111111, 0x222222, null);
+    try hl.define(6, 0x111111, 0x222222, null, true, 0, .{}, false);
+    try hl.define(7, 0xabcdef, null, null, true, 0, .{}, false);
+
+    const c = hl.resolveTabChunk(6);
+    try std.testing.expectEqual(@as(u32, 0x222222), c.fg_rgb);
+    try std.testing.expectEqual(@as(u32, 0x111111), c.bg_rgb);
+    try std.testing.expect(c.flags & TAB_CHUNK_HAS_FG != 0);
+    try std.testing.expect(c.flags & TAB_CHUNK_HAS_BG != 0);
+
+    // Only fg set: reverse moves it to bg and the HAS bits move with it.
+    const d = hl.resolveTabChunk(7);
+    try std.testing.expect(d.flags & TAB_CHUNK_HAS_FG == 0);
+    try std.testing.expect(d.flags & TAB_CHUNK_HAS_BG != 0);
+    try std.testing.expectEqual(@as(u32, 0xabcdef), d.bg_rgb);
+}
+
+test "resolveTabChunk of an unknown or zero id has no colours and no style" {
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    hl.setDefaults(0x111111, 0x222222, null);
+
+    try std.testing.expectEqual(@as(u32, 0), hl.resolveTabChunk(0).flags);
+    try std.testing.expectEqual(@as(u32, 0), hl.resolveTabChunk(999).flags);
+}
+
+test "resolveTabChunk carries bold italic underline strikethrough" {
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try hl.define(8, null, null, null, false, 0, .{ .bold = true, .italic = true, .underline = true, .strikethrough = true }, false);
+    try hl.define(9, null, null, null, false, 0, .{ .italic = true }, false);
+
+    const all = TAB_CHUNK_BOLD | TAB_CHUNK_ITALIC | TAB_CHUNK_UNDERLINE | TAB_CHUNK_STRIKETHROUGH;
+    try std.testing.expectEqual(all, hl.resolveTabChunk(8).flags);
+    try std.testing.expectEqual(TAB_CHUNK_ITALIC, hl.resolveTabChunk(9).flags);
 }

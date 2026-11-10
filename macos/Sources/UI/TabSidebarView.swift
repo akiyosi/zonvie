@@ -184,9 +184,20 @@ final class TabSidebarView: NSView {
         let handle: Int64
         let name: String
         var isSelected: Bool
+        /// Card lines from 'guitablabel'; empty when the tab draws as a
+        /// single-line row (no chunks, or cards off).
+        let cardLines: [[TabChunk]]
     }
 
     private var tabs: [Tab] = []
+    /// Top of each row plus the bottom of the last (tabs.count + 1 entries),
+    /// recomputed whenever `tabs` changes.
+    private var rowOffsets_pt: [CGFloat] = [0]
+
+    private func rowRect(_ index: Int, width: CGFloat) -> NSRect {
+        NSRect(x: 0, y: rowOffsets_pt[index], width: width,
+               height: rowOffsets_pt[index + 1] - rowOffsets_pt[index])
+    }
     private var currentTab: Int64 = 0
 
     // AI-agent indicator (set via on_agent_status). Shared with TabBarView.
@@ -231,7 +242,6 @@ final class TabSidebarView: NSView {
     }
 
     // Appearance constants
-    private let tabRowHeight: CGFloat = 28
     private let tabPadding: CGFloat = 12
     private let closeButtonSize: CGFloat = 14
     private let newTabButtonHeight: CGFloat = 32
@@ -512,29 +522,32 @@ final class TabSidebarView: NSView {
         let isInternalDrag = draggingTabIndex != nil && dropTargetIndex != nil && !isExternalDrag
 
         // Draw tab rows
-        var y: CGFloat = 0
         for (index, tab) in tabs.enumerated() {
-            let rowRect = NSRect(x: 0, y: y, width: bounds.width - separatorWidth, height: tabRowHeight)
             let isBeingDragged = isInternalDrag && index == draggingTabIndex
-            drawTabRow(tab, in: rowRect, index: index, isBeingDragged: isBeingDragged)
-            y += tabRowHeight
+            drawTabRow(tab, in: rowRect(index, width: bounds.width - separatorWidth), index: index,
+                       isBeingDragged: isBeingDragged)
         }
 
         // Draw "New Tab" button below tab list
-        drawNewTabButton(at: y)
+        drawNewTabButton(at: rowOffsets_pt[tabs.count])
 
         // Draw drop indicator and floating tab (after everything else so they're on top)
-        if isInternalDrag, let dragIdx = draggingTabIndex, let targetIdx = dropTargetIndex {
+        // A tabline_update can shrink `tabs` mid-drag (the tracking loop
+        // drains the main queue), so both indices are checked against it.
+        if isInternalDrag, let dragIdx = draggingTabIndex, let targetIdx = dropTargetIndex,
+           dragIdx < tabs.count {
             // A) Drop indicator line
             if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
-                let indicatorY = CGFloat(targetIdx) * tabRowHeight
+                let indicatorY = rowOffsets_pt[min(targetIdx, tabs.count)]
                 NSColor.controlAccentColor.setFill()
                 NSRect(x: 0, y: indicatorY - 1, width: bounds.width - separatorWidth, height: 2).fill()
             }
 
-            // B) Floating tab row
+            // B) Floating tab row, as tall as the dragged row; it shows the
+            // first line only.
             let floatY = dragCurrentY - dragOffsetY
-            let floatRect = NSRect(x: 2, y: floatY, width: bounds.width - separatorWidth - 4, height: tabRowHeight)
+            let floatRect = NSRect(x: 2, y: floatY, width: bounds.width - separatorWidth - 4,
+                                   height: rowRect(dragIdx, width: 0).height)
             let floatPath = NSBezierPath(roundedRect: floatRect, xRadius: 4, yRadius: 4)
 
             NSColor.controlAccentColor.withAlphaComponent(0.3).setFill()
@@ -543,9 +556,7 @@ final class TabSidebarView: NSView {
             floatPath.lineWidth = 1.0
             floatPath.stroke()
 
-            // Draw tab name in floating row. A tabline_update can shrink
-            // `tabs` mid-drag (the tracking loop drains the main queue).
-            guard dragIdx < tabs.count else { return }
+            // Draw tab name in floating row.
             let tab = tabs[dragIdx]
             let font = NSFont.systemFont(ofSize: 12, weight: .medium)
             let paragraphStyle = NSMutableParagraphStyle()
@@ -557,7 +568,7 @@ final class TabSidebarView: NSView {
             ]
             let textRect = NSRect(
                 x: tabPadding + 2,
-                y: floatY + (tabRowHeight - 16) / 2,
+                y: floatY + TabCardLayout.verticalPadding_pt / 2,
                 width: floatRect.width - tabPadding * 2,
                 height: 16
             )
@@ -601,36 +612,79 @@ final class TabSidebarView: NSView {
 
         let closeWidth: CGFloat = (isSelected || isHovered) ? closeButtonSize + 8 : 0
         let textX = isSelected ? tabPadding + 3 : tabPadding
+        let lineH = TabCardLayout.lineHeight_pt
         let textRect = NSRect(
             x: textX,
-            y: rect.minY + (rect.height - 16) / 2,
+            y: rect.minY + TabCardLayout.rowPadding_pt(lineCount: tab.cardLines.count) / 2,
             width: rect.width - textX - tabPadding - closeWidth,
-            height: 16
+            height: lineH
         )
 
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineBreakMode = .byTruncatingTail
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .foregroundColor: textColor,
-            .font: font,
-            .paragraphStyle: paragraphStyle
-        ]
-        let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: textColor)
-        let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
-                               width: textRect.width - indicatorW, height: textRect.height)
-        TabBarView.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
+        if tab.cardLines.isEmpty {
+            let attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: textColor,
+                .font: font,
+                .paragraphStyle: paragraphStyle
+            ]
+            let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: textColor)
+            let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
+                                   width: textRect.width - indicatorW, height: textRect.height)
+            TabBarView.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
+        } else {
+            for (lineIdx, line) in tab.cardLines.enumerated() {
+                // Regular base: weight comes only from the chunks' highlight
+                // (bold), i.e. from 'guitablabel' and the TabLine groups.
+                let lineFont = NSFont.systemFont(ofSize: lineIdx == 0 ? 12 : 11, weight: .regular)
+                var lineRect = textRect.offsetBy(dx: 0, dy: CGFloat(lineIdx) * lineH)
+                if lineIdx == 0 {
+                    let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: lineRect, font: lineFont, color: textColor)
+                    lineRect.origin.x += indicatorW
+                    lineRect.size.width -= indicatorW
+                } else {
+                    // The close button sits beside the first line only.
+                    lineRect.size.width += closeWidth
+                }
+                cardLineString(line, font: lineFont, defaultColor: textColor, paragraphStyle: paragraphStyle)
+                    .draw(with: lineRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            }
+        }
 
         // Close button (X) on hover or selected
         if isSelected || isHovered {
-            let closeRect = NSRect(
-                x: rect.maxX - closeButtonSize - 8,
-                y: rect.midY - closeButtonSize / 2,
-                width: closeButtonSize,
-                height: closeButtonSize
-            )
+            let closeRect = closeButtonRect(in: rect, lineCount: tab.cardLines.count)
             drawCloseButton(in: closeRect, highlighted: hoveredCloseButton == index)
         }
+    }
+
+    /// One card line as runs in their chunk styles. A chunk without fg takes
+    /// the row's text colour. Chunk bg is never painted: Neovim combines every
+    /// chunk over TabLine/TabLineSel, so its bg is that base, which would
+    /// show as a band over the card's own background.
+    private func cardLineString(_ line: [TabChunk], font: NSFont, defaultColor: NSColor,
+                                paragraphStyle: NSParagraphStyle) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for chunk in line {
+            var runFont = font
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if chunk.bold { traits.insert(.bold) }
+            if chunk.italic { traits.insert(.italic) }
+            if !traits.isEmpty {
+                let desc = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(traits))
+                runFont = NSFont(descriptor: desc, size: font.pointSize) ?? font
+            }
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: runFont,
+                .foregroundColor: chunk.fg ?? defaultColor,
+                .paragraphStyle: paragraphStyle,
+            ]
+            if chunk.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            if chunk.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            result.append(NSAttributedString(string: chunk.text, attributes: attrs))
+        }
+        return result
     }
 
     private func drawCloseButton(in rect: NSRect, highlighted: Bool) {
@@ -694,30 +748,31 @@ final class TabSidebarView: NSView {
     // MARK: - Hit Testing
 
     private func tabIndex(at point: NSPoint) -> Int? {
-        guard !tabs.isEmpty else { return nil }
-        for index in 0..<tabs.count {
-            let rowRect = NSRect(x: 0, y: CGFloat(index) * tabRowHeight, width: bounds.width, height: tabRowHeight)
-            if rowRect.contains(point) {
-                return index
-            }
-        }
-        return nil
+        guard point.x >= 0, point.x < bounds.width else { return nil }
+        return TabCardLayout.rowIndex(atY: point.y, offsets: rowOffsets_pt)
     }
 
     private func isCloseButton(at point: NSPoint, tabIndex: Int) -> Bool {
         guard tabIndex < tabs.count else { return false }
-        let rowRect = NSRect(x: 0, y: CGFloat(tabIndex) * tabRowHeight, width: bounds.width - separatorWidth, height: tabRowHeight)
-        let closeRect = NSRect(
+        let rowRect = rowRect(tabIndex, width: bounds.width - separatorWidth)
+        return closeButtonRect(in: rowRect, lineCount: tabs[tabIndex].cardLines.count).contains(point)
+    }
+
+    /// Top-right of the row, centred on the first text line (for a one-line
+    /// row that is the row's centre).
+    private func closeButtonRect(in rowRect: NSRect, lineCount: Int) -> NSRect {
+        let firstLineMidY = rowRect.minY + TabCardLayout.rowPadding_pt(lineCount: lineCount) / 2
+            + TabCardLayout.lineHeight_pt / 2
+        return NSRect(
             x: rowRect.maxX - closeButtonSize - 8,
-            y: rowRect.midY - closeButtonSize / 2,
+            y: firstLineMidY - closeButtonSize / 2,
             width: closeButtonSize,
             height: closeButtonSize
         )
-        return closeRect.contains(point)
     }
 
     private func isNewTabButton(at point: NSPoint) -> Bool {
-        let y = CGFloat(tabs.count) * tabRowHeight
+        let y = rowOffsets_pt[tabs.count]
         let rect = NSRect(x: 0, y: y, width: bounds.width, height: newTabButtonHeight)
         return rect.contains(point)
     }
@@ -749,7 +804,7 @@ final class TabSidebarView: NSView {
         dragStartPoint = startLocation
         draggingTabIndex = tabIndex
         isExternalDrag = false
-        dragOffsetY = startLocation.y - CGFloat(tabIndex) * tabRowHeight
+        dragOffsetY = startLocation.y - rowOffsets_pt[tabIndex]
         dragCurrentY = startLocation.y
         dropTargetIndex = nil
         var isDragging = true
@@ -781,7 +836,7 @@ final class TabSidebarView: NSView {
                 if hasMoved && isOutsideSidebar && !isExternalDrag {
                     isExternalDrag = true
                     dropTargetIndex = nil
-                    dragPreviewHelper.create(tabName: draggedTab.name, at: screenLocation)
+                    dragPreviewHelper.create(tabName: TabCardLayout.firstLine(draggedTab.name), at: screenLocation)
                 } else if hasMoved && !isOutsideSidebar && isExternalDrag {
                     isExternalDrag = false
                     dragPreviewHelper.destroy()
@@ -793,9 +848,7 @@ final class TabSidebarView: NSView {
                     // Internal reorder drag
                     dragCurrentY = location.y
 
-                    dropTargetIndex = Int(zonvie_core_tab_drop_index(
-                        Double(location.y), UInt32(tabs.count), 0,
-                        Double(tabRowHeight), Double(tabRowHeight)))
+                    dropTargetIndex = TabCardLayout.dropIndex(atY: location.y, offsets: rowOffsets_pt)
                 }
                 needsDisplay = true
 
@@ -926,8 +979,15 @@ final class TabSidebarView: NSView {
 
     // MARK: - Public API
 
-    func updateTabs(_ newTabs: [(handle: Int64, name: String)], currentTab: Int64) {
-        self.tabs = newTabs.map { Tab(handle: $0.handle, name: $0.name, isSelected: $0.handle == currentTab) }
+    func updateTabs(_ newTabs: [(handle: Int64, name: String, chunks: [TabChunk])], currentTab: Int64) {
+        let cards = ZonvieConfig.shared.tabline.cards
+        self.tabs = newTabs.map {
+            Tab(handle: $0.handle, name: $0.name, isSelected: $0.handle == currentTab,
+                cardLines: cards && !$0.chunks.isEmpty ? TabCardLayout.lines($0.chunks) : [])
+        }
+        rowOffsets_pt = TabCardLayout.rowOffsets_pt(tabs.map {
+            TabCardLayout.rowHeight_pt(lineCount: $0.cardLines.count)
+        })
         self.currentTab = currentTab
         needsDisplay = true
     }

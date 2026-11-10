@@ -215,6 +215,12 @@ test "gui:visual_agent_status" {
     try gated(can_capture, @import("scenarios/visual/agent_status.zig"));
 }
 
+// macOS only: the sidebar cards are drawn by the macOS frontend, and the
+// scenario posts clicks through the macOS window layer.
+test "gui:visual_sidebar_cards" {
+    try gated(is_macos and can_capture, @import("scenarios/visual/sidebar_cards.zig"));
+}
+
 test "gui:visual_split" {
     try gated(can_capture, @import("scenarios/visual/split.zig"));
 }

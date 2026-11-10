@@ -377,6 +377,15 @@ pub fn build(b: *std.Build) !void {
                     "macos/Tests/RowScrollBlitPlanTests.swift",
                 },
             },
+            // Sidebar cards: a label's line breaks, card heights, and the
+            // cumulative row offsets that hit testing and drag reorder use.
+            .{
+                .exe_name = "tab-card-layout-tests",
+                .sources = &.{
+                    "macos/Sources/UI/TabCardLayout.swift",
+                    "macos/Tests/TabCardLayoutTests.swift",
+                },
+            },
             // The Swift sides of shared rules: SurfaceFrameDecision's bridge
             // to the core's terms and decision, layer-placement damage, and
             // the row-capacity ledger's merge. The core calls are stubbed in

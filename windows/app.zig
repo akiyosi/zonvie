@@ -145,11 +145,13 @@ pub fn baseName(name: []const u8) []const u8 {
 }
 
 /// What a tab entry keeps of the core's full name within `cap` bytes: the
-/// basename, which is all any consumer shows, cut on a UTF-8 boundary. Cutting
-/// the full path first lost the file name, or left a split character that
-/// drew no label at all.
+/// first line of the label, then its basename, which is all any consumer shows,
+/// cut on a UTF-8 boundary. The tab bar is single-line, so a 'guitablabel' that
+/// spans lines keeps only its first. Cutting the full path first lost the file
+/// name, or left a split character that drew no label at all.
 pub fn tabNameForStorage(name: []const u8, cap: usize) []const u8 {
-    const base = baseName(name);
+    const first_line = name[0 .. std.mem.indexOfScalar(u8, name, '\n') orelse name.len];
+    const base = baseName(first_line);
     return base[0..utf8TruncLen(base, cap)];
 }
 
@@ -157,6 +159,11 @@ test "tabNameForStorage keeps the basename of a name longer than the cap" {
     try std.testing.expectEqualStrings("file.zig", tabNameForStorage("/very/deep/path/file.zig", 12));
     // "あいう" is 9 bytes; a cap of 7 must not split the third character.
     try std.testing.expectEqualStrings("あい", tabNameForStorage("/d/あいう", 7));
+}
+
+test "tab name storage keeps only the first line of a multi-line label" {
+    try std.testing.expectEqualStrings("a", tabNameForStorage("a\nb", 255));
+    try std.testing.expectEqualStrings("a", tabNameForStorage("a", 255));
 }
 
 test "baseName ignores trailing separators" {
