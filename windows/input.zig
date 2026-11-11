@@ -496,7 +496,7 @@ pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOr
         .style_is_titlebar = app.tabline_style == .titlebar,
         .sidebar_on_right = app.sidebar_position_right,
         .sidebar_width_px = sidebar_caption.gridInsetsPx(app).left,
-        .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
+        .tab_bar_height_px = @as(i32, sidebar_caption.bandPx(app)),
         .title_band = sidebar_caption.titleBand(app),
     });
 }

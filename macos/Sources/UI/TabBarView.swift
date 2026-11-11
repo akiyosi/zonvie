@@ -269,9 +269,17 @@ final class TabBarView: NSView {
         let handle: Int64
         let name: String
         var isSelected: Bool
+        /// The label's lines from 'guitablabel' chunks, at most
+        /// `TabCardLayout.titlebarMaxLines`; empty without chunks.
+        var lines: [[TabChunk]]
     }
 
     private var tabs: [Tab] = []
+    /// The lines the bar is tall enough for (`TabCardLayout.titlebarLineCount`).
+    private(set) var labelLineCount = 1
+    /// Called when `labelLineCount` changes, never for a label whose content
+    /// changes at the same line count: the owner resizes the bar.
+    var onLabelLineCountChange: ((Int) -> Void)?
     private var currentTab: Int64 = 0
     private var hoveredTabIndex: Int? = nil
     private var hoveredCloseButton: Int? = nil
@@ -292,8 +300,15 @@ final class TabBarView: NSView {
 
     // Tab appearance constants
     private let tabHeight: CGFloat = 30
-    /// Tabs are centred in the bar, level with the traffic lights.
-    private var tabTop: CGFloat { (bounds.height - (tabHeight - 6)) / 2 }
+    /// The tab shape at one line. Extra label lines extend it downward, so
+    /// the first line stays where a single-line label sits.
+    private var tabRectBaseHeight: CGFloat { tabHeight - 6 }
+    private var extraLinesHeight: CGFloat {
+        TabCardLayout.titlebarBarHeight_pt(base_pt: 0, lineCount: labelLineCount)
+    }
+    private var tabRectHeight: CGFloat { tabRectBaseHeight + extraLinesHeight }
+    /// Tabs are centred in the bar's one-line band, level with the traffic lights.
+    private var tabTop: CGFloat { (bounds.height - extraLinesHeight - tabRectBaseHeight) / 2 }
     private let tabMinWidth: CGFloat = 100
     private let tabMaxWidth: CGFloat = 200
     private let tabSpacing: CGFloat = 1
@@ -437,14 +452,14 @@ final class TabBarView: NSView {
             let isHovered = hoveredTabIndex == index && !isSelected
             let isBeingDragged = isDragging && draggingTabIndex == index
 
-            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabHeight - 6)
+            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabRectHeight)
             drawTab(tab, in: tabRect, isSelected: isSelected, isHovered: isHovered, isBeingDragged: isBeingDragged, index: index)
 
             x += tabWidth + tabSpacing
         }
 
         // Draw new tab button (+)
-        drawNewTabButton(at: NSPoint(x: x + 8, y: tabTop + 2))
+        drawNewTabButton()
 
         // Draw drop indicator when dragging
         if isDragging, let targetIdx = dropTargetIndex, let dragIdx = draggingTabIndex {
@@ -452,7 +467,7 @@ final class TabBarView: NSView {
             if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
                 let indicatorX = tabX(targetIdx)
                 NSColor.controlAccentColor.setFill()
-                NSRect(x: indicatorX - 1, y: tabTop - 2, width: 2, height: tabHeight - 6).fill()
+                NSRect(x: indicatorX - 1, y: tabTop - 2, width: 2, height: tabRectHeight).fill()
             }
 
             // Draw floating tab at cursor position. A tabline_update can
@@ -460,7 +475,7 @@ final class TabBarView: NSView {
             guard dragIdx < tabs.count else { return }
             let tab = tabs[dragIdx]
             let floatX = dragCurrentX - dragOffsetX
-            let floatRect = NSRect(x: floatX, y: tabTop, width: tabWidth, height: tabHeight - 6)
+            let floatRect = NSRect(x: floatX, y: tabTop, width: tabWidth, height: tabRectHeight)
             let floatPath = NSBezierPath(roundedRect: floatRect, xRadius: tabCornerRadius, yRadius: tabCornerRadius)
 
             // Light blue background with border
@@ -478,7 +493,7 @@ final class TabBarView: NSView {
             ]
             let textRect = NSRect(
                 x: floatX + tabPadding,
-                y: tabTop + (tabHeight - 6 - 16) / 2,
+                y: tabTop + (tabRectBaseHeight - 16) / 2,
                 width: tabWidth - tabPadding * 2,
                 height: 16
             )
@@ -549,7 +564,7 @@ final class TabBarView: NSView {
         let closeButtonWidth: CGFloat = isSelected || isHovered ? tabCloseButtonSize + 8 : 0
         let titleRect = NSRect(
             x: rect.minX + tabPadding,
-            y: rect.minY + (rect.height - 16) / 2,
+            y: rect.minY + (tabRectBaseHeight - 16) / 2,
             width: rect.width - tabPadding * 2 - closeButtonWidth,
             height: 16
         )
@@ -564,20 +579,42 @@ final class TabBarView: NSView {
         ]
 
         let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: titleRect, font: font, color: textColor)
-        let labelRect = NSRect(x: titleRect.minX + indicatorW, y: titleRect.minY,
-                               width: titleRect.width - indicatorW, height: titleRect.height)
-        Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
+        if tab.lines.isEmpty {
+            let labelRect = NSRect(x: titleRect.minX + indicatorW, y: titleRect.minY,
+                                   width: titleRect.width - indicatorW, height: titleRect.height)
+            Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
+        } else {
+            // Verbatim, no basename. Regular base: weight comes only from the
+            // chunks' highlight, as in the sidebar cards.
+            for (lineIdx, line) in tab.lines.enumerated() {
+                let lineFont = NSFont.systemFont(ofSize: lineIdx == 0 ? 12 : 11, weight: .regular)
+                var lineRect = titleRect.offsetBy(dx: 0, dy: CGFloat(lineIdx) * TabCardLayout.lineHeight_pt)
+                if lineIdx == 0 {
+                    lineRect.origin.x += indicatorW
+                    lineRect.size.width -= indicatorW
+                } else {
+                    // The close button sits beside the first line only.
+                    lineRect.size.width += closeButtonWidth
+                }
+                TabCardLayout.attributedLine(line, font: lineFont, defaultColor: textColor, paragraphStyle: paragraphStyle)
+                    .draw(with: lineRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            }
+        }
 
         // Close button (X) - show on selected or hovered tabs
         if isSelected || isHovered {
-            let closeRect = NSRect(
-                x: rect.maxX - tabCloseButtonSize - 8,
-                y: rect.midY - tabCloseButtonSize / 2,
-                width: tabCloseButtonSize,
-                height: tabCloseButtonSize
-            )
-            drawCloseButton(in: closeRect, highlighted: hoveredCloseButton == index)
+            drawCloseButton(in: closeButtonRect(inTab: rect), highlighted: hoveredCloseButton == index)
         }
+    }
+
+    /// Beside the first line; drawing and hit testing both use it.
+    private func closeButtonRect(inTab rect: NSRect) -> NSRect {
+        NSRect(
+            x: rect.maxX - tabCloseButtonSize - 8,
+            y: rect.minY + (tabRectBaseHeight - tabCloseButtonSize) / 2,
+            width: tabCloseButtonSize,
+            height: tabCloseButtonSize
+        )
     }
 
     private func drawCloseButton(in rect: NSRect, highlighted: Bool) {
@@ -597,23 +634,30 @@ final class TabBarView: NSView {
         path.stroke()
     }
 
-    private func drawNewTabButton(at origin: NSPoint) {
-        let size: CGFloat = 20
-        let rect = NSRect(x: origin.x, y: origin.y, width: size, height: size)
+    /// The + button: a 20pt circle at one label line, stretched downward by
+    /// the extra label lines so it spans the tabs' height. Drawing and hit
+    /// testing both use this rect.
+    private var newTabButtonRect: NSRect {
+        NSRect(x: tabX(tabs.count) + 8, y: tabTop + 2, width: 20, height: 20 + extraLinesHeight)
+    }
 
-        // Background on hover (circular, like close button)
+    private func drawNewTabButton() {
+        let rect = newTabButtonRect
+
+        // Background on hover: a circle at one line, a rounded rect when stretched.
         if hoveredNewTabButton {
             NSColor.secondaryLabelColor.withAlphaComponent(0.3).setFill()
-            NSBezierPath(ovalIn: rect).fill()
+            let radius: CGFloat = extraLinesHeight > 0 ? 6 : rect.width / 2
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
         }
 
         NSColor.secondaryLabelColor.setStroke()
         let path = NSBezierPath()
-        let inset: CGFloat = 5
-        path.move(to: NSPoint(x: rect.midX, y: rect.minY + inset))
-        path.line(to: NSPoint(x: rect.midX, y: rect.maxY - inset))
-        path.move(to: NSPoint(x: rect.minX + inset, y: rect.midY))
-        path.line(to: NSPoint(x: rect.maxX - inset, y: rect.midY))
+        let arm: CGFloat = 5
+        path.move(to: NSPoint(x: rect.midX, y: rect.midY - arm))
+        path.line(to: NSPoint(x: rect.midX, y: rect.midY + arm))
+        path.move(to: NSPoint(x: rect.midX - arm, y: rect.midY))
+        path.line(to: NSPoint(x: rect.midX + arm, y: rect.midY))
         path.lineWidth = 1.5
         path.stroke()
     }
@@ -641,7 +685,7 @@ final class TabBarView: NSView {
         var x = windowControlsWidth
 
         for index in 0..<tabs.count {
-            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabHeight - 6)
+            let tabRect = NSRect(x: x, y: tabTop, width: tabWidth, height: tabRectHeight)
             if tabRect.contains(point) {
                 return index
             }
@@ -659,23 +703,12 @@ final class TabBarView: NSView {
     private func isCloseButton(at point: NSPoint, tabIndex: Int) -> Bool {
         guard tabIndex < tabs.count else { return false }
 
-        let tabRect = NSRect(x: tabX(tabIndex), y: tabTop, width: tabWidth, height: tabHeight - 6)
-
-        let closeRect = NSRect(
-            x: tabRect.maxX - tabCloseButtonSize - 8,
-            y: tabRect.midY - tabCloseButtonSize / 2,
-            width: tabCloseButtonSize,
-            height: tabCloseButtonSize
-        )
-
-        return closeRect.contains(point)
+        let tabRect = NSRect(x: tabX(tabIndex), y: tabTop, width: tabWidth, height: tabRectHeight)
+        return closeButtonRect(inTab: tabRect).contains(point)
     }
 
     private func isNewTabButton(at point: NSPoint) -> Bool {
-        let x = tabX(tabs.count) + 8
-        let rect = NSRect(x: x, y: tabTop + 2, width: 20, height: 20)
-
-        return rect.contains(point)
+        newTabButtonRect.contains(point)
     }
 
     // MARK: - Mouse Events
@@ -930,9 +963,16 @@ final class TabBarView: NSView {
 
     // MARK: - Public API
 
-    func updateTabs(_ newTabs: [(handle: Int64, name: String)], currentTab: Int64) {
-        self.tabs = newTabs.map { Tab(handle: $0.handle, name: $0.name, isSelected: $0.handle == currentTab) }
+    func updateTabs(_ newTabs: [(handle: Int64, name: String, chunks: [TabChunk])], currentTab: Int64) {
+        self.tabs = newTabs.map {
+            Tab(handle: $0.handle, name: $0.name, isSelected: $0.handle == currentTab,
+                lines: TabCardLayout.titlebarLines($0.chunks))
+        }
         self.currentTab = currentTab
+        if let lineCount = TabCardLayout.titlebarLineCountChange(from: labelLineCount, tabLines: tabs.map(\.lines)) {
+            labelLineCount = lineCount
+            onLabelLineCountChange?(lineCount)
+        }
         needsDisplay = true
     }
 

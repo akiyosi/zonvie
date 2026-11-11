@@ -148,7 +148,7 @@ struct ZonvieConfig {
         var agentIndicator: Bool = true      // per-tab AI-agent status icon
         var agentNotification: Bool = true   // OS notification on agent completion
         var cards: Bool = true               // sidebar draws tabs as multi-line cards
-        var cardProvider: Bool = true        // core fills guitablabel when the user has not
+        var cardProvider: Bool = false       // core fills guitablabel when the user has not
     }
 
     struct WindowsConfig {

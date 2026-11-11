@@ -9,7 +9,8 @@ struct TabChunk: Equatable {
     let bold, italic, underline, strikethrough: Bool
 }
 
-/// Sidebar card geometry, kept free of view state so it can be tested alone.
+/// Multi-line tab label geometry for the sidebar cards and the titlebar tab
+/// bar, kept free of view state so it can be tested alone.
 enum TabCardLayout {
     static let lineHeight_pt: CGFloat = 16
     static let verticalPadding_pt: CGFloat = 12
@@ -75,5 +76,65 @@ enum TabCardLayout {
             return i
         }
         return count
+    }
+
+    /// The titlebar bar grows at most this many lines; lines past it are not
+    /// drawn, so a runaway label cannot take over the editor.
+    static let titlebarMaxLines = 4
+
+    /// The lines a titlebar tab draws: none without chunks (the tab draws its
+    /// name as before), otherwise the label's lines up to the cap.
+    static func titlebarLines(_ chunks: [TabChunk]) -> [[TabChunk]] {
+        chunks.isEmpty ? [] : Array(lines(chunks).prefix(titlebarMaxLines))
+    }
+
+    /// The bar's new line count after a tabline update, or nil when it is
+    /// unchanged: only a change of the count resizes the bar, never a change
+    /// of label content.
+    static func titlebarLineCountChange(from current: Int, tabLines: [[[TabChunk]]]) -> Int? {
+        let count = titlebarLineCount(tabLines)
+        return count == current ? nil : count
+    }
+
+    /// The lines the titlebar bar is tall enough for: the most any tab's
+    /// label has (empty lines count), capped. A tab without chunks has no
+    /// lines and counts one. Every tab counts, so switching tabs never
+    /// resizes the bar.
+    static func titlebarLineCount(_ tabLines: [[[TabChunk]]]) -> Int {
+        min(titlebarMaxLines, tabLines.map { max(1, $0.count) }.max() ?? 1)
+    }
+
+    /// The bar at one line is `base_pt`; it grows down by a line height per
+    /// extra line, so the band the window buttons sit in keeps its height.
+    static func titlebarBarHeight_pt(base_pt: CGFloat, lineCount: Int) -> CGFloat {
+        base_pt + CGFloat(max(1, lineCount) - 1) * lineHeight_pt
+    }
+
+    /// One label line as runs in their chunk styles. A chunk without fg takes
+    /// `defaultColor`. Chunk bg is never painted: Neovim combines every chunk
+    /// over TabLine/TabLineSel, so its bg is that base, which would show as a
+    /// band over the tab's own background.
+    static func attributedLine(_ line: [TabChunk], font: NSFont, defaultColor: NSColor,
+                               paragraphStyle: NSParagraphStyle) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for chunk in line {
+            var runFont = font
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if chunk.bold { traits.insert(.bold) }
+            if chunk.italic { traits.insert(.italic) }
+            if !traits.isEmpty {
+                let desc = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(traits))
+                runFont = NSFont(descriptor: desc, size: font.pointSize) ?? font
+            }
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: runFont,
+                .foregroundColor: chunk.fg ?? defaultColor,
+                .paragraphStyle: paragraphStyle,
+            ]
+            if chunk.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            if chunk.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            result.append(NSAttributedString(string: chunk.text, attributes: attrs))
+        }
+        return result
     }
 }

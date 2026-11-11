@@ -295,7 +295,7 @@ pub const Config = struct {
         agent_indicator: bool = true,
         agent_notification: bool = true,
         cards: bool = true,
-        card_provider: bool = true,
+        card_provider: bool = false,
     };
 
     pub const WindowsConfig = struct {
@@ -1155,7 +1155,7 @@ else
     \\        agent_indicator     AI-agent status icon on terminal tabs (default: true)
     \\        agent_notification  Notify when an AI agent finishes (default: true)
     \\        cards               Sidebar draws each tab as a multi-line card from 'guitablabel' (default: true)
-    \\        card_provider       Fill 'guitablabel' with the default card when unset (default: true)
+    \\        card_provider       Fill 'guitablabel' with the default card when unset (default: false)
     \\
     \\    [windows]
     \\        external        Each Neovim window as its own OS window
@@ -1402,20 +1402,20 @@ test "scrollbar.layout parses both values, ignores unknown ones, and needs the b
     try std.testing.expect(!disabled.scrollbar.isColumn());
 }
 
-test "tabline cards and card_provider default on and parse false" {
+test "tabline cards default on, card_provider default off, both parse" {
     var def = try parseForTest(std.testing.allocator, "");
     defer def.deinit();
     try std.testing.expect(def.tabline.cards);
-    try std.testing.expect(def.tabline.card_provider);
+    try std.testing.expect(!def.tabline.card_provider);
 
-    var off = try parseForTest(std.testing.allocator,
+    var flipped = try parseForTest(std.testing.allocator,
         \\[tabline]
         \\cards = false
-        \\card_provider = false
+        \\card_provider = true
     );
-    defer off.deinit();
-    try std.testing.expect(!off.tabline.cards);
-    try std.testing.expect(!off.tabline.card_provider);
+    defer flipped.deinit();
+    try std.testing.expect(!flipped.tabline.cards);
+    try std.testing.expect(flipped.tabline.card_provider);
 }
 
 test "declaring one route keeps the defaults for other events" {

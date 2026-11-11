@@ -122,8 +122,15 @@ pub fn separatorEdge(app: *const App) SeparatorEdge {
     };
 }
 
-/// Height of the band the caption used to occupy.
+/// Height of the band the caption used to occupy. Titlebar tabs grow it a
+/// label line per extra 'guitablabel' line; every other band keeps one.
 pub fn bandPx(app: *const App) c_int {
+    if (layout(app).tabline == .titlebar) return tabline_mod.titlebarBarPx(app);
+    return captionBandPx(app);
+}
+
+/// The band the window buttons sit in, whatever the titlebar tabs' height.
+fn captionBandPx(app: *const App) c_int {
     return app.scalePx(TablineState.TAB_BAR_HEIGHT);
 }
 
@@ -171,7 +178,7 @@ fn buttonWidthPx(app: *const App) c_int {
 /// The caption button under client (x, y), or null.
 /// `with_toggle`: the sidebar toggle has a slot (a captionless sidebar).
 pub fn buttonAt(app: *const App, with_toggle: bool, client_w: c_int, x: c_int, y: c_int) ?u8 {
-    if (y < 0 or y >= bandPx(app)) return null;
+    if (y < 0 or y >= captionBandPx(app)) return null;
     const w = buttonWidthPx(app);
     if (with_toggle and !app.sidebar_position_right and x >= 0 and x < w) return TOGGLE_BTN;
     const from_right = client_w - x;

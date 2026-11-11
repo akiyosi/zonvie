@@ -39,8 +39,17 @@ final class ViewController: NSViewController {
     private var edgeHairline: EdgeHairlineView?
     private var edgeHairlineObserver: Any?
 
-    // Height of the Chrome-style tab bar; over the editor it is the shared band.
-    private var tabBarHeight: CGFloat { editorRunsUnderBand ? TitlebarBand.heightPt : 36 }
+    // Height of the Chrome-style tab bar at one label line; over the editor
+    // it is the shared band.
+    private var tabBarBaseHeight: CGFloat { editorRunsUnderBand ? TitlebarBand.heightPt : 36 }
+    /// Grows down a line for each extra 'guitablabel' line; the band the
+    /// window buttons sit in keeps `tabBarBaseHeight`.
+    private var tabBarHeight: CGFloat {
+        TabCardLayout.titlebarBarHeight_pt(base_pt: tabBarBaseHeight, lineCount: tabBarView?.labelLineCount ?? 1)
+    }
+    private var tabBarHeightConstraint: NSLayoutConstraint?
+    /// The editor's top under a native titlebar, below the tab bar.
+    private var terminalTopConstraint: NSLayoutConstraint?
 
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
@@ -91,10 +100,12 @@ final class ViewController: NSViewController {
         switch tablineStyle {
         case .titlebar:
             setupTabBar()
+            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: editorRunsUnderBand ? 0 : tabBarHeight)
+            terminalTopConstraint = top
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: editorRunsUnderBand ? 0 : tabBarHeight),
+                top,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
 
@@ -646,7 +657,7 @@ final class ViewController: NSViewController {
         tablineShown = true
         updateTitlebarRevealPin()
         updateGridInsets()
-        tabBarView?.updateTabs(tabs.map { (handle: $0.handle, name: $0.name) }, currentTab: currentTab)
+        tabBarView?.updateTabs(tabs, currentTab: currentTab)
         sidebarView?.updateTabs(tabs, currentTab: currentTab)
     }
 
@@ -676,12 +687,24 @@ final class ViewController: NSViewController {
         tabBar.transparentBackground = editorRunsUnderBand
         view.addSubview(tabBar)
 
+        let height = tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight)
+        tabBarHeightConstraint = height
         NSLayoutConstraint.activate([
             tabBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tabBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tabBar.topAnchor.constraint(equalTo: view.topAnchor),
-            tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight),
+            height,
         ])
+
+        // Only a change in the label's line count resizes the bar, and with
+        // it the grid; content changes at the same count never do.
+        tabBar.onLabelLineCountChange = { [weak self] _ in
+            guard let self else { return }
+            self.tabBarHeightConstraint?.constant = self.tabBarHeight
+            if !self.editorRunsUnderBand { self.terminalTopConstraint?.constant = self.tabBarHeight }
+            // Under the band, the grid top is an inset (updateGridInsets).
+            self.updateTitlebarLayout()
+        }
 
         // Wire up callbacks
         tabBar.onTabSelected = { [weak self] handle in

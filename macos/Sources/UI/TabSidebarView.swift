@@ -678,7 +678,7 @@ final class TabSidebarView: NSView {
                     // The close button sits beside the first line only.
                     lineRect.size.width += closeWidth
                 }
-                cardLineString(line, font: lineFont, defaultColor: textColor, paragraphStyle: paragraphStyle)
+                TabCardLayout.attributedLine(line, font: lineFont, defaultColor: textColor, paragraphStyle: paragraphStyle)
                     .draw(with: lineRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
             }
         }
@@ -688,34 +688,6 @@ final class TabSidebarView: NSView {
             let closeRect = closeButtonRect(in: rect, lineCount: tab.cardLines.count)
             drawCloseButton(in: closeRect, highlighted: hoveredCloseButton == index)
         }
-    }
-
-    /// One card line as runs in their chunk styles. A chunk without fg takes
-    /// the row's text colour. Chunk bg is never painted: Neovim combines every
-    /// chunk over TabLine/TabLineSel, so its bg is that base, which would
-    /// show as a band over the card's own background.
-    private func cardLineString(_ line: [TabChunk], font: NSFont, defaultColor: NSColor,
-                                paragraphStyle: NSParagraphStyle) -> NSAttributedString {
-        let result = NSMutableAttributedString()
-        for chunk in line {
-            var runFont = font
-            var traits: NSFontDescriptor.SymbolicTraits = []
-            if chunk.bold { traits.insert(.bold) }
-            if chunk.italic { traits.insert(.italic) }
-            if !traits.isEmpty {
-                let desc = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(traits))
-                runFont = NSFont(descriptor: desc, size: font.pointSize) ?? font
-            }
-            var attrs: [NSAttributedString.Key: Any] = [
-                .font: runFont,
-                .foregroundColor: chunk.fg ?? defaultColor,
-                .paragraphStyle: paragraphStyle,
-            ]
-            if chunk.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-            if chunk.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
-            result.append(NSAttributedString(string: chunk.text, attributes: attrs))
-        }
-        return result
     }
 
     private func drawCloseButton(in rect: NSRect, highlighted: Bool) {

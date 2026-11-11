@@ -1,7 +1,8 @@
 import AppKit
 
 /// Sidebar card layout: where a label's line breaks fall, how tall a card
-/// is, and which row a point in the sidebar lands on.
+/// is, and which row a point in the sidebar lands on. Titlebar bar: its
+/// line count and height.
 @main
 private enum TabCardLayoutTests {
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -64,11 +65,56 @@ private enum TabCardLayoutTests {
         requireEqual(TabCardLayout.dropIndex(atY: 500, offsets: offsets), 3, "drop after the last row")
     }
 
+    /// The titlebar bar's line count: the most lines of any tab, empty lines
+    /// and a trailing break included, a tab without chunks counting one,
+    /// capped at four.
+    private static func verifyTitlebarLineCount() {
+        let lines = { (s: String) in TabCardLayout.lines([chunk(s, nil)]) }
+        requireEqual(TabCardLayout.titlebarLineCount([]), 1, "no tabs")
+        requireEqual(TabCardLayout.titlebarLineCount([[], []]), 1, "tabs without chunks")
+        requireEqual(TabCardLayout.titlebarLineCount([lines("a")]), 1, "one-line label")
+        requireEqual(TabCardLayout.titlebarLineCount([lines("a\nb\n")]), 3, "trailing break counts")
+        requireEqual(TabCardLayout.titlebarLineCount([lines("a\n\nc")]), 3, "empty middle line counts")
+        // A background tab with three lines sizes the bar for every tab.
+        requireEqual(TabCardLayout.titlebarLineCount([lines("x"), [], lines("a\nb\nc")]), 3, "max over tabs")
+        requireEqual(TabCardLayout.titlebarLineCount([lines("1\n2\n3\n4\n5\n6")]), 4, "capped at four")
+    }
+
+    /// What a titlebar tab draws: nothing extra without chunks, at most four
+    /// lines with them.
+    private static func verifyTitlebarLines() {
+        requireEqual(TabCardLayout.titlebarLines([]), [], "no chunks draws the name as before")
+        requireEqual(TabCardLayout.titlebarLines([chunk("a", nil)]).count, 1, "one-line label")
+        requireEqual(TabCardLayout.titlebarLines([chunk("1\n2\n3\n4\n5\n6", nil)]).count, 4, "lines past four are not drawn")
+    }
+
+    /// The bar resizes only when the line count changes, never on content.
+    private static func verifyTitlebarLineCountChange() {
+        let lines = { (s: String) in TabCardLayout.titlebarLines([chunk(s, nil)]) }
+        requireEqual(TabCardLayout.titlebarLineCountChange(from: 3, tabLines: [lines("a\nb\nc")]), nil, "same count")
+        requireEqual(TabCardLayout.titlebarLineCountChange(from: 3, tabLines: [lines("x\n● done\nz")]), nil, "content change at equal count")
+        requireEqual(TabCardLayout.titlebarLineCountChange(from: 1, tabLines: [lines("a\nb\nc")]), 3, "grows")
+        requireEqual(TabCardLayout.titlebarLineCountChange(from: 3, tabLines: [lines("a")]), 1, "shrinks")
+        requireEqual(TabCardLayout.titlebarLineCountChange(from: 1, tabLines: [[], []]), nil, "tabs without chunks keep one line")
+    }
+
+    /// One line keeps today's bar heights; each extra line adds 16pt.
+    private static func verifyTitlebarBarHeight() {
+        requireEqual(TabCardLayout.titlebarBarHeight_pt(base_pt: 44, lineCount: 1), 44, "transparent/unified, one line")
+        requireEqual(TabCardLayout.titlebarBarHeight_pt(base_pt: 36, lineCount: 1), 36, "native, one line")
+        requireEqual(TabCardLayout.titlebarBarHeight_pt(base_pt: 44, lineCount: 3), 44 + 2 * 16, "three lines")
+        requireEqual(TabCardLayout.titlebarBarHeight_pt(base_pt: 36, lineCount: 0), 36, "zero lines clamps to one")
+    }
+
     static func main() {
         verifyBreakInsideChunk()
         verifyBreaksOnly()
         verifyFirstLine()
         verifyOffsetsAndHitTest()
+        verifyTitlebarLineCount()
+        verifyTitlebarBarHeight()
+        verifyTitlebarLines()
+        verifyTitlebarLineCountChange()
         print("TabCardLayoutTests: ok")
     }
 }

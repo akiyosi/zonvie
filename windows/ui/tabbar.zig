@@ -20,15 +20,21 @@ const tab_font_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
 
 /// The tab label font at `height_pt` (negative: character height), DPI-scaled.
 pub fn createTabFont(app: *App, height_pt: c_int) c.HFONT {
+    return createStyledTabFont(app, height_pt, 0);
+}
+
+/// createTabFont in a 'guitablabel' chunk's style (ZONVIE_TAB_CHUNK_* bits).
+fn createStyledTabFont(app: *App, height_pt: c_int, flags: u32) c.HFONT {
+    const hl = core.highlight;
     return c.CreateFontW(
         app.scalePx(height_pt),
         0,
         0,
         0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
+        if (flags & hl.TAB_CHUNK_BOLD != 0) c.FW_BOLD else c.FW_NORMAL,
+        @intFromBool(flags & hl.TAB_CHUNK_ITALIC != 0),
+        @intFromBool(flags & hl.TAB_CHUNK_UNDERLINE != 0),
+        @intFromBool(flags & hl.TAB_CHUNK_STRIKETHROUGH != 0),
         c.DEFAULT_CHARSET,
         c.OUT_DEFAULT_PRECIS,
         c.CLIP_DEFAULT_PRECIS,
@@ -61,6 +67,62 @@ fn drawTabLabel(hdc: c.HDC, name: []const u8, rect: *c.RECT, h_align: c.UINT) vo
     var wide_buf: [256]u16 = undefined;
     const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, name) catch 0;
     _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), rect, h_align | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+}
+
+/// The fonts of one paint's 'guitablabel' runs, created on first use: line 1
+/// at the tab font's size, lines 2+ one point smaller (as the sidebar), by
+/// the style bits. deinit must run while none of them is selected.
+const LabelFonts = struct {
+    const STYLE_BITS = core.highlight.TAB_CHUNK_BOLD | core.highlight.TAB_CHUNK_ITALIC |
+        core.highlight.TAB_CHUNK_UNDERLINE | core.highlight.TAB_CHUNK_STRIKETHROUGH;
+    const STYLE_SHIFT = 2; // TAB_CHUNK_BOLD is the lowest style bit
+
+    fonts: [2][16]?c.HFONT = [_][16]?c.HFONT{[_]?c.HFONT{null} ** 16} ** 2,
+
+    fn get(self: *LabelFonts, app: *App, line: u8, flags: u32) c.HFONT {
+        const size: usize = @intFromBool(line > 0);
+        const style: usize = (flags & STYLE_BITS) >> STYLE_SHIFT;
+        if (self.fonts[size][style]) |f| return f;
+        const f = createStyledTabFont(app, if (size == 0) -12 else -11, flags & STYLE_BITS);
+        self.fonts[size][style] = f;
+        return f;
+    }
+
+    fn deinit(self: *LabelFonts) void {
+        for (self.fonts) |row| {
+            for (row) |f| {
+                if (f) |font| _ = c.DeleteObject(font);
+            }
+        }
+    }
+};
+
+/// Draw line `line` of a 'guitablabel' label into `rect`, verbatim, run by
+/// run in each chunk's fg (else `default_fg`) and style, vertically centred;
+/// the run reaching the right edge ends the line with an ellipsis. Chunk bg
+/// is never painted. Leaves `base_font` selected.
+fn drawLabelLine(app: *App, hdc: c.HDC, fonts: *LabelFonts, base_font: c.HFONT, label: *const app_mod.TabLabel, line: u8, rect: c.RECT, default_fg: c.COLORREF) void {
+    defer _ = c.SelectObject(hdc, base_font);
+    var x = rect.left;
+    for (label.runs[0..label.run_count]) |run| {
+        if (run.line != line) continue;
+        if (x >= rect.right) break;
+        // A run is at most LINE_BYTES bytes, so at most as many UTF-16 units.
+        var wide: [app_mod.TabLabel.LINE_BYTES]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(&wide, label.runText(run)) catch continue;
+        if (n == 0) continue;
+        _ = c.SelectObject(hdc, fonts.get(app, line, run.flags));
+        _ = c.SetTextColor(hdc, if (run.flags & core.highlight.TAB_CHUNK_HAS_FG != 0) c.RGB(
+            @as(u8, @intCast((run.fg_rgb >> 16) & 0xFF)),
+            @as(u8, @intCast((run.fg_rgb >> 8) & 0xFF)),
+            @as(u8, @intCast(run.fg_rgb & 0xFF)),
+        ) else default_fg);
+        var size: c.SIZE = undefined;
+        if (c.GetTextExtentPoint32W(hdc, &wide, @intCast(n), &size) == 0) size.cx = 0;
+        var r = c.RECT{ .left = x, .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+        _ = c.DrawTextW(hdc, &wide, @intCast(n), &r, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS | c.DT_NOPREFIX);
+        x += size.cx;
+    }
 }
 
 // AI-agent spinner glyphs (single glyph, no trailing space; drawn centered in a
@@ -281,16 +343,49 @@ pub fn tabWidthPx(app: *App, client_width: c_int, tab_count: c_int) c_int {
     );
 }
 
+/// Height of the titlebar tab bar: a label line taller per extra
+/// 'guitablabel' line. The caption buttons keep the top TAB_BAR_HEIGHT.
+pub fn titlebarBarPx(app: *const App) c_int {
+    return app_mod.titlebarBarHeightPx(app.scalePx(TablineState.TAB_BAR_HEIGHT), labelLinePx(app), app.tabline_state.bar_lines);
+}
+
+fn labelLinePx(app: *const App) c_int {
+    return app.scalePx(TablineState.TAB_LABEL_LINE_HEIGHT);
+}
+
+/// UI thread, after a tabline change: grow or shrink the titlebar bar to the
+/// labels' line count, moving the grid top as a window resize does (outside
+/// app.mu: the core can re-enter through callbacks). One layout per change
+/// of the count, none otherwise.
+pub fn syncTitlebarLines(hwnd: c.HWND, app: *App) void {
+    if (sidebar_caption.layout(app).tabline != .titlebar) return;
+    app.mu.lockUncancelable(core.clock.io());
+    const changed = app.tabline_state.syncBarLines();
+    app.mu.unlock(core.clock.io());
+    if (!changed) return;
+    app_mod.updateLayoutToCore(hwnd, app);
+    // The grid moved: redraw everything, as the sidebar toggle does, and
+    // move message boxes anchored to the window or grid off the grown bar.
+    app_mod.requestMainFullPaint(app);
+    app_mod.scheduleFloatReposition(app);
+}
+
 /// Left edge of the + button, which sits one gap past the last tab.
 pub fn plusButtonXPx(app: *App, tab_count: c_int, tab_width: c_int) c_int {
     return app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) +
         tab_count * (tab_width + 1) + app.scalePx(8);
 }
 
-/// Side of the square + button. Both the painted ellipse and every hit test
-/// use this.
+/// Width of the + button, and its height at one label line. Both the painted
+/// shape and every hit test use this.
 pub fn plusButtonSizePx(app: *App) c_int {
     return app.scalePx(20);
+}
+
+/// Height of the + button: one line's square stretched downward by the
+/// titlebar bar's extra label lines, so it spans the tabs' height.
+pub fn plusButtonHeightPx(app: *App) c_int {
+    return plusButtonSizePx(app) + titlebarBarPx(app) - app.scalePx(TablineState.TAB_BAR_HEIGHT);
 }
 
 /// What a titlebar-tabline point is on. Hover, press, the pressed-button
@@ -313,12 +408,17 @@ fn inRect(x: c_int, y: c_int, left: c_int, top: c_int, w: c_int, h: c_int) bool 
 }
 
 /// `tab_count` is passed so WM_NCHITTEST can read it under app.mu.
+/// Tabs span the whole bar; the window, close and + buttons sit in its
+/// one-line band at the top, and the strip under the window buttons is empty
+/// bar (it drags the window).
 pub fn tablineHitTest(app: *App, client_width: c_int, tab_count: usize, x: c_int, y: c_int) TablineHit {
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const bar_height = titlebarBarPx(app);
+    const band_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     if (y < 0 or y >= bar_height) return .none;
 
     const btn_start_x = client_width - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     if (x >= btn_start_x) {
+        if (y >= band_height) return .none;
         const idx = @divTrunc(x - btn_start_x, app.scalePx(TablineState.WINDOW_BTN_WIDTH));
         return if (idx >= 0 and idx < 3) .{ .window_button = @intCast(idx) } else .none;
     }
@@ -331,11 +431,11 @@ pub fn tablineHitTest(app: *App, client_width: c_int, tab_count: usize, x: c_int
         const tab_x = tabLeftPx(app, tab_width, i);
         if (x < tab_x or x >= tab_x + tab_width) continue;
         const close_x = tab_x + tab_width - close_size - app.scalePx(6);
-        const close_y = @divTrunc(bar_height - close_size, 2);
+        const close_y = @divTrunc(band_height - close_size, 2);
         return if (inRect(x, y, close_x, close_y, close_size, close_size)) .{ .close = i } else .{ .tab = i };
     }
     const plus_size = plusButtonSizePx(app);
-    if (inRect(x, y, plusButtonXPx(app, count, tab_width), @divTrunc(bar_height - plus_size, 2), plus_size, plus_size)) return .new_tab;
+    if (inRect(x, y, plusButtonXPx(app, count, tab_width), @divTrunc(band_height - plus_size, 2), plus_size, plusButtonHeightPx(app))) return .new_tab;
     return .none;
 }
 
@@ -605,7 +705,7 @@ pub fn tablineBandRect(app: *App, hwnd: c.HWND) c.RECT {
     if (app.tabline_style == .sidebar) return sidebarRectPx(app, hwnd);
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    return .{ .left = 0, .top = 0, .right = client.right, .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT) };
+    return .{ .left = 0, .top = 0, .right = client.right, .bottom = titlebarBarPx(app) };
 }
 
 /// Drop any tab-strip press or drag when the capture is lost, and repaint
@@ -636,7 +736,7 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     const client_width = rect.right;
 
     // DPI-scaled constants
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const bar_height = titlebarBarPx(app);
     const hit = tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y);
 
     // Handle dragging
@@ -1082,9 +1182,19 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&app.colorscheme_fg));
     h.update(std.mem.asBytes(&ts.tab_count));
     h.update(std.mem.asBytes(&ts.current_tab));
+    h.update(std.mem.asBytes(&ts.bar_lines));
     for (ts.tabs[0..ts.tab_count]) |*tab| {
         h.update(std.mem.asBytes(&tab.handle));
         h.update(tab.name[0..tab.name_len]);
+        // Field by field: Run's padding bytes are undefined.
+        h.update(std.mem.asBytes(&tab.label.line_count));
+        for (tab.label.runs[0..tab.label.run_count]) |run| {
+            h.update(std.mem.asBytes(&run.line));
+            h.update(std.mem.asBytes(&run.fg_rgb));
+            h.update(std.mem.asBytes(&run.flags));
+            h.update(std.mem.asBytes(&run.len));
+            h.update(tab.label.runText(run));
+        }
     }
     var opt_fields = [_]u64{
         sigOptIdx(ts.hovered_tab),
@@ -1476,8 +1586,13 @@ pub fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytyp
     }
 }
 
+/// Tabs extend down the whole bar; their first label line, agent indicator,
+/// close button and the + button stay in the one-line band at the top, where
+/// a single-line bar has them.
 pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const bar_height = titlebarBarPx(app);
+    const band_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const line_px = labelLinePx(app);
     const tab_padding = app.scalePx(TablineState.TAB_PADDING);
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
     const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
@@ -1486,6 +1601,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const top_padding = app.scalePx(4);
     const plus_offset = app.scalePx(8);
     const plus_btn_size = plusButtonSizePx(app);
+    const plus_btn_height = plusButtonHeightPx(app);
     const plus_icon_inset = app.scalePx(5);
     const is_dragging = app.tabline_state.dragging_tab != null;
 
@@ -1530,6 +1646,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
     defer _ = c.SelectObject(hdc, old_font);
+    // Freed before the restore above, while `font` is selected (drawLabelLine
+    // reselects it): GDI does not delete a selected font.
+    var label_fonts: LabelFonts = .{};
+    defer label_fonts.deinit();
 
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
@@ -1568,13 +1688,15 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         _ = c.FillRect(hdc, &tab_rect, brush);
 
         // Tab name
-        _ = c.SetTextColor(hdc, if (is_selected) pal.text_selected else pal.text_normal);
+        const text_color = if (is_selected) pal.text_selected else pal.text_normal;
+        _ = c.SetTextColor(hdc, text_color);
 
+        // The first line's box; line k is the same box k label lines lower.
         var text_rect = c.RECT{
             .left = x + tab_padding,
             .top = top_padding,
             .right = x + tab_width - tab_padding - close_size - top_padding,
-            .bottom = bar_height,
+            .bottom = band_height,
         };
 
         // AI-agent indicator drawn in a FIXED-WIDTH cell so varying spinner
@@ -1584,21 +1706,38 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
         if (a_state != 0) {
             // Indicator cell sized near the text cap height, sitting inline.
-            const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
+            const ind_px = @divTrunc((band_height - top_padding * 2) * 7, 10);
             const cell_w = ind_px + top_padding; // glyph box + gap, reserved
-            drawAgentIndicator(app, hdc, a_state, text_rect.left, text_rect.top, text_rect.bottom, @divTrunc(bar_height - ind_px, 2), ind_px);
+            drawAgentIndicator(app, hdc, a_state, text_rect.left, text_rect.top, text_rect.bottom, @divTrunc(band_height - ind_px, 2), ind_px);
             text_rect.left += cell_w; // anchor the title past the fixed cell
         }
 
-        // Display name = basename only (indicator drawn separately above).
-        var base_buf: [256]u8 = undefined;
-        const base_len = extractTabDisplayName(tab, &base_buf);
-        drawTabLabel(hdc, base_buf[0..base_len], &text_rect, c.DT_LEFT);
+        if (tab.label.line_count == 0) {
+            // Display name = basename only (indicator drawn separately above).
+            var base_buf: [256]u8 = undefined;
+            const base_len = extractTabDisplayName(tab, &base_buf);
+            drawTabLabel(hdc, base_buf[0..base_len], &text_rect, c.DT_LEFT);
+        } else {
+            // 'guitablabel' verbatim, no basename. Lines past the bar's are
+            // not drawn; the bar catches up on the UI thread.
+            const lines = @min(tab.label.line_count, app.tabline_state.bar_lines);
+            for (0..lines) |k| {
+                const dy = @as(c_int, @intCast(k)) * line_px;
+                // The close button and the indicator sit beside the first line only.
+                const r = if (k == 0) text_rect else c.RECT{
+                    .left = x + tab_padding,
+                    .top = text_rect.top + dy,
+                    .right = x + tab_width - tab_padding,
+                    .bottom = text_rect.bottom + dy,
+                };
+                drawLabelLine(app, hdc, &label_fonts, font, &tab.label, @intCast(k), r, text_color);
+            }
+        }
 
         // Close button (X) - show on selected or hovered tabs
         if (is_selected or is_hovered) {
             const close_x = x + tab_width - close_size - close_margin;
-            const close_y = @divTrunc(bar_height - close_size, 2);
+            const close_y = @divTrunc(band_height - close_size, 2);
 
             // Highlight if close button hovered
             if (app.tabline_state.hovered_close == i) {
@@ -1632,9 +1771,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
     // Draw new tab button (+)
     const plus_x = x + plus_offset;
-    const plus_y = @divTrunc(bar_height - plus_btn_size, 2);
+    const plus_y = @divTrunc(band_height - plus_btn_size, 2);
     {
-        // Draw hover background (circular) if hovered
+        // Hover background: a circle at one line, a rounded rect when stretched.
         if (app.tabline_state.hovered_new_tab_btn) {
             const plus_hover_brush = c.CreateSolidBrush(pal.glyph_hover_bg);
             // The previous brush is restored before DeleteObject: GDI refuses to
@@ -1643,7 +1782,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             const old_brush_hover = c.SelectObject(hdc, plus_hover_brush);
             const null_pen = c.GetStockObject(c.NULL_PEN);
             const old_pen_hover = c.SelectObject(hdc, null_pen);
-            _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_size);
+            if (plus_btn_height > plus_btn_size) {
+                // RoundRect takes the corner ellipse's diameter: 12 gives a 6px radius.
+                const corner = app.scalePx(12);
+                _ = c.RoundRect(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_height, corner, corner);
+            } else {
+                _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_size);
+            }
             _ = c.SelectObject(hdc, old_pen_hover);
             _ = c.SelectObject(hdc, old_brush_hover);
             _ = c.DeleteObject(plus_hover_brush);
@@ -1654,14 +1799,17 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // keep the arms equal: the 2px thickness sits at center-1..center (half a
         // pixel up-left), so without the -1 on top/left the up-left arms come out
         // 1px short. The +1 on right/bottom also covers FillRect's excluded edge.
+        // The icon is centred in the stretched button, in a square of the
+        // one-line size.
         const plus_cx = plus_x + @divTrunc(plus_btn_size, 2);
-        const plus_cy = plus_y + @divTrunc(plus_btn_size, 2);
+        const icon_y = plus_y + @divTrunc(plus_btn_height - plus_btn_size, 2);
+        const plus_cy = icon_y + @divTrunc(plus_btn_size, 2);
         const plus_brush = c.CreateSolidBrush(pal.glyph_pen);
         var v_bar = c.RECT{
             .left = plus_cx - 1,
-            .top = plus_y + plus_icon_inset - 1,
+            .top = icon_y + plus_icon_inset - 1,
             .right = plus_cx + 1,
-            .bottom = plus_y + plus_btn_size - plus_icon_inset + 1,
+            .bottom = icon_y + plus_btn_size - plus_icon_inset + 1,
         };
         var h_bar = c.RECT{
             .left = plus_x + plus_icon_inset - 1,
@@ -1728,7 +1876,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
                 .left = float_x + tab_padding,
                 .top = top_padding,
                 .right = float_x + tab_width - tab_padding,
-                .bottom = bar_height,
+                .bottom = band_height,
             };
 
             var float_display_name: [256]u8 = undefined;
@@ -1766,13 +1914,16 @@ pub fn onTablineUpdate(
                 const name = app_mod.tabNameForStorage(if (t[i].name_len > 0) t[i].name[0..t[i].name_len] else "", 255);
                 @memcpy(app.tabline_state.tabs[i].name[0..name.len], name);
                 app.tabline_state.tabs[i].name_len = name.len;
+                app.tabline_state.tabs[i].label.store(if (t[i].chunks) |ch| ch[0..t[i].chunk_count] else &.{});
             }
             app.tabline_state.tab_count = count;
         }
     }
 
     // Request repaint via PostMessage to UI thread
-    // Tabline is now drawn on parent window, so invalidate parent
+    // Tabline is now drawn on parent window, so invalidate parent. The
+    // handler also resizes a titlebar bar whose label line count changed
+    // (syncTitlebarLines): never here, the layout call blocks on the core.
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
     }

@@ -2333,7 +2333,7 @@ fn renderMainChromeTextures(app: *App, client: c.RECT) void {
     if (app.ext_tabline_enabled) {
         if (app.tabline_style == .titlebar) {
             const tabline_width: u32 = @intCast(@max(1, client.right));
-            const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
+            const tabline_height: u32 = @intCast(tabline_mod.titlebarBarPx(app));
             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
         } else if (app.tabline_style == .sidebar) {
             // Called unconditionally: unlike the tabline, the sidebar
@@ -3408,7 +3408,7 @@ pub export fn WndProc(
                     // If so, don't treat it as a resize border - let it be handled as HTCLIENT.
                     // But keep rightmost 2 pixels for resize detection.
                     // Only check scrollbar area if scrollbar is enabled.
-                    const tabbar_height_i16: i16 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
+                    const tabbar_height_i16: i16 = @intCast(sidebar_caption.bandPx(app));
                     const resize_edge_width: i32 = 2; // Keep this many pixels at right edge for resize
                     const in_scrollbar_area = if (app.config.scrollbar.enabled) blk: {
                         const scrollbar_area_left = window_rect.right - @as(i32, @intFromFloat(app_mod.scrollbarReservedWidth(app.dpi_scale)));
@@ -3443,7 +3443,8 @@ pub export fn WndProc(
                     // In client coordinates, as the paint and the other hit
                     // tests use: a maximized window's client area is inset
                     // from its window rect (WM_NCCALCSIZE).
-                    const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+                    // The titlebar tabs' grown bar, or the 32px drawn band.
+                    const tabbar_height = sidebar_caption.bandPx(app);
                     var client_pt: c.POINT = .{ .x = x, .y = y };
                     _ = c.ScreenToClient(hwnd, &client_pt);
                     if (client_pt.y < tabbar_height and sidebar_caption.drawsBand(app)) {
@@ -4337,6 +4338,7 @@ pub export fn WndProc(
 
         WM_APP_TABLINE_INVALIDATE => {
             if (getApp(hwnd)) |app| {
+                tabline_mod.syncTitlebarLines(hwnd, app);
                 // Start/stop the agent spinner animation timer to match whether
                 // any tab is currently working (idle/none need no animation).
                 const working = blk: {
@@ -5935,7 +5937,7 @@ pub export fn WndProc(
                         if (app.tabline_style == .titlebar) {
                             // Every button, as the sidebar does: a right press on
                             // a tab reached Neovim as a click on row 0.
-                            if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            if (y < tabline_mod.titlebarBarPx(app)) {
                                 if (msg == c.WM_LBUTTONDOWN) {
                                     tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
                                 }
@@ -6008,7 +6010,7 @@ pub export fn WndProc(
                 // Check tabline/sidebar drag end or area click
                 if (app.ext_tabline_enabled and !press_reached_editor) {
                     if (app.tabline_style == .titlebar) {
-                        if (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                        if (app.tabline_state.dragging_tab != null or y_up < tabline_mod.titlebarBarPx(app)) {
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
@@ -6116,7 +6118,7 @@ pub export fn WndProc(
                 }
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
-                        if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
+                        if (app.tabline_state.dragging_tab != null or (!editor_drag and y < tabline_mod.titlebarBarPx(app))) {
                             tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
                             if (app.tabline_state.dragging_tab != null) return 0;
                         } else {

@@ -3156,7 +3156,7 @@ pub const zonvie_config_values = extern struct {
     tabline_agent_indicator: bool = true,
     tabline_agent_notification: bool = true,
     tabline_cards: bool = true,
-    tabline_card_provider: bool = true,
+    tabline_card_provider: bool = false,
     windows_external: bool = false,
     // neovim
     neovim_path: [*:0]const u8 = "nvim",

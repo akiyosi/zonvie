@@ -1285,7 +1285,7 @@ pub fn setupClipboard(self: *Core) void {
 /// (the last tab seen showing it) is used as a fallback delivery target.
 /// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 ///
-/// The same chunk carries the default sidebar card provider: the global Lua
+/// The same chunk carries the default card provider: the global Lua
 /// function __zonvie_card_label(), installed into 'guitablabel' only when the
 /// option is empty (or already holds the provider's own expression, i.e. a
 /// re-injection). It reads the reporter's per-tab state directly, so the
@@ -1293,13 +1293,15 @@ pub fn setupClipboard(self: *Core) void {
 /// autocmds, exit poll and notifications are installed only when an agent
 /// feature is on.
 ///
-/// The provider is enabled only on macOS with `cards`, `card_provider` and
-/// the sidebar tabline style: the macOS sidebar is the only frontend that
-/// draws cards, and 'guitablabel' is a global Neovim option shared by every
-/// attached UI, so writing it anywhere else would only change other UIs.
+/// The provider is opt-in (`card_provider`, default off), because
+/// 'guitablabel' is a global Neovim option shared by every attached UI. It is
+/// enabled only where Zonvie draws multi-line labels: the macOS sidebar with
+/// `cards`, and the titlebar tab bar on either frontend. The titlebar case
+/// reads the attached ext_tabline state, not the `external` config key: the
+/// command line and the connection dialog can override it either way.
 pub fn setupAgentStatus(self: *Core) void {
     const agent_on = self.msg_config.tabline.agent_indicator or self.msg_config.tabline.agent_notification;
-    const card_on = cardProviderEnabled(self.msg_config.tabline, builtin.os.tag);
+    const card_on = cardProviderEnabled(self.msg_config.tabline, self.ext_tabline_enabled, builtin.os.tag);
     // Nothing would consume the status updates or the card label.
     if (!agent_on and !card_on) return;
     const prefix = if (agent_on)
@@ -1318,17 +1320,29 @@ pub fn setupAgentStatus(self: *Core) void {
     self.log.write("agent status reporter installed (agent={any} card={any})\n", .{ agent_on, card_on });
 }
 
-fn cardProviderEnabled(t: config.Config.TablineConfig, os_tag: std.Target.Os.Tag) bool {
-    return os_tag == .macos and t.cards and t.card_provider and std.mem.eql(u8, t.style, "sidebar");
+fn cardProviderEnabled(t: config.Config.TablineConfig, ext_tabline: bool, os_tag: std.Target.Os.Tag) bool {
+    if (!t.card_provider) return false;
+    if (std.mem.eql(u8, t.style, "sidebar")) return os_tag == .macos and t.cards;
+    return ext_tabline and std.mem.eql(u8, t.style, "titlebar");
 }
 
-test "card provider gate: macOS sidebar with cards and card_provider only" {
-    const on: config.Config.TablineConfig = .{ .style = "sidebar" };
-    try std.testing.expect(cardProviderEnabled(on, .macos));
-    try std.testing.expect(!cardProviderEnabled(on, .windows));
-    try std.testing.expect(!cardProviderEnabled(.{}, .macos));
-    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .cards = false }, .macos));
-    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .card_provider = false }, .macos));
+test "card provider gate: opt-in, macOS sidebar cards or attached-ext_tabline titlebar" {
+    // Off by default in every style.
+    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar" }, true, .macos));
+    try std.testing.expect(!cardProviderEnabled(.{}, true, .macos));
+
+    const sidebar: config.Config.TablineConfig = .{ .style = "sidebar", .card_provider = true };
+    try std.testing.expect(cardProviderEnabled(sidebar, true, .macos));
+    try std.testing.expect(!cardProviderEnabled(sidebar, true, .windows));
+    try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .card_provider = true, .cards = false }, true, .macos));
+
+    // Titlebar follows the attached ext_tabline, whatever `external` says.
+    const titlebar: config.Config.TablineConfig = .{ .card_provider = true };
+    try std.testing.expect(cardProviderEnabled(titlebar, true, .macos));
+    try std.testing.expect(cardProviderEnabled(titlebar, true, .windows));
+    try std.testing.expect(!cardProviderEnabled(titlebar, false, .macos));
+    try std.testing.expect(!cardProviderEnabled(.{ .external = true, .card_provider = true }, false, .macos));
+    try std.testing.expect(!cardProviderEnabled(.{ .style = "menu", .card_provider = true }, true, .macos));
 }
 
 const lua_body =
@@ -1511,7 +1525,7 @@ const lua_body =
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
         \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
         \\_G.__zonvie_agent_timer = nil
-        \\-- Default sidebar card provider. 'guitablabel' is evaluated per tab
+        \\-- Default card provider. 'guitablabel' is evaluated per tab
         \\-- (v:lnum = tab number); the label is three lines joined by %{"\n"}:
         \\-- title, cwd and branch, status with elapsed minutes and a dirty dot.
         \\-- Ownership: written only when empty at injection, or reclaimed when
