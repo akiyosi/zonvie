@@ -400,7 +400,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     func applyLayerRowScroll(gridId id: Int64, rowStart: Int, rowEnd: Int, colStart: Int = 0, colEnd: Int? = nil,
-                             rowsDelta: Int, totalRows: Int, totalCols: Int) {
+                             rowsDelta: Int, viewMoved: Bool, totalRows: Int, totalCols: Int) {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_shift surface=\(gridId) grid=\(id) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
         guard rowsDelta != 0 else { return }
         // Outside a bracket nothing is latched: it would fail the next flush.
@@ -427,7 +427,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             sets: sets,
             rowStart: rowStart,
             rowEnd: rowEnd,
-            rowsDelta: rowsDelta
+            rowsDelta: rowsDelta,
+            viewMoved: viewMoved
         )
         remapSurfaceRowSlots(bufferSet: sets[writeSetIndex], rowStart: rowStart, rowEnd: rowEnd,
                             rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols,
@@ -1494,6 +1495,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // tick drops a seed for a grid a gesture owns.
             if isRoot, captured {
                 stageSurfaceEaseSeed(gridId: id, rowsDelta: pending.rowsDelta,
+                                     viewMoved: core?.gridViewMovedInFlush(id) ?? false,
                                      mousescrollVer: retention.mousescrollVer, lock: lock,
                                      stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
             }
@@ -1515,7 +1517,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         sets: [SurfaceBufferSet],
         rowStart: Int,
         rowEnd: Int,
-        rowsDelta: Int
+        rowsDelta: Int,
+        viewMoved: Bool
     ) {
         guard GridSurfaceRenderer.smoothScrollEnabled else { return }
         captureSurfaceLayerScrollStep(
@@ -1525,6 +1528,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             rowStart: rowStart,
             rowEnd: rowEnd,
             rowsDelta: rowsDelta,
+            viewMoved: viewMoved,
             retention: retention,
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
@@ -1536,7 +1540,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     /// Remap this surface's row slots for a core row-scroll and stage the
     /// scroll for the GPU blit. Core thread, inside the flush bracket.
-    func applyRowScroll(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+    func applyRowScroll(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, viewMoved: Bool, totalRows: Int, totalCols: Int) {
         ZonvieCore.appLog("[ext_applyRowScroll] gridId=\(gridId) rowStart=\(rowStart) rowEnd=\(rowEnd) rowsDelta=\(rowsDelta) isInFlush=\(isInFlush)")
         guard isInFlush else {
             ZonvieCore.appLog("[ExternalGridView] applyRowScroll called outside flush bracket gridId=\(gridId)")
@@ -1588,6 +1592,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     rowStart: rowStart,
                     rowEnd: rowEnd,
                     rowsDelta: rowsDelta,
+                    viewMoved: viewMoved,
                     retention: retention,
                     lock: lock,
                     bracketStagedGrids: &bracketStagedGrids,

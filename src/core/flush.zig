@@ -149,6 +149,8 @@ fn applyFlushFinish(core: *Core, plan: FlushFinishPlan) void {
         core.grid.clearScrolledGrids();
         var sg_it = core.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| sg.clearScrollState();
+        var vp_it = core.grid.viewport.valueIterator();
+        while (vp_it.next()) |vp| vp.view_moved = false;
         return;
     }
     // A transaction-local edge, not persistent atlas state. A callback abort
@@ -17511,6 +17513,73 @@ fn setUpRowShiftCore(core: *Core, state: *RowShiftSink) !void {
     var flush_ctx = FlushCtx{ .core = core };
     try flush_ctx.onFlush(10, 20);
     state.* = .{};
+}
+
+test "a row shift reports whether the view moved, and the report ends with the flush" {
+    // :help ui-events, win_viewport: scroll_delta "contains how much the top
+    // line of a window moved since win_viewport was last emitted". Deleting a
+    // line shifts the rows below it with a grid_scroll but leaves the top
+    // line where it was, so scroll_delta is 0 and a frontend must be able to
+    // tell that shift from a scroll.
+    const Probe = struct {
+        sink: RowShiftSink = .{},
+        core: *Core,
+        calls: u32 = 0,
+        view_moved: bool = false,
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const sink: *RowShiftSink = @ptrCast(@alignCast(ctx.?));
+            const self: *@This() = @fieldParentPtr("sink", sink);
+            self.calls += 1;
+            self.view_moved = self.core.grid.viewMoved(grid_id);
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var probe = Probe{ .core = &core };
+    try setUpRowShiftCore(&core, &probe.sink);
+    core.cb.on_grid_row_scroll = Probe.onRowScroll;
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    // dd on row 3: rows [3,10) move up, the view stays.
+    try core.grid.setViewport(2, 101, 0, 10, 3, 0, 99, 0);
+    core.grid.scrollGrid(2, 3, 10, 0, 20, 1, 0);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 1), probe.calls);
+    try std.testing.expect(!probe.view_moved);
+
+    // CTRL-E: the same kind of shift, with the view moving one line. The
+    // event order within a batch is not fixed, so the scroll comes first.
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    try core.grid.setViewport(2, 101, 1, 11, 3, 0, 99, 1);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+    try std.testing.expect(probe.view_moved);
+
+    // The movement belonged to that batch: an edit in the next one, with no
+    // win_viewport of its own, is not a scroll.
+    core.grid.scrollGrid(2, 3, 10, 0, 20, 1, 0);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 3), probe.calls);
+    try std.testing.expect(!probe.view_moved);
 }
 
 test "the root grid stops painting the default background once windows are layers" {

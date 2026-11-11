@@ -45,6 +45,15 @@ pub fn admitsSeed(rows_delta: i32, live_ver: i32, mode: LargeJumpBehavior) bool 
     };
 }
 
+/// Whether a committed row shift seeds an ease: the one rule both frontends
+/// decide on. `view_moved` is the core's report for the shift's batch
+/// (zonvie_core_grid_view_moved_locked). Without it the rows moved under an
+/// edit (a line deleted or opened) while the view stayed, and they land at
+/// once; with it the size of the scroll decides, as `admitsSeed`.
+pub fn shiftSeedsEase(view_moved: bool, rows_delta: i32, live_ver: i32, mode: LargeJumpBehavior) bool {
+    return view_moved and admitsSeed(rows_delta, live_ver, mode);
+}
+
 /// One grid's eased offset. Layout must match `zonvie_scroll_spring`.
 pub const Spring = extern struct {
     offset_px: f64 = 0,
@@ -134,9 +143,13 @@ pub const Ease = struct {
         self.spring.tick(now_ns);
     }
 
+    /// Seed from one committed row shift of [region_start, region_end).
+    /// Refuses, leaving an ease in flight alone, a shift `shiftSeedsEase`
+    /// refuses. Returns whether the spring took it.
     pub fn seed(
         self: *Ease,
         now_ns: i64,
+        view_moved: bool,
         rows_delta: i32,
         row_h_px: i32,
         region_start: u32,
@@ -145,7 +158,7 @@ pub const Ease = struct {
         mode: LargeJumpBehavior,
     ) bool {
         if (row_h_px <= 0 or region_end <= region_start) return false;
-        if (!admitsSeed(rows_delta, live_ver, mode)) return false;
+        if (!shiftSeedsEase(view_moved, rows_delta, live_ver, mode)) return false;
         if (self.row_h_px != row_h_px or self.region_start != region_start or self.region_end != region_end) {
             self.* = .{ .row_h_px = row_h_px, .region_start = region_start, .region_end = region_end };
         }
@@ -248,12 +261,27 @@ test "snap refuses a batch past one wheel event and keeps an ease in flight" {
 
 test "a new row height or region voids the old offset" {
     var e: Ease = .{ .spring = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1 }, .row_h_px = 20, .region_end = 30 };
-    _ = e.seed(2, 1, 22, 0, 30, 3, .partial);
+    _ = e.seed(2, true, 1, 22, 0, 30, 3, .partial);
     try expectNear(e.spring.offset_px, 22, 0);
     try expectNear(e.spring.velocity_px_s, 0, 0);
     e = .{ .spring = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1 }, .row_h_px = 20, .region_end = 30 };
-    _ = e.seed(2, 1, 20, 0, 30, 3, .partial);
+    _ = e.seed(2, true, 1, 20, 0, 30, 3, .partial);
     try expectNear(e.spring.velocity_px_s, 5, 0);
+}
+
+test "a shift the view did not make seeds nothing and keeps an ease in flight" {
+    // dd moves the rows below the cursor up while the top line stays.
+    try std.testing.expect(!shiftSeedsEase(false, 1, 3, .partial));
+    try std.testing.expect(shiftSeedsEase(true, 1, 3, .partial));
+    // With the view moving, the size rule still decides.
+    try std.testing.expect(!shiftSeedsEase(true, 4, 3, .snap));
+    try std.testing.expect(!shiftSeedsEase(true, 0, 3, .partial));
+
+    // Another region too: a refused shift must not void the offset in flight.
+    var e: Ease = .{ .spring = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1 }, .row_h_px = 20, .region_end = 30 };
+    try std.testing.expect(!e.seed(2, false, 1, 20, 7, 30, 3, .partial));
+    try expectNear(e.spring.offset_px, 40, 0);
+    try std.testing.expectEqual(@as(u32, 0), e.region_start);
 }
 
 test "a steady stream of arrivals never jumps a row in one frame" {

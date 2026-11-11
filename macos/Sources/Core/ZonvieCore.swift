@@ -1506,6 +1506,7 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 let gid = Int64(gridId)
+                let viewMoved = core.gridViewMovedInFlush(gid)
                 ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_shift_receive grid=\(gid) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
                 // Call applyRowScroll directly from core thread — it operates
                 // on the write set (owned by flush bracket) under tripleBufferLock.
@@ -1538,7 +1539,7 @@ final class ZonvieCore {
                         gridId: gid,
                         rowStart: Int(rowStart), rowEnd: Int(rowEnd),
                         colStart: Int(colStart), colEnd: Int(colEnd),
-                        rowsDelta: Int(rowsDelta),
+                        rowsDelta: Int(rowsDelta), viewMoved: viewMoved,
                         totalRows: Int(totalRows), totalCols: Int(totalCols)
                     )
 
@@ -1546,14 +1547,15 @@ final class ZonvieCore {
                     guard core.beginExternalFlushIfNeeded(host) else { return }
                     host.applyLayerRowScroll(gridId: gid, rowStart: Int(rowStart), rowEnd: Int(rowEnd),
                         colStart: Int(colStart), colEnd: Int(colEnd),
-                        rowsDelta: Int(rowsDelta), totalRows: Int(totalRows), totalCols: Int(totalCols))
+                        rowsDelta: Int(rowsDelta), viewMoved: viewMoved,
+                        totalRows: Int(totalRows), totalCols: Int(totalCols))
 
                 case .externalRoot(let view):
                     guard core.beginExternalFlushIfNeeded(view) else { return }
                     view.applyRowScroll(
                         rowStart: Int(rowStart), rowEnd: Int(rowEnd),
                         colStart: Int(colStart), colEnd: Int(colEnd),
-                        rowsDelta: Int(rowsDelta),
+                        rowsDelta: Int(rowsDelta), viewMoved: viewMoved,
                         totalRows: Int(totalRows), totalCols: Int(totalCols)
                     )
                 }
@@ -3771,6 +3773,14 @@ final class ZonvieCore {
     func getMouseScrollVer() -> Int {
         guard let core else { return 0 }
         return Int(zonvie_core_get_mousescroll_ver(core))
+    }
+
+    /// Whether the view of `gridId` moved in the batch being flushed; a row
+    /// shift without it is an edit, not a scroll. Reads core state without
+    /// locking: core thread, inside a flush bracket only.
+    func gridViewMovedInFlush(_ gridId: Int64) -> Bool {
+        guard let core else { return false }
+        return zonvie_core_grid_view_moved_locked(core, gridId)
     }
 
     /// The 'hor' component of 'mousescroll', read the same way.

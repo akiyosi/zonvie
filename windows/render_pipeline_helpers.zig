@@ -1705,6 +1705,9 @@ pub const LayerScroll = struct {
     rows_delta: i32,
     total_rows: u32,
     total_cols: u32,
+    /// The core's report (zonvie_core_grid_view_moved_locked) for a batch
+    /// this shift came from; scroll_ease.shiftSeedsEase decides on it.
+    view_moved: bool = false,
 
     /// This driver does not track the columns a shift covers, so the whole
     /// grid width is what the core is told. `mergeStaged` compares rows only,
@@ -1755,7 +1758,9 @@ pub fn mergeLayerScroll(existing: ?LayerScroll, incoming: LayerScroll) LayerScro
     // `superseded` is also null for a displaced region that was empty, which
     // moved nothing and so owes no repaint — the core drops it and this driver
     // has nothing to dirty either.
-    return .{ .accumulate = LayerScroll.fromStaged(merged.staged) };
+    var sum = LayerScroll.fromStaged(merged.staged);
+    sum.view_moved = incoming.view_moved or (if (existing) |e| e.view_moved else false);
+    return .{ .accumulate = sum };
 }
 
 /// Bound a scroll-delta accumulator well below the integer extremes, which

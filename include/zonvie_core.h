@@ -1574,6 +1574,14 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
     zonvie_viewport_info *out_viewport
 );
 
+/* Whether the view of grid_id moved in the batch being flushed: a win_viewport
+   of the batch carried a nonzero scroll_delta. A row shift that arrives
+   without it is an edit moving rows (a line deleted or opened) rather than a
+   scroll, which a frontend easing its scrolls should land at once.
+   Reads grid state without locking: call ONLY from a callback the core runs
+   inside a flush (on_grid_scroll, on_grid_row_scroll). */
+ZONVIE_API bool zonvie_core_grid_view_moved_locked(zonvie_core *core, int64_t grid_id);
+
 /* Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
    hand it back when it ends (enable=0).
 

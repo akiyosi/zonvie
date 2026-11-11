@@ -1342,6 +1342,11 @@ pub const Viewport = struct {
     /// win_viewport within a batch is not fixed, and doing this with arithmetic
     /// made the result depend on which arrived first.
     scroll_covered: bool = false,
+    /// A win_viewport of the batch being flushed carried a nonzero
+    /// scroll_delta: the view itself moved. A grid_scroll without it is an
+    /// edit moving rows (a line deleted or opened), not a scroll. Held until
+    /// the flush commits, so a retried row shift still reads it.
+    view_moved: bool = false,
 };
 
 /// Distinct rows one flush may stamp before the whole cell-age texture is
@@ -3360,7 +3365,13 @@ pub const Grid = struct {
             .scroll_delta = scroll_delta,
             .uncovered_scroll_rows = if (is_jump) 0 else carried +| scroll_delta,
             .scroll_covered = carried_covered,
+            .view_moved = scroll_delta != 0 or (if (previous) |vp| vp.view_moved else false),
         });
+    }
+
+    /// Whether the view of `grid_id` moved in the batch being flushed.
+    pub fn viewMoved(self: *const Grid, grid_id: i64) bool {
+        return if (self.viewport.get(grid_id)) |vp| vp.view_moved else false;
     }
 
     /// A grid_scroll describes this batch's movement, so it is the authority

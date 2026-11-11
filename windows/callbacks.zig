@@ -1259,6 +1259,7 @@ pub fn onGridRowScroll(
                 .rows_delta = rows_delta,
                 .total_rows = total_rows,
                 .total_cols = total_cols,
+                .view_moved = core.zonvie_core_grid_view_moved_locked(app.corep, grid_id),
             });
             if (!shifted) {
                 core.zonvie_core_force_resend_locked(app.corep);
@@ -1463,6 +1464,7 @@ pub fn onGridRowScroll(
         ext_win.surf.tbs.flush_scroll_row_start = row_start;
         ext_win.surf.tbs.flush_scroll_row_end = row_end;
     }
+    if (core.zonvie_core_grid_view_moved_locked(app.corep, grid_id)) ext_win.surf.tbs.flush_scroll_view_moved = true;
 
     ext_win.surf.flush_needs_invalidate = true;
     // InvalidateRect deferred to onFlushEnd for coalescing.

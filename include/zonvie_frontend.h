@@ -947,10 +947,17 @@ ZONVIE_API void zonvie_blink_stop(zonvie_blink *blink);
    seed gives back a scroll of rows_delta rows (positive = content moved up)
    as offset, keeping the velocity unless the offset changes sign, and clamps
    the sum to min(mousescroll_ver, 8) rows. It refuses (returns false, leaving
-   any ease in flight alone) what zonvie_scroll_ease_admits refuses: a zero
-   delta, ver 0, and with large_jump ZONVIE_LARGE_JUMP_SNAP a scroll larger
-   than mousescroll_ver rows. ZONVIE_LARGE_JUMP_PARTIAL admits any delta and
-   eases its capped part. An unknown large_jump is SNAP.
+   any ease in flight alone) a zero delta, ver 0, and with large_jump
+   ZONVIE_LARGE_JUMP_SNAP a scroll larger than mousescroll_ver rows.
+   ZONVIE_LARGE_JUMP_PARTIAL admits any delta and eases its capped part. An
+   unknown large_jump is SNAP.
+
+   zonvie_scroll_ease_admits is the rule for whether a committed row shift
+   (on_grid_row_scroll) is seeded at all. view_moved is what
+   zonvie_core_grid_view_moved_locked reported for the shift's batch: false
+   means the rows moved under an edit (a line deleted or opened) while the
+   view stayed, and the shift lands at once. With view_moved true it refuses
+   exactly what seed refuses. Decide every seed through it.
 
    Pure — no core pointer, no lock. */
 #define ZONVIE_LARGE_JUMP_PARTIAL 0u
@@ -964,7 +971,7 @@ ZONVIE_API void zonvie_scroll_spring_tick(zonvie_scroll_spring *spring, int64_t 
 ZONVIE_API bool zonvie_scroll_spring_seed(
     zonvie_scroll_spring *spring, int64_t now_ns, int32_t rows_delta,
     int32_t row_h_px, int32_t mousescroll_ver, uint8_t large_jump);
-ZONVIE_API bool zonvie_scroll_ease_admits(int32_t rows_delta, int32_t mousescroll_ver, uint8_t large_jump);
+ZONVIE_API bool zonvie_scroll_ease_admits(bool view_moved, int32_t rows_delta, int32_t mousescroll_ver, uint8_t large_jump);
 
 /* ---------------------------------------------------------------------------
    Bloom chain geometry.

@@ -873,6 +873,8 @@ pub const PaintSnapshot = struct {
     /// Scroll region in rows, matching remapRowSlots' [row_start, row_end).
     scroll_row_start: u32 = 0,
     scroll_row_end: u32 = 0,
+    /// See LayerScroll.view_moved.
+    scroll_view_moved: bool = false,
     /// Layer list bundled with this committed set, so a paint sees the layers
     /// and the vertices they place from the same transaction.
     layers: SurfaceLayers = .{},
@@ -944,6 +946,8 @@ pub const TripleBufferedSurface = struct {
     // Used by applyScrollShift to limit shiftRowVBs to the same range.
     flush_scroll_row_start: u32 = 0,
     flush_scroll_row_end: u32 = 0,
+    /// See LayerScroll.view_moved.
+    flush_scroll_view_moved: bool = false,
 
     // Layer list for this surface. Staged by on_surface_layout during a flush
     // and promoted at commitFlush, so layers and the vertices they place
@@ -969,6 +973,7 @@ pub const TripleBufferedSurface = struct {
     pending_vb_shift: i32 = 0,
     pending_scroll_row_start: u32 = 0,
     pending_scroll_row_end: u32 = 0,
+    pending_scroll_view_moved: bool = false,
 
     // Paint-time dirty snapshot (rotation_mu protected, persistent, no per-paint alloc).
     paint_dirty_snapshot: std.DynamicBitSetUnmanaged = .{},
@@ -1052,6 +1057,7 @@ pub const TripleBufferedSurface = struct {
         self.flush_vb_shift = 0;
         self.flush_scroll_row_start = 0;
         self.flush_scroll_row_end = 0;
+        self.flush_scroll_view_moved = false;
 
         self.is_in_flush = true;
         return true;
@@ -1331,6 +1337,7 @@ pub const TripleBufferedSurface = struct {
                     )) |sum| {
                         self.pending_scroll_dy_px = sum.dy_px;
                         self.pending_vb_shift = sum.vb_shift;
+                        if (self.flush_scroll_view_moved) self.pending_scroll_view_moved = true;
                         // row_start/end unchanged: same region by definition
                     } else {
                         self.pending_scroll_rect = null;
@@ -1355,6 +1362,7 @@ pub const TripleBufferedSurface = struct {
                 self.pending_vb_shift = self.flush_vb_shift;
                 self.pending_scroll_row_start = self.flush_scroll_row_start;
                 self.pending_scroll_row_end = self.flush_scroll_row_end;
+                self.pending_scroll_view_moved = self.flush_scroll_view_moved;
             }
         }
         // Non-fast-path flushes (flush_scroll_rect == null) do NOT invalidate
@@ -1513,7 +1521,10 @@ pub const TripleBufferedSurface = struct {
         var vb_shift: i32 = 0;
         var scroll_row_start: u32 = 0;
         var scroll_row_end: u32 = 0;
+        var scroll_view_moved = false;
         if (self.paint_nesting == 0) {
+            scroll_view_moved = self.pending_scroll_view_moved;
+            self.pending_scroll_view_moved = false;
             scroll_rect = self.pending_scroll_rect;
             scroll_dy_px = self.pending_scroll_dy_px;
             vb_shift = self.pending_vb_shift;
@@ -1540,6 +1551,7 @@ pub const TripleBufferedSurface = struct {
             .vb_shift = vb_shift,
             .scroll_row_start = scroll_row_start,
             .scroll_row_end = scroll_row_end,
+            .scroll_view_moved = scroll_view_moved,
         };
     }
 
@@ -2598,7 +2610,7 @@ pub const GridEase = struct {
                 r.live = scroll_ease.keepsRetained(r.row, s.row_start, s.row_end);
             }
             if (grid_id >= 2 and whole and
-                s_.seed(ein.now_ns, s.rows_delta, row_h_px, s.row_start, s.row_end, ein.mousescroll_ver, ein.large_jump))
+                s_.seed(ein.now_ns, s.view_moved, s.rows_delta, row_h_px, s.row_start, s.row_end, ein.mousescroll_ver, ein.large_jump))
             {
                 if (applog.isEnabled()) applog.appLog("[smooth_scroll_seed] gridId={d} rowsDelta={d}\n", .{ grid_id, s.rows_delta });
                 self.retainScrolledOut(row_vbs, s);
@@ -5844,6 +5856,7 @@ pub fn drawSurfaceRowPass(
         .rows_delta = in.snapshot.vb_shift,
         .total_rows = in.total_rows,
         .total_cols = 0,
+        .view_moved = in.snapshot.scroll_view_moved,
     } else null;
     paint.root_ease.easing = false;
     if (in.ease) |ein| {

@@ -675,7 +675,8 @@ func stageSurfaceRowScroll(
 /// come from — so the two conditions live together, once.
 ///
 /// `cellHeightPx` is the height the rows are captured at. `lock` is the
-/// calling surface's own.
+/// calling surface's own. `viewMoved` is the core's report for this shift
+/// (`ZonvieCore.gridViewMovedInFlush`).
 ///
 /// Returns true when a step was staged or was already staged for this grid in
 /// this bracket, which is what the seed below is gated on.
@@ -687,6 +688,7 @@ func captureSurfaceLayerScrollStep(
     rowStart: Int,
     rowEnd: Int,
     rowsDelta: Int,
+    viewMoved: Bool,
     retention: ScrollRetention,
     lock: NSLock,
     bracketStagedGrids: inout Set<Int64>,
@@ -722,7 +724,7 @@ func captureSurfaceLayerScrollStep(
     }
 
     if stepped {
-        stageSurfaceEaseSeed(gridId: gridId, rowsDelta: rowsDelta,
+        stageSurfaceEaseSeed(gridId: gridId, rowsDelta: rowsDelta, viewMoved: viewMoved,
                              mousescrollVer: retention.mousescrollVer, lock: lock,
                              stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
     }
@@ -731,16 +733,18 @@ func captureSurfaceLayerScrollStep(
 
 /// Stage the sub-row ease seed for a retention step that was taken. A step of
 /// up to one wheel event's worth of rows ('mousescroll' ver) is eased; a
-/// larger one (page motion) lands whole — the core's rule, shared with
-/// Windows. Every surface that seeds goes through here.
+/// larger one (page motion) lands whole, and so does one the view did not
+/// make (`viewMoved` false: a line deleted or opened) — the core's rule,
+/// shared with Windows. Every surface that seeds goes through here.
 func stageSurfaceEaseSeed(
     gridId: Int64,
     rowsDelta: Int,
+    viewMoved: Bool,
     mousescrollVer: Int,
     lock: NSLock,
     stagedSmoothScrollSeeds: inout [(gridId: Int64, rowsDelta: Int)]
 ) {
-    guard zonvie_scroll_ease_admits(Int32(clamping: rowsDelta), Int32(clamping: mousescrollVer),
+    guard zonvie_scroll_ease_admits(viewMoved, Int32(clamping: rowsDelta), Int32(clamping: mousescrollVer),
                                     ZonvieConfig.shared.scroll.largeJump) else { return }
     lock.lock()
     stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
@@ -1556,6 +1560,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         colStart: Int,
         colEnd: Int,
         rowsDelta: Int,
+        viewMoved: Bool,
         totalRows: Int,
         totalCols: Int
     ) {
@@ -1585,7 +1590,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             sets: sets,
             rowStart: rowStart,
             rowEnd: rowEnd,
-            rowsDelta: rowsDelta
+            rowsDelta: rowsDelta,
+            viewMoved: viewMoved
         )
         // The marks have to travel with the rows they describe. The remap below
         // moves a row's vertices to another logical row; a mark left at the
@@ -5271,7 +5277,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         sets: [SurfaceBufferSet],
         rowStart: Int,
         rowEnd: Int,
-        rowsDelta: Int
+        rowsDelta: Int,
+        viewMoved: Bool
     ) {
         guard Self.smoothScrollEnabled else { return }
         captureSurfaceLayerScrollStep(
@@ -5281,6 +5288,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             rowStart: rowStart,
             rowEnd: rowEnd,
             rowsDelta: rowsDelta,
+            viewMoved: viewMoved,
             retention: retention,
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,

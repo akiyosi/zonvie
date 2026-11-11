@@ -2348,8 +2348,8 @@ pub export fn zonvie_scroll_spring_seed(
     return s.seed(now_ns, rows_delta, row_h_px, mousescroll_ver, largeJump(large_jump));
 }
 
-pub export fn zonvie_scroll_ease_admits(rows_delta: i32, mousescroll_ver: i32, large_jump: u8) callconv(.c) bool {
-    return scroll_ease.admitsSeed(rows_delta, mousescroll_ver, largeJump(large_jump));
+pub export fn zonvie_scroll_ease_admits(view_moved: bool, rows_delta: i32, mousescroll_ver: i32, large_jump: u8) callconv(.c) bool {
+    return scroll_ease.shiftSeedsEase(view_moved, rows_delta, mousescroll_ver, largeJump(large_jump));
 }
 
 /// An unknown value is the default, snap.
@@ -2481,6 +2481,16 @@ pub export fn zonvie_core_try_get_viewport(
     if (p == null or out_viewport == null) return -1;
     const box = asBox(p.?);
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
+}
+
+/// Whether the view of `grid_id` moved in the batch being flushed (a
+/// win_viewport with a nonzero scroll_delta). Reads grid state without
+/// locking: call only from a callback the core runs inside a flush.
+pub export fn zonvie_core_grid_view_moved_locked(p: ?*zonvie_core, grid_id: i64) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
+    return box.core.grid.viewMoved(grid_id);
 }
 
 /// Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
