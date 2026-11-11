@@ -16,6 +16,12 @@ final class ViewController: NSViewController {
     // The editor surface starts at the window top, under the chrome.
     private var editorRunsUnderBand: Bool { titlebarLayout.editorRunsUnderBand }
     private var sidebarEdgeConstraint: NSLayoutConstraint?
+    /// Starts at `[tabline] sidebar_width`; a drag of the sidebar edge
+    /// changes it for this session only.
+    private var sidebarWidthPt = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
+    private var sidebarWidthConstraint: NSLayoutConstraint?
+    private static let sidebarMinWidthPt: CGFloat = 120
+    private static let sidebarResizeHandleWidthPt: CGFloat = 5
     private var dragBar: TitlebarDragBar?
     private var sidebarToggleCenterYConstraint: NSLayoutConstraint?
     private var dragBarHeightConstraint: NSLayoutConstraint?
@@ -33,8 +39,17 @@ final class ViewController: NSViewController {
     private var edgeHairline: EdgeHairlineView?
     private var edgeHairlineObserver: Any?
 
-    // Height of the Chrome-style tab bar; over the editor it is the shared band.
-    private var tabBarHeight: CGFloat { editorRunsUnderBand ? TitlebarBand.heightPt : 36 }
+    // Height of the Chrome-style tab bar at one label line; over the editor
+    // it is the shared band.
+    private var tabBarBaseHeight: CGFloat { editorRunsUnderBand ? TitlebarBand.heightPt : 36 }
+    /// Grows down a line for each extra 'guitablabel' line; the band the
+    /// window buttons sit in keeps `tabBarBaseHeight`.
+    private var tabBarHeight: CGFloat {
+        TabCardLayout.titlebarBarHeight_pt(base_pt: tabBarBaseHeight, lineCount: tabBarView?.labelLineCount ?? 1)
+    }
+    private var tabBarHeightConstraint: NSLayoutConstraint?
+    /// The editor's top under a native titlebar, below the tab bar.
+    private var terminalTopConstraint: NSLayoutConstraint?
 
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
@@ -42,7 +57,7 @@ final class ViewController: NSViewController {
     private var agentStatusObserver: Any?
 
     // Current tab list for lookup
-    private var currentTabs: [(handle: Int64, name: String)] = []
+    private var currentTabs: [(handle: Int64, name: String, chunks: [TabChunk])] = []
 
     // `--dialog` startup dialog: deferred to viewDidAppear (needs a window to
     // host the sheet). `pendingConnectDialog` is armed in viewDidLoad when the
@@ -85,10 +100,12 @@ final class ViewController: NSViewController {
         switch tablineStyle {
         case .titlebar:
             setupTabBar()
+            let top = terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: editorRunsUnderBand ? 0 : tabBarHeight)
+            terminalTopConstraint = top
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: editorRunsUnderBand ? 0 : tabBarHeight),
+                top,
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
 
@@ -507,7 +524,7 @@ final class ViewController: NSViewController {
             // Mid-slide the grid keeps the open-sidebar width and only moves,
             // so Neovim is resized once (before opening, after closing) and
             // opening and closing are mirror images.
-            let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
+            let width = sidebarWidthPt
             terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width + column, titleBandInsetPt) : (covered, width - covered + column, titleBandInsetPt)
         } else {
             terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered + column, titleBandInsetPt) : (covered, column, titleBandInsetPt)
@@ -573,7 +590,7 @@ final class ViewController: NSViewController {
     @objc private func toggleSidebar(_ sender: Any?) {
         guard let sidebar = sidebarView, let window = view.window else { return }
         sidebarCollapsed.toggle()
-        let width = CGFloat(ZonvieConfig.shared.tabline.sidebarWidth)
+        let width = sidebarWidthPt
         var minSize = window.contentMinSize
         minSize.width += sidebarCollapsed ? -width : width
         window.contentMinSize = minSize
@@ -633,7 +650,7 @@ final class ViewController: NSViewController {
         }
     }
 
-    private func handleTablineUpdate(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
+    private func handleTablineUpdate(tabs: [(handle: Int64, name: String, chunks: [TabChunk])], currentTab: Int64) {
         self.currentTabs = tabs
         tabBarView?.isHidden = false
         sidebarView?.isHidden = sidebarCollapsed
@@ -670,12 +687,24 @@ final class ViewController: NSViewController {
         tabBar.transparentBackground = editorRunsUnderBand
         view.addSubview(tabBar)
 
+        let height = tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight)
+        tabBarHeightConstraint = height
         NSLayoutConstraint.activate([
             tabBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tabBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tabBar.topAnchor.constraint(equalTo: view.topAnchor),
-            tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight),
+            height,
         ])
+
+        // Only a change in the label's line count resizes the bar, and with
+        // it the grid; content changes at the same count never do.
+        tabBar.onLabelLineCountChange = { [weak self] _ in
+            guard let self else { return }
+            self.tabBarHeightConstraint?.constant = self.tabBarHeight
+            if !self.editorRunsUnderBand { self.terminalTopConstraint?.constant = self.tabBarHeight }
+            // Under the band, the grid top is an inset (updateGridInsets).
+            self.updateTitlebarLayout()
+        }
 
         // Wire up callbacks
         tabBar.onTabSelected = { [weak self] handle in
@@ -705,7 +734,6 @@ final class ViewController: NSViewController {
 
     private func setupSidebar() {
         let config = ZonvieConfig.shared
-        let sidebarWidth = CGFloat(config.tabline.sidebarWidth)
         let isRight = config.tabline.sidebarPosition == "right"
 
         let sidebar = TabSidebarView(frame: .zero)
@@ -742,13 +770,15 @@ final class ViewController: NSViewController {
             ? sidebar.trailingAnchor.constraint(equalTo: view.trailingAnchor)
             : sidebar.leadingAnchor.constraint(equalTo: view.leadingAnchor)
         sidebarEdgeConstraint = edgeConstraint
+        let widthConstraint = sidebar.widthAnchor.constraint(equalToConstant: sidebarWidthPt)
+        sidebarWidthConstraint = widthConstraint
 
         if isRight {
             NSLayoutConstraint.activate([
                 edgeConstraint,
                 sidebar.topAnchor.constraint(equalTo: view.topAnchor),
                 sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-                sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
+                widthConstraint,
 
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: editorRunsUnderBand ? view.trailingAnchor : sidebar.leadingAnchor),
@@ -760,7 +790,7 @@ final class ViewController: NSViewController {
                 edgeConstraint,
                 sidebar.topAnchor.constraint(equalTo: view.topAnchor),
                 sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-                sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
+                widthConstraint,
 
                 terminalView.leadingAnchor.constraint(equalTo: editorRunsUnderBand ? view.leadingAnchor : sidebar.trailingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -768,6 +798,45 @@ final class ViewController: NSViewController {
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
+        installSidebarResizeHandle(sidebar)
+    }
+
+    /// Inside the sidebar's inner edge, so it never covers the editor or
+    /// its scrollbar.
+    private func installSidebarResizeHandle(_ sidebar: TabSidebarView) {
+        let handle = SidebarResizeHandle(frame: .zero)
+        handle.translatesAutoresizingMaskIntoConstraints = false
+        handle.isRightSide = sidebar.isRightSide
+        handle.currentWidthPt = { [weak self] in self?.sidebarWidthPt ?? 0 }
+        handle.onWidthChange = { [weak self] in self?.setSidebarWidth($0) }
+        view.addSubview(handle, positioned: .above, relativeTo: sidebar)
+        sidebar.resizeHandle = handle
+        handle.isHidden = sidebar.isHidden
+        let edge = sidebar.isRightSide
+            ? handle.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor)
+            : handle.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor)
+        NSLayoutConstraint.activate([
+            edge,
+            handle.widthAnchor.constraint(equalToConstant: Self.sidebarResizeHandleWidthPt),
+            handle.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            handle.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+        ])
+    }
+
+    /// Clamped to [120pt, half the window]; the window's minimum width
+    /// tracks the sidebar so the editor keeps its own minimum.
+    private func setSidebarWidth(_ proposedPt: CGFloat) {
+        guard let window = view.window, !sidebarCollapsed, !sidebarSliding else { return }
+        let maxPt = max(Self.sidebarMinWidthPt, (view.bounds.width / 2).rounded(.down))
+        let widthPt = min(max(proposedPt.rounded(), Self.sidebarMinWidthPt), maxPt)
+        guard widthPt != sidebarWidthPt else { return }
+        var minSize = window.contentMinSize
+        minSize.width += widthPt - sidebarWidthPt
+        window.contentMinSize = minSize
+        sidebarWidthPt = widthPt
+        sidebarWidthConstraint?.constant = widthPt
+        view.layoutSubtreeIfNeeded()
+        updateGridInsets()
     }
 
     /// The band spans the editor's side, following the sidebar's slide; a

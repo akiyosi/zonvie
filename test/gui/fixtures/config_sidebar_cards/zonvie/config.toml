@@ -1,0 +1,12 @@
+# Sidebar tabline with cards, for the sidebar_cards visual scenario. The
+# unified titlebar puts the list a fixed band height below the window top;
+# the provider is off so the scenario's own 'guitablabel' is the label.
+[window]
+titlebar_style = "unified"
+
+[tabline]
+external = true
+style = "sidebar"
+sidebar_width = 200
+cards = true
+card_provider = false

@@ -194,6 +194,8 @@ sidebar_position = "left"  # "left" or "right" (for sidebar style)
 sidebar_width = 200  # 100-500 (for sidebar style)
 agent_indicator = true  # show AI-agent status icon on terminal tabs
 agent_notification = true  # OS notification when an AI agent finishes
+cards = true  # sidebar: draw each tab as a multi-line card from 'guitablabel'
+card_provider = false  # sidebar cards / titlebar: fill 'guitablabel' with the default card when you have not set it
 
 [windows]
 external = false  # Each Neovim window as a separate OS window
@@ -348,6 +350,16 @@ as a single live dialog rather than as messages — so the override exists for
 | `sidebar_width` | Sidebar width in pixels (100-500, for sidebar style) |
 | `agent_indicator` | Show AI-agent status icon on terminal tabs (true/false, default true) |
 | `agent_notification` | OS notification when an AI agent finishes (true/false, default true) |
+| `cards` | Sidebar draws each tab as a multi-line card from `'guitablabel'` (true/false, default true) |
+| `card_provider` | Fill `'guitablabel'` with Zonvie's default card (title, cwd · branch, status) when you have not set it. Applies to the macOS sidebar with `cards` and to the titlebar tab bar when the external tabline is on (true/false, default false) |
+
+To design your own card, set `'guitablabel'` yourself (this needs a Neovim with multi-line `'guitablabel'` support). Each `\n` starts a new card line, and `%#Group#` colours the text that follows:
+
+```lua
+vim.o.guitablabel = '%t%{"\\n"}%{fnamemodify(getcwd(-1, v:lnum), ":~")}%{"\\n"}%#Comment#tab %N'
+```
+
+The `"titlebar"` style draws the same multi-line label in each tab, up to 4 lines. The tab bar grows to fit the tab with the most lines, and resizes only when that line count changes, never when the text changes. Empty lines count, so a label that always yields the same number of lines keeps the bar still. Do not make the line count depend on the window height: the bar's resize would change it again.
 
 #### [windows]
 | Key | Description |

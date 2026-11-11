@@ -739,11 +739,33 @@ typedef void (*zonvie_on_popupmenu_select_fn)(void* ctx, int32_t selected);
 
 /* --- ext_tabline types --- */
 
+/* Bits of zonvie_tab_chunk.flags. A colour is meaningful only when its
+   HAS_ bit is set; an attr the core cannot resolve yields flags == 0. */
+#define ZONVIE_TAB_CHUNK_HAS_FG        (1u << 0)
+#define ZONVIE_TAB_CHUNK_HAS_BG        (1u << 1)
+#define ZONVIE_TAB_CHUNK_BOLD          (1u << 2)
+#define ZONVIE_TAB_CHUNK_ITALIC        (1u << 3)
+#define ZONVIE_TAB_CHUNK_UNDERLINE     (1u << 4)
+#define ZONVIE_TAB_CHUNK_STRIKETHROUGH (1u << 5)
+
+/* One styled piece of a tab label. Colours are 0x00RRGGBB. */
+typedef struct zonvie_tab_chunk {
+    uint32_t fg_rgb;
+    uint32_t bg_rgb;
+    uint32_t flags;          /* ZONVIE_TAB_CHUNK_* */
+    const uint8_t* text;     /* UTF-8; may contain '\n' */
+    size_t text_len;
+} zonvie_tab_chunk;
+
 /* A single tab entry in the tabline */
 typedef struct zonvie_tab_entry {
     int64_t tab_handle;      /* Neovim tab page handle */
-    const uint8_t* name;     /* Tab name (UTF-8, e.g., filename) */
+    const uint8_t* name;     /* Tab name (UTF-8, e.g., filename); the whole label */
     size_t name_len;
+    /* Present only when 'guitablabel' produced the label; NULL/0 otherwise.
+       The concatenated chunk texts equal the label (name). */
+    const zonvie_tab_chunk* chunks;
+    size_t chunk_count;
 } zonvie_tab_entry;
 
 /* A single buffer entry in the tabline */
@@ -1961,6 +1983,8 @@ typedef struct zonvie_config_values {
     int32_t tabline_sidebar_width;
     bool tabline_agent_indicator;
     bool tabline_agent_notification;
+    bool tabline_cards;
+    bool tabline_card_provider;
     bool windows_external;
     // neovim
     const char* neovim_path;

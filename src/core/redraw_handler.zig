@@ -3290,18 +3290,30 @@ fn onTablineUpdate(
                 const tab_map = tab_v.map;
                 var tab_handle: i64 = 0;
                 var tab_name: []const u8 = "";
+                var tab_chunks: std.ArrayListUnmanaged(grid_mod.TabChunk) = .empty;
                 for (tab_map) |pair| {
                     if (pair.key == .str) {
                         if (std.mem.eql(u8, pair.key.str, "tab")) {
                             tab_handle = if (pair.val == .int) pair.val.int else if (pair.val == .ext) parseExtHandle(pair.val.ext) else 0;
                         } else if (std.mem.eql(u8, pair.key.str, "name")) {
                             tab_name = if (pair.val == .str) pair.val.str else "";
+                        } else if (std.mem.eql(u8, pair.key.str, "name_chunks") and pair.val == .arr) {
+                            // [[attr_id, text, hl_id], ...]; hl_id (the raw syntax id) is not read.
+                            // A chunk that is not [int, str, ...] is dropped, the rest kept.
+                            for (pair.val.arr) |chunk_v| {
+                                if (chunk_v != .arr) continue;
+                                const chunk = chunk_v.arr;
+                                if (chunk.len < 2 or chunk[0] != .int or chunk[1] != .str) continue;
+                                const attr_id = checkedU32(chunk[0].int) orelse continue;
+                                try tab_chunks.append(arena, .{ .attr_id = attr_id, .text = chunk[1].str });
+                            }
                         }
                     }
                 }
                 try tabs.append(arena, TabEntry{
                     .tab_handle = tab_handle,
                     .name = tab_name,
+                    .chunks = tab_chunks.items,
                 });
             }
         }
@@ -5887,4 +5899,86 @@ test "closing a split window clears the main window's stamps" {
     // The windows left behind resize into the closed one's rows.
     try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_close", &.{3}));
     try std.testing.expect(grid.cellStampGridCleared(1));
+}
+
+/// tabline_update tuple with one tab: [curtab, [{tab, name, name_chunks?}], curbuf, []]
+fn testTablineTuple(arena: std.mem.Allocator, name: []const u8, name_chunks: ?[]mp.Value) ![]mp.Value {
+    const pairs = try arena.alloc(mp.Pair, if (name_chunks != null) 3 else 2);
+    pairs[0] = .{ .key = .{ .str = "tab" }, .val = .{ .int = 5 } };
+    pairs[1] = .{ .key = .{ .str = "name" }, .val = .{ .str = name } };
+    if (name_chunks) |nc| pairs[2] = .{ .key = .{ .str = "name_chunks" }, .val = .{ .arr = nc } };
+    const tabs = try arena.alloc(mp.Value, 1);
+    tabs[0] = .{ .map = pairs };
+    const t = try arena.alloc(mp.Value, 4);
+    t[0] = .{ .int = 5 };
+    t[1] = .{ .arr = tabs };
+    t[2] = .{ .int = 1 };
+    t[3] = .{ .arr = &[_]mp.Value{} };
+    return t;
+}
+
+test "tabline_update keeps name_chunks in order with their attr ids" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const chunks = try arena.alloc(mp.Value, 2);
+    chunks[0] = try testChunk(arena, 7, "a\n", 3);
+    chunks[1] = try testChunk(arena, 9, "b", 3);
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "tabline_update", try testTablineTuple(arena, "a\nb", chunks)));
+
+    const tab = grid.tabline_state.tabs.items[0];
+    try std.testing.expectEqualStrings("a\nb", tab.name);
+    try std.testing.expectEqual(@as(usize, 2), tab.chunks.len);
+    try std.testing.expectEqual(@as(u32, 7), tab.chunks[0].attr_id);
+    try std.testing.expectEqualStrings("a\n", tab.chunks[0].text);
+    try std.testing.expectEqual(@as(u32, 9), tab.chunks[1].attr_id);
+    try std.testing.expectEqualStrings("b", tab.chunks[1].text);
+}
+
+test "tabline_update without name_chunks stores no chunks" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "tabline_update", try testTablineTuple(arena, "x", null)));
+    try std.testing.expectEqual(@as(usize, 1), grid.tabline_state.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), grid.tabline_state.tabs.items[0].chunks.len);
+}
+
+test "a malformed name_chunks entry is skipped, the rest kept" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const wrong_attr = try arena.alloc(mp.Value, 2);
+    wrong_attr[0] = .{ .str = "7" };
+    wrong_attr[1] = .{ .str = "bad-attr" };
+    const wrong_text = try arena.alloc(mp.Value, 2);
+    wrong_text[0] = .{ .int = 7 };
+    wrong_text[1] = .{ .int = 1 };
+    const chunks = try arena.alloc(mp.Value, 5);
+    chunks[0] = .{ .str = "not-a-chunk" };
+    chunks[1] = try testChunk(arena, 7, "short", 1);
+    chunks[2] = .{ .arr = wrong_attr };
+    chunks[3] = .{ .arr = wrong_text };
+    chunks[4] = try testChunk(arena, 9, "ok", 3);
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "tabline_update", try testTablineTuple(arena, "ok", chunks)));
+
+    const tab = grid.tabline_state.tabs.items[0];
+    try std.testing.expectEqual(@as(usize, 1), tab.chunks.len);
+    try std.testing.expectEqual(@as(u32, 9), tab.chunks[0].attr_id);
+    try std.testing.expectEqualStrings("ok", tab.chunks[0].text);
 }

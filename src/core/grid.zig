@@ -743,7 +743,24 @@ pub const PopupmenuState = struct {
 pub const TabEntry = struct {
     tab_handle: i64,
     name: []const u8,
+    /// Styled pieces of `name` from 'guitablabel'; empty when absent.
+    chunks: []const TabChunk = &.{},
 };
+
+/// One styled piece of a tab label. `text` may contain "\n".
+pub const TabChunk = struct {
+    attr_id: u32,
+    text: []const u8,
+};
+
+/// Frees the name and chunk storage a TablineState-owned tab holds.
+fn freeTabEntry(alloc: std.mem.Allocator, tab: TabEntry) void {
+    if (tab.name.len > 0) alloc.free(tab.name);
+    for (tab.chunks) |c| {
+        if (c.text.len > 0) alloc.free(c.text);
+    }
+    if (tab.chunks.len > 0) alloc.free(tab.chunks);
+}
 
 /// A single buffer entry from Neovim.
 pub const BufferEntry = struct {
@@ -761,9 +778,7 @@ pub const TablineState = struct {
     dirty: bool = false,
 
     pub fn deinit(self: *TablineState, alloc: std.mem.Allocator) void {
-        for (self.tabs.items) |tab| {
-            if (tab.name.len > 0) alloc.free(tab.name);
-        }
+        for (self.tabs.items) |tab| freeTabEntry(alloc, tab);
         self.tabs.deinit(alloc);
         self.tabs = .empty;
         for (self.buffers.items) |buf| {
@@ -774,9 +789,7 @@ pub const TablineState = struct {
     }
 
     pub fn clear(self: *TablineState, alloc: std.mem.Allocator) void {
-        for (self.tabs.items) |tab| {
-            if (tab.name.len > 0) alloc.free(tab.name);
-        }
+        for (self.tabs.items) |tab| freeTabEntry(alloc, tab);
         self.tabs.clearRetainingCapacity();
         for (self.buffers.items) |buf| {
             if (buf.name.len > 0) alloc.free(buf.name);
@@ -3707,20 +3720,24 @@ pub const Grid = struct {
         // --- Phase 1: build new tab list (old state untouched on error) ---
         var new_tabs: std.ArrayListUnmanaged(TabEntry) = .empty;
         errdefer {
-            for (new_tabs.items) |t| {
-                if (t.name.len > 0) self.alloc.free(t.name);
-            }
+            for (new_tabs.items) |t| freeTabEntry(self.alloc, t);
             new_tabs.deinit(self.alloc);
         }
         for (tabs) |tab| {
             const duped_name = if (tab.name.len > 0) try self.alloc.dupe(u8, tab.name) else "";
-            new_tabs.append(self.alloc, TabEntry{
-                .tab_handle = tab.tab_handle,
-                .name = duped_name,
-            }) catch |e| {
-                if (duped_name.len > 0) self.alloc.free(duped_name);
-                return e;
-            };
+            var entry = TabEntry{ .tab_handle = tab.tab_handle, .name = duped_name };
+            errdefer freeTabEntry(self.alloc, entry);
+            if (tab.chunks.len > 0) {
+                const duped_chunks = try self.alloc.alloc(TabChunk, tab.chunks.len);
+                // Unfilled texts stay "" so freeTabEntry skips them if a dupe fails midway.
+                for (duped_chunks) |*c| c.* = .{ .attr_id = 0, .text = "" };
+                entry.chunks = duped_chunks;
+                for (tab.chunks, duped_chunks) |src, *dst| {
+                    dst.attr_id = src.attr_id;
+                    if (src.text.len > 0) dst.text = try self.alloc.dupe(u8, src.text);
+                }
+            }
+            try new_tabs.append(self.alloc, entry);
         }
 
         // --- Phase 2: build new buffer list (old state untouched on error) ---
@@ -3743,9 +3760,7 @@ pub const Grid = struct {
         }
 
         // --- Phase 3: all allocations succeeded → free old state, install new ---
-        for (self.tabline_state.tabs.items) |t| {
-            if (t.name.len > 0) self.alloc.free(t.name);
-        }
+        for (self.tabline_state.tabs.items) |t| freeTabEntry(self.alloc, t);
         self.tabline_state.tabs.deinit(self.alloc);
         for (self.tabline_state.buffers.items) |b| {
             if (b.name.len > 0) self.alloc.free(b.name);
@@ -5893,4 +5908,26 @@ test "a window shown again with the frame it was hidden with re-reads its font" 
     try grid.setWinPos(2, 1000, 0, 0);
     grid.noteWinFrame(2, 1000, 5, 20);
     try std.testing.expectEqualSlices(i64, &.{1000}, grid.font_query_wanted.items);
+}
+
+test "setTablineUpdate frees chunk text on replace and deinit" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    const chunks = [_]TabChunk{
+        .{ .attr_id = 7, .text = "a\n" },
+        .{ .attr_id = 9, .text = "b" },
+    };
+    const tabs = [_]TabEntry{.{ .tab_handle = 1, .name = "a\nb", .chunks = &chunks }};
+    try grid.setTablineUpdate(1, &tabs, 0, &.{});
+    try std.testing.expectEqual(@as(usize, 2), grid.tabline_state.tabs.items[0].chunks.len);
+    try std.testing.expectEqualStrings("a\n", grid.tabline_state.tabs.items[0].chunks[0].text);
+
+    // Replace with a different chunk list; the old copies must be freed.
+    const chunks2 = [_]TabChunk{.{ .attr_id = 3, .text = "c" }};
+    const tabs2 = [_]TabEntry{.{ .tab_handle = 1, .name = "c", .chunks = &chunks2 }};
+    try grid.setTablineUpdate(1, &tabs2, 0, &.{});
+    try std.testing.expectEqual(@as(usize, 1), grid.tabline_state.tabs.items[0].chunks.len);
+    try std.testing.expectEqual(@as(u32, 3), grid.tabline_state.tabs.items[0].chunks[0].attr_id);
+    // grid.deinit (deferred) frees the second set; the testing allocator flags any leak.
 }

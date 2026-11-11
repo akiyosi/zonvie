@@ -147,6 +147,8 @@ struct ZonvieConfig {
         var sidebarWidth: Int = 200          // 100-500 pixels
         var agentIndicator: Bool = true      // per-tab AI-agent status icon
         var agentNotification: Bool = true   // OS notification on agent completion
+        var cards: Bool = true               // sidebar draws tabs as multi-line cards
+        var cardProvider: Bool = false       // core fills guitablabel when the user has not
     }
 
     struct WindowsConfig {
@@ -327,6 +329,8 @@ struct ZonvieConfig {
         config.tabline.sidebarWidth = Int(v.tabline_sidebar_width)
         config.tabline.agentIndicator = v.tabline_agent_indicator
         config.tabline.agentNotification = v.tabline_agent_notification
+        config.tabline.cards = v.tabline_cards
+        config.tabline.cardProvider = v.tabline_card_provider
         config.windows.external = v.windows_external
 
         // Neovim

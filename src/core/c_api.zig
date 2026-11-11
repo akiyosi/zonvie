@@ -335,6 +335,18 @@ pub const TabEntry = extern struct {
     tab_handle: i64,
     name: [*]const u8,
     name_len: usize,
+    chunks: ?[*]const TabChunk,
+    chunk_count: usize,
+};
+
+/// One styled piece of a tab label, colours resolved in the core.
+/// `flags` are the ZONVIE_TAB_CHUNK_* bits.
+pub const TabChunk = extern struct {
+    fg_rgb: u32,
+    bg_rgb: u32,
+    flags: u32,
+    text: [*]const u8,
+    text_len: usize,
 };
 
 /// A single buffer entry (ext_tabline).
@@ -3143,6 +3155,8 @@ pub const zonvie_config_values = extern struct {
     tabline_sidebar_width: i32 = 200,
     tabline_agent_indicator: bool = true,
     tabline_agent_notification: bool = true,
+    tabline_cards: bool = true,
+    tabline_card_provider: bool = false,
     windows_external: bool = false,
     // neovim
     neovim_path: [*:0]const u8 = "nvim",
@@ -3271,6 +3285,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .tabline_sidebar_width = @intCast(cfg.tabline.sidebar_width),
         .tabline_agent_indicator = cfg.tabline.agent_indicator,
         .tabline_agent_notification = cfg.tabline.agent_notification,
+        .tabline_cards = cfg.tabline.cards,
+        .tabline_card_provider = cfg.tabline.card_provider,
         .windows_external = cfg.windows.external,
         // neovim
         .neovim_path = dupeZForC(alloc, cfg.neovim.path, "nvim"),
