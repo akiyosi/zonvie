@@ -7,8 +7,8 @@
 // first click would land on "+" instead.
 //
 // Needs an nvim that sends `name_chunks` for 'guitablabel' (upstream branch
-// feat/ext-tabline-guitablabel); without it there are no chunks and the
-// rows stay single-line, so the assertions fail.
+// feat/ext-tabline-guitablabel); skipped on an nvim where the option is
+// still an immutable stub.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -38,6 +38,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .app_args = &.{ "--log", "tmp/gui_sidebar_cards.log" },
     });
     defer g.deinit();
+
+    if (try g.evalInt("exists('+guitablabel')") == 0) {
+        std.debug.print("[gui] skipped: this nvim cannot set 'guitablabel'.\n", .{});
+        return error.SkipZigTest;
+    }
 
     driver.platform.pinWindow(g.app_pid, 80, 80);
     g.activateApp();
