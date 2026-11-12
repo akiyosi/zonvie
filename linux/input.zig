@@ -4,12 +4,14 @@
 const std = @import("std");
 const core = @import("zonvie_core");
 const clock = core.clock;
+const rules = core.frontend_rules;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const scrollbar = @import("scrollbar.zig");
+const core_timers = @import("core_timers.zig");
 const askpass = @import("askpass.zig");
 
 /// One GLArea's input: the surface its pointer addresses, its IME context
@@ -23,8 +25,9 @@ pub const Pointer = struct {
     /// Logical widget px of the last pointer motion; the wheel has no position.
     x: f64 = 0,
     y: f64 = 0,
-    /// Button held since a press, and the grid that press chose.
-    held_button: ?[*:0]const u8 = null,
+    /// The buttons held since a press sent to Neovim, and the grid the
+    /// claiming press chose.
+    claim: rules.PressClaim = .{},
     press_grid_id: i64 = 1,
     drag_row: i32 = -1,
     drag_col: i32 = -1,
@@ -268,6 +271,60 @@ fn surfaceCell(app: *App, x: f64, y: f64) ?@TypeOf(transform.pxToCell(0, 0, 1, 1
     return transform.pxToCell(x * s, y * s, cw, ch);
 }
 
+/// The cell logical widget px (x, y) names in `grid_id`, by the core's rule:
+/// where the grid's committed layer sits and the sub-row ease the last frame
+/// drew it with. Null when the surface has no layer for the grid.
+fn gridCell(p: *Pointer, grid_id: i64, x: f64, y: f64) ?Cell {
+    const app = p.app;
+    // The ext UI grids are overlays this frontend places, not layers.
+    if (grid_id <= 0) return null;
+    var geom: core.pointer_target.GridGeometry = undefined;
+    var local: [2]f32 = undefined;
+    var ease_px: f32 = 0;
+    {
+        app.mu.lockUncancelable(clock.io());
+        defer app.mu.unlock(clock.io());
+        if (app.cell_w_px == 0 or app.cell_h_px == 0) return null;
+        const layer = for (app.surface.committedSurfaceLayers(p.surface_id)) |l| {
+            if (l.grid_id == grid_id) break l;
+        } else return null;
+        const s: f64 = app.scale;
+        local = .{
+            @floatCast(x * s - @as(f64, @floatFromInt(layer.x_px))),
+            @floatCast(y * s - @as(f64, @floatFromInt(layer.y_px))),
+        };
+        geom = .{
+            .cell_w_px = app.cell_w_px,
+            .cell_h_px = app.cell_h_px,
+            .extent_w_px = layer.cols * app.cell_w_px,
+            .extent_h_px = layer.rows * app.cell_h_px,
+            .rows = @intCast(layer.rows),
+            .cols = @intCast(layer.cols),
+        };
+        if (app.surface.gridEase(grid_id)) |e| {
+            if (e.easing) ease_px = e.offset_px;
+        }
+    }
+    for (app.pointer_grids[0..app.pointer_grids_len]) |g| {
+        if (g.grid_id != grid_id) continue;
+        geom.margin_top = g.margin_top;
+        geom.margin_bottom = g.margin_bottom;
+        break;
+    }
+    const hit = core.pointer_target.cellInGridEased(local[0], local[1], ease_px, geom);
+    return .{ .grid_id = grid_id, .row = hit.row, .col = hit.col };
+}
+
+/// The surface's own root grid takes a position no grid claims; it has no
+/// cell above or left of its first.
+fn rootCell(p: *Pointer, x: f64, y: f64) ?Cell {
+    const c = gridCell(p, p.surface_id, x, y) orelse blk: {
+        const sc = surfaceCell(p.app, x, y) orelse return null;
+        break :blk Cell{ .grid_id = p.surface_id, .row = sc.row, .col = sc.col };
+    };
+    return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
+}
+
 /// On a miss the surface's own root grid takes the position.
 fn resolve(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64, require_scrollable: c_int) ?Cell {
     const app = p.app;
@@ -275,30 +332,42 @@ fn resolve(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64, require_scrollabl
     refreshGrids(app, cp);
     var hit: core.zonvie_pointer_hit = undefined;
     if (core.zonvie_core_resolve_pointer_grid(&app.pointer_grids, app.pointer_grids_len, p.surface_id, c.row, c.col, require_scrollable, &hit) != 0) {
-        return .{ .grid_id = hit.grid_id, .row = hit.row, .col = hit.col };
+        if (hit.grid_id == p.surface_id) return rootCell(p, x, y);
+        return gridCell(p, hit.grid_id, x, y) orelse .{ .grid_id = hit.grid_id, .row = hit.row, .col = hit.col };
     }
-    return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
+    return rootCell(p, x, y);
 }
 
 /// Rebases a surface position into the grid the press chose, so a drag that
 /// leaves a float keeps addressing it.
 fn inPressGrid(p: *Pointer, x: f64, y: f64) ?Cell {
-    const app = p.app;
-    const c = surfaceCell(app, x, y) orelse return null;
-    for (app.pointer_grids[0..app.pointer_grids_len]) |g| {
-        if (g.grid_id != p.press_grid_id or p.press_grid_id == p.surface_id) continue;
-        return .{ .grid_id = g.grid_id, .row = c.row - g.start_row, .col = c.col - g.start_col };
+    if (p.press_grid_id != p.surface_id) {
+        if (gridCell(p, p.press_grid_id, x, y)) |c| return c;
     }
-    return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
+    return rootCell(p, x, y);
 }
 
-fn buttonName(button: c_uint) ?[*:0]const u8 {
+/// GTK's button number as PressClaim's (zonvie_core.h) and Neovim's name.
+const Button = struct { claim: u8, name: [*:0]const u8 };
+
+fn buttonOf(button: c_uint) ?Button {
     return switch (button) {
+        1 => .{ .claim = 1, .name = "left" },
+        2 => .{ .claim = 3, .name = "middle" },
+        3 => .{ .claim = 2, .name = "right" },
+        8 => .{ .claim = 4, .name = "x1" },
+        9 => .{ .claim = 5, .name = "x2" },
+        else => null,
+    };
+}
+
+fn claimName(claim: u8) ?[*:0]const u8 {
+    return switch (claim) {
         1 => "left",
-        2 => "middle",
-        3 => "right",
-        8 => "x1",
-        9 => "x2",
+        2 => "right",
+        3 => "middle",
+        4 => "x1",
+        5 => "x2",
         else => null,
     };
 }
@@ -308,19 +377,20 @@ fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyop
     const p = ptrFrom(data);
     const cp = p.app.corep orelse return;
     const button = gtk.gtk_gesture_single_get_current_button(gesture.?);
-    if (button == 1 and p.held_button == null and scrollbar.press(p.app, p.surface_id, x, y)) {
+    if (button == 1 and p.claim.held_mask == 0 and scrollbar.press(p.app, p.surface_id, x, y)) {
         p.bar_held = true;
         return;
     }
-    const name = buttonName(button) orelse return;
+    const b = buttonOf(button) orelse return;
     const c = resolve(p, cp, x, y, 0) orelse return;
     var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
-    p.held_button = name;
-    p.press_grid_id = c.grid_id;
-    p.drag_row = c.row;
-    p.drag_col = c.col;
-    core.zonvie_core_send_mouse_input(cp, name, "press", m.ptr, c.grid_id, c.row, c.col);
+    if (p.claim.press(b.claim)) {
+        p.press_grid_id = c.grid_id;
+        p.drag_row = c.row;
+        p.drag_col = c.col;
+    }
+    core.zonvie_core_send_mouse_input(cp, b.name, "press", m.ptr, c.grid_id, c.row, c.col);
 }
 
 fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
@@ -332,12 +402,13 @@ fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyo
         return;
     }
     const cp = p.app.corep orelse return;
-    const name = p.held_button orelse return;
-    p.held_button = null;
+    const b = buttonOf(gtk.gtk_gesture_single_get_current_button(gesture.?)) orelse return;
+    // Every sent press gets its release, to the claim's grid.
+    if (!p.claim.release(b.claim).send) return;
     const c = inPressGrid(p, x, y) orelse return;
     var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
-    core.zonvie_core_send_mouse_input(cp, name, "release", m.ptr, c.grid_id, c.row, c.col);
+    core.zonvie_core_send_mouse_input(cp, b.name, "release", m.ptr, c.grid_id, c.row, c.col);
 }
 
 fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
@@ -345,7 +416,7 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     p.x = x;
     p.y = y;
     if (scrollbar.motion(p.app, p.surface_id, x, y)) return;
-    const name = p.held_button orelse return;
+    const name = claimName(p.claim.owner) orelse return;
     const cp = p.app.corep orelse return;
     const c = inPressGrid(p, x, y) orelse return;
     if (c.row == p.drag_row and c.col == p.drag_col) return;
@@ -426,6 +497,8 @@ fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c)
         const dir: [*:0]const u8 = if (dx > 0) "right" else "left";
         sendSteps(cp, c, dir, m.ptr, dx);
     }
+    // A scroll of a message float can be throttled into a message deadline.
+    core_timers.scheduleMsg(p.app);
     return 1;
 }
 

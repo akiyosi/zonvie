@@ -1,6 +1,7 @@
-//! Core callbacks. They run on the core thread with grid_mu held, so they
-//! never call a core API that takes grid_mu, never paint, and reach GTK only
-//! through g_idle_add.
+//! Core callbacks. They run with grid_mu held, on the core thread or, for a
+//! flush a core_timers tick runs, on the GTK thread; so they never call a
+//! core API that takes grid_mu, never paint, and reach GTK only through
+//! g_idle_add.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -16,6 +17,7 @@ const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
 const blink = @import("blink.zig");
 const scrollbar = @import("scrollbar.zig");
+const core_timers = @import("core_timers.zig");
 const font_picker = @import("font_picker.zig");
 
 pub fn makeCallbacks() core.Callbacks {
@@ -289,12 +291,11 @@ fn onMsgShow(
     msg_id: i64,
     timeout_ms: u32,
 ) callconv(.c) void {
-    _ = replace_last;
     _ = history;
     _ = msg_id;
     const app = appFrom(ctx);
     lock(app);
-    app.ui.msgShow(view, kind[0..kind_len], chunks[0..chunk_count], append != 0, timeout_ms);
+    app.ui.msgShow(view, kind[0..kind_len], chunks[0..chunk_count], replace_last != 0, append != 0, timeout_ms);
     unlock(app);
     ui_widgets.queueRefresh(app);
 }
@@ -413,7 +414,12 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // cached by the core, whatever happens to the rows.
         if (failed) {
             app.surface.cancel();
-            if (core.zonvie_core_flush_is_retryable(cp)) core.zonvie_core_force_resend_locked(cp);
+            // An abort causes no further flush by itself; core_timers
+            // retries it. A fixed resource limit would only fail again.
+            if (core.zonvie_core_flush_is_retryable(cp)) {
+                core.zonvie_core_force_resend_locked(cp);
+                app.flush_outcome.store(.aborted, .release);
+            }
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
             app.flush_seq += 1;
             // The grids this commit frees, released with it.
@@ -426,9 +432,11 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 .large_jump = app.large_jump,
             });
             committed = true;
+            app.flush_outcome.store(.committed, .release);
         } else |_| {
             app.surface.cancel();
             core.zonvie_core_abort_flush(cp);
+            app.flush_outcome.store(.aborted, .release);
         }
     }
     queueRender(app);
@@ -465,6 +473,9 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     // Every flush may carry a mode change, and with it a new cadence.
     blink.update(app);
     scrollbar.update(app);
+    // A flush can arm, move or clear the core's message deadline.
+    core_timers.scheduleMsg(app);
+    core_timers.settleFlush(app);
     return 0;
 }
 

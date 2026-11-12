@@ -239,15 +239,19 @@ fn apply(app: *App, snap: *const Snapshot) void {
     const buf = &app.ui_text_scratch;
     for (snap.ui.minis, 0..) |m, i| setText(w.minis[i], m.text(), buf);
     setText(w.confirm, snap.ui.confirm.text(), buf);
-    var toast_buf: [4096 + 3 * 257]u8 = undefined;
+    var toast_buf: [5 * 1025 + 3 * 257]u8 = undefined;
     setText(w.toast, snap.ui.toastText(&toast_buf), buf);
     if (w.toast) |t| {
-        // Statuses alone carry no tone of their own.
-        setToneClass(t, if (snap.ui.toast.len == 0) 0 else snap.ui.toast_tone);
-        if (snap.ui.toast.len != 0 and snap.ui.toast_timeout_ms != 0 and app.toast_timer_seq != snap.ui.toast_seq) {
+        setToneClass(t, snap.ui.toastTone());
+        // timeout 0 stays (errors). The timer belongs to the stack.
+        if (snap.ui.toast_count != 0 and snap.ui.toast_timeout_ms != 0 and app.toast_timer_seq != snap.ui.toast_seq) {
             app.toast_timer_seq = snap.ui.toast_seq;
             _ = gtk.g_timeout_add(snap.ui.toast_timeout_ms, &onToastTimeout, app);
         }
+    }
+    if (snap.ui.minis[@intFromEnum(ui_state.Mini.message)].len != 0 and snap.ui.mini_timeout_ms != 0 and app.mini_timer_seq != snap.ui.mini_seq) {
+        app.mini_timer_seq = snap.ui.mini_seq;
+        _ = gtk.g_timeout_add(snap.ui.mini_timeout_ms, &onMiniTimeout, app);
     }
     applyTabline(app, &snap.ui);
     placeMessages(app);
@@ -407,7 +411,19 @@ fn onToastTimeout(data: ?*anyopaque) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(data.?));
     app.mu.lockUncancelable(clock.io());
     const current = app.ui.toast_seq == app.toast_timer_seq;
-    if (current) app.ui.toast.clear();
+    if (current) app.ui.toast_count = 0;
+    app.mu.unlock(clock.io());
+    if (current) queueRefresh(app);
+    return 0;
+}
+
+/// Hides the mini-routed message that set this timer, unless a newer one
+/// replaced it.
+fn onMiniTimeout(data: ?*anyopaque) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.mu.lockUncancelable(clock.io());
+    const current = app.ui.mini_seq == app.mini_timer_seq;
+    if (current) app.ui.minis[@intFromEnum(ui_state.Mini.message)].clear();
     app.mu.unlock(clock.io());
     if (current) queueRefresh(app);
     return 0;

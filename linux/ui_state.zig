@@ -7,6 +7,7 @@
 const std = @import("std");
 const core = @import("zonvie_core");
 const rules = core.frontend_rules;
+const msg_stack = core.msg_stack;
 
 pub fn TextBuf(comptime cap: usize) type {
     return struct {
@@ -35,6 +36,12 @@ pub fn TextBuf(comptime cap: usize) type {
 
 pub const Mini = enum(u2) { showmode, showcmd, ruler, message };
 
+pub const ToastMsg = struct {
+    text: TextBuf(1024) = .{},
+    /// zonvie_core_msg_kind_tone.
+    tone: u8 = 0,
+};
+
 pub const tab_cap = 32;
 pub const Tab = struct {
     handle: i64 = 0,
@@ -54,11 +61,15 @@ pub const UiState = struct {
     minis: [4]TextBuf(256) = @splat(.{}),
     /// A prompt Neovim blocks on, shown until the next message or a clear.
     confirm: TextBuf(4096) = .{},
-    toast: TextBuf(4096) = .{},
-    toast_tone: u8 = 0,
+    /// The messages the toast shows together, oldest first (msg_stack).
+    toast: [msg_stack.max_messages]ToastMsg = @splat(.{}),
+    toast_count: usize = 0,
     toast_timeout_ms: u32 = 0,
     /// Bumped per toast, so a timer for an older one does not hide it.
     toast_seq: u32 = 0,
+    /// The message mini's auto-hide, as the toast's.
+    mini_timeout_ms: u32 = 0,
+    mini_seq: u32 = 0,
     /// A message for the "notification" view, not yet handed to the OS;
     /// the GTK thread sends it and clears `notice_pending`.
     notice: TextBuf(1024) = .{},
@@ -112,15 +123,23 @@ pub const UiState = struct {
         return false;
     }
 
+    /// A mini's text from `chunks`, clamped as every frontend clamps it.
+    fn setMini(self: *UiState, which: Mini, chunks: []const core.MsgChunk) void {
+        var raw: TextBuf(4096) = .{};
+        raw.appendChunks(chunks);
+        const m = &self.minis[@intFromEnum(which)];
+        m.len = rules.clampMiniContent(&m.bytes, raw.text());
+    }
+
     /// on_msg_show for a view this frontend draws. `kind` picks the confirm
-    /// box; append (:echon) extends the text shown, anything else replaces it.
-    pub fn msgShow(self: *UiState, view: core.zonvie_msg_view_type, kind: []const u8, chunks: []const core.MsgChunk, append: bool, timeout_ms: u32) void {
+    /// box. The toast stacks its messages by the core's rule (msg_stack).
+    pub fn msgShow(self: *UiState, view: core.zonvie_msg_view_type, kind: []const u8, chunks: []const core.MsgChunk, replace_last: bool, append: bool, timeout_ms: u32) void {
         switch (view) {
             .none, .split => {},
             .mini => {
-                const m = &self.minis[@intFromEnum(Mini.message)];
-                if (!append) m.clear();
-                m.appendChunks(chunks);
+                self.setMini(.message, chunks);
+                self.mini_timeout_ms = timeout_ms;
+                self.mini_seq +%= 1;
             },
             .confirm => {
                 self.confirm.clear();
@@ -136,9 +155,22 @@ pub const UiState = struct {
             .ext_float => {
                 // A new message replaces a confirm that is no longer asked.
                 self.confirm.clear();
-                if (!append) self.toast.clear();
-                self.toast.appendChunks(chunks);
-                self.toast_tone = core.zonvie_core_msg_kind_tone(kind.ptr, kind.len);
+                const plan = msg_stack.plan(self.toast_count, replace_last, append);
+                // Only a push evicts, so the room it needs is made first.
+                if (plan.evict_oldest != 0) {
+                    const n = self.toast_count - plan.evict_oldest;
+                    std.mem.copyForwards(ToastMsg, self.toast[0..n], self.toast[plan.evict_oldest..self.toast_count]);
+                    self.toast_count = n;
+                }
+                if (plan.action == .push) {
+                    self.toast[self.toast_count] = .{};
+                    self.toast_count += 1;
+                }
+                const last = &self.toast[self.toast_count - 1];
+                if (plan.action == .replace_last) last.text.clear();
+                last.text.appendChunks(chunks);
+                // An appended piece keeps the tone of the message it joins.
+                if (plan.action != .append_to_last) last.tone = core.zonvie_core_msg_kind_tone(kind.ptr, kind.len);
                 self.toast_timeout_ms = timeout_ms;
                 self.toast_seq +%= 1;
             },
@@ -148,9 +180,10 @@ pub const UiState = struct {
     /// on_msg_clear: the core resends the statuses it still holds.
     pub fn msgClear(self: *UiState) void {
         self.confirm.clear();
-        self.toast.clear();
+        self.toast_count = 0;
         self.toast_seq +%= 1;
         self.minis[@intFromEnum(Mini.message)].clear();
+        self.mini_seq +%= 1;
         for (&self.float_status) |*f| f.clear();
     }
 
@@ -171,26 +204,31 @@ pub const UiState = struct {
                 self.notice.appendChunks(chunks);
                 self.notice_pending = self.notice.len != 0;
             },
-            else => {
-                const m = &self.minis[@intFromEnum(which)];
-                m.clear();
-                m.appendChunks(chunks);
-            },
+            else => self.setMini(which, chunks),
         }
     }
 
-    /// The toast's text: the message, then each ext_float status on a line
-    /// of its own, cut to `buf`.
+    /// The tone of the toast's newest message; 0 when only statuses show.
+    pub fn toastTone(self: *const UiState) u8 {
+        return if (self.toast_count == 0) 0 else self.toast[self.toast_count - 1].tone;
+    }
+
+    /// The toast's text: the stacked messages, then each ext_float status,
+    /// every one on a line of its own, cut to `buf`.
     pub fn toastText(self: *const UiState, buf: []u8) []const u8 {
-        var n = rules.copyUtf8Truncated(buf, self.toast.text());
-        for (self.float_status) |f| {
-            if (f.len == 0) continue;
-            if (n != 0 and n < buf.len) {
-                buf[n] = '\n';
-                n += 1;
+        var n: usize = 0;
+        const add = struct {
+            fn f(b: []u8, len: *usize, line: []const u8) void {
+                if (line.len == 0) return;
+                if (len.* != 0 and len.* < b.len) {
+                    b[len.*] = '\n';
+                    len.* += 1;
+                }
+                len.* += rules.copyUtf8Truncated(b[len.*..], line);
             }
-            n += rules.copyUtf8Truncated(buf[n..], f.text());
-        }
+        }.f;
+        for (self.toast[0..self.toast_count]) |*m| add(buf, &n, m.text.text());
+        for (&self.float_status) |*f| add(buf, &n, f.text());
         return buf[0..n];
     }
 
@@ -236,25 +274,45 @@ test "a text buffer cuts at a UTF-8 boundary and marks the cut" {
     try testing.expectEqualStrings("a\u{2026}", b.text());
 }
 
-test "echon appends to the toast, a new message replaces it" {
+test "the toast stacks messages; echon extends and replace_last replaces the last" {
     var s: UiState = .{};
-    s.msgShow(.ext_float, "echo", &.{chunk("a")}, false, 4000);
-    s.msgShow(.ext_float, "echo", &.{chunk("b")}, true, 4000);
-    try testing.expectEqualStrings("ab", s.toast.text());
-    s.msgShow(.ext_float, "echo", &.{chunk("c")}, false, 4000);
-    try testing.expectEqualStrings("c", s.toast.text());
+    var buf: [64]u8 = undefined;
+    s.msgShow(.ext_float, "emsg", &.{chunk("a")}, false, false, 4000);
+    s.msgShow(.ext_float, "echo", &.{chunk("b")}, false, true, 4000);
+    try testing.expectEqualStrings("ab", s.toastText(&buf));
+    // The appended piece did not take the error's tone away.
+    try testing.expectEqual(core.zonvie_core_msg_kind_tone("emsg", 4), s.toastTone());
+    s.msgShow(.ext_float, "echo", &.{chunk("c")}, false, false, 4000);
+    try testing.expectEqualStrings("ab\nc", s.toastText(&buf));
+    s.msgShow(.ext_float, "echo", &.{chunk("d")}, true, false, 4000);
+    try testing.expectEqualStrings("ab\nd", s.toastText(&buf));
+    // Past the cap the oldest goes.
+    for (0..4) |_| s.msgShow(.ext_float, "echo", &.{chunk("x")}, false, false, 4000);
+    try testing.expectEqualStrings("d\nx\nx\nx\nx", s.toastText(&buf));
+}
+
+test "a mini message is clamped to ten lines and replaced, not extended" {
+    var s: UiState = .{};
+    s.msgShow(.mini, "echo", &.{chunk("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n")}, false, false, 3000);
+    const m = &s.minis[@intFromEnum(Mini.message)];
+    try testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n\u{2026}(3 more lines)", m.text());
+    try testing.expectEqual(@as(u32, 3000), s.mini_timeout_ms);
+    const seq = s.mini_seq;
+    s.msgShow(.mini, "echo", &.{chunk("b")}, false, true, 0);
+    try testing.expectEqualStrings("b", m.text());
+    try testing.expect(s.mini_seq != seq);
 }
 
 test "the notification view queues an OS notification, not a toast" {
     var s: UiState = .{};
-    s.msgShow(.notification, "echo", &.{chunk("built")}, false, 0);
-    s.msgShow(.notification, "echo", &.{chunk(" ok")}, true, 0);
+    s.msgShow(.notification, "echo", &.{chunk("built")}, false, false, 0);
+    s.msgShow(.notification, "echo", &.{chunk(" ok")}, false, true, 0);
     try testing.expect(s.notice_pending);
     try testing.expectEqualStrings("built ok", s.notice.text());
-    try testing.expectEqual(@as(usize, 0), s.toast.len);
+    try testing.expectEqual(@as(usize, 0), s.toast_count);
     // Once sent, the next message starts a new one even when appended.
     s.notice_pending = false;
-    s.msgShow(.notification, "echo", &.{chunk("next")}, true, 0);
+    s.msgShow(.notification, "echo", &.{chunk("next")}, false, true, 0);
     try testing.expectEqualStrings("next", s.notice.text());
 }
 
@@ -262,11 +320,11 @@ test "statuses follow their route: ext_float joins the toast, others their mini"
     var s: UiState = .{};
     s.status(.showmode, .ext_float, &.{chunk("-- INSERT --")});
     try testing.expectEqual(@as(usize, 0), s.minis[@intFromEnum(Mini.showmode)].len);
-    s.msgShow(.ext_float, "echo", &.{chunk("saved")}, false, 4000);
+    s.msgShow(.ext_float, "echo", &.{chunk("saved")}, false, false, 4000);
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("saved\n-- INSERT --", s.toastText(&buf));
     // The message times out; the status stays.
-    s.toast.clear();
+    s.toast_count = 0;
     try testing.expectEqualStrings("-- INSERT --", s.toastText(&buf));
     s.status(.showcmd, .mini, &.{chunk("2d")});
     try testing.expectEqualStrings("2d", s.minis[@intFromEnum(Mini.showcmd)].text());
@@ -278,7 +336,7 @@ test "statuses follow their route: ext_float joins the toast, others their mini"
 
 test "a confirm stays until a clear or the next message" {
     var s: UiState = .{};
-    s.msgShow(.confirm, "confirm", &.{chunk("Save? [Y]es")}, false, 0);
+    s.msgShow(.confirm, "confirm", &.{chunk("Save? [Y]es")}, false, false, 0);
     try testing.expectEqualStrings("Save? [Y]es", s.confirm.text());
     s.msgClear();
     try testing.expectEqual(@as(usize, 0), s.confirm.len);

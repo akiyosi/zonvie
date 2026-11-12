@@ -1,5 +1,5 @@
 //! Font loading (fontconfig → hbft) and the rasterize/shape/ascii-table
-//! work behind the core's atlas callbacks. Touched only on the core thread.
+//! work behind the core's atlas callbacks. Touched only with the core's grid lock held (callbacks.zig).
 
 const std = @import("std");
 const core = @import("zonvie_core");

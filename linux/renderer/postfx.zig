@@ -368,7 +368,7 @@ fn bloom(app: *App, t: *gl_renderer.Target, p: *PostFx, cp: *core.zonvie_core, s
 /// The cursor as Ghostty's uniforms carry it: (left, bottom, w, h) in
 /// drawable px, y down, and its colour; null when it is not on this surface.
 /// Takes App.mu.
-fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32, style: i32 } {
+fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32 } {
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
     const cur = app.surface.committedCursor();
@@ -377,11 +377,7 @@ fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32
         if (l.grid_id == cur.grid_id) break l;
     } else return null;
     const b = core.cursor_rect.bounds(core.Vertex, cur.verts, @floatFromInt(layer.x_px), @floatFromInt(layer.y_px)) orelse return null;
-    const cw: f32 = @floatFromInt(app.cell_w_px);
-    const ch: f32 = @floatFromInt(app.cell_h_px);
-    // Ghostty's style enum: 0 block, 2 bar, 3 underline.
-    const style: i32 = if (b.width() < cw * 0.5) 2 else if (b.height() < ch * 0.5) 3 else 0;
-    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color, .style = style };
+    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color };
 }
 
 fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id: i64) void {
@@ -403,23 +399,28 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     p.frame +%= 1;
     u.iWindowOffset = .{ 0, 0 };
     u.iWindowSize = .{ w, h };
-    u.iCellSize = .{ @floatFromInt(app.cell_w_px), @floatFromInt(app.cell_h_px) };
-    // The root grid starts at the surface's corner.
-    u.iGridOrigin = .{ 0, 0 };
-    u.iTimeLastEdit = p.age_cache.last_edit;
-    if (cursorState(app, surface_id)) |c| {
+    const cursor = cursorState(app, surface_id);
+    if (cursor) |c| {
         if (!std.mem.eql(f32, &c.rect, &p.cursor_cur)) {
             u.iPreviousCursor = u.iCurrentCursor;
             u.iPreviousCursorColor = u.iCurrentCursorColor;
-            u.iPreviousCursorStyle = u.iCurrentCursorStyle;
             u.iTimeCursorChange = u.iTime;
             p.cursor_cur = c.rect;
         }
         u.iCurrentCursor = c.rect;
         u.iCurrentCursorColor = c.color;
-        u.iCurrentCursorStyle = c.style;
-        u.iCursorVisible = 1;
-    } else u.iCursorVisible = 0;
+    }
+    // The rest by the core's rule, cursor styles included. The root grid
+    // starts at the surface's corner.
+    core.fillEditUniforms(
+        u,
+        @floatFromInt(app.cell_w_px),
+        @floatFromInt(app.cell_h_px),
+        .{ 0, 0 },
+        p.age_cache.last_edit,
+        cursor != null,
+        p.uses_edit,
+    );
 }
 
 /// The main surface (with its overlays), or an external window's.

@@ -50,6 +50,8 @@ pub const AtlasOps = struct {
     }
 };
 
+pub const FlushOutcome = enum(u8) { none, committed, aborted };
+
 pub const App = struct {
     alloc: std.mem.Allocator,
     mu: std.Io.Mutex = .init,
@@ -185,6 +187,8 @@ pub const App = struct {
     ui_text_scratch: [4097]u8 = undefined,
     /// The toast_seq a hide timer is pending for.
     toast_timer_seq: u32 = 0,
+    /// The mini_seq a hide timer is pending for.
+    mini_timer_seq: u32 = 0,
     ui_idle_queued: std.atomic.Value(bool) = .init(false),
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
@@ -212,9 +216,18 @@ pub const App = struct {
     pointer_grids: [32]core.GridInfo = undefined,
     pointer_grids_len: usize = 0,
 
-    // Core thread only.
+    /// core_timers.zig. GTK main thread only.
+    msg_timer: c_uint = 0,
+    flush_retry_timer: c_uint = 0,
+    flush_retry_delay_ms: c_uint = 16,
+    /// What the flushes since core_timers last looked came to; the last one
+    /// wins, since a commit after an abort carries the aborted rows.
+    flush_outcome: std.atomic.Value(FlushOutcome) = .init(.none),
+
+    // The flushing thread only: the core thread, or the GTK thread while a
+    // core_timers tick runs a flush. grid_mu is held either way.
     flush_failed: bool = false,
-    /// Between on_flush_begin and on_flush_end. Core thread only.
+    /// Between on_flush_begin and on_flush_end.
     in_flush: bool = false,
     /// Counts on_flush_begin, as the core counts its flushes, so render
     /// traces of both sides carry one id.
