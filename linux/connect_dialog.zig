@@ -162,7 +162,15 @@ pub fn run(alloc: std.mem.Allocator, seed: Choice) !?Choice {
     }
     _ = gtk.g_signal_connect(cancel, "clicked", @ptrCast(&onCancel), &ui);
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onClose), &ui);
+    gtk.gtk_window_set_default_widget(win, connect);
     gtk.gtk_window_present(win);
+    // GTK would focus the notebook's tabs, which take Enter for themselves;
+    // start where the seeded mode is typed into, or on Connect.
+    _ = gtk.gtk_widget_grab_focus(switch (seed.mode) {
+        .local => connect,
+        .ssh => ui.host,
+        .devcontainer => ui.workspace,
+    });
     while (!ui.done) _ = gtk.g_main_context_iteration(null, 1);
 
     defer {

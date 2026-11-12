@@ -172,6 +172,7 @@ pub extern "c" fn gtk_widget_get_height(widget: *anyopaque) c_int;
 pub extern "c" fn gtk_widget_get_scale_factor(widget: *anyopaque) c_int;
 pub extern "c" fn gtk_widget_set_focusable(widget: *anyopaque, focusable: c_int) void;
 pub extern "c" fn gtk_widget_grab_focus(widget: *anyopaque) c_int;
+pub extern "c" fn gtk_window_set_default_widget(window: *anyopaque, default_widget: ?*anyopaque) void;
 /// (widget, frame_clock, user_data) -> G_SOURCE_CONTINUE (1) or G_SOURCE_REMOVE (0).
 pub const GtkTickCallback = *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 pub extern "c" fn gtk_widget_add_tick_callback(widget: *anyopaque, callback: GtkTickCallback, user_data: ?*anyopaque, notify: ?*anyopaque) c_uint;

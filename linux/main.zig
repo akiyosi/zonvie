@@ -408,6 +408,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild = false;
     var dialog = false;
+    // A bare `--ssh` / `--devcontainer` still picks the dialog's tab.
+    var ssh_tab = config.neovim.ssh;
+    var dc_tab = false;
     var extra: std.ArrayListUnmanaged([]const u8) = .empty;
     // The file arguments among them, absolute: what a second launch hands a
     // running instance under [server] single_instance.
@@ -440,6 +443,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const t = core.frontend_rules.sshTarget(arg["--ssh=".len..]);
             ssh = .{ .host = t.host, .port = t.port };
         } else if (std.mem.eql(u8, arg, "--ssh")) {
+            ssh_tab = true;
             if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
                 i += 1;
                 const t = core.frontend_rules.sshTarget(args[i]);
@@ -448,6 +452,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.startsWith(u8, arg, "--devcontainer=")) {
             devcontainer = .{ .workspace = arg["--devcontainer=".len..] };
         } else if (std.mem.eql(u8, arg, "--devcontainer")) {
+            dc_tab = true;
             if (core.frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null)) {
                 i += 1;
                 devcontainer = .{ .workspace = args[i] };
@@ -517,7 +522,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (dialog) {
         // The CLI and config seed the dialog; its answer replaces them.
         var seed: connect_dialog.Choice = .{
-            .mode = if (ssh != null) .ssh else if (devcontainer != null) .devcontainer else .local,
+            .mode = if (ssh != null or ssh_tab) .ssh else if (devcontainer != null or dc_tab) .devcontainer else .local,
             .nvim_path = cli_nvim_path orelse "",
             .ssh_host = if (ssh) |s| s.host else "",
             .ssh_identity = ssh_identity orelse "",
