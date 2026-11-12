@@ -30,6 +30,7 @@ pub fn makeCallbacks() core.Callbacks {
         .on_external_window = onExternalWindow,
         .on_external_window_close = onExternalWindowClose,
         .on_popupmenu_show = onPopupmenuShow,
+        .on_cmdline_show = onCmdlineShow,
         .on_msg_show = onMsgShow,
         .on_msg_clear = onMsgClear,
         .on_msg_showmode = onMsgShowmode,
@@ -232,6 +233,44 @@ fn onPopupmenuShow(
     lock(app);
     defer unlock(app);
     app.pmenu_bg = c.pmenu_bg;
+}
+
+fn onCmdlineShow(
+    ctx: ?*anyopaque,
+    _: [*]const core.CmdlineChunk,
+    _: usize,
+    _: u32,
+    firstc: u8,
+    _: [*]const u8,
+    _: usize,
+    _: u32,
+    _: u32,
+    _: u32,
+) callconv(.c) void {
+    const app = appFrom(ctx);
+    lock(app);
+    app.cmdline_firstc = firstc;
+    unlock(app);
+    if (!app.panel_colors_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idlePanelColors, app);
+}
+
+/// GTK thread: the highlight lookups take grid_mu, which the core holds
+/// around every callback.
+fn idlePanelColors(data: ?*anyopaque) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.panel_colors_queued.store(false, .release);
+    const cp = app.corep orelse return 0;
+    const names = [_]?[*:0]const u8{ "Search", "Comment" };
+    var fg: [2]u32 = undefined;
+    var bg: [2]u32 = undefined;
+    var found: [2]c_int = undefined;
+    _ = core.zonvie_core_get_hl_by_names_batch(cp, &names, &fg, &bg, &found, names.len);
+    lock(app);
+    app.cmdline_border_rgb = if (found[0] != 0) bg[0] else 0xffff00;
+    app.cmdline_icon_rgb = if (found[1] != 0) fg[1] else 0x808080;
+    unlock(app);
+    app.queueRenderAll();
+    return 0;
 }
 
 // The frontend-drawn ext UI (ui_state.zig). Immediate callbacks: state is
@@ -603,12 +642,13 @@ fn sendLayout(app: *App) void {
 }
 
 /// The cmdline's width budget: its overlay spans the main view, less the
-/// panel padding and the screen margin. Caller does not hold App.mu.
+/// panel chrome and the screen margin. Caller does not hold App.mu.
 pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols {
     lock(app);
     const scale: u32 = @intFromFloat(app.scale);
+    const copy = app.copy_cmdline;
     unlock(app);
-    const chrome: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_padding_pt));
+    const chrome: u32 = @intCast(overlay_layout.cmdlineChromePx(@intCast(scale), copy));
     const margin: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_screen_margin_pt));
     return rules.cmdlineCols(main_w_px, main_w_px, chrome, margin, cell_w_px);
 }

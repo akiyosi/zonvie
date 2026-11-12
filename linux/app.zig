@@ -112,6 +112,15 @@ pub const App = struct {
     ui: ui_state.UiState = .{},
     /// Pmenu's background from on_popupmenu_show; the popupmenu panel's fill.
     pmenu_bg: u32 = 0,
+    /// The cmdline's firstc from on_cmdline_show: '/' and '?' get the
+    /// search icon, the rest the chevron.
+    cmdline_firstc: u8 = 0,
+    /// Search bg (the cmdline and popupmenu border) and Comment fg (the
+    /// cmdline icon), as Windows and macOS colour them; read on the GTK
+    /// thread when a cmdline shows, since a core callback cannot.
+    cmdline_border_rgb: u32 = 0xffff00,
+    cmdline_icon_rgb: u32 = 0x808080,
+    panel_colors_queued: std.atomic.Value(bool) = .init(false),
     /// config.scroll.large_jump_behavior; set before the core starts.
     large_jump: scroll_ease.LargeJumpBehavior = .snap,
     title: [256]u8 = undefined,

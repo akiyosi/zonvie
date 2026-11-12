@@ -62,12 +62,38 @@ const msg_margin_pt: i32 = 10;
 const msg_history_gap_pt: i32 = 4;
 const cmdline_popup_gap_pt: i32 = 4;
 
+/// The cmdline's icon (windows/app.zig CMDLINE_ICON_*): 18 square at the
+/// padding's edge, 14 before the text, so the text starts at 12 + 32.
+pub const cmdline_icon_size_pt: i32 = 18;
+const cmdline_icon_strip_pt: i32 = cmdline_icon_size_pt + 14;
+
 pub fn paddingPx(kind: Kind, scale: i32) i32 {
     return scale * switch (kind) {
         .cmdline => cmdline_padding_pt,
         .msg_show, .msg_history => msg_padding_pt,
         .popupmenu => 0,
     };
+}
+
+/// Where a surface's grid starts inside its panel: past the padding, and
+/// for the cmdline its icon strip too.
+pub fn contentOrigin(kind: Kind, scale: i32) [2]i32 {
+    const pad = paddingPx(kind, scale);
+    const icon: i32 = if (kind == .cmdline) cmdline_icon_strip_pt * scale else 0;
+    return .{ pad + icon, pad };
+}
+
+/// The cmdline icon's box inside panel `r`, vertically centred.
+pub fn cmdlineIconRect(r: Rect, scale: i32) Rect {
+    const box = cmdline_icon_size_pt * scale;
+    return .{ .x = r.x + paddingPx(.cmdline, scale), .y = r.y + @divTrunc(r.h - box, 2), .w = box, .h = box };
+}
+
+/// Everything beside the cmdline grid across its panel, for the core's
+/// width budget (cmdlineCols): padding, icon strip and copy button.
+pub fn cmdlineChromePx(scale: i32, copy: bool) i32 {
+    const copy_w: i32 = if (copy) copy_margin_left_pt + copy_size_pt + copy_margin_right_pt else 0;
+    return scale * (2 * cmdline_padding_pt + cmdline_icon_strip_pt + copy_w);
 }
 
 pub const Inputs = struct {
@@ -134,10 +160,11 @@ pub fn msgTarget(mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, main_w_
 
 fn size(kind: Kind, s: Surface, in: Inputs) [2]i32 {
     const pad = 2 * paddingPx(kind, in.scale);
+    const icon: i32 = if (kind == .cmdline) cmdline_icon_strip_pt * in.scale else 0;
     // The copy button sits beside the text, never over it.
     const copy: i32 = if (hasCopy(kind, in)) (copy_margin_left_pt + copy_size_pt + copy_margin_right_pt) * in.scale else 0;
     return .{
-        @as(i32, @intCast(s.cols)) * in.cell_w_px + pad + copy,
+        @as(i32, @intCast(s.cols)) * in.cell_w_px + pad + icon + copy,
         @as(i32, @intCast(s.rows)) * in.cell_h_px + pad,
     };
 }
@@ -194,7 +221,7 @@ pub fn place(surfaces: *const [4]Surface, in: Inputs) [4]?Rect {
             };
         } else if (out[@intFromEnum(Kind.cmdline)]) |cmd| {
             // Cmdline completion: under the cmdline's text column.
-            const ax = cmd.x + paddingPx(.cmdline, in.scale) + @max(0, pum.start_col) * in.cell_w_px;
+            const ax = cmd.x + contentOrigin(.cmdline, in.scale)[0] + @max(0, pum.start_col) * in.cell_w_px;
             out[@intFromEnum(Kind.popupmenu)] = .{
                 .x = core.zonvie_core_popupmenu_left(ax, wh[0], 0, 0, in.main_w_px),
                 .y = core.zonvie_core_cmdline_popupmenu_top(cmd.y, cmd.bottom(), wh[1], cmdline_popup_gap_pt * in.scale, 0),
@@ -218,8 +245,8 @@ test "the cmdline is centred a third of the way down" {
     var s: [4]Surface = @splat(.{});
     s[@intFromEnum(Kind.cmdline)] = open(1, 40, -1, -1);
     const r = place(&s, in1)[@intFromEnum(Kind.cmdline)].?;
-    try testing.expectEqual(@as(i32, 424), r.w);
-    try testing.expectEqual(@as(i32, 188), r.x);
+    try testing.expectEqual(@as(i32, 456), r.w);
+    try testing.expectEqual(@as(i32, 172), r.x);
     try testing.expectEqual(@as(i32, 44), r.h);
     try testing.expectEqual(@as(i32, 185), r.y);
 }
@@ -244,6 +271,9 @@ test "a cmdline completion needs the cmdline and sits beside it" {
     const cmd = out[@intFromEnum(Kind.cmdline)].?;
     const pum = out[@intFromEnum(Kind.popupmenu)].?;
     try testing.expect(pum.y + pum.h <= cmd.y or pum.y >= cmd.y + cmd.h);
+    // Under the cmdline's text: past its padding and icon strip.
+    try testing.expectEqual(cmd.x + 12 + 32 + 2 * 10, pum.x);
+    try testing.expectEqual(@as(i32, 12 * 2 + 32 + 30), cmdlineChromePx(1, true));
 }
 
 test "msg_show stacks below msg_history at the top-right" {

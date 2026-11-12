@@ -478,6 +478,71 @@ fn pushRect(app: *App, t: *Target, x: i32, y: i32, w: i32, h: i32, color: [4]f32
     }
 }
 
+fn pushTri(app: *App, t: *Target, pts: [3][2]f32, color: [4]f32) void {
+    for (pts) |p| {
+        t.scratch.append(app.alloc, .{
+            .position = p,
+            .texCoord = .{ -1, -1 },
+            .color = color,
+            .grid_id = 0,
+            .deco_flags = 0,
+            .deco_phase = 0,
+        }) catch return;
+    }
+}
+
+/// A stroke from `a` to `b`, `half_w` either side, as two triangles.
+fn pushSegment(app: *App, t: *Target, a: [2]f32, b: [2]f32, half_w: f32, color: [4]f32) void {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len == 0) return;
+    const nx = -dy / len * half_w;
+    const ny = dx / len * half_w;
+    const a0: [2]f32 = .{ a[0] + nx, a[1] + ny };
+    const a1: [2]f32 = .{ a[0] - nx, a[1] - ny };
+    const b0: [2]f32 = .{ b[0] + nx, b[1] + ny };
+    const b1: [2]f32 = .{ b[0] - nx, b[1] - ny };
+    pushTri(app, t, .{ a0, b0, a1 }, color);
+    pushTri(app, t, .{ b0, b1, a1 }, color);
+}
+
+/// The cmdline icon in `box`: a magnifier for a search, else a chevron.
+/// The shapes and margins of the D3D11 icon SDFs (windows/shaders/main.hlsl
+/// ICON_CIRCLE, ICON_HANDLE, ICON_CHEVRON), in box-local 0..1 units.
+fn pushCmdlineIcon(app: *App, t: *Target, box: overlay_layout.Rect, search: bool, color: [4]f32) void {
+    const margin: f32 = if (search) 0.15 else 0.18;
+    const bw: f32 = @floatFromInt(box.w);
+    const bh: f32 = @floatFromInt(box.h);
+    const ox = @as(f32, @floatFromInt(box.x)) + bw * margin;
+    const oy = @as(f32, @floatFromInt(box.y)) + bh * margin;
+    const sw = bw * (1 - 2 * margin);
+    const sh = bh * (1 - 2 * margin);
+    const P = struct {
+        fn at(x: f32, y: f32, o: [2]f32, size: [2]f32) [2]f32 {
+            return .{ o[0] + x * size[0], o[1] + y * size[1] };
+        }
+    };
+    const o: [2]f32 = .{ ox, oy };
+    const sz: [2]f32 = .{ sw, sh };
+    if (!search) {
+        const tip = P.at(0.75, 0.5, o, sz);
+        pushSegment(app, t, P.at(0.25, 0.2, o, sz), tip, 0.08 * sw, color);
+        pushSegment(app, t, P.at(0.25, 0.8, o, sz), tip, 0.08 * sw, color);
+        return;
+    }
+    const segments = 24;
+    const c = P.at(0.42, 0.42, o, sz);
+    const rad = 0.32 * sw;
+    var i: usize = 0;
+    while (i < segments) : (i += 1) {
+        const a0 = @as(f32, @floatFromInt(i)) / segments * 2 * std.math.pi;
+        const a1 = @as(f32, @floatFromInt(i + 1)) / segments * 2 * std.math.pi;
+        pushTri(app, t, .{ c, .{ c[0] + rad * @cos(a0), c[1] + rad * @sin(a0) }, .{ c[0] + rad * @cos(a1), c[1] + rad * @sin(a1) } }, color);
+    }
+    pushSegment(app, t, P.at(0.5, 0.5, o, sz), P.at(0.92, 0.92, o, sz), 0.06 * sw, color);
+}
+
 const surface_layer: core.Layer = .{ .grid_id = 0, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 0, .cols = 0, .z = 0, .flags = 0 };
 
 /// What places the ext UI panels on a `w_px` x `h_px` main view: the one
@@ -507,7 +572,9 @@ fn drawOverlays(app: *App, t: *Target) usize {
     const rects = overlay_layout.place(&app.overlays, overlayInputs(app, t.w_px, t.h_px));
     const bg = rgba(app.default_bg, 1);
     const panel = rules.panelBg(bg[0], bg[1], bg[2]);
-    const border = rgba(app.default_fg, 0.25);
+    // As on Windows and macOS: the cmdline and popupmenu carry a Search-bg
+    // border, the message panels none.
+    const border = rgba(app.cmdline_border_rgb, 1);
     const cur = app.surface.committedCursor();
     var total: usize = 0;
     for (overlay_layout.draw_order) |kind| {
@@ -519,18 +586,19 @@ fn drawOverlays(app: *App, t: *Target) usize {
 
         const fill: [4]f32 = if (kind == .popupmenu) rgba(app.pmenu_bg, 1) else .{ panel[0], panel[1], panel[2], 1 };
         t.scratch.clearRetainingCapacity();
-        pushRect(app, t, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
+        if (kind == .cmdline or kind == .popupmenu) pushRect(app, t, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
         pushRect(app, t, r.x, r.y, r.w, r.h, fill);
+        if (kind == .cmdline) pushCmdlineIcon(app, t, overlay_layout.cmdlineIconRect(r, scale), app.cmdline_firstc == '/' or app.cmdline_firstc == '?', rgba(app.cmdline_icon_rgb, 1));
         drawVerts(app, t, t.scratch.items, surface_layer, 0);
 
         // A cmdline wider than the window is clipped to its panel.
         gl.glEnable(gl.GL_SCISSOR_TEST);
         scissor(t, r.x, r.y, r.w, r.h);
-        const pad = overlay_layout.paddingPx(kind, scale);
+        const origin = overlay_layout.contentOrigin(kind, scale);
         for (layers) |layer| {
             var placed = layer;
-            placed.x_px += r.x + pad;
-            placed.y_px += r.y + pad;
+            placed.x_px += r.x + origin[0];
+            placed.y_px += r.y + origin[1];
             if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, t, placed, grid, .{ 0, 0 }, 0);
             if (cur.verts.len != 0 and cur.grid_id == layer.grid_id and app.cursor_blink.visible) {
                 total += cur.verts.len;
