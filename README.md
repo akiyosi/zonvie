@@ -2,11 +2,11 @@
 
 <img src="zonvie.png" width="100" height="100" alt="Zonvie">
 
-Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Windows.
+Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windows and Linux.
 
 ## Features
 
-- **Native Performance**: Zig core with Metal (macOS) and D3D11 (Windows) rendering
+- **Native Performance**: Zig core with Metal (macOS), D3D11 (Windows) and OpenGL (Linux) rendering
 - **Zero-allocation Hot Paths**: Optimized for minimal latency during redraw/flush
 - **Full Neovim UI API Compliance**: Supports ext_cmdline, ext_popupmenu, ext_messages, ext_tabline
 - **Remote Development**:
@@ -32,6 +32,21 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Wi
 
 - **macOS**: AppKit + Swift + Metal
 - **Windows**: Win32 + D3D11/DXGI + DirectWrite
+- **Linux**: GTK 4 + OpenGL (EGL) + FreeType/HarfBuzz/Fontconfig
+
+### Linux notes
+
+- **New Session**: Ctrl+Shift+N opens another zonvie with the connection
+  dialog (macOS: Cmd+N). The key never reaches Neovim. The desktop entry
+  written by `--install` has the same "New Session" action.
+- **External UI**: the external cmdline, popup menu, messages and tabline
+  are drawn inside the main window, not as separate OS windows. Message
+  views follow `[messages] msg_pos` within it.
+- **Translucency**: `[window] opacity` and `blur` make the window
+  translucent; the blur itself is the compositor's (e.g. a Hyprland or KDE
+  blur rule), so `blur_radius` has no effect.
+- **Devcontainer**: Docker must already be running; zonvie does not start
+  it.
 
 ## Installation
 
@@ -49,6 +64,16 @@ Build from source (requires Zig 0.16.x):
 
 ```bash
 zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+```
+
+### Linux
+
+Build from source (requires Zig 0.16.x and the development packages of
+GTK 4, EGL/OpenGL, GBM, FreeType, HarfBuzz and Fontconfig):
+
+```bash
+zig build linux -Doptimize=ReleaseFast
+linux/zig-out/zonvie --install   # default config, desktop entry and icon
 ```
 
 ## Usage
@@ -76,7 +101,9 @@ zonvie [OPTIONS] [--] [NVIM_ARGS...]
 | `--devcontainer-rebuild` | Rebuild devcontainer before starting |
 | `--connect-nvim=<addr>` | Attach to a running Neovim server. Address: POSIX (macOS/Linux) — TCP `host:port` or Unix socket path; Windows — named pipe path (e.g. `\\.\pipe\nvim.31920.0`). Mutually exclusive with `--ssh` / `--devcontainer` / `--wsl`. |
 | `--remote-ui=<addr>` | Alias of `--connect-nvim`, mirrors `nvim --remote-ui` |
-| `--install` | Create default config file and exit |
+| `--dialog` | Choose the connection (Local / SSH / Devcontainer) in a dialog at startup. `--ssh` / `--devcontainer` pre-select their tab. Mutually exclusive with `--connect-nvim` |
+| `--install` | Create default config file and exit (Linux: also the desktop entry and icon) |
+| `--version` | Show version information and exit |
 | `--` | Pass all remaining arguments to nvim |
 | `--help`, `-h` | Show help message |
 
@@ -122,7 +149,8 @@ one. On macOS it writes to the same single path the app reads. On Windows it
 always writes to `%APPDATA%`, so running it while a config lives at the
 `%USERPROFILE%\.config` fallback will shadow that config. Windows also creates
 the default config automatically on first launch when neither candidate
-exists.
+exists. On Linux it also writes the desktop entry and its icon under
+`$XDG_DATA_HOME` (`~/.local/share`), pointing at the binary it was run from.
 
 ### Example Configuration
 
@@ -262,7 +290,7 @@ paths = [
 |-----|-------------|
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
-| `blur_radius` | Blur radius (1-100, when blur=true) |
+| `blur_radius` | Blur radius (1-100, when blur=true). Not applicable on Linux, where the compositor blurs |
 | `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge (default: `"native"`) |
 
 #### [scrollbar]
