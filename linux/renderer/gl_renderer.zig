@@ -40,6 +40,7 @@ pub const Target = struct {
     u_scroll_offset: i32 = -1,
     u_layer_origin_x: i32 = -1,
     u_mode: i32 = -1,
+    u_clear_bg: i32 = -1,
     w_px: u32 = 0,
     h_px: u32 = 0,
     /// Row 0 of the framebuffer is the image's top: an FBO over a dmabuf
@@ -102,8 +103,10 @@ pub fn realize(t: *Target) bool {
     t.u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
     t.u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
     t.u_mode = gl.glGetUniformLocation(prog, "u_mode");
+    t.u_clear_bg = gl.glGetUniformLocation(prog, "u_clear_bg");
     gl.glUseProgram(prog);
     gl.glUniform1i(gl.glGetUniformLocation(prog, "u_atlas"), 0);
+    gl.glUniform4f(t.u_clear_bg, 0, 0, 0, -1);
 
     gl.glGenVertexArrays(1, &t.vao);
     gl.glBindVertexArray(t.vao);
@@ -562,6 +565,7 @@ pub fn overlayInputs(app: *const App, w_px: u32, h_px: u32) overlay_layout.Input
         .msg_target = overlay_layout.msgTarget(app.msg_pos.ext_float, app.msg_anchor, w, h, cw, ch),
         .copy_cmdline = app.copy_cmdline,
         .copy_messages = app.copy_messages,
+        .confirm = app.confirm_rect,
     };
 }
 
@@ -584,7 +588,11 @@ fn drawOverlays(app: *App, t: *Target) usize {
         if (layers.len == 0) continue;
         if (applog.isEnabled()) applog.appLog("[overlay] {s} x={d} y={d} w={d} h={d} layers={d}\n", .{ @tagName(kind), r.x, r.y, r.w, r.h, layers.len });
 
-        const fill: [4]f32 = if (kind == .popupmenu) rgba(app.pmenu_bg, 1) else .{ panel[0], panel[1], panel[2], 1 };
+        // The popupmenu's Pmenu goes through panelBg as the other panels'
+        // Normal does, as on Windows and macOS.
+        const pmenu = rgba(app.pmenu_bg, 1);
+        const pmenu_panel = rules.panelBg(pmenu[0], pmenu[1], pmenu[2]);
+        const fill: [4]f32 = if (kind == .popupmenu) .{ pmenu_panel[0], pmenu_panel[1], pmenu_panel[2], 1 } else .{ panel[0], panel[1], panel[2], 1 };
         t.scratch.clearRetainingCapacity();
         if (kind == .cmdline or kind == .popupmenu) pushRect(app, t, r.x - scale, r.y - scale, r.w + 2 * scale, r.h + 2 * scale, border);
         pushRect(app, t, r.x, r.y, r.w, r.h, fill);
@@ -595,6 +603,12 @@ fn drawOverlays(app: *App, t: *Target) usize {
         gl.glEnable(gl.GL_SCISSOR_TEST);
         scissor(t, r.x, r.y, r.w, r.h);
         const origin = overlay_layout.contentOrigin(kind, scale);
+        // Cells in the panel's source colour let its fill through, so no
+        // darker band shows behind the text (as on Windows).
+        const src = if (kind == .popupmenu) pmenu else bg;
+        gl.glUseProgram(t.program);
+        gl.glUniform4f(t.u_clear_bg, src[0], src[1], src[2], 1);
+        defer gl.glUniform4f(t.u_clear_bg, 0, 0, 0, -1);
         for (layers) |layer| {
             var placed = layer;
             placed.x_px += r.x + origin[0];

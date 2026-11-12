@@ -52,6 +52,7 @@ pub const Widgets = struct {
     /// The colors the stylesheet was last built from; 0xffffffff until then.
     css_fg: u32 = 0xffffffff,
     css_bg: u32 = 0xffffffff,
+    css_font_px: u32 = 0,
     /// The tabline the strip was last built from.
     tab_count: usize = 0,
     tab_handles: [ui_state.tab_cap]i64 = @splat(0),
@@ -132,13 +133,13 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     w.mini_box = mini_box;
     gtk.gtk_overlay_add_overlay(overlay, mini_box);
 
-    const confirm = label(&.{ "zonvie-panel", "zonvie-confirm" });
+    const confirm = label(&.{ "zonvie-panel", "zonvie-confirm", "zonvie-confirm-prompt" });
     gtk.gtk_widget_set_halign(confirm, gtk.GTK_ALIGN_CENTER);
     gtk.gtk_widget_set_valign(confirm, gtk.GTK_ALIGN_CENTER);
     w.confirm = confirm;
     gtk.gtk_overlay_add_overlay(overlay, confirm);
 
-    const toast = label(&.{"zonvie-panel"});
+    const toast = label(&.{ "zonvie-panel", "zonvie-toast" });
     gtk.gtk_widget_set_halign(toast, gtk.GTK_ALIGN_END);
     gtk.gtk_widget_set_valign(toast, gtk.GTK_ALIGN_START);
     gtk.gtk_widget_set_margin_end(toast, m);
@@ -191,6 +192,8 @@ const Snapshot = struct {
     ui: ui_state.UiState,
     fg: u32,
     bg: u32,
+    /// The editor font's size in logical px; 0 before the first font.
+    font_px: u32,
 };
 
 fn idleRefresh(data: ?*anyopaque) callconv(.c) c_int {
@@ -199,7 +202,7 @@ fn idleRefresh(data: ?*anyopaque) callconv(.c) c_int {
     // Large (the confirm and toast buffers); kept off the stack.
     const snap = &app.ui_snapshot;
     app.mu.lockUncancelable(clock.io());
-    snap.* = .{ .ui = app.ui, .fg = app.default_fg, .bg = app.default_bg };
+    snap.* = .{ .ui = app.ui, .fg = app.default_fg, .bg = app.default_bg, .font_px = @intFromFloat(@round(app.preedit_px)) };
     // Announced once: the snapshot carries them out.
     app.ui.done_count = 0;
     app.mu.unlock(clock.io());
@@ -224,7 +227,7 @@ fn setText(l: ?*anyopaque, text: []const u8, buf: []u8) void {
 
 fn apply(app: *App, snap: *const Snapshot) void {
     const w = &app.widgets;
-    applyCss(w, snap.fg, snap.bg);
+    applyCss(w, snap.fg, snap.bg, snap.font_px);
     const buf = &app.ui_text_scratch;
     for (snap.ui.minis, 0..) |m, i| setText(w.minis[i], m.text(), buf);
     setText(w.confirm, snap.ui.confirm.text(), buf);
@@ -324,11 +327,39 @@ pub fn placeMessages(app: *App) void {
     const vw = view_w * scale;
     const vh = view_h * scale;
     const m: c_int = margin_pt;
+    // A monospace advance is about 0.6 of the font size: the widths below,
+    // in logical px, become the labels' character limits.
+    const char_px: f32 = 0.6 * @as(f32, @floatFromInt(if (w.css_font_px == 0) 13 else @max(12, w.css_font_px)));
     if (w.toast) |t| {
         const r = overlay_layout.msgTarget(pos.ext_float, anchor, vw, vh, cw, ch);
         gtk.gtk_widget_set_margin_top(t, @divTrunc(r.top, scale) + m);
         gtk.gtk_widget_set_margin_end(t, @divTrunc(vw - r.right, scale) + m);
+        // macOS and Windows: at most 0.8 of the target and 600 wide.
+        const max_px = @min(0.8 * @as(f32, @floatFromInt(@divTrunc(r.right - r.left, scale))), 600) - 24;
+        gtk.gtk_label_set_max_width_chars(t, @intFromFloat(@max(1, max_px / char_px)));
     }
+    var confirm_rect: ?overlay_layout.Rect = null;
+    if (w.confirm) |c| {
+        // At most the view less 40, and 800.
+        const max_px = @as(f32, @floatFromInt(@min(view_w - 40, 800))) - 24;
+        gtk.gtk_label_set_max_width_chars(c, @intFromFloat(@max(1, max_px / char_px)));
+        if (gtk.gtk_widget_get_visible(c) != 0) {
+            // Centred in the view (halign/valign), at its natural size.
+            var nat: gtk.GtkRequisition = .{};
+            gtk.gtk_widget_get_preferred_size(c, null, &nat);
+            confirm_rect = .{
+                .x = @divTrunc(view_w - nat.width, 2) * scale,
+                .y = @divTrunc(view_h - nat.height, 2) * scale,
+                .w = nat.width * scale,
+                .h = nat.height * scale,
+            };
+        }
+    }
+    app.mu.lockUncancelable(clock.io());
+    const moved = !std.meta.eql(app.confirm_rect, confirm_rect);
+    app.confirm_rect = confirm_rect;
+    app.mu.unlock(clock.io());
+    if (moved) app.queueRenderAll();
     if (w.mini_box) |b| {
         const r = overlay_layout.msgTarget(pos.mini, anchor, vw, vh, cw, ch);
         const place: [2]c_int = .{ @divTrunc(vw - r.right, scale) + m, @divTrunc(vh - r.bottom, scale) + m };
@@ -342,15 +373,12 @@ pub fn placeMessages(app: *App) void {
     }
 }
 
-const tone_classes = [_][*:0]const u8{ "tone-error", "tone-warn" };
+/// By zonvie_core_msg_kind_tone: error, warn, prompt, search.
+const tone_classes = [_][*:0]const u8{ "tone-error", "tone-warn", "tone-prompt", "tone-search" };
 
 fn setToneClass(widget: *anyopaque, tone: u8) void {
     for (tone_classes) |c| gtk.gtk_widget_remove_css_class(widget, c);
-    switch (tone) {
-        1 => gtk.gtk_widget_add_css_class(widget, tone_classes[0]),
-        2 => gtk.gtk_widget_add_css_class(widget, tone_classes[1]),
-        else => {},
-    }
+    if (tone >= 1 and tone <= tone_classes.len) gtk.gtk_widget_add_css_class(widget, tone_classes[tone - 1]);
 }
 
 /// Hides the toast that set this timer, unless a newer one replaced it.
@@ -364,11 +392,16 @@ fn onToastTimeout(data: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
-fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
-    if (w.css_fg == fg and w.css_bg == bg) return;
+fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
+    if (w.css_fg == fg and w.css_bg == bg and w.css_font_px == font_px) return;
     const css = w.css orelse return;
     w.css_fg = fg;
     w.css_bg = bg;
+    w.css_font_px = font_px;
+    // The panels' text at the editor font's size, the minis smaller: the
+    // sizes macOS and Windows give them (toast ~ the cell, minis 0.75 of it).
+    const panel_px: u32 = if (font_px == 0) 13 else @max(12, font_px);
+    const mini_px: u32 = if (font_px == 0) 11 else @max(11, font_px * 3 / 4);
     const b: [3]f32 = .{
         @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0,
         @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0,
@@ -376,13 +409,20 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
     };
     const p = core.frontend_rules.panelBg(b[0], b[1], b[2]);
     const panel: u32 = (@as(u32, @intFromFloat(p[0] * 255)) << 16) | (@as(u32, @intFromFloat(p[1] * 255)) << 8) | @as(u32, @intFromFloat(p[2] * 255));
-    var buf: [1536]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    // Tone colours as macOS's message panels (ZonvieCore.swift): the text
+    // and, where it has one, the border.
     const text = std.fmt.bufPrintZ(&buf,
         \\.zonvie-panel {{ background-color: #{x:0>6}; color: #{x:0>6}; font-family: monospace;
-        \\  padding: 6px 10px; border-radius: 6px; border: 1px solid alpha(#{x:0>6}, 0.25); }}
-        \\.zonvie-confirm {{ padding: 12px 16px; }}
-        \\.zonvie-panel.tone-error {{ border-color: #e06c75; color: #e06c75; }}
-        \\.zonvie-panel.tone-warn {{ border-color: #e5c07b; }}
+        \\  font-size: {d}px; padding: 12px; border-radius: 6px; border: 1px solid alpha(#{x:0>6}, 0.25); }}
+        \\.zonvie-panel.zonvie-mini {{ background-color: #{x:0>6}; font-size: {d}px; padding: 0 8px;
+        \\  border: none; border-radius: 0; }}
+        \\.zonvie-confirm-prompt {{ min-height: 200px; color: #99ccff; border-color: #4d99ff; }}
+        \\.zonvie-toast {{ min-width: 100px; }}
+        \\.zonvie-panel.tone-error {{ border-color: #ff4d4d; color: #ff6666; }}
+        \\.zonvie-panel.tone-warn {{ border-color: #ffcc4d; color: #ffd966; }}
+        \\.zonvie-panel.tone-prompt {{ border-color: #4d99ff; color: #99ccff; }}
+        \\.zonvie-panel.tone-search {{ color: #99ff99; }}
         \\window.zonvie-translucent {{ background: transparent; }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar {{ background-color: #{x:0>6}; }}
@@ -395,7 +435,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32) void {
         \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
         \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
         \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
-    , .{ panel, fg, fg, bg, fg, panel, fg, bg, fg, fg, fg }) catch return;
+    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, panel, fg, bg, fg, fg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
 
@@ -496,8 +536,9 @@ pub fn showProgress(app: *App, text: [:0]const u8) void {
     app.mu.lockUncancelable(clock.io());
     const fg = app.default_fg;
     const bg = app.default_bg;
+    const font_px: u32 = @intFromFloat(@round(app.preedit_px));
     app.mu.unlock(clock.io());
-    applyCss(&app.widgets, fg, bg);
+    applyCss(&app.widgets, fg, bg, font_px);
     gtk.gtk_label_set_text(l, text.ptr);
     gtk.gtk_widget_set_visible(l, 1);
 }

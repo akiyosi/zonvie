@@ -93,6 +93,10 @@ pub const App = struct {
     /// the first (zonvie_core_msg_anchor). Written on the GTK main thread
     /// under `mu`.
     msg_anchor: ?core.MsgAnchor = null,
+    /// The confirm dialog's box in surface px while it shows; written by
+    /// ui_widgets.placeMessages on the GTK thread under `mu`, read by the
+    /// overlay layout wherever the frame is drawn.
+    confirm_rect: ?overlay_layout.Rect = null,
     /// config.toml's [font]; `family` borrows the Config, which outlives the app.
     font_cfg: core.config.Config.FontConfig = .{},
     /// GLArea size in device pixels and its integer scale factor; written by

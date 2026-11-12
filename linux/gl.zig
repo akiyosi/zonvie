@@ -121,6 +121,7 @@ pub extern "c" fn glUseProgram(program: GLuint) void;
 pub extern "c" fn glGetUniformLocation(program: GLuint, name: [*:0]const GLchar) GLint;
 pub extern "c" fn glUniform1i(location: GLint, v0: GLint) void;
 pub extern "c" fn glUniform1f(location: GLint, v0: GLfloat) void;
+pub extern "c" fn glUniform4f(location: GLint, v0: f32, v1: f32, v2: f32, v3: f32) void;
 pub extern "c" fn glGetUniformBlockIndex(program: GLuint, name: [*:0]const GLchar) GLuint;
 pub extern "c" fn glUniformBlockBinding(program: GLuint, block_index: GLuint, binding: GLuint) void;
 pub extern "c" fn glBindBufferBase(target: GLenum, index: GLuint, buffer: GLuint) void;

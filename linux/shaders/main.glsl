@@ -6,6 +6,7 @@
 #define DECO_UNDERDOUBLE   (1u << 2)
 #define DECO_UNDERDOTTED   (1u << 3)
 #define DECO_UNDERDASHED   (1u << 4)
+#define DECO_CURSOR        (1u << 6)
 // Transport-only: the vertex is in the scrollable content area, not a margin.
 #define DECO_SCROLLABLE    (1u << 7)
 #define DECO_GLOW          (1u << 9)
@@ -49,6 +50,10 @@ uniform float u_layer_origin_x_px;
 // 0 draws the grid; 1 extracts the glyphs the core marked DECO_GLOW, in their
 // own colour, for the bloom (windows/shaders/main.hlsl PSGlowExtract).
 uniform int u_mode;
+// A panel's own bg (alpha >= 0): solid cells of that colour are left out so
+// the panel fill shows through, as windows/ui/external_windows.zig
+// appendDecoratedContent makes them transparent. Alpha < 0 draws them all.
+uniform vec4 u_clear_bg;
 
 in vec2 v_uv;
 in vec4 v_col;
@@ -76,6 +81,8 @@ void main() {
     // Solid quads (backgrounds, decorations, cursor) carry uv.x < 0; for
     // decorations uv.y is the local y within the quad (0 top, 1 bottom).
     if (v_uv.x < 0.0) {
+        if (u_clear_bg.a >= 0.0 && (v_deco & DECO_CURSOR) == 0u &&
+            all(lessThan(abs(v_col.rgb - u_clear_bg.rgb), vec3(0.005)))) discard;
         float x_px = gl_FragCoord.x - u_layer_origin_x_px;
         if ((v_deco & DECO_UNDERCURL) != 0u) {
             float cell_width = 8.0;

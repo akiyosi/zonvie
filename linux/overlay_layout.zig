@@ -109,6 +109,9 @@ pub const Inputs = struct {
     /// [cmdline] / [messages] copy_button: those panels reserve room for it.
     copy_cmdline: bool = false,
     copy_messages: bool = false,
+    /// The confirm dialog while it shows: the cmdline answering it goes
+    /// below it, as on Windows and macOS.
+    confirm: ?Rect = null,
 };
 
 /// The copy button's box and gaps, as windows/app.zig's COPY_BUTTON_*.
@@ -181,12 +184,18 @@ pub fn place(surfaces: *const [4]Surface, in: Inputs) [4]?Rect {
         // Windows (centredOnWorkArea with a divisor of 3).
         const margin = cmdline_screen_margin_pt * in.scale;
         const w = @min(wh[0], @max(0, in.main_w_px - 2 * margin));
-        out[@intFromEnum(Kind.cmdline)] = .{
+        var r: Rect = .{
             .x = @divTrunc(in.main_w_px - w, 2),
             .y = @max(0, @divTrunc(in.main_h_px - wh[1], 3)),
             .w = w,
             .h = wh[1],
         };
+        if (in.confirm) |c| {
+            // 4 below it and centred on it, kept in the view.
+            r.x = std.math.clamp(c.x + @divTrunc(c.w - w, 2), 0, @max(0, in.main_w_px - w));
+            r.y = std.math.clamp(c.bottom() + cmdline_popup_gap_pt * in.scale, 0, @max(0, in.main_h_px - wh[1]));
+        }
+        out[@intFromEnum(Kind.cmdline)] = r;
     }
 
     // A box wider than a narrow target keeps its left edge in the view.
@@ -249,6 +258,16 @@ test "the cmdline is centred a third of the way down" {
     try testing.expectEqual(@as(i32, 172), r.x);
     try testing.expectEqual(@as(i32, 44), r.h);
     try testing.expectEqual(@as(i32, 185), r.y);
+}
+
+test "the cmdline answering a confirm sits 4 below it" {
+    var s: [4]Surface = @splat(.{});
+    s[@intFromEnum(Kind.cmdline)] = open(1, 40, -1, -1);
+    var in = in1;
+    in.confirm = .{ .x = 300, .y = 200, .w = 200, .h = 100 };
+    const r = place(&s, in)[@intFromEnum(Kind.cmdline)].?;
+    try testing.expectEqual(@as(i32, 304), r.y);
+    try testing.expectEqual(@as(i32, 400), r.x + @divTrunc(r.w, 2));
 }
 
 test "a buffer popupmenu opens below its anchor and flips above near the bottom" {
