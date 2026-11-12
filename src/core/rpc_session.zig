@@ -1522,6 +1522,119 @@ const lua_body =
         \\    end
         \\  end, 800)
         \\end
+        \\-- OSC 7501 (Program Status Protocol, rev 0.4). A buffer that has sent
+        \\-- one valid report is driven by its records alone; the title
+        \\-- classification, prompt scrape and exit poll above stay the fallback
+        \\-- for agents that never send one. rec[buf][id] holds the last report
+        \\-- per id ('' = root); each report replaces its record whole.
+        \\local osc, rec, rec_seq, prev7501 = {}, {}, 0, {}
+        \\local P_RANK = { idle = 1, done = 2, error = 2, working = 3, blocked = 4 }
+        \\-- Decoded text, or nil when the report must be discarded whole.
+        \\local function b64text(v, max_enc, max_dec)
+        \\  if #v > max_enc then return nil end
+        \\  local ok, s = pcall(vim.base64.decode, v .. string.rep('=', (4 - #v % 4) % 4))
+        \\  if not ok or #s > max_dec or s:find('[%z\1-\31\127]') or s:find('\194[\128-\159]') then return nil end
+        \\  return s
+        \\end
+        \\local function parse7501(body)
+        \\  if #body > 4096 then return nil end
+        \\  local r = {}
+        \\  for pair in (body .. ':'):gmatch('([^:]*):') do
+        \\    local k, v = pair:match('^%s*([a-z]+)%s*=%s*(.-)%s*$')
+        \\    if k then
+        \\      if #k > 16 then return nil end
+        \\      if v:find('^[A-Za-z0-9_.,+/=%-]*$') then r[k] = v end
+        \\    end
+        \\  end
+        \\  if r.state ~= 'clear' and not P_RANK[r.state or ''] then return nil end
+        \\  local id = r.id or ''
+        \\  if r.id then
+        \\    if #id > 128 then return nil end
+        \\    local n = 0
+        \\    for seg in (id .. '/'):gmatch('([^/]*)/') do
+        \\      n = n + 1
+        \\      if n > 8 or #seg > 32 or not seg:find('^[A-Za-z0-9_.+%-]+$') then return nil end
+        \\    end
+        \\  end
+        \\  local out = { state = r.state, id = id }
+        \\  if r.app and #r.app <= 32 and r.app:find('^[A-Za-z0-9_.+%-]+$') then out.app = r.app end
+        \\  if r.title then out.title = b64text(r.title, 256, 192); if not out.title then return nil end end
+        \\  if r.msg then out.msg = b64text(r.msg, 2732, 2048); if not out.msg then return nil end end
+        \\  return out
+        \\end
+        \\-- A record without app inherits it from its nearest ancestor.
+        \\local function app_of(t, id)
+        \\  while true do
+        \\    local r = t[id]
+        \\    if r and r.app then return r.app end
+        \\    if id == '' then return nil end
+        \\    id = id:match('^(.*)/[^/]*$') or ''
+        \\  end
+        \\end
+        \\-- Wire state of a buffer: the strongest record wins (blocked > working
+        \\-- > done/error > idle, newest on ties). error shares wire state 1 with
+        \\-- done; only its summary says "Failed".
+        \\local function agg7501(buf)
+        \\  local t, best = rec[buf] or {}, nil
+        \\  for _, r in pairs(t) do
+        \\    if not best or P_RANK[r.state] > P_RANK[best.state]
+        \\      or (P_RANK[r.state] == P_RANK[best.state] and r.seq > best.seq) then best = r end
+        \\  end
+        \\  if not best then return 0, '', nil, nil end
+        \\  local app = app_of(t, best.id)
+        \\  local s = ({ idle = 1, done = 1, error = 1, blocked = 4 })[best.state]
+        \\    or ((app == 'claude-code') and 2 or 3)
+        \\  local title = (best.state == 'blocked' and best.msg) or best.title or best.msg or app or ''
+        \\  if best.state == 'error' then title = 'Failed: ' .. title end
+        \\  return s, title, best.state, best
+        \\end
+        \\-- fresh: the record this report just stored, nil for clear/prompt.
+        \\local function update7501(buf, fresh)
+        \\  local s, title, raw, best = agg7501(buf)
+        \\  pend[buf] = (pend[buf] or 0) + 1
+        \\  present[buf] = (s ~= 0) or nil
+        \\  -- Notify only for a new report that is itself what the tab now shows,
+        \\  -- so an old done/error resurfacing after a clear stays silent.
+        \\  local notify = fresh ~= nil and fresh == best and raw ~= prev7501[buf]
+        \\    and (raw == 'done' or raw == 'error' or raw == 'blocked')
+        \\  prev7501[buf] = raw
+        \\  prevb[buf] = (s ~= 0) and s or nil
+        \\  deliver(buf, s, title, notify)
+        \\end
+        \\local function on7501(buf, body)
+        \\  if body:find('^%s*%?%s*$') then
+        \\    local ch = vim.bo[buf].channel
+        \\    if ch and ch > 0 then pcall(vim.api.nvim_chan_send, ch, '\27]7501;?\27\\') end
+        \\    return
+        \\  end
+        \\  local r = parse7501(body)
+        \\  if not r then return end
+        \\  osc[buf] = true
+        \\  local t = rec[buf] or {}
+        \\  rec[buf] = t
+        \\  if r.state == 'clear' then
+        \\    for id in pairs(t) do
+        \\      if r.id == '' or id == r.id or id:sub(1, #r.id + 1) == r.id .. '/' then t[id] = nil end
+        \\    end
+        \\  else
+        \\    rec_seq = rec_seq + 1; r.seq = rec_seq; t[r.id] = r
+        \\    -- At most 64 records per terminal; evict the least recently updated.
+        \\    local n, old = 0, nil
+        \\    for _, x in pairs(t) do n = n + 1; if not old or x.seq < old.seq then old = x end end
+        \\    if n > 64 then t[old.id] = nil end
+        \\  end
+        \\  update7501(buf, r.state ~= 'clear' and r or nil)
+        \\end
+        \\-- A new shell prompt (OSC 133;A) ends the program: drop its live
+        \\-- records (working/blocked, and idle); done/error survive.
+        \\local function prompt7501(buf)
+        \\  local t, hit = rec[buf] or {}, false
+        \\  for id, r in pairs(t) do
+        \\    if r.state == 'working' or r.state == 'blocked' or r.state == 'idle' then t[id] = nil; hit = true end
+        \\  end
+        \\  if hit then update7501(buf) end
+        \\end
+        \\local function forget7501(buf) osc[buf] = nil; rec[buf] = nil; prev7501[buf] = nil end
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
         \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
         \\_G.__zonvie_agent_timer = nil
@@ -1630,6 +1743,12 @@ const lua_body =
         \\  group = grp,
         \\  callback = function(ev)
         \\    local seq = ev.data and ev.data.sequence or ''
+        \\    local p = seq:match('^\27%]7501;(.*)$')
+        \\    if p then on7501(ev.buf, p) return end
+        \\    if osc[ev.buf] then
+        \\      if seq:find('^\27%]133;A') then prompt7501(ev.buf) end
+        \\      return
+        \\    end
         \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
         \\    if not body then return end
         \\    local s = classify(ev.buf, body)
@@ -1648,7 +1767,7 @@ const lua_body =
         \\  callback = function(ev)
         \\    pend[ev.buf] = (pend[ev.buf] or 0) + 1
         \\    present[ev.buf] = nil; kind[ev.buf] = nil; bufstate[ev.buf] = nil; buftitle[ev.buf] = nil
-        \\    prevb[ev.buf] = nil; buftab[ev.buf] = nil
+        \\    prevb[ev.buf] = nil; buftab[ev.buf] = nil; forget7501(ev.buf)
         \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
         \\  end,
         \\})
@@ -1667,7 +1786,9 @@ const lua_body =
         \\local card_tick = 0
         \\_G.__zonvie_agent_timer = vim.fn.timer_start(500, function()
         \\  for buf in pairs(present) do
-        \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
+        \\    if osc[buf] and vim.api.nvim_buf_is_valid(buf) then
+        \\      -- OSC 7501 records have no heartbeat and do not follow the title.
+        \\    elseif vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
         \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
         \\      t = (ok and t) or ''
         \\      local agentish = marker(t) ~= nil or t:find('Claude') ~= nil
@@ -1682,7 +1803,7 @@ const lua_body =
         \\    else
         \\      pend[buf] = (pend[buf] or 0) + 1
         \\      present[buf] = nil; kind[buf] = nil; bufstate[buf] = nil; buftitle[buf] = nil
-        \\      prevb[buf] = nil; buftab[buf] = nil
+        \\      prevb[buf] = nil; buftab[buf] = nil; forget7501(buf)
         \\    end
         \\  end
         \\  -- Card upkeep rides this poll, so it costs nothing without an agent:
