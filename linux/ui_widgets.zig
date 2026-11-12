@@ -55,6 +55,8 @@ pub const Widgets = struct {
     css_font_px: u32 = 0,
     /// The tabline the strip was last built from.
     tab_count: usize = 0,
+    /// The width sizeTabs last gave each titlebar tab, logical px.
+    tab_w: c_int = 0,
     tab_handles: [ui_state.tab_cap]i64 = @splat(0),
     curtab: i64 = 0,
 };
@@ -83,15 +85,20 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
 
     const tabbar = gtk.gtk_box_new(along, 0).?;
     gtk.gtk_widget_add_css_class(tabbar, "zonvie-tabbar");
+    if (w.sidebar) gtk.gtk_widget_add_css_class(tabbar, "sidebar");
     gtk.gtk_widget_set_visible(tabbar, 0);
     if (w.sidebar) {
         gtk.gtk_widget_set_size_request(tabbar, @intCast(std.math.clamp(cfg.sidebar_width, 100, 500)), -1);
         // Set, so the tab names' hexpand does not widen it past that.
         gtk.gtk_widget_set_hexpand(tabbar, 0);
     }
+    // Equal tabs (dropIndex divides the strip evenly): 100..200 wide along
+    // a titlebar (sizeTabs), fixed-height rows down a sidebar, packed from
+    // the start with "+" right after them, as macOS and Windows lay them.
     const tabs = gtk.gtk_box_new(along, 0).?;
     gtk.gtk_box_set_homogeneous(tabs, 1);
-    if (!w.sidebar) gtk.gtk_widget_set_hexpand(tabs, 1);
+    // Set, or the names' hexpand would propagate and stretch the tabs.
+    gtk.gtk_widget_set_hexpand(tabs, 0);
     gtk.gtk_box_append(tabbar, tabs);
     const plus = gtk.gtk_button_new_with_label("+").?;
     gtk.gtk_widget_set_focusable(plus, 0);
@@ -313,6 +320,8 @@ fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
 /// window moves the targets. GTK main thread.
 pub fn placeMessages(app: *App) void {
     const w = &app.widgets;
+    // A resize reaches here through the flush it causes.
+    sizeTabs(app);
     const view = w.overlay orelse return;
     const view_w = gtk.gtk_widget_get_width(view);
     const view_h = gtk.gtk_widget_get_height(view);
@@ -392,6 +401,53 @@ fn onToastTimeout(data: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+fn rgbOf(c: [3]f32) u32 {
+    const ch = struct {
+        fn f(v: f32) u32 {
+            return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+        }
+    }.f;
+    return (ch(c[0]) << 16) | (ch(c[1]) << 8) | ch(c[2]);
+}
+
+/// The sidebar tabline's colours from Neovim's fg and bg, as Windows
+/// derives them (windows/ui/tabbar.zig): a darker strip on a dark theme,
+/// a lighter one on a light theme, and so on.
+const SidebarPalette = struct { bg: u32, selected: u32, hover: u32, text: u32, separator: u32, indicator: u32 };
+
+fn sidebarPalette(fg_rgb: u32, bg_rgb: u32) SidebarPalette {
+    const split = struct {
+        fn f(c: u32) [3]f32 {
+            return .{
+                @as(f32, @floatFromInt((c >> 16) & 0xff)) / 255.0,
+                @as(f32, @floatFromInt((c >> 8) & 0xff)) / 255.0,
+                @as(f32, @floatFromInt(c & 0xff)) / 255.0,
+            };
+        }
+    }.f;
+    const b = split(bg_rgb);
+    const f = split(fg_rgb);
+    const dark = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2] < 0.5;
+    var out: [6][3]f32 = undefined;
+    for (0..3) |i| {
+        const sb = if (dark) b[i] * 0.85 else @min(1.0, b[i] + 0.03);
+        out[0][i] = sb;
+        out[1][i] = if (dark) b[i] + 0.06 else b[i] - 0.06;
+        out[2][i] = if (dark) b[i] + 0.03 else b[i] - 0.03;
+        out[3][i] = f[i] * @as(f32, if (dark) 0.6 else 0.5);
+        out[4][i] = if (dark) sb * 0.9 + 0.1 else sb * 0.9;
+        out[5][i] = f[i] * 0.7;
+    }
+    return .{ .bg = rgbOf(out[0]), .selected = rgbOf(out[1]), .hover = rgbOf(out[2]), .text = rgbOf(out[3]), .separator = rgbOf(out[4]), .indicator = rgbOf(out[5]) };
+}
+
+test "a dark sidebar is darker than the editor, its selection lighter" {
+    const p = sidebarPalette(0xffffff, 0x202020);
+    try std.testing.expectEqual(@as(u32, 0x1b1b1b), p.bg);
+    try std.testing.expectEqual(@as(u32, 0x2f2f2f), p.selected);
+    try std.testing.expectEqual(@as(u32, 0x999999), p.text);
+}
+
 fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     if (w.css_fg == fg and w.css_bg == bg and w.css_font_px == font_px) return;
     const css = w.css orelse return;
@@ -408,8 +464,9 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         @as(f32, @floatFromInt(bg & 0xff)) / 255.0,
     };
     const p = core.frontend_rules.panelBg(b[0], b[1], b[2]);
-    const panel: u32 = (@as(u32, @intFromFloat(p[0] * 255)) << 16) | (@as(u32, @intFromFloat(p[1] * 255)) << 8) | @as(u32, @intFromFloat(p[2] * 255));
-    var buf: [2048]u8 = undefined;
+    const panel = rgbOf(p);
+    const sb = sidebarPalette(fg, bg);
+    var buf: [4096]u8 = undefined;
     // Tone colours as macOS's message panels (ZonvieCore.swift): the text
     // and, where it has one, the border.
     const text = std.fmt.bufPrintZ(&buf,
@@ -425,17 +482,25 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-panel.tone-search {{ color: #99ff99; }}
         \\window.zonvie-translucent {{ background: transparent; }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
-        \\.zonvie-tabbar {{ background-color: #{x:0>6}; }}
-        \\.zonvie-tabbar button {{ background: none; color: alpha(#{x:0>6}, 0.6); border-radius: 0;
-        \\  border: none; padding: 4px 14px; font-family: monospace; }}
-        \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; }}
-        \\.zonvie-tab.current {{ background-color: #{x:0>6}; }}
-        \\.zonvie-tab.current button {{ color: #{x:0>6}; }}
+        \\.zonvie-tabbar button {{ background: none; color: inherit; border-radius: 0; border: none;
+        \\  box-shadow: none; padding: 4px 14px; }}
+        \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; opacity: 0; }}
+        \\.zonvie-tab.current button.zonvie-tab-close, .zonvie-tab:hover button.zonvie-tab-close {{ opacity: 0.8; }}
+        \\.zonvie-tabbar:not(.sidebar) .zonvie-tab {{ opacity: 0.7; }}
+        \\.zonvie-tabbar:not(.sidebar) .zonvie-tab.current {{ opacity: 1; background-color: alpha(currentColor, 0.12); }}
+        \\.zonvie-tabbar:not(.sidebar) .zonvie-tab:hover {{ background-color: alpha(currentColor, 0.08); }}
+        \\.zonvie-tabbar.sidebar {{ background-color: #{x:0>6}; color: #{x:0>6}; }}
+        \\.zonvie-tabbar.sidebar .zonvie-tab {{ min-height: 28px; border-left: 3px solid transparent;
+        \\  border-bottom: 1px solid #{x:0>6}; }}
+        \\.zonvie-tabbar.sidebar .zonvie-tab:hover {{ background-color: #{x:0>6}; }}
+        \\.zonvie-tabbar.sidebar .zonvie-tab.current {{ background-color: #{x:0>6}; color: #{x:0>6};
+        \\  border-left-color: #{x:0>6}; }}
+        \\.zonvie-tabbar.sidebar button {{ padding: 4px 12px; }}
         \\.zonvie-agent {{ margin-left: 8px; }}
         \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
         \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
         \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
-    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, panel, fg, bg, fg, fg, fg }) catch return;
+    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, sb.bg, sb.text, sb.separator, sb.hover, sb.selected, fg, sb.indicator, fg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
 
@@ -634,6 +699,7 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         // whenever the list changes, so it never outlives its tab.
         const name_btn = gtk.gtk_button_new_with_label("") orelse continue;
         setButtonLabel(app, name_btn, t.name.text());
+        if (gtk.gtk_button_get_child(name_btn)) |l| gtk.gtk_label_set_ellipsize(l, gtk.PANGO_ELLIPSIZE_END);
         gtk.gtk_widget_set_focusable(name_btn, 0);
         gtk.gtk_widget_set_hexpand(name_btn, 1);
         _ = gtk.g_signal_connect(name_btn, "clicked", @ptrCast(&onTabClicked), @ptrFromInt(i + 1));
@@ -645,7 +711,25 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         gtk.gtk_box_append(tab, close);
         gtk.gtk_box_append(tabs, tab);
     }
+    w.tab_w = 0;
+    sizeTabs(app);
     applyIndicators(app, ui);
+}
+
+/// A titlebar tab's width: the strip shared out, held to 100..200 as macOS
+/// and Windows hold theirs. Rerun when the strip's width may have changed.
+fn sizeTabs(app: *App) void {
+    const w = &app.widgets;
+    if (w.sidebar or w.tab_count == 0) return;
+    const bar = w.tabbar orelse return;
+    const tabs = w.tabs orelse return;
+    const plus_w: c_int = 40;
+    const avail = gtk.gtk_widget_get_width(bar) - plus_w;
+    const tw: c_int = std.math.clamp(@divTrunc(avail, @as(c_int, @intCast(w.tab_count))), 100, 200);
+    if (tw == w.tab_w) return;
+    w.tab_w = tw;
+    var child = gtk.gtk_widget_get_first_child(tabs);
+    while (child) |c| : (child = gtk.gtk_widget_get_next_sibling(c)) gtk.gtk_widget_set_size_request(c, tw, -1);
 }
 
 fn setButtonLabel(app: *App, btn: *anyopaque, name: []const u8) void {

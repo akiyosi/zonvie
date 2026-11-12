@@ -213,6 +213,9 @@ pub extern "c" fn gtk_label_set_text(label: *anyopaque, str: [*:0]const u8) void
 pub extern "c" fn gtk_label_set_xalign(label: *anyopaque, xalign: f32) void;
 pub extern "c" fn gtk_label_set_wrap(label: *anyopaque, wrap: c_int) void;
 pub extern "c" fn gtk_label_set_max_width_chars(label: *anyopaque, n_chars: c_int) void;
+pub extern "c" fn gtk_label_set_ellipsize(label: *anyopaque, mode: c_int) void;
+pub const PANGO_ELLIPSIZE_END: c_int = 3;
+pub extern "c" fn gtk_button_get_child(button: *anyopaque) ?*anyopaque;
 pub extern "c" fn gtk_label_set_attributes(label: *anyopaque, attrs: ?*anyopaque) void;
 pub extern "c" fn gtk_widget_get_visible(widget: *anyopaque) c_int;
 pub const GtkRequisition = extern struct { width: c_int = 0, height: c_int = 0 };

@@ -10,4 +10,5 @@ test {
     _ = @import("ui_state.zig");
     _ = @import("cli.zig");
     _ = @import("scrollbar.zig");
+    _ = @import("ui_widgets.zig");
 }
