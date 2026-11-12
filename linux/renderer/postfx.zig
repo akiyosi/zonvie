@@ -5,8 +5,9 @@
 //! bloom is added onto it, then each custom shader reads the previous
 //! output and the last one writes the GLArea's framebuffer. Same passes as
 //! the D3D11 renderer (windows/shaders/main.hlsl, PSKawase*); the chain's
-//! geometry is the core's (glow_chain.zig). GTK main thread, with the main
-//! GLArea's context current.
+//! geometry is the core's (glow_chain.zig). Each PostFx belongs to one GL
+//! context and is used only on the thread that has it current: a GLArea's
+//! on the GTK main thread, the render thread's on that thread.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -94,8 +95,9 @@ pub const PostFx = struct {
     /// 1x1 black: what iPrevFrame and iCellAge read when no shader uses them.
     black: u32 = 0,
     /// The previous frame's final output, top-down, when a shader reads
-    /// iPrevFrame.
+    /// iPrevFrame; `out` takes this frame's, and the two swap.
     prev: Rt = .{},
+    out: Rt = .{},
     uses_prev: bool = false,
     /// This surface's iCellAge: cols x rows R32F of edit times, when a shader
     /// reads it.
@@ -113,9 +115,9 @@ pub const PostFx = struct {
     cursor_cur: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// Whether the main window needs the offscreen path this frame.
-pub fn active(app: *App) bool {
-    if (app.postfx.failed) return false;
+/// Whether a surface drawn with `p` needs the offscreen path this frame.
+pub fn active(app: *App, p: *const PostFx) bool {
+    if (p.failed) return false;
     if (app.shader_paths.len != 0) return true;
     const cp = app.corep orelse return false;
     return core.zonvie_core_get_glow_enabled(cp);
@@ -426,12 +428,17 @@ fn scene(app: *App, t: *gl_renderer.Target, surface_id: i64) gl_renderer.Frame {
 }
 
 /// A surface through the bloom and the shader chain, ending in the
-/// framebuffer bound on entry (its GLArea's).
+/// framebuffer bound on entry: a GLArea's (bottom-up), or the render
+/// thread's dmabuf, top-down as `t.flip_y` says.
 pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i64) gl_renderer.Frame {
     var screen_fbo: gl.GLint = 0;
     gl.glGetIntegerv(gl.GL_FRAMEBUFFER_BINDING, &screen_fbo);
     if (!setup(app, p) or t.w_px == 0 or t.h_px == 0) return scene(app, t, surface_id);
 
+    // Offscreen textures are top-down already; only a bottom-up screen
+    // needs the final pass to flip.
+    const screen_top_down = t.flip_y;
+    const to_screen = !screen_top_down;
     p.scene.ensure(t.w_px, t.h_px);
     gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.scene.fbo);
     t.flip_y = true;
@@ -439,7 +446,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     if (app.corep) |cp| {
         if (core.zonvie_core_get_glow_enabled(cp)) bloom(app, t, p, cp, surface_id);
     }
-    t.flip_y = false;
+    t.flip_y = screen_top_down;
 
     gl.glBindVertexArray(p.vao);
     gl.glDisable(gl.GL_BLEND);
@@ -448,16 +455,19 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
         gl.glUseProgram(p.copy.prog);
         gl.glUniform1f(p.copy.u_scale, 1);
-        drawFullscreen(p.copy, p.scene.tex, true);
+        drawFullscreen(p.copy, p.scene.tex, to_screen);
         return f;
     }
 
+    if (p.uses_prev) {
+        p.prev.ensure(t.w_px, t.h_px);
+        p.out.ensure(t.w_px, t.h_px);
+    }
     const age = if (p.uses_edit) syncCellAge(app, p, surface_id) else 0;
     fillUniforms(app, t, p, surface_id);
     gl.glBindBuffer(gl.GL_UNIFORM_BUFFER, p.ubo);
     gl.glBufferSubData(gl.GL_UNIFORM_BUFFER, 0, @sizeOf(Uniforms), &p.uniforms);
     gl.glBindBufferBase(gl.GL_UNIFORM_BUFFER, 1, p.ubo);
-    if (p.uses_prev) p.prev.ensure(t.w_px, t.h_px);
     gl.glActiveTexture(gl.GL_TEXTURE2);
     gl.glBindTexture(gl.GL_TEXTURE_2D, if (p.uses_prev) p.prev.tex else p.black);
     gl.glActiveTexture(gl.GL_TEXTURE3);
@@ -466,24 +476,24 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     for (p.custom[0..p.custom_len], 0..) |c, i| {
         const last = i + 1 == p.custom_len;
         if (last) {
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, if (p.uses_prev) p.out.fbo else @intCast(screen_fbo));
         } else {
             const dst = &p.ping[i % 2];
             dst.ensure(t.w_px, t.h_px);
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, dst.fbo);
         }
-        drawFullscreen(c.pass, src, last);
+        drawFullscreen(c.pass, src, last and to_screen and !p.uses_prev);
         if (!last) src = p.ping[i % 2].tex;
     }
     if (p.uses_prev) {
-        // The output just drawn is next frame's iPrevFrame: copied back,
-        // flipped to the top-down rows every offscreen texture keeps.
-        const w: gl.GLint = @intCast(t.w_px);
-        const h: gl.GLint = @intCast(t.h_px);
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, @intCast(screen_fbo));
-        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, p.prev.fbo);
-        gl.glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST);
+        // The output is kept offscreen, top-down, for next frame's
+        // iPrevFrame and copied to the screen from there; a blit out of the
+        // render thread's dmabuf reads nothing on some drivers.
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
+        gl.glUseProgram(p.copy.prog);
+        gl.glUniform1f(p.copy.u_scale, 1);
+        drawFullscreen(p.copy, p.out.tex, to_screen);
+        std.mem.swap(Rt, &p.prev, &p.out);
     }
     return f;
 }
@@ -526,6 +536,7 @@ pub fn unrealize(p: *PostFx) void {
     for (&p.mips) |*m| m.deinit();
     for (&p.ping) |*r| r.deinit();
     p.prev.deinit();
+    p.out.deinit();
     if (p.age_tex != 0) gl.glDeleteTextures(1, &p.age_tex);
     for (p.custom[0..p.custom_len]) |c| gl.glDeleteProgram(c.pass.prog);
     for ([_]Pass{ p.copy, p.down, p.up }) |pass| if (pass.prog != 0) gl.glDeleteProgram(pass.prog);

@@ -396,7 +396,7 @@ pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void 
 pub fn render(app: *App) void {
     app.gl.w_px = app.drawable_w_px;
     app.gl.h_px = app.drawable_h_px;
-    if (postfx.active(app)) {
+    if (postfx.active(app, &app.postfx)) {
         const f = postfx.renderFrame(app, &app.gl, &app.postfx, 1);
         app.presented_seq = f.flush_seq;
         if (f.moving or app.postfx.animating) startEaseTick(app);
@@ -442,7 +442,7 @@ fn drawScrollbar(app: *App, t: *Target, st: *const scrollbar.State) void {
 
 /// An external window's render signal: the surface rooted at `surface_id`.
 pub fn renderExternal(app: *App, t: *Target, p: *postfx.PostFx, surface_id: i64) void {
-    const f = if (postfx.active(app))
+    const f = if (postfx.active(app, p))
         postfx.renderFrame(app, t, p, surface_id)
     else
         renderExternalScene(app, t, surface_id);
@@ -560,6 +560,9 @@ fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) 
     defer app.mu.unlock(clock.io());
     // An animated custom shader keeps frames coming as an ease does.
     var moving = app.postfx.animating;
+    if (app.render_thread) |rt| {
+        if (rt.animating.load(.acquire)) moving = true;
+    }
     var it = app.surface.grids.valueIterator();
     while (it.next()) |g| {
         if (g.*.ease.moving()) moving = true;

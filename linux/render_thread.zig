@@ -19,6 +19,7 @@ const gl = @import("gl.zig");
 const egl = @import("egl.zig");
 const gtk = @import("gtk_bindings.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
+const postfx = @import("renderer/postfx.zig");
 const applog = @import("app_log.zig");
 
 const pool_len = 3;
@@ -67,6 +68,10 @@ pub const RenderThread = struct {
     destroy_image: egl.PfnDestroyImage = undefined,
     image_target: egl.PfnImageTargetTexture2D = undefined,
     target: gl_renderer.Target = .{ .flip_y = true },
+    /// The bloom and shader chain in this thread's context.
+    postfx: postfx.PostFx = .{},
+    /// Some shader reads time; the GTK tick keeps requesting frames.
+    animating: std.atomic.Value(bool) = .init(false),
 
     // GTK thread only.
     picture: ?*anyopaque = null,
@@ -199,7 +204,11 @@ fn run(rt: *RenderThread) void {
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, b.fbo);
         rt.target.w_px = w;
         rt.target.h_px = h;
-        const f = gl_renderer.renderMain(rt.app, &rt.target);
+        const f = if (postfx.active(rt.app, &rt.postfx))
+            postfx.renderFrame(rt.app, &rt.target, &rt.postfx, 1)
+        else
+            gl_renderer.renderMain(rt.app, &rt.target);
+        rt.animating.store(rt.postfx.animating, .release);
         const t_drawn = clock.nowNs();
         // The dmabuf goes to another process: the frame must be complete.
         gl.glFinish();
@@ -213,9 +222,10 @@ fn run(rt: *RenderThread) void {
         b.state = .ready;
         rt.mu.unlock(io);
         if (!rt.present_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idlePresent, rt);
-        if (f.moving and !rt.ease_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idleStartEase, rt);
+        if ((f.moving or rt.postfx.animating) and !rt.ease_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idleStartEase, rt);
     }
     for (&rt.buffers) |*b| freeBuffer(rt, b);
+    postfx.unrealize(&rt.postfx);
     gl_renderer.unrealize(&rt.target);
     rt.target.deinit(rt.app.alloc);
     _ = egl.eglMakeCurrent(rt.dpy, null, null, egl.EGL_NO_CONTEXT);
