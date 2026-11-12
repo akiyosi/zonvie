@@ -1,6 +1,6 @@
 //! What the frontend-drawn ext UI shows: the minis (showmode, showcmd,
-//! ruler, mini-routed messages), a confirm prompt, a toast and the ext
-//! tabline. Core callbacks write it under App.mu; the GTK thread copies it
+//! ruler, mini-routed messages), a confirm prompt, a toast, OS
+//! notifications and the ext tabline. Core callbacks write it under App.mu; the GTK thread copies it
 //! out and updates the widgets (ui_widgets.zig). Fixed buffers, so a
 //! callback never allocates.
 
@@ -59,6 +59,10 @@ pub const UiState = struct {
     toast_timeout_ms: u32 = 0,
     /// Bumped per toast, so a timer for an older one does not hide it.
     toast_seq: u32 = 0,
+    /// A message for the "notification" view, not yet handed to the OS;
+    /// the GTK thread sends it and clears `notice_pending`.
+    notice: TextBuf(1024) = .{},
+    notice_pending: bool = false,
     tabline_visible: bool = false,
     curtab: i64 = 0,
     tabs: [tab_cap]Tab = @splat(.{}),
@@ -118,7 +122,14 @@ pub const UiState = struct {
                 self.confirm.clear();
                 self.confirm.appendChunks(chunks);
             },
-            .notification, .ext_float => {
+            .notification => {
+                // As macOS and Windows: an OS notification titled "Neovim".
+                // :echon extends one not yet sent.
+                if (!append or !self.notice_pending) self.notice.clear();
+                self.notice.appendChunks(chunks);
+                self.notice_pending = self.notice.len != 0;
+            },
+            .ext_float => {
                 // A new message replaces a confirm that is no longer asked.
                 self.confirm.clear();
                 if (!append) self.toast.clear();
@@ -195,6 +206,19 @@ test "echon appends to the toast, a new message replaces it" {
     try testing.expectEqualStrings("ab", s.toast.text());
     s.msgShow(.ext_float, "echo", &.{chunk("c")}, false, 4000);
     try testing.expectEqualStrings("c", s.toast.text());
+}
+
+test "the notification view queues an OS notification, not a toast" {
+    var s: UiState = .{};
+    s.msgShow(.notification, "echo", &.{chunk("built")}, false, 0);
+    s.msgShow(.notification, "echo", &.{chunk(" ok")}, true, 0);
+    try testing.expect(s.notice_pending);
+    try testing.expectEqualStrings("built ok", s.notice.text());
+    try testing.expectEqual(@as(usize, 0), s.toast.len);
+    // Once sent, the next message starts a new one even when appended.
+    s.notice_pending = false;
+    s.msgShow(.notification, "echo", &.{chunk("next")}, true, 0);
+    try testing.expectEqualStrings("next", s.notice.text());
 }
 
 test "a confirm stays until a clear or the next message" {

@@ -212,6 +212,7 @@ fn idleRefresh(data: ?*anyopaque) callconv(.c) c_int {
     snap.* = .{ .ui = app.ui, .fg = app.default_fg, .bg = app.default_bg, .font_px = @intFromFloat(@round(app.preedit_px)) };
     // Announced once: the snapshot carries them out.
     app.ui.done_count = 0;
+    app.ui.notice_pending = false;
     app.mu.unlock(clock.io());
     apply(app, snap);
     return 0;
@@ -249,22 +250,31 @@ fn apply(app: *App, snap: *const Snapshot) void {
     applyTabline(app, &snap.ui);
     placeMessages(app);
     if (snap.ui.done_count != 0) notifyCompletions(app, snap.ui.done[0..snap.ui.done_count]);
+    if (snap.ui.notice_pending) sendNotification(app, null, "Neovim", snap.ui.notice.text());
+}
+
+/// One OS notification through the desktop's notification service. A null
+/// `id` makes each its own entry, as macOS posts each message; an id
+/// replaces the last one sent with it.
+fn sendNotification(app: *App, id: ?[*:0]const u8, title: [*:0]const u8, body: []const u8) void {
+    const gapp = app.gtk_app orelse return;
+    var z: [1025]u8 = undefined;
+    const n = @min(body.len, z.len - 1);
+    @memcpy(z[0..n], body[0..n]);
+    z[n] = 0;
+    const note = gtk.g_notification_new(title) orelse return;
+    defer gtk.g_object_unref(note);
+    gtk.g_notification_set_body(note, @ptrCast(&z));
+    gtk.g_application_send_notification(gapp, id, note);
 }
 
 /// The OS notification for agent completions ([tabline] agent_notification),
 /// sent always: the agent runs in this app's own terminal, so focus says
 /// nothing about whether the user saw it.
 fn notifyCompletions(app: *App, done: []const ui_state.Completion) void {
-    const gapp = app.gtk_app orelse return;
     var buf: [320]u8 = undefined;
     const msg = ui_state.completionMessage(buf[0 .. buf.len - 1], done);
-    var z: [320]u8 = undefined;
-    @memcpy(z[0..msg.len], msg);
-    z[msg.len] = 0;
-    const n = gtk.g_notification_new("Zonvie") orelse return;
-    defer gtk.g_object_unref(n);
-    gtk.g_notification_set_body(n, @ptrCast(&z));
-    gtk.g_application_send_notification(gapp, "agent", n);
+    sendNotification(app, "agent", "Zonvie", msg);
 }
 
 const claude_frames = [_][:0]const u8{ "·", "✢", "✳", "✶", "✻", "✽" };
