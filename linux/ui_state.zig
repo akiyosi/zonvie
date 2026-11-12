@@ -63,6 +63,10 @@ pub const UiState = struct {
     /// the GTK thread sends it and clears `notice_pending`.
     notice: TextBuf(1024) = .{},
     notice_pending: bool = false,
+    /// showmode, showcmd and ruler routed to ext_float, by Mini: state,
+    /// not a log, so each keeps its latest text under the toast and never
+    /// times out (as windows/window.zig status_messages).
+    float_status: [3]TextBuf(256) = @splat(.{}),
     tabline_visible: bool = false,
     curtab: i64 = 0,
     tabs: [tab_cap]Tab = @splat(.{}),
@@ -147,14 +151,47 @@ pub const UiState = struct {
         self.toast.clear();
         self.toast_seq +%= 1;
         self.minis[@intFromEnum(Mini.message)].clear();
+        for (&self.float_status) |*f| f.clear();
     }
 
-    /// showmode, showcmd or ruler; an empty list hides that mini.
+    /// showmode, showcmd or ruler, by the view its route picks, as Windows
+    /// routes them: ext_float joins the toast, notification goes to the OS,
+    /// anything else shows in its mini. An empty list hides it.
     pub fn status(self: *UiState, which: Mini, view: core.zonvie_msg_view_type, chunks: []const core.MsgChunk) void {
-        if (view == .none) return;
-        const m = &self.minis[@intFromEnum(which)];
-        m.clear();
-        m.appendChunks(chunks);
+        switch (view) {
+            .none => {},
+            .ext_float => {
+                const f = &self.float_status[@intFromEnum(which)];
+                f.clear();
+                f.appendChunks(chunks);
+                self.minis[@intFromEnum(which)].clear();
+            },
+            .notification => {
+                self.notice.clear();
+                self.notice.appendChunks(chunks);
+                self.notice_pending = self.notice.len != 0;
+            },
+            else => {
+                const m = &self.minis[@intFromEnum(which)];
+                m.clear();
+                m.appendChunks(chunks);
+            },
+        }
+    }
+
+    /// The toast's text: the message, then each ext_float status on a line
+    /// of its own, cut to `buf`.
+    pub fn toastText(self: *const UiState, buf: []u8) []const u8 {
+        var n = rules.copyUtf8Truncated(buf, self.toast.text());
+        for (self.float_status) |f| {
+            if (f.len == 0) continue;
+            if (n != 0 and n < buf.len) {
+                buf[n] = '\n';
+                n += 1;
+            }
+            n += rules.copyUtf8Truncated(buf[n..], f.text());
+        }
+        return buf[0..n];
     }
 
     pub fn tabline(self: *UiState, curtab: i64, tabs: []const core.TabEntry) void {
@@ -219,6 +256,24 @@ test "the notification view queues an OS notification, not a toast" {
     s.notice_pending = false;
     s.msgShow(.notification, "echo", &.{chunk("next")}, true, 0);
     try testing.expectEqualStrings("next", s.notice.text());
+}
+
+test "statuses follow their route: ext_float joins the toast, others their mini" {
+    var s: UiState = .{};
+    s.status(.showmode, .ext_float, &.{chunk("-- INSERT --")});
+    try testing.expectEqual(@as(usize, 0), s.minis[@intFromEnum(Mini.showmode)].len);
+    s.msgShow(.ext_float, "echo", &.{chunk("saved")}, false, 4000);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("saved\n-- INSERT --", s.toastText(&buf));
+    // The message times out; the status stays.
+    s.toast.clear();
+    try testing.expectEqualStrings("-- INSERT --", s.toastText(&buf));
+    s.status(.showcmd, .mini, &.{chunk("2d")});
+    try testing.expectEqualStrings("2d", s.minis[@intFromEnum(Mini.showcmd)].text());
+    s.status(.ruler, .none, &.{chunk("1,1")});
+    try testing.expectEqual(@as(usize, 0), s.minis[@intFromEnum(Mini.ruler)].len);
+    s.msgClear();
+    try testing.expectEqualStrings("", s.toastText(&buf));
 }
 
 test "a confirm stays until a clear or the next message" {

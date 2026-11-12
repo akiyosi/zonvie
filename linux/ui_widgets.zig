@@ -239,9 +239,11 @@ fn apply(app: *App, snap: *const Snapshot) void {
     const buf = &app.ui_text_scratch;
     for (snap.ui.minis, 0..) |m, i| setText(w.minis[i], m.text(), buf);
     setText(w.confirm, snap.ui.confirm.text(), buf);
-    setText(w.toast, snap.ui.toast.text(), buf);
+    var toast_buf: [4096 + 3 * 257]u8 = undefined;
+    setText(w.toast, snap.ui.toastText(&toast_buf), buf);
     if (w.toast) |t| {
-        setToneClass(t, snap.ui.toast_tone);
+        // Statuses alone carry no tone of their own.
+        setToneClass(t, if (snap.ui.toast.len == 0) 0 else snap.ui.toast_tone);
         if (snap.ui.toast.len != 0 and snap.ui.toast_timeout_ms != 0 and app.toast_timer_seq != snap.ui.toast_seq) {
             app.toast_timer_seq = snap.ui.toast_seq;
             _ = gtk.g_timeout_add(snap.ui.toast_timeout_ms, &onToastTimeout, app);
