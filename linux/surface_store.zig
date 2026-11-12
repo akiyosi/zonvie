@@ -14,7 +14,7 @@ pub const Row = struct {
 };
 
 /// `total_rows` is the grid's row count the scroll was made at.
-const Shift = struct { row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32 };
+const Shift = struct { row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32, view_moved: bool };
 
 pub const GridRows = struct {
     front: std.ArrayListUnmanaged(Row) = .empty,
@@ -54,8 +54,8 @@ pub const GridRows = struct {
         self.dirty.set(row);
     }
 
-    pub fn stageShift(self: *GridRows, row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32) void {
-        self.staged_shift = .{ .row_start = row_start, .row_end = row_end, .rows_delta = rows_delta, .total_rows = total_rows };
+    pub fn stageShift(self: *GridRows, row_start: u32, row_end: u32, rows_delta: i32, total_rows: u32, view_moved: bool) void {
+        self.staged_shift = .{ .row_start = row_start, .row_end = row_end, .rows_delta = rows_delta, .total_rows = total_rows, .view_moved = view_moved };
     }
 
     pub fn stageClear(self: *GridRows) void {
@@ -94,7 +94,7 @@ pub const GridRows = struct {
             if (self.applyShift(s, in.row_h_px)) |end| {
                 // A scroll made at another size cannot be given back.
                 if (eases and s.total_rows == len) {
-                    self.ease.seedAndRetain(self.front.items, s.row_start, end, s.rows_delta, in);
+                    self.ease.seedAndRetain(self.front.items, s.row_start, end, s.rows_delta, s.view_moved, in);
                 } else {
                     self.ease.spring.reset();
                     self.ease.dropRetained();
@@ -425,7 +425,7 @@ test "shift then vacated rows" {
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, no_scroll);
-    g.stageShift(0, 4, 1, 4);
+    g.stageShift(0, 4, 1, 4, true);
     try g.stageRow(testing.allocator, 3, &.{v(40)}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, no_scroll);
@@ -441,7 +441,7 @@ test "shift down by 1 with region" {
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i))}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, no_scroll);
-    g.stageShift(1, 4, -1, 4);
+    g.stageShift(1, 4, -1, 4, true);
     try g.stageRow(testing.allocator, 1, &.{v(10)}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, no_scroll);
@@ -471,7 +471,7 @@ test "failed prepareCommit then cancel keeps the committed frame, even with a sh
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, no_scroll);
 
-    g.stageShift(0, 2, 1, 2);
+    g.stageShift(0, 2, 1, 2, true);
     try g.stageRow(testing.allocator, 1, &.{v(50)}, 64);
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, g.prepareCommit(failing.allocator()));
@@ -646,7 +646,7 @@ test "a shift rebases moved rows to their new row" {
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, in);
-    g.stageShift(0, 4, 1, 4);
+    g.stageShift(0, 4, 1, 4, true);
     try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, in);
@@ -660,7 +660,7 @@ test "an eased shift keeps the scrolled-out row and the resend fills the band" {
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, in);
-    g.stageShift(0, 4, 1, 4);
+    g.stageShift(0, 4, 1, 4, true);
     try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
     try g.prepareCommit(testing.allocator);
     g.commit(testing.allocator, true, in);
@@ -680,7 +680,7 @@ test "the root grid never eases" {
     for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 10))}, 4);
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, in);
-    g.stageShift(0, 4, 1, 4);
+    g.stageShift(0, 4, 1, 4, true);
     try g.stageRow(testing.allocator, 3, &.{v(30)}, 4);
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, in);

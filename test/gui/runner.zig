@@ -69,6 +69,9 @@ const redraws_partially = !is_linux;
 /// The cmdline is an overlay in the main window on Linux, not a window of its
 /// own, and a tiling compositor sizes the window, not :set columns/lines.
 const places_own_windows = !is_linux;
+/// Per-grid fonts (on_grid_font and the font slot callbacks) are not wired
+/// in the Linux frontend.
+const draws_grid_fonts = !is_linux;
 
 /// The build runner holds a test's stderr until the test process ends, so a
 /// scenario that hangs until the CI step timeout leaves no trace of which one
@@ -337,7 +340,7 @@ test "gui:visual_scrollbind_layers_blit_matches_jump" {
 }
 
 test "gui:visual_per_grid_font_workflow" {
-    try gated(can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
+    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
 }
 
 test "gui:visual_proportional_font_support" {
@@ -429,7 +432,7 @@ test "gui:visual_extwin_split_with_float_background" {
 }
 
 test "gui:visual_per_grid_font_margin" {
-    try gated(can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
+    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {

@@ -296,7 +296,7 @@ test "an empty status hides its mini and leaves the others" {
 test "the tabline keeps at most tab_cap tabs" {
     var s: UiState = .{};
     var entries: [tab_cap + 3]core.TabEntry = undefined;
-    for (&entries, 0..) |*e, i| e.* = .{ .tab_handle = @intCast(i + 1), .name = "x", .name_len = 1 };
+    for (&entries, 0..) |*e, i| e.* = .{ .tab_handle = @intCast(i + 1), .name = "x", .name_len = 1, .chunks = null, .chunk_count = 0 };
     s.tabline(2, &entries);
     try testing.expectEqual(@as(usize, tab_cap), s.tab_count);
     try testing.expect(s.tabline_visible);

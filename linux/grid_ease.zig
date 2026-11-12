@@ -75,9 +75,10 @@ pub const GridEase = struct {
         row_start: u32,
         row_end: u32,
         rows_delta: i32,
+        view_moved: bool,
         in: ScrollInput,
     ) void {
-        const seeded = self.spring.seed(in.now_ns, rows_delta, @intCast(in.row_h_px), row_start, row_end, in.mousescroll_ver, in.large_jump);
+        const seeded = self.spring.seed(in.now_ns, view_moved, rows_delta, @intCast(in.row_h_px), row_start, row_end, in.mousescroll_ver, in.large_jump);
         if (seeded) {
             const n: u32 = @intCast(@abs(rows_delta));
             const band_start: u32 = if (rows_delta > 0) row_end - n else row_start;
@@ -145,7 +146,7 @@ test "a seeded scroll keeps the scrolled-out row above the region and empties th
     defer for (&rows) |*r| r.verts.deinit(testing.allocator);
     try rows[3].verts.append(testing.allocator, vtx(-10));
     e.beforeShift(0, 4, 1, input);
-    e.seedAndRetain(&rows, 0, 4, 1, input);
+    e.seedAndRetain(&rows, 0, 4, 1, true, input);
     try testing.expectEqual(@as(usize, 0), rows[3].verts.items.len);
     try testing.expect(e.retained[0].live);
     try testing.expectEqual(@as(i32, -1), e.retained[0].row);
@@ -161,7 +162,7 @@ test "a kept row travels with the next scroll and leaves past retention depth" {
     try rows[0].verts.append(testing.allocator, vtx(40));
     // Down by 1: old row 3 sits at row 0 rebased to y = 40, kept at row 4.
     e.beforeShift(0, 4, -1, input);
-    e.seedAndRetain(&rows, 0, 4, -1, input);
+    e.seedAndRetain(&rows, 0, 4, -1, true, input);
     try testing.expectEqual(@as(i32, 4), e.retained[0].row);
     e.beforeShift(0, 4, -2, input);
     try testing.expectEqual(@as(i32, 6), e.retained[0].row);
@@ -178,7 +179,7 @@ test "a refused seed keeps nothing" {
     try rows[3].verts.append(testing.allocator, vtx(-10));
     const snap: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 0, .large_jump = .snap };
     e.beforeShift(0, 4, 1, snap);
-    e.seedAndRetain(&rows, 0, 4, 1, snap);
+    e.seedAndRetain(&rows, 0, 4, 1, true, snap);
     try testing.expect(!e.retained[0].live);
     try testing.expect(!e.moving());
 }
@@ -189,7 +190,7 @@ test "plan eases until rest, drawing the resting frame once" {
     var rows: [4]TestRow = .{ .{}, .{}, .{}, .{} };
     defer for (&rows) |*r| r.verts.deinit(testing.allocator);
     e.beforeShift(0, 4, 1, input);
-    e.seedAndRetain(&rows, 0, 4, 1, input);
+    e.seedAndRetain(&rows, 0, 4, 1, true, input);
     var now: i64 = 1;
     var frames: usize = 0;
     while (true) : (frames += 1) {
@@ -211,7 +212,7 @@ test "a row height change voids the ease" {
     var rows: [4]TestRow = .{ .{}, .{}, .{}, .{} };
     defer for (&rows) |*r| r.verts.deinit(testing.allocator);
     e.beforeShift(0, 4, 1, input);
-    e.seedAndRetain(&rows, 0, 4, 1, input);
+    e.seedAndRetain(&rows, 0, 4, 1, true, input);
     e.plan(2, 12, 4);
     try testing.expect(!e.moving());
 }

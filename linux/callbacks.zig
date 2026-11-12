@@ -151,7 +151,7 @@ fn onGridRowScroll(
         return;
     }
     const rows = rowsFor(app, grid_id) orelse return failFlush(app);
-    rows.stageShift(row_start, row_end, rows_delta, total_rows);
+    rows.stageShift(row_start, row_end, rows_delta, total_rows, core.zonvie_core_grid_view_moved_locked(app.corep, grid_id));
 }
 
 fn onSurfaceLayout(
