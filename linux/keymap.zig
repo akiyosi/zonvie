@@ -59,21 +59,8 @@ pub fn coreMods(gdk_state: u32) u32 {
     return m;
 }
 
-pub fn mouseModString(gdk_state: u32, buf: *[8]u8) [:0]const u8 {
-    var n: usize = 0;
-    const order = [_]struct { mask: u32, letter: u8 }{
-        .{ .mask = GDK_SHIFT_MASK, .letter = 'S' },
-        .{ .mask = GDK_CONTROL_MASK, .letter = 'C' },
-        .{ .mask = GDK_ALT_MASK, .letter = 'A' },
-        .{ .mask = GDK_SUPER_MASK, .letter = 'D' },
-    };
-    for (order) |o| {
-        if (gdk_state & o.mask == 0) continue;
-        buf[n] = o.letter;
-        n += 1;
-    }
-    buf[n] = 0;
-    return buf[0..n :0];
+pub fn mouseModString(gdk_state: u32, buf: *[5]u8) [:0]const u8 {
+    return core.frontend_rules.mouseModifierString(buf, coreMods(gdk_state));
 }
 
 /// Ctrl+Shift+N, the frontend's New Session (macOS's Cmd+N; Super is the
@@ -128,7 +115,7 @@ test "mods" {
 }
 
 test "mouse modifier string matches the core's S/C/A/D form" {
-    var buf: [8]u8 = undefined;
+    var buf: [5]u8 = undefined;
     try testing.expectEqualStrings("SC", mouseModString(1 | 4, &buf));
     try testing.expectEqualStrings("", mouseModString(0, &buf));
     try testing.expectEqualStrings("SCAD", mouseModString(1 | 4 | 8 | (1 << 26), &buf));

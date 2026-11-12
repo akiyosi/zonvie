@@ -314,7 +314,7 @@ fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyop
     }
     const name = buttonName(button) orelse return;
     const c = resolve(p, cp, x, y, 0) orelse return;
-    var mods: [8]u8 = undefined;
+    var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
     p.held_button = name;
     p.press_grid_id = c.grid_id;
@@ -335,7 +335,7 @@ fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyo
     const name = p.held_button orelse return;
     p.held_button = null;
     const c = inPressGrid(p, x, y) orelse return;
-    var mods: [8]u8 = undefined;
+    var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "release", m.ptr, c.grid_id, c.row, c.col);
 }
@@ -351,7 +351,7 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     if (c.row == p.drag_row and c.col == p.drag_col) return;
     p.drag_row = c.row;
     p.drag_col = c.col;
-    var mods: [8]u8 = undefined;
+    var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     core.zonvie_core_send_mouse_input(cp, name, "drag", m.ptr, c.grid_id, c.row, c.col);
 }
@@ -413,7 +413,7 @@ fn onLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {
     const p = ptrFrom(data);
     const cp = p.app.corep orelse return 0;
-    var mods: [8]u8 = undefined;
+    var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
     if (dy != 0) {
         // Vertical only: a float showing all its lines lets the wheel through.

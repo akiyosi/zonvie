@@ -54,18 +54,18 @@ pub const Rect = struct {
     }
 };
 
-/// Unscaled chrome, as windows/app.zig's CMDLINE_* and MSG_* constants.
-pub const cmdline_padding_pt: i32 = 12;
-pub const msg_padding_pt: i32 = 8;
-pub const cmdline_screen_margin_pt: i32 = 40;
+/// Unscaled chrome.
+pub const cmdline_padding_pt: i32 = rules.cmdline_padding_pt;
+pub const msg_padding_pt: i32 = rules.msg_padding_pt;
+pub const cmdline_screen_margin_pt: i32 = rules.cmdline_screen_margin_pt;
 const msg_margin_pt: i32 = 10;
 const msg_history_gap_pt: i32 = 4;
 const cmdline_popup_gap_pt: i32 = 4;
 
-/// The cmdline's icon (windows/app.zig CMDLINE_ICON_*): 18 square at the
-/// padding's edge, 14 before the text, so the text starts at 12 + 32.
-pub const cmdline_icon_size_pt: i32 = 18;
-const cmdline_icon_strip_pt: i32 = cmdline_icon_size_pt + 14;
+/// The cmdline's icon box and the strip it takes before the text.
+pub const cmdline_icon_size_pt: i32 = rules.cmdline_icon_size_pt;
+const cmdline_icon_margin_left_pt: i32 = rules.cmdline_icon_margin_left_pt;
+const cmdline_icon_strip_pt: i32 = cmdline_icon_margin_left_pt + cmdline_icon_size_pt + rules.cmdline_icon_margin_right_pt;
 
 pub fn paddingPx(kind: Kind, scale: i32) i32 {
     return scale * switch (kind) {
@@ -86,7 +86,7 @@ pub fn contentOrigin(kind: Kind, scale: i32) [2]i32 {
 /// The cmdline icon's box inside panel `r`, vertically centred.
 pub fn cmdlineIconRect(r: Rect, scale: i32) Rect {
     const box = cmdline_icon_size_pt * scale;
-    return .{ .x = r.x + paddingPx(.cmdline, scale), .y = r.y + @divTrunc(r.h - box, 2), .w = box, .h = box };
+    return .{ .x = r.x + paddingPx(.cmdline, scale) + cmdline_icon_margin_left_pt * scale, .y = r.y + @divTrunc(r.h - box, 2), .w = box, .h = box };
 }
 
 /// Everything beside the cmdline grid across its panel, for the core's
@@ -114,10 +114,10 @@ pub const Inputs = struct {
     confirm: ?Rect = null,
 };
 
-/// The copy button's box and gaps, as windows/app.zig's COPY_BUTTON_*.
-pub const copy_size_pt: i32 = 18;
-const copy_margin_left_pt: i32 = 4;
-const copy_margin_right_pt: i32 = 8;
+/// The copy button's box and gaps.
+pub const copy_size_pt: i32 = rules.copy_button_size_pt;
+const copy_margin_left_pt: i32 = rules.copy_button_margin_left_pt;
+const copy_margin_right_pt: i32 = rules.copy_button_margin_right_pt;
 
 fn hasCopy(kind: Kind, in: Inputs) bool {
     return switch (kind) {

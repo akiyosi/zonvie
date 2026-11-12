@@ -714,6 +714,111 @@ test "panelBg moves brightness toward the middle and keeps hue and saturation" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), black[1], tol);
 }
 
+// ---------------------------------------------------------------------------
+// Ext UI panel chrome and tabline geometry, unscaled
+
+/// Padding around the cmdline panel's content.
+pub const cmdline_padding_pt: u32 = 12;
+/// The cmdline icon's box. Its margins are measured from the content
+/// padding, so the icon sits at x = 12 and the text at x = 44.
+pub const cmdline_icon_size_pt: u32 = 18;
+pub const cmdline_icon_margin_left_pt: u32 = 0;
+pub const cmdline_icon_margin_right_pt: u32 = 14;
+/// The cmdline panel's margin from the screen edges.
+pub const cmdline_screen_margin_pt: u32 = 40;
+/// Padding around a message panel's content.
+pub const msg_padding_pt: u32 = 8;
+/// The copy-content button: its box (also the hit area), the gap from the
+/// grid content and the gap from the trailing edge.
+pub const copy_button_size_pt: u32 = 18;
+pub const copy_button_margin_left_pt: u32 = 4;
+pub const copy_button_margin_right_pt: u32 = 8;
+
+/// The bounds a titlebar tab's width is held to.
+pub const tab_min_width_pt: i32 = 100;
+pub const tab_max_width_pt: i32 = 200;
+
+/// One titlebar tab's width: the strip's `available_px` shared out among
+/// `tab_count` tabs, held to [min_px, max_px] (the tab_*_width_pt bounds in
+/// the caller's pixels). 0 with no tabs.
+pub fn titlebarTabWidth(available_px: i32, tab_count: i32, min_px: i32, max_px: i32) i32 {
+    if (tab_count <= 0) return 0;
+    return @min(max_px, @max(min_px, @divTrunc(available_px, tab_count)));
+}
+
+test "a titlebar tab shares the strip within its bounds" {
+    try std.testing.expectEqual(@as(i32, 0), titlebarTabWidth(900, 0, 100, 200));
+    try std.testing.expectEqual(@as(i32, 200), titlebarTabWidth(900, 2, 100, 200));
+    try std.testing.expectEqual(@as(i32, 150), titlebarTabWidth(900, 6, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(900, 20, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(-40, 3, 100, 200));
+}
+
+/// The sidebar tabline's colours (sRGB 0..1; a channel may leave the range
+/// and the caller clamps).
+pub const SidebarPalette = struct {
+    is_dark: bool,
+    bg: [3]f32,
+    selected: [3]f32,
+    hover: [3]f32,
+    text: [3]f32,
+    text_selected: [3]f32,
+    separator: [3]f32,
+    close: [3]f32,
+    close_hi: [3]f32,
+    indicator: [3]f32,
+};
+
+/// The sidebar's colours from the colorscheme's fg and bg: the strip a
+/// little darker than a dark bg or lighter than a light one, the selected
+/// and hovered rows stepped the other way, the text dimmed fg, and the
+/// separator 10% white (dark) or black (light) over the strip. `strip_bg`
+/// replaces the derived strip colour where a frontend tints it itself.
+pub fn sidebarPalette(fg: [3]f32, bg: [3]f32, strip_bg: ?[3]f32) SidebarPalette {
+    const is_dark = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5;
+    const dim: f32 = if (is_dark) 0.6 else 0.5;
+    var p: SidebarPalette = undefined;
+    p.is_dark = is_dark;
+    p.text_selected = fg;
+    for (0..3) |i| {
+        const b = bg[i];
+        const strip = if (strip_bg) |s| s[i] else if (is_dark) b * 0.85 else @min(@as(f32, 1.0), b + 0.03);
+        p.bg[i] = strip;
+        p.selected[i] = if (is_dark) b + 0.06 else @max(@as(f32, 0.0), b - 0.06);
+        p.hover[i] = if (is_dark) b + 0.03 else @max(@as(f32, 0.0), b - 0.03);
+        p.text[i] = fg[i] * dim;
+        p.separator[i] = if (is_dark) strip * 0.9 + 0.1 else strip * 0.9;
+        p.close[i] = fg[i] * 0.5;
+        p.close_hi[i] = fg[i] * 0.8;
+        p.indicator[i] = fg[i] * 0.7;
+    }
+    return p;
+}
+
+test "the sidebar strip is darker on a dark theme and lighter on a light one" {
+    const tol = 1e-6;
+    const dark = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, null);
+    try std.testing.expect(dark.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.17), dark.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), dark.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.23), dark.hover[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), dark.text[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.253), dark.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), dark.indicator[0], tol);
+
+    const light = sidebarPalette(.{ 0, 0, 0 }, .{ 0.99, 0.9, 0.9 }, null);
+    try std.testing.expect(!light.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), light.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.84), light.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), light.separator[0], tol);
+
+    // A frontend's own strip colour also carries the separator.
+    const tinted = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, .{ 0.5, 0.5, 0.5 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), tinted.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), tinted.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), tinted.selected[0], tol);
+}
+
 /// How one argument goes into a spawn command so the core's tokenizer
 /// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
 /// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote

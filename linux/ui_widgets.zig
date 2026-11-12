@@ -422,42 +422,12 @@ fn rgbOf(c: [3]f32) u32 {
     return (ch(c[0]) << 16) | (ch(c[1]) << 8) | ch(c[2]);
 }
 
-/// The sidebar tabline's colours from Neovim's fg and bg, as Windows
-/// derives them (windows/ui/tabbar.zig): a darker strip on a dark theme,
-/// a lighter one on a light theme, and so on.
-const SidebarPalette = struct { bg: u32, selected: u32, hover: u32, text: u32, separator: u32, indicator: u32 };
-
-fn sidebarPalette(fg_rgb: u32, bg_rgb: u32) SidebarPalette {
-    const split = struct {
-        fn f(c: u32) [3]f32 {
-            return .{
-                @as(f32, @floatFromInt((c >> 16) & 0xff)) / 255.0,
-                @as(f32, @floatFromInt((c >> 8) & 0xff)) / 255.0,
-                @as(f32, @floatFromInt(c & 0xff)) / 255.0,
-            };
-        }
-    }.f;
-    const b = split(bg_rgb);
-    const f = split(fg_rgb);
-    const dark = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2] < 0.5;
-    var out: [6][3]f32 = undefined;
-    for (0..3) |i| {
-        const sb = if (dark) b[i] * 0.85 else @min(1.0, b[i] + 0.03);
-        out[0][i] = sb;
-        out[1][i] = if (dark) b[i] + 0.06 else b[i] - 0.06;
-        out[2][i] = if (dark) b[i] + 0.03 else b[i] - 0.03;
-        out[3][i] = f[i] * @as(f32, if (dark) 0.6 else 0.5);
-        out[4][i] = if (dark) sb * 0.9 + 0.1 else sb * 0.9;
-        out[5][i] = f[i] * 0.7;
-    }
-    return .{ .bg = rgbOf(out[0]), .selected = rgbOf(out[1]), .hover = rgbOf(out[2]), .text = rgbOf(out[3]), .separator = rgbOf(out[4]), .indicator = rgbOf(out[5]) };
-}
-
-test "a dark sidebar is darker than the editor, its selection lighter" {
-    const p = sidebarPalette(0xffffff, 0x202020);
-    try std.testing.expectEqual(@as(u32, 0x1b1b1b), p.bg);
-    try std.testing.expectEqual(@as(u32, 0x2f2f2f), p.selected);
-    try std.testing.expectEqual(@as(u32, 0x999999), p.text);
+fn splitRgb(c: u32) [3]f32 {
+    return .{
+        @as(f32, @floatFromInt((c >> 16) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt((c >> 8) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt(c & 0xff)) / 255.0,
+    };
 }
 
 fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
@@ -470,14 +440,10 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     // sizes macOS and Windows give them (toast ~ the cell, minis 0.75 of it).
     const panel_px: u32 = if (font_px == 0) 13 else @max(12, font_px);
     const mini_px: u32 = if (font_px == 0) 11 else @max(11, font_px * 3 / 4);
-    const b: [3]f32 = .{
-        @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0,
-        @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0,
-        @as(f32, @floatFromInt(bg & 0xff)) / 255.0,
-    };
+    const b = splitRgb(bg);
     const p = core.frontend_rules.panelBg(b[0], b[1], b[2]);
     const panel = rgbOf(p);
-    const sb = sidebarPalette(fg, bg);
+    const sb = core.frontend_rules.sidebarPalette(splitRgb(fg), b, null);
     var buf: [4096]u8 = undefined;
     // Tone colours as macOS's message panels (ZonvieCore.swift): the text
     // and, where it has one, the border.
@@ -512,7 +478,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
         \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
         \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
-    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, sb.bg, sb.text, sb.separator, sb.hover, sb.selected, fg, sb.indicator, fg, fg }) catch return;
+    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, rgbOf(sb.bg), rgbOf(sb.text), rgbOf(sb.separator), rgbOf(sb.hover), rgbOf(sb.selected), fg, rgbOf(sb.indicator), fg, fg }) catch return;
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
 
@@ -728,8 +694,8 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
     applyIndicators(app, ui);
 }
 
-/// A titlebar tab's width: the strip shared out, held to 100..200 as macOS
-/// and Windows hold theirs. Rerun when the strip's width may have changed.
+/// A titlebar tab's width: the strip shared out within the shared bounds.
+/// Rerun when the strip's width may have changed.
 fn sizeTabs(app: *App) void {
     const w = &app.widgets;
     if (w.sidebar or w.tab_count == 0) return;
@@ -737,7 +703,8 @@ fn sizeTabs(app: *App) void {
     const tabs = w.tabs orelse return;
     const plus_w: c_int = 40;
     const avail = gtk.gtk_widget_get_width(bar) - plus_w;
-    const tw: c_int = std.math.clamp(@divTrunc(avail, @as(c_int, @intCast(w.tab_count))), 100, 200);
+    const rules = core.frontend_rules;
+    const tw: c_int = rules.titlebarTabWidth(avail, @intCast(w.tab_count), rules.tab_min_width_pt, rules.tab_max_width_pt);
     if (tw == w.tab_w) return;
     w.tab_w = tw;
     var child = gtk.gtk_widget_get_first_child(tabs);

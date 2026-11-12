@@ -332,14 +332,15 @@ fn calculateDropTarget(mouse_pos: c_int, item_count: usize, origin: c_int, strid
 /// tab_count <= 0 returns 0. The inline copies divided without that guard and
 /// were safe only because their callers checked first.
 pub fn tabWidthPx(app: *App, client_width: c_int, tab_count: c_int) c_int {
-    if (tab_count <= 0) return 0;
     const available = client_width -
         app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) -
         app.scalePx(40) -
         app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    return @min(
+    return core.frontend_rules.titlebarTabWidth(
+        available,
+        tab_count,
+        app.scalePx(TablineState.TAB_MIN_WIDTH),
         app.scalePx(TablineState.TAB_MAX_WIDTH),
-        @max(app.scalePx(TablineState.TAB_MIN_WIDTH), @divTrunc(available, tab_count)),
     );
 }
 
@@ -2163,93 +2164,58 @@ const SidebarColors = struct {
             fgB = @as(f32, @floatFromInt(app.colorscheme_fg & 0xFF)) / 255.0;
         }
 
-        const luminance = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
-        const is_dark = luminance < 0.5;
-
-        // Sidebar background: slightly darker (dark theme) or lighter (light theme) than bg.
+        // The strip is the editor card's ground when the card is drawn.
         // Captionless, it is macOS's translucent tint over the editor bg: the
         // bg with its OKLab lightness moved, at the overlay's alpha.
-        var sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
-        var sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
-        var sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
+        var strip: ?[3]f32 = null;
         if (sidebar_caption.island(app) != null) {
-            // The editor card's ground, exactly as the renderer clears it.
+            // Exactly as the renderer clears it.
             const ground = islandGroundRgb(app.colorscheme_bg);
-            sb_bgR = @as(f32, @floatFromInt((ground >> 16) & 0xFF)) / 255.0;
-            sb_bgG = @as(f32, @floatFromInt((ground >> 8) & 0xFF)) / 255.0;
-            sb_bgB = @as(f32, @floatFromInt(ground & 0xFF)) / 255.0;
+            strip = .{
+                @as(f32, @floatFromInt((ground >> 16) & 0xFF)) / 255.0,
+                @as(f32, @floatFromInt((ground >> 8) & 0xFF)) / 255.0,
+                @as(f32, @floatFromInt(ground & 0xFF)) / 255.0,
+            };
         } else if (sidebar_caption.captionless(app)) {
+            const is_dark = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB < 0.5;
             const tint = lightnessShifted(bgR, bgG, bgB, !is_dark);
             const overlay_alpha: f32 = 0.55;
-            sb_bgR = bgR + (tint[0] - bgR) * overlay_alpha;
-            sb_bgG = bgG + (tint[1] - bgG) * overlay_alpha;
-            sb_bgB = bgB + (tint[2] - bgB) * overlay_alpha;
+            strip = .{
+                bgR + (tint[0] - bgR) * overlay_alpha,
+                bgG + (tint[1] - bgG) * overlay_alpha,
+                bgB + (tint[2] - bgB) * overlay_alpha,
+            };
         }
-
-        // Selected tab: brighter (dark) or darker (light) than bg
-        const sel_R = if (is_dark) bgR + 0.06 else @max(@as(f32, 0.0), bgR - 0.06);
-        const sel_G = if (is_dark) bgG + 0.06 else @max(@as(f32, 0.0), bgG - 0.06);
-        const sel_B = if (is_dark) bgB + 0.06 else @max(@as(f32, 0.0), bgB - 0.06);
-
-        // Hover tab: slightly brighter/darker
-        const hov_R = if (is_dark) bgR + 0.03 else @max(@as(f32, 0.0), bgR - 0.03);
-        const hov_G = if (is_dark) bgG + 0.03 else @max(@as(f32, 0.0), bgG - 0.03);
-        const hov_B = if (is_dark) bgB + 0.03 else @max(@as(f32, 0.0), bgB - 0.03);
-
-        // Text colors
-        const dim = if (is_dark) @as(f32, 0.6) else @as(f32, 0.5);
-        const txt_R = fgR * dim;
-        const txt_G = fgG * dim;
-        const txt_B = fgB * dim;
-
-        // Separator: white 10% alpha on dark bg, black 10% alpha on light bg
-        // For opaque GDI, blend with sidebar bg
-        const sep_R = if (is_dark) sb_bgR * 0.9 + 1.0 * 0.1 else sb_bgR * 0.9;
-        const sep_G = if (is_dark) sb_bgG * 0.9 + 1.0 * 0.1 else sb_bgG * 0.9;
-        const sep_B = if (is_dark) sb_bgB * 0.9 + 1.0 * 0.1 else sb_bgB * 0.9;
-
-        // Close button
-        const close_R = fgR * 0.5;
-        const close_G = fgG * 0.5;
-        const close_B = fgB * 0.5;
-
-        const close_hi_R = fgR * 0.8;
-        const close_hi_G = fgG * 0.8;
-        const close_hi_B = fgB * 0.8;
-
-        // Selection indicator: use fg color as accent
-        const ind_R = fgR * 0.7;
-        const ind_G = fgG * 0.7;
-        const ind_B = fgB * 0.7;
+        const p = core.frontend_rules.sidebarPalette(.{ fgR, fgG, fgB }, .{ bgR, bgG, bgB }, strip);
 
         return .{
-            .bg_r = f2u8(sb_bgR),
-            .bg_g = f2u8(sb_bgG),
-            .bg_b = f2u8(sb_bgB),
-            .selected_r = f2u8(sel_R),
-            .selected_g = f2u8(sel_G),
-            .selected_b = f2u8(sel_B),
-            .hover_r = f2u8(hov_R),
-            .hover_g = f2u8(hov_G),
-            .hover_b = f2u8(hov_B),
-            .text_r = f2u8(txt_R),
-            .text_g = f2u8(txt_G),
-            .text_b = f2u8(txt_B),
-            .text_sel_r = f2u8(fgR),
-            .text_sel_g = f2u8(fgG),
-            .text_sel_b = f2u8(fgB),
-            .sep_r = f2u8(sep_R),
-            .sep_g = f2u8(sep_G),
-            .sep_b = f2u8(sep_B),
-            .close_r = f2u8(close_R),
-            .close_g = f2u8(close_G),
-            .close_b = f2u8(close_B),
-            .close_hi_r = f2u8(close_hi_R),
-            .close_hi_g = f2u8(close_hi_G),
-            .close_hi_b = f2u8(close_hi_B),
-            .indicator_r = f2u8(ind_R),
-            .indicator_g = f2u8(ind_G),
-            .indicator_b = f2u8(ind_B),
+            .bg_r = f2u8(p.bg[0]),
+            .bg_g = f2u8(p.bg[1]),
+            .bg_b = f2u8(p.bg[2]),
+            .selected_r = f2u8(p.selected[0]),
+            .selected_g = f2u8(p.selected[1]),
+            .selected_b = f2u8(p.selected[2]),
+            .hover_r = f2u8(p.hover[0]),
+            .hover_g = f2u8(p.hover[1]),
+            .hover_b = f2u8(p.hover[2]),
+            .text_r = f2u8(p.text[0]),
+            .text_g = f2u8(p.text[1]),
+            .text_b = f2u8(p.text[2]),
+            .text_sel_r = f2u8(p.text_selected[0]),
+            .text_sel_g = f2u8(p.text_selected[1]),
+            .text_sel_b = f2u8(p.text_selected[2]),
+            .sep_r = f2u8(p.separator[0]),
+            .sep_g = f2u8(p.separator[1]),
+            .sep_b = f2u8(p.separator[2]),
+            .close_r = f2u8(p.close[0]),
+            .close_g = f2u8(p.close[1]),
+            .close_b = f2u8(p.close[2]),
+            .close_hi_r = f2u8(p.close_hi[0]),
+            .close_hi_g = f2u8(p.close_hi[1]),
+            .close_hi_b = f2u8(p.close_hi[2]),
+            .indicator_r = f2u8(p.indicator[0]),
+            .indicator_g = f2u8(p.indicator[1]),
+            .indicator_b = f2u8(p.indicator[2]),
         };
     }
 
