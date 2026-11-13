@@ -192,9 +192,9 @@ pub fn island(app: *const App) ?Insets {
     if (!l.island()) return null;
     const m = app.scalePx(ISLAND_MARGIN_PT);
     const side = sidebarInsetsPx(app);
-    // Titlebar tabs reach their bar's bottom, so the card keeps a margin
-    // from it; a title band already holds the card off the top.
-    const top = if (l.tabline == .titlebar) editorTopPx(app) + m else @max(editorTopPx(app), m);
+    // Titlebar tabs sit on the card's top edge, the selected one merging
+    // into it; a title band already holds the card off the top.
+    const top = if (l.tabline == .titlebar) editorTopPx(app) else @max(editorTopPx(app), m);
     return .{ .left = side.left + m, .right = side.right + m, .top = top, .bottom = m };
 }
 

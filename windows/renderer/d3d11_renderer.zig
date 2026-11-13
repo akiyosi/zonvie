@@ -339,6 +339,9 @@ pub const Renderer = struct {
     // Tabline and sidebar strips, rendered from GDI bitmaps.
     tabline_strip: StripTexture = .{},
     sidebar_strip: StripTexture = .{},
+    /// The strips hold final premultiplied pixels and are written with
+    /// blending off, as the editor card is (tabbar.renderOffscreenToD3D).
+    strips_replace: bool = false,
 
     // Post-process bloom (neon glow, Dual Kawase)
     glow_extract_tex: ?*c.ID3D11Texture2D = null,
@@ -1548,7 +1551,15 @@ pub const Renderer = struct {
         const ps_set_srv = ctx.*.lpVtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
         var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-        try self.drawVertices(&verts);
+        if (self.strips_replace) {
+            const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+            var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+            set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+            defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+            try self.drawVertices(&verts);
+        } else {
+            try self.drawVertices(&verts);
+        }
         srvs[0] = self.atlas_srv;
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }

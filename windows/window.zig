@@ -342,6 +342,14 @@ pub fn applyWindowBackdrop(hwnd: c.HWND) void {
     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
+/// Clears WS_SYSMENU, and with it the caption buttons DWM draws. Idempotent.
+fn dropSystemMenu(hwnd: c.HWND) void {
+    const style: c.DWORD = @bitCast(@as(i32, @truncate(c.GetWindowLongPtrW(hwnd, c.GWL_STYLE))));
+    if (style & c.WS_SYSMENU == 0) return;
+    _ = c.SetWindowLongPtrW(hwnd, c.GWL_STYLE, @as(c.LONG_PTR, @as(i32, @bitCast(style & ~@as(c.DWORD, c.WS_SYSMENU)))));
+    _ = c.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+}
+
 // WM_SETTINGCHANGE dispatch helper for any top-level window that wants its
 // DWM titlebar to follow the OS app theme. Returns true if the message was
 // the "ImmersiveColorSet" broadcast and the theme was re-applied.
@@ -6349,6 +6357,10 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 if (app.config.window.blur) {
                     applyWindowBackdrop(hwnd);
+                    // The sheet of glass carries DWM's own caption buttons,
+                    // which show through translucent chrome beside the ones
+                    // the window draws; without a system menu DWM draws none.
+                    if (customFrame(app)) dropSystemMenu(hwnd);
                 } else if (customFrame(app) and app.config.window.opacity >= 1.0) {
                     const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
                     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);

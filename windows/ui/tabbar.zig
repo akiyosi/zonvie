@@ -1161,6 +1161,7 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&width));
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
+    if (app.renderer) |*r| h.update(std.mem.asBytes(&r.opacity));
     h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
     // `titlebar_style = "hidden"` paints the bar from the colorscheme.
     h.update(std.mem.asBytes(&app.drag_bar.revealed));
@@ -1294,8 +1295,24 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
         }
     }
 
-    const pixel_data = pixels[0 .. width * height * 4];
+    // On a translucent surface the clear paints the editor card's ground,
+    // and the card its bg, at the window opacity, written rather than
+    // blended. Chrome beside the card is written the same way, every pixel
+    // at that opacity (the strip shader premultiplies), so its ground is the
+    // clear's and a selected tab running into the card is the card's own
+    // colour. Keyed pixels stay (0,0,0,0): the sidebar, drawn after, covers
+    // them.
     const g = &(app.renderer.?);
+    g.strips_replace = g.opacity < 1.0 and sidebar_caption.island(app) != null;
+    if (g.strips_replace) {
+        const a: u8 = @intFromFloat(@round(g.opacity * 255.0));
+        i = 0;
+        while (i < pixel_count) : (i += 1) {
+            if (pixels[i * 4 + 3] != 0) pixels[i * 4 + 3] = a;
+        }
+    }
+
+    const pixel_data = pixels[0 .. width * height * 4];
     g.updateStripTexture(surface, width, height, pixel_data) catch |e| {
         if (applog.isEnabled()) applog.appLog("[{s}] updateStripTexture failed: {any}\n", .{ @tagName(surface), e });
         return false;
@@ -1348,6 +1365,7 @@ fn sidebarRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&width));
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
+    if (app.renderer) |*r| h.update(std.mem.asBytes(&r.opacity));
     h.update(std.mem.asBytes(&app.colorscheme_bg));
     h.update(std.mem.asBytes(&app.colorscheme_fg));
     h.update(std.mem.asBytes(&app.sidebar_position_right));
@@ -1590,6 +1608,115 @@ pub fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytyp
     }
 }
 
+/// Corner radius of a titlebar tab, as macOS TabBarView.tabCornerRadius.
+const TAB_CORNER_RADIUS_PT: c_int = 8;
+
+const TabShape = enum {
+    /// Every corner rounded.
+    rounded,
+    /// Top corners rounded; the bottom runs into the editor card below,
+    /// flaring out into it with concave corners beside `rect`.
+    merged,
+};
+
+/// Fill `rect` with `color` in `shape`, corners of `radius` px antialiased.
+/// GDI's RoundRect does not antialias, so on a DIB section (the offscreen
+/// strip) the corners are blended into its pixels directly; any other DC
+/// gets RoundRect, or a plain rect for `merged`.
+fn fillTabShape(hdc: c.HDC, rect: c.RECT, radius: c_int, color: c.COLORREF, shape: TabShape) void {
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    if (w <= 0 or h <= 0) return;
+    const r = @max(0, @min(radius, @divTrunc(@min(w, h), 2)));
+    const brush = c.CreateSolidBrush(color);
+    defer _ = c.DeleteObject(brush);
+
+    var ds: c.DIBSECTION = undefined;
+    const bmp = c.GetCurrentObject(hdc, c.OBJ_BITMAP);
+    const is_dib = bmp != null and c.GetObjectW(bmp, @sizeOf(c.DIBSECTION), &ds) == @sizeOf(c.DIBSECTION) and
+        ds.dsBm.bmBits != null and ds.dsBm.bmBitsPixel == 32;
+    if (!is_dib or r == 0) {
+        if (r == 0 or shape == .merged) {
+            var fill = rect;
+            _ = c.FillRect(hdc, &fill, brush);
+            return;
+        }
+        const old_brush = c.SelectObject(hdc, brush);
+        const old_pen = c.SelectObject(hdc, c.GetStockObject(c.NULL_PEN));
+        // RoundRect's corner argument is the ellipse's diameter.
+        _ = c.RoundRect(hdc, rect.left, rect.top, rect.right + 1, rect.bottom + 1, r * 2, r * 2);
+        _ = c.SelectObject(hdc, old_pen);
+        _ = c.SelectObject(hdc, old_brush);
+        return;
+    }
+
+    // The body: a cross of two rects leaves the r x r corner squares; a
+    // merged shape fills its bottom corners square.
+    const bottom_inset = if (shape == .merged) 0 else r;
+    var mid = c.RECT{ .left = rect.left + r, .top = rect.top, .right = rect.right - r, .bottom = rect.bottom };
+    _ = c.FillRect(hdc, &mid, brush);
+    var sides = c.RECT{ .left = rect.left, .top = rect.top + r, .right = rect.right, .bottom = rect.bottom - bottom_inset };
+    _ = c.FillRect(hdc, &sides, brush);
+
+    // Pending GDI writes must land before the bits are touched.
+    _ = c.GdiFlush();
+    // The DC's viewport origin moves what GDI draws; the bits do not.
+    var org: c.POINT = .{ .x = 0, .y = 0 };
+    _ = c.GetViewportOrgEx(hdc, &org);
+    const bw: c_int = ds.dsBm.bmWidth;
+    const bh: c_int = ds.dsBm.bmHeight;
+    // Row 0 of the bits is the top: the strip's DIB is created top-down
+    // (renderOffscreenToD3D), and GetObject cannot be asked, since it reports
+    // dsBmih.biHeight without the sign that says so.
+    const stride: usize = @intCast(ds.dsBm.bmWidthBytes);
+    const bits: [*]u8 = @ptrCast(ds.dsBm.bmBits);
+    const col = [3]f32{
+        @floatFromInt(c.GetBValue(color)),
+        @floatFromInt(c.GetGValue(color)),
+        @floatFromInt(c.GetRValue(color)),
+    };
+    const rf: f32 = @floatFromInt(r);
+
+    // An r x r square at (x, y) and the circle centre its arc is cut from.
+    // Convex corners keep the inside of the circle; a concave flare keeps
+    // the outside.
+    const Corner = struct { x: c_int, y: c_int, cx: c_int, cy: c_int, concave: bool };
+    var corners: [4]Corner = undefined;
+    corners[0] = .{ .x = rect.left, .y = rect.top, .cx = rect.left + r, .cy = rect.top + r, .concave = false };
+    corners[1] = .{ .x = rect.right - r, .y = rect.top, .cx = rect.right - r, .cy = rect.top + r, .concave = false };
+    if (shape == .merged) {
+        corners[2] = .{ .x = rect.left - r, .y = rect.bottom - r, .cx = rect.left - r, .cy = rect.bottom - r, .concave = true };
+        corners[3] = .{ .x = rect.right, .y = rect.bottom - r, .cx = rect.right + r, .cy = rect.bottom - r, .concave = true };
+    } else {
+        corners[2] = .{ .x = rect.left, .y = rect.bottom - r, .cx = rect.left + r, .cy = rect.bottom - r, .concave = false };
+        corners[3] = .{ .x = rect.right - r, .y = rect.bottom - r, .cx = rect.right - r, .cy = rect.bottom - r, .concave = false };
+    }
+    for (corners) |k| {
+        const cx: f32 = @floatFromInt(k.cx);
+        const cy: f32 = @floatFromInt(k.cy);
+        var y = k.y;
+        while (y < k.y + r) : (y += 1) {
+            const dy = y + org.y;
+            if (dy < 0 or dy >= bh) continue;
+            const row: usize = @intCast(dy);
+            var x = k.x;
+            while (x < k.x + r) : (x += 1) {
+                const dx = x + org.x;
+                if (dx < 0 or dx >= bw) continue;
+                const fx = @as(f32, @floatFromInt(x)) + 0.5 - cx;
+                const fy = @as(f32, @floatFromInt(y)) + 0.5 - cy;
+                const inside = std.math.clamp(rf - @sqrt(fx * fx + fy * fy) + 0.5, 0.0, 1.0);
+                const cov = if (k.concave) 1 - inside else inside;
+                if (cov <= 0) continue;
+                const p = bits[row * stride + @as(usize, @intCast(dx)) * 4 ..][0..3];
+                for (0..3) |ch| {
+                    p[ch] = @intFromFloat(@round(@as(f32, @floatFromInt(p[ch])) * (1 - cov) + col[ch] * cov));
+                }
+            }
+        }
+    }
+}
+
 /// Tabs extend down the whole bar; their first label line, agent indicator,
 /// close button and the + button stay in the one-line band at the top, where
 /// a single-line bar has them.
@@ -1633,17 +1760,16 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     const tab_width = tabWidthPx(app, client_width, tab_count);
 
-    // Brushes
-    const selected_brush = c.CreateSolidBrush(pal.tab_selected);
-    const hover_brush = c.CreateSolidBrush(pal.tab_hover);
-    const normal_brush = c.CreateSolidBrush(pal.tab_normal);
-    const dragging_brush = c.CreateSolidBrush(pal.tab_dragging);
-    defer {
-        _ = c.DeleteObject(selected_brush);
-        _ = c.DeleteObject(hover_brush);
-        _ = c.DeleteObject(normal_brush);
-        _ = c.DeleteObject(dragging_brush);
-    }
+    const tab_radius = app.scalePx(TAB_CORNER_RADIUS_PT);
+    // A tab's background stands clear of the bar on every side, so its
+    // rounded corners do not meet a neighbour or the bar's edges.
+    const tab_inset_y = app.scalePx(5);
+    const tab_inset_x = app.scalePx(3);
+    // The editor card's bg when the tabs sit on its top edge.
+    const card_bg: ?c.COLORREF = if (sidebar_caption.island(app) == null) null else blk: {
+        const bg = if (app.colorscheme_bg == 0xFFFFFFFF) 0x252629 else app.colorscheme_bg;
+        break :blk c.RGB(@as(u8, @intCast((bg >> 16) & 0xFF)), @as(u8, @intCast((bg >> 8) & 0xFF)), @as(u8, @intCast(bg & 0xFF)));
+    };
 
     // Font
     const font = createTabFont(app, -12);
@@ -1670,26 +1796,32 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         const is_hovered = app.tabline_state.hovered_tab == i;
         const is_being_dragged = is_actually_dragging and app.tabline_state.dragging_tab == i;
 
-        var tab_rect = c.RECT{
-            .left = x + 1,
-            .top = top_padding,
-            .right = x + tab_width - 1,
-            .bottom = bar_height,
+        const tab_rect = c.RECT{
+            .left = x + tab_inset_x,
+            .top = tab_inset_y,
+            .right = x + tab_width - tab_inset_x,
+            .bottom = bar_height - tab_inset_y,
         };
 
         // If this tab is being dragged (moved beyond threshold), draw a placeholder (dimmed)
         if (is_being_dragged) {
             // Draw dimmed placeholder
-            const placeholder_brush = c.CreateSolidBrush(pal.tab_placeholder);
-            _ = c.FillRect(hdc, &tab_rect, placeholder_brush);
-            _ = c.DeleteObject(placeholder_brush);
+            fillTabShape(hdc, tab_rect, tab_radius, pal.tab_placeholder, .rounded);
             x += tab_width + 1;
             continue;
         }
 
-        // Background
-        const brush = if (is_selected) selected_brush else if (is_hovered) hover_brush else normal_brush;
-        _ = c.FillRect(hdc, &tab_rect, brush);
+        // Background. Over an editor card the selected tab is the card's
+        // own bg, run down into its top edge, and an idle tab is bare
+        // ground: a fill there would cut into a neighbour's flare.
+        if (is_selected and card_bg != null) {
+            var merged_rect = tab_rect;
+            merged_rect.bottom = bar_height;
+            fillTabShape(hdc, merged_rect, tab_radius, card_bg.?, .merged);
+        } else if (is_selected or is_hovered or card_bg == null) {
+            const tab_bg = if (is_selected) pal.tab_selected else if (is_hovered) pal.tab_hover else pal.tab_normal;
+            fillTabShape(hdc, tab_rect, tab_radius, tab_bg, .rounded);
+        }
 
         // Tab name
         const text_color = if (is_selected) pal.text_selected else pal.text_normal;
@@ -1851,25 +1983,23 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
             // Calculate floating tab position - centered on cursor
             const float_x = app.tabline_state.drag_current_x - app.tabline_state.drag_offset_x;
-            var float_rect = c.RECT{
-                .left = float_x + 1,
-                .top = top_padding,
-                .right = float_x + tab_width - 1,
-                .bottom = bar_height,
+            const float_rect = c.RECT{
+                .left = float_x + tab_inset_x,
+                .top = tab_inset_y,
+                .right = float_x + tab_width - tab_inset_x,
+                .bottom = bar_height - tab_inset_y,
             };
 
             // Draw floating tab tinted with the accent color (no transparency
             // in GDI; use the dragging-tab palette entry for a consistent feel).
-            const float_brush = c.CreateSolidBrush(pal.tab_dragging);
-            _ = c.FillRect(hdc, &float_rect, float_brush);
-            _ = c.DeleteObject(float_brush);
+            fillTabShape(hdc, float_rect, tab_radius, pal.tab_dragging, .rounded);
 
             // Draw border for floating tab
             const border_pen = c.CreatePen(c.PS_SOLID, 1, pal.accent);
             const old_border_pen = c.SelectObject(hdc, border_pen);
             const float_null_brush = c.GetStockObject(c.NULL_BRUSH);
             const old_float_brush = c.SelectObject(hdc, float_null_brush);
-            _ = c.Rectangle(hdc, float_rect.left, float_rect.top, float_rect.right, float_rect.bottom);
+            _ = c.RoundRect(hdc, float_rect.left, float_rect.top, float_rect.right, float_rect.bottom, tab_radius * 2, tab_radius * 2);
             _ = c.SelectObject(hdc, old_float_brush);
             _ = c.SelectObject(hdc, old_border_pen);
             _ = c.DeleteObject(border_pen);
@@ -2149,8 +2279,7 @@ const SidebarColors = struct {
             .sidebar_darker => -0.07,
             .sidebar_lighter => 0.04,
             .island_ground => blk: {
-                const step: f32 = if (L >= 0.5) 0.07 else 0.04;
-                break :blk if (L >= 0.2) -step else step;
+                break :blk if (L >= 0.2) -0.06 else 0.06;
             },
         };
         L = std.math.clamp(L + delta, 0.0, 1.0);
