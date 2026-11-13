@@ -19,6 +19,7 @@ const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
+const grid_pixels = @import("grid_pixels.zig");
 
 const log_path = "tmp/gui_shader_probe.log";
 
@@ -73,7 +74,8 @@ fn bandCentroidX(img: driver.capture.Image, y0: usize, y1: usize) struct { x: f6
 }
 
 /// Where the band must land, in capture pixels, for the window holding the
-/// cursor: its first screen column times the cell width. This makes both
+/// cursor: its first screen column times the cell width, past the grid's
+/// left inset. This makes both
 /// phases exact rather than "somewhere in the correct half" — a cursor
 /// pinned to the top-left window produces a left-half band all by itself,
 /// and an origin error of a few cells, or one that used the anchor grid
@@ -104,7 +106,8 @@ fn captureBandMoved(
 
 fn expectedBandX(g: *Gui, cell_w: f64) !f64 {
     const win_col = try g.evalInt("win_screenpos(0)[1]");
-    return @as(f64, @floatFromInt(win_col - 1)) * cell_w;
+    const insets = try grid_pixels.gridInsets(g.alloc, log_path);
+    return insets.left + @as(f64, @floatFromInt(win_col - 1)) * cell_w;
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {

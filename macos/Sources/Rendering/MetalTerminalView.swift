@@ -253,10 +253,13 @@ final class MetalTerminalView: GridInputView {
     }
 
     private func applyGridInsets() {
-        renderer.setGridInsets(leftPx: (gridInsetsPt.left * backingScale).rounded(),
-                               rightPx: (gridInsetsPt.right * backingScale).rounded(),
-                               topPx: (gridInsetsPt.top * backingScale).rounded(),
-                               bottomPx: (gridInsetsPt.bottom * backingScale).rounded())
+        let leftPx = (gridInsetsPt.left * backingScale).rounded()
+        let rightPx = (gridInsetsPt.right * backingScale).rounded()
+        let topPx = (gridInsetsPt.top * backingScale).rounded()
+        let bottomPx = (gridInsetsPt.bottom * backingScale).rounded()
+        renderer.setGridInsets(leftPx: leftPx, rightPx: rightPx, topPx: topPx, bottomPx: bottomPx)
+        // The grid's place in the view, in the field form the GUI driver parses.
+        ZonvieCore.appLog("[grid_insets] left=\(leftPx) top=\(topPx) right=\(rightPx) bottom=\(bottomPx)")
         let island = islandInsetsPt.map { i in
             GridSurfaceRenderer.Island(
                 leftPx: (i.left * backingScale).rounded(), rightPx: (i.right * backingScale).rounded(),

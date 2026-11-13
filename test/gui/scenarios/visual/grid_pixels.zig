@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
+const app_log = @import("../../app_log.zig");
 
 /// Perceptually crude but sufficient: the frontend paints text and chrome in
 /// grey on grey, so a plain channel mean separates ink from background.
@@ -60,6 +61,24 @@ pub fn firstContentRow(img: driver.capture.Image, bg: u8) u32 {
         if (bg_px * 10 > img.w * 4) return y;
     }
     return 0;
+}
+
+pub const Insets = struct { left: f64, top: f64, right: f64, bottom: f64 };
+
+/// What the grid leaves at each side of the editor view, in capture pixels,
+/// as the app last logged it. The view starts at firstContentRow and reaches
+/// the capture's other three edges; an editor card's margin and padding put
+/// the grid inside it.
+pub fn gridInsets(alloc: std.mem.Allocator, log_path: []const u8) !Insets {
+    const line = (try app_log.lastLineSince(alloc, log_path, "[grid_insets]", 0)) orelse
+        return error.GridInsetsUnknown;
+    defer alloc.free(line);
+    return .{
+        .left = app_log.field(line, "left") orelse return error.GridInsetsUnknown,
+        .top = app_log.field(line, "top") orelse return error.GridInsetsUnknown,
+        .right = app_log.field(line, "right") orelse return error.GridInsetsUnknown,
+        .bottom = app_log.field(line, "bottom") orelse return error.GridInsetsUnknown,
+    };
 }
 
 /// Longest vertical run of ink at column `x`, from `y0` down, treating a gap

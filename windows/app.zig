@@ -7396,10 +7396,18 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const cw: u32 = @max(1, app.cell_w_px);
     const ch: u32 = app.rowHeightPx();
 
-    if (applog.isEnabled()) applog.appLog(
-        "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
-        .{ w, h, cw, ch },
-    );
+    if (applog.isEnabled()) {
+        applog.appLog(
+            "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
+            .{ w, h, cw, ch },
+        );
+        // The grid's place in the client area, in the field form the GUI driver parses.
+        const insets = sidebar_caption.gridInsetsPx(app);
+        applog.appLog(
+            "[grid_insets] left={d} top={d} right={d} bottom={d}\n",
+            .{ insets.left, insets.top, insets.right, insets.bottom },
+        );
+    }
 
     // The cmdline's width budget goes in first so the flush the layout update
     // retries already sizes the cmdline with it.
