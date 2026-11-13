@@ -803,7 +803,10 @@ typedef void (*zonvie_on_tabline_hide_fn)(void* ctx);
    only, and must NOT edge-detect notifications itself from successive calls
    -- a flagged report can target a tab that is not currently displaying the
    agent's terminal (the agent's buffer may be hidden). Fired immediately on
-   change (not coupled to redraw, so a background-tab agent still updates). */
+   change (not coupled to redraw, so a background-tab agent still updates).
+   A flagged base-1 report whose title starts with "Failed: " is a failure
+   (OSC 7501 state=error): the frontend shows the title as the whole
+   notification body instead of prefixing "Finished: ". */
 typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state, const char* title, size_t title_len);
 
 /* --- Clipboard callbacks --- */

@@ -4397,7 +4397,9 @@ pub export fn WndProc(
                                 const waiting = app.tabline_state.agent_completed_waiting[0];
                                 const label = if (waiting) "Needs input" else "Finished";
                                 const fallback = if (waiting) "AI agent needs input" else "AI agent finished";
-                                if (summary.len > 0) {
+                                if (!waiting and std.mem.startsWith(u8, summary, "Failed: ")) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{s}", .{summary}) catch fallback;
+                                } else if (summary.len > 0) {
                                     bmsg = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ label, summary }) catch fallback;
                                 } else {
                                     bmsg = fallback;

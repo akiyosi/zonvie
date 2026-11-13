@@ -8889,6 +8889,8 @@ final class ZonvieCore {
                 let body: String
                 if base == 4 {
                     body = summary.isEmpty ? "AI agent needs input" : "Needs input: \(summary)"
+                } else if summary.hasPrefix("Failed: ") {
+                    body = summary
                 } else {
                     body = summary.isEmpty ? "AI agent finished" : "Finished: \(summary)"
                 }
