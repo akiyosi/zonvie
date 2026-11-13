@@ -4927,7 +4927,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 usage: [.renderTarget, .shaderRead]))
         }
         guard let padded = insetPadTexture else { return nil }
-        if let island {
+        // Without its pipeline the card is left undrawn: the plain pad below
+        // still puts the grid at its inset.
+        if let island, shared.islandPipeline != nil {
             return encodeIsland(island, f, cmd: cmd, backTex: backTex, padded: padded, view: view, inset: inset)
         }
         let rpd = MTLRenderPassDescriptor()

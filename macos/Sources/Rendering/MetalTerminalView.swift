@@ -1551,6 +1551,13 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
         didSet { if scrollbarInsetRightPt != oldValue { layoutScrollbarFrame() } }
     }
 
+    /// Points an editor card keeps the scrollbar in from the view's edges,
+    /// on top of `scrollbarInsetRightPt`: the scroller runs along the card's
+    /// right edge, inside it. Zero without a card.
+    var scrollbarCardInsetsPt: (right: CGFloat, top: CGFloat, bottom: CGFloat) = (0, 0, 0) {
+        didSet { if scrollbarCardInsetsPt != oldValue { layoutScrollbarFrame() } }
+    }
+
     /// The main surface relays the insets to its renderer and Neovim.
     func gridInsetsDidChange() {}
 
@@ -2007,14 +2014,21 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
         scrollbarController.update()
     }
 
-    /// Pin the scroller to the right edge, full height.
+    /// The scrollbar strip's right edge, in view points from the left.
+    private var scrollbarStripRightPt: CGFloat {
+        bounds.width - scrollbarInsetRightPt - scrollbarCardInsetsPt.right
+    }
+
+    /// Pin the scroller to the right edge, full height; inside an editor
+    /// card, to the card's.
     func layoutScrollbarFrame() {
         let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
+        let card = scrollbarCardInsetsPt
         verticalScroller.frame = NSRect(
-            x: bounds.width - scrollbarInsetRightPt - scrollerWidth,
-            y: 0,
+            x: scrollbarStripRightPt - scrollerWidth,
+            y: card.bottom,
             width: scrollerWidth,
-            height: bounds.height
+            height: max(0, bounds.height - card.top - card.bottom)
         )
     }
 
@@ -2039,7 +2053,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
         let locationInView = convert(event.locationInWindow, from: nil)
         let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
-        let right = bounds.width - scrollbarInsetRightPt
+        let right = scrollbarStripRightPt
         return locationInView.x >= right - scrollerWidth && locationInView.x < right
     }
 

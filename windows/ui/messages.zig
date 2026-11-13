@@ -12,14 +12,14 @@ const sidebar_caption = @import("sidebar_caption.zig");
 const render_helpers = @import("../render_pipeline_helpers.zig");
 
 /// The main window's grid area in screen pixels: the client rect less its
-/// chrome (a titlebar tabline, a sidebar on either side). macOS measures
-/// against the terminal view for the same reason.
-fn mainSurfaceRect(client_screen: c.RECT, origin_x: c_int, origin_y: c_int, right_chrome_px: c_int) c.RECT {
+/// chrome (a titlebar tabline, a sidebar on either side, an editor card's
+/// margins). macOS measures against the terminal view for the same reason.
+fn mainSurfaceRect(client_screen: c.RECT, origin_x: c_int, origin_y: c_int, right_chrome_px: c_int, bottom_chrome_px: c_int) c.RECT {
     return .{
         .left = client_screen.left + origin_x,
         .top = client_screen.top + origin_y,
         .right = client_screen.right - right_chrome_px,
-        .bottom = client_screen.bottom,
+        .bottom = client_screen.bottom - bottom_chrome_px,
     };
 }
 
@@ -54,10 +54,17 @@ pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
     app.mu.lockUncancelable(core.clock.io());
     const host_hwnd: ?c.HWND = if (surface_id != 1) (if (app.external_windows.get(surface_id)) |w| w.hwnd else null) else null;
     const origin = input.surfaceOriginPx(app, true);
-    const right_chrome_px: c_int = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+    // Inside an editor card the grid also ends short of the client's right
+    // and bottom edges.
+    const card = sidebar_caption.island(app) != null;
+    const insets = sidebar_caption.gridInsetsPx(app);
+    const right_chrome_px: c_int = if (card)
+        insets.right
+    else if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
         sidebar_caption.coveredPx(app)
     else
         0;
+    const bottom_chrome_px: c_int = if (card) insets.bottom else 0;
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
     app.mu.unlock(core.clock.io());
@@ -70,7 +77,7 @@ pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
             if (clientScreenRect(hwnd)) |rect| break :blk rect;
         }
         const client = clientScreenRect(main_hwnd) orelse return app_mod.monitorWorkArea(main_hwnd);
-        break :blk mainSurfaceRect(client, origin.x, origin.y, right_chrome_px);
+        break :blk mainSurfaceRect(client, origin.x, origin.y, right_chrome_px, bottom_chrome_px);
     };
     if (mode == .grid and have_anchor) return anchorCellRect(surface, anchor, cell_w, cell_h);
     return surface;
@@ -1094,7 +1101,7 @@ test "msg target: a .grid box covers the anchor's cells in surface space" {
     };
 
     // Left sidebar 200px, titlebar-free; client at screen (100, 50), 1400x900.
-    const surface = mainSurfaceRect(.{ .left = 100, .top = 50, .right = 1500, .bottom = 950 }, 200, 0, 0);
+    const surface = mainSurfaceRect(.{ .left = 100, .top = 50, .right = 1500, .bottom = 950 }, 200, 0, 0, 0);
     try std.testing.expectEqual(@as(c_int, 300), surface.left);
     const r = anchorCellRect(surface, anchor, 10, 20);
     try std.testing.expectEqual(@as(c_int, 300 + 61 * 10), r.left);
@@ -1104,10 +1111,15 @@ test "msg target: a .grid box covers the anchor's cells in surface space" {
 }
 
 test "msg target: a right sidebar and a titlebar tabline are outside the surface" {
-    const surface = mainSurfaceRect(.{ .left = 0, .top = 0, .right = 1000, .bottom = 800 }, 0, 32, 180);
+    const surface = mainSurfaceRect(.{ .left = 0, .top = 0, .right = 1000, .bottom = 800 }, 0, 32, 180, 0);
     try std.testing.expectEqual(@as(c_int, 820), surface.right);
     try std.testing.expectEqual(@as(c_int, 32), surface.top);
     try std.testing.expectEqual(@as(c_int, 800), surface.bottom);
+}
+
+test "msg target: an editor card's margins are outside the surface on every side" {
+    const surface = mainSurfaceRect(.{ .left = 0, .top = 0, .right = 1000, .bottom = 800 }, 12, 12, 12, 12);
+    try std.testing.expectEqual(c.RECT{ .left = 12, .top = 12, .right = 988, .bottom = 788 }, surface);
 }
 
 test "message kinds: interactive prompts are dialogs, status kinds are not" {

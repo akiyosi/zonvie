@@ -514,14 +514,25 @@ final class ViewController: NSViewController {
     private func setGridArea(left: CGFloat, right: CGFloat, top: CGFloat, column: CGFloat) {
         guard titlebarLayout.island else {
             terminalView.islandInsetsPt = nil
+            terminalView.scrollbarCardInsetsPt = (0, 0, 0)
             terminalView.gridInsetsPt = (left, right + column, top, 0)
             return
         }
         let m = Self.islandMarginPt, p = Self.islandPaddingPt
         let island = (left: left + m, right: right + m, top: max(top, m), bottom: m)
         terminalView.islandInsetsPt = island
-        terminalView.gridInsetsPt = (island.left + p, island.right + p + column, island.top + p, island.bottom + p)
+        // The scrollbar runs inside the card, a gap in from its right edge
+        // and level with the grid's top and bottom, clear of the rounded
+        // corners. A "column" one takes the right padding's place: the grid
+        // ends at its strip.
+        let gap = Self.islandScrollbarGapPt
+        terminalView.scrollbarCardInsetsPt = (right: m + gap, top: island.top + p, bottom: island.bottom + p)
+        let gridRight = island.right + (column > 0 ? gap + column : p)
+        terminalView.gridInsetsPt = (island.left + p, gridRight, island.top + p, island.bottom + p)
     }
+
+    /// Card background between the scrollbar and the card's right edge.
+    private static let islandScrollbarGapPt: CGFloat = 2
 
     /// Ground between the editor card and the window edges or the sidebar.
     private static let islandMarginPt: CGFloat = 6

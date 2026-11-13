@@ -198,6 +198,11 @@ pub fn island(app: *const App) ?Insets {
     return .{ .left = side.left + m, .right = side.right + m, .top = top, .bottom = m };
 }
 
+/// Width of the strip a "column" scrollbar reserves, 0 for an overlay one.
+pub fn columnPx(app: *const App) c_int {
+    return if (app.config.scrollbar.isColumn()) @intFromFloat(app_mod.scrollbarReservedWidth(app.dpi_scale)) else 0;
+}
+
 /// The frontend-drawn chrome (titlebar tabs, a title band) sits on the
 /// card's ground instead of the editor bg.
 pub fn chromeOnGround(app: *const App) bool {
@@ -207,10 +212,14 @@ pub fn chromeOnGround(app: *const App) bool {
 
 /// Pixels the grid leaves at each side: the sidebar's, the title band or
 /// titlebar tabs above it, and inside an editor card its margin and padding.
+/// A "column" scrollbar's strip is not in `right`: the content width
+/// already leaves it out (app.getEffectiveContentWidth). In a card that
+/// strip takes the right padding's place, so the grid ends at it.
 pub fn gridInsetsPx(app: *const App) Insets {
     if (island(app)) |card| {
         const p = app.scalePx(ISLAND_PADDING_PT);
-        return .{ .left = card.left + p, .right = card.right + p, .top = card.top + p, .bottom = card.bottom + p };
+        const right_pad = if (columnPx(app) > 0) 0 else p;
+        return .{ .left = card.left + p, .right = card.right + right_pad, .top = card.top + p, .bottom = card.bottom + p };
     }
     var insets = sidebarInsetsPx(app);
     insets.top = editorTopPx(app);

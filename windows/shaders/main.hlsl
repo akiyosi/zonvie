@@ -261,11 +261,12 @@ float4 PSMain(VSOut i) : SV_Target {
                 return renderIconSDF(i.col, min(d1, d2));
             }
             // Editor card quarter: (uv.y, deco_phase) are pixel distances
-            // from the card's nearest vertical and horizontal edges, and
-            // deco_flags is the corner radius in px. Coverage, not alpha
+            // from the card's nearest vertical and horizontal edges.
+            // deco_flags holds the corner radius in px (low byte) and the
+            // ground's RGB (the three bytes above). Coverage, not alpha
             // ramps, so the 1px edge matches Shaders.metal ps_island.
             if (i.uv.x >= ISLAND_CARD - 0.1 && i.uv.x <= ISLAND_CARD + 0.1) {
-                float radius = (float)i.deco_flags;
+                float radius = (float)(i.deco_flags & 0xFFu);
                 float2 q = radius - float2(i.uv.y, i.deco_phase);
                 float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
                 float coverage = saturate(0.5 - sdf);
@@ -275,8 +276,10 @@ float4 PSMain(VSOut i) : SV_Target {
                 float inner = saturate(-0.5 - sdf);
                 float toward = dot(i.col.rgb, float3(0.299, 0.587, 0.114)) < 0.5 ? 1.0 : 0.0;
                 float3 border = lerp(i.col.rgb, float3(toward, toward, toward), ISLAND_BORDER_MIX);
-                float3 rgb = border * (coverage - inner) + i.col.rgb * inner;
-                return float4(rgb * i.col.a, i.col.a * coverage);
+                float3 ground = float3((i.deco_flags >> 24) & 0xFFu, (i.deco_flags >> 16) & 0xFFu, (i.deco_flags >> 8) & 0xFFu) / 255.0;
+                // Drawn with blending off: every pixel of the quad is final.
+                float3 rgb = ground * (1.0 - coverage) + border * (coverage - inner) + i.col.rgb * inner;
+                return float4(rgb * i.col.a, i.col.a);
             }
             // Filled rounded rect spanning the quad (copy button hover wash)
             if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {

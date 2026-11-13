@@ -1279,9 +1279,9 @@ pub const Renderer = struct {
         }
 
         // ---- Editor card ----
-        // Only over a fresh clear: the card lies outside every row's scissor,
-        // so a preserved back_tex keeps it, and drawing it again would blend
-        // its anti-aliased edge over itself.
+        // Only over a fresh clear: the card overwrites its whole rect, rows
+        // included, and its margins lie outside every row's scissor, so a
+        // preserved back_tex keeps it.
         if (should_clear) {
             if (opts.island) |card| {
                 self.setFullViewport();
@@ -1566,10 +1566,20 @@ pub const Renderer = struct {
     /// One quad per quarter, each carrying its pixel distances from the
     /// card's two nearest edges (uv.y, deco_phase), which interpolate
     /// linearly within a quarter; ISLAND_CARD in main.hlsl rounds the corner
-    /// from them. The radius rides in deco_flags, unused by that branch.
+    /// from them. deco_flags, unused by that branch as flags, carries the
+    /// radius in its low byte and the ground's RGB above it: the shader
+    /// writes ground, border and bg itself, with blending off, so a
+    /// translucent surface gets exactly (colour * opacity, opacity) and not
+    /// the card compounded over the cleared ground.
     fn drawIslandCard(self: *Renderer, card: Island, bg_rgb: u32) !void {
         if (self.width == 0 or self.height == 0) return;
         try self.setLayerTransform(0, 0, 0, 0);
+        const ctx = self.ctx orelse return error.NoContext;
+        const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+        var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+        set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+        defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+        const packed_flags: u32 = @min(card.radius_px, 0xFF) | ((card.ground_rgb & 0xFFFFFF) << 8);
         const rgb = if (bg_rgb == 0xFFFFFFFF) 0 else bg_rgb;
         const color: [4]f32 = .{
             @as(f32, @floatFromInt((rgb >> 16) & 0xFF)) / 255.0,
@@ -1611,7 +1621,7 @@ pub const Renderer = struct {
                 .{ x0, y1, q[2], q[7] },
             };
             for (corners, 0..) |v, j| {
-                verts[i * 6 + j] = .{ .position = .{ v[0], v[1] }, .texCoord = .{ marker, v[2] }, .color = color, .grid_id = 0, .deco_flags = card.radius_px, .deco_phase = v[3] };
+                verts[i * 6 + j] = .{ .position = .{ v[0], v[1] }, .texCoord = .{ marker, v[2] }, .color = color, .grid_id = 0, .deco_flags = packed_flags, .deco_phase = v[3] };
             }
         }
         try self.drawVertices(&verts);
