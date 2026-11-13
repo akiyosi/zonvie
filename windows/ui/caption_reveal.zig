@@ -1,4 +1,4 @@
-//! `[window] titlebar_style = "transparent"`: a captionless window draws its
+//! `[window] titlebar_style = "hidden"`: a captionless window draws its
 //! window buttons only while the pointer is in its caption band. The state
 //! lives with the window (App for the main one, ExternalWindow for the rest);
 //! this module decides it from the cursor and leaves the repaint to the caller.

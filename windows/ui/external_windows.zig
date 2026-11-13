@@ -2159,7 +2159,7 @@ pub fn windowOuterSizePx(app: *const App, hwnd: c.HWND, client_w: c_int, client_
 }
 
 /// A normal (captioned) external window under `titlebar_style =
-/// "transparent"`: no native caption, its own buttons on hover. Decided from
+/// "hidden"`: no native caption, its own buttons on hover. Decided from
 /// the style alone so WM_NCCALCSIZE can answer before the window is mapped
 /// to its grid.
 fn captionlessFrame(app: *const App, style: c.DWORD) bool {
@@ -2388,7 +2388,7 @@ pub fn ensureExternalWindowClassRegistered() bool {
     return true;
 }
 
-// --- Captionless normal window (`titlebar_style = "transparent"`) ---
+// --- Captionless normal window (`titlebar_style = "hidden"`) ---
 // The grid reaches the window top. The window buttons are drawn over its
 // top-right corner while the pointer is in the band, and resting in the band
 // for a while reveals a bar that drags the window (as on the main window).
@@ -3560,13 +3560,11 @@ pub fn updateExternalWindowColors(app: *App) void {
     // Read during WM_PAINT (setExternalWindowClearColor) where grid_mu is unsafe.
     var msg_area_bg: u32 = 0xFFFFFFFF;
     var pmenu_bg: u32 = 0xFFFFFFFF;
-    // The titlebar hairline (`titlebar_edge = "border"`), read in WM_PAINT.
-    var separator_fg: u32 = 0xFFFFFFFF;
 
     // Every highlight group in one grid_mu acquisition instead of a lock
     // round-trip per group.
     if (app.corep) |corep| {
-        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu", "WinSeparator" };
+        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu" };
         var fg: [names.len]u32 = undefined;
         var bg: [names.len]u32 = undefined;
         var found: [names.len]i32 = undefined;
@@ -3584,7 +3582,6 @@ pub fn updateExternalWindowColors(app: *App) void {
         }
         if (found[2] != 0) msg_area_bg = bg[2];
         if (found[3] != 0) pmenu_bg = bg[3];
-        if (found[4] != 0) separator_fg = fg[4];
     }
 
     app.mu.lockUncancelable(core.clock.io());
@@ -3592,7 +3589,6 @@ pub fn updateExternalWindowColors(app: *App) void {
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
-    app.cached_separator_fg = separator_fg;
     app.mu.unlock(core.clock.io());
 }
 

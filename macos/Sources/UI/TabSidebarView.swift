@@ -301,14 +301,13 @@ final class TabSidebarView: NSView {
     // the blur effect. The sidebar draws a subtle colorscheme tint over it.
     // When blur is disabled, the sidebar draws an opaque colorscheme-based background.
 
-    /// The editor surface draws the ground under the sidebar (the editor
-    /// card's surround), so the sidebar paints none of its own.
-    var showsEditorGround = false {
-        didSet { if showsEditorGround != oldValue { needsDisplay = true } }
-    }
+    /// The sidebar sits on the ground of an editor card.
+    private var paintsIslandGround: Bool { ZonvieConfig.shared.titlebarLayout.island }
 
     private var sidebarBackgroundColor: NSColor {
-        if showsEditorGround { return .clear }
+        // The editor surface runs under the sidebar and draws its card's
+        // ground there; a second fill here would not match it under blur.
+        if paintsIslandGround { return .clear }
         if blurEnabled {
             // Subtle tint over the blur effect
             return NSColor(red: bgR, green: bgG, blue: bgB, alpha: 0.25)
@@ -568,8 +567,9 @@ final class TabSidebarView: NSView {
         bounds.fill()
 
         // Separator line on the edge adjacent to terminal. A transparent
-        // titlebar separates the panes by the lightness gap alone.
-        if !transparentTitlebar {
+        // titlebar separates the panes by the lightness gap alone, and an
+        // editor card by its ground.
+        if !transparentTitlebar && !paintsIslandGround {
             separatorColor.setFill()
             if isRightSide {
                 NSRect(x: 0, y: 0, width: separatorWidth, height: bounds.height).fill()

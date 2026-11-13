@@ -3206,8 +3206,6 @@ pub const zonvie_config_values = extern struct {
     window_titlebar_style: u8 = @intFromEnum(cfg_defaults.window.titlebar_style),
     // scrollbar: 0 = overlay, 1 = column
     scrollbar_layout: u8 = @intFromEnum(cfg_defaults.scrollbar.layout),
-    // window: 0 = fade, 1 = border, 2 = none
-    window_titlebar_edge: u8 = @intFromEnum(cfg_defaults.window.titlebar_edge),
 };
 
 const ConfigHandle = struct {
@@ -3332,7 +3330,6 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .scroll_large_jump = @intFromEnum(cfg.scroll.large_jump_behavior),
         .window_titlebar_style = @intFromEnum(cfg.window.titlebar_style),
         .scrollbar_layout = @intFromEnum(cfg.scrollbar.layout),
-        .window_titlebar_edge = @intFromEnum(cfg.window.titlebar_edge),
     };
 }
 

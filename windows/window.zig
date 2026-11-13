@@ -2093,9 +2093,7 @@ fn snapshotMainPaint(hwnd: c.HWND, app: *App, tbs_snapshot: *const app_mod.Paint
         if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
         // Fixed by config and the band height; a DPI change that moves the
         // band repaints every row anyway.
-        const edge = sidebar_caption.separatorEdge(app);
-        g.separator_fade_px = edge.fade_px;
-        g.separator_hard_edge = edge.hard;
+        g.separator_fade_px = sidebar_caption.separatorFadePx(app);
     }
     var atlas_reset_consumed = false;
     var atlas_generation: u64 = 0;
@@ -2245,7 +2243,7 @@ const MainContentGeom = struct {
     content_right_i32: i32,
     /// Snapped to cell boundaries.
     content_height: u32,
-    /// The editor card a captionless sidebar window draws the grid in.
+    /// The editor card the grid is drawn in (sidebar_caption.island).
     island: ?d3d11.Renderer.Island,
 };
 
@@ -4435,8 +4433,6 @@ pub export fn WndProc(
             // deadlock when calling zonvie_core_get_hl_by_name from callback context.
             if (getApp(hwnd)) |app| {
                 external_windows.updateExternalWindowColors(app);
-                // The border hairline takes WinSeparator's new colour.
-                if (sidebar_caption.separatorEdge(app).hard) sidebar_caption.repaint(hwnd, app);
                 // Posted after every colorscheme change: the unified caption
                 // follows it. The table decides the colours; a removed caption
                 // only skips two DWM calls that would set the theme default.

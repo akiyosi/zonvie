@@ -16,12 +16,10 @@ cbuffer LayerTransform : register(b0) {
     // margins (winbar, float borders) stay put. Zero when nothing eases.
     float layer_scroll_offset_px;
     float layer_pad;
-    // `[window] titlebar_edge`: DECO_SEPARATOR glyphs within this many px of
-    // the layer top fade in (separator_hard_edge 0) or are hidden (1). 0 px
-    // leaves them alone.
+    // DECO_SEPARATOR glyphs within this many px of the layer top fade in.
+    // 0 px leaves them alone.
     float separator_fade_px;
-    float separator_hard_edge;
-    float2 separator_pad;
+    float3 separator_pad;
 };
 
 struct VSIn {
@@ -42,9 +40,9 @@ struct VSOut {
     // Layer origin in surface pixels, so pattern decorations can phase from
     // the layer's own left edge instead of the window's.
     float2 layer_origin : TEXCOORD2;
-    // Layer-local y in px, and the separator edge (fade px, hard edge).
+    // Layer-local y in px, and the separator fade height in px.
     float layer_y : TEXCOORD3;
-    nointerpolation float2 separator_edge : TEXCOORD4;
+    nointerpolation float separator_fade : TEXCOORD4;
 };
 
 VSOut VSMain(VSIn i) {
@@ -54,7 +52,7 @@ VSOut VSMain(VSIn i) {
     o.pos = float4(p * layer_scale + layer_offset, 0.0, 1.0);
     o.layer_origin = layer_origin_px;
     o.layer_y = p.y;
-    o.separator_edge = float2(separator_fade_px, separator_hard_edge);
+    o.separator_fade = separator_fade_px;
     o.uv  = i.uv;
     o.col = i.col;
     o.deco_flags = i.deco_flags;
@@ -85,16 +83,15 @@ SamplerState samp0 : register(s0);
 // this frontend never fades foreground quads. Declared so the flag is not
 // mistaken for an unknown bit by the next reader.
 #define DECO_SOLID_GLYPH   (1u << 11)
-// Window separators on the default grid: faded or hidden under the titlebar
-// band (separatorEdge).
+// Window separators on the default grid: faded under the titlebar band
+// (separatorEdge).
 #define DECO_SEPARATOR     (1u << 12)
 
 // Alpha factor for a DECO_SEPARATOR glyph: 0 at the layer top, 1 below the
 // band, so a separator reaching under the titlebar does not start abruptly.
 float separatorEdge(VSOut i) {
-    if (!(i.deco_flags & DECO_SEPARATOR) || i.separator_edge.x <= 0.0) return 1.0;
-    if (i.separator_edge.y > 0.5) return step(i.separator_edge.x, i.layer_y);
-    return smoothstep(0.0, i.separator_edge.x, i.layer_y);
+    if (!(i.deco_flags & DECO_SEPARATOR) || i.separator_fade <= 0.0) return 1.0;
+    return smoothstep(0.0, i.separator_fade, i.layer_y);
 }
 
 // Visual decoration flags, excluding the transport-only ones (SCROLLABLE) and
@@ -113,6 +110,9 @@ float separatorEdge(VSOut i) {
 #define ICON_DISC        (-9.0)  // filled disc spanning the quad (close badge)
 #define ICON_CROSS       (-10.0) // close badge cross
 #define ISLAND_CARD      (-11.0) // a quarter of the editor card (drawIslandCard)
+// How far the card's border moves from the bg toward white or black.
+// Shaders.metal's ISLAND_BORDER_MIX is the same value.
+#define ISLAND_BORDER_MIX 0.12
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -268,8 +268,15 @@ float4 PSMain(VSOut i) : SV_Target {
                 float radius = (float)i.deco_flags;
                 float2 q = radius - float2(i.uv.y, i.deco_phase);
                 float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
-                float alpha = i.col.a * saturate(0.5 - sdf);
-                return float4(i.col.rgb * alpha, alpha);
+                float coverage = saturate(0.5 - sdf);
+                // The card less its outermost pixel, which is the border:
+                // the bg a step toward white on a dark bg, black on a light
+                // one.
+                float inner = saturate(-0.5 - sdf);
+                float toward = dot(i.col.rgb, float3(0.299, 0.587, 0.114)) < 0.5 ? 1.0 : 0.0;
+                float3 border = lerp(i.col.rgb, float3(toward, toward, toward), ISLAND_BORDER_MIX);
+                float3 rgb = border * (coverage - inner) + i.col.rgb * inner;
+                return float4(rgb * i.col.a, i.col.a * coverage);
             }
             // Filled rounded rect spanning the quad (copy button hover wash)
             if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {

@@ -3179,7 +3179,7 @@ pub const ExternalWindow = struct {
 
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
-    // `titlebar_style = "transparent"` on a normal window: its self-drawn
+    // `titlebar_style = "hidden"` on a normal window: its self-drawn
     // caption (ui/caption_reveal.zig).
     caption: caption_reveal.ExternalCaption = .{},
     // The left press landed on the copy button; only then does its release
@@ -6483,8 +6483,6 @@ pub const App = struct {
     // 0xFFFFFFFF = not set (fall back to colorscheme_bg).
     cached_msg_area_bg: u32 = 0xFFFFFFFF,
     cached_pmenu_bg: u32 = 0xFFFFFFFF,
-    // WinSeparator fg for the titlebar hairline; 0xFFFFFFFF = not set.
-    cached_separator_fg: u32 = 0xFFFFFFFF,
 
     // ext_cmdline enabled flag (set from --extcmdline command line arg)
     ext_cmdline_enabled: bool = false,
@@ -6510,7 +6508,7 @@ pub const App = struct {
     sidebar_slide_start_ms: u64 = 0,
     sidebar_slide_now_ms: u64 = 0,
     drag_bar: caption_reveal.DragBar = .{},
-    // `titlebar_style = "transparent"` (ui/caption_reveal.zig): the pointer is
+    // `titlebar_style = "hidden"` (ui/caption_reveal.zig): the pointer is
     // in the main window's caption band, so its window buttons are drawn.
     caption_buttons_revealed: bool = false,
 

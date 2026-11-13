@@ -72,14 +72,6 @@ struct ZonvieConfig {
         var opacity: Double = 0.5  // Only used when blur=true
         var blurRadius: Int = 20   // Blur radius (0-100), only used when blur=true; 0 = translucent without blur
         var titlebarStyle: TitlebarStyle = .native
-        var titlebarEdge: TitlebarEdge = .fade
-    }
-
-    /// `[window] titlebar_edge`; raw values match `zonvie_config_values.window_titlebar_edge`.
-    enum TitlebarEdge: UInt8 {
-        case fade = 0    // separators fade in across the band
-        case border = 1  // hairline at the band bottom; separators start there
-        case none = 2
     }
 
     struct ScrollbarConfig {
@@ -305,7 +297,6 @@ struct ZonvieConfig {
         config.window.opacity = Double(v.window_opacity)
         config.window.blurRadius = Int(v.window_blur_radius)
         config.window.titlebarStyle = TitlebarStyle(rawValue: v.window_titlebar_style) ?? .native
-        config.window.titlebarEdge = TitlebarEdge(rawValue: v.window_titlebar_edge) ?? .fade
 
         // Scrollbar
         config.scrollbar.enabled = v.scrollbar_enabled

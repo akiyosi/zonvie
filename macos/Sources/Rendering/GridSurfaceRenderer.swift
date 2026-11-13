@@ -2459,10 +2459,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if separatorFadePx != oldValue { markAllRowsDirty() }
         }
     }
-    /// Cut separators off at `separatorFadePx` instead of fading them in.
-    var separatorHardEdge = false {
-        didSet { if separatorHardEdge != oldValue { markAllRowsDirty() } }
-    }
 
     var gridInsetsPx: (left: CGFloat, right: CGFloat, top: CGFloat) {
         lock.lock()
@@ -4459,7 +4455,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             fixedFloatBands: f.fixedFloatBands,
             fixedFloatIntervals: f.fixedFloatIntervals,
             separatorFadePx: separatorFadePx,
-            separatorHardEdge: separatorHardEdge,
             bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: f.scrollOffsets) }
         )
 

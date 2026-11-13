@@ -138,22 +138,11 @@ pub const Config = struct {
         /// What each value yields depends on where the tabline sits; see
         /// `TitlebarLayout`.
         titlebar_style: TitlebarStyle = .native,
-        /// How window separators meet a transparent/unified titlebar band.
-        titlebar_edge: TitlebarEdge = .fade,
-    };
-
-    pub const TitlebarEdge = enum(u8) {
-        /// Separators fade in across the band.
-        fade = 0,
-        /// A hairline at the band's bottom; separators start there.
-        border = 1,
-        /// Separators run to the grid top unchanged.
-        none = 2,
     };
 
     pub const TitlebarStyle = enum(u8) {
         native = 0,
-        transparent = 1,
+        hidden = 1,
         unified = 2,
 
         /// Chrome the frontend draws in the caption area (titlebar tabs, a
@@ -162,7 +151,7 @@ pub const Config = struct {
         pub fn paintsEditorBg(self: TitlebarStyle) bool {
             return switch (self) {
                 .native => false,
-                .transparent, .unified => true,
+                .hidden, .unified => true,
             };
         }
     };
@@ -175,13 +164,22 @@ pub const Config = struct {
     /// placement. Both frontends follow this table; macOS mirrors it as
     /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift.
     ///
-    ///                 native        transparent         unified
-    ///   titlebar      tabs          tabs, editor bg     tabs, editor bg
-    ///   sidebar       native        captionless         title band
-    ///   other         native        captionless         title band
+    ///                 native          hidden              unified
+    ///   titlebar      tabs, card      tabs, editor bg     tabs on ground, card
+    ///   sidebar       native, card    captionless         title band, card
+    ///   other         native, card    captionless         title band, card
     pub const TitlebarLayout = struct {
         style: TitlebarStyle,
         tabline: TablinePlacement,
+
+        /// The main window draws its grid in a rounded card on a ground
+        /// colour. A hidden titlebar keeps the editor edge to edge.
+        pub fn island(self: TitlebarLayout) bool {
+            return switch (self.style) {
+                .native, .unified => true,
+                .hidden => false,
+            };
+        }
 
         /// No caption band: the editor reaches the window top, the window
         /// buttons show only while the pointer is in the top band, and
@@ -189,7 +187,7 @@ pub const Config = struct {
         pub fn captionless(self: TitlebarLayout) bool {
             return switch (self.style) {
                 .native, .unified => false,
-                .transparent => self.tabline != .titlebar,
+                .hidden => self.tabline != .titlebar,
             };
         }
 
@@ -197,7 +195,7 @@ pub const Config = struct {
         /// editor starts below it and a sidebar still reaches the top.
         pub fn titleBand(self: TitlebarLayout) bool {
             return switch (self.style) {
-                .native, .transparent => false,
+                .native, .hidden => false,
                 .unified => self.tabline != .titlebar,
             };
         }
@@ -478,14 +476,12 @@ pub const Config = struct {
             if (w.titlebar_style) |v| {
                 if (std.mem.eql(u8, v, "native")) {
                     self.window.titlebar_style = .native;
-                } else if (std.mem.eql(u8, v, "transparent")) {
-                    self.window.titlebar_style = .transparent;
+                } else if (std.mem.eql(u8, v, "hidden") or std.mem.eql(u8, v, "transparent")) {
+                    // "transparent" is the value's former name.
+                    self.window.titlebar_style = .hidden;
                 } else if (std.mem.eql(u8, v, "unified")) {
                     self.window.titlebar_style = .unified;
                 }
-            }
-            if (w.titlebar_edge) |v| {
-                if (std.meta.stringToEnum(TitlebarEdge, v)) |edge| self.window.titlebar_edge = edge;
             }
         }
 
@@ -973,6 +969,8 @@ const TomlWindow = struct {
     blur: ?bool = null,
     blur_radius: ?i32 = null,
     titlebar_style: ?[]const u8 = null,
+    /// Removed option, accepted and ignored: an unknown key fails the whole
+    /// file, and a config that sets it must keep loading.
     titlebar_edge: ?[]const u8 = null,
 };
 
@@ -1111,9 +1109,7 @@ else "") ++
     ++ (if (is_windows) "" else std.fmt.comptimePrint(
     "\n        blur_radius     Blur radius (0-100, default: {d})", .{defaults.window.blur_radius})) ++
     (if (builtin.os.tag == .macos or is_windows)
-    "\n        titlebar_style  \"native\", \"transparent\" or \"unified\" (default: \"native\")" ++
-    "\n        titlebar_edge   Window separators under a transparent/unified titlebar:" ++
-    "\n                        \"fade\", \"border\" or \"none\" (default: \"fade\")" else "") ++
+    "\n        titlebar_style  \"native\", \"hidden\" or \"unified\" (default: \"native\")" else "") ++
     \\
     \\
     \\    [scrollbar]
@@ -1223,8 +1219,7 @@ pub const default_config_toml: [:0]const u8 = std.fmt.comptimePrint(
     \\# opacity = {d:.1}
     \\# blur = {}
     ++ (if (is_windows) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
-    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\", \"transparent\" or \"unified\"" ++
-        "\n# titlebar_edge = \"fade\"     # \"fade\", \"border\" or \"none\"" else "") ++
+    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\", \"hidden\" or \"unified\"" else "") ++
     \\
     \\
     \\[server]
@@ -1292,13 +1287,20 @@ test "scroll.large_jump_behavior parses both values and ignores unknown ones" {
     try std.testing.expectEqual(Config.LargeJumpBehavior.snap, unknown.scroll.large_jump_behavior);
 }
 
-test "window.titlebar_style parses both values and ignores unknown ones" {
-    var transparent = try parseForTest(std.testing.allocator,
+test "window.titlebar_style parses every value, hidden's former name, and ignores unknown ones" {
+    var hidden = try parseForTest(std.testing.allocator,
+        \\[window]
+        \\titlebar_style = "hidden"
+    );
+    defer hidden.deinit();
+    try std.testing.expectEqual(Config.TitlebarStyle.hidden, hidden.window.titlebar_style);
+
+    var former = try parseForTest(std.testing.allocator,
         \\[window]
         \\titlebar_style = "transparent"
     );
-    defer transparent.deinit();
-    try std.testing.expectEqual(Config.TitlebarStyle.transparent, transparent.window.titlebar_style);
+    defer former.deinit();
+    try std.testing.expectEqual(Config.TitlebarStyle.hidden, former.window.titlebar_style);
 
     var unified = try parseForTest(std.testing.allocator,
         \\[window]
@@ -1326,17 +1328,18 @@ test "TitlebarLayout: every style and tabline placement" {
         draws_band: bool,
         // Self-drawn caption chrome (tabs, band) takes the editor bg.
         paints_bg: bool,
+        island: bool,
     };
     const rows = [_]Row{
-        .{ .s = .native, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = false },
-        .{ .s = .native, .t = .sidebar, .captionless = false, .title_band = false, .removes = false, .below = false, .draws_band = false, .paints_bg = false },
-        .{ .s = .native, .t = .other, .captionless = false, .title_band = false, .removes = false, .below = false, .draws_band = false, .paints_bg = false },
-        .{ .s = .transparent, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = true },
-        .{ .s = .transparent, .t = .sidebar, .captionless = true, .title_band = false, .removes = true, .below = false, .draws_band = true, .paints_bg = true },
-        .{ .s = .transparent, .t = .other, .captionless = true, .title_band = false, .removes = true, .below = false, .draws_band = true, .paints_bg = true },
-        .{ .s = .unified, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = true },
-        .{ .s = .unified, .t = .sidebar, .captionless = false, .title_band = true, .removes = true, .below = true, .draws_band = true, .paints_bg = true },
-        .{ .s = .unified, .t = .other, .captionless = false, .title_band = true, .removes = true, .below = true, .draws_band = true, .paints_bg = true },
+        .{ .s = .native, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = false, .island = true },
+        .{ .s = .native, .t = .sidebar, .captionless = false, .title_band = false, .removes = false, .below = false, .draws_band = false, .paints_bg = false, .island = true },
+        .{ .s = .native, .t = .other, .captionless = false, .title_band = false, .removes = false, .below = false, .draws_band = false, .paints_bg = false, .island = true },
+        .{ .s = .hidden, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = true, .island = false },
+        .{ .s = .hidden, .t = .sidebar, .captionless = true, .title_band = false, .removes = true, .below = false, .draws_band = true, .paints_bg = true, .island = false },
+        .{ .s = .hidden, .t = .other, .captionless = true, .title_band = false, .removes = true, .below = false, .draws_band = true, .paints_bg = true, .island = false },
+        .{ .s = .unified, .t = .titlebar, .captionless = false, .title_band = false, .removes = true, .below = true, .draws_band = false, .paints_bg = true, .island = true },
+        .{ .s = .unified, .t = .sidebar, .captionless = false, .title_band = true, .removes = true, .below = true, .draws_band = true, .paints_bg = true, .island = true },
+        .{ .s = .unified, .t = .other, .captionless = false, .title_band = true, .removes = true, .below = true, .draws_band = true, .paints_bg = true, .island = true },
     };
     for (rows) |r| {
         const l: Config.TitlebarLayout = .{ .style = r.s, .tabline = r.t };
@@ -1346,34 +1349,19 @@ test "TitlebarLayout: every style and tabline placement" {
         try std.testing.expectEqual(r.paints_bg, r.s.paintsEditorBg());
         try std.testing.expectEqual(r.removes, l.removesNativeCaption());
         try std.testing.expectEqual(r.below, l.editorBelowBand());
+        try std.testing.expectEqual(r.island, l.island());
     }
 }
 
-test "window.titlebar_edge parses every value, defaults to fade, and ignores unknown ones" {
-    var unset = try parseForTest(std.testing.allocator, "");
-    defer unset.deinit();
-    try std.testing.expectEqual(Config.TitlebarEdge.fade, unset.window.titlebar_edge);
-
-    var border = try parseForTest(std.testing.allocator,
+test "a config that still sets the removed window.titlebar_edge loads" {
+    var cfg = try parseForTest(std.testing.allocator,
         \\[window]
         \\titlebar_edge = "border"
+        \\titlebar_style = "unified"
     );
-    defer border.deinit();
-    try std.testing.expectEqual(Config.TitlebarEdge.border, border.window.titlebar_edge);
-
-    var none = try parseForTest(std.testing.allocator,
-        \\[window]
-        \\titlebar_edge = "none"
-    );
-    defer none.deinit();
-    try std.testing.expectEqual(Config.TitlebarEdge.none, none.window.titlebar_edge);
-
-    var unknown = try parseForTest(std.testing.allocator,
-        \\[window]
-        \\titlebar_edge = "bogus"
-    );
-    defer unknown.deinit();
-    try std.testing.expectEqual(Config.TitlebarEdge.fade, unknown.window.titlebar_edge);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.parse_error == null);
+    try std.testing.expectEqual(Config.TitlebarStyle.unified, cfg.window.titlebar_style);
 }
 
 test "scrollbar.layout parses both values, ignores unknown ones, and needs the bar enabled" {

@@ -1162,17 +1162,17 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
     h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
-    // `titlebar_style = "transparent"` paints the bar from the colorscheme.
+    // `titlebar_style = "hidden"` paints the bar from the colorscheme.
     h.update(std.mem.asBytes(&app.drag_bar.revealed));
     // What is drawn, not the raw hover state: a pinned band does not change.
     const buttons_shown = sidebar_caption.captionButtonsShown(app);
     h.update(std.mem.asBytes(&buttons_shown));
     h.update(std.mem.asBytes(&app.sidebar_collapsed));
-    // The `titlebar_edge = "border"` hairline takes WinSeparator's colour.
-    h.update(std.mem.asBytes(&app.config.window.titlebar_edge));
-    h.update(std.mem.asBytes(&app.cached_separator_fg));
-    // The title band: its text, and the see-through sidebar part mid-slide.
-    if (sidebar_caption.titleBand(app)) {
+    // The title band: whether it is drawn (not over a card that reaches the
+    // top), its text, and the see-through sidebar part mid-slide.
+    const title_band = sidebar_caption.titleBand(app);
+    h.update(std.mem.asBytes(&title_band));
+    if (title_band) {
         h.update(std.mem.sliceAsBytes(app.pending_title[0..app.pending_title_len]));
         const covered = sidebar_caption.coveredPx(app);
         h.update(std.mem.asBytes(&covered));
@@ -1400,9 +1400,9 @@ pub const TitlebarPalette = struct {
 
 pub fn currentTitlebarPalette(app: *const App) TitlebarPalette {
     if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF) {
-        // Titlebar tabs over an editor card sit on its ground, as the
-        // renderer clears it; tab states shift from there.
-        const base = if (sidebar_caption.titlebarTabsIsland(app)) islandGroundRgb(app.colorscheme_bg) else app.colorscheme_bg;
+        // Chrome beside an editor card sits on its ground, as the renderer
+        // clears it; tab and button states shift from there.
+        const base = if (sidebar_caption.chromeOnGround(app)) islandGroundRgb(app.colorscheme_bg) else app.colorscheme_bg;
         return colorschemeTitlebarPalette(base, app.colorscheme_fg);
     }
     return osTitlebarPalette();
@@ -1451,7 +1451,7 @@ fn osTitlebarPalette() TitlebarPalette {
     };
 }
 
-/// `titlebar_style = "transparent"` or `"unified"`: the bar is the editor's default bg, so it
+/// `titlebar_style = "hidden"` or `"unified"`: the bar is the editor's default bg, so it
 /// reads as part of the editor (the post shader runs over it too); tab states
 /// are that bg shifted toward the text side.
 fn colorschemeTitlebarPalette(bg: u32, fg_or_none: u32) TitlebarPalette {
@@ -2226,7 +2226,8 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
     } else {
         sep_rect = .{ .left = width - sep_w, .top = 0, .right = width, .bottom = height };
     }
-    if (!captionless) _ = c.FillRect(hdc, &sep_rect, sep_brush);
+    // An editor card is set apart by its ground, with no line.
+    if (!captionless and sidebar_caption.island(app) == null) _ = c.FillRect(hdc, &sep_rect, sep_brush);
     // The list starts below the band that drags the window.
     _ = c.SetViewportOrgEx(hdc, 0, sidebarTopInsetPx(app), null);
     defer _ = c.SetViewportOrgEx(hdc, 0, 0, null);

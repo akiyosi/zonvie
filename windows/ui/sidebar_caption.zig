@@ -1,4 +1,4 @@
-//! Captionless main window: `[window] titlebar_style = "transparent"` with
+//! Captionless main window: `[window] titlebar_style = "hidden"` with
 //! any tabline but the titlebar one (which draws its own caption). The
 //! native caption is gone and the editor reaches the window top. The window
 //! buttons float over the top-right corner while the pointer is in the band
@@ -40,9 +40,39 @@ pub fn captionless(app: *const App) bool {
 }
 
 /// The band is drawn over the editor's side with the title, the editor
-/// starts below it, and the sidebar still reaches the window top.
+/// starts below it, and the sidebar still reaches the window top. Not while
+/// the editor card reaches the top (cardReachesTop): then only the buttons
+/// remain of the band.
 pub fn titleBand(app: *const App) bool {
-    return layout(app).titleBand();
+    return layout(app).titleBand() and !cardReachesTop(app);
+}
+
+/// An open sidebar on the window buttons' side (the right) holds them and
+/// the toggle, so the editor card beside it needs no band and rises to the
+/// client top. With the sidebar closed, on the left, or narrower than the
+/// buttons, they would lie over the card, and the band stays. Mid-slide
+/// counts as open, as the grid's width does.
+fn cardReachesTop(app: *const App) bool {
+    const l = layout(app);
+    if (!(l.island() and l.titleBand() and enabled(app))) return false;
+    return sidebarHoldsButtons(app.sidebar_position_right, fullPx(app), buttonWidthPx(app) * 4, app.sidebar_collapsed, sliding(app));
+}
+
+/// cardReachesTop's rule for a title band window with a sidebar.
+/// `buttons_px` is the toggle and the three window buttons.
+fn sidebarHoldsButtons(sidebar_right: bool, sidebar_px: c_int, buttons_px: c_int, collapsed: bool, mid_slide: bool) bool {
+    if (!sidebar_right or sidebar_px < buttons_px) return false;
+    return !collapsed or mid_slide;
+}
+
+test "sidebarHoldsButtons: an open right sidebar at least as wide as the buttons" {
+    try std.testing.expect(sidebarHoldsButtons(true, 200, 184, false, false));
+    try std.testing.expect(sidebarHoldsButtons(true, 184, 184, false, false));
+    // Closing and opening both keep the open layout until the slide ends.
+    try std.testing.expect(sidebarHoldsButtons(true, 200, 184, true, true));
+    try std.testing.expect(!sidebarHoldsButtons(true, 200, 184, true, false));
+    try std.testing.expect(!sidebarHoldsButtons(false, 200, 184, false, false));
+    try std.testing.expect(!sidebarHoldsButtons(true, 183, 184, false, false));
 }
 
 /// The main window draws this module's band overlay instead of a caption.
@@ -53,7 +83,7 @@ pub fn drawsBand(app: *const App) bool {
 /// Where the main window's editor starts: below titlebar tabs or the title
 /// band, else at the client top.
 pub fn editorTopPx(app: *const App) c_int {
-    return if (layout(app).editorBelowBand()) bandPx(app) else 0;
+    return if (layout(app).tabline == .titlebar or titleBand(app)) bandPx(app) else 0;
 }
 
 /// Whether the band's buttons follow the pointer. Off while an open right
@@ -104,22 +134,11 @@ pub fn enabled(app: *const App) bool {
     return drawsBand(app) and app.ext_tabline_enabled and app.tabline_style == .sidebar;
 }
 
-pub const SeparatorEdge = struct { fade_px: f32 = 0, hard: bool = false };
-
-/// How window separators meet the band (`[window] titlebar_edge`), in the
-/// root grid's own pixels: they fade in across the band, or, with a border,
-/// are hidden where the band lies over the grid.
-pub fn separatorEdge(app: *const App) SeparatorEdge {
-    if (!drawsBand(app)) return .{};
-    const band: f32 = @floatFromInt(bandPx(app));
-    return switch (app.config.window.titlebar_edge) {
-        .fade => .{ .fade_px = band },
-        .none => .{},
-        // A captionless window shows no band, so there is no edge to border:
-        // its separators fade under the hidden caption instead. The title
-        // band is chrome above the editor, which starts below it.
-        .border => if (captionless(app)) .{ .fade_px = band } else .{ .hard = true },
-    };
+/// Height, in the root grid's own pixels, across which window separators
+/// fade in: the band where it lies over the grid, which is a captionless
+/// one. A title band and an editor card start the grid below the band.
+pub fn separatorFadePx(app: *const App) f32 {
+    return if (captionless(app)) @floatFromInt(bandPx(app)) else 0;
 }
 
 /// Height of the band the caption used to occupy. Titlebar tabs grow it a
@@ -165,27 +184,25 @@ const ISLAND_MARGIN_PT: c_int = 6;
 const ISLAND_PADDING_PT: c_int = 6;
 pub const ISLAND_RADIUS_PT: c_int = 10;
 
-/// Ground between the titlebar tabs, which reach the bar's bottom, and the card.
-const ISLAND_TAB_GAP_PT: c_int = 4;
-
-/// The rounded editor card the grid is drawn in, under a captionless sidebar
-/// or titlebar tabs in the editor's colours: its edges' distances from the
-/// client edges, in px.
+/// The rounded editor card the main window's grid is drawn in
+/// (Config.TitlebarLayout.island): its edges' distances from the client
+/// edges, in px. Null when the layout has none.
 pub fn island(app: *const App) ?Insets {
+    const l = layout(app);
+    if (!l.island()) return null;
     const m = app.scalePx(ISLAND_MARGIN_PT);
-    if (titlebarTabsIsland(app)) {
-        return .{ .left = m, .right = m, .top = editorTopPx(app) + app.scalePx(ISLAND_TAB_GAP_PT), .bottom = m };
-    }
-    if (!(captionless(app) and enabled(app))) return null;
     const side = sidebarInsetsPx(app);
-    // The band above already holds the card off the top.
-    return .{ .left = side.left + m, .right = side.right + m, .top = @max(editorTopPx(app), m), .bottom = m };
+    // Titlebar tabs reach their bar's bottom, so the card keeps a margin
+    // from it; a title band already holds the card off the top.
+    const top = if (l.tabline == .titlebar) editorTopPx(app) + m else @max(editorTopPx(app), m);
+    return .{ .left = side.left + m, .right = side.right + m, .top = top, .bottom = m };
 }
 
-/// Titlebar tabs on the editor's colours: the bar sits on the card's ground.
-pub fn titlebarTabsIsland(app: *const App) bool {
+/// The frontend-drawn chrome (titlebar tabs, a title band) sits on the
+/// card's ground instead of the editor bg.
+pub fn chromeOnGround(app: *const App) bool {
     const l = layout(app);
-    return l.tabline == .titlebar and l.style.paintsEditorBg();
+    return l.island() and l.style.paintsEditorBg();
 }
 
 /// Pixels the grid leaves at each side: the sidebar's, the title band or
@@ -278,25 +295,9 @@ pub fn drawOverlayContent(app: *App, hdc: c.HDC, width: c_int) void {
         _ = c.FillRect(hdc, &bar, bar_brush);
     }
 
-    if (separatorEdge(app).hard) drawHairline(app, hdc, width, pal);
     if (titleBand(app)) drawTitle(app, hdc, width);
     if (with_toggle and captionButtonsShown(app)) drawToggle(app, hdc, width, pal);
     tabline_mod.drawWindowButtons(app, hdc, width, pal);
-}
-
-/// `titlebar_edge = "border"`: a one-pixel line in WinSeparator's colour
-/// along the band's bottom, over the editor's columns.
-fn drawHairline(app: *App, hdc: c.HDC, width: c_int, pal: tabline_mod.TitlebarPalette) void {
-    const inset = gridInsetsPx(app);
-    const fg = app.cached_separator_fg;
-    var color: c.COLORREF = if (fg == 0xFFFFFFFF) pal.wbtn_icon else c.RGB(@as(u8, @intCast((fg >> 16) & 0xFF)), @as(u8, @intCast((fg >> 8) & 0xFF)), @as(u8, @intCast(fg & 0xFF)));
-    // The bar colour is the overlay's transparency key; the line must not vanish into it.
-    if (color == pal.bar_bg) color ^= 1;
-    const brush = c.CreateSolidBrush(color);
-    defer _ = c.DeleteObject(brush);
-    const band = bandPx(app);
-    var r = c.RECT{ .left = inset.left, .top = band - 1, .right = width - inset.right, .bottom = band };
-    _ = c.FillRect(hdc, &r, brush);
 }
 
 /// The title band's window title, centered over the editor's side in the

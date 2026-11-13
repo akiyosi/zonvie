@@ -382,11 +382,9 @@ pub const Renderer = struct {
     layer_cb: ?*c.ID3D11Buffer = null,
     /// Last value written to layer_cb, so redundant updates are skipped.
     layer_cb_value: [12]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    /// `[window] titlebar_edge`, folded into every layer transform: window
-    /// separators within this many px of the layer top fade in, or with
-    /// `separator_hard_edge` are hidden. Set by the paint, UI thread.
+    /// Folded into every layer transform: window separators within this
+    /// many px of the layer top fade in. Set by the paint, UI thread.
     separator_fade_px: f32 = 0,
-    separator_hard_edge: bool = false,
     /// The next present waits for vblank. A smooth-scroll frame asks for it,
     /// so the paint loop that drives the ease runs at the display rate
     /// instead of spinning; every other present stays unthrottled.
@@ -4418,7 +4416,6 @@ pub const Renderer = struct {
         scroll_offset_px: f32,
     ) error{LayerTransformMapFailed}!void {
         self.assertContextLocked();
-        const hard_edge: f32 = if (self.separator_hard_edge) 1 else 0;
         const value: [12]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
             .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
         else .{
@@ -4431,7 +4428,7 @@ pub const Renderer = struct {
             scroll_offset_px,
             0,
             self.separator_fade_px,
-            hard_edge,
+            0,
             0,
             0,
         };

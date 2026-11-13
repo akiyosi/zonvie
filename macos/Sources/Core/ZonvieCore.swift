@@ -7634,12 +7634,6 @@ final class ZonvieCore {
         return Self.rgbColor(foreground ? fg : bg)
     }
 
-    /// WinSeparator's foreground: the titlebar hairline meets the window
-    /// separators in their own colour.
-    func separatorColor() -> NSColor {
-        hlColor("WinSeparator", foreground: true, fallback: .separatorColor)
-    }
-
     /// Get the Search highlight color (background) for cmdline border.
     private func getSearchHighlightColor() -> NSColor {
         hlColor("Search", foreground: false, fallback: .yellow)
