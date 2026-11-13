@@ -75,7 +75,7 @@ import AppKit
 /// mode: the editor runs under it, the traffic lights sit at the same spot,
 /// and the tabs or the sidebar toggle start after them.
 enum TitlebarBand {
-    static let heightPt: CGFloat = 44
+    static let heightPt: CGFloat = 40
     static let lightsLeftPt: CGFloat = 20
     static let controlsWidthPt: CGFloat = 90
     /// Tabs start further out than the sidebar toggle does.
@@ -101,7 +101,7 @@ extension NSWindow {
 /// What each value yields depends on the tabline: see `TitlebarLayout`.
 enum TitlebarStyle: UInt8 {
     case native = 0
-    case transparent = 1
+    case hidden = 1
     case unified = 2
 }
 
@@ -110,10 +110,10 @@ enum TitlebarStyle: UInt8 {
 /// the table; every main- and external-window titlebar decision derives
 /// from here.
 ///
-///                 native        transparent         unified
-///   titlebar      tabs          tabs, editor bg     tabs, editor bg
-///   sidebar       native        captionless         title band
-///   other         native        captionless         title band
+///                 native          hidden              unified
+///   titlebar      tabs, card      tabs, editor bg     tabs on ground, card
+///   sidebar       native, card    captionless         title band, card
+///   other         native, card    captionless         title band, card
 struct TitlebarLayout: Equatable {
     /// `other` is a menu, no ext_tabline, or an external window.
     enum Tabline { case titlebar, sidebar, other }
@@ -127,7 +127,7 @@ struct TitlebarLayout: Equatable {
     var captionless: Bool {
         switch style {
         case .native, .unified: return false
-        case .transparent: return tabline != .titlebar
+        case .hidden: return tabline != .titlebar
         }
     }
 
@@ -135,8 +135,17 @@ struct TitlebarLayout: Equatable {
     /// starts below it and a sidebar still reaches the top.
     var titleBand: Bool {
         switch style {
-        case .native, .transparent: return false
+        case .native, .hidden: return false
         case .unified: return tabline != .titlebar
+        }
+    }
+
+    /// The main window draws its grid in a rounded card on a ground colour.
+    /// A hidden titlebar keeps the editor edge to edge.
+    var island: Bool {
+        switch style {
+        case .native, .unified: return true
+        case .hidden: return false
         }
     }
 
@@ -152,7 +161,7 @@ struct TitlebarLayout: Equatable {
     var editorRunsUnderBand: Bool {
         switch style {
         case .native: return false
-        case .transparent: return true
+        case .hidden: return true
         case .unified: return tabline == .titlebar
         }
     }
@@ -299,10 +308,15 @@ final class TabBarView: NSView {
     private let externalDragThreshold: CGFloat = 50  // pixels outside window to trigger external drag
 
     // Tab appearance constants
-    private let tabHeight: CGFloat = 30
-    /// The tab shape at one line. Extra label lines extend it downward, so
-    /// the first line stays where a single-line label sits.
-    private var tabRectBaseHeight: CGFloat { tabHeight - 6 }
+    private let tabMaxHeightPt: CGFloat = 26
+    /// The least bar above and below a one-line tab.
+    private let tabMinMarginPt: CGFloat = 6
+    /// The tab shape at one line, centred in the bar's one-line band so the
+    /// bar above and below it is equal. Extra label lines extend it
+    /// downward, so the first line stays where a single-line label sits.
+    private var tabRectBaseHeight: CGFloat {
+        min(tabMaxHeightPt, bounds.height - extraLinesHeight - tabMinMarginPt * 2)
+    }
     private var extraLinesHeight: CGFloat {
         TabCardLayout.titlebarBarHeight_pt(base_pt: 0, lineCount: labelLineCount)
     }
@@ -638,7 +652,7 @@ final class TabBarView: NSView {
     /// the extra label lines so it spans the tabs' height. Drawing and hit
     /// testing both use this rect.
     private var newTabButtonRect: NSRect {
-        NSRect(x: tabX(tabs.count) + 8, y: tabTop + 2, width: 20, height: 20 + extraLinesHeight)
+        NSRect(x: tabX(tabs.count) + 8, y: tabTop + (tabRectBaseHeight - 20) / 2, width: 20, height: 20 + extraLinesHeight)
     }
 
     private func drawNewTabButton() {

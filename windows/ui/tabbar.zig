@@ -1161,18 +1161,19 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&width));
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
+    if (app.renderer) |*r| h.update(std.mem.asBytes(&r.opacity));
     h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
-    // `titlebar_style = "transparent"` paints the bar from the colorscheme.
+    // `titlebar_style = "hidden"` paints the bar from the colorscheme.
     h.update(std.mem.asBytes(&app.drag_bar.revealed));
     // What is drawn, not the raw hover state: a pinned band does not change.
     const buttons_shown = sidebar_caption.captionButtonsShown(app);
     h.update(std.mem.asBytes(&buttons_shown));
     h.update(std.mem.asBytes(&app.sidebar_collapsed));
-    // The `titlebar_edge = "border"` hairline takes WinSeparator's colour.
-    h.update(std.mem.asBytes(&app.config.window.titlebar_edge));
-    h.update(std.mem.asBytes(&app.cached_separator_fg));
-    // The title band: its text, and the see-through sidebar part mid-slide.
-    if (sidebar_caption.titleBand(app)) {
+    // The title band: whether it is drawn (not over a card that reaches the
+    // top), its text, and the see-through sidebar part mid-slide.
+    const title_band = sidebar_caption.titleBand(app);
+    h.update(std.mem.asBytes(&title_band));
+    if (title_band) {
         h.update(std.mem.sliceAsBytes(app.pending_title[0..app.pending_title_len]));
         const covered = sidebar_caption.coveredPx(app);
         h.update(std.mem.asBytes(&covered));
@@ -1294,8 +1295,24 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
         }
     }
 
-    const pixel_data = pixels[0 .. width * height * 4];
+    // On a translucent surface the clear paints the editor card's ground,
+    // and the card its bg, at the window opacity, written rather than
+    // blended. Chrome beside the card is written the same way, every pixel
+    // at that opacity (the strip shader premultiplies), so its ground is the
+    // clear's and a selected tab running into the card is the card's own
+    // colour. Keyed pixels stay (0,0,0,0): the sidebar, drawn after, covers
+    // them.
     const g = &(app.renderer.?);
+    g.strips_replace = g.opacity < 1.0 and sidebar_caption.island(app) != null;
+    if (g.strips_replace) {
+        const a: u8 = @intFromFloat(@round(g.opacity * 255.0));
+        i = 0;
+        while (i < pixel_count) : (i += 1) {
+            if (pixels[i * 4 + 3] != 0) pixels[i * 4 + 3] = a;
+        }
+    }
+
+    const pixel_data = pixels[0 .. width * height * 4];
     g.updateStripTexture(surface, width, height, pixel_data) catch |e| {
         if (applog.isEnabled()) applog.appLog("[{s}] updateStripTexture failed: {any}\n", .{ @tagName(surface), e });
         return false;
@@ -1348,6 +1365,7 @@ fn sidebarRenderSignature(app: *App, width: u32, height: u32) u64 {
     h.update(std.mem.asBytes(&width));
     h.update(std.mem.asBytes(&height));
     h.update(std.mem.asBytes(&app.dpi_scale));
+    if (app.renderer) |*r| h.update(std.mem.asBytes(&r.opacity));
     h.update(std.mem.asBytes(&app.colorscheme_bg));
     h.update(std.mem.asBytes(&app.colorscheme_fg));
     h.update(std.mem.asBytes(&app.sidebar_position_right));
@@ -1399,8 +1417,12 @@ pub const TitlebarPalette = struct {
 };
 
 pub fn currentTitlebarPalette(app: *const App) TitlebarPalette {
-    if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
-        return colorschemeTitlebarPalette(app.colorscheme_bg, app.colorscheme_fg);
+    if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF) {
+        // Chrome beside an editor card sits on its ground, as the renderer
+        // clears it; tab and button states shift from there.
+        const base = if (sidebar_caption.chromeOnGround(app)) islandGroundRgb(app.colorscheme_bg) else app.colorscheme_bg;
+        return colorschemeTitlebarPalette(base, app.colorscheme_fg);
+    }
     return osTitlebarPalette();
 }
 
@@ -1447,7 +1469,7 @@ fn osTitlebarPalette() TitlebarPalette {
     };
 }
 
-/// `titlebar_style = "transparent"` or `"unified"`: the bar is the editor's default bg, so it
+/// `titlebar_style = "hidden"` or `"unified"`: the bar is the editor's default bg, so it
 /// reads as part of the editor (the post shader runs over it too); tab states
 /// are that bg shifted toward the text side.
 fn colorschemeTitlebarPalette(bg: u32, fg_or_none: u32) TitlebarPalette {
@@ -1586,6 +1608,115 @@ pub fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytyp
     }
 }
 
+/// Corner radius of a titlebar tab, as macOS TabBarView.tabCornerRadius.
+const TAB_CORNER_RADIUS_PT: c_int = 8;
+
+const TabShape = enum {
+    /// Every corner rounded.
+    rounded,
+    /// Top corners rounded; the bottom runs into the editor card below,
+    /// flaring out into it with concave corners beside `rect`.
+    merged,
+};
+
+/// Fill `rect` with `color` in `shape`, corners of `radius` px antialiased.
+/// GDI's RoundRect does not antialias, so on a DIB section (the offscreen
+/// strip) the corners are blended into its pixels directly; any other DC
+/// gets RoundRect, or a plain rect for `merged`.
+fn fillTabShape(hdc: c.HDC, rect: c.RECT, radius: c_int, color: c.COLORREF, shape: TabShape) void {
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    if (w <= 0 or h <= 0) return;
+    const r = @max(0, @min(radius, @divTrunc(@min(w, h), 2)));
+    const brush = c.CreateSolidBrush(color);
+    defer _ = c.DeleteObject(brush);
+
+    var ds: c.DIBSECTION = undefined;
+    const bmp = c.GetCurrentObject(hdc, c.OBJ_BITMAP);
+    const is_dib = bmp != null and c.GetObjectW(bmp, @sizeOf(c.DIBSECTION), &ds) == @sizeOf(c.DIBSECTION) and
+        ds.dsBm.bmBits != null and ds.dsBm.bmBitsPixel == 32;
+    if (!is_dib or r == 0) {
+        if (r == 0 or shape == .merged) {
+            var fill = rect;
+            _ = c.FillRect(hdc, &fill, brush);
+            return;
+        }
+        const old_brush = c.SelectObject(hdc, brush);
+        const old_pen = c.SelectObject(hdc, c.GetStockObject(c.NULL_PEN));
+        // RoundRect's corner argument is the ellipse's diameter.
+        _ = c.RoundRect(hdc, rect.left, rect.top, rect.right + 1, rect.bottom + 1, r * 2, r * 2);
+        _ = c.SelectObject(hdc, old_pen);
+        _ = c.SelectObject(hdc, old_brush);
+        return;
+    }
+
+    // The body: a cross of two rects leaves the r x r corner squares; a
+    // merged shape fills its bottom corners square.
+    const bottom_inset = if (shape == .merged) 0 else r;
+    var mid = c.RECT{ .left = rect.left + r, .top = rect.top, .right = rect.right - r, .bottom = rect.bottom };
+    _ = c.FillRect(hdc, &mid, brush);
+    var sides = c.RECT{ .left = rect.left, .top = rect.top + r, .right = rect.right, .bottom = rect.bottom - bottom_inset };
+    _ = c.FillRect(hdc, &sides, brush);
+
+    // Pending GDI writes must land before the bits are touched.
+    _ = c.GdiFlush();
+    // The DC's viewport origin moves what GDI draws; the bits do not.
+    var org: c.POINT = .{ .x = 0, .y = 0 };
+    _ = c.GetViewportOrgEx(hdc, &org);
+    const bw: c_int = ds.dsBm.bmWidth;
+    const bh: c_int = ds.dsBm.bmHeight;
+    // Row 0 of the bits is the top: the strip's DIB is created top-down
+    // (renderOffscreenToD3D), and GetObject cannot be asked, since it reports
+    // dsBmih.biHeight without the sign that says so.
+    const stride: usize = @intCast(ds.dsBm.bmWidthBytes);
+    const bits: [*]u8 = @ptrCast(ds.dsBm.bmBits);
+    const col = [3]f32{
+        @floatFromInt(c.GetBValue(color)),
+        @floatFromInt(c.GetGValue(color)),
+        @floatFromInt(c.GetRValue(color)),
+    };
+    const rf: f32 = @floatFromInt(r);
+
+    // An r x r square at (x, y) and the circle centre its arc is cut from.
+    // Convex corners keep the inside of the circle; a concave flare keeps
+    // the outside.
+    const Corner = struct { x: c_int, y: c_int, cx: c_int, cy: c_int, concave: bool };
+    var corners: [4]Corner = undefined;
+    corners[0] = .{ .x = rect.left, .y = rect.top, .cx = rect.left + r, .cy = rect.top + r, .concave = false };
+    corners[1] = .{ .x = rect.right - r, .y = rect.top, .cx = rect.right - r, .cy = rect.top + r, .concave = false };
+    if (shape == .merged) {
+        corners[2] = .{ .x = rect.left - r, .y = rect.bottom - r, .cx = rect.left - r, .cy = rect.bottom - r, .concave = true };
+        corners[3] = .{ .x = rect.right, .y = rect.bottom - r, .cx = rect.right + r, .cy = rect.bottom - r, .concave = true };
+    } else {
+        corners[2] = .{ .x = rect.left, .y = rect.bottom - r, .cx = rect.left + r, .cy = rect.bottom - r, .concave = false };
+        corners[3] = .{ .x = rect.right - r, .y = rect.bottom - r, .cx = rect.right - r, .cy = rect.bottom - r, .concave = false };
+    }
+    for (corners) |k| {
+        const cx: f32 = @floatFromInt(k.cx);
+        const cy: f32 = @floatFromInt(k.cy);
+        var y = k.y;
+        while (y < k.y + r) : (y += 1) {
+            const dy = y + org.y;
+            if (dy < 0 or dy >= bh) continue;
+            const row: usize = @intCast(dy);
+            var x = k.x;
+            while (x < k.x + r) : (x += 1) {
+                const dx = x + org.x;
+                if (dx < 0 or dx >= bw) continue;
+                const fx = @as(f32, @floatFromInt(x)) + 0.5 - cx;
+                const fy = @as(f32, @floatFromInt(y)) + 0.5 - cy;
+                const inside = std.math.clamp(rf - @sqrt(fx * fx + fy * fy) + 0.5, 0.0, 1.0);
+                const cov = if (k.concave) 1 - inside else inside;
+                if (cov <= 0) continue;
+                const p = bits[row * stride + @as(usize, @intCast(dx)) * 4 ..][0..3];
+                for (0..3) |ch| {
+                    p[ch] = @intFromFloat(@round(@as(f32, @floatFromInt(p[ch])) * (1 - cov) + col[ch] * cov));
+                }
+            }
+        }
+    }
+}
+
 /// Tabs extend down the whole bar; their first label line, agent indicator,
 /// close button and the + button stay in the one-line band at the top, where
 /// a single-line bar has them.
@@ -1629,17 +1760,16 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     const tab_width = tabWidthPx(app, client_width, tab_count);
 
-    // Brushes
-    const selected_brush = c.CreateSolidBrush(pal.tab_selected);
-    const hover_brush = c.CreateSolidBrush(pal.tab_hover);
-    const normal_brush = c.CreateSolidBrush(pal.tab_normal);
-    const dragging_brush = c.CreateSolidBrush(pal.tab_dragging);
-    defer {
-        _ = c.DeleteObject(selected_brush);
-        _ = c.DeleteObject(hover_brush);
-        _ = c.DeleteObject(normal_brush);
-        _ = c.DeleteObject(dragging_brush);
-    }
+    const tab_radius = app.scalePx(TAB_CORNER_RADIUS_PT);
+    // A tab's background stands clear of the bar on every side, so its
+    // rounded corners do not meet a neighbour or the bar's edges.
+    const tab_inset_y = app.scalePx(5);
+    const tab_inset_x = app.scalePx(3);
+    // The editor card's bg when the tabs sit on its top edge.
+    const card_bg: ?c.COLORREF = if (sidebar_caption.island(app) == null) null else blk: {
+        const bg = if (app.colorscheme_bg == 0xFFFFFFFF) 0x252629 else app.colorscheme_bg;
+        break :blk c.RGB(@as(u8, @intCast((bg >> 16) & 0xFF)), @as(u8, @intCast((bg >> 8) & 0xFF)), @as(u8, @intCast(bg & 0xFF)));
+    };
 
     // Font
     const font = createTabFont(app, -12);
@@ -1666,26 +1796,32 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         const is_hovered = app.tabline_state.hovered_tab == i;
         const is_being_dragged = is_actually_dragging and app.tabline_state.dragging_tab == i;
 
-        var tab_rect = c.RECT{
-            .left = x + 1,
-            .top = top_padding,
-            .right = x + tab_width - 1,
-            .bottom = bar_height,
+        const tab_rect = c.RECT{
+            .left = x + tab_inset_x,
+            .top = tab_inset_y,
+            .right = x + tab_width - tab_inset_x,
+            .bottom = bar_height - tab_inset_y,
         };
 
         // If this tab is being dragged (moved beyond threshold), draw a placeholder (dimmed)
         if (is_being_dragged) {
             // Draw dimmed placeholder
-            const placeholder_brush = c.CreateSolidBrush(pal.tab_placeholder);
-            _ = c.FillRect(hdc, &tab_rect, placeholder_brush);
-            _ = c.DeleteObject(placeholder_brush);
+            fillTabShape(hdc, tab_rect, tab_radius, pal.tab_placeholder, .rounded);
             x += tab_width + 1;
             continue;
         }
 
-        // Background
-        const brush = if (is_selected) selected_brush else if (is_hovered) hover_brush else normal_brush;
-        _ = c.FillRect(hdc, &tab_rect, brush);
+        // Background. Over an editor card the selected tab is the card's
+        // own bg, run down into its top edge, and an idle tab is bare
+        // ground: a fill there would cut into a neighbour's flare.
+        if (is_selected and card_bg != null) {
+            var merged_rect = tab_rect;
+            merged_rect.bottom = bar_height;
+            fillTabShape(hdc, merged_rect, tab_radius, card_bg.?, .merged);
+        } else if (is_selected or is_hovered or card_bg == null) {
+            const tab_bg = if (is_selected) pal.tab_selected else if (is_hovered) pal.tab_hover else pal.tab_normal;
+            fillTabShape(hdc, tab_rect, tab_radius, tab_bg, .rounded);
+        }
 
         // Tab name
         const text_color = if (is_selected) pal.text_selected else pal.text_normal;
@@ -1847,25 +1983,23 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
             // Calculate floating tab position - centered on cursor
             const float_x = app.tabline_state.drag_current_x - app.tabline_state.drag_offset_x;
-            var float_rect = c.RECT{
-                .left = float_x + 1,
-                .top = top_padding,
-                .right = float_x + tab_width - 1,
-                .bottom = bar_height,
+            const float_rect = c.RECT{
+                .left = float_x + tab_inset_x,
+                .top = tab_inset_y,
+                .right = float_x + tab_width - tab_inset_x,
+                .bottom = bar_height - tab_inset_y,
             };
 
             // Draw floating tab tinted with the accent color (no transparency
             // in GDI; use the dragging-tab palette entry for a consistent feel).
-            const float_brush = c.CreateSolidBrush(pal.tab_dragging);
-            _ = c.FillRect(hdc, &float_rect, float_brush);
-            _ = c.DeleteObject(float_brush);
+            fillTabShape(hdc, float_rect, tab_radius, pal.tab_dragging, .rounded);
 
             // Draw border for floating tab
             const border_pen = c.CreatePen(c.PS_SOLID, 1, pal.accent);
             const old_border_pen = c.SelectObject(hdc, border_pen);
             const float_null_brush = c.GetStockObject(c.NULL_BRUSH);
             const old_float_brush = c.SelectObject(hdc, float_null_brush);
-            _ = c.Rectangle(hdc, float_rect.left, float_rect.top, float_rect.right, float_rect.bottom);
+            _ = c.RoundRect(hdc, float_rect.left, float_rect.top, float_rect.right, float_rect.bottom, tab_radius * 2, tab_radius * 2);
             _ = c.SelectObject(hdc, old_float_brush);
             _ = c.SelectObject(hdc, old_border_pen);
             _ = c.DeleteObject(border_pen);
@@ -2038,7 +2172,13 @@ const SidebarColors = struct {
         var sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
         var sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
         var sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
-        if (sidebar_caption.captionless(app)) {
+        if (sidebar_caption.island(app) != null) {
+            // The editor card's ground, exactly as the renderer clears it.
+            const ground = islandGroundRgb(app.colorscheme_bg);
+            sb_bgR = @as(f32, @floatFromInt((ground >> 16) & 0xFF)) / 255.0;
+            sb_bgG = @as(f32, @floatFromInt((ground >> 8) & 0xFF)) / 255.0;
+            sb_bgB = @as(f32, @floatFromInt(ground & 0xFF)) / 255.0;
+        } else if (sidebar_caption.captionless(app)) {
             const tint = lightnessShifted(bgR, bgG, bgB, !is_dark);
             const overlay_alpha: f32 = 0.55;
             sb_bgR = bgR + (tint[0] - bgR) * overlay_alpha;
@@ -2116,6 +2256,16 @@ const SidebarColors = struct {
     /// `rgb` (sRGB 0-1) with its OKLab L moved by the sidebar delta, hue and
     /// chroma kept. Same constants as macOS TabSidebarView.lightnessShifted.
     fn lightnessShifted(r: f32, g: f32, b: f32, darker: bool) [3]f32 {
+        return oklabLightnessShifted(r, g, b, if (darker) .sidebar_darker else .sidebar_lighter);
+    }
+
+    const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
+
+    /// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The
+    /// island ground goes darker by the sidebar step for the bg's side of
+    /// mid-grey, or lighter when darker would clip to black: macOS
+    /// TabSidebarView.islandGroundRGB.
+    fn oklabLightnessShifted(r: f32, g: f32, b: f32, shift: LightnessShift) [3]f32 {
         const lr = srgbToLinear(r);
         const lg = srgbToLinear(g);
         const lb = srgbToLinear(b);
@@ -2125,7 +2275,14 @@ const SidebarColors = struct {
         var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
         const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
         const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
-        L = std.math.clamp(L + (if (darker) @as(f32, -0.07) else 0.04), 0.0, 1.0);
+        const delta: f32 = switch (shift) {
+            .sidebar_darker => -0.07,
+            .sidebar_lighter => 0.04,
+            .island_ground => blk: {
+                break :blk if (L >= 0.2) -0.06 else 0.06;
+            },
+        };
+        L = std.math.clamp(L + delta, 0.0, 1.0);
         const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
         const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
         const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
@@ -2150,6 +2307,21 @@ const SidebarColors = struct {
         return @intFromFloat(clamped * 255.0);
     }
 };
+
+/// The ground an editor card and the sidebar share, as 0xRRGGBB, from the
+/// colorscheme bg (0xFFFFFFFF before one is known: SidebarColors' default).
+pub fn islandGroundRgb(colorscheme_bg: u32) u32 {
+    const bg = if (colorscheme_bg == 0xFFFFFFFF) 0x252629 else colorscheme_bg;
+    const shifted = SidebarColors.oklabLightnessShifted(
+        @as(f32, @floatFromInt((bg >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((bg >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(bg & 0xFF)) / 255.0,
+        .island_ground,
+    );
+    return (@as(u32, SidebarColors.f2u8(shifted[0])) << 16) |
+        (@as(u32, SidebarColors.f2u8(shifted[1])) << 8) |
+        SidebarColors.f2u8(shifted[2]);
+}
 
 /// Draw sidebar content (vertical tab list) using GDI.
 /// Colors are derived from the Neovim colorscheme (mirroring macOS TabSidebarView).
@@ -2183,7 +2355,8 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
     } else {
         sep_rect = .{ .left = width - sep_w, .top = 0, .right = width, .bottom = height };
     }
-    if (!captionless) _ = c.FillRect(hdc, &sep_rect, sep_brush);
+    // An editor card is set apart by its ground, with no line.
+    if (!captionless and sidebar_caption.island(app) == null) _ = c.FillRect(hdc, &sep_rect, sep_brush);
     // The list starts below the band that drags the window.
     _ = c.SetViewportOrgEx(hdc, 0, sidebarTopInsetPx(app), null);
     defer _ = c.SetViewportOrgEx(hdc, 0, 0, null);

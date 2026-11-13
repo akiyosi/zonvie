@@ -489,6 +489,12 @@ pub fn clientPxToCell(
 /// (include/zonvie_core.h), and must not then pay the offset a second time on
 /// the way to the core.
 pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOrigin {
+    // Inside an editor card the grid starts past its margin and padding,
+    // whichever side the sidebar is on.
+    if (is_main_window and sidebar_caption.island(app) != null) {
+        const insets = sidebar_caption.gridInsetsPx(app);
+        return .{ .x = insets.left, .y = insets.top };
+    }
     return render_helpers.surfaceOriginPx(.{
         .is_main_window = is_main_window,
         .ext_tabline_enabled = app.ext_tabline_enabled,
@@ -508,10 +514,13 @@ pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
     if (!app.ext_tabline_enabled) return false;
     const origin = surfaceOriginPx(app, true);
     if (px < origin.x or py < origin.y) return true;
-    if (app.tabline_style == .sidebar and app.sidebar_position_right) {
+    const card = sidebar_caption.island(app) != null;
+    if (card or (app.tabline_style == .sidebar and app.sidebar_position_right)) {
         var client: c.RECT = undefined;
         if (c.GetClientRect(hwnd, &client) == 0) return false;
-        return px >= client.right - sidebar_caption.gridInsetsPx(app).right;
+        const insets = sidebar_caption.gridInsetsPx(app);
+        if (card and py >= client.bottom - insets.bottom) return true;
+        return px >= client.right - insets.right;
     }
     return false;
 }

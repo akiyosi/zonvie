@@ -253,9 +253,34 @@ final class MetalTerminalView: GridInputView {
     }
 
     private func applyGridInsets() {
-        renderer.setGridInsets(leftPx: (gridInsetsPt.left * backingScale).rounded(),
-                               rightPx: (gridInsetsPt.right * backingScale).rounded(),
-                               topPx: (gridInsetsPt.top * backingScale).rounded())
+        let leftPx = (gridInsetsPt.left * backingScale).rounded()
+        let rightPx = (gridInsetsPt.right * backingScale).rounded()
+        let topPx = (gridInsetsPt.top * backingScale).rounded()
+        let bottomPx = (gridInsetsPt.bottom * backingScale).rounded()
+        renderer.setGridInsets(leftPx: leftPx, rightPx: rightPx, topPx: topPx, bottomPx: bottomPx)
+        // The grid's place in the view, in the field form the GUI driver parses.
+        ZonvieCore.appLog("[grid_insets] left=\(leftPx) top=\(topPx) right=\(rightPx) bottom=\(bottomPx)")
+        let island = islandInsetsPt.map { i in
+            GridSurfaceRenderer.Island(
+                leftPx: (i.left * backingScale).rounded(), rightPx: (i.right * backingScale).rounded(),
+                topPx: (i.top * backingScale).rounded(), bottomPx: (i.bottom * backingScale).rounded(),
+                radiusPx: (Self.islandCornerRadiusPt * backingScale).rounded())
+        }
+        renderer.setIsland(island)
+    }
+
+    static let islandCornerRadiusPt: CGFloat = 10
+
+    /// Insets of the rounded editor card from the drawable edges; nil draws
+    /// no card. The grid sits inside it (gridInsetsPt), and the drawable
+    /// outside it shows the ground colour the sidebar shares.
+    var islandInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat)? {
+        didSet {
+            guard islandInsetsPt.map({ [$0.left, $0.right, $0.top, $0.bottom] })
+                    != oldValue.map({ [$0.left, $0.right, $0.top, $0.bottom] }) else { return }
+            applyGridInsets()
+            requestRedraw()
+        }
     }
 
     var renderer: GridSurfaceRenderer!
@@ -671,7 +696,7 @@ final class MetalTerminalView: GridInputView {
             // reference. A size seen during a live resize is the user's drag
             // even when it equals the last snap. Main-thread only, same as the snap.
             let curTermPt = CGSize(width: bounds.width - gridInsetsPt.left - gridInsetsPt.right,
-                                   height: bounds.height - gridInsetsPt.top)
+                                   height: bounds.height - gridInsetsPt.top - gridInsetsPt.bottom)
             if !inLiveResize, let snapped = core.lastSnappedTermPx,
                abs(curTermPt.width - snapped.width) < 0.5,
                abs(curTermPt.height - snapped.height) < 0.5 {
@@ -1512,10 +1537,11 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// from the same point, so they name the same cell.
     var contentOriginPt: CGPoint { CGPoint(x: gridInsetsPt.left, y: gridInsetsPt.top) }
 
-    /// Points of the drawable left of, right of and above the grid, covered
-    /// by a translucent sidebar or titlebar tabs. The drawable (and the custom shader) spans the
-    /// whole view; Neovim's grid gets the rest.
-    var gridInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat) = (0, 0, 0) {
+    /// Points of the drawable left of, right of, above and below the grid,
+    /// covered by a translucent sidebar, titlebar tabs or the island margin.
+    /// The drawable (and the custom shader) spans the whole view; Neovim's
+    /// grid gets the rest.
+    var gridInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat) = (0, 0, 0, 0) {
         didSet {
             guard gridInsetsPt != oldValue else { return }
             gridInsetsDidChange()
@@ -1526,6 +1552,13 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// the visible sidebar, not the grid, which keeps a fixed width mid-slide.
     var scrollbarInsetRightPt: CGFloat = 0 {
         didSet { if scrollbarInsetRightPt != oldValue { layoutScrollbarFrame() } }
+    }
+
+    /// Points an editor card keeps the scrollbar in from the view's edges,
+    /// on top of `scrollbarInsetRightPt`: the scroller runs along the card's
+    /// right edge, inside it. Zero without a card.
+    var scrollbarCardInsetsPt: (right: CGFloat, top: CGFloat, bottom: CGFloat) = (0, 0, 0) {
+        didSet { if scrollbarCardInsetsPt != oldValue { layoutScrollbarFrame() } }
     }
 
     /// The main surface relays the insets to its renderer and Neovim.
@@ -1984,14 +2017,21 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
         scrollbarController.update()
     }
 
-    /// Pin the scroller to the right edge, full height.
+    /// The scrollbar strip's right edge, in view points from the left.
+    private var scrollbarStripRightPt: CGFloat {
+        bounds.width - scrollbarInsetRightPt - scrollbarCardInsetsPt.right
+    }
+
+    /// Pin the scroller to the right edge, full height; inside an editor
+    /// card, to the card's.
     func layoutScrollbarFrame() {
         let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
+        let card = scrollbarCardInsetsPt
         verticalScroller.frame = NSRect(
-            x: bounds.width - scrollbarInsetRightPt - scrollerWidth,
-            y: 0,
+            x: scrollbarStripRightPt - scrollerWidth,
+            y: card.bottom,
             width: scrollerWidth,
-            height: bounds.height
+            height: max(0, bounds.height - card.top - card.bottom)
         )
     }
 
@@ -2016,7 +2056,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
         let locationInView = convert(event.locationInWindow, from: nil)
         let scrollerWidth = ZonvieConfig.ScrollbarConfig.scrollerWidthPt
-        let right = bounds.width - scrollbarInsetRightPt
+        let right = scrollbarStripRightPt
         return locationInView.x >= right - scrollerWidth && locationInView.x < right
     }
 

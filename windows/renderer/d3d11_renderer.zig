@@ -339,6 +339,9 @@ pub const Renderer = struct {
     // Tabline and sidebar strips, rendered from GDI bitmaps.
     tabline_strip: StripTexture = .{},
     sidebar_strip: StripTexture = .{},
+    /// The strips hold final premultiplied pixels and are written with
+    /// blending off, as the editor card is (tabbar.renderOffscreenToD3D).
+    strips_replace: bool = false,
 
     // Post-process bloom (neon glow, Dual Kawase)
     glow_extract_tex: ?*c.ID3D11Texture2D = null,
@@ -382,11 +385,9 @@ pub const Renderer = struct {
     layer_cb: ?*c.ID3D11Buffer = null,
     /// Last value written to layer_cb, so redundant updates are skipped.
     layer_cb_value: [12]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    /// `[window] titlebar_edge`, folded into every layer transform: window
-    /// separators within this many px of the layer top fade in, or with
-    /// `separator_hard_edge` are hidden. Set by the paint, UI thread.
+    /// Folded into every layer transform: window separators within this
+    /// many px of the layer top fade in. Set by the paint, UI thread.
     separator_fade_px: f32 = 0,
-    separator_hard_edge: bool = false,
     /// The next present waits for vblank. A smooth-scroll frame asks for it,
     /// so the paint loop that drives the ease runs at the display rate
     /// instead of spinning; every other present stays unthrottled.
@@ -1078,6 +1079,18 @@ pub const Renderer = struct {
         return true;
     }
 
+    /// The editor card: a rounded rect in client px filled with the default
+    /// bg, on a ground the clear paints everywhere else.
+    pub const Island = struct {
+        left_px: i32,
+        top_px: i32,
+        right_px: i32,
+        bottom_px: i32,
+        radius_px: u32,
+        /// 0xRRGGBB.
+        ground_rgb: u32,
+    };
+
     pub const DrawOpts = struct {
         // If dirty_rect == null but we are doing partial redraw into a persistent back buffer,
         // we must NOT clear. (Row-mode present step uses this.)
@@ -1110,6 +1123,9 @@ pub const Renderer = struct {
 
         // Left edge of the sidebar strip in client pixels, null without one.
         sidebar_x_px: ?i32 = null,
+
+        // The rounded card the grid sits in, on a ground colour.
+        island: ?Island = null,
 
         // Post-process bloom (neon glow)
         glow_enabled: bool = false,
@@ -1190,13 +1206,16 @@ pub const Renderer = struct {
         // black before onDefaultColorsSet has fired so behavior matches
         // the previous hardcoded clear in that early window.
         const bg_rgb = self.default_bg_rgb.load(.acquire);
+        // Under an editor card the clear paints its ground; the card covers
+        // the rest with the default bg.
+        const clear_rgb = if (opts.island) |card| card.ground_rgb else bg_rgb;
         const clear: [4]f32 = blk: {
-            if (bg_rgb == 0xFFFFFFFF) {
+            if (clear_rgb == 0xFFFFFFFF) {
                 break :blk .{ 0, 0, 0, self.opacity };
             }
-            const r_u: u32 = (bg_rgb >> 16) & 0xFF;
-            const g_u: u32 = (bg_rgb >> 8) & 0xFF;
-            const b_u: u32 = bg_rgb & 0xFF;
+            const r_u: u32 = (clear_rgb >> 16) & 0xFF;
+            const g_u: u32 = (clear_rgb >> 8) & 0xFF;
+            const b_u: u32 = clear_rgb & 0xFF;
             const r: f32 = (@as(f32, @floatFromInt(r_u)) / 255.0) * self.opacity;
             const g: f32 = (@as(f32, @floatFromInt(g_u)) / 255.0) * self.opacity;
             const b: f32 = (@as(f32, @floatFromInt(b_u)) / 255.0) * self.opacity;
@@ -1260,6 +1279,18 @@ pub const Renderer = struct {
             const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return;
             var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
             om_set_blend(ctx, self.blend.?, &blend_factor, 0xFFFFFFFF);
+        }
+
+        // ---- Editor card ----
+        // Only over a fresh clear: the card overwrites its whole rect, rows
+        // included, and its margins lie outside every row's scissor, so a
+        // preserved back_tex keeps it.
+        if (should_clear) {
+            if (opts.island) |card| {
+                self.setFullViewport();
+                try self.drawIslandCard(card, bg_rgb);
+                bindContentViewport(ctx, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height, effective_dirty);
+            }
         }
 
         // ---- Tabbar (if content_y_offset is set) ----
@@ -1520,7 +1551,15 @@ pub const Renderer = struct {
         const ps_set_srv = ctx.*.lpVtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
         var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-        try self.drawVertices(&verts);
+        if (self.strips_replace) {
+            const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+            var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+            set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+            defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+            try self.drawVertices(&verts);
+        } else {
+            try self.drawVertices(&verts);
+        }
         srvs[0] = self.atlas_srv;
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }
@@ -1532,6 +1571,71 @@ pub const Renderer = struct {
         if (self.tabline_strip.width == 0 or height == 0 or self.width == 0 or self.height == 0) return;
         const ndc_bottom: f32 = 1.0 - 2.0 * (@as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(self.height)));
         try self.drawStripTexture(&self.tabline_strip, -1.0, 1.0, 1.0, ndc_bottom);
+    }
+
+    /// The editor card in the default bg, over the ground the clear painted.
+    /// One quad per quarter, each carrying its pixel distances from the
+    /// card's two nearest edges (uv.y, deco_phase), which interpolate
+    /// linearly within a quarter; ISLAND_CARD in main.hlsl rounds the corner
+    /// from them. deco_flags, unused by that branch as flags, carries the
+    /// radius in its low byte and the ground's RGB above it: the shader
+    /// writes ground, border and bg itself, with blending off, so a
+    /// translucent surface gets exactly (colour * opacity, opacity) and not
+    /// the card compounded over the cleared ground.
+    fn drawIslandCard(self: *Renderer, card: Island, bg_rgb: u32) !void {
+        if (self.width == 0 or self.height == 0) return;
+        try self.setLayerTransform(0, 0, 0, 0);
+        const ctx = self.ctx orelse return error.NoContext;
+        const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+        var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+        set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+        defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+        const packed_flags: u32 = @min(card.radius_px, 0xFF) | ((card.ground_rgb & 0xFFFFFF) << 8);
+        const rgb = if (bg_rgb == 0xFFFFFFFF) 0 else bg_rgb;
+        const color: [4]f32 = .{
+            @as(f32, @floatFromInt((rgb >> 16) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt((rgb >> 8) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt(rgb & 0xFF)) / 255.0,
+            self.opacity,
+        };
+        const w: f32 = @floatFromInt(self.width);
+        const h: f32 = @floatFromInt(self.height);
+        const l: f32 = @floatFromInt(card.left_px);
+        const t: f32 = @floatFromInt(card.top_px);
+        const r: f32 = @floatFromInt(card.right_px);
+        const b: f32 = @floatFromInt(card.bottom_px);
+        const cx = (l + r) * 0.5;
+        const cy = (t + b) * 0.5;
+        const half_w = cx - l;
+        const half_h = cy - t;
+        // Per quarter: x span with the distance to the vertical edge at each
+        // end, then the same for y.
+        const quarters = [4][8]f32{
+            .{ l, cx, 0, half_w, t, cy, 0, half_h },
+            .{ cx, r, half_w, 0, t, cy, 0, half_h },
+            .{ l, cx, 0, half_w, cy, b, half_h, 0 },
+            .{ cx, r, half_w, 0, cy, b, half_h, 0 },
+        };
+        const marker: f32 = -11.0;
+        var verts: [24]core.Vertex = undefined;
+        for (quarters, 0..) |q, i| {
+            const x0 = -1.0 + 2.0 * q[0] / w;
+            const x1 = -1.0 + 2.0 * q[1] / w;
+            const y0 = 1.0 - 2.0 * q[4] / h;
+            const y1 = 1.0 - 2.0 * q[5] / h;
+            const corners = [6][4]f32{
+                .{ x0, y0, q[2], q[6] },
+                .{ x1, y0, q[3], q[6] },
+                .{ x0, y1, q[2], q[7] },
+                .{ x1, y0, q[3], q[6] },
+                .{ x1, y1, q[3], q[7] },
+                .{ x0, y1, q[2], q[7] },
+            };
+            for (corners, 0..) |v, j| {
+                verts[i * 6 + j] = .{ .position = .{ v[0], v[1] }, .texCoord = .{ marker, v[2] }, .color = color, .grid_id = 0, .deco_flags = packed_flags, .deco_phase = v[3] };
+            }
+        }
+        try self.drawVertices(&verts);
     }
 
     /// Draw sidebar texture as a full-height strip whose left edge is `x_px`.
@@ -4333,7 +4437,6 @@ pub const Renderer = struct {
         scroll_offset_px: f32,
     ) error{LayerTransformMapFailed}!void {
         self.assertContextLocked();
-        const hard_edge: f32 = if (self.separator_hard_edge) 1 else 0;
         const value: [12]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
             .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
         else .{
@@ -4346,7 +4449,7 @@ pub const Renderer = struct {
             scroll_offset_px,
             0,
             self.separator_fade_px,
-            hard_edge,
+            0,
             0,
             0,
         };

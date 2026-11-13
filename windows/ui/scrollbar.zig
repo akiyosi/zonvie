@@ -81,6 +81,8 @@ pub const Surface = struct {
     top_offset_px: f32,
     /// Space a right sidebar tabline takes right of the track (main window only).
     right_inset_px: f32 = 0,
+    /// Space an editor card's margin takes below the track (main window only).
+    bottom_inset_px: i32 = 0,
     /// External windows inset the knob 1px inside its track and the main
     /// window does not; the two look different, and making them agree is a
     /// visual decision, not a side effect of sharing code.
@@ -93,13 +95,30 @@ pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
     // A right sidebar is drawn over the client's right edge, so the track
     // sits left of it (the sidebar would otherwise take its input).
     const right_sidebar = app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right;
+    const sidebar_right_px: f32 = if (right_sidebar) @floatFromInt(sidebar_caption.coveredPx(app)) else 0;
+    // In an editor card the track runs inside the card, along its right
+    // edge and level with the grid's top and bottom, clear of the rounded
+    // corners. A "column" one's strip is where the right padding would be.
+    if (sidebar_caption.island(app)) |card| {
+        const grid = sidebar_caption.gridInsetsPx(app);
+        return .{
+            .hwnd = hwnd,
+            .state = &app.surf.scrollbar,
+            .root_grid = 1,
+            .dpi_scale = app.dpi_scale,
+            .top_offset_px = @floatFromInt(grid.top),
+            .right_inset_px = @floatFromInt(card.right),
+            .bottom_inset_px = grid.bottom,
+            .knob_inset_px = 0,
+        };
+    }
     return .{
         .hwnd = hwnd,
         .state = &app.surf.scrollbar,
         .root_grid = 1,
         .dpi_scale = app.dpi_scale,
         .top_offset_px = @floatFromInt(input.surfaceOriginPx(app, true).y),
-        .right_inset_px = if (right_sidebar) @floatFromInt(sidebar_caption.coveredPx(app)) else 0,
+        .right_inset_px = sidebar_right_px,
         .knob_inset_px = 0,
     };
 }
@@ -121,7 +140,7 @@ pub fn externalSurface(ext_win: *app_mod.ExternalWindow, grid_id: i64) Surface {
 /// core viewport: it is also needed once fade-out reaches zero, when only the
 /// previously saved overlay must be restored.
 pub fn trackRect(sf: Surface, client_width: i32, client_height: i32) ?c.RECT {
-    return trackDamageRect(client_width, client_height, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
+    return trackDamageRect(client_width, client_height - sf.bottom_inset_px, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
 }
 
 fn invalidateTrack(sf: Surface) void {
@@ -135,7 +154,7 @@ fn invalidateTrack(sf: Surface) void {
 }
 
 pub fn geometry(app: *App, sf: Surface, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
-    return scrollbarGeometryFor(app, scrollbarGrid(app, sf), client_width, client_height, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
+    return scrollbarGeometryFor(app, scrollbarGrid(app, sf), client_width, client_height - sf.bottom_inset_px, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
 }
 
 /// The track and knob quads at `alpha` (a paint passes the alpha it

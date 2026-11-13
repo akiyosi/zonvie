@@ -3179,7 +3179,7 @@ pub const ExternalWindow = struct {
 
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
-    // `titlebar_style = "transparent"` on a normal window: its self-drawn
+    // `titlebar_style = "hidden"` on a normal window: its self-drawn
     // caption (ui/caption_reveal.zig).
     caption: caption_reveal.ExternalCaption = .{},
     // The left press landed on the copy button; only then does its release
@@ -3889,6 +3889,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             .sidebar_right_width = params.sidebar_right_width,
             .sidebar_x_px = params.sidebar_x_px,
             .tabbar_bg_color = params.tabbar_bg_color,
+            .island = params.island,
         },
     );
 
@@ -4248,6 +4249,7 @@ pub const RowModeDrawParams = struct {
     sidebar_right_width: ?u32 = null,
     sidebar_x_px: ?i32 = null,
     tabbar_bg_color: ?[4]f32 = null,
+    island: ?d3d11.Renderer.Island = null,
     /// The root grid's smooth scroll, when this frame draws it eased.
     root_ease: ?*const GridEase = null,
 
@@ -6481,8 +6483,6 @@ pub const App = struct {
     // 0xFFFFFFFF = not set (fall back to colorscheme_bg).
     cached_msg_area_bg: u32 = 0xFFFFFFFF,
     cached_pmenu_bg: u32 = 0xFFFFFFFF,
-    // WinSeparator fg for the titlebar hairline; 0xFFFFFFFF = not set.
-    cached_separator_fg: u32 = 0xFFFFFFFF,
 
     // ext_cmdline enabled flag (set from --extcmdline command line arg)
     ext_cmdline_enabled: bool = false,
@@ -6508,7 +6508,7 @@ pub const App = struct {
     sidebar_slide_start_ms: u64 = 0,
     sidebar_slide_now_ms: u64 = 0,
     drag_bar: caption_reveal.DragBar = .{},
-    // `titlebar_style = "transparent"` (ui/caption_reveal.zig): the pointer is
+    // `titlebar_style = "hidden"` (ui/caption_reveal.zig): the pointer is
     // in the main window's caption band, so its window buttons are drawn.
     caption_buttons_revealed: bool = false,
 
@@ -7379,9 +7379,9 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
     // The DWM custom titlebar is inside the client area: the tab bar's or the
-    // title band's rows are not Neovim's.
-    const tabbar_height: u32 = @intCast(sidebar_caption.editorTopPx(app));
-    const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
+    // title band's rows are not Neovim's, nor an editor card's margins.
+    const chrome_h: u32 = @intCast(insets.top + insets.bottom);
+    const h = if (client_h > chrome_h) client_h - chrome_h else 1;
 
     return .{ .w = w, .h = h };
 }
@@ -7396,10 +7396,18 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const cw: u32 = @max(1, app.cell_w_px);
     const ch: u32 = app.rowHeightPx();
 
-    if (applog.isEnabled()) applog.appLog(
-        "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
-        .{ w, h, cw, ch },
-    );
+    if (applog.isEnabled()) {
+        applog.appLog(
+            "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
+            .{ w, h, cw, ch },
+        );
+        // The grid's place in the client area, in the field form the GUI driver parses.
+        const insets = sidebar_caption.gridInsetsPx(app);
+        applog.appLog(
+            "[grid_insets] left={d} top={d} right={d} bottom={d}\n",
+            .{ insets.left, insets.top, insets.right, insets.bottom },
+        );
+    }
 
     // The cmdline's width budget goes in first so the flush the layout update
     // retries already sizes the cmdline with it.

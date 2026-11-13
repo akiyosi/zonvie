@@ -107,8 +107,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // The statusline row, in capture pixels, from the capture itself and the
     // grid size rather than a logged metric — the only cell metric the app
     // logs is macOS-specific, and this scenario runs wherever capture does.
-    // The capture includes the title bar, so the grid's first row is found by
-    // scanning; from there the grid fills the rest of the window.
+    // The capture includes the title bar, so the editor view's first row is
+    // found by scanning; the grid fills the view less the insets the app
+    // logged.
     //
     // The band is ONE row, not the bottom of the window: with vertical splits
     // the window separators run down to the row above the statusline, and a
@@ -116,8 +117,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const total_lines = try g.evalInt("&lines");
     const img_h = @as(f64, @floatFromInt(incremental.h));
     const bg = grid_pixels.modalLuma(incremental, 0, incremental.w, 0, incremental.h);
-    const grid_top_px = @as(f64, @floatFromInt(grid_pixels.firstContentRow(incremental, bg)));
-    const cell_h_px = (img_h - grid_top_px) / @as(f64, @floatFromInt(total_lines));
+    const insets = try grid_pixels.gridInsets(alloc, log_path);
+    const grid_top_px = @as(f64, @floatFromInt(grid_pixels.firstContentRow(incremental, bg))) + insets.top;
+    const cell_h_px = (img_h - grid_top_px - insets.bottom) / @as(f64, @floatFromInt(total_lines));
     // cmdheight=1, so the statusline is the row above the command line.
     const statusline_row = @as(f64, @floatFromInt(total_lines - 2));
     const row_top_px = grid_top_px + statusline_row * cell_h_px;

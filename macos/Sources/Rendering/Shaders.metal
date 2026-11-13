@@ -79,9 +79,6 @@ struct DrawableSize {
     float height;
     // Height of window chrome over the grid top; 0 leaves separators alone.
     float separatorFadePx;
-    // 1: hide separators above separatorFadePx outright (titlebar_edge
-    // "border", where a hairline marks the edge); 0: fade them in.
-    float separatorHardEdge;
 };
 
 // Alpha factor for a DECO_SEPARATOR glyph: 0 at the surface top, 1 below the
@@ -89,9 +86,6 @@ struct DrawableSize {
 static inline float separatorFade(VSOut in, constant DrawableSize& drawableSize) {
     if ((in.deco_flags & DECO_SEPARATOR) == 0u || drawableSize.separatorFadePx <= 0.0) {
         return 1.0;
-    }
-    if (drawableSize.separatorHardEdge > 0.5) {
-        return step(drawableSize.separatorFadePx, in.position.y);
     }
     return smoothstep(0.0, drawableSize.separatorFadePx, in.position.y);
 }
@@ -726,6 +720,48 @@ fragment float4 ps_copy(CopyVSOut in [[stage_in]],
                         texture2d<float> srcTexture [[texture(0)]],
                         sampler samp [[sampler(0)]]) {
     return srcTexture.sample(samp, in.uv);
+}
+
+/// Mirrors IslandUniforms in MetalTypes.swift.
+struct IslandUniforms {
+    float4 island;   // rounded card rect (minX, minY, maxX, maxY), px
+    float4 grid;     // back buffer rect, px
+    float2 uvScale;
+    float radius;
+    float pad;
+    float4 bg;
+    float4 ground;
+};
+
+// How far the card's border moves from the bg toward white or black.
+// main.hlsl's ISLAND_BORDER_MIX is the same value.
+#define ISLAND_BORDER_MIX 0.12
+
+/// The editor card on its ground: a rounded rect (1px anti-aliased edge)
+/// filled with the default background inside a 1px border, the back buffer
+/// at the grid rect.
+fragment float4 ps_island(CopyVSOut in [[stage_in]],
+                          texture2d<float> srcTexture [[texture(0)]],
+                          sampler samp [[sampler(0)]],
+                          constant IslandUniforms& u [[buffer(0)]]) {
+    float2 p = in.position.xy;
+    float2 center = (u.island.xy + u.island.zw) * 0.5;
+    float2 half_size = (u.island.zw - u.island.xy) * 0.5;
+    float2 q = abs(p - center) - half_size + u.radius;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u.radius;
+    float coverage = clamp(0.5 - d, 0.0, 1.0);
+    // The card less its outermost pixel, which is the border.
+    float inner = clamp(-0.5 - d, 0.0, 1.0);
+    float4 inside = u.bg;
+    if (all(p >= u.grid.xy) && all(p < u.grid.zw)) {
+        float2 uv = (p - u.grid.xy) / (u.grid.zw - u.grid.xy) * u.uvScale;
+        inside = srcTexture.sample(samp, uv);
+    }
+    // A faint line: the bg a step toward white on a dark bg, black on a
+    // light one.
+    float toward = dot(u.bg.rgb, float3(0.299, 0.587, 0.114)) < 0.5 ? 1.0 : 0.0;
+    float4 border = float4(mix(u.bg.rgb, float3(toward), ISLAND_BORDER_MIX), u.bg.a);
+    return u.ground * (1.0 - coverage) + border * (coverage - inner) + inside * inner;
 }
 
 // Vertex shader paired with user-supplied fragment shaders compiled from

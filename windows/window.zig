@@ -342,6 +342,14 @@ pub fn applyWindowBackdrop(hwnd: c.HWND) void {
     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
+/// Clears WS_SYSMENU, and with it the caption buttons DWM draws. Idempotent.
+fn dropSystemMenu(hwnd: c.HWND) void {
+    const style: c.DWORD = @bitCast(@as(i32, @truncate(c.GetWindowLongPtrW(hwnd, c.GWL_STYLE))));
+    if (style & c.WS_SYSMENU == 0) return;
+    _ = c.SetWindowLongPtrW(hwnd, c.GWL_STYLE, @as(c.LONG_PTR, @as(i32, @bitCast(style & ~@as(c.DWORD, c.WS_SYSMENU)))));
+    _ = c.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+}
+
 // WM_SETTINGCHANGE dispatch helper for any top-level window that wants its
 // DWM titlebar to follow the OS app theme. Returns true if the message was
 // the "ImmersiveColorSet" broadcast and the theme was re-applied.
@@ -2093,9 +2101,7 @@ fn snapshotMainPaint(hwnd: c.HWND, app: *App, tbs_snapshot: *const app_mod.Paint
         if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
         // Fixed by config and the band height; a DPI change that moves the
         // band repaints every row anyway.
-        const edge = sidebar_caption.separatorEdge(app);
-        g.separator_fade_px = edge.fade_px;
-        g.separator_hard_edge = edge.hard;
+        g.separator_fade_px = sidebar_caption.separatorFadePx(app);
     }
     var atlas_reset_consumed = false;
     var atlas_generation: u64 = 0;
@@ -2245,6 +2251,8 @@ const MainContentGeom = struct {
     content_right_i32: i32,
     /// Snapped to cell boundaries.
     content_height: u32,
+    /// The editor card the grid is drawn in (sidebar_caption.island).
+    island: ?d3d11.Renderer.Island,
 };
 
 fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
@@ -2278,7 +2286,8 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
     // update failure). Track the OS light/dark theme cache so
     // the fallback matches currentTitlebarPalette().bar_bg
     // (RGB(32,32,32) dark / RGB(240,240,240) light).
-    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
+    // An editor card's top margin is ground, not a tab bar.
+    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null and sidebar_caption.island(app) == null)
         (if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
             [4]f32{
                 @as(f32, @floatFromInt((app.colorscheme_bg >> 16) & 0xFF)) / 255.0,
@@ -2315,10 +2324,18 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
         // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
         // misalignment between vertex positions and scissor rects (which causes stripes).
         .content_height = app_mod.snappedContentHeight(
-            @intCast(@max(1, client_for_content.bottom - client_for_content.top)),
+            @intCast(@max(1, client_for_content.bottom - client_for_content.top - sidebar_caption.gridInsetsPx(app).bottom)),
             row_h_px,
             content_y_offset orelse 0,
         ),
+        .island = if (sidebar_caption.island(app)) |card| .{
+            .left_px = card.left,
+            .top_px = card.top,
+            .right_px = client_for_content.right - card.right,
+            .bottom_px = client_for_content.bottom - card.bottom,
+            .radius_px = @intCast(app.scalePx(sidebar_caption.ISLAND_RADIUS_PT)),
+            .ground_rgb = tabline_mod.islandGroundRgb(app.colorscheme_bg),
+        } else null,
     };
 }
 
@@ -2402,7 +2419,7 @@ fn drawMainFlatFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameI
     // Do NOT hold app.mu here: Present can pump
     // Win32 messages, and a re-entrant handler taking
     // app.mu would self-deadlock.
-    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .sidebar_x_px = geom.sidebar_x_px, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
+    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .sidebar_x_px = geom.sidebar_x_px, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .island = geom.island, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
         if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
         return .failed;
     };
@@ -2957,6 +2974,7 @@ fn drawMainRowFrame(
         .sidebar_right_width = geom.sidebar_right_width,
         .sidebar_x_px = geom.sidebar_x_px,
         .tabbar_bg_color = geom.tabbar_bg_color,
+        .island = geom.island,
         // The root layer drives the pixel space core
         // vertices arrive in. It sits at the surface origin
         // today; an anchored float will carry its own
@@ -4423,8 +4441,6 @@ pub export fn WndProc(
             // deadlock when calling zonvie_core_get_hl_by_name from callback context.
             if (getApp(hwnd)) |app| {
                 external_windows.updateExternalWindowColors(app);
-                // The border hairline takes WinSeparator's new colour.
-                if (sidebar_caption.separatorEdge(app).hard) sidebar_caption.repaint(hwnd, app);
                 // Posted after every colorscheme change: the unified caption
                 // follows it. The table decides the colours; a removed caption
                 // only skips two DWM calls that would set the theme default.
@@ -6341,6 +6357,10 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 if (app.config.window.blur) {
                     applyWindowBackdrop(hwnd);
+                    // The sheet of glass carries DWM's own caption buttons,
+                    // which show through translucent chrome beside the ones
+                    // the window draws; without a system menu DWM draws none.
+                    if (customFrame(app)) dropSystemMenu(hwnd);
                 } else if (customFrame(app) and app.config.window.opacity >= 1.0) {
                     const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
                     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);

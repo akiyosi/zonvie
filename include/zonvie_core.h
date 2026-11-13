@@ -2029,15 +2029,12 @@ typedef struct zonvie_config_values {
     const char* server_open_mode;  // "tab" or "current"
     // scroll
     uint8_t scroll_large_jump;  // ZONVIE_LARGE_JUMP_PARTIAL or ZONVIE_LARGE_JUMP_SNAP
-    // window: 0 = native titlebar, 1 = transparent (no band, buttons on hover),
-    // 2 = unified (band kept, painted the editor default bg)
+    // window: 0 = native titlebar, 1 = hidden (no band, buttons on hover,
+    // editor edge to edge), 2 = unified (band kept, drawn by the frontend).
+    // 0 and 2 draw the main window's grid in a rounded card on a ground colour.
     uint8_t window_titlebar_style;
     // scrollbar: 0 = overlay (drawn over the grid), 1 = column (a strip beside it)
     uint8_t scrollbar_layout;
-    // window separators under a transparent/unified titlebar band:
-    // 0 = fade in across the band, 1 = hairline at the band bottom with
-    // separators hidden above it, 2 = unchanged
-    uint8_t window_titlebar_edge;
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

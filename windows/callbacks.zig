@@ -1573,7 +1573,13 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         }
         app.surf.tbs.commitFlush(app.alloc);
         if (app.pending_colorscheme_bg != 0xFFFFFFFF or app.pending_colorscheme_fg != 0xFFFFFFFF) {
-            if (app.pending_colorscheme_bg != 0xFFFFFFFF) app.colorscheme_bg = app.pending_colorscheme_bg;
+            if (app.pending_colorscheme_bg != 0xFFFFFFFF and app.pending_colorscheme_bg != app.colorscheme_bg) {
+                app.colorscheme_bg = app.pending_colorscheme_bg;
+                // The island ground and card edges sit outside every grid
+                // row, so only a cleared full paint repaints them.
+                app_mod.requestMainFullPaintLocked(app);
+                app.seed_clear_pending = true;
+            }
             if (app.pending_colorscheme_fg != 0xFFFFFFFF) app.colorscheme_fg = app.pending_colorscheme_fg;
             app.pending_colorscheme_bg = 0xFFFFFFFF;
             app.pending_colorscheme_fg = 0xFFFFFFFF;

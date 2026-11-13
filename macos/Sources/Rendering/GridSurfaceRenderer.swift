@@ -2409,15 +2409,38 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var gridInsetLeftPx: CGFloat = 0
     private var gridInsetRightPx: CGFloat = 0
     private var gridInsetTopPx: CGFloat = 0
+    private var gridInsetBottomPx: CGFloat = 0
     /// Full-drawable texture the back buffer is composited into at the inset.
     private var insetPadTexture: MTLTexture?
 
-    func setGridInsets(leftPx: CGFloat, rightPx: CGFloat, topPx: CGFloat) {
+    /// A rounded card the grid sits in, on a ground colour derived from the
+    /// default background. Insets are from the drawable edges, in px.
+    struct Island: Equatable {
+        var leftPx: CGFloat, rightPx: CGFloat, topPx: CGFloat, bottomPx: CGFloat
+        var radiusPx: CGFloat
+    }
+    /// Main thread only, like draw.
+    private var island: Island?
+    /// Ground colour cache keyed by the bg it was derived from: the OKLab
+    /// shift is too costly to redo every frame.
+    private var islandGroundForBg: (bg: UInt32, ground: UInt32)?
+
+    func setIsland(_ newIsland: Island?) {
+        guard newIsland != island else { return }
+        island = newIsland
+        lock.lock()
+        invalidatePresentedLocked()
+        lock.unlock()
+    }
+
+    func setGridInsets(leftPx: CGFloat, rightPx: CGFloat, topPx: CGFloat, bottomPx: CGFloat) {
         lock.lock()
         let changed = gridInsetLeftPx != leftPx || gridInsetRightPx != rightPx || gridInsetTopPx != topPx
+            || gridInsetBottomPx != bottomPx
         gridInsetLeftPx = leftPx
         gridInsetRightPx = rightPx
         gridInsetTopPx = topPx
+        gridInsetBottomPx = bottomPx
         // A moved grid is a whole new composite: a frame with no dirty row
         // would present nothing and leave the grid at its old place.
         if changed { invalidatePresentedLocked() }
@@ -2436,10 +2459,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if separatorFadePx != oldValue { markAllRowsDirty() }
         }
     }
-    /// Cut separators off at `separatorFadePx` instead of fading them in.
-    var separatorHardEdge = false {
-        didSet { if separatorHardEdge != oldValue { markAllRowsDirty() } }
-    }
 
     var gridInsetsPx: (left: CGFloat, right: CGFloat, top: CGFloat) {
         lock.lock()
@@ -2447,11 +2466,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return (gridInsetLeftPx, gridInsetRightPx, gridInsetTopPx)
     }
 
+    private var gridInsetsBottomPx: CGFloat {
+        lock.lock()
+        defer { lock.unlock() }
+        return gridInsetBottomPx
+    }
+
     /// The drawable minus the grid insets: the size the grid is laid out in.
     func gridDrawableSize(_ view: MTKView) -> CGSize {
         let inset = gridInsetsPx
         return CGSize(width: max(1, view.drawableSize.width - inset.left - inset.right),
-                      height: max(1, view.drawableSize.height - inset.top))
+                      height: max(1, view.drawableSize.height - inset.top - gridInsetsBottomPx))
     }
     private let scrollScratch = SurfaceScrollScratchTexture()
 
@@ -4430,7 +4455,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             fixedFloatBands: f.fixedFloatBands,
             fixedFloatIntervals: f.fixedFloatIntervals,
             separatorFadePx: separatorFadePx,
-            separatorHardEdge: separatorHardEdge,
             bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: f.scrollOffsets) }
         )
 
@@ -4903,6 +4927,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 usage: [.renderTarget, .shaderRead]))
         }
         guard let padded = insetPadTexture else { return nil }
+        // Without its pipeline the card is left undrawn: the plain pad below
+        // still puts the grid at its inset.
+        if let island, shared.islandPipeline != nil {
+            return encodeIsland(island, f, cmd: cmd, backTex: backTex, padded: padded, view: view, inset: inset)
+        }
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = padded
         rpd.colorAttachments[0].loadAction = .clear
@@ -4918,6 +4947,54 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
         enc.setFragmentTexture(backTex, index: 0)
         enc.setFragmentSamplerState(samp, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        enc.endEncoding()
+        return padded
+    }
+
+    /// One full-drawable pass: ground outside the rounded card, the default
+    /// background inside it, and the back buffer at the grid inset. Every
+    /// pixel is written, so the pass needs no clear.
+    private func encodeIsland(
+        _ island: Island, _ f: MainSurfaceFrame, cmd: MTLCommandBuffer, backTex: MTLTexture,
+        padded: MTLTexture, view: MTKView, inset: (left: CGFloat, right: CGFloat, top: CGFloat)
+    ) -> MTLTexture? {
+        guard let pipe = shared.islandPipeline, let copyVB = shared.copyVertexBuffer,
+              let samp = shared.sampler else { return nil }
+        let full = view.drawableSize
+        let grid = gridDrawableSize(view)
+        let alpha = Float(resolveSurfaceClearAlpha(blurEnabled: blurEnabled, decoratedSurface: false))
+        let ground: UInt32
+        if let cached = islandGroundForBg, cached.bg == f.bgRGB {
+            ground = cached.ground
+        } else {
+            ground = TabSidebarView.islandGroundRGB(bgRGB: f.bgRGB)
+            islandGroundForBg = (f.bgRGB, ground)
+        }
+        func rgba(_ c: UInt32) -> SIMD4<Float> {
+            SIMD4(Float((c >> 16) & 0xFF) / 255, Float((c >> 8) & 0xFF) / 255, Float(c & 0xFF) / 255, alpha)
+        }
+        let scale = surfaceUVScale(logicalSize: grid, capacity: backTex)
+        var u = IslandUniforms(
+            island: SIMD4(Float(island.leftPx), Float(island.topPx),
+                          Float(full.width - island.rightPx), Float(full.height - island.bottomPx)),
+            grid: SIMD4(Float(inset.left), Float(inset.top),
+                        Float(inset.left + grid.width), Float(inset.top + grid.height)),
+            uvScale: scale, radius: Float(island.radiusPx), pad: 0,
+            bg: rgba(f.bgRGB), ground: rgba(ground))
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = padded
+        rpd.colorAttachments[0].loadAction = .dontCare
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return nil }
+        enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(full.width), height: Double(full.height), znear: 0, zfar: 1))
+        enc.setRenderPipelineState(pipe)
+        enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+        var unitScale = SIMD2<Float>(1, 1)
+        enc.setVertexBytes(&unitScale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
+        enc.setFragmentTexture(backTex, index: 0)
+        enc.setFragmentSamplerState(samp, index: 0)
+        enc.setFragmentBytes(&u, length: MemoryLayout<IslandUniforms>.stride, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         enc.endEncoding()
         return padded

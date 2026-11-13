@@ -4170,7 +4170,7 @@ final class ZonvieCore {
         // (LIMITATION #1 there): even if the burst splits, correctness holds.
         let actualContentPt = CGSize(
             width: view.bounds.width - view.gridInsetsPt.left - view.gridInsetsPt.right,
-            height: view.bounds.height - view.gridInsetsPt.top)
+            height: view.bounds.height - view.gridInsetsPt.top - view.gridInsetsPt.bottom)
         if desiredTermPx == nil { desiredTermPx = actualContentPt }
         let baseContentPt = desiredTermPx ?? actualContentPt
 
@@ -7634,12 +7634,6 @@ final class ZonvieCore {
         return Self.rgbColor(foreground ? fg : bg)
     }
 
-    /// WinSeparator's foreground: the titlebar hairline meets the window
-    /// separators in their own colour.
-    func separatorColor() -> NSColor {
-        hlColor("WinSeparator", foreground: true, fallback: .separatorColor)
-    }
-
     /// Get the Search highlight color (background) for cmdline border.
     private func getSearchHighlightColor() -> NSColor {
         hlColor("Search", foreground: false, fallback: .yellow)
@@ -8514,7 +8508,9 @@ final class ZonvieCore {
         var grid = mainView.bounds
         grid.origin.x += mainView.gridInsetsPt.left
         grid.size.width -= mainView.gridInsetsPt.left + mainView.gridInsetsPt.right
-        grid.size.height -= mainView.gridInsetsPt.top
+        // Unflipped: the bottom inset moves the origin up.
+        grid.origin.y += mainView.gridInsetsPt.bottom
+        grid.size.height -= mainView.gridInsetsPt.top + mainView.gridInsetsPt.bottom
         return window.convertToScreen(mainView.convert(grid, to: nil))
     }
 
