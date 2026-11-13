@@ -4170,7 +4170,7 @@ final class ZonvieCore {
         // (LIMITATION #1 there): even if the burst splits, correctness holds.
         let actualContentPt = CGSize(
             width: view.bounds.width - view.gridInsetsPt.left - view.gridInsetsPt.right,
-            height: view.bounds.height - view.gridInsetsPt.top)
+            height: view.bounds.height - view.gridInsetsPt.top - view.gridInsetsPt.bottom)
         if desiredTermPx == nil { desiredTermPx = actualContentPt }
         let baseContentPt = desiredTermPx ?? actualContentPt
 
@@ -8514,7 +8514,9 @@ final class ZonvieCore {
         var grid = mainView.bounds
         grid.origin.x += mainView.gridInsetsPt.left
         grid.size.width -= mainView.gridInsetsPt.left + mainView.gridInsetsPt.right
-        grid.size.height -= mainView.gridInsetsPt.top
+        // Unflipped: the bottom inset moves the origin up.
+        grid.origin.y += mainView.gridInsetsPt.bottom
+        grid.size.height -= mainView.gridInsetsPt.top + mainView.gridInsetsPt.bottom
         return window.convertToScreen(mainView.convert(grid, to: nil))
     }
 

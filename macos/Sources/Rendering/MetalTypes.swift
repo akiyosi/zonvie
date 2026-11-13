@@ -920,6 +920,18 @@ func packSurfaceBgRGB(red: Double, green: Double, blue: Double) -> UInt32 {
     return (r << 16) | (g << 8) | b
 }
 
+/// Mirrors `IslandUniforms` in Shaders.metal. Rects are (minX, minY, maxX,
+/// maxY) in drawable px from the top-left.
+struct IslandUniforms {
+    var island: SIMD4<Float>
+    var grid: SIMD4<Float>
+    var uvScale: SIMD2<Float>
+    var radius: Float
+    var pad: Float
+    var bg: SIMD4<Float>
+    var ground: SIMD4<Float>
+}
+
 /// The clear colour a surface's load action uses: its 8-bit background plus
 /// the alpha its kind resolves to. GridSurfaceRenderer resolves that alpha
 /// from `blurEnabled` on every draw; ExternalGridView is handed it by the app,

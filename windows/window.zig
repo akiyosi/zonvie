@@ -2245,6 +2245,8 @@ const MainContentGeom = struct {
     content_right_i32: i32,
     /// Snapped to cell boundaries.
     content_height: u32,
+    /// The editor card a captionless sidebar window draws the grid in.
+    island: ?d3d11.Renderer.Island,
 };
 
 fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
@@ -2278,7 +2280,8 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
     // update failure). Track the OS light/dark theme cache so
     // the fallback matches currentTitlebarPalette().bar_bg
     // (RGB(32,32,32) dark / RGB(240,240,240) light).
-    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
+    // An editor card's top margin is ground, not a tab bar.
+    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null and sidebar_caption.island(app) == null)
         (if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
             [4]f32{
                 @as(f32, @floatFromInt((app.colorscheme_bg >> 16) & 0xFF)) / 255.0,
@@ -2315,10 +2318,18 @@ fn mainContentGeom(hwnd: c.HWND, app: *App, row_h_px: u32) MainContentGeom {
         // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
         // misalignment between vertex positions and scissor rects (which causes stripes).
         .content_height = app_mod.snappedContentHeight(
-            @intCast(@max(1, client_for_content.bottom - client_for_content.top)),
+            @intCast(@max(1, client_for_content.bottom - client_for_content.top - sidebar_caption.gridInsetsPx(app).bottom)),
             row_h_px,
             content_y_offset orelse 0,
         ),
+        .island = if (sidebar_caption.island(app)) |card| .{
+            .left_px = card.left,
+            .top_px = card.top,
+            .right_px = client_for_content.right - card.right,
+            .bottom_px = client_for_content.bottom - card.bottom,
+            .radius_px = @intCast(app.scalePx(sidebar_caption.ISLAND_RADIUS_PT)),
+            .ground_rgb = tabline_mod.islandGroundRgb(app.colorscheme_bg),
+        } else null,
     };
 }
 
@@ -2402,7 +2413,7 @@ fn drawMainFlatFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameI
     // Do NOT hold app.mu here: Present can pump
     // Win32 messages, and a re-entrant handler taking
     // app.mu would self-deadlock.
-    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .sidebar_x_px = geom.sidebar_x_px, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
+    g.drawEx(&.{}, &.{}, dirty, .{ .content_width = geom.content_width, .content_y_offset = geom.content_y_offset, .content_x_offset = geom.content_x_offset, .sidebar_right_width = geom.sidebar_right_width, .sidebar_x_px = geom.sidebar_x_px, .content_height = geom.content_height, .tabbar_bg_color = geom.tabbar_bg_color, .island = geom.island, .glow_enabled = in.glow.enabled, .glow_intensity = in.glow.intensity }) catch |e| {
         if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
         return .failed;
     };
@@ -2957,6 +2968,7 @@ fn drawMainRowFrame(
         .sidebar_right_width = geom.sidebar_right_width,
         .sidebar_x_px = geom.sidebar_x_px,
         .tabbar_bg_color = geom.tabbar_bg_color,
+        .island = geom.island,
         // The root layer drives the pixel space core
         // vertices arrive in. It sits at the surface origin
         // today; an anchored float will carry its own

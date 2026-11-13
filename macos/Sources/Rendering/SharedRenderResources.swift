@@ -205,6 +205,9 @@ final class SharedRenderResources {
     /// XPC compiler service after fork().
     var copyPipeline: MTLRenderPipelineState?
     var copyVertexBuffer: MTLBuffer?
+    /// The main surface's rounded editor card (ps_island); nil leaves the
+    /// card undrawn and the composite falls back to the plain inset pad.
+    var islandPipeline: MTLRenderPipelineState?
 
     /// The bloom chain: extract, the Dual Kawase down/up pair, the composite,
     /// the occlusion pass that keeps glow off covered rows, and the bilinear
@@ -1102,6 +1105,22 @@ extension SharedRenderResources {
         return d
     }
 
+    /// Built on both creation paths, like the copy pipeline it shares a
+    /// vertex stage with. Failure only leaves the editor card undrawn.
+    private func buildIslandPipeline(lib: MTLLibrary, vsCopy: MTLFunction, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) {
+        guard let fs = lib.makeFunction(name: "ps_island") else {
+            ZonvieCore.appLog("WARNING: Missing ps_island shader (editor card disabled)")
+            return
+        }
+        let desc = Self.makeCopyPipelineDescriptor(
+            vsCopy: vsCopy, fsCopy: fs, vertexDescriptor: copyVertexDesc, pixelFormat: pixelFormat)
+        do {
+            islandPipeline = try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            ZonvieCore.appLog("WARNING: Failed to make island pipeline: \(error)")
+        }
+    }
+
     /// Ensure pipeline is ready for use by external grid views.
     /// Called before creating ExternalGridView to guarantee shared pipeline availability.
     /// This builds the pipeline synchronously if not already done.
@@ -1222,6 +1241,7 @@ extension SharedRenderResources {
             // Build bloom pipelines for neon glow
             buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
             buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+            buildIslandPipeline(lib: lib, vsCopy: vsCopy, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
             buildCopyVertexBuffer()
             return
         }
@@ -1258,6 +1278,7 @@ extension SharedRenderResources {
             // Non-fatal: we can still render, just might have issues
         }
 
+        buildIslandPipeline(lib: lib, vsCopy: vsCopy, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
         buildCopyVertexBuffer()
 
         // Build 2-pass pipelines for blur support

@@ -112,6 +112,7 @@ float separatorEdge(VSOut i) {
 #define ICON_CHECK       (-8.0)  // post-copy acknowledgement checkmark
 #define ICON_DISC        (-9.0)  // filled disc spanning the quad (close badge)
 #define ICON_CROSS       (-10.0) // close badge cross
+#define ISLAND_CARD      (-11.0) // a quarter of the editor card (drawIslandCard)
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -258,6 +259,17 @@ float4 PSMain(VSOut i) : SV_Target {
                 float d1 = sdSegment(localUV, float2(0.32, 0.32), float2(0.68, 0.68)) - halfStroke;
                 float d2 = sdSegment(localUV, float2(0.32, 0.68), float2(0.68, 0.32)) - halfStroke;
                 return renderIconSDF(i.col, min(d1, d2));
+            }
+            // Editor card quarter: (uv.y, deco_phase) are pixel distances
+            // from the card's nearest vertical and horizontal edges, and
+            // deco_flags is the corner radius in px. Coverage, not alpha
+            // ramps, so the 1px edge matches Shaders.metal ps_island.
+            if (i.uv.x >= ISLAND_CARD - 0.1 && i.uv.x <= ISLAND_CARD + 0.1) {
+                float radius = (float)i.deco_flags;
+                float2 q = radius - float2(i.uv.y, i.deco_phase);
+                float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+                float alpha = i.col.a * saturate(0.5 - sdf);
+                return float4(i.col.rgb * alpha, alpha);
             }
             // Filled rounded rect spanning the quad (copy button hover wash)
             if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {

@@ -3889,6 +3889,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             .sidebar_right_width = params.sidebar_right_width,
             .sidebar_x_px = params.sidebar_x_px,
             .tabbar_bg_color = params.tabbar_bg_color,
+            .island = params.island,
         },
     );
 
@@ -4248,6 +4249,7 @@ pub const RowModeDrawParams = struct {
     sidebar_right_width: ?u32 = null,
     sidebar_x_px: ?i32 = null,
     tabbar_bg_color: ?[4]f32 = null,
+    island: ?d3d11.Renderer.Island = null,
     /// The root grid's smooth scroll, when this frame draws it eased.
     root_ease: ?*const GridEase = null,
 
@@ -7379,9 +7381,9 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
     // The DWM custom titlebar is inside the client area: the tab bar's or the
-    // title band's rows are not Neovim's.
-    const tabbar_height: u32 = @intCast(sidebar_caption.editorTopPx(app));
-    const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
+    // title band's rows are not Neovim's, nor an editor card's margins.
+    const chrome_h: u32 = @intCast(insets.top + insets.bottom);
+    const h = if (client_h > chrome_h) client_h - chrome_h else 1;
 
     return .{ .w = w, .h = h };
 }

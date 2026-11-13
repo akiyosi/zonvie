@@ -728,6 +728,37 @@ fragment float4 ps_copy(CopyVSOut in [[stage_in]],
     return srcTexture.sample(samp, in.uv);
 }
 
+/// Mirrors IslandUniforms in MetalTypes.swift.
+struct IslandUniforms {
+    float4 island;   // rounded card rect (minX, minY, maxX, maxY), px
+    float4 grid;     // back buffer rect, px
+    float2 uvScale;
+    float radius;
+    float pad;
+    float4 bg;
+    float4 ground;
+};
+
+/// The editor card on its ground: a rounded rect (1px anti-aliased edge)
+/// filled with the default background, the back buffer at the grid rect.
+fragment float4 ps_island(CopyVSOut in [[stage_in]],
+                          texture2d<float> srcTexture [[texture(0)]],
+                          sampler samp [[sampler(0)]],
+                          constant IslandUniforms& u [[buffer(0)]]) {
+    float2 p = in.position.xy;
+    float2 center = (u.island.xy + u.island.zw) * 0.5;
+    float2 half_size = (u.island.zw - u.island.xy) * 0.5;
+    float2 q = abs(p - center) - half_size + u.radius;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u.radius;
+    float coverage = clamp(0.5 - d, 0.0, 1.0);
+    float4 inside = u.bg;
+    if (all(p >= u.grid.xy) && all(p < u.grid.zw)) {
+        float2 uv = (p - u.grid.xy) / (u.grid.zw - u.grid.xy) * u.uvScale;
+        inside = srcTexture.sample(samp, uv);
+    }
+    return mix(u.ground, inside, coverage);
+}
+
 // Vertex shader paired with user-supplied fragment shaders compiled from
 // GLSL via glslang + SPIRV-Cross. SPIRV-Cross emits fragment inputs with
 // explicit `[[user(locnN)]]` attributes derived from `layout(location=N)` in

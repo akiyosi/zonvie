@@ -1078,6 +1078,18 @@ pub const Renderer = struct {
         return true;
     }
 
+    /// The editor card: a rounded rect in client px filled with the default
+    /// bg, on a ground the clear paints everywhere else.
+    pub const Island = struct {
+        left_px: i32,
+        top_px: i32,
+        right_px: i32,
+        bottom_px: i32,
+        radius_px: u32,
+        /// 0xRRGGBB.
+        ground_rgb: u32,
+    };
+
     pub const DrawOpts = struct {
         // If dirty_rect == null but we are doing partial redraw into a persistent back buffer,
         // we must NOT clear. (Row-mode present step uses this.)
@@ -1110,6 +1122,9 @@ pub const Renderer = struct {
 
         // Left edge of the sidebar strip in client pixels, null without one.
         sidebar_x_px: ?i32 = null,
+
+        // The rounded card the grid sits in, on a ground colour.
+        island: ?Island = null,
 
         // Post-process bloom (neon glow)
         glow_enabled: bool = false,
@@ -1190,13 +1205,16 @@ pub const Renderer = struct {
         // black before onDefaultColorsSet has fired so behavior matches
         // the previous hardcoded clear in that early window.
         const bg_rgb = self.default_bg_rgb.load(.acquire);
+        // Under an editor card the clear paints its ground; the card covers
+        // the rest with the default bg.
+        const clear_rgb = if (opts.island) |card| card.ground_rgb else bg_rgb;
         const clear: [4]f32 = blk: {
-            if (bg_rgb == 0xFFFFFFFF) {
+            if (clear_rgb == 0xFFFFFFFF) {
                 break :blk .{ 0, 0, 0, self.opacity };
             }
-            const r_u: u32 = (bg_rgb >> 16) & 0xFF;
-            const g_u: u32 = (bg_rgb >> 8) & 0xFF;
-            const b_u: u32 = bg_rgb & 0xFF;
+            const r_u: u32 = (clear_rgb >> 16) & 0xFF;
+            const g_u: u32 = (clear_rgb >> 8) & 0xFF;
+            const b_u: u32 = clear_rgb & 0xFF;
             const r: f32 = (@as(f32, @floatFromInt(r_u)) / 255.0) * self.opacity;
             const g: f32 = (@as(f32, @floatFromInt(g_u)) / 255.0) * self.opacity;
             const b: f32 = (@as(f32, @floatFromInt(b_u)) / 255.0) * self.opacity;
@@ -1260,6 +1278,18 @@ pub const Renderer = struct {
             const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return;
             var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
             om_set_blend(ctx, self.blend.?, &blend_factor, 0xFFFFFFFF);
+        }
+
+        // ---- Editor card ----
+        // Only over a fresh clear: the card lies outside every row's scissor,
+        // so a preserved back_tex keeps it, and drawing it again would blend
+        // its anti-aliased edge over itself.
+        if (should_clear) {
+            if (opts.island) |card| {
+                self.setFullViewport();
+                try self.drawIslandCard(card, bg_rgb);
+                bindContentViewport(ctx, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height, effective_dirty);
+            }
         }
 
         // ---- Tabbar (if content_y_offset is set) ----
@@ -1532,6 +1562,61 @@ pub const Renderer = struct {
         if (self.tabline_strip.width == 0 or height == 0 or self.width == 0 or self.height == 0) return;
         const ndc_bottom: f32 = 1.0 - 2.0 * (@as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(self.height)));
         try self.drawStripTexture(&self.tabline_strip, -1.0, 1.0, 1.0, ndc_bottom);
+    }
+
+    /// The editor card in the default bg, over the ground the clear painted.
+    /// One quad per quarter, each carrying its pixel distances from the
+    /// card's two nearest edges (uv.y, deco_phase), which interpolate
+    /// linearly within a quarter; ISLAND_CARD in main.hlsl rounds the corner
+    /// from them. The radius rides in deco_flags, unused by that branch.
+    fn drawIslandCard(self: *Renderer, card: Island, bg_rgb: u32) !void {
+        if (self.width == 0 or self.height == 0) return;
+        try self.setLayerTransform(0, 0, 0, 0);
+        const rgb = if (bg_rgb == 0xFFFFFFFF) 0 else bg_rgb;
+        const color: [4]f32 = .{
+            @as(f32, @floatFromInt((rgb >> 16) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt((rgb >> 8) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt(rgb & 0xFF)) / 255.0,
+            self.opacity,
+        };
+        const w: f32 = @floatFromInt(self.width);
+        const h: f32 = @floatFromInt(self.height);
+        const l: f32 = @floatFromInt(card.left_px);
+        const t: f32 = @floatFromInt(card.top_px);
+        const r: f32 = @floatFromInt(card.right_px);
+        const b: f32 = @floatFromInt(card.bottom_px);
+        const cx = (l + r) * 0.5;
+        const cy = (t + b) * 0.5;
+        const half_w = cx - l;
+        const half_h = cy - t;
+        // Per quarter: x span with the distance to the vertical edge at each
+        // end, then the same for y.
+        const quarters = [4][8]f32{
+            .{ l, cx, 0, half_w, t, cy, 0, half_h },
+            .{ cx, r, half_w, 0, t, cy, 0, half_h },
+            .{ l, cx, 0, half_w, cy, b, half_h, 0 },
+            .{ cx, r, half_w, 0, cy, b, half_h, 0 },
+        };
+        const marker: f32 = -11.0;
+        var verts: [24]core.Vertex = undefined;
+        for (quarters, 0..) |q, i| {
+            const x0 = -1.0 + 2.0 * q[0] / w;
+            const x1 = -1.0 + 2.0 * q[1] / w;
+            const y0 = 1.0 - 2.0 * q[4] / h;
+            const y1 = 1.0 - 2.0 * q[5] / h;
+            const corners = [6][4]f32{
+                .{ x0, y0, q[2], q[6] },
+                .{ x1, y0, q[3], q[6] },
+                .{ x0, y1, q[2], q[7] },
+                .{ x1, y0, q[3], q[6] },
+                .{ x1, y1, q[3], q[7] },
+                .{ x0, y1, q[2], q[7] },
+            };
+            for (corners, 0..) |v, j| {
+                verts[i * 6 + j] = .{ .position = .{ v[0], v[1] }, .texCoord = .{ marker, v[2] }, .color = color, .grid_id = 0, .deco_flags = card.radius_px, .deco_phase = v[3] };
+            }
+        }
+        try self.drawVertices(&verts);
     }
 
     /// Draw sidebar texture as a full-height strip whose left edge is `x_px`.

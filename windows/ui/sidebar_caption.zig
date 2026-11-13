@@ -156,12 +156,41 @@ pub fn coveredPx(app: *const App) c_int {
     return @intFromFloat(@round(@as(f32, @floatFromInt(full)) * open));
 }
 
-pub const Insets = struct { left: c_int = 0, right: c_int = 0 };
+pub const Insets = struct { left: c_int = 0, right: c_int = 0, top: c_int = 0, bottom: c_int = 0 };
+
+/// Ground between the editor card and the window edges or the sidebar.
+const ISLAND_MARGIN_PT: c_int = 6;
+/// Background between the card's edge and the grid; at least (1 - 1/sqrt 2)
+/// of the corner radius, so no cell reaches into a corner.
+const ISLAND_PADDING_PT: c_int = 6;
+pub const ISLAND_RADIUS_PT: c_int = 10;
+
+/// The rounded editor card a captionless sidebar window draws the grid in:
+/// its edges' distances from the client edges, in px.
+pub fn island(app: *const App) ?Insets {
+    if (!(captionless(app) and enabled(app))) return null;
+    const side = sidebarInsetsPx(app);
+    const m = app.scalePx(ISLAND_MARGIN_PT);
+    // The band above already holds the card off the top.
+    return .{ .left = side.left + m, .right = side.right + m, .top = @max(editorTopPx(app), m), .bottom = m };
+}
+
+/// Pixels the grid leaves at each side: the sidebar's, the title band or
+/// titlebar tabs above it, and inside an editor card its margin and padding.
+pub fn gridInsetsPx(app: *const App) Insets {
+    if (island(app)) |card| {
+        const p = app.scalePx(ISLAND_PADDING_PT);
+        return .{ .left = card.left + p, .right = card.right + p, .top = card.top + p, .bottom = card.bottom + p };
+    }
+    var insets = sidebarInsetsPx(app);
+    insets.top = editorTopPx(app);
+    return insets;
+}
 
 /// Pixels the grid leaves to the sidebar at each side. Mid-slide the grid
 /// keeps the open width and only moves, so Neovim is resized once per toggle
 /// (before opening, after closing).
-pub fn gridInsetsPx(app: *const App) Insets {
+fn sidebarInsetsPx(app: *const App) Insets {
     if (!(app.ext_tabline_enabled and app.tabline_style == .sidebar)) return .{};
     const full = fullPx(app);
     const covered = coveredPx(app);

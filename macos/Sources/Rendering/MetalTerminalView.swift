@@ -255,7 +255,29 @@ final class MetalTerminalView: GridInputView {
     private func applyGridInsets() {
         renderer.setGridInsets(leftPx: (gridInsetsPt.left * backingScale).rounded(),
                                rightPx: (gridInsetsPt.right * backingScale).rounded(),
-                               topPx: (gridInsetsPt.top * backingScale).rounded())
+                               topPx: (gridInsetsPt.top * backingScale).rounded(),
+                               bottomPx: (gridInsetsPt.bottom * backingScale).rounded())
+        let island = islandInsetsPt.map { i in
+            GridSurfaceRenderer.Island(
+                leftPx: (i.left * backingScale).rounded(), rightPx: (i.right * backingScale).rounded(),
+                topPx: (i.top * backingScale).rounded(), bottomPx: (i.bottom * backingScale).rounded(),
+                radiusPx: (Self.islandCornerRadiusPt * backingScale).rounded())
+        }
+        renderer.setIsland(island)
+    }
+
+    static let islandCornerRadiusPt: CGFloat = 10
+
+    /// Insets of the rounded editor card from the drawable edges; nil draws
+    /// no card. The grid sits inside it (gridInsetsPt), and the drawable
+    /// outside it shows the ground colour the sidebar shares.
+    var islandInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat)? {
+        didSet {
+            guard islandInsetsPt.map({ [$0.left, $0.right, $0.top, $0.bottom] })
+                    != oldValue.map({ [$0.left, $0.right, $0.top, $0.bottom] }) else { return }
+            applyGridInsets()
+            requestRedraw()
+        }
     }
 
     var renderer: GridSurfaceRenderer!
@@ -671,7 +693,7 @@ final class MetalTerminalView: GridInputView {
             // reference. A size seen during a live resize is the user's drag
             // even when it equals the last snap. Main-thread only, same as the snap.
             let curTermPt = CGSize(width: bounds.width - gridInsetsPt.left - gridInsetsPt.right,
-                                   height: bounds.height - gridInsetsPt.top)
+                                   height: bounds.height - gridInsetsPt.top - gridInsetsPt.bottom)
             if !inLiveResize, let snapped = core.lastSnappedTermPx,
                abs(curTermPt.width - snapped.width) < 0.5,
                abs(curTermPt.height - snapped.height) < 0.5 {
@@ -1512,10 +1534,11 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// from the same point, so they name the same cell.
     var contentOriginPt: CGPoint { CGPoint(x: gridInsetsPt.left, y: gridInsetsPt.top) }
 
-    /// Points of the drawable left of, right of and above the grid, covered
-    /// by a translucent sidebar or titlebar tabs. The drawable (and the custom shader) spans the
-    /// whole view; Neovim's grid gets the rest.
-    var gridInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat) = (0, 0, 0) {
+    /// Points of the drawable left of, right of, above and below the grid,
+    /// covered by a translucent sidebar, titlebar tabs or the island margin.
+    /// The drawable (and the custom shader) spans the whole view; Neovim's
+    /// grid gets the rest.
+    var gridInsetsPt: (left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat) = (0, 0, 0, 0) {
         didSet {
             guard gridInsetsPt != oldValue else { return }
             gridInsetsDidChange()

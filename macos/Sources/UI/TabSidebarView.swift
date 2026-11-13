@@ -301,7 +301,14 @@ final class TabSidebarView: NSView {
     // the blur effect. The sidebar draws a subtle colorscheme tint over it.
     // When blur is disabled, the sidebar draws an opaque colorscheme-based background.
 
+    /// The editor surface draws the ground under the sidebar (the editor
+    /// card's surround), so the sidebar paints none of its own.
+    var showsEditorGround = false {
+        didSet { if showsEditorGround != oldValue { needsDisplay = true } }
+    }
+
     private var sidebarBackgroundColor: NSColor {
+        if showsEditorGround { return .clear }
         if blurEnabled {
             // Subtle tint over the blur effect
             return NSColor(red: bgR, green: bgG, blue: bgB, alpha: 0.25)
@@ -329,6 +336,28 @@ final class TabSidebarView: NSView {
 
     /// `bg` with its OKLab L moved by the sidebar delta, hue and chroma kept.
     static func lightnessShifted(r: CGFloat, g: CGFloat, b: CGFloat, darker: Bool) -> NSColor {
+        oklabLightnessShifted(r: r, g: g, b: b) { _ in darker ? -sidebarLightnessDeltaLight : sidebarLightnessDeltaDark }
+    }
+
+    /// Below this OKLab L a darker ground would clip to black, so the ground
+    /// goes lighter than the card instead.
+    private static let islandDarkenMinL: CGFloat = 0.2
+
+    /// The ground the editor card and the sidebar share: the bg a lightness
+    /// step darker (lighter for a near-black bg), hue and chroma kept.
+    static func islandGroundRGB(bgRGB: UInt32) -> UInt32 {
+        let c = oklabLightnessShifted(
+            r: CGFloat((bgRGB >> 16) & 0xFF) / 255, g: CGFloat((bgRGB >> 8) & 0xFF) / 255, b: CGFloat(bgRGB & 0xFF) / 255
+        ) { L in
+            let delta = L >= 0.5 ? sidebarLightnessDeltaLight : sidebarLightnessDeltaDark
+            return L >= islandDarkenMinL ? -delta : delta
+        }
+        func byte(_ v: CGFloat) -> UInt32 { UInt32((max(0, min(1, v)) * 255).rounded()) }
+        return (byte(c.redComponent) << 16) | (byte(c.greenComponent) << 8) | byte(c.blueComponent)
+    }
+
+    /// `bg` with its OKLab L moved by `deltaL(L)`, hue and chroma kept.
+    private static func oklabLightnessShifted(r: CGFloat, g: CGFloat, b: CGFloat, deltaL: (CGFloat) -> CGFloat) -> NSColor {
         func toLinear(_ c: CGFloat) -> CGFloat { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
         func toSRGB(_ c: CGFloat) -> CGFloat {
             let v = max(0, min(1, c))
@@ -341,7 +370,7 @@ final class TabSidebarView: NSView {
         var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
         let A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
         let B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-        L = max(0, min(1, L + (darker ? -sidebarLightnessDeltaLight : sidebarLightnessDeltaDark)))
+        L = max(0, min(1, L + deltaL(L)))
         let l2 = pow(L + 0.3963377774 * A + 0.2158037573 * B, 3)
         let m2 = pow(L - 0.1055613458 * A - 0.0638541728 * B, 3)
         let s2 = pow(L - 0.0894841775 * A - 1.2914855480 * B, 3)

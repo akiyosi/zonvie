@@ -2038,7 +2038,13 @@ const SidebarColors = struct {
         var sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
         var sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
         var sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
-        if (sidebar_caption.captionless(app)) {
+        if (sidebar_caption.island(app) != null) {
+            // The editor card's ground, exactly as the renderer clears it.
+            const ground = islandGroundRgb(app.colorscheme_bg);
+            sb_bgR = @as(f32, @floatFromInt((ground >> 16) & 0xFF)) / 255.0;
+            sb_bgG = @as(f32, @floatFromInt((ground >> 8) & 0xFF)) / 255.0;
+            sb_bgB = @as(f32, @floatFromInt(ground & 0xFF)) / 255.0;
+        } else if (sidebar_caption.captionless(app)) {
             const tint = lightnessShifted(bgR, bgG, bgB, !is_dark);
             const overlay_alpha: f32 = 0.55;
             sb_bgR = bgR + (tint[0] - bgR) * overlay_alpha;
@@ -2116,6 +2122,16 @@ const SidebarColors = struct {
     /// `rgb` (sRGB 0-1) with its OKLab L moved by the sidebar delta, hue and
     /// chroma kept. Same constants as macOS TabSidebarView.lightnessShifted.
     fn lightnessShifted(r: f32, g: f32, b: f32, darker: bool) [3]f32 {
+        return oklabLightnessShifted(r, g, b, if (darker) .sidebar_darker else .sidebar_lighter);
+    }
+
+    const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
+
+    /// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The
+    /// island ground goes darker by the sidebar step for the bg's side of
+    /// mid-grey, or lighter when darker would clip to black: macOS
+    /// TabSidebarView.islandGroundRGB.
+    fn oklabLightnessShifted(r: f32, g: f32, b: f32, shift: LightnessShift) [3]f32 {
         const lr = srgbToLinear(r);
         const lg = srgbToLinear(g);
         const lb = srgbToLinear(b);
@@ -2125,7 +2141,15 @@ const SidebarColors = struct {
         var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
         const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
         const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
-        L = std.math.clamp(L + (if (darker) @as(f32, -0.07) else 0.04), 0.0, 1.0);
+        const delta: f32 = switch (shift) {
+            .sidebar_darker => -0.07,
+            .sidebar_lighter => 0.04,
+            .island_ground => blk: {
+                const step: f32 = if (L >= 0.5) 0.07 else 0.04;
+                break :blk if (L >= 0.2) -step else step;
+            },
+        };
+        L = std.math.clamp(L + delta, 0.0, 1.0);
         const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
         const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
         const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
@@ -2150,6 +2174,21 @@ const SidebarColors = struct {
         return @intFromFloat(clamped * 255.0);
     }
 };
+
+/// The ground an editor card and the sidebar share, as 0xRRGGBB, from the
+/// colorscheme bg (0xFFFFFFFF before one is known: SidebarColors' default).
+pub fn islandGroundRgb(colorscheme_bg: u32) u32 {
+    const bg = if (colorscheme_bg == 0xFFFFFFFF) 0x252629 else colorscheme_bg;
+    const shifted = SidebarColors.oklabLightnessShifted(
+        @as(f32, @floatFromInt((bg >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((bg >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(bg & 0xFF)) / 255.0,
+        .island_ground,
+    );
+    return (@as(u32, SidebarColors.f2u8(shifted[0])) << 16) |
+        (@as(u32, SidebarColors.f2u8(shifted[1])) << 8) |
+        SidebarColors.f2u8(shifted[2]);
+}
 
 /// Draw sidebar content (vertical tab list) using GDI.
 /// Colors are derived from the Neovim colorscheme (mirroring macOS TabSidebarView).

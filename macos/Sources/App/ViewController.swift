@@ -88,7 +88,7 @@ final class ViewController: NSViewController {
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         // A "column" scrollbar keeps its strip from launch, chrome or not;
         // updateGridInsets re-adds it whenever the chrome moves the grid.
-        terminalView.gridInsetsPt = (0, ZonvieConfig.shared.scrollbar.columnWidthPt, 0)
+        terminalView.gridInsetsPt = (0, ZonvieConfig.shared.scrollbar.columnWidthPt, 0, 0)
 
         view.addSubview(terminalView)
 
@@ -498,20 +498,23 @@ final class ViewController: NSViewController {
         let column = ZonvieConfig.shared.scrollbar.columnWidthPt
         if tabBarView != nil, editorRunsUnderBand {
             // Titlebar tabs float over the editor surface; the grid starts below them.
-            terminalView.gridInsetsPt = (0, column, tabBarHeight)
+            terminalView.islandInsetsPt = nil
+            terminalView.gridInsetsPt = (0, column, tabBarHeight, 0)
             return
         }
         guard let sidebar = sidebarView else {
             // Native titlebar tabs, a menu or no tabline: the grid starts at
             // the editor top, under a captionless band.
-            terminalView.gridInsetsPt = (0, column, titleBandInsetPt)
+            terminalView.islandInsetsPt = nil
+            terminalView.gridInsetsPt = (0, column, titleBandInsetPt, 0)
             return
         }
         guard editorRunsUnderBand else {
             // The editor sits beside the sidebar (its constraints), not under
             // it: only the column strip comes off the grid.
+            terminalView.islandInsetsPt = nil
             terminalView.scrollbarInsetRightPt = 0
-            terminalView.gridInsetsPt = (0, column, titleBandInsetPt)
+            terminalView.gridInsetsPt = (0, column, titleBandInsetPt, 0)
             return
         }
         // Under a transparent titlebar the editor spans the window under the sidebar.
@@ -520,16 +523,29 @@ final class ViewController: NSViewController {
         // starts full width and the window snap never records that width.
         let covered = view.bounds.intersection(sidebar.frame).width
         terminalView.scrollbarInsetRightPt = sidebar.isRightSide ? covered : 0
+        // The editor card's edges: what the sidebar leaves, less a margin of
+        // ground on every side. The band above already holds it off the top.
+        let left: CGFloat, right: CGFloat
         if sidebarSliding {
             // Mid-slide the grid keeps the open-sidebar width and only moves,
             // so Neovim is resized once (before opening, after closing) and
             // opening and closing are mirror images.
             let width = sidebarWidthPt
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, width + column, titleBandInsetPt) : (covered, width - covered + column, titleBandInsetPt)
+            (left, right) = sidebar.isRightSide ? (0, width) : (covered, width - covered)
         } else {
-            terminalView.gridInsetsPt = sidebar.isRightSide ? (0, covered + column, titleBandInsetPt) : (covered, column, titleBandInsetPt)
+            (left, right) = sidebar.isRightSide ? (0, covered) : (covered, 0)
         }
+        let m = Self.islandMarginPt, p = Self.islandPaddingPt
+        let island = (left: left + m, right: right + m, top: max(titleBandInsetPt, m), bottom: m)
+        terminalView.islandInsetsPt = island
+        terminalView.gridInsetsPt = (island.left + p, island.right + p + column, island.top + p, island.bottom + p)
     }
+
+    /// Ground between the editor card and the window edges or the sidebar.
+    private static let islandMarginPt: CGFloat = 6
+    /// Background between the card's edge and the grid; at least
+    /// (1 - 1/√2) of the corner radius, so no cell reaches into a corner.
+    private static let islandPaddingPt: CGFloat = 6
 
     private var titlebarChromeInstalled = false
     /// Where the toggle sits: past the traffic lights for a left sidebar, or
@@ -756,6 +772,8 @@ final class ViewController: NSViewController {
         }
 
         self.sidebarView = sidebar
+        // Under the sidebar the editor surface draws its card's ground.
+        sidebar.showsEditorGround = editorRunsUnderBand
 
         // A self-drawn band lies clear over the top of the editor's side (its
         // height comes off the grid, titleBandInsetPt); the sidebar still
