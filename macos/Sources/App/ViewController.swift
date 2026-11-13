@@ -497,9 +497,11 @@ final class ViewController: NSViewController {
         // the chrome leaves, left of a right sidebar.
         let column = ZonvieConfig.shared.scrollbar.columnWidthPt
         if tabBarView != nil, editorRunsUnderBand {
-            // Titlebar tabs float over the editor surface; the grid starts below them.
-            terminalView.islandInsetsPt = nil
-            terminalView.gridInsetsPt = (0, column, tabBarHeight, 0)
+            // Titlebar tabs float over the editor surface, clear, so the
+            // card's ground shows under them. The tabs stay centred on the
+            // traffic lights; the card rises to just below their shapes.
+            let tabsBottomPt = tabBarHeight - (tabBarBaseHeight - TabBarView.tabShapeHeightPt) / 2
+            setIsland(left: 0, right: 0, top: tabsBottomPt + Self.islandTabGapPt, column: column)
             return
         }
         guard let sidebar = sidebarView else {
@@ -523,8 +525,7 @@ final class ViewController: NSViewController {
         // starts full width and the window snap never records that width.
         let covered = view.bounds.intersection(sidebar.frame).width
         terminalView.scrollbarInsetRightPt = sidebar.isRightSide ? covered : 0
-        // The editor card's edges: what the sidebar leaves, less a margin of
-        // ground on every side. The band above already holds it off the top.
+        // The editor card goes in what the sidebar leaves.
         let left: CGFloat, right: CGFloat
         if sidebarSliding {
             // Mid-slide the grid keeps the open-sidebar width and only moves,
@@ -535,12 +536,21 @@ final class ViewController: NSViewController {
         } else {
             (left, right) = sidebar.isRightSide ? (0, covered) : (covered, 0)
         }
+        setIsland(left: left, right: right, top: titleBandInsetPt, column: column)
+    }
+
+    /// The editor card within what the chrome leaves (`left`, `right`,
+    /// `top`), less a margin of ground on every side; the band above already
+    /// holds it off the top. The grid sits inside it past the padding.
+    private func setIsland(left: CGFloat, right: CGFloat, top: CGFloat, column: CGFloat) {
         let m = Self.islandMarginPt, p = Self.islandPaddingPt
-        let island = (left: left + m, right: right + m, top: max(titleBandInsetPt, m), bottom: m)
+        let island = (left: left + m, right: right + m, top: max(top, m), bottom: m)
         terminalView.islandInsetsPt = island
         terminalView.gridInsetsPt = (island.left + p, island.right + p + column, island.top + p, island.bottom + p)
     }
 
+    /// Ground between the titlebar tabs' shapes and the editor card.
+    private static let islandTabGapPt: CGFloat = 4
     /// Ground between the editor card and the window edges or the sidebar.
     private static let islandMarginPt: CGFloat = 6
     /// Background between the card's edge and the grid; at least

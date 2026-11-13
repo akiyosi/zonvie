@@ -302,7 +302,8 @@ final class TabBarView: NSView {
     private let tabHeight: CGFloat = 30
     /// The tab shape at one line. Extra label lines extend it downward, so
     /// the first line stays where a single-line label sits.
-    private var tabRectBaseHeight: CGFloat { tabHeight - 6 }
+    private var tabRectBaseHeight: CGFloat { Self.tabShapeHeightPt }
+    static let tabShapeHeightPt: CGFloat = 24
     private var extraLinesHeight: CGFloat {
         TabCardLayout.titlebarBarHeight_pt(base_pt: 0, lineCount: labelLineCount)
     }

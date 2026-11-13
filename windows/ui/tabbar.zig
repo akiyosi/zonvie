@@ -1399,8 +1399,12 @@ pub const TitlebarPalette = struct {
 };
 
 pub fn currentTitlebarPalette(app: *const App) TitlebarPalette {
-    if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF)
-        return colorschemeTitlebarPalette(app.colorscheme_bg, app.colorscheme_fg);
+    if (app.config.window.titlebar_style.paintsEditorBg() and app.colorscheme_bg != 0xFFFFFFFF) {
+        // Titlebar tabs over an editor card sit on its ground, as the
+        // renderer clears it; tab states shift from there.
+        const base = if (sidebar_caption.titlebarTabsIsland(app)) islandGroundRgb(app.colorscheme_bg) else app.colorscheme_bg;
+        return colorschemeTitlebarPalette(base, app.colorscheme_fg);
+    }
     return osTitlebarPalette();
 }
 

@@ -165,14 +165,27 @@ const ISLAND_MARGIN_PT: c_int = 6;
 const ISLAND_PADDING_PT: c_int = 6;
 pub const ISLAND_RADIUS_PT: c_int = 10;
 
-/// The rounded editor card a captionless sidebar window draws the grid in:
-/// its edges' distances from the client edges, in px.
+/// Ground between the titlebar tabs, which reach the bar's bottom, and the card.
+const ISLAND_TAB_GAP_PT: c_int = 4;
+
+/// The rounded editor card the grid is drawn in, under a captionless sidebar
+/// or titlebar tabs in the editor's colours: its edges' distances from the
+/// client edges, in px.
 pub fn island(app: *const App) ?Insets {
+    const m = app.scalePx(ISLAND_MARGIN_PT);
+    if (titlebarTabsIsland(app)) {
+        return .{ .left = m, .right = m, .top = editorTopPx(app) + app.scalePx(ISLAND_TAB_GAP_PT), .bottom = m };
+    }
     if (!(captionless(app) and enabled(app))) return null;
     const side = sidebarInsetsPx(app);
-    const m = app.scalePx(ISLAND_MARGIN_PT);
     // The band above already holds the card off the top.
     return .{ .left = side.left + m, .right = side.right + m, .top = @max(editorTopPx(app), m), .bottom = m };
+}
+
+/// Titlebar tabs on the editor's colours: the bar sits on the card's ground.
+pub fn titlebarTabsIsland(app: *const App) bool {
+    const l = layout(app);
+    return l.tabline == .titlebar and l.style.paintsEditorBg();
 }
 
 /// Pixels the grid leaves at each side: the sidebar's, the title band or
