@@ -33,6 +33,12 @@ pub const Widgets = struct {
     drag_start: [2]f64 = .{ 0, 0 },
     /// Holds the editor view and the boxes over it; the same size as the view.
     overlay: ?*anyopaque = null,
+    /// The rounded editor card around `overlay` (App.island); null without one.
+    card: ?*anyopaque = null,
+    /// The alpha of the card's ring and ground: [window] opacity, which the
+    /// view inside clears itself with. Set with `card`, before the first
+    /// stylesheet, and fixed from then on.
+    opacity: f32 = 1,
     mini_box: ?*anyopaque = null,
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
@@ -118,9 +124,25 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     gtk.gtk_overlay_set_child(overlay, area);
     w.overlay = overlay;
     if (frames) |f| gtk.gtk_overlay_add_overlay(overlay, f);
+    // The editor card: the overlay inside a styled box (.zonvie-card), whose
+    // ground is a shadow the holder clips to its own rect. A ground painted
+    // under the card would show through a translucent one (applyCss).
+    var content: *anyopaque = overlay;
+    if (app.island()) {
+        const card = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
+        gtk.gtk_widget_add_css_class(card, "zonvie-card");
+        gtk.gtk_box_append(card, overlay);
+        const holder = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
+        gtk.gtk_widget_set_overflow(holder, gtk.GTK_OVERFLOW_HIDDEN);
+        gtk.gtk_box_append(holder, card);
+        gtk.gtk_widget_add_css_class(tabbar, "ground");
+        w.card = card;
+        w.opacity = std.math.clamp(app.window_cfg.opacity, 0, 1);
+        content = holder;
+    }
     const right = w.sidebar and std.mem.eql(u8, cfg.sidebar_position, "right");
     if (!right) gtk.gtk_box_append(root, tabbar);
-    gtk.gtk_box_append(root, overlay);
+    gtk.gtk_box_append(root, content);
     if (right) gtk.gtk_box_append(root, tabbar);
 
     const m: c_int = margin_pt;
@@ -446,6 +468,16 @@ fn splitRgb(c: u32) [3]f32 {
     };
 }
 
+/// Where the first titlebar tab starts on an editor card's ground: past the
+/// card's corner.
+const tab_strip_inset_pt = core.frontend_rules.island_margin_pt + core.frontend_rules.island_radius_pt;
+
+/// `rgba(r, g, b, a)` for the stylesheet.
+fn cssRgba(out: *[40]u8, c: [3]f32, a: f32) []const u8 {
+    const v = rgbOf(c);
+    return std.fmt.bufPrint(out, "rgba({d},{d},{d},{d:.3})", .{ (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff, a }) catch "transparent";
+}
+
 fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     if (w.css_fg == fg and w.css_bg == bg and w.css_font_px == font_px) return;
     const css = w.css orelse return;
@@ -459,8 +491,11 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     const b = splitRgb(bg);
     const p = core.frontend_rules.panelBg(b[0], b[1], b[2]);
     const panel = rgbOf(p);
-    const sb = core.frontend_rules.sidebarPalette(splitRgb(fg), b, null);
-    var buf: [4096]u8 = undefined;
+    const rules = core.frontend_rules;
+    // With an editor card the sidebar is the card's ground.
+    const ground: ?[3]f32 = if (w.card != null) rules.oklabLightnessShifted(b, .island_ground) else null;
+    const sb = rules.sidebarPalette(splitRgb(fg), b, ground);
+    var buf: [6144]u8 = undefined;
     // Tone colours as macOS's message panels (ZonvieCore.swift): the text
     // and, where it has one, the border.
     const text = std.fmt.bufPrintZ(&buf,
@@ -495,6 +530,35 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
         \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
     , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, rgbOf(sb.bg), rgbOf(sb.text), rgbOf(sb.separator), rgbOf(sb.hover), rgbOf(sb.selected), fg, rgbOf(sb.indicator), fg, fg }) catch return;
+    if (ground) |g| {
+        // The card paints nothing under the view, which clears itself at
+        // the same alpha: its padding is a border in the bg, and the card's
+        // one-pixel edge an outline around that, taken from the margin. The
+        // ground is a shadow spread past the holder's corners, which lie
+        // sqrt(2) * (margin + radius) from the corner arcs' centres.
+        // The tab strip sits on the ground with no line of its own (the
+        // theme borders a .sidebar), the current tab in the card's bg and
+        // joined to its top edge, clear of the card's corner.
+        var c: [3][40]u8 = undefined;
+        const card_margin_pt = rules.island_margin_pt;
+        const card_radius_pt = rules.island_radius_pt;
+        const ground_css = cssRgba(&c[0], g, w.opacity);
+        const bg_css = cssRgba(&c[1], b, w.opacity);
+        _ = std.fmt.bufPrintZ(buf[text.len..],
+            \\.zonvie-card {{ margin: {d}px; border: {d}px solid {s}; outline: 1px solid {s};
+            \\  border-radius: {d}px; box-shadow: 0 0 0 {d}px {s}; }}
+            \\.zonvie-card.under-tabs {{ margin-top: 1px; }}
+            \\.zonvie-tabbar.ground {{ background-color: {s}; border: none; }}
+            \\.zonvie-tabbar.ground:not(.sidebar) {{ color: #{x:0>6}; padding-left: {d}px; }}
+            \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab {{ border-radius: 8px 8px 0 0; }}
+            \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab.current {{ background-color: {s}; }}
+        , .{
+            card_margin_pt + 1, rules.island_padding_pt - 1,   bg_css,     cssRgba(&c[2], rules.islandBorder(b), w.opacity),
+            card_radius_pt - 1, 2 * (card_margin_pt + card_radius_pt),   ground_css,
+            ground_css,    fg,                            tab_strip_inset_pt,
+            bg_css,
+        }) catch return;
+    }
     gtk.gtk_css_provider_load_from_string(css, text.ptr);
 }
 
@@ -657,6 +721,10 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
     const bar = w.tabbar orelse return;
     const tabs = w.tabs orelse return;
     gtk.gtk_widget_set_visible(bar, @intFromBool(ui.tabline_visible));
+    // Titlebar tabs sit on the card's top edge.
+    if (w.card) |card| {
+        if (ui.tabline_visible and !w.sidebar) gtk.gtk_widget_add_css_class(card, "under-tabs") else gtk.gtk_widget_remove_css_class(card, "under-tabs");
+    }
     var same = w.tab_count == ui.tab_count and w.curtab == ui.curtab;
     if (same) {
         for (ui.tabs[0..ui.tab_count], w.tab_handles[0..ui.tab_count]) |t, h| {
@@ -693,7 +761,11 @@ fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
         // whenever the list changes, so it never outlives its tab.
         const name_btn = gtk.gtk_button_new_with_label("") orelse continue;
         setButtonLabel(app, name_btn, t.name.text());
-        if (gtk.gtk_button_get_child(name_btn)) |l| gtk.gtk_label_set_ellipsize(l, gtk.PANGO_ELLIPSIZE_END);
+        // A long name must not widen the tab past its share (sizeTabs): the
+        // button ellipsizes its label (it resets the label's own ellipsize
+        // mode on every set_label), which asks for no width of its own.
+        gtk.gtk_button_set_can_shrink(name_btn, 1);
+        if (gtk.gtk_button_get_child(name_btn)) |l| gtk.gtk_label_set_max_width_chars(l, 1);
         gtk.gtk_widget_set_focusable(name_btn, 0);
         gtk.gtk_widget_set_hexpand(name_btn, 1);
         _ = gtk.g_signal_connect(name_btn, "clicked", @ptrCast(&onTabClicked), @ptrFromInt(i + 1));

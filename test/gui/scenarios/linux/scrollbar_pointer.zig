@@ -35,16 +35,19 @@ pub fn run(alloc: std.mem.Allocator) !void {
     gui_io.sleepNs(500 * std.time.ns_per_ms);
     const b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
 
-    // The track's centre line, 2 + 6 logical px in from the right edge.
-    const x = b.x + b.w - 8;
+    // The editor view sits inside the card's margin and padding
+    // (frontend_rules.island_margin_pt + island_padding_pt), logical px.
+    const card = 12;
+    // The track's centre line, 2 + 6 logical px in from the view's right edge.
+    const x = b.x + b.w - card - 8;
     // At line 1 the knob starts at the top of the track.
-    ptr.drag(.{ x, b.y + 12 }, .{ x, b.y + b.h - 4 }, 12);
+    ptr.drag(.{ x, b.y + card + 12 }, .{ x, b.y + b.h - card - 4 }, 12);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
     const bottom = try g.evalInt("line('w0')");
 
     // The knob is at the bottom now: a press near the top is on the track
     // above it, which pages up.
-    ptr.click(x, b.y + 20, @import("../../linux_pointer.zig").btn_left);
+    ptr.click(x, b.y + card + 20, @import("../../linux_pointer.zig").btn_left);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
     const paged = try g.evalInt("line('w0')");
 

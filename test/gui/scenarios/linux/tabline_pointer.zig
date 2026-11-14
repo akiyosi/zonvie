@@ -20,9 +20,12 @@ const log_path = "tmp/gui_tabline_pointer.log";
 /// width, held to 100..200 (ui_widgets.sizeTabs), and + follows the last.
 const plus_w = 40;
 const strip_mid_y = 14;
+/// Where the first tab starts: past the editor card's corner, its margin
+/// and radius (frontend_rules.island_margin_pt + island_radius_pt).
+const strip_inset = 16;
 
-fn tabWidth(strip_w: f64, count: f64) f64 {
-    return std.math.clamp(@floor((strip_w - plus_w) / count), 100, 200);
+fn tabWidth(window_w: f64, count: f64) f64 {
+    return std.math.clamp(@floor((window_w - strip_inset - plus_w) / count), 100, 200);
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -45,27 +48,28 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('silent! tabonly | enew | file one | tabnew | file two | tabnew | file three | 1tabnext')");
     gui_io.sleepNs(600 * std.time.ns_per_ms);
     const b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
+    const x0 = b.x + strip_inset;
     const tab_w = tabWidth(b.w, 3);
     const y = b.y + strip_mid_y;
 
     // A click on the second tab's name selects it.
-    ptr.click(b.x + tab_w * 1.4, y, btn_left);
+    ptr.click(x0 + tab_w * 1.4, y, btn_left);
     gui_io.sleepNs(400 * std.time.ns_per_ms);
     const selected = try g.evalInt("tabpagenr()");
 
     // The third tab's close button, at its trailing edge.
-    ptr.click(b.x + tab_w * 3 - 12, y, btn_left);
+    ptr.click(x0 + tab_w * 3 - 12, y, btn_left);
     gui_io.sleepNs(400 * std.time.ns_per_ms);
     const after_close = try g.evalInt("tabpagenr('$')");
 
     // +, right after the last of the two tabs left.
-    ptr.click(b.x + tabWidth(b.w, 2) * 2 + plus_w / 2, y, btn_left);
+    ptr.click(x0 + tabWidth(b.w, 2) * 2 + plus_w / 2, y, btn_left);
     gui_io.sleepNs(400 * std.time.ns_per_ms);
     const after_new = try g.evalInt("tabpagenr('$')");
 
     // Three tabs again: drag the first ("one") past the last.
     const tab_w3 = tabWidth(b.w, 3);
-    ptr.drag(.{ b.x + tab_w3 * 0.4, y }, .{ b.x + tab_w3 * 2.9, y }, 10);
+    ptr.drag(.{ x0 + tab_w3 * 0.4, y }, .{ x0 + tab_w3 * 2.9, y }, 10);
     gui_io.sleepNs(500 * std.time.ns_per_ms);
     const last_is_one = try g.evalInt("bufname(tabpagebuflist(tabpagenr('$'))[0]) ==# 'one'");
 

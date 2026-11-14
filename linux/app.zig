@@ -73,6 +73,8 @@ pub const App = struct {
     copy_messages: bool = true,
     /// config.toml's [tabline].
     tabline_cfg: core.config.Config.TablineConfig = .{},
+    /// ext_tabline is on (config.toml or --exttabline).
+    ext_tabline: bool = false,
     /// config.toml's [scrollbar], and the main window's bar.
     scrollbar_cfg: core.config.Config.ScrollbarConfig = .{},
     scrollbar: scrollbar.State = .{},
@@ -252,6 +254,23 @@ pub const App = struct {
         self.ext_ops.deinit(self.alloc);
         self.ext_ops_gtk.deinit(self.alloc);
         self.cell_age.deinit();
+    }
+
+    /// The main window draws its grid in a rounded card on a ground colour.
+    /// Of Config.TitlebarLayout Linux follows this predicate alone: the
+    /// desktop draws the titlebar. Fixed at startup.
+    pub fn island(self: *const App) bool {
+        const Config = core.config.Config;
+        const tabline: Config.TablinePlacement = if (!self.ext_tabline)
+            .other
+        else if (std.mem.eql(u8, self.tabline_cfg.style, "sidebar"))
+            .sidebar
+        else if (std.mem.eql(u8, self.tabline_cfg.style, "titlebar"))
+            .titlebar
+        else
+            .other;
+        const layout: Config.TitlebarLayout = .{ .style = self.window_cfg.titlebar_style, .tabline = tabline };
+        return layout.island();
     }
 
     /// GTK main thread: every window draws the committed frame.

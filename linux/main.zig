@@ -154,6 +154,27 @@ fn buildThreaded(app: *App) ?[2]*anyopaque {
     return .{ area, picture };
 }
 
+/// What the editor view leaves at each side of the window (a tab strip or
+/// sidebar, an editor card's margin and padding), device px, in the field
+/// form the GUI driver parses. As laid out now: called from the view's
+/// resize, which every change of those follows.
+fn logGridInsets(app: *App, scale: f32) void {
+    const win = app.window orelse return;
+    const view = app.widgets.overlay orelse return;
+    var r: gtk.GrapheneRect = .{};
+    if (gtk.gtk_widget_compute_bounds(view, win, &r) == 0) return;
+    const win_w: f32 = @floatFromInt(gtk.gtk_widget_get_width(win));
+    const win_h: f32 = @floatFromInt(gtk.gtk_widget_get_height(win));
+    const px = struct {
+        fn f(v: f32, k: f32) i32 {
+            return @intFromFloat(@round(@max(0, v) * k));
+        }
+    }.f;
+    applog.appLog("[grid_insets] left={d} top={d} right={d} bottom={d}\n", .{
+        px(r.x, scale), px(r.y, scale), px(win_w - r.x - r.w, scale), px(win_h - r.y - r.h, scale),
+    });
+}
+
 /// Non-blocking: grid_mu can be held for seconds (clipboard), so a busy core
 /// is retried on a short timeout with the latest size.
 fn pushLayout(app: *App) void {
@@ -163,8 +184,10 @@ fn pushLayout(app: *App) void {
     const h = app.drawable_h_px;
     const cw = app.cell_w_px;
     const ch = app.cell_h_px;
+    const scale = app.scale;
     unlock(app);
     if (w == 0 or h == 0 or cw == 0 or ch == 0) return;
+    if (applog.isEnabled()) logGridInsets(app, scale);
     const cols = callbacks.cmdlineCols(app, w, cw);
     if (!core.zonvie_core_try_update_layout_px(cp, w, h, cw, ch, cols.screen_cols, cols.default_cols)) {
         if (!app.layout_retry_queued) {
@@ -638,6 +661,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .window_cfg = config.window,
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
+        .ext_tabline = startup.ext_tabline,
         .copy_cmdline = config.cmdline.copy_button,
         .copy_messages = config.messages.copy_button,
         .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),

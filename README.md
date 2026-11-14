@@ -45,6 +45,10 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
 - **Translucency**: `[window] opacity` and `blur` make the window
   translucent; the blur itself is the compositor's (e.g. a Hyprland or KDE
   blur rule), so `blur_radius` has no effect.
+- **Titlebar**: the window keeps the desktop's own decorations. Of
+  `[window] titlebar_style` only the editor card applies: `"native"` and
+  `"unified"` draw it, with the tab strip or sidebar on its ground colour;
+  `"hidden"` runs the editor edge to edge.
 - **Devcontainer**: Docker must already be running; zonvie does not start
   it.
 
@@ -173,7 +177,7 @@ linespace = 2
 blur = true
 opacity = 0.85
 blur_radius = 20
-titlebar_style = "native"  # "native", "hidden" or "unified" (macOS, Windows)
+titlebar_style = "native"  # "native", "hidden" or "unified"
 
 [scrollbar]
 enabled = true
@@ -291,7 +295,7 @@ paths = [
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true). Not applicable on Linux, where the compositor blurs |
-| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge (default: `"native"`) |
+| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. On Linux only that card follows this key (default: `"native"`) |
 
 #### [scrollbar]
 | Key | Description |

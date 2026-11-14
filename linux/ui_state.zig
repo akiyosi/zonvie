@@ -244,15 +244,19 @@ pub const UiState = struct {
     }
 };
 
-/// The notification for completions drained together, as Windows words it:
+/// The notification for completions drained together, as Windows words it.
+/// The result lies in `buf`, in `done`, or is static:
 /// one names its summary, several are counted, and "needs input" is never
 /// reported as finished.
 pub fn completionMessage(buf: []u8, done: []const Completion) []const u8 {
     if (done.len == 1) {
-        const d = done[0];
+        // By pointer: a failure's title is returned as it lies in `done`.
+        const d = &done[0];
         const label = if (d.waiting) "Needs input" else "Finished";
         const fallback = if (d.waiting) "AI agent needs input" else "AI agent finished";
         if (d.title.len == 0) return fallback;
+        // A failure's title is its whole body (on_agent_status).
+        if (!d.waiting and std.mem.startsWith(u8, d.title.text(), "Failed: ")) return d.title.text();
         return std.fmt.bufPrint(buf, "{s}: {s}", .{ label, d.title.text() }) catch fallback;
     }
     var waiting: usize = 0;
@@ -380,6 +384,12 @@ test "a completion message names one and counts several" {
     var one: [1]Completion = .{.{}};
     one[0].title.append("fixed the bug");
     try testing.expectEqualStrings("Finished: fixed the bug", completionMessage(&buf, &one));
+    var failed = [_]Completion{.{}};
+    failed[0].title.append("Failed: build broke");
+    const body = completionMessage(&buf, &failed);
+    try testing.expectEqualStrings("Failed: build broke", body);
+    // In `failed` itself, not in a copy that died with the call.
+    try testing.expectEqual(@intFromPtr(failed[0].title.text().ptr), @intFromPtr(body.ptr));
     one[0] = .{ .waiting = true };
     try testing.expectEqualStrings("AI agent needs input", completionMessage(&buf, &one));
     const mixed = [_]Completion{ .{}, .{ .waiting = true }, .{} };

@@ -168,6 +168,10 @@ pub extern "c" fn gtk_gl_area_set_allowed_apis(area: *anyopaque, apis: c_uint) v
 pub extern "c" fn gtk_gl_area_make_current(area: *anyopaque) void;
 pub extern "c" fn gtk_gl_area_get_error(area: *anyopaque) ?*anyopaque;
 pub extern "c" fn gtk_widget_get_width(widget: *anyopaque) c_int;
+/// graphene_rect_t.
+pub const GrapheneRect = extern struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, h: f32 = 0 };
+/// `widget`'s bounds in `target`'s coordinates; 0 when they share no ancestor.
+pub extern "c" fn gtk_widget_compute_bounds(widget: *anyopaque, target: *anyopaque, out_bounds: *GrapheneRect) c_int;
 pub extern "c" fn gtk_widget_get_height(widget: *anyopaque) c_int;
 pub extern "c" fn gtk_widget_get_scale_factor(widget: *anyopaque) c_int;
 pub extern "c" fn gtk_widget_set_focusable(widget: *anyopaque, focusable: c_int) void;
@@ -213,8 +217,8 @@ pub extern "c" fn gtk_label_set_text(label: *anyopaque, str: [*:0]const u8) void
 pub extern "c" fn gtk_label_set_xalign(label: *anyopaque, xalign: f32) void;
 pub extern "c" fn gtk_label_set_wrap(label: *anyopaque, wrap: c_int) void;
 pub extern "c" fn gtk_label_set_max_width_chars(label: *anyopaque, n_chars: c_int) void;
-pub extern "c" fn gtk_label_set_ellipsize(label: *anyopaque, mode: c_int) void;
-pub const PANGO_ELLIPSIZE_END: c_int = 3;
+/// GTK 4.12.
+pub extern "c" fn gtk_button_set_can_shrink(button: *anyopaque, can_shrink: c_int) void;
 pub extern "c" fn gtk_button_get_child(button: *anyopaque) ?*anyopaque;
 pub extern "c" fn gtk_label_set_attributes(label: *anyopaque, attrs: ?*anyopaque) void;
 pub extern "c" fn gtk_widget_get_visible(widget: *anyopaque) c_int;
@@ -248,6 +252,8 @@ pub extern "c" fn g_notification_new(title: [*:0]const u8) ?*anyopaque;
 pub extern "c" fn g_notification_set_body(notification: *anyopaque, body: [*:0]const u8) void;
 pub extern "c" fn g_application_send_notification(app: *anyopaque, id: ?[*:0]const u8, notification: *anyopaque) void;
 pub extern "c" fn gtk_widget_set_vexpand(widget: *anyopaque, expand: c_int) void;
+pub const GTK_OVERFLOW_HIDDEN: c_int = 1;
+pub extern "c" fn gtk_widget_set_overflow(widget: *anyopaque, overflow: c_int) void;
 pub extern "c" fn gtk_widget_set_margin_top(widget: *anyopaque, m: c_int) void;
 pub extern "c" fn gtk_widget_set_margin_bottom(widget: *anyopaque, m: c_int) void;
 pub extern "c" fn gtk_widget_set_margin_start(widget: *anyopaque, m: c_int) void;

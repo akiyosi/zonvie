@@ -162,7 +162,9 @@ pub const Config = struct {
 
     /// The window chrome one `TitlebarStyle` yields with one tabline
     /// placement. Both frontends follow this table; macOS mirrors it as
-    /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift.
+    /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift. Linux, whose
+    /// titlebar is the desktop's, follows `island` alone, and puts its tab
+    /// strip and sidebar on the card's ground.
     ///
     ///                 native          hidden              unified
     ///   titlebar      tabs, card      tabs, editor bg     tabs on ground, card
@@ -1109,7 +1111,9 @@ else "") ++
     ++ (if (is_windows) "" else std.fmt.comptimePrint(
     "\n        blur_radius     Blur radius (0-100, default: {d})", .{defaults.window.blur_radius})) ++
     (if (builtin.os.tag == .macos or is_windows)
-    "\n        titlebar_style  \"native\", \"hidden\" or \"unified\" (default: \"native\")" else "") ++
+    "\n        titlebar_style  \"native\", \"hidden\" or \"unified\" (default: \"native\")" else if (builtin.os.tag == .linux)
+    "\n        titlebar_style  \"hidden\" draws the editor edge to edge instead of in a" ++
+    "\n                        rounded card (default: \"native\")" else "") ++
     \\
     \\
     \\    [scrollbar]
@@ -1219,7 +1223,7 @@ pub const default_config_toml: [:0]const u8 = std.fmt.comptimePrint(
     \\# opacity = {d:.1}
     \\# blur = {}
     ++ (if (is_windows) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
-    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\", \"hidden\" or \"unified\"" else "") ++
+    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\", \"hidden\" or \"unified\"" else if (builtin.os.tag == .linux) "\n# titlebar_style = \"native\"   # \"hidden\": the editor edge to edge, no card" else "") ++
     \\
     \\
     \\[server]
