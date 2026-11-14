@@ -1,5 +1,5 @@
 const std = @import("std");
-const pointer_target = @import("pointer_target.zig");
+pub const pointer_target = @import("pointer_target.zig");
 const scrollbar_metrics = @import("scrollbar_metrics.zig");
 const popup_placement = @import("popup_placement.zig");
 const build_options = @import("build_options");
@@ -25,7 +25,7 @@ pub const font_slots = @import("font_slots.zig");
 pub const scroll_ease = @import("scroll_ease.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
-const msg_stack = @import("msg_stack.zig");
+pub const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const frontend_rules = @import("frontend_rules.zig");
 pub const cell_age_store = @import("cell_age_store.zig");
@@ -3808,6 +3808,7 @@ pub export fn zonvie_core_update_layout_px_locked(
 pub const zonvie_shader_target = enum(c_int) {
     msl = 0, // Metal Shading Language
     hlsl = 1, // HLSL (shader model 5.0)
+    glsl = 2, // GLSL 330 core (OpenGL 3.3)
     _,
 };
 
@@ -4095,6 +4096,7 @@ pub export fn zonvie_shader_compile_glsl(
     const t: shader_compiler.Target = switch (target) {
         .msl => .msl,
         .hlsl => .hlsl,
+        .glsl => .glsl,
         _ => return buildShaderError("unknown shader target"),
     };
     const compiled = shader_compiler.compileGlslToTarget(gpa, src, t) catch |err| {

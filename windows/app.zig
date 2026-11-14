@@ -399,26 +399,26 @@ pub const MSG_HISTORY_GRID_ID: i64 = core.grid_mod.MSG_HISTORY_GRID_ID;
 // =========================================================================
 
 // --- Cmdline window styling constants (matching macOS) ---
-pub const CMDLINE_PADDING: u32 = 12; // Padding around content (pixels)
-pub const CMDLINE_ICON_SIZE: u32 = 18; // Icon size (pixels)
+pub const CMDLINE_PADDING: u32 = core.frontend_rules.cmdline_padding_pt; // Padding around content (pixels)
+pub const CMDLINE_ICON_SIZE: u32 = core.frontend_rules.cmdline_icon_size_pt; // Icon size (pixels)
 // Measured from the content padding, so the icon sits at x = 12 and the text
 // at x = 44, where macOS puts them (its cmdlineIconMarginLeft is measured from
 // the window edge and already includes the padding). These were 2 and 4, which
 // drew the icon at 14 and the text at 36.
-pub const CMDLINE_ICON_MARGIN_LEFT: u32 = 0; // Left margin for icon (pixels)
-pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = 14; // Right margin for icon (pixels)
+pub const CMDLINE_ICON_MARGIN_LEFT: u32 = core.frontend_rules.cmdline_icon_margin_left_pt; // Left margin for icon (pixels)
+pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = core.frontend_rules.cmdline_icon_margin_right_pt; // Right margin for icon (pixels)
 pub const CMDLINE_BORDER_WIDTH: u32 = 1; // Border width (pixels)
 pub const CMDLINE_CORNER_RADIUS: f32 = 8.0; // Corner radius for rounded rect
-pub const CMDLINE_SCREEN_MARGIN: u32 = 40; // Margin from screen edges (matching macOS cmdlineScreenMargin)
+pub const CMDLINE_SCREEN_MARGIN: u32 = core.frontend_rules.cmdline_screen_margin_pt; // Margin from screen edges (matching macOS cmdlineScreenMargin)
 
 // --- Msg_show window styling constants ---
-pub const MSG_PADDING: u32 = 8; // Padding around content (pixels)
+pub const MSG_PADDING: u32 = core.frontend_rules.msg_padding_pt; // Padding around content (pixels)
 
 // --- Copy-content button (decorated cmdline / message surfaces) ---
 // Unscaled base sizes; every consumer runs them through App.scalePx.
-pub const COPY_BUTTON_SIZE: u32 = 18; // Icon box / hit area (pixels)
-pub const COPY_BUTTON_MARGIN_LEFT: u32 = 4; // Gap from grid content (pixels)
-pub const COPY_BUTTON_MARGIN_RIGHT: u32 = 8; // Gap from trailing edge (pixels)
+pub const COPY_BUTTON_SIZE: u32 = core.frontend_rules.copy_button_size_pt; // Icon box / hit area (pixels)
+pub const COPY_BUTTON_MARGIN_LEFT: u32 = core.frontend_rules.copy_button_margin_left_pt; // Gap from grid content (pixels)
+pub const COPY_BUTTON_MARGIN_RIGHT: u32 = core.frontend_rules.copy_button_margin_right_pt; // Gap from trailing edge (pixels)
 /// Vertices the copy button consumes: one SDF quad for the icon plus one for
 /// the hover wash behind it.
 pub const COPY_ICON_VERTS: usize = 12;
@@ -2392,8 +2392,8 @@ pub const TablineState = struct {
     // What each extra label line adds to the titlebar tab bar: the line
     // height of the tab label font (Segoe UI, 12 logical px).
     pub const TAB_LABEL_LINE_HEIGHT: c_int = 16;
-    pub const TAB_MIN_WIDTH: c_int = 100;
-    pub const TAB_MAX_WIDTH: c_int = 200;
+    pub const TAB_MIN_WIDTH: c_int = core.frontend_rules.tab_min_width_pt;
+    pub const TAB_MAX_WIDTH: c_int = core.frontend_rules.tab_max_width_pt;
     pub const TAB_PADDING: c_int = 8;
     pub const TAB_CLOSE_SIZE: c_int = 14;
     pub const WINDOW_CONTROLS_WIDTH: c_int = 0; // Windows has controls on the right (no left offset needed)

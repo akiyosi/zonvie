@@ -62,6 +62,10 @@ func absoluteFileArg(_ arg: String, prev: String?, afterDashDash: Bool = false) 
 do {
     var i = 1  // Skip argv[0] (executable path)
     var passAllToNvim = false
+    // After zonvie's `--`: nvim's own command line, flags and all, whose
+    // tokens are files only after nvim's own `--` (frontend_rules.NvimArgScan).
+    var nvimPrev: String? = nil
+    var nvimDashDash = false
     while i < args.count {
         let arg = args[i]
 
@@ -73,8 +77,15 @@ do {
         }
 
         if passAllToNvim {
-            nvimExtraArgs.append(absoluteFileArg(arg, prev: nil, afterDashDash: true))
+            if !nvimDashDash && arg == "--" {
+                // nvim's own `--`, passed on as is.
+                nvimDashDash = true
+                nvimExtraArgs.append(arg)
+            } else {
+                nvimExtraArgs.append(absoluteFileArg(arg, prev: nvimPrev, afterDashDash: nvimDashDash))
+            }
             nvimForwardedArgs[i] = nvimExtraArgs[nvimExtraArgs.count - 1]
+            nvimPrev = arg
             i += 1
             continue
         }

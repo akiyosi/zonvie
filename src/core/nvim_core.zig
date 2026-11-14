@@ -3765,6 +3765,15 @@ pub const Core = struct {
     /// moment served a stale one: a float the cursor had just entered was
     /// missing, and the box landed on the main window. Caller holds grid_mu.
     pub fn publishMsgAnchorLocked(self: *Core) void {
+        // The cursor sits in a synthetic ext UI grid (the cmdline; negative
+        // ids) only while that UI is up. Messages keep hanging from the
+        // window the user is working in, not from the one-row cmdline grid.
+        if (self.grid.cursor_grid < 0) {
+            self.msg_anchor_mu.lockUncancelable(clock.io());
+            const have = self.msg_anchor != null;
+            self.msg_anchor_mu.unlock(clock.io());
+            if (have) return;
+        }
         const surfaceOf = struct {
             fn f(info: ?c_api.GridInfo) i64 {
                 const i = info orelse return 1;
@@ -8578,6 +8587,13 @@ test "the message anchor walks the cursor's float to the window it hangs off" {
     try std.testing.expectEqual(@as(i64, 1), u.cursor_surface);
     try std.testing.expectEqual(@as(i64, 1), u.anchor_grid);
     try std.testing.expectEqual(@as(i32, 20), u.rows);
+
+    // The cmdline holding the cursor keeps the window's anchor.
+    core.grid.cursor_grid = 4;
+    core.publishMsgAnchorLocked();
+    core.grid.cursor_grid = grid_mod.CMDLINE_GRID_ID;
+    core.publishMsgAnchorLocked();
+    try std.testing.expectEqual(@as(i64, 3), core.msgAnchor().?.anchor_grid);
 }
 
 test "a float an external window hosts is reported in that window's cells" {

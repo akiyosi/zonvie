@@ -9,6 +9,7 @@
 //! corner: top-left, or left of the window buttons for a right sidebar.
 //! The toggle slides the sidebar closed and open.
 const std = @import("std");
+const core = @import("zonvie_core");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const Config = app_mod.config_mod.Config;
@@ -177,12 +178,9 @@ pub fn coveredPx(app: *const App) c_int {
 
 pub const Insets = struct { left: c_int = 0, right: c_int = 0, top: c_int = 0, bottom: c_int = 0 };
 
-/// Ground between the editor card and the window edges or the sidebar.
-const ISLAND_MARGIN_PT: c_int = 6;
-/// Background between the card's edge and the grid; at least (1 - 1/sqrt 2)
-/// of the corner radius, so no cell reaches into a corner.
-const ISLAND_PADDING_PT: c_int = 6;
-pub const ISLAND_RADIUS_PT: c_int = 10;
+const ISLAND_MARGIN_PT: c_int = core.frontend_rules.island_margin_pt;
+const ISLAND_PADDING_PT: c_int = core.frontend_rules.island_padding_pt;
+pub const ISLAND_RADIUS_PT: c_int = core.frontend_rules.island_radius_pt;
 
 /// The rounded editor card the main window's grid is drawn in
 /// (Config.TitlebarLayout.island): its edges' distances from the client

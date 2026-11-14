@@ -1,4 +1,4 @@
-// runner.zig — entrypoint for `zig build gui-test` (macOS and Windows hosts).
+// runner.zig — entrypoint for `zig build gui-test` (macOS, Windows and Linux hosts).
 //
 // Launches the REAL zonvie app: windows will appear on the current
 // desktop while tests run. Skips cleanly when the app build or nvim is
@@ -42,9 +42,14 @@ fn requirePrereqs() !void {
         else => return e,
     };
     testing.allocator.free(app);
+    if (builtin.os.tag == .linux and !driver.platform.available()) {
+        std.debug.print("[gui] no compositor IPC to observe windows (Hyprland)\n", .{});
+        return missingPrereq();
+    }
 }
 
-// Scenarios are grouped by platform applicability:
+// Scenarios are grouped by platform applicability (Linux observes windows
+// through Hyprland's IPC: linux_window.zig):
 //   common/  — run on every host (behavior-level, driven via nvim RPC)
 //   macos/   — macOS-only behavior
 //   windows/ — Windows-only behavior
@@ -55,6 +60,18 @@ fn requirePrereqs() !void {
 const is_macos = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 const can_capture = driver.capture.supported;
+const is_linux = builtin.os.tag == .linux;
+
+/// The Linux renderer draws every committed row of every layer each frame:
+/// no row reuse, blit, scroll fast path or per-row gating, so the scenarios
+/// that assert those paths ran have nothing to observe there.
+const redraws_partially = !is_linux;
+/// The cmdline is an overlay in the main window on Linux, not a window of its
+/// own, and a tiling compositor sizes the window, not :set columns/lines.
+const places_own_windows = !is_linux;
+/// Per-grid fonts (on_grid_font and the font slot callbacks) are not wired
+/// in the Linux frontend.
+const draws_grid_fonts = !is_linux;
 
 /// The build runner holds a test's stderr until the test process ends, so a
 /// scenario that hangs until the CI step timeout leaves no trace of which one
@@ -110,8 +127,13 @@ fn gated(comptime ok: bool, comptime M: type) !void {
     }
 }
 
+// The Linux capture module's own image codec test.
+test {
+    if (is_linux) _ = driver.capture;
+}
+
 test "gui:cmdline_window" {
-    try gated(true, @import("scenarios/common/cmdline_window.zig"));
+    try gated(true and places_own_windows, @import("scenarios/common/cmdline_window.zig"));
 }
 
 test "gui:external_window" {
@@ -123,7 +145,7 @@ test "gui:render_trace" {
 }
 
 test "gui:set_columns_lines" {
-    try gated(true, @import("scenarios/common/set_columns_lines.zig"));
+    try gated(true and places_own_windows, @import("scenarios/common/set_columns_lines.zig"));
 }
 
 test "gui:window_frame_stability" {
@@ -200,9 +222,10 @@ test "gui:extfloat_message_position" {
 }
 
 test "gui:wheel_scroll" {
-    // Windows only: synthesizes WM_MOUSEWHEEL into the real frontend wheel
-    // handler. No macOS equivalent in this driver.
-    try gated(is_windows, @import("scenarios/windows/wheel_scroll.zig"));
+    // Windows synthesizes WM_MOUSEWHEEL into the real frontend wheel handler,
+    // Linux a virtual pointer's wheel notch. No macOS equivalent in this
+    // driver.
+    try gated(is_windows or is_linux, @import("scenarios/windows/wheel_scroll.zig"));
 }
 
 // Visual scenarios run wherever the screenshot layer is implemented.
@@ -226,11 +249,11 @@ test "gui:visual_split" {
 }
 
 test "gui:visual_partial_matches_full" {
-    try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
 test "gui:visual_partial_matches_full_float_move" {
-    try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full_float_move.zig"));
 }
 
 test "gui:visual_split_divider_survives_layer_redraw" {
@@ -238,7 +261,7 @@ test "gui:visual_split_divider_survives_layer_redraw" {
 }
 
 test "gui:visual_statusline_survives_layer_redraw" {
-    try gated(can_capture, @import("scenarios/visual/statusline_survives_layer_redraw.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/statusline_survives_layer_redraw.zig"));
 }
 
 test "gui:visual_float" {
@@ -274,15 +297,15 @@ test "gui:visual_cmdline_cursor_animation" {
 }
 
 test "gui:visual_continuous_j_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_extwin_continuous_j_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_incremental_scroll_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/incremental_scroll_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/incremental_scroll_matches_jump.zig"));
 }
 
 test "gui:visual_scroll_then_cursor_move" {
@@ -290,11 +313,11 @@ test "gui:visual_scroll_then_cursor_move" {
 }
 
 test "gui:visual_scrolled_layer_row_gating" {
-    try gated(can_capture, @import("scenarios/visual/scrolled_layer_row_gating.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/scrolled_layer_row_gating.zig"));
 }
 
 test "gui:visual_float_over_scrolled_split" {
-    try gated(can_capture, @import("scenarios/visual/float_over_scrolled_split.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/float_over_scrolled_split.zig"));
 }
 
 test "gui:visual_extfloat_over_scrolled_anchor" {
@@ -302,7 +325,7 @@ test "gui:visual_extfloat_over_scrolled_anchor" {
 }
 
 test "gui:visual_extfloat_opaque_partial" {
-    if (comptime can_capture) {
+    if (comptime can_capture and redraws_partially) {
         try requirePrereqs();
         try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").runOpaque(testing.allocator);
     } else return error.SkipZigTest;
@@ -313,11 +336,11 @@ test "gui:visual_extfloat_over_born_external_anchor" {
 }
 
 test "gui:visual_scrollbind_layers_blit_matches_jump" {
-    try gated(can_capture, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig"));
 }
 
 test "gui:visual_per_grid_font_workflow" {
-    try gated(can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
+    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
 }
 
 test "gui:visual_proportional_font_support" {
@@ -387,11 +410,11 @@ test "gui:extwin_hosted_float_phantom_hit" {
 }
 
 test "gui:extwin_cursor_move_reuses_rows" {
-    try gated(true, @import("scenarios/common/extwin_cursor_move_reuses_rows.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/extwin_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_hosted_layer_row_gating" {
-    try gated(true, @import("scenarios/common/extwin_hosted_layer_row_gating.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/extwin_hosted_layer_row_gating.zig"));
 }
 
 test "gui:extwin_blink_without_cursor_skips" {
@@ -409,7 +432,7 @@ test "gui:visual_extwin_split_with_float_background" {
 }
 
 test "gui:visual_per_grid_font_margin" {
-    try gated(can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
+    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {
@@ -438,17 +461,54 @@ test "gui:blink_survives_popupmenu" {
     try gated(is_macos, @import("scenarios/macos/blink_survives_popupmenu.zig"));
 }
 
+test "gui:scrollbar_pointer" {
+    // Linux only: linux/scrollbar.zig through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/scrollbar_pointer.zig"));
+}
+
+test "gui:tabline_pointer" {
+    // Linux only: linux/ui_widgets.zig's tab strip through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));
+}
+
+test "gui:copy_button_pointer" {
+    // Linux only: linux/ui_widgets.zig's copy buttons through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/copy_button_pointer.zig"));
+}
+
+test "gui:font_dialog_pointer" {
+    // Linux only: linux/font_picker.zig through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/font_dialog_pointer.zig"));
+}
+
+test "gui:msg_pos_float_anchor" {
+    // Linux only: messages are drawn inside the main window there, so their
+    // places come from the log (the macOS scenarios watch new OS windows).
+    try gated(is_linux, @import("scenarios/linux/msg_pos_float_anchor.zig"));
+}
+
+test "gui:main_float_mouse_disabled_wheel" {
+    // Linux only: the main_float_mouse_disabled_scroll rule through
+    // virtual-pointer wheel notches.
+    try gated(is_linux, @import("scenarios/linux/main_float_mouse_disabled_wheel.zig"));
+}
+
+test "gui:cursor_blinks" {
+    // Linux only: the timer and its log line are linux/blink.zig's.
+    try gated(is_linux, @import("scenarios/linux/cursor_blinks.zig"));
+}
+
 test "gui:extwin_animated_shader_reuses_rows" {
     // macOS only: ExternalGridView is macOS frontend code.
     try gated(is_macos, @import("scenarios/macos/extwin_animated_shader_reuses_rows.zig"));
 }
 
 test "gui:main_idle_while_extwin_updates" {
-    try gated(true, @import("scenarios/common/main_idle_while_extwin_updates.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/main_idle_while_extwin_updates.zig"));
 }
 
 test "gui:main_cursor_move_reuses_rows" {
-    try gated(true, @import("scenarios/common/main_cursor_move_reuses_rows.zig"));
+    try gated(true and redraws_partially, @import("scenarios/common/main_cursor_move_reuses_rows.zig"));
 }
 
 test "gui:extwin_float_follows_externalized_anchor" {

@@ -714,6 +714,189 @@ test "panelBg moves brightness toward the middle and keeps hue and saturation" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), black[1], tol);
 }
 
+// ---------------------------------------------------------------------------
+// Editor card (Config.TitlebarLayout.island)
+
+/// Ground between the editor card and the window edges or the sidebar.
+pub const island_margin_pt: i32 = 6;
+/// Background between the card's edge and the grid; at least (1 - 1/sqrt 2)
+/// of the corner radius, so no cell reaches into a corner.
+pub const island_padding_pt: i32 = 6;
+pub const island_radius_pt: i32 = 10;
+/// How far the card's border moves from the bg toward white (dark bg) or
+/// black (light bg). The renderers that draw the card in a shader hold the
+/// same value and rule: ISLAND_BORDER_MIX in windows/shaders/main.hlsl and
+/// macos/Sources/Rendering/Shaders.metal.
+pub const island_border_mix: f32 = 0.12;
+
+fn srgbToLinear(v: f32) f32 {
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(v_in: f32) f32 {
+    const v = std.math.clamp(v_in, 0.0, 1.0);
+    return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
+
+pub const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
+
+/// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The island
+/// ground goes darker, or lighter when darker would clip to black.
+pub fn oklabLightnessShifted(rgb: [3]f32, shift: LightnessShift) [3]f32 {
+    const lr = srgbToLinear(rgb[0]);
+    const lg = srgbToLinear(rgb[1]);
+    const lb = srgbToLinear(rgb[2]);
+    const l_ = std.math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+    const m_ = std.math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+    const s_ = std.math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+    var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+    const delta: f32 = switch (shift) {
+        .sidebar_darker => -0.07,
+        .sidebar_lighter => 0.04,
+        .island_ground => if (L >= 0.2) -0.06 else 0.06,
+    };
+    L = std.math.clamp(L + delta, 0.0, 1.0);
+    const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
+    const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
+    const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
+    return .{
+        linearToSrgb(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
+        linearToSrgb(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
+        linearToSrgb(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
+    };
+}
+
+/// The editor card's border from the default bg (sRGB 0-1).
+pub fn islandBorder(bg: [3]f32) [3]f32 {
+    const toward: f32 = if (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5) 1.0 else 0.0;
+    return .{
+        bg[0] + (toward - bg[0]) * island_border_mix,
+        bg[1] + (toward - bg[1]) * island_border_mix,
+        bg[2] + (toward - bg[2]) * island_border_mix,
+    };
+}
+
+test "island ground: a step darker, lighter for a near-black bg, grey stays grey" {
+    const mid = oklabLightnessShifted(.{ 0.5, 0.5, 0.5 }, .island_ground);
+    try std.testing.expect(mid[0] < 0.5);
+    try std.testing.expectApproxEqAbs(mid[0], mid[1], 1e-3);
+    try std.testing.expectApproxEqAbs(mid[1], mid[2], 1e-3);
+    const black = oklabLightnessShifted(.{ 0, 0, 0 }, .island_ground);
+    try std.testing.expect(black[0] > 0);
+}
+
+test "island border: toward white on a dark bg, black on a light one" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.12), islandBorder(.{ 0, 0, 0 })[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.88), islandBorder(.{ 1, 1, 1 })[0], 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// Ext UI panel chrome and tabline geometry, unscaled
+
+/// Padding around the cmdline panel's content.
+pub const cmdline_padding_pt: u32 = 12;
+/// The cmdline icon's box. Its margins are measured from the content
+/// padding, so the icon sits at x = 12 and the text at x = 44.
+pub const cmdline_icon_size_pt: u32 = 18;
+pub const cmdline_icon_margin_left_pt: u32 = 0;
+pub const cmdline_icon_margin_right_pt: u32 = 14;
+/// The cmdline panel's margin from the screen edges.
+pub const cmdline_screen_margin_pt: u32 = 40;
+/// Padding around a message panel's content.
+pub const msg_padding_pt: u32 = 8;
+/// The copy-content button: its box (also the hit area), the gap from the
+/// grid content and the gap from the trailing edge.
+pub const copy_button_size_pt: u32 = 18;
+pub const copy_button_margin_left_pt: u32 = 4;
+pub const copy_button_margin_right_pt: u32 = 8;
+
+/// The bounds a titlebar tab's width is held to.
+pub const tab_min_width_pt: i32 = 100;
+pub const tab_max_width_pt: i32 = 200;
+
+/// One titlebar tab's width: the strip's `available_px` shared out among
+/// `tab_count` tabs, held to [min_px, max_px] (the tab_*_width_pt bounds in
+/// the caller's pixels). 0 with no tabs.
+pub fn titlebarTabWidth(available_px: i32, tab_count: i32, min_px: i32, max_px: i32) i32 {
+    if (tab_count <= 0) return 0;
+    return @min(max_px, @max(min_px, @divTrunc(available_px, tab_count)));
+}
+
+test "a titlebar tab shares the strip within its bounds" {
+    try std.testing.expectEqual(@as(i32, 0), titlebarTabWidth(900, 0, 100, 200));
+    try std.testing.expectEqual(@as(i32, 200), titlebarTabWidth(900, 2, 100, 200));
+    try std.testing.expectEqual(@as(i32, 150), titlebarTabWidth(900, 6, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(900, 20, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(-40, 3, 100, 200));
+}
+
+/// The sidebar tabline's colours (sRGB 0..1; a channel may leave the range
+/// and the caller clamps).
+pub const SidebarPalette = struct {
+    is_dark: bool,
+    bg: [3]f32,
+    selected: [3]f32,
+    hover: [3]f32,
+    text: [3]f32,
+    text_selected: [3]f32,
+    separator: [3]f32,
+    close: [3]f32,
+    close_hi: [3]f32,
+    indicator: [3]f32,
+};
+
+/// The sidebar's colours from the colorscheme's fg and bg: the strip a
+/// little darker than a dark bg or lighter than a light one, the selected
+/// and hovered rows stepped the other way, the text dimmed fg, and the
+/// separator 10% white (dark) or black (light) over the strip. `strip_bg`
+/// replaces the derived strip colour where a frontend tints it itself.
+pub fn sidebarPalette(fg: [3]f32, bg: [3]f32, strip_bg: ?[3]f32) SidebarPalette {
+    const is_dark = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5;
+    const dim: f32 = if (is_dark) 0.6 else 0.5;
+    var p: SidebarPalette = undefined;
+    p.is_dark = is_dark;
+    p.text_selected = fg;
+    for (0..3) |i| {
+        const b = bg[i];
+        const strip = if (strip_bg) |s| s[i] else if (is_dark) b * 0.85 else @min(@as(f32, 1.0), b + 0.03);
+        p.bg[i] = strip;
+        p.selected[i] = if (is_dark) b + 0.06 else @max(@as(f32, 0.0), b - 0.06);
+        p.hover[i] = if (is_dark) b + 0.03 else @max(@as(f32, 0.0), b - 0.03);
+        p.text[i] = fg[i] * dim;
+        p.separator[i] = if (is_dark) strip * 0.9 + 0.1 else strip * 0.9;
+        p.close[i] = fg[i] * 0.5;
+        p.close_hi[i] = fg[i] * 0.8;
+        p.indicator[i] = fg[i] * 0.7;
+    }
+    return p;
+}
+
+test "the sidebar strip is darker on a dark theme and lighter on a light one" {
+    const tol = 1e-6;
+    const dark = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, null);
+    try std.testing.expect(dark.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.17), dark.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), dark.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.23), dark.hover[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), dark.text[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.253), dark.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), dark.indicator[0], tol);
+
+    const light = sidebarPalette(.{ 0, 0, 0 }, .{ 0.99, 0.9, 0.9 }, null);
+    try std.testing.expect(!light.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), light.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.84), light.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), light.separator[0], tol);
+
+    // A frontend's own strip colour also carries the separator.
+    const tinted = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, .{ 0.5, 0.5, 0.5 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), tinted.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), tinted.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), tinted.selected[0], tol);
+}
+
 /// How one argument goes into a spawn command so the core's tokenizer
 /// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
 /// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote
@@ -769,6 +952,31 @@ test "nvimArgIsFile keeps flags, commands and option values out of the file list
     try std.testing.expect(nvimArgIsFile(null, "-u", true));
     try std.testing.expect(nvimArgIsFile(null, "+10", true));
     try std.testing.expect(!nvimArgIsFile(null, "-", true));
+}
+
+/// Walks nvim's own command line — what follows zonvie's `--` — token by
+/// token, saying which are files. Its `after_dash_dash` is nvim's `--`, not
+/// zonvie's: treating zonvie's as nvim's made `zonvie -- -u init.lua` hand
+/// nvim `<cwd>/-u <cwd>/init.lua`. nvim's `--` itself is no file.
+pub const NvimArgScan = struct {
+    prev: ?[]const u8 = null,
+    after_dash_dash: bool = false,
+
+    pub fn isFile(self: *NvimArgScan, arg: []const u8) bool {
+        defer self.prev = arg;
+        if (!self.after_dash_dash and std.mem.eql(u8, arg, "--")) {
+            self.after_dash_dash = true;
+            return false;
+        }
+        return nvimArgIsFile(self.prev, arg, self.after_dash_dash);
+    }
+};
+
+test "nvim's command line keeps its flags until its own --" {
+    var scan: NvimArgScan = .{};
+    const args = [_][]const u8{ "-u", "init.lua", "+10", "a.txt", "--", "-b.txt", "-" };
+    const want = [_]bool{ false, false, false, true, false, true, false };
+    for (args, want) |a, w| try std.testing.expectEqual(w, scan.isFile(a));
 }
 
 /// A devcontainer workspace or config path as the devcontainer commands can
