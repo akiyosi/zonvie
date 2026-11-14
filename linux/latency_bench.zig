@@ -1,4 +1,7 @@
 //! Input-to-paint latency, for comparing renderers (ZONVIE_LATENCY_BENCH=N).
+//! ZONVIE_LATENCY_BENCH_KEYS="a b" sends those two keys alternately in
+//! normal mode instead of typing and erasing in insert mode; "^X" is the
+//! control key (e.g. "^F ^F" pages through a file, repainting every row).
 //! A timer types into Neovim through the same core input path as a key; a
 //! sample runs from that send to the main frame clock's after-paint of the
 //! first frame showing a commit made after it. Both renderers report the
@@ -29,6 +32,12 @@ pub const Bench = struct {
     base_seq: u64 = 0,
     flip: bool = false,
     started: bool = false,
+    /// Sent alternately. The default pair types and erases in insert mode.
+    /// Raw bytes: the core's input path sends '<' as text, so a special key
+    /// goes as its control character.
+    keys: [2][]const u8 = .{ "x", "\x08" },
+    ctrl: [2]u8 = .{ 0, 0 },
+    insert: bool = true,
 };
 
 var bench_state: ?*Bench = null;
@@ -44,6 +53,18 @@ pub fn init(app: *App, renderer: []const u8) void {
         return;
     };
     b.* = .{ .app = app, .renderer = renderer, .wanted = n, .samples = samples };
+    if (std.c.getenv("ZONVIE_LATENCY_BENCH_KEYS")) |k| {
+        const pair = std.mem.span(k);
+        if (std.mem.indexOfScalar(u8, pair, ' ')) |sp| {
+            b.keys = .{ pair[0..sp], pair[sp + 1 ..] };
+            for (&b.keys, &b.ctrl) |*key, *c| {
+                if (key.len != 2 or key.*[0] != '^') continue;
+                c.* = key.*[1] & 0x1f;
+                key.* = c[0..1];
+            }
+            b.insert = false;
+        }
+    }
     bench_state = b;
     // Long enough for Neovim to attach and the first frames to settle.
     _ = gtk.g_timeout_add(1500, &onStart, b);
@@ -62,7 +83,7 @@ fn onStart(data: ?*anyopaque) callconv(.c) c_int {
     const fc = gtk.gtk_widget_get_frame_clock(widget) orelse return 0;
     _ = gtk.g_signal_connect(fc, "after-paint", @ptrCast(&onAfterPaint), b);
     const cp = b.app.corep orelse return 0;
-    core.zonvie_core_send_input(cp, "i", 1);
+    if (b.insert) core.zonvie_core_send_input(cp, "i", 1);
     b.started = true;
     _ = gtk.g_timeout_add(interval_ms, &onTick, b);
     return 0;
@@ -82,8 +103,8 @@ fn onTick(data: ?*anyopaque) callconv(.c) c_int {
     b.waiting = true;
     b.base_seq = flushSeq(b.app);
     b.t0_ns = clock.nowNs();
-    // Typing and erasing keeps the line short, so every sample redraws one row.
-    const key: []const u8 = if (b.flip) "<BS>" else "x";
+    // The default pair keeps the line short, so every sample redraws one row.
+    const key = b.keys[@intFromBool(b.flip)];
     b.flip = !b.flip;
     core.zonvie_core_send_input(cp, key.ptr, key.len);
     return 1;
