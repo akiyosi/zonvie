@@ -805,9 +805,12 @@ pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
 pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
 
 pub fn loadSystemCursor(id: usize) c.HCURSOR {
-    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
+    // A USER handle is an opaque table entry, not a real pointer, so it need
+    // not satisfy HCURSOR's 4-byte alignment; returning HCURSOR from the raw
+    // signature avoids an @alignCast that trips the Debug alignment check.
+    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) c.HCURSOR;
     const load_fn: RawLoadCursorFn = @ptrCast(&c.LoadCursorW);
-    return @ptrCast(@alignCast(load_fn(null, id)));
+    return load_fn(null, id);
 }
 
 /// The composition edges and the committed character, for both window
