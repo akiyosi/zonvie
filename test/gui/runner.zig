@@ -471,6 +471,11 @@ test "gui:tabline_pointer" {
     try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));
 }
 
+test "gui:tabline_hover" {
+    // Linux only: the tab strip's own hover wash, through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/tabline_hover.zig"));
+}
+
 test "gui:copy_button_pointer" {
     // Linux only: linux/ui_widgets.zig's copy buttons through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/copy_button_pointer.zig"));

@@ -498,6 +498,9 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     var buf: [6144]u8 = undefined;
     // Tone colours as macOS's message panels (ZonvieCore.swift): the text
     // and, where it has one, the border.
+    // The strip's buttons drop the theme's look, hover included, so the
+    // close and new-tab buttons get their own hover wash, as macOS fills
+    // them.
     const text = std.fmt.bufPrintZ(&buf,
         \\.zonvie-panel {{ background-color: #{x:0>6}; color: #{x:0>6}; font-family: monospace;
         \\  font-size: {d}px; padding: 12px; border-radius: 6px; border: 1px solid alpha(#{x:0>6}, 0.25); }}
@@ -515,6 +518,9 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\  box-shadow: none; padding: 4px 14px; }}
         \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; opacity: 0; }}
         \\.zonvie-tab.current button.zonvie-tab-close, .zonvie-tab:hover button.zonvie-tab-close {{ opacity: 0.8; }}
+        \\.zonvie-tabbar button.zonvie-tab-close:hover {{ opacity: 1; }}
+        \\.zonvie-tabbar button.zonvie-tab-close:hover, .zonvie-tabbar > button:hover {{
+        \\  background-color: alpha(currentColor, 0.3); border-radius: 6px; }}
         \\.zonvie-tabbar:not(.sidebar) .zonvie-tab {{ opacity: 0.7; }}
         \\.zonvie-tabbar:not(.sidebar) .zonvie-tab.current {{ opacity: 1; background-color: alpha(currentColor, 0.12); }}
         \\.zonvie-tabbar:not(.sidebar) .zonvie-tab:hover {{ background-color: alpha(currentColor, 0.08); }}
