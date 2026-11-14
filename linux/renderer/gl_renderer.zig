@@ -306,6 +306,18 @@ const SurfaceDraw = struct { verts: usize = 0, moving: bool = false };
 /// is on this surface. Caller holds App.mu.
 fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) SurfaceDraw {
     var out: SurfaceDraw = .{};
+    // A translucent target is cleared to the background at its alpha, and
+    // the back layer's default-background cells carry that alpha themselves:
+    // drawn over the clear the two would compound, so the clear goes from
+    // under that layer. Not under blur, where the core drops those cells
+    // and the clear is their background.
+    if (layers.len != 0 and !app.window_cfg.blur and app.window_cfg.opacity < 1.0) {
+        gl.glEnable(gl.GL_SCISSOR_TEST);
+        scissorRows(app, t, layers[0], 0, layers[0].rows);
+        gl.glClearColor(0, 0, 0, 0);
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+        gl.glDisable(gl.GL_SCISSOR_TEST);
+    }
     // The core sends layers back-to-front; draw in order (windows/app.zig:4432).
     for (layers) |layer| {
         const grid = app.surface.committedGrid(layer.grid_id) orelse continue;
