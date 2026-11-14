@@ -2222,50 +2222,7 @@ const SidebarColors = struct {
     /// `rgb` (sRGB 0-1) with its OKLab L moved by the sidebar delta, hue and
     /// chroma kept. Same constants as macOS TabSidebarView.lightnessShifted.
     fn lightnessShifted(r: f32, g: f32, b: f32, darker: bool) [3]f32 {
-        return oklabLightnessShifted(r, g, b, if (darker) .sidebar_darker else .sidebar_lighter);
-    }
-
-    const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
-
-    /// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The
-    /// island ground goes darker by the sidebar step for the bg's side of
-    /// mid-grey, or lighter when darker would clip to black: macOS
-    /// TabSidebarView.islandGroundRGB.
-    fn oklabLightnessShifted(r: f32, g: f32, b: f32, shift: LightnessShift) [3]f32 {
-        const lr = srgbToLinear(r);
-        const lg = srgbToLinear(g);
-        const lb = srgbToLinear(b);
-        const l_ = std.math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
-        const m_ = std.math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
-        const s_ = std.math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
-        var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
-        const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
-        const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
-        const delta: f32 = switch (shift) {
-            .sidebar_darker => -0.07,
-            .sidebar_lighter => 0.04,
-            .island_ground => blk: {
-                break :blk if (L >= 0.2) -0.06 else 0.06;
-            },
-        };
-        L = std.math.clamp(L + delta, 0.0, 1.0);
-        const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
-        const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
-        const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
-        return .{
-            linearToSrgb(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
-            linearToSrgb(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
-            linearToSrgb(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
-        };
-    }
-
-    fn srgbToLinear(v: f32) f32 {
-        return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
-    }
-
-    fn linearToSrgb(v_in: f32) f32 {
-        const v = std.math.clamp(v_in, 0.0, 1.0);
-        return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+        return core.frontend_rules.oklabLightnessShifted(.{ r, g, b }, if (darker) .sidebar_darker else .sidebar_lighter);
     }
 
     fn f2u8(v: f32) u8 {
@@ -2278,12 +2235,11 @@ const SidebarColors = struct {
 /// colorscheme bg (0xFFFFFFFF before one is known: SidebarColors' default).
 pub fn islandGroundRgb(colorscheme_bg: u32) u32 {
     const bg = if (colorscheme_bg == 0xFFFFFFFF) 0x252629 else colorscheme_bg;
-    const shifted = SidebarColors.oklabLightnessShifted(
+    const shifted = core.frontend_rules.oklabLightnessShifted(.{
         @as(f32, @floatFromInt((bg >> 16) & 0xFF)) / 255.0,
         @as(f32, @floatFromInt((bg >> 8) & 0xFF)) / 255.0,
         @as(f32, @floatFromInt(bg & 0xFF)) / 255.0,
-        .island_ground,
-    );
+    }, .island_ground);
     return (@as(u32, SidebarColors.f2u8(shifted[0])) << 16) |
         (@as(u32, SidebarColors.f2u8(shifted[1])) << 8) |
         SidebarColors.f2u8(shifted[2]);

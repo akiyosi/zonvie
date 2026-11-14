@@ -715,6 +715,84 @@ test "panelBg moves brightness toward the middle and keeps hue and saturation" {
 }
 
 // ---------------------------------------------------------------------------
+// Editor card (Config.TitlebarLayout.island)
+
+/// Ground between the editor card and the window edges or the sidebar.
+pub const island_margin_pt: i32 = 6;
+/// Background between the card's edge and the grid; at least (1 - 1/sqrt 2)
+/// of the corner radius, so no cell reaches into a corner.
+pub const island_padding_pt: i32 = 6;
+pub const island_radius_pt: i32 = 10;
+/// How far the card's border moves from the bg toward white (dark bg) or
+/// black (light bg). The renderers that draw the card in a shader hold the
+/// same value and rule: ISLAND_BORDER_MIX in windows/shaders/main.hlsl and
+/// macos/Sources/Rendering/Shaders.metal.
+pub const island_border_mix: f32 = 0.12;
+
+fn srgbToLinear(v: f32) f32 {
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(v_in: f32) f32 {
+    const v = std.math.clamp(v_in, 0.0, 1.0);
+    return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
+
+pub const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
+
+/// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The island
+/// ground goes darker, or lighter when darker would clip to black.
+pub fn oklabLightnessShifted(rgb: [3]f32, shift: LightnessShift) [3]f32 {
+    const lr = srgbToLinear(rgb[0]);
+    const lg = srgbToLinear(rgb[1]);
+    const lb = srgbToLinear(rgb[2]);
+    const l_ = std.math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+    const m_ = std.math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+    const s_ = std.math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+    var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+    const delta: f32 = switch (shift) {
+        .sidebar_darker => -0.07,
+        .sidebar_lighter => 0.04,
+        .island_ground => if (L >= 0.2) -0.06 else 0.06,
+    };
+    L = std.math.clamp(L + delta, 0.0, 1.0);
+    const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
+    const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
+    const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
+    return .{
+        linearToSrgb(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
+        linearToSrgb(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
+        linearToSrgb(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
+    };
+}
+
+/// The editor card's border from the default bg (sRGB 0-1).
+pub fn islandBorder(bg: [3]f32) [3]f32 {
+    const toward: f32 = if (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5) 1.0 else 0.0;
+    return .{
+        bg[0] + (toward - bg[0]) * island_border_mix,
+        bg[1] + (toward - bg[1]) * island_border_mix,
+        bg[2] + (toward - bg[2]) * island_border_mix,
+    };
+}
+
+test "island ground: a step darker, lighter for a near-black bg, grey stays grey" {
+    const mid = oklabLightnessShifted(.{ 0.5, 0.5, 0.5 }, .island_ground);
+    try std.testing.expect(mid[0] < 0.5);
+    try std.testing.expectApproxEqAbs(mid[0], mid[1], 1e-3);
+    try std.testing.expectApproxEqAbs(mid[1], mid[2], 1e-3);
+    const black = oklabLightnessShifted(.{ 0, 0, 0 }, .island_ground);
+    try std.testing.expect(black[0] > 0);
+}
+
+test "island border: toward white on a dark bg, black on a light one" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.12), islandBorder(.{ 0, 0, 0 })[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.88), islandBorder(.{ 1, 1, 1 })[0], 1e-6);
+}
+
+// ---------------------------------------------------------------------------
 // Ext UI panel chrome and tabline geometry, unscaled
 
 /// Padding around the cmdline panel's content.
