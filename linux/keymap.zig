@@ -9,23 +9,24 @@ const GDK_SUPER_MASK: u32 = 1 << 26;
 
 /// Keys the core names in `winSpecialName` (src/core/nvim_core.zig), as
 /// `0x10000 | VK`. Everything else, including keypad digits, reaches the core
-/// as text.
+/// as text. The keypad's navigation keys (NumLock off) are their main-block
+/// twins, as Windows reports them.
 pub fn coreKeycode(keyval: u32) u32 {
     const vk: u32 = switch (keyval) {
-        0xff51 => 0x25, // Left
-        0xff52 => 0x26, // Up
-        0xff53 => 0x27, // Right
-        0xff54 => 0x28, // Down
-        0xff50 => 0x24, // Home
-        0xff57 => 0x23, // End
-        0xff55 => 0x21, // Page_Up
-        0xff56 => 0x22, // Page_Down
+        0xff51, 0xff96 => 0x25, // Left, KP_Left
+        0xff52, 0xff97 => 0x26, // Up, KP_Up
+        0xff53, 0xff98 => 0x27, // Right, KP_Right
+        0xff54, 0xff99 => 0x28, // Down, KP_Down
+        0xff50, 0xff95 => 0x24, // Home, KP_Home
+        0xff57, 0xff9c => 0x23, // End, KP_End
+        0xff55, 0xff9a => 0x21, // Page_Up, KP_Page_Up
+        0xff56, 0xff9b => 0x22, // Page_Down, KP_Page_Down
         0xff08 => 0x08, // BackSpace
-        0xffff => 0x2E, // Delete
+        0xffff, 0xff9f => 0x2E, // Delete, KP_Delete
         0xff0d, 0xff8d => 0x0D, // Return, KP_Enter
         0xff09, 0xfe20 => 0x09, // Tab, ISO_Left_Tab (Shift+Tab)
         0xff1b => 0x1B, // Escape
-        0xff63 => 0x2D, // Insert
+        0xff63, 0xff9e => 0x2D, // Insert, KP_Insert
         0xffbe...0xffd5 => 0x70 + (keyval - 0xffbe), // F1..F24
         else => return 0,
     };
@@ -94,6 +95,9 @@ test "special keys map to Win32 VK and the core treats them as special" {
         .{ 0xffca, 0x7C }, .{ 0xffd5, 0x87 }, // F13 F24
         .{ 0xff08, 0x08 }, .{ 0xff09, 0x09 }, .{ 0xff0d, 0x0D }, .{ 0xff1b, 0x1B }, // BS Tab CR Esc
         .{ 0xff8d, 0x0D }, .{ 0xfe20, 0x09 }, // KP_Enter, ISO_Left_Tab (Shift+Tab)
+        .{ 0xff95, 0x24 }, .{ 0xff96, 0x25 }, .{ 0xff97, 0x26 }, .{ 0xff98, 0x27 }, // KP_Home KP arrows
+        .{ 0xff99, 0x28 }, .{ 0xff9a, 0x21 }, .{ 0xff9b, 0x22 }, .{ 0xff9c, 0x23 }, // KP_Down PgUp PgDn End
+        .{ 0xff9e, 0x2D }, .{ 0xff9f, 0x2E }, // KP_Insert KP_Delete
     };
     for (cases) |c| {
         try testing.expectEqual(0x10000 | c[1], coreKeycode(c[0]));

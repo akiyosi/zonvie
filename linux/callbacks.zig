@@ -15,10 +15,18 @@ const input = @import("input.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
+const panel_popup = @import("panel_popup.zig");
 const blink = @import("blink.zig");
 const scrollbar = @import("scrollbar.zig");
 const core_timers = @import("core_timers.zig");
 const font_picker = @import("font_picker.zig");
+const window_size = @import("window_size.zig");
+const ime_off = @import("ime_off.zig");
+const font_mod = @import("renderer/font.zig");
+const Fonts = font_mod.Fonts;
+const font_spec = @import("font_spec.zig");
+const layer_geom = @import("layer_geom.zig");
+const session = @import("session.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -48,6 +56,12 @@ pub fn makeCallbacks() core.Callbacks {
         .on_rasterize_glyph_by_id = onRasterizeGlyphById,
         .on_shape_text_run = onShapeTextRun,
         .on_get_ascii_table = onGetAsciiTable,
+        .on_font_slot_load = onFontSlotLoad,
+        .on_font_slot_release = onFontSlotRelease,
+        .on_grid_font = onGridFont,
+        .on_shape_text_run_ex = onShapeTextRunEx,
+        .on_rasterize_glyph_ex = onRasterizeGlyphEx,
+        .on_rasterize_glyph_by_id_ex = onRasterizeGlyphByIdEx,
         .on_guifont = onGuiFont,
         .on_linespace = onLineSpace,
         .on_default_colors_set = onDefaultColorsSet,
@@ -60,7 +74,70 @@ pub fn makeCallbacks() core.Callbacks {
         .on_callback_error = onCallbackError,
         .on_quit_requested = onQuitRequested,
         .on_ime_off = onImeOff,
+        .on_cursor_grid_changed = onCursorGridChanged,
+        .on_restart = onRestart,
+        .on_connect = onConnect,
     };
+}
+
+/// `wincmd H/J/K/L`, `x`, `r`, `=` and `h/j/k/l` over external OS windows,
+/// set only under X11 (x11_place). On Wayland no client can read or move a
+/// toplevel, so they stay unset and the core does what it does without
+/// them: nothing for the layout operations, and win_move_cursor answers 0.
+pub fn addWindowLayout(cb: *core.Callbacks) void {
+    cb.on_win_move = onWinMove;
+    cb.on_win_exchange = onWinExchange;
+    cb.on_win_rotate = onWinRotate;
+    cb.on_win_resize_equal = onWinResizeEqual;
+    cb.on_win_move_cursor = onWinMoveCursor;
+}
+
+/// Queued behind the opens and closes before it, for the GTK thread. A
+/// user command, so a failed append drops it rather than the flush.
+fn queueLayout(app: *App, op: ext_window.Op) void {
+    {
+        lock(app);
+        defer unlock(app);
+        app.ext_ops.append(app.alloc, op) catch {
+            applog.appLog("[linux] window layout {s} dropped: out of memory\n", .{@tagName(op.layout_op)});
+            return;
+        };
+    }
+    ext_window.queueApply(app);
+}
+
+fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
+    _ = win;
+    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .move, .arg = flags, .count = 1, .source_grid = grid_id });
+}
+
+fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
+    _ = win;
+    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .exchange, .count = count, .source_grid = grid_id });
+}
+
+fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
+    _ = grid_id;
+    _ = win;
+    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .rotate, .arg = direction, .count = count });
+}
+
+/// Every window takes the average size, top-left corners kept.
+fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
+    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .resize_equal });
+}
+
+/// Synchronous (zonvie_core.h). Called while the core handles Neovim's
+/// request, with grid_mu not held, so it may ask the core for the cursor
+/// and the grids (as Windows does).
+fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
+    const app = appFrom(ctx);
+    const cp = app.corep orelse return 0;
+    const cursor_grid = core.zonvie_core_get_cursor_position(cp, null, null);
+    var grids: [64]core.GridInfo = undefined;
+    const n = core.zonvie_core_get_visible_grids(cp, &grids, grids.len);
+    const main_win = core.zonvie_core_get_win_id(cp, core.win_layout.mainTargetGrid(core.GridInfo, grids[0..n]));
+    return ext_window.findWindow(app, cursor_grid, direction, count, main_win);
 }
 
 /// One structured render-trace line, stamped with the flush it belongs to
@@ -188,7 +265,7 @@ fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u
             return;
         }
         // An ext_windows grid: a window of its own, opened on the GTK thread.
-        app.ext_ops.append(app.alloc, .{ .kind = .open, .grid_id = grid_id, .rows = rows, .cols = cols }) catch return failFlush(app);
+        app.ext_ops.append(app.alloc, .{ .kind = .open, .grid_id = grid_id, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col }) catch return failFlush(app);
     }
     ext_window.queueApply(app);
 }
@@ -201,6 +278,12 @@ fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
         defer unlock(app);
         if (overlay_layout.kindOf(grid_id)) |kind| {
             app.overlays[@intFromEnum(kind)] = .{};
+            // msg_show is pinned only until it closes; the next one starts
+            // at its anchor with no pointer on it.
+            if (kind == .msg_show) {
+                app.msg_chrome.reset();
+                app.msg_show_user = null;
+            }
         } else {
             // Reserved before closing, so a refused close leaves the surface
             // open for the retry to close again.
@@ -376,6 +459,11 @@ fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = appFrom(ctx);
+    {
+        lock(app);
+        defer unlock(app);
+        app.surface.dropGridFont(grid_id);
+    }
     if (!app.in_flush) {
         // A session teardown (SurfaceStore.destroyNow), not a flush's.
         traceRender(app, "event=destroy_now grid={d}\n", .{grid_id});
@@ -466,8 +554,12 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     } else false;
     unlock(app);
     ui_widgets.placeMessages(app);
+    panel_popup.update(app);
     ui_widgets.placeCopyButtons(app);
-    if (nvim_drawn) ui_widgets.hideProgress(app);
+    if (nvim_drawn) {
+        ui_widgets.hideProgress(app);
+        session.onReady(app);
+    }
     app.queueRenderAll();
     input.updateImeCursor(app);
     // Every flush may carry a mode change, and with it a new cadence.
@@ -570,12 +662,122 @@ fn onGetAsciiTable(ctx: ?*anyopaque, style_flags: u32, out_glyph_ids: [*]u32, ou
     return @intFromBool(app.fonts.asciiTable(style_flags, out_glyph_ids, out_x_advances, out_lig_triggers));
 }
 
+// Per-grid fonts (zonvie_core.h on_font_slot_load ff.). Core thread with
+// grid_mu held, like the global font's callbacks; the _ex ones come only
+// with a font_id the core loaded and has not released.
+
+/// The loaded face set of a non-zero font_id.
+fn slotFonts(app: *App, font_id: u32) ?*Fonts {
+    if (font_id == 0 or font_id >= app.slot_fonts.len) return null;
+    return app.slot_fonts[font_id];
+}
+
+fn releaseSlot(app: *App, font_id: u32) void {
+    const f = slotFonts(app, font_id) orelse return;
+    f.deinit(app.alloc);
+    app.alloc.destroy(f);
+    app.slot_fonts[font_id] = null;
+}
+
+/// The first candidate of the payload that loads, at its size times
+/// `scale`; an empty name or size is the global font's. Post on 1: the slot
+/// holds that face set and the out cell is its cell, the row height with
+/// 'linespace' as the global cell has it. On 0 the slot is unchanged.
+fn onFontSlotLoad(ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize, scale: f32, out_cell_w_px: *u32, out_cell_h_px: *u32) callconv(.c) c_int {
+    const app = appFrom(ctx);
+    if (font_id == 0 or font_id >= app.slot_fonts.len) return 0;
+    ensureFont(app);
+    lock(app);
+    const global_pt = app.font_pt;
+    unlock(app);
+    const global: font_spec.Defaults = .{
+        .family = app.fonts.family[0..app.fonts.family_len],
+        .point_size = if (global_pt > 0) global_pt else configPt(app),
+        .features = app.fonts.features[0..app.fonts.features_len],
+    };
+    const fonts = app.alloc.create(Fonts) catch return 0;
+    fonts.* = .{};
+    const payload: []const u8 = if (len != 0) utf8[0..len] else "";
+    var it = std.mem.splitScalar(u8, payload, '\n');
+    while (it.next()) |line| {
+        const cand = font_spec.slotCandidate(line, global, scale) orelse continue;
+        const base: font_mod.BaseStyle = if (cand.global_face) app.fonts.base else .{};
+        if (!fonts.load(app.alloc, cand.family, pixelSize(app, cand.point_size), cand.features, base)) continue;
+        releaseSlot(app, font_id);
+        app.slot_fonts[font_id] = fonts;
+        out_cell_w_px.* = fonts.cell_w_px;
+        out_cell_h_px.* = rowHeightPx(fonts.cell_h_px, app.linespace_px);
+        applog.appLog("[font_slot] load id={d} {s} {d}pt cell={d}x{d}\n", .{ font_id, cand.family, cand.point_size, out_cell_w_px.*, out_cell_h_px.* });
+        return 1;
+    }
+    fonts.deinit(app.alloc);
+    app.alloc.destroy(fonts);
+    applog.appLog("[font_slot] load id={d} failed\n", .{font_id});
+    return 0;
+}
+
+fn onFontSlotRelease(ctx: ?*anyopaque, font_id: u32) callconv(.c) void {
+    releaseSlot(appFrom(ctx), font_id);
+}
+
+/// Staged for the next commit (zonvie_core.h on_grid_font): the grid's
+/// committed rows are still in the font they were laid out in.
+fn onGridFont(ctx: ?*anyopaque, grid_id: i64, font_id: u32, cell_w_px: u32, cell_h_px: u32, extent_w_px: u32, extent_h_px: u32) callconv(.c) void {
+    const app = appFrom(ctx);
+    const font: ?layer_geom.GridFont = if (font_id == 0 or cell_w_px == 0 or cell_h_px == 0) null else .{
+        .font_id = font_id,
+        .cell_w_px = cell_w_px,
+        .cell_h_px = cell_h_px,
+        .extent_w_px = extent_w_px,
+        .extent_h_px = extent_h_px,
+    };
+    lock(app);
+    defer unlock(app);
+    app.surface.stageGridFont(app.alloc, grid_id, font) catch {
+        // Not resent by the core: the grid would be drawn in a font it is
+        // not laid out in. Rare (OOM); logged.
+        applog.appLog("[font_slot] grid_font dropped grid={d}: out of memory\n", .{grid_id});
+    };
+}
+
+fn onShapeTextRunEx(
+    ctx: ?*anyopaque,
+    font_id: u32,
+    scalars: [*]const u32,
+    scalar_count: usize,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_clusters: [*]u32,
+    out_x_advance: [*]i32,
+    out_x_offset: [*]i32,
+    out_y_offset: [*]i32,
+    out_cap: usize,
+) callconv(.c) usize {
+    const app = appFrom(ctx);
+    const f = slotFonts(app, font_id) orelse return 0;
+    return f.shape(app.alloc, scalars, scalar_count, style_flags, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+}
+
+fn onRasterizeGlyphEx(ctx: ?*anyopaque, font_id: u32, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
+    const app = appFrom(ctx);
+    const f = slotFonts(app, font_id) orelse return 0;
+    var cluster_len: u8 = 0;
+    const cluster_ptr = core.zonvie_core_get_emoji_cluster(app.corep, &cluster_len);
+    const cluster: []const u32 = if (cluster_ptr) |p| p[0..cluster_len] else &.{};
+    return @intFromBool(f.rasterizeScalar(app.alloc, scalar, style_flags, cluster, out_bitmap));
+}
+
+fn onRasterizeGlyphByIdEx(ctx: ?*anyopaque, font_id: u32, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
+    const app = appFrom(ctx);
+    const f = slotFonts(app, font_id) orelse return 0;
+    return @intFromBool(f.rasterizeGlyphId(app.alloc, glyph_id, style_flags, out_bitmap));
+}
+
 // =========================================================================
 // Font and metrics
 // =========================================================================
 
 const default_family = "monospace";
-const default_pt: f32 = 12.0;
 
 fn pixelSize(app: *App, pt: f32) u32 {
     lock(app);
@@ -587,16 +789,17 @@ fn pixelSize(app: *App, pt: f32) u32 {
 
 /// [font] size when config.toml sets it, else the Linux default.
 fn configPt(app: *App) f32 {
-    return if (app.font_cfg.size_explicit and app.font_cfg.size > 0) app.font_cfg.size else default_pt;
+    // [font] size, else the default `--help` documents (Config.FontConfig).
+    return if (app.font_cfg.size > 0) app.font_cfg.size else (core.config.Config.FontConfig{}).size;
 }
 
 /// Loads the first candidate of a newline-separated list (a guifont payload,
 /// or [font] family through the core's formatter) that fontconfig accepts.
-fn loadFirst(app: *App, list: []const u8, size_explicit: bool) bool {
+fn loadFirst(app: *App, list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) bool {
     var it = std.mem.splitScalar(u8, list, '\n');
     while (it.next()) |line| {
         const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
-        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features)) {
+        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features, base)) {
             applog.appLog("[linux] font: {s} {d}pt features={s}\n", .{ cand.name, cand.point_size, cand.features });
             lock(app);
             app.font_pt = cand.point_size;
@@ -613,30 +816,72 @@ fn loadConfigFamily(app: *App) bool {
     var arena = std.heap.ArenaAllocator.init(app.alloc);
     defer arena.deinit();
     const list = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.font_cfg.family, configPt(app), default_family) catch return false;
-    return loadFirst(app, list, false);
+    return loadFirst(app, list, false, .{});
 }
 
 /// Loads [font] (or its defaults) when no guifont has been applied yet.
 /// Core thread, or any thread before zonvie_core_start.
 pub fn ensureFont(app: *App) void {
     if (app.fonts.regular != null) return;
-    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "");
+    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{});
     updateMetrics(app);
+}
+
+/// A font cell's row height with 'linespace', floored at 1: the unit
+/// zonvie_core_update_layout_px and on_font_slot_load take as cell_h_px.
+fn rowHeightPx(cell_h_px: u32, linespace_px: i32) u32 {
+    return @intCast(@max(1, @as(i32, @intCast(cell_h_px)) + linespace_px));
+}
+
+/// The scale the surfaces now draw at changed: the global faces are loaded
+/// again at its pixel size and the core re-rasterizes and re-lays out, as
+/// for a guifont change. Per-grid fonts keep the pixel size they were loaded
+/// at until their window's font is set again (as on Windows: the core holds
+/// their cells). GTK main thread, not holding App.mu; blocks on grid_mu.
+pub fn applyScale(app: *App, scale: f32) void {
+    lock(app);
+    const changed = app.scale != scale;
+    app.scale = scale;
+    unlock(app);
+    if (!changed) return;
+    const cp = app.corep orelse return; // ensureFont loads at this scale
+    core.zonvie_core_lock_grid(cp);
+    defer core.zonvie_core_unlock_grid(cp);
+    lock(app);
+    const pt = app.font_pt;
+    unlock(app);
+    if (pt <= 0 or !app.fonts.reload(app.alloc, pixelSize(app, pt))) return;
+    applog.appLog("[linux] scale {d}: font reloaded at {d}px\n", .{ scale, app.fonts.pixel_size });
+    updateMetrics(app);
+    core.zonvie_core_invalidate_glyph_cache(cp);
+    lock(app);
+    const w = app.drawable_w_px;
+    const h = app.drawable_h_px;
+    const cw = app.cell_w_px;
+    const ch = app.cell_h_px;
+    unlock(app);
+    if (w != 0 and h != 0) core.zonvie_core_update_layout_px_locked(cp, w, h, cw, ch);
+    // update_layout_px_locked leaves the flush to its caller.
+    core.zonvie_core_retry_flush_locked(cp);
 }
 
 /// Publishes the font cell plus linespace.
 fn updateMetrics(app: *App) void {
-    const h: i32 = @as(i32, @intCast(app.fonts.cell_h_px)) + app.linespace_px;
+    const h = rowHeightPx(app.fonts.cell_h_px, app.linespace_px);
     lock(app);
     app.cell_w_px = app.fonts.cell_w_px;
-    app.cell_h_px = @intCast(@max(1, h));
+    app.cell_h_px = h;
     const n = app.fonts.family_len;
     @memcpy(app.preedit_family[0..n], app.fonts.family[0..n]);
     app.preedit_family_len = n;
     app.preedit_px = @as(f32, @floatFromInt(app.fonts.pixel_size)) / app.scale;
     unlock(app);
     // The line the GUI harness reads the cell size from, as on Windows.
-    applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ app.fonts.cell_w_px, @max(1, h) });
+    applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ app.fonts.cell_w_px, h });
+    // The windows follow the new cell: the main one snaps to it, external
+    // ones keep their grids' rows and columns.
+    window_size.queueSnap(app);
+    ext_window.queueRefit(app);
 }
 
 fn sendLayout(app: *App) void {
@@ -645,23 +890,28 @@ fn sendLayout(app: *App) void {
     const h = app.drawable_h_px;
     const cw = app.cell_w_px;
     const ch = app.cell_h_px;
+    const scale = app.scale;
     unlock(app);
     if (w == 0 or h == 0 or cw == 0) return;
     const cols = cmdlineCols(app, w, cw);
+    const grid_w = scrollbar.gridWidthPx(app.scrollbar_cfg, w, scale);
     // On the redraw thread the core applies this under the grid_mu it holds.
-    _ = core.zonvie_core_try_update_layout_px(app.corep, w, h, cw, ch, cols.screen_cols, cols.default_cols);
+    _ = core.zonvie_core_try_update_layout_px(app.corep, grid_w, h, cw, ch, cols.screen_cols, cols.default_cols);
 }
 
-/// The cmdline's width budget: its overlay spans the main view, less the
-/// panel chrome and the screen margin. Caller does not hold App.mu.
+/// The cmdline's width budget, less the panel chrome and the screen margin:
+/// the output's width while the cmdline is a popup that may reach past the
+/// window (panel_popup.zig), as Windows grows it to its monitor's work
+/// area, else the main view's. Caller does not hold App.mu.
 pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols {
     lock(app);
     const scale: u32 = @intFromFloat(app.scale);
     const copy = app.copy_cmdline;
+    const work_w_px = if (app.panel_popups) @max(main_w_px, app.monitor_w_px) else main_w_px;
     unlock(app);
     const chrome: u32 = @intCast(overlay_layout.cmdlineChromePx(@intCast(scale), copy));
     const margin: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_screen_margin_pt));
-    return rules.cmdlineCols(main_w_px, main_w_px, chrome, margin, cell_w_px);
+    return rules.cmdlineCols(work_w_px, main_w_px, chrome, margin, cell_w_px);
 }
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
@@ -673,13 +923,20 @@ fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void
     // none. An explicit [font] size wins over each entry's `:hN`. A pick
     // from the font dialog wins over both.
     const picked = app.font_picked.swap(false, .acq_rel);
+    // The pick's weight and slant are the regular face's; any other guifont
+    // is the family's regular face, and the next dialog starts from that.
+    const base: font_mod.BaseStyle = if (picked) .{ .bold = app.picked_bold.load(.acquire), .italic = app.picked_italic.load(.acquire) } else .{};
+    if (!picked) {
+        app.picked_bold.store(false, .release);
+        app.picked_italic.store(false, .release);
+    }
     const loaded = if (app.font_cfg.family_explicit and !picked)
         loadConfigFamily(app)
     else
-        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked);
+        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked, base);
     if (!loaded) {
         if (app.fonts.regular != null) return;
-        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "")) return;
+        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{})) return;
     }
     updateMetrics(app);
     if (app.corep) |cp| core.zonvie_core_invalidate_glyph_cache(cp);
@@ -718,12 +975,13 @@ fn onSetTitle(ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.
 fn idleSetTitle(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     const window = app.window orelse return 0;
+    _ = window;
     var buf: [256]u8 = undefined;
     lock(app);
     @memcpy(buf[0..app.title_len], app.title[0..app.title_len]);
-    buf[app.title_len] = 0;
+    const n = app.title_len;
     unlock(app);
-    gtk.gtk_window_set_title(window, @ptrCast(&buf));
+    session.applyTitle(app, buf[0..n]);
     return 0;
 }
 
@@ -736,6 +994,9 @@ fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
 }
 
 fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
+    // Neovim quitting (`:qa`) closes the window without a close-request,
+    // so its frame is remembered here, while the window still exists.
+    window_size.save(appFrom(data));
     if (appFrom(data).gtk_app) |a| gtk.g_application_quit(a);
     return 0;
 }
@@ -749,6 +1010,7 @@ fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
 fn idleQuitRequested(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     const cp = app.corep orelse return 0;
+    if (!session.takeQuitReply(app)) return 0;
     if (!app.quit_has_unsaved.load(.acquire)) {
         core.zonvie_core_quit_confirmed(cp, 0);
         return 0;
@@ -759,7 +1021,7 @@ fn idleQuitRequested(data: ?*anyopaque) callconv(.c) c_int {
     gtk.gtk_alert_dialog_set_buttons(dialog, &labels);
     gtk.gtk_alert_dialog_set_cancel_button(dialog, 0);
     gtk.gtk_alert_dialog_set_default_button(dialog, 0);
-    gtk.gtk_alert_dialog_choose(dialog, app.window, null, &onQuitDialogDone, app);
+    gtk.gtk_alert_dialog_choose(dialog, session.parentWindow(app), null, &onQuitDialogDone, app);
     return 0;
 }
 
@@ -773,12 +1035,46 @@ fn onQuitDialogDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque)
     if (app.corep) |cp| core.zonvie_core_quit_confirmed(cp, 1);
 }
 
+/// `:restart` / `:connect`: the core reconnects by itself and no on_exit
+/// follows (zonvie_core.h). The Linux frontend keeps no per-session
+/// surface generation or cursor-grid memory (Windows' onSessionSwap): ext
+/// windows open and close in the core's order through one queue, so there
+/// is nothing to reset; the address is logged.
+fn onRestart(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) void {
+    _ = ctx;
+    applog.appLog("[linux] on_restart: reconnecting to listen_addr={s}\n", .{addr[0..addr_len]});
+}
+
+fn onConnect(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) void {
+    _ = ctx;
+    applog.appLog("[linux] on_connect: hot-swap to server_addr={s}\n", .{addr[0..addr_len]});
+}
+
 fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
     _ = gtk.g_idle_add(&idleImeOff, appFrom(ctx));
 }
 
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
-    if (appFrom(data).pointer.im_context) |im| gtk.gtk_im_context_reset(im);
+    ime_off.off(appFrom(data).pointer.im_context);
+    return 0;
+}
+
+/// The cursor moved to another grid: the window showing it comes forward.
+/// Core thread; the GTK thread presents it.
+fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+    const app = appFrom(ctx);
+    lock(app);
+    app.cursor_grid_focus = grid_id;
+    unlock(app);
+    _ = gtk.g_idle_add(&idleFocusGrid, app);
+}
+
+fn idleFocusGrid(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    lock(app);
+    const grid = app.cursor_grid_focus;
+    unlock(app);
+    ext_window.focusGrid(app, grid);
     return 0;
 }
 
@@ -791,26 +1087,13 @@ fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void {
     _ = gtk.g_idle_add(&idleResizeToGrid, app);
 }
 
-/// Sizes the window so the GLArea holds the requested cells; the GLArea
-/// resize that follows reports the layout to the core.
 fn idleResizeToGrid(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
-    const window = app.window orelse return 0;
-    const area = app.gl_area orelse return 0;
     lock(app);
     const rows = app.requested_rows;
     const cols = app.requested_cols;
-    const cw = app.cell_w_px;
-    const ch = app.cell_h_px;
-    const scale = app.scale;
     unlock(app);
-    if (rows == 0 or cols == 0 or cw == 0 or ch == 0) return 0;
-    // Window chrome (a CSD titlebar) is the window/area size difference.
-    const chrome_w = @max(0, gtk.gtk_widget_get_width(window) - gtk.gtk_widget_get_width(area));
-    const chrome_h = @max(0, gtk.gtk_widget_get_height(window) - gtk.gtk_widget_get_height(area));
-    const w_logical: c_int = @intFromFloat(@ceil(@as(f32, @floatFromInt(cols * cw)) / scale));
-    const h_logical: c_int = @intFromFloat(@ceil(@as(f32, @floatFromInt(rows * ch)) / scale));
-    gtk.gtk_window_set_default_size(window, w_logical + chrome_w, h_logical + chrome_h);
+    window_size.resizeToGrid(app, rows, cols);
     return 0;
 }
 
@@ -962,9 +1245,9 @@ fn onClipboardReadFinish(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyop
 fn onClipboardSet(ctx: ?*anyopaque, register: [*]const u8, data: [*]const u8, len: usize) callconv(.c) c_int {
     _ = register;
     const app = appFrom(ctx);
-    if (len == 0) return 1;
-    // The idle owns its copy, so a later set cannot overwrite text GDK is
-    // still reading.
+    // An empty register empties the clipboard (it is set to ""), as on
+    // macOS and Windows. The idle owns its copy, so a later set cannot
+    // overwrite text GDK is still reading.
     const buf = app.alloc.alloc(u8, len + 1) catch return 0;
     @memcpy(buf[0..len], data[0..len]);
     buf[len] = 0;

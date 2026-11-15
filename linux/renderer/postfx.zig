@@ -74,6 +74,8 @@ const Custom = struct {
     uses_prev: bool = false,
     /// Reads iCellAge or its companions (frontend_rules.shaderUsesEditInputs).
     uses_edit: bool = false,
+    /// Declares `@zonvie-owns-cursor` (frontend_rules.shaderOwnsCursor).
+    owns_cursor: bool = false,
 };
 
 const max_custom = 8;
@@ -106,6 +108,12 @@ pub const PostFx = struct {
     age_rows: u32 = 0,
     age_cache: core.cell_age_store.SyncCache = .{},
     uses_edit: bool = false,
+    /// Some loaded shader draws the cursor itself.
+    owns_cursor: bool = false,
+    /// iDate's date fields and the wall-clock second they were taken at:
+    /// localtime runs at most once a second.
+    date_second: i64 = -1,
+    date_ymds: [4]f32 = .{ 0, 0, 0, 0 },
     /// Some shader reads time: the frame clock keeps drawing.
     animating: bool = false,
     start_ns: i128 = 0,
@@ -256,6 +264,7 @@ fn setup(app: *App, p: *PostFx) bool {
             if (c.needs_animation) p.animating = true;
             if (c.uses_prev) p.uses_prev = true;
             if (c.uses_edit) p.uses_edit = true;
+            if (c.owns_cursor) p.owns_cursor = true;
         }
     }
     // The core records no stamps until a shader wants them. Every window
@@ -314,7 +323,55 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
         .needs_animation = core.zonvie_core_shader_needs_animation(src.ptr, src.len),
         .uses_prev = core.frontend_rules.shaderUsesPrevFrame(src),
         .uses_edit = core.frontend_rules.shaderUsesEditInputs(src),
+        .owns_cursor = core.frontend_rules.shaderOwnsCursor(src),
     };
+}
+
+/// True when a `@zonvie-owns-cursor` shader draws the cursor this frame, so
+/// the native cursor must not be drawn. Until it has been given a cursor
+/// rect the native pass stays in charge (windows d3d11_renderer
+/// shaderDrawsCursorNow).
+fn shaderDrawsCursor(p: *const PostFx) bool {
+    const r = p.uniforms.iCurrentCursor;
+    return p.owns_cursor and p.custom_len != 0 and r[2] > 0 and r[3] > 0;
+}
+
+const Tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: ?[*:0]const u8,
+};
+extern "c" fn localtime_r(t: *const c_long, out: *Tm) ?*Tm;
+
+/// Shadertoy's iDate: (year, month 1..12, day, seconds since local
+/// midnight), as Windows and macOS fill it; the sub-second part runs every
+/// frame, the date fields are taken once per wall-clock second.
+fn fillDate(p: *PostFx, u: *Uniforms) void {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return;
+    const sec: i64 = @intCast(ts.sec);
+    if (sec != p.date_second) {
+        const t: c_long = @intCast(sec);
+        var tm: Tm = undefined;
+        if (localtime_r(&t, &tm) == null) return;
+        p.date_second = sec;
+        p.date_ymds = .{
+            @floatFromInt(tm.year + 1900),
+            @floatFromInt(tm.mon + 1),
+            @floatFromInt(tm.mday),
+            @floatFromInt(tm.hour * 3600 + tm.min * 60 + tm.sec),
+        };
+    }
+    u.iDate = p.date_ymds;
+    u.iDate[3] += @as(f32, @floatFromInt(ts.nsec)) / std.time.ns_per_s;
 }
 
 fn drawFullscreen(pass: Pass, tex: u32, to_screen: bool) void {
@@ -368,7 +425,7 @@ fn bloom(app: *App, t: *gl_renderer.Target, p: *PostFx, cp: *core.zonvie_core, s
 /// The cursor as Ghostty's uniforms carry it: (left, bottom, w, h) in
 /// drawable px, y down, and its colour; null when it is not on this surface.
 /// Takes App.mu.
-fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32 } {
+fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32, cell: [2]f32 } {
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
     const cur = app.surface.committedCursor();
@@ -377,7 +434,13 @@ fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32
         if (l.grid_id == cur.grid_id) break l;
     } else return null;
     const b = core.cursor_rect.bounds(core.Vertex, cur.verts, @floatFromInt(layer.x_px), @floatFromInt(layer.y_px)) orelse return null;
-    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color };
+    // The cursor's cell is its grid's: a per-grid font's when it has one.
+    const f = app.surface.gridFont(cur.grid_id);
+    const cell: [2]f32 = .{
+        @floatFromInt(if (f) |g| g.cell_w_px else app.cell_w_px),
+        @floatFromInt(if (f) |g| g.cell_h_px else app.cell_h_px),
+    };
+    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color, .cell = cell };
 }
 
 fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id: i64) void {
@@ -397,6 +460,10 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     p.last_ns = now;
     u.iFrame = p.frame;
     p.frame +%= 1;
+    fillDate(p, u);
+    // An external window's offset from the main window's surface: Wayland
+    // gives a client no window position, its own or another's, so every
+    // window reports (0,0) and is its own origin.
     u.iWindowOffset = .{ 0, 0 };
     u.iWindowSize = .{ w, h };
     const cursor = cursorState(app, surface_id);
@@ -412,10 +479,11 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     }
     // The rest by the core's rule, cursor styles included. The root grid
     // starts at the surface's corner.
+    const cell: [2]f32 = if (cursor) |c| c.cell else .{ @floatFromInt(app.cell_w_px), @floatFromInt(app.cell_h_px) };
     core.fillEditUniforms(
         u,
-        @floatFromInt(app.cell_w_px),
-        @floatFromInt(app.cell_h_px),
+        cell[0],
+        cell[1],
         .{ 0, 0 },
         p.age_cache.last_edit,
         cursor != null,
@@ -443,7 +511,9 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     p.scene.ensure(t.w_px, t.h_px);
     gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.scene.fbo);
     t.flip_y = true;
+    t.skip_cursor = shaderDrawsCursor(p);
     const f = scene(app, t, surface_id);
+    t.skip_cursor = false;
     if (app.corep) |cp| {
         if (core.zonvie_core_get_glow_enabled(cp)) bloom(app, t, p, cp, surface_id);
     }

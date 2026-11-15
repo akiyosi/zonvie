@@ -28,6 +28,7 @@ pub const win_layout = @import("win_layout.zig");
 pub const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const frontend_rules = @import("frontend_rules.zig");
+pub const tab_label = @import("tab_label.zig");
 pub const cell_age_store = @import("cell_age_store.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
@@ -36,6 +37,7 @@ pub const highlight = @import("highlight.zig");
 pub const log_mod = @import("log.zig");
 
 test {
+    _ = @import("tab_label.zig");
     _ = @import("abi_header_test.zig");
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");

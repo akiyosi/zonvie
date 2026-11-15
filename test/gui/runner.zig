@@ -466,6 +466,22 @@ test "gui:scrollbar_pointer" {
     try gated(is_linux, @import("scenarios/linux/scrollbar_pointer.zig"));
 }
 
+test "gui:hires_scroll" {
+    // Linux only: fractional scroll steps gathered into wheel steps, through
+    // the virtual pointer's smooth axis events.
+    try gated(is_linux, @import("scenarios/linux/hires_scroll.zig"));
+}
+
+test "gui:ext_float_panels" {
+    // Linux only: a panel in an external float is a popup of that window.
+    try gated(is_linux, @import("scenarios/linux/ext_float_panels.zig"));
+}
+
+test "gui:tab_tearoff" {
+    // Linux only: a tab dragged out of the strip becomes an external float.
+    try gated(is_linux, @import("scenarios/linux/tab_tearoff.zig"));
+}
+
 test "gui:tabline_pointer" {
     // Linux only: linux/ui_widgets.zig's tab strip through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));
@@ -479,6 +495,16 @@ test "gui:tabline_hover" {
 test "gui:copy_button_pointer" {
     // Linux only: linux/ui_widgets.zig's copy buttons through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/copy_button_pointer.zig"));
+}
+
+test "gui:message_panel_pointer" {
+    // Linux only: linux/input.zig's ext UI panels through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/message_panel_pointer.zig"));
+}
+
+test "gui:cmdline_popup_pointer" {
+    // Linux only: linux/panel_popup.zig through the virtual pointer.
+    try gated(is_linux, @import("scenarios/linux/cmdline_popup_pointer.zig"));
 }
 
 test "gui:font_dialog_pointer" {

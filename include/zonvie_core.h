@@ -1599,7 +1599,7 @@ ZONVIE_API bool zonvie_core_grid_view_moved_locked(zonvie_core *core, int64_t gr
    restore arriving twice is harmless. Windows without 'wrap' are skipped: the
    option does nothing there.
 
-   No-op off macOS (sub-cell trackpad scrolling is a macOS frontend feature).
+   No-op off macOS and Linux (the frontends with sub-cell trackpad scrolling).
    Returns 1 when the request was issued, 0 when it could not be (grid lock
    busy, or no window known for the grid yet) — the caller must try again, which
    matters most for the restore. */

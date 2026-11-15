@@ -1,7 +1,8 @@
 // app_log.zig — Frontend logging for Linux (mirrors windows/app_log.zig).
 
 const std = @import("std");
-const clock = @import("zonvie_core").clock;
+const core = @import("zonvie_core");
+const clock = core.clock;
 
 var g_enabled: bool = false;
 var g_log_file: ?std.Io.File = null;
@@ -45,7 +46,19 @@ pub fn isVerbose() bool {
     return g_enabled and g_verbose;
 }
 
-/// Set log output file path. If path is provided, logs go to file instead of stderr.
+var g_perf_only: bool = false;
+var g_scroll_only: bool = false;
+
+/// config.toml [log] perf_only / scroll_only, for frontend lines. Set before
+/// any thread logs.
+pub fn setFilters(perf_only: bool, scroll_only: bool) void {
+    g_perf_only = perf_only;
+    g_scroll_only = scroll_only;
+}
+
+/// Set log output file path. If path is provided, logs go to file instead of
+/// stderr. The file is appended to, as on macOS and Windows, so a restart
+/// keeps the previous session's lines.
 pub fn setLogPath(path: ?[]const u8) void {
     // Close existing file if any
     if (g_log_file) |f| {
@@ -55,17 +68,20 @@ pub fn setLogPath(path: ?[]const u8) void {
 
     if (path) |p| {
         if (p.len > 0) {
-            g_log_file = if (std.fs.path.isAbsolute(p))
-                std.Io.Dir.createFileAbsolute(clock.io(), p, .{ .truncate = true }) catch null
+            const io = clock.io();
+            const f = (if (std.fs.path.isAbsolute(p))
+                std.Io.Dir.createFileAbsolute(io, p, .{ .truncate = false, .read = true })
             else
-                std.Io.Dir.cwd().createFile(clock.io(), p, .{ .truncate = true }) catch null;
+                std.Io.Dir.cwd().createFile(io, p, .{ .truncate = false, .read = true })) catch return;
+            if (f.length(io)) |len| io.vtable.fileSeekTo(io.userdata, f, len) catch {} else |_| {}
+            g_log_file = f;
         }
     }
 }
 
 /// printf-style logging for app/frontend side.
 pub fn appLog(comptime fmt: []const u8, args: anytype) void {
-    if (!g_enabled) return;
+    if (!g_enabled or !core.frontend_rules.logLineEmitted(fmt, g_perf_only, g_scroll_only)) return;
 
     if (g_log_file) |f| {
         // Write to file using a stack buffer
@@ -90,6 +106,7 @@ pub fn appLog(comptime fmt: []const u8, args: anytype) void {
 /// Used by core on_log callback: bytes already contain newline sometimes; caller decides.
 pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
     if (!g_enabled) return;
+    if (!core.frontend_rules.logLineEmitted(if (prefix.len != 0) prefix else bytes, g_perf_only, g_scroll_only)) return;
 
     if (g_log_file) |f| {
         var buf: [32]u8 = undefined;

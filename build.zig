@@ -298,7 +298,16 @@ pub fn build(b: *std.Build) !void {
             .file = b.path("macos/Sources/Font/HBFTBridge.c"),
             .flags = &.{},
         });
+        // ext-background-effect-v1 (compositor blur behind the windows).
+        linux_mod.addCSourceFile(.{
+            .file = b.path("linux/wl_blur.c"),
+            .flags = &.{},
+        });
+        linux_mod.linkSystemLibrary("wayland-client", .{});
         linux_mod.linkSystemLibrary("gtk-4", .{});
+        // Xlib, which GTK's X11 backend already loads: window placement
+        // under an X11 session (linux/x11_place.zig).
+        linux_mod.linkSystemLibrary("X11", .{});
         linux_mod.linkSystemLibrary("GL", .{});
         linux_mod.linkSystemLibrary("EGL", .{});
         linux_mod.linkSystemLibrary("gbm", .{});

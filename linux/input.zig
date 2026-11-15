@@ -9,10 +9,19 @@ const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const transform = @import("transform.zig");
+const layer_geom = @import("layer_geom.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const scrollbar = @import("scrollbar.zig");
 const core_timers = @import("core_timers.zig");
 const askpass = @import("askpass.zig");
+const overlay_layout = @import("overlay_layout.zig");
+const gl_renderer = @import("renderer/gl_renderer.zig");
+const preedit_target = @import("preedit_target.zig");
+const applog = @import("app_log.zig");
+const trackpad = @import("trackpad.zig");
+const pixel_scroll = @import("pixel_scroll.zig");
+const panel_popup = @import("panel_popup.zig");
+const popup_place = @import("popup_place.zig");
 
 /// One GLArea's input: the surface its pointer addresses, its IME context
 /// and the press it is tracking. The main window's lives in App; each
@@ -21,6 +30,9 @@ pub const Pointer = struct {
     app: *App,
     /// 1 for the main window, else the external window's root grid.
     surface_id: i64 = 1,
+    /// A panel popup's pointer (panel_popup.zig): surface 1's panel of this
+    /// kind only, its positions mapped onto the main view.
+    panel: ?overlay_layout.Kind = null,
     im_context: ?*anyopaque = null,
     /// Logical widget px of the last pointer motion; the wheel has no position.
     x: f64 = 0,
@@ -33,7 +45,43 @@ pub const Pointer = struct {
     drag_col: i32 = -1,
     /// The scrollbar took the held press; Neovim never saw it.
     bar_held: bool = false,
+    /// The GLArea, for its pointer shape.
+    area: ?*anyopaque = null,
+    /// An external window's preedit label (the main window's is
+    /// App.widgets.preedit).
+    preedit_label: ?*anyopaque = null,
+    /// The pointer shows the hand: the cell under it holds a URL.
+    url_hand: bool = false,
+    /// A left press on an ext UI panel, which Neovim never sees.
+    panel_press: ?PanelPress = null,
+    /// The message grid (-102 / -103) the pointer rests on, 0 for none.
+    msg_hover: i64 = 0,
+    /// The touchpad gesture and the wheel's fractional steps.
+    scroll: trackpad.State = .{},
+    /// Latched when a file drag enters: its drop would insert the paths.
+    /// The mode cannot change while the drag is held, and motion fires on
+    /// every move, so it is not re-read there.
+    drag_inserts_path: bool = false,
 };
+
+/// A left press held on a panel: on msg_show's close badge (a click
+/// dismisses it on release over the badge), or dragging the cmdline or
+/// msg_show.
+pub const PanelPress = struct {
+    kind: overlay_layout.Kind,
+    badge: bool,
+    /// Logical widget px of the press.
+    x: f64,
+    y: f64,
+    /// The panel at the press, surface px.
+    rect: overlay_layout.Rect,
+    /// Past the threshold: the panel follows the pointer.
+    moved: bool = false,
+};
+
+/// Logical px a press must travel before it moves a panel, so a click
+/// leaves it (and msg_show's anchor) alone.
+const panel_drag_threshold = 3.0;
 
 fn ptrFrom(data: ?*anyopaque) *Pointer {
     return @ptrCast(@alignCast(data.?));
@@ -44,6 +92,7 @@ fn appFrom(data: ?*anyopaque) *App {
 }
 
 pub fn attach(p: *Pointer, area: *anyopaque) void {
+    p.area = area;
     const im = gtk.gtk_im_multicontext_new() orelse return;
     p.im_context = im;
     gtk.gtk_im_context_set_client_widget(im, area);
@@ -69,8 +118,10 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
         _ = gtk.g_signal_connect(click, "released", @ptrCast(&onReleased), p);
         gtk.gtk_widget_add_controller(area, click);
     }
-    if (gtk.gtk_drop_target_new(gtk.gdk_file_list_get_type(), gtk.GDK_ACTION_COPY)) |drop| {
+    if (gtk.gtk_drop_target_new(gtk.gdk_file_list_get_type(), gtk.GDK_ACTION_COPY | gtk.GDK_ACTION_LINK)) |drop| {
         _ = gtk.g_signal_connect(drop, "drop", @ptrCast(&onDrop), p);
+        _ = gtk.g_signal_connect(drop, "enter", @ptrCast(&onDragEnter), p);
+        _ = gtk.g_signal_connect(drop, "motion", @ptrCast(&onDragMotion), p);
         gtk.gtk_widget_add_controller(area, drop);
     }
     if (gtk.gtk_event_controller_motion_new()) |motion| {
@@ -78,8 +129,13 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
         _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onLeave), p);
         gtk.gtk_widget_add_controller(area, motion);
     }
-    if (gtk.gtk_event_controller_scroll_new(gtk.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES | gtk.GTK_EVENT_CONTROLLER_SCROLL_DISCRETE)) |scroll| {
+    // Not DISCRETE: a touchpad's surface px drive trackpad.zig, and a
+    // wheel's steps are gathered into whole ones in onScroll.
+    if (gtk.gtk_event_controller_scroll_new(gtk.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES | gtk.GTK_EVENT_CONTROLLER_SCROLL_KINETIC)) |scroll| {
         _ = gtk.g_signal_connect(scroll, "scroll", @ptrCast(&onScroll), p);
+        _ = gtk.g_signal_connect(scroll, "scroll-begin", @ptrCast(&trackpad.onBegin), p);
+        _ = gtk.g_signal_connect(scroll, "scroll-end", @ptrCast(&trackpad.onEnd), p);
+        _ = gtk.g_signal_connect(scroll, "decelerate", @ptrCast(&trackpad.onDecelerate), p);
         gtk.gtk_widget_add_controller(area, scroll);
     }
 }
@@ -89,9 +145,8 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
 // =========================================================================
 
 fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uint, data: ?*anyopaque) callconv(.c) c_int {
-    _ = ctrl;
-    _ = keycode;
-    const app = appFrom(data);
+    const p = ptrFrom(data);
+    const app = p.app;
     if (keymap.isNewSession(keyval, state)) {
         openNewSession();
         return 1;
@@ -106,14 +161,34 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     if (cp_u != 0) n = std.unicode.utf8Encode(@intCast(cp_u), &buf) catch 0;
     // A bare modifier or dead key: nothing the core can format.
     if (code == 0 and n == 0) return 0;
-    core.zonvie_core_send_key_event(cp, code, mods, &buf, @intCast(n), &buf, @intCast(n));
+    // A modified key names its unshifted key (<C-S-2>, not <C-S-@>), as
+    // Windows' ToUnicodeEx with the modifiers cleared does.
+    var ign: [4]u8 = undefined;
+    var ign_n: usize = n;
+    @memcpy(ign[0..n], buf[0..n]);
+    if (mods & (core.MOD_CTRL | core.MOD_ALT | core.MOD_SUPER) != 0) {
+        if (baseKeyval(p, ctrl.?, keycode)) |base| {
+            const base_u = gtk.gdk_keyval_to_unicode(base);
+            if (base_u != 0) ign_n = std.unicode.utf8Encode(@intCast(base_u), &ign) catch ign_n;
+        }
+    }
+    core.zonvie_core_send_key_event(cp, code, mods, &buf, @intCast(n), &ign, @intCast(ign_n));
     return 1;
+}
+
+/// The keyval `keycode` has with no modifier held, in the event's layout.
+fn baseKeyval(p: *Pointer, ctrl: *anyopaque, keycode: c_uint) ?c_uint {
+    const event = gtk.gtk_event_controller_get_current_event(ctrl) orelse return null;
+    const display = gtk.gtk_widget_get_display(p.area orelse return null) orelse return null;
+    var keyval: c_uint = 0;
+    if (gtk.gdk_display_translate_key(display, keycode, 0, @intCast(gtk.gdk_key_event_get_layout(event)), &keyval, null, null, null) == 0) return null;
+    return keyval;
 }
 
 /// New Session: another zonvie process showing the connection dialog, as
 /// macOS opens a window with it. Its own process, so it has its own nvim,
 /// GTK app and single-instance opt-out (`--dialog` never forwards).
-fn openNewSession() void {
+pub fn openNewSession() void {
     var exe: [std.fs.max_path_bytes:0]u8 = undefined;
     const n = std.c.readlink("/proc/self/exe", &exe, exe.len - 1);
     if (n <= 0) return;
@@ -172,17 +247,42 @@ fn onPreeditChanged(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
         return;
     }
     app.preedit_active = true;
-    // No target clause: GTK reports it only through Pango attributes, which
-    // the overlay label draws as they are.
-    const inline_shown = core.zonvie_core_set_preedit(cp, t.ptr, t.len, 0, 0) != 0;
-    // The overlay is the main window's: an external window's composition
-    // shows only inline.
-    if (p.surface_id != 1) return;
-    ui_widgets.showPreedit(app, if (inline_shown) "" else t, attrs, cursorRect(app));
+    // The clause being converted, as the IME's Pango attributes mark it; the
+    // overlay label draws those attributes as they are.
+    const clause = preedit_target.fromPango(attrs, t.len);
+    const inline_shown = core.zonvie_core_set_preedit(cp, t.ptr, t.len, clause[0], clause[1]) != 0;
+    const target = preeditTarget(p, cursorRect(p));
+    hidePreeditExcept(p, target.label);
+    ui_widgets.showPreedit(app, target.label, if (inline_shown) "" else t, attrs, target.at);
+}
+
+/// The label this window's composition shows in when the core does not
+/// draw it inline.
+fn preeditLabel(p: *const Pointer) ?*anyopaque {
+    return if (p.surface_id == 1) p.app.widgets.preedit else p.preedit_label;
+}
+
+/// The label for a composition at the cursor `at` (logical px of `p`'s
+/// window), and `at` in that label's overlay: the cmdline popup's while
+/// the cursor is in it, since the main view's label would sit under the
+/// popup, else the window's own.
+fn preeditTarget(p: *const Pointer, at: ?gtk.GdkRectangle) struct { label: ?*anyopaque, at: ?gtk.GdkRectangle } {
+    if (p.surface_id == 1) {
+        if (at) |r| if (panel_popup.cmdlinePreedit(p.app, r)) |c| return .{ .label = c.label, .at = c.at };
+    }
+    return .{ .label = preeditLabel(p), .at = at };
+}
+
+/// Hides every composition label of `p`'s window but `keep`.
+fn hidePreeditExcept(p: *Pointer, keep: ?*anyopaque) void {
+    const popup: ?*anyopaque = if (p.surface_id == 1) panel_popup.cmdlinePreeditLabel(p.app) else null;
+    for ([_]?*anyopaque{ preeditLabel(p), popup }) |l| {
+        if (l != null and l != keep) ui_widgets.showPreedit(p.app, l, "", null, null);
+    }
 }
 
 fn hidePreedit(p: *Pointer) void {
-    if (p.surface_id == 1) ui_widgets.showPreedit(p.app, "", null, null);
+    hidePreeditExcept(p, null);
 }
 
 fn onPreeditEnd(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -204,27 +304,85 @@ fn onFocusOut(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     if (ptrFrom(data).im_context) |im| gtk.gtk_im_context_focus_out(im);
 }
 
-/// Places the main window's IME candidate window, and the preedit label when
-/// it is up, at the committed cursor.
+/// Places the IME candidate window, and the preedit label when it is up, at
+/// the committed cursor, on whichever window draws it: the main window (its
+/// grids and the ext cmdline panel) or an external one.
 pub fn updateImeCursor(app: *App) void {
-    const im = app.pointer.im_context orelse return;
-    const rect = cursorRect(app) orelse return;
-    gtk.gtk_im_context_set_cursor_location(im, &rect);
-    if (ui_widgets.preeditShown(app)) ui_widgets.placePreedit(app, rect);
+    placeIme(&app.pointer);
+    var it = app.ext_windows.valueIterator();
+    while (it.next()) |w| placeIme(&w.*.pointer);
 }
 
-/// The committed cursor on the main surface, in logical px; null when it is
+fn placeIme(p: *Pointer) void {
+    const im = p.im_context orelse return;
+    const rect = cursorRect(p) orelse return;
+    gtk.gtk_im_context_set_cursor_location(im, &rect);
+    const target = preeditTarget(p, rect);
+    const label = target.label orelse return;
+    if (ui_widgets.preeditShown(label)) ui_widgets.placePreedit(label, target.at);
+}
+
+/// `p`'s surface size in device px, as its frames are drawn. GTK main
+/// thread (ext_windows); caller holds App.mu.
+fn surfaceSizePx(p: *const Pointer) ?[2]u32 {
+    const app = p.app;
+    if (p.surface_id == 1) return .{ app.drawable_w_px, app.drawable_h_px };
+    const w = app.ext_windows.get(p.surface_id) orelse return null;
+    return .{ w.gl.w_px, w.gl.h_px };
+}
+
+/// The panels drawn on `p`'s surface and what placed them. Caller holds
+/// App.mu.
+fn surfacePanels(p: *const Pointer) ?struct { rects: [4]?overlay_layout.Rect, in: overlay_layout.Inputs } {
+    const app = p.app;
+    const sz = surfaceSizePx(p) orelse return null;
+    if (sz[0] == 0 or app.cell_w_px == 0 or app.cell_h_px == 0) return null;
+    const in = gl_renderer.overlayInputs(app, p.surface_id, sz[0], sz[1]);
+    var rects = overlay_layout.place(&app.overlays, in);
+    // A popup's panel is where the compositor put the popup; none while it
+    // is hidden. On any surface: a panel hangs from the surface it is placed
+    // on (panel_popup.hostSurface).
+    if (app.panel_popups) {
+        for (&rects, 0..) |*r, i| {
+            if (r.* != null) r.* = panel_popup.panelRect(app, @enumFromInt(i), in.scale);
+        }
+    }
+    return .{ .rects = rects, .in = in };
+}
+
+/// Where the cursor grid's layer sits on `p`'s surface, surface px: a layer
+/// of the surface, or a grid drawn in an ext UI panel there (the cmdline),
+/// past the panel's chrome. Null when the surface does not draw the grid.
+/// Caller holds App.mu.
+fn cursorLayerOrigin(p: *const Pointer, grid_id: i64) ?[2]i32 {
+    const app = p.app;
+    if (overlay_layout.kindOf(grid_id)) |kind| {
+        const panels = surfacePanels(p) orelse return null;
+        const in = panels.in;
+        const r = panels.rects[@intFromEnum(kind)] orelse return null;
+        const layer = for (app.surface.committedSurfaceLayers(grid_id)) |l| {
+            if (l.grid_id == grid_id) break l;
+        } else return null;
+        const o = overlay_layout.contentOrigin(kind, in.scale);
+        return .{ r.x + o[0] + layer.x_px, r.y + o[1] + layer.y_px };
+    }
+    const layer = for (app.surface.committedSurfaceLayers(p.surface_id)) |l| {
+        if (l.grid_id == grid_id) break l;
+    } else return null;
+    return .{ layer.x_px, layer.y_px };
+}
+
+/// The committed cursor on `p`'s window, in its logical px; null when it is
 /// elsewhere.
-fn cursorRect(app: *App) ?gtk.GdkRectangle {
+fn cursorRect(p: *const Pointer) ?gtk.GdkRectangle {
+    const app = p.app;
     var rect: gtk.GdkRectangle = undefined;
     {
         app.mu.lockUncancelable(clock.io());
         defer app.mu.unlock(clock.io());
         const cur = app.surface.committedCursor();
         if (cur.verts.len == 0) return null;
-        const layer = for (app.surface.committedLayers()) |l| {
-            if (l.grid_id == cur.grid_id) break l;
-        } else return null;
+        const origin = cursorLayerOrigin(p, cur.grid_id) orelse return null;
         var x0: f32 = std.math.floatMax(f32);
         var y0: f32 = std.math.floatMax(f32);
         var x1: f32 = -std.math.floatMax(f32);
@@ -236,8 +394,8 @@ fn cursorRect(app: *App) ?gtk.GdkRectangle {
             y1 = @max(y1, v.position[1]);
         }
         const s = app.scale;
-        const lx: f32 = @floatFromInt(layer.x_px);
-        const ly: f32 = @floatFromInt(layer.y_px);
+        const lx: f32 = @floatFromInt(origin[0]);
+        const ly: f32 = @floatFromInt(origin[1]);
         rect = .{
             .x = @intFromFloat((x0 + lx) / s),
             .y = @intFromFloat((y0 + ly) / s),
@@ -249,10 +407,233 @@ fn cursorRect(app: *App) ?gtk.GdkRectangle {
 }
 
 // =========================================================================
+// Ext UI panels (overlay_layout): drawn over the main surface, never a
+// target of Neovim's mouse
+// =========================================================================
+
+/// A main-window position on a panel, surface px, with what placed it.
+const PanelHit = struct {
+    kind: overlay_layout.Kind,
+    rect: overlay_layout.Rect,
+    in: overlay_layout.Inputs,
+    x_px: i32,
+    y_px: i32,
+
+    fn onBadge(self: PanelHit) bool {
+        const b = overlay_layout.closeBadgeRect(self.kind, self.rect, self.in.scale) orelse return false;
+        return overlay_layout.contains(b, self.x_px, self.y_px);
+    }
+
+    /// The panel grid's cell under the position.
+    fn cell(self: PanelHit) Cell {
+        const rc = overlay_layout.panelCell(self.kind, self.rect, self.x_px, self.y_px, self.in);
+        return .{ .grid_id = overlay_layout.gridId(self.kind), .row = rc[0], .col = rc[1] };
+    }
+};
+
+/// The panel at logical widget px (x, y) of `p`'s window (a popup's: of
+/// its host surface's view), by the layout its frames are drawn with; null
+/// elsewhere.
+fn panelAt(p: *const Pointer, x: f64, y: f64) ?PanelHit {
+    const app = p.app;
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    const panels = surfacePanels(p) orelse return null;
+    const rects = popup_place.hitRects(panels.rects, app.panel_popups, p.panel);
+    const xp: i32 = @intFromFloat(@floor(x * app.scale));
+    const yp: i32 = @intFromFloat(@floor(y * app.scale));
+    const kind = overlay_layout.hit(&rects, xp, yp) orelse return null;
+    return .{ .kind = kind, .rect = rects[@intFromEnum(kind)].?, .in = panels.in, .x_px = xp, .y_px = yp };
+}
+
+/// A press on a panel. Every button is swallowed: the core refuses buttons
+/// on its own grids (pointer_target.buttonReachesNeovim), and neither macOS
+/// nor Windows selects a popupmenu item on a click. A left press with no
+/// editor button held may close msg_show by its badge or drag the cmdline or
+/// msg_show.
+fn pressPanel(p: *Pointer, h: PanelHit, button: c_uint, x: f64, y: f64) void {
+    if (button != 1 or p.claim.held_mask != 0 or p.panel_press != null) return;
+    const badge = h.onBadge();
+    if (!badge and h.kind != .cmdline and h.kind != .msg_show) return;
+    p.panel_press = .{ .kind = h.kind, .badge = badge, .x = x, .y = y, .rect = h.rect };
+}
+
+/// The left button let go of a panel press: a badge click dismisses
+/// msg_show when it ends on the badge too.
+fn releasePanel(p: *Pointer, pp: PanelPress, x: f64, y: f64) void {
+    if (!pp.badge) return;
+    const h = panelAt(p, x, y) orelse return;
+    if (h.kind != .msg_show or !h.onBadge()) return;
+    const cp = p.app.corep orelse return;
+    core.zonvie_core_dismiss_msg_show(cp);
+    core_timers.scheduleMsg(p.app);
+}
+
+/// Moves the dragged panel with the pointer once it is past the threshold.
+/// The first real move pins msg_show until it closes
+/// (MsgShowChrome.dragEnded), as Windows' WM_MOVING does; the cmdline keeps
+/// its spot for the session.
+fn dragPanel(p: *Pointer, pp: *PanelPress, x: f64, y: f64) void {
+    const dx = x - pp.x;
+    const dy = y - pp.y;
+    if (!pp.moved and @abs(dx) < panel_drag_threshold and @abs(dy) < panel_drag_threshold) return;
+    pp.moved = true;
+    const app = p.app;
+    {
+        app.mu.lockUncancelable(clock.io());
+        defer app.mu.unlock(clock.io());
+        var r = pp.rect;
+        r.x += @intFromFloat(@round(dx * app.scale));
+        r.y += @intFromFloat(@round(dy * app.scale));
+        switch (pp.kind) {
+            .cmdline => app.cmdline_user = r,
+            .msg_show => {
+                app.msg_show_user = .{ r.x, r.y };
+                app.msg_chrome.dragEnded(true);
+            },
+            .popupmenu, .msg_history => unreachable,
+        }
+    }
+    app.queueRenderAll();
+    // A popup's panel moves by moving the popup.
+    panel_popup.update(app);
+    ui_widgets.placeCopyButtons(app);
+}
+
+/// The pointer over `p`'s view (logical px of the overlay holding its
+/// GLArea, the GLArea's too), or gone when null: the message panel it rests
+/// on stops its auto-hide countdown (zonvie_core_set_msg_hover) and msg_show
+/// shows its close badge. Watched on the overlay rather than the GLArea, so
+/// the copy button over a panel still counts as the panel.
+fn panelHover(p: *Pointer, at: ?[2]f64) void {
+    const app = p.app;
+    const h: ?PanelHit = if (at) |pt| panelAt(p, pt[0], pt[1]) else null;
+    const grid: i64 = if (h) |v| switch (v.kind) {
+        .msg_show, .msg_history => overlay_layout.gridId(v.kind),
+        else => 0,
+    } else 0;
+    const on_show = if (h) |v| v.kind == .msg_show else false;
+    const on_badge = if (h) |v| v.onBadge() else false;
+    app.mu.lockUncancelable(clock.io());
+    const badge_changed = app.msg_chrome.pointer(on_show, on_badge);
+    app.mu.unlock(clock.io());
+    if (badge_changed) app.queueRenderAll();
+    if (grid == p.msg_hover) return;
+    const cp = app.corep orelse return;
+    if (p.msg_hover != 0) core.zonvie_core_set_msg_hover(cp, p.msg_hover, 0);
+    if (grid != 0) core.zonvie_core_set_msg_hover(cp, grid, 1);
+    p.msg_hover = grid;
+    // What the GUI harness reads the hover from.
+    applog.appLog("[msg_hover] surface={d} grid={d}\n", .{ p.surface_id, grid });
+    // Both transitions move the earliest deadline (zonvie_core.h).
+    core_timers.scheduleMsg(app);
+}
+
+fn onPanelMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = ctrl;
+    panelHover(ptrFrom(data), .{ x, y });
+}
+
+fn onPanelLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = ctrl;
+    panelHover(ptrFrom(data), null);
+}
+
+/// Watches the pointer over `overlay`, `p`'s view and the widgets over it,
+/// for panelHover.
+pub fn attachPanelHover(p: *Pointer, overlay: *anyopaque) void {
+    const motion = gtk.gtk_event_controller_motion_new() orelse return;
+    _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onPanelMotion), p);
+    _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onPanelLeave), p);
+    gtk.gtk_widget_add_controller(overlay, motion);
+}
+
+// A panel popup (panel_popup.zig): its pointer sees only its own panel, at
+// main-view positions, so the panel code above serves it as it serves the
+// main view. Nothing here reaches Neovim's mouse: a press, wheel or hover
+// on the popup's shadow margin is swallowed.
+
+/// Logical px of the popup's area (x, y) on the main view. The origin is
+/// read per event, so a popup dragged under a still pointer keeps the
+/// pointer's view position.
+fn popupToView(p: *const Pointer, x: f64, y: f64) [2]f64 {
+    const o = panel_popup.viewOrigin(p.app, p.panel.?) orelse return .{ x, y };
+    return .{ x + o[0], y + o[1] };
+}
+
+/// Watches popup `p`'s `area` and the `overlay` holding it and its copy
+/// button. Pre: p.panel != null, p.surface_id == 1.
+pub fn attachPopup(p: *Pointer, area: *anyopaque, overlay: *anyopaque) void {
+    std.debug.assert(p.panel != null and p.surface_id == 1);
+    p.area = area;
+    if (gtk.gtk_gesture_click_new()) |click| {
+        gtk.gtk_gesture_single_set_button(click, 0);
+        _ = gtk.g_signal_connect(click, "pressed", @ptrCast(&onPopupPressed), p);
+        _ = gtk.g_signal_connect(click, "released", @ptrCast(&onPopupReleased), p);
+        gtk.gtk_widget_add_controller(area, click);
+    }
+    if (gtk.gtk_event_controller_motion_new()) |motion| {
+        _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onPopupMotion), p);
+        gtk.gtk_widget_add_controller(area, motion);
+    }
+    if (gtk.gtk_event_controller_scroll_new(gtk.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES)) |scroll| {
+        _ = gtk.g_signal_connect(scroll, "scroll", @ptrCast(&onPopupScroll), p);
+        gtk.gtk_widget_add_controller(area, scroll);
+    }
+    if (gtk.gtk_event_controller_motion_new()) |motion| {
+        _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onPopupHover), p);
+        _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onPanelLeave), p);
+        gtk.gtk_widget_add_controller(overlay, motion);
+    }
+}
+
+fn onPopupPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = n_press;
+    const p = ptrFrom(data);
+    const v = popupToView(p, x, y);
+    const h = panelAt(p, v[0], v[1]) orelse return;
+    pressPanel(p, h, gtk.gtk_gesture_single_get_current_button(gesture.?), v[0], v[1]);
+}
+
+fn onPopupReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = n_press;
+    const p = ptrFrom(data);
+    if (gtk.gtk_gesture_single_get_current_button(gesture.?) != 1) return;
+    const pp = p.panel_press orelse return;
+    p.panel_press = null;
+    const v = popupToView(p, x, y);
+    releasePanel(p, pp, v[0], v[1]);
+}
+
+fn onPopupMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = ctrl;
+    const p = ptrFrom(data);
+    const v = popupToView(p, x, y);
+    p.x = v[0];
+    p.y = v[1];
+    if (p.panel_press) |*pp| {
+        if (!pp.badge) dragPanel(p, pp, v[0], v[1]);
+    }
+}
+
+/// The wheel on the panel, as onScroll takes it there; off it, nothing.
+fn onPopupScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {
+    const p = ptrFrom(data);
+    if (panelAt(p, p.x, p.y) == null) return 1;
+    return onScroll(ctrl, dx, dy, data);
+}
+
+fn onPopupHover(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    _ = ctrl;
+    const p = ptrFrom(data);
+    panelHover(p, popupToView(p, x, y));
+}
+
+// =========================================================================
 // Mouse and wheel
 // =========================================================================
 
-const Cell = struct { grid_id: i64, row: i32, col: i32 };
+pub const Cell = struct { grid_id: i64, row: i32, col: i32 };
 
 fn refreshGrids(app: *App, cp: *core.zonvie_core) void {
     var total: usize = 0;
@@ -293,11 +674,14 @@ fn gridCell(p: *Pointer, grid_id: i64, x: f64, y: f64) ?Cell {
             @floatCast(x * s - @as(f64, @floatFromInt(layer.x_px))),
             @floatCast(y * s - @as(f64, @floatFromInt(layer.y_px))),
         };
+        // The grid's own cell and box when it is drawn in its own font, as
+        // the painter places it (windows/input.zig gridCellAt).
+        const g = layer_geom.Geom.of(layer, app.surface.gridFont(grid_id), app.cell_w_px, app.cell_h_px);
         geom = .{
-            .cell_w_px = app.cell_w_px,
-            .cell_h_px = app.cell_h_px,
-            .extent_w_px = layer.cols * app.cell_w_px,
-            .extent_h_px = layer.rows * app.cell_h_px,
+            .cell_w_px = g.cell_w_px,
+            .cell_h_px = g.row_h_px,
+            .extent_w_px = g.widthPx(),
+            .extent_h_px = g.heightPx(),
             .rows = @intCast(layer.rows),
             .cols = @intCast(layer.cols),
         };
@@ -315,36 +699,38 @@ fn gridCell(p: *Pointer, grid_id: i64, x: f64, y: f64) ?Cell {
     return .{ .grid_id = grid_id, .row = hit.row, .col = hit.col };
 }
 
-/// The surface's own root grid takes a position no grid claims; it has no
-/// cell above or left of its first.
-fn rootCell(p: *Pointer, x: f64, y: f64) ?Cell {
+/// The surface's own root grid takes a position no grid claims. Only a drag
+/// keeps a cell above or left of its first: Neovim scrolls a drag selection
+/// by how far past the edge it is, and "row 0" would stop that scroll.
+fn rootCell(p: *Pointer, x: f64, y: f64, allow_negative: bool) ?Cell {
     const c = gridCell(p, p.surface_id, x, y) orelse blk: {
         const sc = surfaceCell(p.app, x, y) orelse return null;
         break :blk Cell{ .grid_id = p.surface_id, .row = sc.row, .col = sc.col };
     };
+    if (allow_negative) return c;
     return .{ .grid_id = p.surface_id, .row = @max(0, c.row), .col = @max(0, c.col) };
 }
 
 /// On a miss the surface's own root grid takes the position.
-fn resolve(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64, require_scrollable: c_int) ?Cell {
+pub fn resolve(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64, require_scrollable: c_int) ?Cell {
     const app = p.app;
     const c = surfaceCell(app, x, y) orelse return null;
     refreshGrids(app, cp);
     var hit: core.zonvie_pointer_hit = undefined;
     if (core.zonvie_core_resolve_pointer_grid(&app.pointer_grids, app.pointer_grids_len, p.surface_id, c.row, c.col, require_scrollable, &hit) != 0) {
-        if (hit.grid_id == p.surface_id) return rootCell(p, x, y);
+        if (hit.grid_id == p.surface_id) return rootCell(p, x, y, false);
         return gridCell(p, hit.grid_id, x, y) orelse .{ .grid_id = hit.grid_id, .row = hit.row, .col = hit.col };
     }
-    return rootCell(p, x, y);
+    return rootCell(p, x, y, false);
 }
 
 /// Rebases a surface position into the grid the press chose, so a drag that
 /// leaves a float keeps addressing it.
-fn inPressGrid(p: *Pointer, x: f64, y: f64) ?Cell {
+fn inPressGrid(p: *Pointer, x: f64, y: f64, allow_negative: bool) ?Cell {
     if (p.press_grid_id != p.surface_id) {
         if (gridCell(p, p.press_grid_id, x, y)) |c| return c;
     }
-    return rootCell(p, x, y);
+    return rootCell(p, x, y, allow_negative);
 }
 
 /// GTK's button number as PressClaim's (zonvie_core.h) and Neovim's name.
@@ -377,6 +763,8 @@ fn onPressed(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyop
     const p = ptrFrom(data);
     const cp = p.app.corep orelse return;
     const button = gtk.gtk_gesture_single_get_current_button(gesture.?);
+    // The panels draw over the scrollbar and the grids.
+    if (panelAt(p, x, y)) |h| return pressPanel(p, h, button, x, y);
     if (button == 1 and p.claim.held_mask == 0 and scrollbar.press(p.app, p.surface_id, x, y)) {
         p.bar_held = true;
         return;
@@ -401,11 +789,18 @@ fn onReleased(gesture: ?*anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyo
         _ = scrollbar.release(p.app, p.surface_id);
         return;
     }
+    const button = gtk.gtk_gesture_single_get_current_button(gesture.?);
+    if (button == 1) {
+        if (p.panel_press) |pp| {
+            p.panel_press = null;
+            return releasePanel(p, pp, x, y);
+        }
+    }
     const cp = p.app.corep orelse return;
-    const b = buttonOf(gtk.gtk_gesture_single_get_current_button(gesture.?)) orelse return;
+    const b = buttonOf(button) orelse return;
     // Every sent press gets its release, to the claim's grid.
     if (!p.claim.release(b.claim).send) return;
-    const c = inPressGrid(p, x, y) orelse return;
+    const c = inPressGrid(p, x, y, false) orelse return;
     var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(gesture.?), &mods);
     core.zonvie_core_send_mouse_input(cp, b.name, "release", m.ptr, c.grid_id, c.row, c.col);
@@ -415,10 +810,14 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     const p = ptrFrom(data);
     p.x = x;
     p.y = y;
-    if (scrollbar.motion(p.app, p.surface_id, x, y)) return;
-    const name = claimName(p.claim.owner) orelse return;
+    if (p.panel_press) |*pp| {
+        if (!pp.badge) dragPanel(p, pp, x, y);
+        return;
+    }
+    if (scrollbar.motion(p.app, p.surface_id, x, y)) return showUrlHand(p, false);
     const cp = p.app.corep orelse return;
-    const c = inPressGrid(p, x, y) orelse return;
+    const name = claimName(p.claim.owner) orelse return updateUrlHand(p, cp, x, y);
+    const c = inPressGrid(p, x, y, true) orelse return;
     if (c.row == p.drag_row and c.col == p.drag_col) return;
     p.drag_row = c.row;
     p.drag_col = c.col;
@@ -475,10 +874,55 @@ fn onDrop(target: ?*anyopaque, value: ?*const anyopaque, x: f64, y: f64, data: ?
     return 1;
 }
 
+/// A file drag arrives: whether its drop would insert the paths, read
+/// without blocking (a busy core keeps the last answer).
+fn onDragEnter(target: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_uint {
+    const p = ptrFrom(data);
+    if (p.app.corep) |cp| {
+        var mode: [32]u8 = undefined;
+        var visible: bool = true;
+        if (core.zonvie_core_try_get_mode_state(cp, &mode, mode.len, &visible) == 1)
+            p.drag_inserts_path = core.frontend_rules.dropInsertsPath(std.mem.sliceTo(&mode, 0), false, false);
+    }
+    return onDragMotion(target, x, y, data);
+}
+
+/// The drag's badge predicts the drop: link while it inserts paths into
+/// the command line, copy while it opens the files.
+fn onDragMotion(target: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_uint {
+    _ = x;
+    _ = y;
+    const p = ptrFrom(data);
+    const drop = gtk.gtk_drop_target_get_current_drop(target.?) orelse return 0;
+    const offered = gtk.gdk_drop_get_actions(drop);
+    return switch (core.frontend_rules.dropFeedback(p.drag_inserts_path, offered & gtk.GDK_ACTION_COPY != 0, offered & gtk.GDK_ACTION_LINK != 0)) {
+        .none => 0,
+        .copy => gtk.GDK_ACTION_COPY,
+        .link => gtk.GDK_ACTION_LINK,
+    };
+}
+
+/// The hand over a cell whose highlight carries a URL, as a click there
+/// would name it. A busy core (-1) keeps the last answer.
+fn updateUrlHand(p: *Pointer, cp: *core.zonvie_core, x: f64, y: f64) void {
+    if (panelAt(p, x, y) != null) return showUrlHand(p, false);
+    const c = resolve(p, cp, x, y, 0) orelse return showUrlHand(p, false);
+    const has = core.zonvie_core_try_cell_has_url(cp, c.grid_id, c.row, c.col);
+    if (has >= 0) showUrlHand(p, has == 1);
+}
+
+fn showUrlHand(p: *Pointer, on: bool) void {
+    if (p.url_hand == on) return;
+    p.url_hand = on;
+    const area = p.area orelse return;
+    gtk.gtk_widget_set_cursor_from_name(area, if (on) "pointer" else null);
+}
+
 fn onLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
     const p = ptrFrom(data);
     scrollbar.leave(p.app, p.surface_id);
+    showUrlHand(p, false);
 }
 
 fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) c_int {
@@ -486,21 +930,47 @@ fn onScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c)
     const cp = p.app.corep orelse return 0;
     var mods: [5]u8 = undefined;
     const m = keymap.mouseModString(gtk.gtk_event_controller_get_current_event_state(ctrl.?), &mods);
-    if (dy != 0) {
+    const touchpad = gtk.gtk_event_controller_scroll_get_unit(ctrl.?) == gtk.GDK_SCROLL_UNIT_SURFACE;
+    if (panelAt(p, p.x, p.y)) |h| {
+        // The panel's own grid: the core scrolls a message panel itself and
+        // drops the wheel on the cmdline and popupmenu
+        // (pointer_target.wheelReachesNeovim), so it never reaches the
+        // buffer under them. A touchpad's pixels count a step a line.
+        const k: f64 = if (touchpad) 1.0 / panel_step_px else 1.0;
+        const py = pixel_scroll.takeSteps(&p.scroll.wheel_y, dy * k);
+        const px = pixel_scroll.takeSteps(&p.scroll.wheel_x, dx * k);
+        const c = h.cell();
+        if (py != 0) sendSteps(cp, c, if (py > 0) "down" else "up", m.ptr, @floatFromInt(py));
+        if (px != 0) sendSteps(cp, c, if (px > 0) "right" else "left", m.ptr, @floatFromInt(px));
+        core_timers.scheduleMsg(p.app);
+        return 1;
+    }
+    if (touchpad) {
+        trackpad.scroll(p, cp, dx, dy, m.ptr);
+        core_timers.scheduleMsg(p.app);
+        return 1;
+    }
+    // A high-resolution wheel reports fractions of a step.
+    const sy: f64 = @floatFromInt(pixel_scroll.takeSteps(&p.scroll.wheel_y, dy));
+    const sx: f64 = @floatFromInt(pixel_scroll.takeSteps(&p.scroll.wheel_x, dx));
+    if (sy != 0) {
         // Vertical only: a float showing all its lines lets the wheel through.
         const c = resolve(p, cp, p.x, p.y, 1) orelse return 1;
-        const dir: [*:0]const u8 = if (dy > 0) "down" else "up";
-        sendSteps(cp, c, dir, m.ptr, dy);
+        const dir: [*:0]const u8 = if (sy > 0) "down" else "up";
+        sendSteps(cp, c, dir, m.ptr, sy);
     }
-    if (dx != 0) {
+    if (sx != 0) {
         const c = resolve(p, cp, p.x, p.y, 0) orelse return 1;
-        const dir: [*:0]const u8 = if (dx > 0) "right" else "left";
-        sendSteps(cp, c, dir, m.ptr, dx);
+        const dir: [*:0]const u8 = if (sx > 0) "right" else "left";
+        sendSteps(cp, c, dir, m.ptr, sx);
     }
     // A scroll of a message float can be throttled into a message deadline.
     core_timers.scheduleMsg(p.app);
     return 1;
 }
+
+/// Touchpad px per wheel step over a message panel: about a text line.
+const panel_step_px = 20.0;
 
 /// One event per discrete wheel step.
 fn sendSteps(cp: *core.zonvie_core, c: Cell, dir: [*:0]const u8, mods: [*:0]const u8, delta: f64) void {

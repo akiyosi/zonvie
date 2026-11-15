@@ -12,10 +12,14 @@ const ui_widgets = @import("ui_widgets.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
 const input = @import("input.zig");
 const ext_window = @import("ext_window.zig");
+const panel_popup = @import("panel_popup.zig");
 const gtk = @import("gtk_bindings.zig");
 const render_thread = @import("render_thread.zig");
 const postfx = @import("renderer/postfx.zig");
 const scrollbar = @import("scrollbar.zig");
+const window_size = @import("window_size.zig");
+const lifecycle = @import("lifecycle.zig");
+const tray = @import("tray.zig");
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -68,6 +72,9 @@ pub const App = struct {
     /// [server] open_mode = "current": a single forwarded file replaces the
     /// current window instead of opening a tab.
     open_mode_current: bool = false,
+    /// config.toml [log] perf_only / scroll_only, applied to the core.
+    log_perf_only: bool = false,
+    log_scroll_only: bool = false,
     /// [cmdline] / [messages] copy_button.
     copy_cmdline: bool = true,
     copy_messages: bool = true,
@@ -75,6 +82,15 @@ pub const App = struct {
     tabline_cfg: core.config.Config.TablineConfig = .{},
     /// ext_tabline is on (config.toml or --exttabline).
     ext_tabline: bool = false,
+    /// The notification server's ids per slot. GTK main thread.
+    notify: @import("notify.zig").State = .{},
+    /// The grid the cursor last moved to (on_cursor_grid_changed).
+    cursor_grid_focus: i64 = 1,
+    /// The main window's size against the cell grid. GTK main thread.
+    window_size: window_size.State = .{},
+    /// ext_cmdline is on (config.toml or --extcmdline); without it Neovim
+    /// draws its cmdline on the grid's last row.
+    ext_cmdline: bool = false,
     /// config.toml's [scrollbar], and the main window's bar.
     scrollbar_cfg: core.config.Config.ScrollbarConfig = .{},
     scrollbar: scrollbar.State = .{},
@@ -91,6 +107,10 @@ pub const App = struct {
     /// The next guifont broadcast is a font-dialog pick (font_picker.zig),
     /// which wins over an explicit [font] family and size.
     font_picked: std.atomic.Value(bool) = .init(false),
+    /// The weight and slant of that pick (Pango: weight >= semibold, slant
+    /// not normal), applied with it as the regular face's style.
+    picked_bold: std.atomic.Value(bool) = .init(false),
+    picked_italic: std.atomic.Value(bool) = .init(false),
     /// config.toml's [messages] msg_pos.
     msg_pos: core.config.Config.MsgPosConfig = .{},
     /// The core's message anchor as of the last committed flush; null before
@@ -116,6 +136,20 @@ pub const App = struct {
     /// The core-owned ext UI surfaces, by overlay_layout.Kind; written by
     /// on_external_window and its close, read by the paint.
     overlays: [4]overlay_layout.Surface = @splat(.{}),
+    /// The cmdline panel where the user dropped it, for the rest of the
+    /// session (overlay_layout.Inputs.cmdline_user). GTK thread writes, the
+    /// paint reads; under `mu`.
+    cmdline_user: ?overlay_layout.Rect = null,
+    /// msg_show's pointer and pin (frontend_rules.MsgShowChrome) and the
+    /// corner it is pinned at; reset when it closes. Under `mu`.
+    msg_chrome: core.frontend_rules.MsgShowChrome = .{},
+    msg_show_user: ?[2]i32 = null,
+    /// The main view's panels are popup surfaces (panel_popup.zig), not
+    /// drawn in the view. GTK thread writes, the paint reads; under `mu`.
+    panel_popups: bool = false,
+    /// The width of the output the main window is on, device px; 0 until
+    /// known (panel_popup.noteMonitor). Under `mu`.
+    monitor_w_px: u32 = 0,
     /// The frontend-drawn ext UI: messages, minis, the tabline.
     ui: ui_state.UiState = .{},
     /// Pmenu's background from on_popupmenu_show; the popupmenu panel's fill.
@@ -172,6 +206,8 @@ pub const App = struct {
     gtk_app: ?*anyopaque = null,
     /// The main window's input; set up with the window.
     pointer: input.Pointer = undefined,
+    /// The panel popups, by overlay_layout.Kind; GTK main thread only.
+    popups: [4]?*panel_popup.Popup = @splat(null),
     /// ext_windows by root grid id; GTK main thread only.
     ext_windows: std.AutoHashMapUnmanaged(i64, *ext_window.ExtWindow) = .empty,
     /// Opens and closes the core queued (under `mu`), and the list the GTK
@@ -179,6 +215,9 @@ pub const App = struct {
     ext_ops: std.ArrayListUnmanaged(ext_window.Op) = .empty,
     ext_ops_gtk: std.ArrayListUnmanaged(ext_window.Op) = .empty,
     ext_idle_queued: std.atomic.Value(bool) = .init(false),
+    /// A torn-off tab's drop point for the next external window (X11 only;
+    /// x11_place). GTK main thread only.
+    ext_placement: core.frontend_rules.PlacementMemory = .{},
     /// A frame-clock tick callback is installed and redraws every frame
     /// while some grid eases.
     ease_tick_active: bool = false,
@@ -196,6 +235,31 @@ pub const App = struct {
     render_idle_queued: std.atomic.Value(bool) = .init(false),
     /// on_quit_requested's argument, read by its idle.
     quit_has_unsaved: std.atomic.Value(bool) = .init(false),
+
+    // Lifecycle (session.zig); GTK main thread only.
+    /// The close / quit-timeout state machine.
+    quit: lifecycle.Quit = .{},
+    /// The armed quit timeout's source id, 0 when none.
+    quit_timer: c_uint = 0,
+    /// Set while `devcontainer up` runs before the core starts; cancelling
+    /// it abandons the start (the `up` itself keeps running, as on macOS
+    /// and Windows).
+    dc_up_cancel: ?*anyopaque = null,
+    /// Neovim drew its first frame: the window is shown (if it waited for
+    /// that) and queued file opens are sent.
+    nvim_ready: bool = false,
+    /// The main window stays hidden until `nvim_ready` (SSH, --connect-nvim).
+    show_when_ready: bool = false,
+    /// Files handed over before nvim could take them, owned by `alloc`.
+    pending_opens: std.ArrayListUnmanaged([:0]u8) = .empty,
+    /// The connection dialog's "Name", shown in the window title; borrowed
+    /// from main's arena, which outlives the App.
+    session_name: []const u8 = "",
+    /// The main window is minimized or suspended (occluded).
+    window_hidden: bool = false,
+    /// [server] close_to_tray, and the tray item when it registered.
+    close_to_tray: bool = false,
+    tray: tray.Tray = .{},
 
     // Window and input state; GTK main thread only.
     /// main.zig's Startup, alive for the whole GTK run.
@@ -235,6 +299,10 @@ pub const App = struct {
     /// traces of both sides carry one id.
     trace_flush: u64 = 0,
     fonts: Fonts = .{},
+    /// Per-grid fonts by font_id (on_font_slot_load); [0] is unused, the
+    /// global font being `fonts`. Same discipline as `fonts`: touched only
+    /// with grid_mu held.
+    slot_fonts: [core.font_slots.max_slots]?*Fonts = @splat(null),
 
     clipboard_mu: std.Io.Mutex = .init,
     /// A get's whole text; out_len reports its full size (zonvie_core.h).
@@ -245,20 +313,37 @@ pub const App = struct {
     /// belongs to a caller that timed out and must not signal.
     clipboard_seq: u64 = 0,
 
+    /// on_win_move_cursor's answer from the GTK thread (X11 only), as the
+    /// clipboard's: the core thread polls `win_find_ready` under
+    /// `win_find_mu`; an answer whose seq is stale is dropped.
+    win_find_mu: std.Io.Mutex = .init,
+    win_find_ready: bool = false,
+    win_find_result: i64 = 0,
+    win_find_seq: u64 = 0,
+
     pub fn deinit(self: *App) void {
         self.surface.deinit(self.alloc);
         self.atlas_pending.deinit(self.alloc);
         self.gl.deinit(self.alloc);
         self.fonts.deinit(self.alloc);
+        for (&self.slot_fonts) |*slot| {
+            if (slot.*) |f| {
+                f.deinit(self.alloc);
+                self.alloc.destroy(f);
+            }
+            slot.* = null;
+        }
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
         self.ext_ops_gtk.deinit(self.alloc);
         self.cell_age.deinit();
+        for (self.pending_opens.items) |p| self.alloc.free(p);
+        self.pending_opens.deinit(self.alloc);
     }
 
-    /// The main window draws its grid in a rounded card on a ground colour.
-    /// Of Config.TitlebarLayout Linux follows this predicate alone: the
-    /// desktop draws the titlebar. Fixed at startup.
+    /// The main window draws its grid in a rounded card on a ground colour
+    /// (Config.TitlebarLayout.island; the rest of the layout is
+    /// linux/chrome.zig's). Fixed at startup.
     pub fn island(self: *const App) bool {
         const Config = core.config.Config;
         const tabline: Config.TablinePlacement = if (!self.ext_tabline)
@@ -283,5 +368,6 @@ pub const App = struct {
         if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);
         var it = self.ext_windows.valueIterator();
         while (it.next()) |w| if (w.*.area) |a| gtk.gtk_gl_area_queue_render(a);
+        panel_popup.queueRender(self);
     }
 };

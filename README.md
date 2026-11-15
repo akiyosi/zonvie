@@ -43,12 +43,19 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
   are drawn inside the main window, not as separate OS windows. Message
   views follow `[messages] msg_pos` within it.
 - **Translucency**: `[window] opacity` and `blur` make the window
-  translucent; the blur itself is the compositor's (e.g. a Hyprland or KDE
-  blur rule), so `blur_radius` has no effect.
-- **Titlebar**: the window keeps the desktop's own decorations. Of
-  `[window] titlebar_style` only the editor card applies: `"native"` and
-  `"unified"` draw it, with the tab strip or sidebar on its ground colour;
-  `"hidden"` runs the editor edge to edge.
+  translucent. With `blur`, zonvie asks the compositor to blur what lies
+  behind it through the `ext-background-effect-v1` protocol (KDE Plasma,
+  GNOME, Hyprland, niri); elsewhere the blur is the compositor's own rules.
+  The compositor picks the strength, so `blur_radius` has no effect.
+- **Titlebar**: zonvie draws its own (client-side) titlebar. `"native"` is a
+  GTK header bar; `"hidden"` removes it, showing the window buttons over the
+  top band on hover and a drag bar after resting there; `"unified"` draws a
+  title band in the editor's colours. Titlebar tabs take the titlebar's
+  place. The app menu (New Session, About, Quit) sits next to the window
+  buttons, and `[tabline] style = "menu"` adds a Tabs menu there.
+- **Window placement**: Wayland lets no client place its windows, so a torn
+  off tab or an external window opens where the compositor puts it, and only
+  the window size is remembered between runs.
 - **Devcontainer**: Docker must already be running; zonvie does not start
   it.
 
@@ -295,7 +302,7 @@ paths = [
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true). Not applicable on Linux, where the compositor blurs |
-| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. On Linux only that card follows this key (default: `"native"`) |
+| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. Linux follows the same table with a GTK header bar, the hover-revealed buttons and the title band (default: `"native"`) |
 
 #### [scrollbar]
 | Key | Description |
@@ -381,7 +388,7 @@ as a single live dialog rather than as messages — so the override exists for
 | `agent_indicator` | Show AI-agent status icon on terminal tabs (true/false, default true) |
 | `agent_notification` | OS notification when an AI agent finishes (true/false, default true) |
 | `cards` | Sidebar draws each tab as a multi-line card from `'guitablabel'` (true/false, default true) |
-| `card_provider` | Fill `'guitablabel'` with Zonvie's default card (title, cwd · branch, status) when you have not set it. Applies to the macOS sidebar with `cards` and to the titlebar tab bar when the external tabline is on (true/false, default false) |
+| `card_provider` | Fill `'guitablabel'` with Zonvie's default card (title, cwd · branch, status) when you have not set it. Applies to the macOS and Linux sidebar with `cards` and to the titlebar tab bar when the external tabline is on (true/false, default false) |
 
 To design your own card, set `'guitablabel'` yourself (this needs a Neovim with multi-line `'guitablabel'` support). Each `\n` starts a new card line, and `%#Group#` colours the text that follows:
 

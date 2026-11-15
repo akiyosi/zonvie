@@ -2,8 +2,11 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const testing = std.testing;
 
-/// `out` is width*height*4 bytes. HBFT emits only bytes_per_pixel 1 (gray coverage) or
-/// 4 (BGRA, FT_PIXEL_MODE_BGRA; HBFTBridge.c:424-430); anything else becomes transparent.
+/// `out` is width*height*4 bytes. HBFT emits bytes_per_pixel 1 (gray coverage),
+/// 3 (LCD coverage, R G B samples per pixel) or 4 (BGRA, FT_PIXEL_MODE_BGRA);
+/// anything else becomes transparent. LCD coverage collapses to its luminance,
+/// the weights Windows' shader reads ClearType coverage with, so text has no
+/// colour fringes on any frontend.
 pub fn toRgba8(bm: *const core.GlyphBitmap, out: []u8) void {
     const w: usize = bm.width;
     const h: usize = bm.height;
@@ -23,6 +26,10 @@ pub fn toRgba8(bm: *const core.GlyphBitmap, out: []u8) void {
                 const c = src[y * pitch + x];
                 dst[x * 4 ..][0..4].* = .{ c, c, c, c };
             },
+            3 => for (0..w) |x| {
+                const c = lcdCoverage(src[y * pitch + x * 3 ..][0..3].*);
+                dst[x * 4 ..][0..4].* = .{ c, c, c, c };
+            },
             4 => for (0..w) |x| {
                 const p = src[y * pitch + x * 4 ..][0..4];
                 dst[x * 4 ..][0..4].* = .{ p[2], p[1], p[0], p[3] };
@@ -30,6 +37,27 @@ pub fn toRgba8(bm: *const core.GlyphBitmap, out: []u8) void {
             else => @memset(dst, 0),
         }
     }
+}
+
+/// One pixel's coverage from its R, G, B LCD samples: luminance, rounded.
+pub fn lcdCoverage(rgb: [3]u8) u8 {
+    const sum: u32 = 299 * @as(u32, rgb[0]) + 587 * @as(u32, rgb[1]) + 114 * @as(u32, rgb[2]);
+    return @intCast((sum + 500) / 1000);
+}
+
+test "LCD samples collapse to their luminance" {
+    try testing.expectEqual(@as(u8, 255), lcdCoverage(.{ 255, 255, 255 }));
+    try testing.expectEqual(@as(u8, 0), lcdCoverage(.{ 0, 0, 0 }));
+    try testing.expectEqual(@as(u8, 76), lcdCoverage(.{ 255, 0, 0 }));
+    try testing.expectEqual(@as(u8, 150), lcdCoverage(.{ 0, 255, 0 }));
+}
+
+test "3-byte LCD coverage expands to its luminance in every channel" {
+    const px = [_]u8{ 255, 255, 255, 0, 0, 0 };
+    const bm = core.GlyphBitmap{ .pixels = &px, .width = 2, .height = 1, .pitch = 6, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 3 };
+    var out: [8]u8 = undefined;
+    toRgba8(&bm, &out);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 0, 0, 0, 0 }, &out);
 }
 
 test "1-byte coverage expands to RGBA with coverage in every channel" {
@@ -73,8 +101,8 @@ test "pitch smaller than a row yields zeros" {
 }
 
 test "unsupported bytes_per_pixel and null pixels yield zeros" {
-    const px = [_]u8{ 1, 2, 3 };
-    var bm = core.GlyphBitmap{ .pixels = &px, .width = 1, .height = 1, .pitch = 3, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 3 };
+    const px = [_]u8{ 1, 2 };
+    var bm = core.GlyphBitmap{ .pixels = &px, .width = 1, .height = 1, .pitch = 2, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 0, .ascent_px = 0, .descent_px = 0, .bytes_per_pixel = 2 };
     var out: [4]u8 = .{ 9, 9, 9, 9 };
     toRgba8(&bm, &out);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &out);

@@ -243,6 +243,13 @@ pub const Gui = struct {
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
             try g.app_env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", home_abs);
+            if (builtin.os.tag == .linux) {
+                // Persisted window state (linux/window_size.zig) goes to
+                // $XDG_STATE_HOME before $HOME: a session that sets it would
+                // hand every scenario the size the last one closed with.
+                var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+                try g.app_env.put("XDG_STATE_HOME", try std.fmt.bufPrint(&state_buf, "{s}/.local/state", .{home_abs}));
+            }
             if (builtin.os.tag == .macos) {
                 var name_buf: [160]u8 = undefined;
                 // Per run too: the key outlives the home dir the scenario

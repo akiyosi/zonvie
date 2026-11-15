@@ -57,6 +57,21 @@ typedef struct zonvie_font_axis {
 // zonvie_ft_hb_font_set_variations with fractional values.
 void zonvie_ft_hb_font_set_variation_axes(zonvie_ft_hb_font* f, const zonvie_font_axis* axes, size_t count);
 
+// The face's current design coordinates, one per fvar axis (at most `cap`):
+// a named instance opened through face_index's high 16 bits reports that
+// instance's coordinates. Returns the count written; 0 for a static face.
+size_t zonvie_ft_hb_font_get_variation_axes(zonvie_ft_hb_font* f, zonvie_font_axis* out, size_t cap);
+
+// Synthesize a style the face lacks: `bold` emboldens every outline,
+// `oblique` slants it, as a platform rasterizer simulates a missing style.
+// Glyph advances are left as the face reports them, so the cell grid holds.
+void zonvie_ft_hb_font_set_synthetic(zonvie_ft_hb_font* f, int bold, int oblique);
+
+// Render outline glyphs as horizontal LCD coverage, three samples per pixel
+// (zonvie_ft_render_glyph_color then reports bytes_per_pixel 3 and the pixel
+// width), as Windows rasterizes ClearType 3x1. Off by default.
+void zonvie_ft_hb_font_set_lcd(zonvie_ft_hb_font* f, int on);
+
 // Shape UTF-32 scalars.
 // Outputs are HarfBuzz position values in 26.6 fixed-point pixels (1px = 64).
 // Returns glyph_count written to outputs (<= out_cap). If out_cap is too small, returns needed count.

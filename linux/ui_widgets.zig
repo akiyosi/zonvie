@@ -12,25 +12,22 @@ const ui_state = @import("ui_state.zig");
 const applog = @import("app_log.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
+const tab_strip = @import("tab_strip.zig");
+const chrome = @import("chrome.zig");
+const notify = @import("notify.zig");
+const window_size = @import("window_size.zig");
+const input = @import("input.zig");
+const popup_place = @import("popup_place.zig");
 
 const margin_pt = 10;
 
 pub const Widgets = struct {
-    /// The tab strip: `tabs`, then the new-tab button.
-    tabbar: ?*anyopaque = null,
-    /// One box per tab, equal sizes, so a drag's drop index is the core's
-    /// tabDropIndex over them.
-    tabs: ?*anyopaque = null,
-    /// [tabline] style = "sidebar": the strip runs down one side.
-    sidebar: bool = false,
+    /// The ext tabline strip (titlebar tabs or sidebar rows).
+    strip: tab_strip.Strip = .{},
+    /// The window's header, sidebar and menus.
+    chrome: chrome.Chrome = .{},
     /// The minis' margins from the view's right and bottom edges, logical px.
     mini_place: [2]c_int = .{ -1, -1 },
-    /// Advances the working agents' spinners while any runs.
-    spinner_timer: c_uint = 0,
-    spinner_frame: u32 = 0,
-    /// The tab a drag started on, and where.
-    drag_from: ?u32 = null,
-    drag_start: [2]f64 = .{ 0, 0 },
     /// Holds the editor view and the boxes over it; the same size as the view.
     overlay: ?*anyopaque = null,
     /// The rounded editor card around `overlay` (App.island); null without one.
@@ -39,6 +36,9 @@ pub const Widgets = struct {
     /// view inside clears itself with. Set with `card`, before the first
     /// stylesheet, and fixed from then on.
     opacity: f32 = 1,
+    /// [window] opacity, the alpha of the message boxes' fill as of the GL
+    /// panels' (gl_renderer.drawOverlays). Fixed at build.
+    panel_alpha: f32 = 1,
     mini_box: ?*anyopaque = null,
     minis: [4]?*anyopaque = @splat(null),
     confirm: ?*anyopaque = null,
@@ -59,12 +59,6 @@ pub const Widgets = struct {
     css_fg: u32 = 0xffffffff,
     css_bg: u32 = 0xffffffff,
     css_font_px: u32 = 0,
-    /// The tabline the strip was last built from.
-    tab_count: usize = 0,
-    /// The width sizeTabs last gave each titlebar tab, logical px.
-    tab_w: c_int = 0,
-    tab_handles: [ui_state.tab_cap]i64 = @splat(0),
-    curtab: i64 = 0,
 };
 
 fn label(classes: []const [*:0]const u8) *anyopaque {
@@ -84,45 +78,13 @@ fn label(classes: []const [*:0]const u8) *anyopaque {
 /// Returns the box.
 pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     const w = &app.widgets;
-    const cfg = app.tabline_cfg;
-    w.sidebar = std.mem.eql(u8, cfg.style, "sidebar");
-    const along: c_int = if (w.sidebar) gtk.GTK_ORIENTATION_VERTICAL else gtk.GTK_ORIENTATION_HORIZONTAL;
-    const root = gtk.gtk_box_new(if (w.sidebar) gtk.GTK_ORIENTATION_HORIZONTAL else gtk.GTK_ORIENTATION_VERTICAL, 0).?;
-
-    const tabbar = gtk.gtk_box_new(along, 0).?;
-    gtk.gtk_widget_add_css_class(tabbar, "zonvie-tabbar");
-    if (w.sidebar) gtk.gtk_widget_add_css_class(tabbar, "sidebar");
-    gtk.gtk_widget_set_visible(tabbar, 0);
-    if (w.sidebar) {
-        gtk.gtk_widget_set_size_request(tabbar, @intCast(std.math.clamp(cfg.sidebar_width, 100, 500)), -1);
-        // Set, so the tab names' hexpand does not widen it past that.
-        gtk.gtk_widget_set_hexpand(tabbar, 0);
-    }
-    // Equal tabs (dropIndex divides the strip evenly): 100..200 wide along
-    // a titlebar (sizeTabs), fixed-height rows down a sidebar, packed from
-    // the start with "+" right after them, as macOS and Windows lay them.
-    const tabs = gtk.gtk_box_new(along, 0).?;
-    gtk.gtk_box_set_homogeneous(tabs, 1);
-    // Set, or the names' hexpand would propagate and stretch the tabs.
-    gtk.gtk_widget_set_hexpand(tabs, 0);
-    gtk.gtk_box_append(tabbar, tabs);
-    const plus = gtk.gtk_button_new_with_label("+").?;
-    gtk.gtk_widget_set_focusable(plus, 0);
-    _ = gtk.g_signal_connect(plus, "clicked", @ptrCast(&onNewTab), null);
-    gtk.gtk_box_append(tabbar, plus);
-    if (gtk.gtk_gesture_drag_new()) |drag| {
-        _ = gtk.g_signal_connect(drag, "drag-begin", @ptrCast(&onTabDragBegin), app);
-        _ = gtk.g_signal_connect(drag, "drag-end", @ptrCast(&onTabDragEnd), app);
-        gtk.gtk_widget_add_controller(tabs, drag);
-    }
-    w.tabbar = tabbar;
-    w.tabs = tabs;
-
     const overlay = gtk.gtk_overlay_new().?;
     gtk.gtk_widget_set_vexpand(overlay, 1);
     gtk.gtk_widget_set_hexpand(overlay, 1);
     gtk.gtk_overlay_set_child(overlay, area);
     w.overlay = overlay;
+    w.panel_alpha = std.math.clamp(app.window_cfg.opacity, 0, 1);
+    input.attachPanelHover(&app.pointer, overlay);
     if (frames) |f| gtk.gtk_overlay_add_overlay(overlay, f);
     // The editor card: the overlay inside a styled box (.zonvie-card), whose
     // ground is a shadow the holder clips to its own rect. A ground painted
@@ -134,16 +96,13 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
         gtk.gtk_box_append(card, overlay);
         const holder = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
         gtk.gtk_widget_set_overflow(holder, gtk.GTK_OVERFLOW_HIDDEN);
+        gtk.gtk_widget_set_vexpand(holder, 1);
         gtk.gtk_box_append(holder, card);
-        gtk.gtk_widget_add_css_class(tabbar, "ground");
         w.card = card;
         w.opacity = std.math.clamp(app.window_cfg.opacity, 0, 1);
         content = holder;
     }
-    const right = w.sidebar and std.mem.eql(u8, cfg.sidebar_position, "right");
-    if (!right) gtk.gtk_box_append(root, tabbar);
-    gtk.gtk_box_append(root, content);
-    if (right) gtk.gtk_box_append(root, tabbar);
+    const root = chrome.build(app, content);
 
     const m: c_int = margin_pt;
     const mini_box = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 4).?;
@@ -164,7 +123,8 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
 
     const confirm = label(&.{ "zonvie-panel", "zonvie-confirm", "zonvie-confirm-prompt" });
     gtk.gtk_widget_set_halign(confirm, gtk.GTK_ALIGN_CENTER);
-    gtk.gtk_widget_set_valign(confirm, gtk.GTK_ALIGN_CENTER);
+    // Its top is placeMessages' (overlay_layout.confirmTop).
+    gtk.gtk_widget_set_valign(confirm, gtk.GTK_ALIGN_START);
     w.confirm = confirm;
     gtk.gtk_overlay_add_overlay(overlay, confirm);
 
@@ -179,6 +139,8 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     for ([_]overlay_layout.Kind{ .cmdline, .msg_show, .msg_history }) |kind| {
         const b = gtk.gtk_button_new_with_label(copy_glyph).?;
         gtk.gtk_widget_add_css_class(b, "zonvie-copy");
+        // macOS's tooltip.
+        gtk.gtk_widget_set_tooltip_text(b, "Copy contents");
         gtk.gtk_widget_set_focusable(b, 0);
         gtk.gtk_widget_set_halign(b, gtk.GTK_ALIGN_START);
         gtk.gtk_widget_set_valign(b, gtk.GTK_ALIGN_START);
@@ -194,12 +156,7 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
     w.progress = progress;
     gtk.gtk_overlay_add_overlay(overlay, progress);
 
-    const preedit = gtk.gtk_label_new(null).?;
-    gtk.gtk_widget_add_css_class(preedit, "zonvie-preedit");
-    gtk.gtk_widget_set_halign(preedit, gtk.GTK_ALIGN_START);
-    gtk.gtk_widget_set_valign(preedit, gtk.GTK_ALIGN_START);
-    gtk.gtk_widget_set_can_target(preedit, 0);
-    gtk.gtk_widget_set_visible(preedit, 0);
+    const preedit = newPreeditLabel().?;
     w.preedit = preedit;
     gtk.gtk_overlay_add_overlay(overlay, preedit);
 
@@ -258,6 +215,7 @@ fn setText(l: ?*anyopaque, text: []const u8, buf: []u8) void {
 fn apply(app: *App, snap: *const Snapshot) void {
     const w = &app.widgets;
     applyCss(w, snap.fg, snap.bg, snap.font_px);
+    if (w.css_bg != 0xffffffff) window_size.chromeReady(app);
     const buf = &app.ui_text_scratch;
     for (snap.ui.minis, 0..) |m, i| setText(w.minis[i], m.text(), buf);
     setText(w.confirm, snap.ui.confirm.text(), buf);
@@ -278,22 +236,7 @@ fn apply(app: *App, snap: *const Snapshot) void {
     applyTabline(app, &snap.ui);
     placeMessages(app);
     if (snap.ui.done_count != 0) notifyCompletions(app, snap.ui.done[0..snap.ui.done_count]);
-    if (snap.ui.notice_pending) sendNotification(app, null, "Neovim", snap.ui.notice.text());
-}
-
-/// One OS notification through the desktop's notification service. A null
-/// `id` makes each its own entry, as macOS posts each message; an id
-/// replaces the last one sent with it.
-fn sendNotification(app: *App, id: ?[*:0]const u8, title: [*:0]const u8, body: []const u8) void {
-    const gapp = app.gtk_app orelse return;
-    var z: [1025]u8 = undefined;
-    const n = @min(body.len, z.len - 1);
-    @memcpy(z[0..n], body[0..n]);
-    z[n] = 0;
-    const note = gtk.g_notification_new(title) orelse return;
-    defer gtk.g_object_unref(note);
-    gtk.g_notification_set_body(note, @ptrCast(&z));
-    gtk.g_application_send_notification(gapp, id, note);
+    if (snap.ui.notice_pending) notify.send(app, .none, "Neovim", snap.ui.notice.text());
 }
 
 /// The OS notification for agent completions ([tabline] agent_notification),
@@ -302,54 +245,7 @@ fn sendNotification(app: *App, id: ?[*:0]const u8, title: [*:0]const u8, body: [
 fn notifyCompletions(app: *App, done: []const ui_state.Completion) void {
     var buf: [320]u8 = undefined;
     const msg = ui_state.completionMessage(buf[0 .. buf.len - 1], done);
-    sendNotification(app, "agent", "Zonvie", msg);
-}
-
-const claude_frames = [_][:0]const u8{ "·", "✢", "✳", "✶", "✻", "✽" };
-const braille_frames = [_][:0]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-const spinner_interval_ms = 120;
-
-/// The per-tab indicator for an agent state: 🤖 done, ⏸ waiting for input,
-/// a spinner while working, as Windows draws them.
-fn indicatorGlyph(state: u8, frame: u32) [:0]const u8 {
-    return switch (state) {
-        1 => "\u{1f916}",
-        2 => claude_frames[frame % claude_frames.len],
-        3 => braille_frames[frame % braille_frames.len],
-        4 => "\u{23f8}",
-        else => "",
-    };
-}
-
-/// Sets every tab's indicator from `ui`, and runs the spinner timer while
-/// some agent works.
-fn applyIndicators(app: *App, ui: *const ui_state.UiState) void {
-    const w = &app.widgets;
-    if (!app.tabline_cfg.agent_indicator) return;
-    var child = if (w.tabs) |t| gtk.gtk_widget_get_first_child(t) else null;
-    for (ui.tabs[0..ui.tab_count]) |t| {
-        const tab = child orelse break;
-        child = gtk.gtk_widget_get_next_sibling(tab);
-        const ind = gtk.gtk_widget_get_first_child(tab) orelse continue;
-        const glyph = indicatorGlyph(ui.agentState(t.handle), w.spinner_frame);
-        gtk.gtk_label_set_text(ind, glyph.ptr);
-        gtk.gtk_widget_set_visible(ind, @intFromBool(glyph.len != 0));
-    }
-    const working = ui.anyWorking();
-    if (working and w.spinner_timer == 0) {
-        w.spinner_timer = gtk.g_timeout_add(spinner_interval_ms, &onSpinner, app);
-    } else if (!working and w.spinner_timer != 0) {
-        _ = gtk.g_source_remove(w.spinner_timer);
-        w.spinner_timer = 0;
-    }
-}
-
-fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
-    const app: *App = @ptrCast(@alignCast(data.?));
-    app.widgets.spinner_frame +%= 1;
-    applyIndicators(app, &app.ui_snapshot.ui);
-    // applyIndicators keeps the timer while anything works.
-    return @intFromBool(app.widgets.spinner_timer != 0);
+    notify.send(app, .agent, "Zonvie", msg);
 }
 
 /// Hangs the toast from the top-right of msg_pos.ext_float's target and the
@@ -359,7 +255,7 @@ fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
 pub fn placeMessages(app: *App) void {
     const w = &app.widgets;
     // A resize reaches here through the flush it causes.
-    sizeTabs(app);
+    tab_strip.sizeTabs(app);
     const view = w.overlay orelse return;
     const view_w = gtk.gtk_widget_get_width(view);
     const view_h = gtk.gtk_widget_get_height(view);
@@ -391,12 +287,14 @@ pub fn placeMessages(app: *App) void {
         const max_px = @as(f32, @floatFromInt(@min(view_w - 40, 800))) - 24;
         gtk.gtk_label_set_max_width_chars(c, @intFromFloat(@max(1, max_px / char_px)));
         if (gtk.gtk_widget_get_visible(c) != 0) {
-            // Centred in the view (halign/valign), at its natural size.
+            // Centred across the view (halign), at its natural size.
             var nat: gtk.GtkRequisition = .{};
             gtk.gtk_widget_get_preferred_size(c, null, &nat);
+            const top = overlay_layout.confirmTop(view_h, nat.height, @divTrunc(ch, scale), app.ext_cmdline);
+            gtk.gtk_widget_set_margin_top(c, top);
             confirm_rect = .{
                 .x = @divTrunc(view_w - nat.width, 2) * scale,
-                .y = @divTrunc(view_h - nat.height, 2) * scale,
+                .y = top * scale,
                 .w = nat.width * scale,
                 .h = nat.height * scale,
             };
@@ -490,21 +388,21 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
     const mini_px: u32 = if (font_px == 0) 11 else @max(11, font_px * 3 / 4);
     const b = splitRgb(bg);
     const p = core.frontend_rules.panelBg(b[0], b[1], b[2]);
-    const panel = rgbOf(p);
     const rules = core.frontend_rules;
     // With an editor card the sidebar is the card's ground.
     const ground: ?[3]f32 = if (w.card != null) rules.oklabLightnessShifted(b, .island_ground) else null;
     const sb = rules.sidebarPalette(splitRgb(fg), b, ground);
-    var buf: [6144]u8 = undefined;
+    var buf: [8192]u8 = undefined;
+    var fills: [2][40]u8 = undefined;
     // Tone colours as macOS's message panels (ZonvieCore.swift): the text
     // and, where it has one, the border.
     // The strip's buttons drop the theme's look, hover included, so the
     // close and new-tab buttons get their own hover wash, as macOS fills
     // them.
     const text = std.fmt.bufPrintZ(&buf,
-        \\.zonvie-panel {{ background-color: #{x:0>6}; color: #{x:0>6}; font-family: monospace;
+        \\.zonvie-panel {{ background-color: {s}; color: #{x:0>6}; font-family: monospace;
         \\  font-size: {d}px; padding: 12px; border-radius: 6px; border: 1px solid alpha(#{x:0>6}, 0.25); }}
-        \\.zonvie-panel.zonvie-mini {{ background-color: #{x:0>6}; font-size: {d}px; padding: 0 8px;
+        \\.zonvie-panel.zonvie-mini {{ background-color: {s}; font-size: {d}px; padding: 0 8px;
         \\  border: none; border-radius: 0; }}
         \\.zonvie-confirm-prompt {{ min-height: 200px; color: #99ccff; border-color: #4d99ff; }}
         \\.zonvie-toast {{ min-width: 100px; }}
@@ -513,29 +411,53 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-panel.tone-prompt {{ border-color: #4d99ff; color: #99ccff; }}
         \\.zonvie-panel.tone-search {{ color: #99ff99; }}
         \\window.zonvie-translucent {{ background: transparent; }}
+        \\window.zonvie-blur {{ backdrop-filter: blur(20px); }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar button {{ background: none; color: inherit; border-radius: 0; border: none;
-        \\  box-shadow: none; padding: 4px 14px; }}
-        \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; opacity: 0; }}
+        \\  box-shadow: none; padding: 4px 14px; min-height: 0; }}
+        \\.zonvie-tab-name {{ padding: 4px 6px 4px 14px; }}
+        \\.zonvie-tabbar button.zonvie-tab-close {{ padding: 4px 8px; margin: 2px 4px 0 0; opacity: 0; }}
         \\.zonvie-tab.current button.zonvie-tab-close, .zonvie-tab:hover button.zonvie-tab-close {{ opacity: 0.8; }}
         \\.zonvie-tabbar button.zonvie-tab-close:hover {{ opacity: 1; }}
         \\.zonvie-tabbar button.zonvie-tab-close:hover, .zonvie-tabbar > button:hover {{
         \\  background-color: alpha(currentColor, 0.3); border-radius: 6px; }}
-        \\.zonvie-tabbar:not(.sidebar) .zonvie-tab {{ opacity: 0.7; }}
+        \\.zonvie-tabbar:not(.sidebar) .zonvie-tab {{ opacity: 0.7; border-radius: 8px 8px 0 0; }}
         \\.zonvie-tabbar:not(.sidebar) .zonvie-tab.current {{ opacity: 1; background-color: alpha(currentColor, 0.12); }}
         \\.zonvie-tabbar:not(.sidebar) .zonvie-tab:hover {{ background-color: alpha(currentColor, 0.08); }}
-        \\.zonvie-tabbar.sidebar {{ background-color: #{x:0>6}; color: #{x:0>6}; }}
+        \\.zonvie-tabbar .zonvie-tab.dragging {{ opacity: 0.35; }}
+        \\.zonvie-drop-line {{ background-color: #{x:0>6}; }}
+        \\.zonvie-tab-floating {{ background-color: #{x:0>6}; color: #{x:0>6}; border-radius: 6px; padding: 4px 14px;
+        \\  opacity: 0.9; box-shadow: 0 2px 6px rgba(0,0,0,0.35); }}
+        \\.zonvie-tabbar.sidebar, .zonvie-sidebar {{ background-color: #{x:0>6}; color: #{x:0>6}; }}
         \\.zonvie-tabbar.sidebar .zonvie-tab {{ min-height: 28px; border-left: 3px solid transparent;
         \\  border-bottom: 1px solid #{x:0>6}; }}
         \\.zonvie-tabbar.sidebar .zonvie-tab:hover {{ background-color: #{x:0>6}; }}
         \\.zonvie-tabbar.sidebar .zonvie-tab.current {{ background-color: #{x:0>6}; color: #{x:0>6};
         \\  border-left-color: #{x:0>6}; }}
-        \\.zonvie-tabbar.sidebar button {{ padding: 4px 12px; }}
+        \\.zonvie-tabbar.sidebar .zonvie-tab-name {{ padding: 4px 6px 4px 12px; }}
+        \\.zonvie-tabbar.sidebar > button {{ padding: 6px 12px; }}
+        \\.zonvie-sidebar-handle {{ box-shadow: inset -1px 0 #{x:0>6}; }}
+        \\.zonvie-sidebar.ground .zonvie-sidebar-handle {{ box-shadow: none; }}
         \\.zonvie-agent {{ margin-left: 8px; }}
+        \\headerbar.zonvie-header {{ min-height: 0; padding-top: 0; padding-bottom: 0; }}
+        \\.zonvie-tab-header > menubutton, .zonvie-tab-header > windowcontrols {{ margin: 2px 4px; }}
+        \\.zonvie-band > box > menubutton {{ margin: 0 2px; }}
+        \\.zonvie-header.editor-bg {{ background: #{x:0>6}; color: #{x:0>6}; box-shadow: none; border: none; }}
+        \\.zonvie-hover-controls {{ opacity: 0; transition: opacity 150ms; padding: 2px 4px; }}
+        \\.zonvie-hover-controls.revealed {{ opacity: 1; }}
+        \\.zonvie-drag-bar {{ background-color: alpha(#{x:0>6}, 0.12); }}
         \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
         \\  box-shadow: none; color: alpha(#{x:0>6}, 0.6); font-size: 12px; }}
         \\button.zonvie-copy:hover {{ color: #{x:0>6}; }}
-    , .{ panel, fg, panel_px, fg, bg, mini_px, bg, fg, rgbOf(sb.bg), rgbOf(sb.text), rgbOf(sb.separator), rgbOf(sb.hover), rgbOf(sb.selected), fg, rgbOf(sb.indicator), fg, fg }) catch return;
+    , .{
+        cssRgba(&fills[0], p, w.panel_alpha), fg, panel_px, fg, cssRgba(&fills[1], b, w.panel_alpha), mini_px, bg, fg,
+        rgbOf(sb.indicator), rgbOf(p), fg,
+        rgbOf(sb.bg), rgbOf(sb.text), rgbOf(sb.separator), rgbOf(sb.hover), rgbOf(sb.selected), fg, rgbOf(sb.indicator),
+        rgbOf(sb.separator),
+        bg, fg,
+        fg,
+        fg, fg,
+    }) catch return;
     if (ground) |g| {
         // The card paints nothing under the view, which clears itself at
         // the same alpha: its padding is a border in the bg, and the card's
@@ -554,14 +476,15 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
             \\.zonvie-card {{ margin: {d}px; border: {d}px solid {s}; outline: 1px solid {s};
             \\  border-radius: {d}px; box-shadow: 0 0 0 {d}px {s}; }}
             \\.zonvie-card.under-tabs {{ margin-top: 1px; }}
-            \\.zonvie-tabbar.ground {{ background-color: {s}; border: none; }}
+            \\.zonvie-tabbar.ground, .zonvie-header.ground, .zonvie-sidebar.ground {{ background: {s}; border: none; box-shadow: none; }}
+            \\.zonvie-header.ground {{ color: #{x:0>6}; }}
             \\.zonvie-tabbar.ground:not(.sidebar) {{ color: #{x:0>6}; padding-left: {d}px; }}
             \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab {{ border-radius: 8px 8px 0 0; }}
             \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab.current {{ background-color: {s}; }}
         , .{
             card_margin_pt + 1, rules.island_padding_pt - 1,   bg_css,     cssRgba(&c[2], rules.islandBorder(b), w.opacity),
             card_radius_pt - 1, 2 * (card_margin_pt + card_radius_pt),   ground_css,
-            ground_css,    fg,                            tab_strip_inset_pt,
+            ground_css,    fg, fg,                        tab_strip_inset_pt,
             bg_css,
         }) catch return;
     }
@@ -575,7 +498,8 @@ const copy_retry_ms = 16;
 const copy_tries = 10;
 
 /// Puts each copy button on its panel's trailing edge, where the renderer
-/// left room for it, and hides those whose panel is closed. After every
+/// left room for it, and hides those whose panel is closed. A panel popup
+/// holds its own button (panel_popup.zig), placed in the popup. After every
 /// flush: panels open, close and resize there. GTK main thread.
 pub fn placeCopyButtons(app: *App) void {
     const w = &app.widgets;
@@ -585,13 +509,14 @@ pub fn placeCopyButtons(app: *App) void {
     if (vw <= 0 or vh <= 0) return;
     app.mu.lockUncancelable(clock.io());
     const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
-    const in = gl_renderer.overlayInputs(app, @intCast(vw * scale), @intCast(vh * scale));
+    const in = gl_renderer.overlayInputs(app, 1, @intCast(vw * scale), @intCast(vh * scale));
     const rects = overlay_layout.place(&app.overlays, in);
+    const popups = app.panel_popups;
     app.mu.unlock(clock.io());
     for (w.copy, 0..) |btn, i| {
         const b = btn orelse continue;
         const kind: overlay_layout.Kind = @enumFromInt(i);
-        const box = if (rects[i]) |r| overlay_layout.copyButtonRect(kind, r, in) else null;
+        const box = if (rects[i]) |r| overlay_layout.copyButtonRect(kind, if (popups) popup_place.frame(r, scale).inner else r, in) else null;
         const r = box orelse {
             gtk.gtk_widget_set_visible(b, 0);
             continue;
@@ -677,11 +602,11 @@ pub fn hideProgress(app: *App) void {
     if (gtk.gtk_widget_get_visible(l) != 0) gtk.gtk_widget_set_visible(l, 0);
 }
 
-/// Shows `text` (null-terminated) with the IME's Pango `attrs` (its
-/// underlines and the converting clause) in the editor font, or hides the
-/// label for an empty one. GTK main thread.
-pub fn showPreedit(app: *App, text: [:0]const u8, attrs: ?*anyopaque, at: ?gtk.GdkRectangle) void {
-    const l = app.widgets.preedit orelse return;
+/// Shows `text` (null-terminated) in preedit label `label` with the IME's
+/// Pango `attrs` (its underlines and the converting clause) in the editor
+/// font, or hides it for an empty one. GTK main thread.
+pub fn showPreedit(app: *App, label_widget: ?*anyopaque, text: [:0]const u8, attrs: ?*anyopaque, at: ?gtk.GdkRectangle) void {
+    const l = label_widget orelse return;
     if (text.len == 0) {
         gtk.gtk_widget_set_visible(l, 0);
         return;
@@ -704,181 +629,44 @@ pub fn showPreedit(app: *App, text: [:0]const u8, attrs: ?*anyopaque, at: ?gtk.G
     }
     gtk.gtk_label_set_text(l, text.ptr);
     gtk.gtk_label_set_attributes(l, list);
-    placePreedit(app, at);
+    placePreedit(l, at);
     gtk.gtk_widget_set_visible(l, 1);
 }
 
-/// Moves the preedit label to the cursor cell `at` (logical px), when it is
-/// up. GTK main thread.
-pub fn placePreedit(app: *App, at: ?gtk.GdkRectangle) void {
-    const l = app.widgets.preedit orelse return;
+/// Moves preedit label `l` to the cursor cell `at` (logical px of its
+/// window's view). GTK main thread.
+pub fn placePreedit(l: *anyopaque, at: ?gtk.GdkRectangle) void {
     const r = at orelse return;
     gtk.gtk_widget_set_margin_start(l, @max(0, r.x));
     gtk.gtk_widget_set_margin_top(l, @max(0, r.y));
 }
 
-pub fn preeditShown(app: *const App) bool {
-    const l = app.widgets.preedit orelse return false;
+pub fn preeditShown(l: *anyopaque) bool {
     return gtk.gtk_widget_get_visible(l) != 0;
 }
 
+/// A preedit label for an external window's view, as build makes the main
+/// window's.
+pub fn newPreeditLabel() ?*anyopaque {
+    const preedit = gtk.gtk_label_new(null) orelse return null;
+    gtk.gtk_widget_add_css_class(preedit, "zonvie-preedit");
+    gtk.gtk_widget_set_halign(preedit, gtk.GTK_ALIGN_START);
+    gtk.gtk_widget_set_valign(preedit, gtk.GTK_ALIGN_START);
+    gtk.gtk_widget_set_can_target(preedit, 0);
+    gtk.gtk_widget_set_visible(preedit, 0);
+    return preedit;
+}
+
 fn applyTabline(app: *App, ui: *const ui_state.UiState) void {
-    const w = &app.widgets;
-    const bar = w.tabbar orelse return;
-    const tabs = w.tabs orelse return;
-    gtk.gtk_widget_set_visible(bar, @intFromBool(ui.tabline_visible));
+    tab_strip.apply(app, ui);
+    chrome.applyTabMenu(app, ui);
     // Titlebar tabs sit on the card's top edge.
-    if (w.card) |card| {
-        if (ui.tabline_visible and !w.sidebar) gtk.gtk_widget_add_css_class(card, "under-tabs") else gtk.gtk_widget_remove_css_class(card, "under-tabs");
+    if (app.widgets.card) |card| {
+        if (ui.tabline_visible and !app.widgets.strip.sidebar and app.widgets.strip.root != null)
+            gtk.gtk_widget_add_css_class(card, "under-tabs")
+        else
+            gtk.gtk_widget_remove_css_class(card, "under-tabs");
     }
-    var same = w.tab_count == ui.tab_count and w.curtab == ui.curtab;
-    if (same) {
-        for (ui.tabs[0..ui.tab_count], w.tab_handles[0..ui.tab_count]) |t, h| {
-            if (t.handle != h) same = false;
-        }
-    }
-    // Names are not compared: a rename rebuilds on the next change, and a
-    // tabline update without one is the common case worth skipping.
-    if (same and ui.tab_count != 0) {
-        var child = gtk.gtk_widget_get_first_child(tabs);
-        for (ui.tabs[0..ui.tab_count]) |t| {
-            const tab = child orelse break;
-            // Children: indicator, name, close.
-            const ind = gtk.gtk_widget_get_first_child(tab);
-            if (ind) |i| if (gtk.gtk_widget_get_next_sibling(i)) |name_btn| setButtonLabel(app, name_btn, t.name.text());
-            child = gtk.gtk_widget_get_next_sibling(tab);
-        }
-        applyIndicators(app, ui);
-        return;
-    }
-    while (gtk.gtk_widget_get_first_child(tabs)) |c| gtk.gtk_box_remove(tabs, c);
-    w.tab_count = ui.tab_count;
-    w.curtab = ui.curtab;
-    for (ui.tabs[0..ui.tab_count], 0..) |t, i| {
-        w.tab_handles[i] = t.handle;
-        const tab = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0) orelse continue;
-        gtk.gtk_widget_add_css_class(tab, "zonvie-tab");
-        if (t.handle == ui.curtab) gtk.gtk_widget_add_css_class(tab, "current");
-        const ind = gtk.gtk_label_new(null) orelse continue;
-        gtk.gtk_widget_add_css_class(ind, "zonvie-agent");
-        gtk.gtk_widget_set_visible(ind, 0);
-        gtk.gtk_box_append(tab, ind);
-        // Signal data is the 1-based tab number: the strip is rebuilt
-        // whenever the list changes, so it never outlives its tab.
-        const name_btn = gtk.gtk_button_new_with_label("") orelse continue;
-        setButtonLabel(app, name_btn, t.name.text());
-        // A long name must not widen the tab past its share (sizeTabs): the
-        // button ellipsizes its label (it resets the label's own ellipsize
-        // mode on every set_label), which asks for no width of its own.
-        gtk.gtk_button_set_can_shrink(name_btn, 1);
-        if (gtk.gtk_button_get_child(name_btn)) |l| gtk.gtk_label_set_max_width_chars(l, 1);
-        gtk.gtk_widget_set_focusable(name_btn, 0);
-        gtk.gtk_widget_set_hexpand(name_btn, 1);
-        _ = gtk.g_signal_connect(name_btn, "clicked", @ptrCast(&onTabClicked), @ptrFromInt(i + 1));
-        gtk.gtk_box_append(tab, name_btn);
-        const close = gtk.gtk_button_new_with_label("\u{00d7}") orelse continue;
-        gtk.gtk_widget_add_css_class(close, "zonvie-tab-close");
-        gtk.gtk_widget_set_focusable(close, 0);
-        _ = gtk.g_signal_connect(close, "clicked", @ptrCast(&onTabClose), @ptrFromInt(i + 1));
-        gtk.gtk_box_append(tab, close);
-        gtk.gtk_box_append(tabs, tab);
-    }
-    w.tab_w = 0;
-    sizeTabs(app);
-    applyIndicators(app, ui);
-}
-
-/// A titlebar tab's width: the strip shared out within the shared bounds.
-/// Rerun when the strip's width may have changed.
-fn sizeTabs(app: *App) void {
-    const w = &app.widgets;
-    if (w.sidebar or w.tab_count == 0) return;
-    const bar = w.tabbar orelse return;
-    const tabs = w.tabs orelse return;
-    const plus_w: c_int = 40;
-    const avail = gtk.gtk_widget_get_width(bar) - plus_w;
-    const rules = core.frontend_rules;
-    const tw: c_int = rules.titlebarTabWidth(avail, @intCast(w.tab_count), rules.tab_min_width_pt, rules.tab_max_width_pt);
-    if (tw == w.tab_w) return;
-    w.tab_w = tw;
-    var child = gtk.gtk_widget_get_first_child(tabs);
-    while (child) |c| : (child = gtk.gtk_widget_get_next_sibling(c)) gtk.gtk_widget_set_size_request(c, tw, -1);
-}
-
-fn setButtonLabel(app: *App, btn: *anyopaque, name: []const u8) void {
-    const buf = &app.ui_text_scratch;
-    const text = if (name.len == 0) "[No Name]" else name;
-    const n = @min(text.len, 255);
-    @memcpy(buf[0..n], text[0..n]);
-    buf[n] = 0;
-    gtk.gtk_button_set_label(btn, @ptrCast(buf.ptr));
-}
-
-fn sendCommand(cmd: []const u8) void {
-    const app = the_app orelse return;
-    const cp = app.corep orelse return;
-    core.zonvie_core_send_command(cp, cmd.ptr, cmd.len);
-    if (app.gl_area) |a| _ = gtk.gtk_widget_grab_focus(a);
-}
-
-fn onTabClicked(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = btn;
-    var buf: [32]u8 = undefined;
-    sendCommand(std.fmt.bufPrint(&buf, "{d}tabnext", .{@intFromPtr(data)}) catch return);
-}
-
-fn onTabClose(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = btn;
-    var buf: [32]u8 = undefined;
-    sendCommand(std.fmt.bufPrint(&buf, "{d}tabclose", .{@intFromPtr(data)}) catch return);
-}
-
-fn onNewTab(btn: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = btn;
-    _ = data;
-    sendCommand("tabnew");
-}
-
-/// Logical px a press must travel before it is a drag, not a click.
-const drag_threshold = 8;
-
-/// The tab under `pos` along the strip, by the core's rule.
-fn dropIndex(w: *const Widgets, pos: f64) u32 {
-    const tabs = w.tabs orelse return 0;
-    const count: u32 = @intCast(w.tab_count);
-    if (count == 0) return 0;
-    const len: f64 = @floatFromInt(if (w.sidebar) gtk.gtk_widget_get_height(tabs) else gtk.gtk_widget_get_width(tabs));
-    const stride = len / @as(f64, @floatFromInt(count));
-    return core.frontend_rules.tabDropIndex(pos, count, 0, stride, stride);
-}
-
-fn onTabDragBegin(gesture: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
-    _ = gesture;
-    const app: *App = @ptrCast(@alignCast(data.?));
-    const w = &app.widgets;
-    w.drag_start = .{ x, y };
-    const pos = if (w.sidebar) y else x;
-    // The tab containing the press.
-    const count: u32 = @intCast(w.tab_count);
-    const len: f64 = @floatFromInt(if (w.sidebar) gtk.gtk_widget_get_height(w.tabs.?) else gtk.gtk_widget_get_width(w.tabs.?));
-    const stride = if (count == 0) 0 else len / @as(f64, @floatFromInt(count));
-    const under: u32 = if (stride > 0) @intFromFloat(@floor(pos / stride)) else 0;
-    w.drag_from = if (under < count) under else null;
-}
-
-fn onTabDragEnd(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) void {
-    _ = gesture;
-    const app: *App = @ptrCast(@alignCast(data.?));
-    const w = &app.widgets;
-    const from = w.drag_from orelse return;
-    w.drag_from = null;
-    const moved = if (w.sidebar) dy else dx;
-    if (@abs(moved) < drag_threshold) return;
-    const pos = (if (w.sidebar) w.drag_start[1] else w.drag_start[0]) + moved;
-    const cp = app.corep orelse return;
-    // Selects the dragged tab and moves it in one command; nothing for a
-    // drop onto its own slot.
-    _ = core.zonvie_core_tab_move(cp, from, dropIndex(w, pos), @intCast(w.tab_count));
 }
 
 /// Set once in main before the window exists; tab buttons carry only their

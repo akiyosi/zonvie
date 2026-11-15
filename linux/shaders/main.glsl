@@ -62,6 +62,23 @@ in float v_phase;
 
 out vec4 o_color;
 
+// DirectWrite's coverage correction, as windows/shaders/main.hlsl applies it
+// (from Windows Terminal): gamma 1.8 ratios.
+const vec4 dwrite_gamma_ratios = vec4(0.148054421, -0.894594550, 1.47590804, -0.324668258);
+
+float dwriteEnhanceContrast(float a, float k) {
+    return a * (k + 1.0) / (a * k + 1.0);
+}
+
+float dwriteAlphaCorrection(float a, float intensity) {
+    vec4 g = dwrite_gamma_ratios;
+    return a + a * (1.0 - a) * ((g.x * intensity + g.y) * a + (g.z * intensity + g.w));
+}
+
+float dwriteLightOnDarkContrast(float k, vec3 c) {
+    return k * clamp(dot(c, vec3(0.30, 0.59, 0.11) * -4.0) + 3.0, 0.0, 1.0);
+}
+
 vec4 premultiply(vec4 c) {
     return vec4(c.rgb * c.a, c.a);
 }
@@ -108,7 +125,12 @@ void main() {
         o_color = texture(u_atlas, v_uv);
         return;
     }
-    // Coverage is linear FreeType gray, replicated into every channel.
-    o_color = premultiply(v_col) * texture(u_atlas, v_uv).r;
+    // Coverage (FreeType gray, or LCD coverage collapsed to its luminance)
+    // replicated into every channel, corrected as Windows' shader corrects
+    // DirectWrite coverage: contrast enhanced, light-on-dark adjusted, then
+    // the gamma 1.8 alpha correction.
+    float k = dwriteLightOnDarkContrast(1.0, v_col.rgb);
+    float a = dwriteEnhanceContrast(texture(u_atlas, v_uv).r, k);
+    o_color = premultiply(v_col) * dwriteAlphaCorrection(a, dot(v_col.rgb, vec3(0.30, 0.59, 0.11)));
 }
 #endif

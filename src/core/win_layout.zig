@@ -121,6 +121,23 @@ fn swapPositions(a: *Frame, b: *Frame) void {
     b.y = ay;
 }
 
+/// The grid whose Neovim window a move INTO the main window lands on: the
+/// top-left split the main window still shows (placed by surface 1, not a
+/// float). Grid 2 is only that window until it is externalized. `Grid` is any
+/// struct with GridInfo's `grid_id`, `zindex`, `placed_by_surface`,
+/// `start_row` and `start_col`.
+pub fn mainTargetGrid(comptime Grid: type, grids: []const Grid) i64 {
+    var best: ?Grid = null;
+    for (grids) |g| {
+        if (g.grid_id <= 1 or g.zindex > 0 or g.placed_by_surface != 1) continue;
+        if (best) |b| {
+            if (g.start_row > b.start_row or (g.start_row == b.start_row and g.start_col >= b.start_col)) continue;
+        }
+        best = g;
+    }
+    return if (best) |b| b.grid_id else 2;
+}
+
 pub const Op = enum(i32) { move = 0, exchange = 1, rotate = 2, resize_equal = 3, _ };
 
 /// Plan `op` over `frames` in place. `arg` is the direction for `move` and
@@ -310,4 +327,17 @@ test "resize_equal averages sizes and keeps every top-left corner" {
     try std.testing.expect(plan(.resize_equal, 0, 0, 0, 20, &frames));
     try std.testing.expectEqual(Frame{ .id = 1, .x = 10, .y = 20, .w = 200, .h = 100 }, frames[0]);
     try std.testing.expectEqual(Frame{ .id = 2, .x = 300, .y = 40, .w = 200, .h = 100 }, frames[1]);
+}
+
+test "a move into the main window lands on its top-left split, else grid 2" {
+    const G = struct { grid_id: i64, zindex: i64 = 0, placed_by_surface: i64 = 1, start_row: i32, start_col: i32 };
+    const grids = [_]G{
+        .{ .grid_id = 1, .start_row = 0, .start_col = 0 },
+        .{ .grid_id = 4, .start_row = 0, .start_col = 40 },
+        .{ .grid_id = 5, .start_row = 0, .start_col = 0 },
+        .{ .grid_id = 6, .zindex = 50, .start_row = 0, .start_col = 0 },
+        .{ .grid_id = 7, .placed_by_surface = 7, .start_row = 0, .start_col = 0 },
+    };
+    try std.testing.expectEqual(@as(i64, 5), mainTargetGrid(G, &grids));
+    try std.testing.expectEqual(@as(i64, 2), mainTargetGrid(G, grids[0..1]));
 }

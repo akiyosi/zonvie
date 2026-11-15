@@ -31,8 +31,10 @@ const visual = @import("../../visual.zig");
 const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
 
-/// The float sits in the upper-left quadrant. Cropping to it keeps the main
-/// grid's own cursor and any chrome out of the measurement.
+/// The float sits in the upper-left quadrant, from the editor's first row so
+/// its cursor's starting row stays in the region under any titlebar (Linux
+/// draws its own). Cropping to it keeps the main grid's own cursor out of the
+/// measurement.
 const float_region = visual.Region{ .x0 = 0.02, .y0 = 0.05, .x1 = 0.55, .y1 = 0.45 };
 
 /// A cursor is a small part of even a cropped region, so the bar is low — but
@@ -48,7 +50,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // and plain identical-width content so only the cursor varies the pixels.
     const before_float = try app_log.lineMark(alloc, fixture.default_log_path);
     try g.exec(
-        \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 12 do l[i] = "float line" end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, true, {relative="editor", row=3, col=4, width=20, height=10, style="minimal", border="single"}) vim.api.nvim_win_set_cursor(_G.z_float, {1, 0}) return 1 end)()')
+        \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 12 do l[i] = "float line" end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_float = vim.api.nvim_open_win(b, true, {relative="editor", row=0, col=4, width=20, height=10, style="minimal", border="single"}) vim.api.nvim_win_set_cursor(_G.z_float, {1, 0}) return 1 end)()')
     );
     // Let the float's own first frames land before measuring.
     try app_log.waitFramesAfter(alloc, fixture.default_log_path, 1, 2, before_float, 10_000);

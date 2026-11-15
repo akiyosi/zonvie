@@ -25,6 +25,21 @@ const lock_retry_ms = 16;
 
 pub const Viewport = struct { topline: i64, botline: i64, line_count: i64 };
 
+/// Device px the "column" layout takes off a surface's right edge for the
+/// strip the track sits in (windows/app.zig scrollbarReservedWidth); 0 when
+/// the bar overlays the grid or is disabled.
+pub fn columnStripPx(cfg: core.config.Config.ScrollbarConfig, scale: f32) u32 {
+    if (!cfg.isColumn()) return 0;
+    return @intFromFloat(@round((width_pt + 2 * margin_pt) * scale));
+}
+
+/// The width a surface of `w_px` gives its grid: less the column strip,
+/// leaving the grid at least one px.
+pub fn gridWidthPx(cfg: core.config.Config.ScrollbarConfig, w_px: u32, scale: f32) u32 {
+    const strip = columnStripPx(cfg, scale);
+    return if (w_px > strip) w_px - strip else @min(w_px, 1);
+}
+
 pub const State = struct {
     /// Under App.mu: what the renderer draws.
     vp: ?Viewport = null,
@@ -422,4 +437,16 @@ test "a press finds the knob or the track either side of it" {
     try testing.expectEqual(Hit.track_above, hitTest(g, 790, g.knob_top - 5));
     try testing.expectEqual(Hit.track_below, hitTest(g, 790, g.knob_bottom + 5));
     try testing.expectEqual(Hit.none, hitTest(g, 400, 300));
+}
+
+test "the column layout takes the track's strip off the grid, the overlay nothing" {
+    var cfg: core.config.Config.ScrollbarConfig = .{ .enabled = true, .layout = .column };
+    // (12 + 2 * 2) pt at scale 2.
+    try std.testing.expectEqual(@as(u32, 32), columnStripPx(cfg, 2));
+    try std.testing.expectEqual(@as(u32, 768), gridWidthPx(cfg, 800, 2));
+    try std.testing.expectEqual(@as(u32, 1), gridWidthPx(cfg, 20, 2));
+    cfg.layout = .overlay;
+    try std.testing.expectEqual(@as(u32, 800), gridWidthPx(cfg, 800, 2));
+    cfg = .{ .enabled = false, .layout = .column };
+    try std.testing.expectEqual(@as(u32, 0), columnStripPx(cfg, 2));
 }

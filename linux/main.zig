@@ -13,10 +13,18 @@ const ui_widgets = @import("ui_widgets.zig");
 const ext_window = @import("ext_window.zig");
 const latency_bench = @import("latency_bench.zig");
 const render_thread = @import("render_thread.zig");
+const panel_popup = @import("panel_popup.zig");
 const blink = @import("blink.zig");
 const cli = @import("cli.zig");
 const askpass = @import("askpass.zig");
 const connect_dialog = @import("connect_dialog.zig");
+const window_size = @import("window_size.zig");
+const x11_place = @import("x11_place.zig");
+const blur = @import("blur.zig");
+const scrollbar = @import("scrollbar.zig");
+const session = @import("session.zig");
+const lifecycle = @import("lifecycle.zig");
+const tray = @import("tray.zig");
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -42,6 +50,14 @@ const Startup = struct {
     inherit_cwd: bool = false,
     /// Shown over the window until the first frame (a devcontainer start).
     progress: ?[:0]const u8 = null,
+    /// `devcontainer up`'s argv, run before the core starts (a rebuild);
+    /// `nvim_cmd` then execs into the container it brought up.
+    dc_up_argv: ?[*:null]const ?[*:0]const u8 = null,
+    /// The window waits for Neovim's first frame (SSH, --connect-nvim): an
+    /// SSH password is asked in a window of its own (askpass.zig).
+    hide_until_ready: bool = false,
+    /// The connection dialog's "Name".
+    session_name: []const u8 = "",
 };
 
 fn appFrom(data: ?*anyopaque) *App {
@@ -97,8 +113,37 @@ fn onResize(area: ?*anyopaque, w_px: c_int, h_px: c_int, data: ?*anyopaque) call
     lock(app);
     app.drawable_w_px = @intCast(w_px);
     app.drawable_h_px = @intCast(h_px);
-    app.scale = @floatFromInt(@max(1, gtk.gtk_widget_get_scale_factor(area.?)));
     unlock(app);
+    setScale(app, area.?);
+    window_size.noteResize(app, @intCast(w_px), @intCast(h_px));
+    pushLayout(app);
+}
+
+/// The main window's integer scale, read from `widget`. A change reloads the
+/// faces at the new pixel size (callbacks.applyScale) and refits the external
+/// windows, which draw in the same cell. Both the scale-factor notify and
+/// the area's resize land here, whichever comes first.
+///
+/// GTK reports fractional output scales (1.25, 1.5) as the next integer
+/// here and lets the compositor downsample; gdk_surface_get_scale would
+/// give the fraction, but a GLArea's framebuffer is still allocated at the
+/// integer scale, so drawing at the fraction would need a viewporter path
+/// GTK does not expose to GL widgets.
+fn setScale(app: *App, widget: *anyopaque) void {
+    const scale: f32 = @floatFromInt(@max(1, gtk.gtk_widget_get_scale_factor(widget)));
+    lock(app);
+    const changed = app.scale != scale;
+    unlock(app);
+    if (!changed) return;
+    callbacks.applyScale(app, scale);
+    ext_window.refitAll(app);
+    app.queueRenderAll();
+}
+
+fn onScaleFactor(widget: ?*anyopaque, pspec: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = pspec;
+    const app = appFrom(data);
+    setScale(app, widget.?);
     pushLayout(app);
 }
 
@@ -124,9 +169,10 @@ fn onAreaResize(area: ?*anyopaque, w: c_int, h: c_int, data: ?*anyopaque) callco
     lock(app);
     app.drawable_w_px = w_px;
     app.drawable_h_px = h_px;
-    app.scale = @floatFromInt(scale);
     unlock(app);
+    setScale(app, area.?);
     if (app.render_thread) |rt| rt.resize(w_px, h_px);
+    window_size.noteResize(app, w_px, h_px);
     pushLayout(app);
 }
 
@@ -170,8 +216,8 @@ fn logGridInsets(app: *App, scale: f32) void {
             return @intFromFloat(@round(@max(0, v) * k));
         }
     }.f;
-    applog.appLog("[grid_insets] left={d} top={d} right={d} bottom={d}\n", .{
-        px(r.x, scale), px(r.y, scale), px(win_w - r.x - r.w, scale), px(win_h - r.y - r.h, scale),
+    applog.appLog("[grid_insets] left={d} top={d} right={d} bottom={d} scale={d}\n", .{
+        px(r.x, scale), px(r.y, scale), px(win_w - r.x - r.w, scale), px(win_h - r.y - r.h, scale), scale,
     });
 }
 
@@ -179,6 +225,8 @@ fn logGridInsets(app: *App, scale: f32) void {
 /// is retried on a short timeout with the latest size.
 fn pushLayout(app: *App) void {
     const cp = app.corep orelse return;
+    // Not started yet (`devcontainer up` runs): launch() sends the layout.
+    if (app.dc_up_cancel != null) return;
     lock(app);
     const w = app.drawable_w_px;
     const h = app.drawable_h_px;
@@ -188,8 +236,12 @@ fn pushLayout(app: *App) void {
     unlock(app);
     if (w == 0 or h == 0 or cw == 0 or ch == 0) return;
     if (applog.isEnabled()) logGridInsets(app, scale);
+    panel_popup.noteMonitor(app);
     const cols = callbacks.cmdlineCols(app, w, cw);
-    if (!core.zonvie_core_try_update_layout_px(cp, w, h, cw, ch, cols.screen_cols, cols.default_cols)) {
+    // The grid leaves the "column" scrollbar its strip; the cmdline overlay
+    // still spans the whole view.
+    const grid_w = scrollbar.gridWidthPx(app.scrollbar_cfg, w, scale);
+    if (!core.zonvie_core_try_update_layout_px(cp, grid_w, h, cw, ch, cols.screen_cols, cols.default_cols)) {
         if (!app.layout_retry_queued) {
             app.layout_retry_queued = true;
             _ = gtk.g_timeout_add(layout_retry_ms, &retryLayout, app);
@@ -198,7 +250,7 @@ fn pushLayout(app: *App) void {
     }
     if (!app.layout_ready_sent) {
         app.layout_ready_sent = true;
-        core.zonvie_core_notify_layout_ready(cp, @max(1, h / ch), @max(1, w / cw));
+        core.zonvie_core_notify_layout_ready(cp, @max(1, h / ch), @max(1, grid_w / cw));
     }
 }
 
@@ -223,6 +275,7 @@ fn startCore(app: *App, area: *anyopaque) void {
     callbacks.ensureFont(app);
 
     var cb = callbacks.makeCallbacks();
+    if (x11_place.active()) callbacks.addWindowLayout(&cb);
     app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
     const cp = app.corep orelse return failStart(app, -1);
     if (config_mod.getConfigFilePath(app.alloc)) |path| {
@@ -234,6 +287,8 @@ fn startCore(app: *App, area: *anyopaque) void {
     } else |_| {}
     if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
     if (applog.isVerbose()) core.zonvie_core_set_log_verbose(cp, 1);
+    if (app.log_perf_only) core.zonvie_core_set_log_perf_only(cp, 1);
+    if (app.log_scroll_only) core.zonvie_core_set_log_scroll_only(cp, 1);
     if (startup.inherit_cwd) core.zonvie_core_set_inherit_cwd(cp, 1);
     // Default-background cells take this alpha (0.5 under blur), as on Windows.
     core.zonvie_core_set_background_opacity(cp, app.window_cfg.opacity);
@@ -243,7 +298,15 @@ fn startCore(app: *App, area: *anyopaque) void {
     if (startup.ext_messages) core.zonvie_core_set_ext_messages(cp, 1);
     if (startup.ext_tabline) core.zonvie_core_set_ext_tabline(cp, 1);
     if (startup.ext_windows) core.zonvie_core_set_ext_windows(cp, 1);
+    if (startup.dc_up_argv) |argv| return runDevcontainerUp(app, area, argv);
+    launch(app, area);
+}
 
+/// Starts the created core in `area`'s size.
+fn launch(app: *App, area: *anyopaque) void {
+    const startup: *const Startup = @ptrCast(@alignCast(app.startup.?));
+    const cp = app.corep.?;
+    const scale = app.scale;
     lock(app);
     const cw = app.cell_w_px;
     const ch = app.cell_h_px;
@@ -259,18 +322,118 @@ fn startCore(app: *App, area: *anyopaque) void {
     else
         core.zonvie_core_start(cp, startup.nvim_cmd.ptr, rows, cols);
     if (rc != 0) return failStart(app, rc);
+    // A window waiting for the first frame is not allocated, so no resize
+    // comes before nvim attaches: lay out at the start size; the resize on
+    // presenting corrects it.
+    if (app.show_when_ready) {
+        lock(app);
+        if (app.drawable_w_px == 0 or app.drawable_h_px == 0) {
+            app.drawable_w_px = w_px;
+            app.drawable_h_px = h_px;
+        }
+        unlock(app);
+    }
     // A resize that arrived before the core existed.
     pushLayout(app);
 }
 
 fn failStart(app: *App, rc: c_int) void {
     applog.appLog("[linux] core start failed rc={d}\n", .{rc});
+    var buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrintZ(&buf, "{s} (rc={d})", .{ cli.startFailureReason(rc), rc }) catch "Unknown error.";
+    failWith(app, "Zonvie failed to start", detail);
+}
+
+/// No nvim will run in this window: say why, then quit with status 1.
+fn failWith(app: *App, heading: [*:0]const u8, detail: [*:0]const u8) void {
     app.start_failed = true;
-    const dialog = gtk.gtk_alert_dialog_new("Failed to start Neovim (error %d)", rc) orelse {
+    ui_widgets.hideProgress(app);
+    const dialog = gtk.gtk_alert_dialog_new("%s", heading) orelse {
         if (app.gtk_app) |a| gtk.g_application_quit(a);
         return;
     };
-    gtk.gtk_alert_dialog_choose(dialog, app.window, null, &onStartFailDone, app);
+    gtk.gtk_alert_dialog_set_detail(dialog, detail);
+    gtk.gtk_alert_dialog_choose(dialog, session.parentWindow(app), null, &onStartFailDone, app);
+}
+
+// =========================================================================
+// Devcontainer rebuild: `devcontainer up` before the core starts
+// =========================================================================
+
+extern "c" fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
+
+const DcUp = struct {
+    app: *App,
+    area: *anyopaque,
+    cancel: *anyopaque,
+    /// `up`'s merged stdout and stderr, read back for a failure's tail.
+    out_fd: c_int,
+};
+
+/// Runs `devcontainer up` as macOS and Windows do, outside the core, so its
+/// failure can be shown and closing the window abandons the start. Its
+/// output goes to an anonymous file, not a pipe: an abandoned `up` keeps
+/// running to completion, as on those platforms, with nobody reading.
+fn runDevcontainerUp(app: *App, area: *anyopaque, argv: [*:null]const ?[*:0]const u8) void {
+    const fd = memfd_create("devcontainer-up", 0);
+    const launcher = gtk.g_subprocess_launcher_new(gtk.G_SUBPROCESS_FLAGS_STDERR_MERGE) orelse return failStart(app, -2);
+    defer gtk.g_object_unref(launcher);
+    if (fd >= 0) gtk.g_subprocess_launcher_take_stdout_fd(launcher, std.c.dup(fd));
+    var err: ?*anyopaque = null;
+    const sub = gtk.g_subprocess_launcher_spawnv(launcher, argv, &err) orelse {
+        if (fd >= 0) _ = std.c.close(fd);
+        var buf: [512]u8 = undefined;
+        const msg: [*:0]const u8 = if (err) |e| (@as(*gtk.GError, @ptrCast(@alignCast(e))).message orelse "") else "";
+        const detail = std.fmt.bufPrintZ(&buf, "Could not run `devcontainer up`: {s}", .{std.mem.span(msg)}) catch "Could not run `devcontainer up`.";
+        if (err) |e| gtk.g_error_free(e);
+        return failWith(app, "Devcontainer failed to start", detail);
+    };
+    const up = app.alloc.create(DcUp) catch return failStart(app, -2);
+    up.* = .{ .app = app, .area = area, .cancel = gtk.g_cancellable_new().?, .out_fd = fd };
+    app.dc_up_cancel = up.cancel;
+    applog.appLog("[linux] devcontainer up started\n", .{});
+    gtk.g_subprocess_wait_check_async(sub, up.cancel, &onDevcontainerUpDone, up);
+    gtk.g_object_unref(sub);
+}
+
+fn onDevcontainerUpDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const up: *DcUp = @ptrCast(@alignCast(data.?));
+    const app = up.app;
+    defer {
+        if (up.out_fd >= 0) _ = std.c.close(up.out_fd);
+        gtk.g_object_unref(up.cancel);
+        app.alloc.destroy(up);
+    }
+    var err: ?*anyopaque = null;
+    const ok = gtk.g_subprocess_wait_check_finish(source.?, result, &err) != 0;
+    if (err) |e| gtk.g_error_free(e);
+    // Closing the window abandoned the start (session.onCloseRequest).
+    if (gtk.g_cancellable_is_cancelled(up.cancel) != 0) return;
+    app.dc_up_cancel = null;
+    if (ok) {
+        applog.appLog("[linux] devcontainer up completed\n", .{});
+        ui_widgets.showProgress(app, "Connecting to devcontainer...");
+        return launch(app, up.area);
+    }
+    // The tail of what `up` printed (macOS: 20 lines, 800 characters).
+    var out_buf: [16 * 1024]u8 = undefined;
+    var out: []const u8 = "";
+    if (up.out_fd >= 0) {
+        const size = std.c.lseek(up.out_fd, 0, std.c.SEEK.END);
+        if (size > 0) {
+            const from: usize = @intCast(@max(0, size - @as(i64, out_buf.len)));
+            const n = std.c.pread(up.out_fd, &out_buf, out_buf.len, @intCast(from));
+            if (n > 0) out = out_buf[0..@intCast(n)];
+        }
+    }
+    const tail = lifecycle.outputTail(out, 20, 800);
+    applog.appLog("[linux] devcontainer up failed. Output tail:\n{s}\n", .{tail});
+    var detail_buf: [804]u8 = undefined;
+    const detail = if (tail.len == 0)
+        "`devcontainer up` failed. See the log for details."
+    else
+        std.fmt.bufPrintZ(&detail_buf, "{s}", .{tail}) catch unreachable;
+    failWith(app, "Devcontainer failed to start", detail);
 }
 
 fn onStartFailDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -287,16 +450,7 @@ fn onStartFailDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) 
 
 fn onCloseRequest(window: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
     _ = window;
-    const app = appFrom(data);
-    const cp = app.corep orelse return 0;
-    if (app.start_failed) return 0;
-    lock(app);
-    const exited = app.exit_code != null;
-    unlock(app);
-    if (exited) return 0;
-    // The core answers through on_quit_requested, then on_exit.
-    core.zonvie_core_request_quit(cp);
-    return 1;
+    return session.onCloseRequest(appFrom(data));
 }
 
 /// Files a later launch handed over ([server] single_instance): `:drop`ped
@@ -307,22 +461,18 @@ fn onOpen(gapp: ?*anyopaque, gfiles: [*]const *anyopaque, n_files: c_int, hint: 
     _ = hint;
     const app = appFrom(data);
     if (app.window) |w| gtk.gtk_window_present(w);
-    const cp = app.corep orelse return;
     const n: usize = @intCast(@max(0, n_files));
-    var paths: [64][*:0]u8 = undefined;
-    var lens: [64]usize = undefined;
+    var paths: [64][:0]u8 = undefined;
     var count: usize = 0;
     for (gfiles[0..n]) |f| {
         if (count == paths.len) break;
         const p = gtk.g_file_get_path(f) orelse continue;
-        paths[count] = p;
-        lens[count] = std.mem.len(p);
+        paths[count] = std.mem.span(p);
         count += 1;
     }
-    defer for (paths[0..count]) |p| gtk.g_free(p);
-    if (count == 0) return;
-    const tab_per_file = !app.open_mode_current or count > 1;
-    core.zonvie_core_drop_paths(cp, @ptrCast(&paths), &lens, count, @intFromBool(tab_per_file));
+    defer for (paths[0..count]) |p| gtk.g_free(p.ptr);
+    // Queued until nvim has drawn: the core cannot send before it attached.
+    session.openPaths(app, paths[0..count]);
 }
 
 fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -331,9 +481,14 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     if (app.window) |w| return gtk.gtk_window_present(w);
     const win = gtk.gtk_application_window_new(gapp.?) orelse return;
     app.window = win;
-    gtk.gtk_window_set_title(win, "zonvie");
+    session.applyTitle(app, "");
+    _ = gtk.g_signal_connect(win, "realize", @ptrCast(&session.onWindowRealize), app);
     if (app.translucent()) gtk.gtk_widget_add_css_class(win, "zonvie-translucent");
-    gtk.gtk_window_set_default_size(win, default_w_logical, default_h_logical);
+    if (app.window_cfg.blur) blur.watch(app, win);
+    const saved = window_size.restored();
+    const size = if (saved) |s| s.size else .{ default_w_logical, default_h_logical };
+    gtk.gtk_window_set_default_size(win, size[0], size[1]);
+    if (saved) |s| if (s.pos) |p| window_size.restorePosition(app, win, p);
 
     const startup: *const Startup = @ptrCast(@alignCast(app.startup.?));
     var area: *anyopaque = undefined;
@@ -361,10 +516,20 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     input.attach(&app.pointer, area);
 
     gtk.gtk_window_set_child(win, ui_widgets.build(app, area, frames));
+    panel_popup.init(app);
     if (startup.progress) |text| ui_widgets.showProgress(app, text);
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), app);
+    _ = gtk.g_signal_connect(win, "notify::scale-factor", @ptrCast(&onScaleFactor), app);
     blink.watchWindow(app, win);
-    gtk.gtk_window_present(win);
+    if (app.close_to_tray and !tray.init(app)) app.close_to_tray = false;
+    if (startup.hide_until_ready) {
+        // Realized without being shown, so the core starts now; the first
+        // frame presents the window (session.onReady).
+        app.show_when_ready = true;
+        gtk.gtk_widget_realize(area);
+    } else {
+        gtk.gtk_window_present(win);
+    }
     _ = gtk.gtk_widget_grab_focus(area);
 }
 
@@ -379,6 +544,15 @@ fn appendArg(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, arg: [
     if (q != 0) try list.append(alloc, q);
     try list.appendSlice(alloc, arg);
     if (q != 0) try list.append(alloc, q);
+}
+
+/// An option error: on stderr, and in an alert when no terminal shows
+/// stderr (a launcher start, or a detached one), as macOS does when started
+/// from Finder. Returns the exit status.
+fn optionError(msg: [:0]const u8) u8 {
+    std.debug.print("{s}\n", .{msg});
+    if (std.c.isatty(0) == 0) connect_dialog.alert(null, "Zonvie cannot start", msg);
+    return 1;
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -409,8 +583,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const connects = cli.hasPrefix(args, "--connect-nvim") or cli.hasPrefix(args, "--remote-ui");
     if (!nofork and !connects and std.c.isatty(0) != 0 and cli.detach()) return 0;
 
+    // Also makes a write to a dead nvim's pipe fail with EPIPE instead of
+    // killing the process: std.Io.Threaded installs a SIGPIPE handler.
     clock.init();
     if (cli.hasFlag(args, "--install")) return cli.install(alloc);
+    // First launch: the default config and the desktop entry, as Windows
+    // does (macOS only on --install). An existing desktop entry is kept.
+    if (config_mod.getConfigFilePath(alloc)) |p| alloc.free(p) else |_| cli.installFirstLaunch(alloc);
+    // A launcher start has no shell behind it: take the login shell's
+    // environment (PATH for LSPs and the like), as macOS does from Finder.
+    if (std.c.getenv("TERM") == null) cli.importLoginShellEnv(alloc);
+    // Claude Code in a :terminal draws its cursor natively; nvim and its
+    // children inherit the environment at spawn.
+    _ = cli.setenv("CLAUDE_CODE_NATIVE_CURSOR", "1", 1);
 
     var config = config_mod.load(alloc);
     defer config.deinit();
@@ -500,7 +685,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
         } else if (std.mem.eql(u8, arg, "--extcmdline")) {
             ext_cmdline = true;
-        } else if (std.mem.eql(u8, arg, "--extpopup")) {
+        } else if (std.mem.eql(u8, arg, "--extpopup") or std.mem.eql(u8, arg, "--extpopupmenu")) {
             ext_popupmenu = true;
         } else if (std.mem.eql(u8, arg, "--extmessages")) {
             ext_messages = true;
@@ -510,9 +695,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             connect_addr = arg["--connect-nvim=".len..];
         } else if (std.mem.startsWith(u8, arg, "--remote-ui=")) {
             connect_addr = arg["--remote-ui=".len..];
-        } else if ((std.mem.eql(u8, arg, "--connect-nvim") or std.mem.eql(u8, arg, "--remote-ui")) and i + 1 < args.len) {
-            i += 1;
-            connect_addr = args[i];
+        } else if (std.mem.eql(u8, arg, "--connect-nvim") or std.mem.eql(u8, arg, "--remote-ui")) {
+            // Bare, it is still this option: never nvim's argument.
+            connect_addr = if (i + 1 < args.len) blk: {
+                i += 1;
+                break :blk args[i];
+            } else "";
         } else if (std.mem.eql(u8, arg, "--renderer=thread")) {
             threaded = true;
         } else if (std.mem.eql(u8, arg, "--renderer=glarea")) {
@@ -531,17 +719,25 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     applog.setVerbose(config.log.verbose and !config.log.perf_only and !config.log.scroll_only);
-    // --log wins over [log], as on Windows.
-    if (log_path orelse if (config.log.enabled) config.log.path else null) |p| {
+    applog.setFilters(config.log.perf_only, config.log.scroll_only);
+    // --log wins over [log], as on Windows; [log] enabled without a path
+    // logs to stderr.
+    if (log_path) |p| {
         applog.setEnabled(true);
         applog.setLogPath(p);
+    } else if (config.log.enabled) {
+        applog.setEnabled(true);
+        applog.setLogPath(config.log.path);
     }
     defer applog.deinit();
 
+    if (connect_addr) |a| if (a.len == 0) {
+        return optionError("zonvie: --connect-nvim / --remote-ui requires a non-empty address (e.g. /tmp/nvim.sock or 127.0.0.1:6789).");
+    };
     if (dialog and connect_addr != null) {
-        std.debug.print("--dialog chooses the connection, so it cannot be combined with --connect-nvim. Remove the conflicting option and retry.\n", .{});
-        return 1;
+        return optionError("--dialog chooses the connection, so it cannot be combined with --connect-nvim. Remove the conflicting option and retry.");
     }
+    var session_name: []const u8 = "";
     if (dialog) {
         // The CLI and config seed the dialog; its answer replaces them.
         var seed: connect_dialog.Choice = .{
@@ -559,6 +755,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             seed.ssh_port = std.fmt.bufPrint(&port_buf, "{d}", .{p}) catch "";
         };
         const c = (connect_dialog.run(aa, seed) catch return 1) orelse return 0;
+        session_name = c.name;
         if (c.nvim_path.len != 0) {
             nvim_path = c.nvim_path;
             cli_nvim_path = c.nvim_path;
@@ -591,9 +788,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     if (@as(u8, @intFromBool(ssh != null)) + @intFromBool(connect_addr != null) + @intFromBool(devcontainer != null) > 1) {
-        std.debug.print("--connect-nvim, --ssh (or [neovim] ssh in config.toml) and --devcontainer are mutually exclusive. Remove the conflicting option and retry.\n", .{});
-        return 1;
+        return optionError("--connect-nvim, --ssh (or [neovim] ssh in config.toml) and --devcontainer are mutually exclusive. Remove the conflicting option and retry.");
     }
+    var dc_up_argv: ?[*:null]const ?[*:0]const u8 = null;
     var cmd: std.ArrayListUnmanaged(u8) = .empty;
     appendArg(&cmd, aa, nvim_path) catch return 1;
     for (extra.items) |a| appendArg(&cmd, aa, a) catch return 1;
@@ -612,7 +809,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .config = if (devcontainer_config) |c| cli.expandTilde(aa, c) catch return 1 else null,
             .rebuild = devcontainer_rebuild,
         };
-        break :blk cli.devcontainerCommand(aa, target, cli.nvimConfigDir(aa) catch return 1) catch return 1;
+        if (devcontainer_rebuild) dc_up_argv = cli.devcontainerUpArgv(aa, target, cli.nvimConfigDir(aa) catch return 1) catch return 1;
+        break :blk cli.devcontainerCommand(aa, target) catch return 1;
     } else aa.dupeZ(u8, cmd.items) catch return 1;
     const progress: ?[:0]const u8 = if (devcontainer != null)
         (if (devcontainer_rebuild) "Building devcontainer..." else "Connecting to devcontainer...")
@@ -629,6 +827,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .connect_addr = connect_addr,
         .inherit_cwd = nofork,
         .progress = progress,
+        .dc_up_argv = dc_up_argv,
+        // A devcontainer start shows its progress in the window, which
+        // closing also cancels, so that window shows at once (macOS and
+        // Windows show a progress window of its own instead).
+        .hide_until_ready = ssh != null or connect_addr != null,
+        .session_name = session_name,
     };
 
     // Without [server] single_instance each process owns its own nvim, so a
@@ -662,13 +866,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
         .ext_tabline = startup.ext_tabline,
+        .ext_cmdline = startup.ext_cmdline,
         .copy_cmdline = config.cmdline.copy_button,
         .copy_messages = config.messages.copy_button,
         .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),
+        .log_perf_only = config.log.perf_only,
+        .log_scroll_only = config.log.scroll_only,
         .shader_paths = if (config.shaders.enabled) config.shaders.paths else &.{},
         .shader_preserve_alpha = config.shaders.preserve_alpha,
         .shader_epoch_ns = clock.nowNs(),
         .cell_age = core.cell_age_store.Stores.init(alloc),
+        .session_name = session_name,
+        .close_to_tray = config.server.close_to_tray,
     };
     defer app.deinit();
     ui_widgets.the_app = app;
@@ -682,6 +891,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // The loop no longer serves clipboard idles; release a core thread
     // waiting on one so destroy does not sit out its timeout.
     callbacks.abandonClipboardWait(app);
+    ext_window.abandonFindWait(app);
     // Lifecycle thread, outside any callback.
     if (app.corep) |cp| core.zonvie_core_destroy(cp);
     app.corep = null;
@@ -694,6 +904,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // After the window: its textures' destroy notifies reach the thread's
     // buffers, so they must all have run.
     while (gtk.g_main_context_iteration(null, 0) != 0) {}
+    // The popups went with the window; their unrealize read them.
+    panel_popup.deinit(app);
     if (app.render_thread) |rt| render_thread.destroy(rt);
     app.render_thread = null;
 

@@ -8,6 +8,7 @@ const core = @import("zonvie_core");
 const Vertex = core.Vertex;
 const grid_ease = @import("grid_ease.zig");
 pub const ScrollInput = grid_ease.ScrollInput;
+pub const GridFont = @import("layer_geom.zig").GridFont;
 
 pub const Row = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
@@ -181,6 +182,13 @@ pub const SurfaceStore = struct {
     cursor_back_grid: i64 = 0,
     cursor_staged: bool = false,
     destroyed: std.ArrayListUnmanaged(i64) = .empty,
+    /// Per-grid fonts (on_grid_font): staged by the core thread under App.mu
+    /// whenever they arrive, published by the next commit, so a grid's rows
+    /// and the font they were laid out in become visible together. A
+    /// cancelled flush keeps the staged table for the next commit.
+    fonts_staged: std.AutoHashMapUnmanaged(i64, GridFont) = .empty,
+    fonts: std.AutoHashMapUnmanaged(i64, GridFont) = .empty,
+    fonts_dirty: bool = false,
 
     pub fn deinit(self: *SurfaceStore, alloc: std.mem.Allocator) void {
         var it = self.grids.valueIterator();
@@ -199,6 +207,34 @@ pub const SurfaceStore = struct {
         self.cursor_front.deinit(alloc);
         self.cursor_back.deinit(alloc);
         self.destroyed.deinit(alloc);
+        self.fonts_staged.deinit(alloc);
+        self.fonts.deinit(alloc);
+    }
+
+    /// on_grid_font: null = back on the surface's font. Caller holds App.mu.
+    pub fn stageGridFont(self: *SurfaceStore, alloc: std.mem.Allocator, grid_id: i64, font: ?GridFont) !void {
+        if (font) |f| try self.fonts_staged.put(alloc, grid_id, f) else _ = self.fonts_staged.remove(grid_id);
+        self.fonts_dirty = true;
+    }
+
+    /// A destroyed grid's staged and visible font go at once (zonvie_core.h
+    /// on_grid_font). Caller holds App.mu.
+    pub fn dropGridFont(self: *SurfaceStore, grid_id: i64) void {
+        _ = self.fonts_staged.remove(grid_id);
+        _ = self.fonts.remove(grid_id);
+    }
+
+    /// The published font of `grid_id`; null on the surface's font. Caller
+    /// holds App.mu.
+    pub fn gridFont(self: *const SurfaceStore, grid_id: i64) ?GridFont {
+        if (self.fonts.count() == 0) return null;
+        return self.fonts.get(grid_id);
+    }
+
+    /// The row height `grid_id` is laid out in: its published font's, else
+    /// `surface_row_h_px`. Caller holds App.mu.
+    pub fn rowHeightPx(self: *const SurfaceStore, grid_id: i64, surface_row_h_px: u32) u32 {
+        return if (self.gridFont(grid_id)) |f| f.cell_h_px else surface_row_h_px;
     }
 
     /// Core thread only. The map grows only on a grid's first row, so App.mu
@@ -287,14 +323,26 @@ pub const SurfaceStore = struct {
     pub fn prepareCommit(self: *SurfaceStore, alloc: std.mem.Allocator) !void {
         var it = self.grids.valueIterator();
         while (it.next()) |g| try g.*.prepareCommit(alloc);
+        if (self.fonts_dirty) try self.fonts.ensureTotalCapacity(alloc, self.fonts_staged.count());
     }
 
     /// Caller holds App.mu; prepareCommit must have succeeded since the last stage.
     pub fn commit(self: *SurfaceStore, alloc: std.mem.Allocator, in: ScrollInput) void {
+        if (self.fonts_dirty) {
+            self.fonts.clearRetainingCapacity();
+            var fit = self.fonts_staged.iterator();
+            while (fit.next()) |e| self.fonts.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
+            self.fonts_dirty = false;
+        }
         var it = self.grids.iterator();
         // Grid 1 is the root, holding chrome and messages, and negative ids
-        // are UI the core owns: neither eases.
-        while (it.next()) |kv| kv.value_ptr.*.commit(alloc, kv.key_ptr.* >= 2, in);
+        // are UI the core owns: neither eases. A shift is in the grid's own
+        // rows, as of the font this commit publishes.
+        while (it.next()) |kv| {
+            var grid_in = in;
+            grid_in.row_h_px = self.rowHeightPx(kv.key_ptr.*, in.row_h_px);
+            kv.value_ptr.*.commit(alloc, kv.key_ptr.* >= 2, grid_in);
+        }
         self.main.commit();
         var oit = self.others.valueIterator();
         while (oit.next()) |l| l.*.commit();
@@ -711,6 +759,40 @@ test "layers for a surface never opened are dropped" {
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 0), s.committedSurfaceLayers(-101).len);
+}
+
+test "a grid font publishes with the commit and survives a cancel" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    const f: GridFont = .{ .font_id = 3, .cell_w_px = 12, .cell_h_px = 20, .extent_w_px = 48, .extent_h_px = 60 };
+    try s.stageGridFont(testing.allocator, 2, f);
+    try testing.expect(s.gridFont(2) == null);
+    s.cancel();
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    try testing.expectEqual(@as(u32, 20), s.gridFont(2).?.cell_h_px);
+    try testing.expectEqual(@as(u32, 20), s.rowHeightPx(2, 16));
+    try testing.expectEqual(@as(u32, 16), s.rowHeightPx(3, 16));
+    try s.stageGridFont(testing.allocator, 2, null);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll);
+    try testing.expect(s.gridFont(2) == null);
+}
+
+test "a shift in a font grid rebases by the grid's own row height" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    const in: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 0, .large_jump = .snap };
+    try s.stageGridFont(testing.allocator, 2, .{ .font_id = 1, .cell_w_px = 9, .cell_h_px = 25, .extent_w_px = 90, .extent_h_px = 100 });
+    const g = try s.rowsFor(testing.allocator, 2);
+    for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(@floatFromInt(i * 25))}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, in);
+    g.stageShift(0, 4, 1, 4, true);
+    try g.stageRow(testing.allocator, 3, &.{v(75)}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, in);
+    for (0..4) |i| try testing.expectEqual(@as(?f32, @floatFromInt(i * 25)), firstY(g, i));
 }
 
 test "a grid destroyed between flushes keeps the rows a later flush sends for its id" {

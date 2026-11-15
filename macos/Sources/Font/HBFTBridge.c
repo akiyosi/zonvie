@@ -6,6 +6,8 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_MULTIPLE_MASTERS_H
+#include FT_SYNTHESIS_H
+#include FT_LCD_FILTER_H
 
 #include <harfbuzz/hb.h>
 #include <harfbuzz/hb-ft.h>
@@ -25,6 +27,11 @@ struct zonvie_ft_hb_font {
   // The fixed strike a bitmap-only face was opened at (y ppem in px), or 0
   // for a scalable face. Glyphs then come out at this size, not pixel_size.
   uint32_t strike_px;
+  // Styles simulated at render time (zonvie_ft_hb_font_set_synthetic).
+  int synth_bold;
+  int synth_oblique;
+  // Outline glyphs render as horizontal LCD coverage (zonvie_ft_hb_font_set_lcd).
+  int lcd;
 
   // OpenType features for shaping (set via zonvie_ft_hb_font_set_features).
   hb_feature_t features[ZONVIE_MAX_FONT_FEATURES];
@@ -308,6 +315,53 @@ void zonvie_ft_hb_font_set_variation_axes(zonvie_ft_hb_font* f, const zonvie_fon
   apply_variations(f, NULL, axes, count);
 }
 
+size_t zonvie_ft_hb_font_get_variation_axes(zonvie_ft_hb_font* f, zonvie_font_axis* out, size_t cap) {
+  if (!f || !f->ft_face || !out || cap == 0) return 0;
+  FT_MM_Var* mm_var = NULL;
+  if (FT_Get_MM_Var(f->ft_face, &mm_var) != 0 || !mm_var) return 0;
+  FT_UInt num_axes = mm_var->num_axis;
+  if (num_axes > 32) num_axes = 32;
+  FT_Fixed coords[32];
+  size_t n = 0;
+  if (num_axes > 0 && FT_Get_Var_Design_Coordinates(f->ft_face, num_axes, coords) == 0) {
+    for (FT_UInt a = 0; a < num_axes && n < cap; a++, n++) {
+      const FT_ULong tag = mm_var->axis[a].tag;
+      out[n].tag[0] = (char)((tag >> 24) & 0xff);
+      out[n].tag[1] = (char)((tag >> 16) & 0xff);
+      out[n].tag[2] = (char)((tag >> 8) & 0xff);
+      out[n].tag[3] = (char)(tag & 0xff);
+      out[n].value = (float)((double)coords[a] / 65536.0);
+    }
+  }
+  FT_Done_MM_Var(f->ft_lib, mm_var);
+  return n;
+}
+
+void zonvie_ft_hb_font_set_lcd(zonvie_ft_hb_font* f, int on) {
+  if (!f) return;
+  f->lcd = on != 0;
+  // ClearType-style FIR filtering. A FreeType built with Harmony LCD only
+  // rejects this and filters by its own layout, which is as good.
+  if (f->lcd) FT_Library_SetLcdFilter(f->ft_lib, FT_LCD_FILTER_DEFAULT);
+}
+
+void zonvie_ft_hb_font_set_synthetic(zonvie_ft_hb_font* f, int bold, int oblique) {
+  if (!f) return;
+  f->synth_bold = bold != 0;
+  f->synth_oblique = oblique != 0;
+}
+
+// The simulated styles, applied to a loaded outline before it is rendered.
+// The advance stays the face's: the grid lays cells out by it.
+static void apply_synthetic(zonvie_ft_hb_font* f) {
+  FT_GlyphSlot g = f->ft_face->glyph;
+  if (g->format != FT_GLYPH_FORMAT_OUTLINE) return;
+  const FT_Vector advance = g->advance;
+  if (f->synth_oblique) FT_GlyphSlot_Oblique(g);
+  if (f->synth_bold) FT_GlyphSlot_Embolden(g);
+  g->advance = advance;
+}
+
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {
   if (!f) return;
 
@@ -399,6 +453,7 @@ int zonvie_ft_render_glyph(
   if (!f || !f->ft_face) return -1;
 
   if (FT_Load_Glyph(f->ft_face, glyph_id, FT_LOAD_DEFAULT) != 0) return -2;
+  apply_synthetic(f);
   if (FT_Render_Glyph(f->ft_face->glyph, FT_RENDER_MODE_NORMAL) != 0) return -3;
 
   FT_GlyphSlot g = f->ft_face->glyph;
@@ -431,13 +486,17 @@ int zonvie_ft_render_glyph_color(
 
   // Try color rendering first (FT_LOAD_COLOR enables BGRA for color emoji)
   if (FT_Load_Glyph(f->ft_face, glyph_id, FT_LOAD_COLOR) != 0) return -2;
-  if (FT_Render_Glyph(f->ft_face->glyph, FT_RENDER_MODE_NORMAL) != 0) return -3;
+  apply_synthetic(f);
+  // A color glyph is already a bitmap, which no render mode changes.
+  if (FT_Render_Glyph(f->ft_face->glyph, f->lcd ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL) != 0) return -3;
 
   FT_GlyphSlot g = f->ft_face->glyph;
   FT_Bitmap* bm = &g->bitmap;
 
   if (out_buffer) *out_buffer = (const uint8_t*)bm->buffer;
-  if (out_width)  *out_width  = (int)bm->width;
+  // LCD coverage holds three samples (R, G, B) per pixel.
+  const int lcd = bm->pixel_mode == FT_PIXEL_MODE_LCD;
+  if (out_width)  *out_width  = (int)(lcd ? bm->width / 3 : bm->width);
   if (out_height) *out_height = (int)bm->rows;
   if (out_pitch)  *out_pitch  = (int)bm->pitch;
   if (out_left)   *out_left   = (int)g->bitmap_left;
@@ -448,6 +507,8 @@ int zonvie_ft_render_glyph_color(
   if (out_bytes_per_pixel) {
     if (bm->pixel_mode == FT_PIXEL_MODE_BGRA) {
       *out_bytes_per_pixel = 4;
+    } else if (lcd) {
+      *out_bytes_per_pixel = 3;
     } else {
       *out_bytes_per_pixel = 1;
     }

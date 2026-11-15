@@ -13,6 +13,8 @@ const Blink = core.frontend_rules.Blink;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const applog = @import("app_log.zig");
+const ime_off = @import("ime_off.zig");
+const panel_popup = @import("panel_popup.zig");
 
 /// Retry delay when the core's grid lock is busy (Windows' LOCK_RETRY_INTERVAL_MS).
 const lock_retry_ms = 16;
@@ -46,13 +48,12 @@ fn idleSettleActive(data: ?*anyopaque) callconv(.c) c_int {
     app.app_active = active;
     if (app.corep) |cp| core.zonvie_core_set_focus(cp, active);
     // [input] ime_disable_on_activate, as on Windows: the IME starts each
-    // activation off (GTK's nearest is resetting the context).
-    if (active and app.input_cfg.ime_disable_on_activate) {
-        if (app.pointer.im_context) |im| gtk.gtk_im_context_reset(im);
-    }
+    // activation off.
+    if (active and app.input_cfg.ime_disable_on_activate) ime_off.off(app.pointer.im_context);
     // The timer stops with the app, as on macOS and Windows; activation
     // re-arms it through the gate.
     if (active) update(app) else pause(app);
+    panel_popup.update(app);
     return 0;
 }
 
@@ -136,9 +137,9 @@ pub fn update(app: *App) void {
     }
     const changed = !app.cursor_blink.sameSettings(wait_ms, on_ms, off_ms);
     if (Blink.blinks(on_ms, off_ms)) {
-        // Only where it can be seen: a background window does not repaint
-        // twice a second.
-        if (!app.app_active) {
+        // Only where it can be seen: a background, minimized or occluded
+        // window does not repaint twice a second.
+        if (!app.app_active or app.window_hidden) {
             if (app.blink_timer != 0) pause(app);
             return;
         }

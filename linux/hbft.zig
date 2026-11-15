@@ -29,6 +29,12 @@ pub const zonvie_font_feature = extern struct { tag: [4]u8, value: i32 };
 pub extern "c" fn zonvie_ft_hb_font_set_features(f: *zonvie_ft_hb_font, features: [*]const zonvie_font_feature, count: usize) void;
 pub extern "c" fn zonvie_ft_hb_font_set_variations(f: *zonvie_ft_hb_font, variations: [*]const zonvie_font_feature, count: usize) void;
 pub extern "c" fn zonvie_ft_hb_font_strike_px(f: *const zonvie_ft_hb_font) u32;
+/// include/zonvie_hbft.h zonvie_font_axis: a fractional axis coordinate.
+pub const zonvie_font_axis = extern struct { tag: [4]u8, value: f32 };
+pub extern "c" fn zonvie_ft_hb_font_set_variation_axes(f: *zonvie_ft_hb_font, axes: [*]const zonvie_font_axis, count: usize) void;
+pub extern "c" fn zonvie_ft_hb_font_get_variation_axes(f: *zonvie_ft_hb_font, out: [*]zonvie_font_axis, cap: usize) usize;
+pub extern "c" fn zonvie_ft_hb_font_set_lcd(f: *zonvie_ft_hb_font, on: c_int) void;
+pub extern "c" fn zonvie_ft_hb_font_set_synthetic(f: *zonvie_ft_hb_font, bold: c_int, oblique: c_int) void;
 
 // =========================================================================
 // Text shaping

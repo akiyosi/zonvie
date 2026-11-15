@@ -98,8 +98,10 @@ const listener: RegistryListener = .{ .global = onGlobal, .global_remove = onGlo
 // Opcodes of zwlr_virtual_pointer_v1.
 const op_motion_absolute = 1;
 const op_button = 2;
+const op_axis = 3;
 const op_frame = 4;
 const op_axis_source = 5;
+const op_axis_stop = 6;
 const op_axis_discrete = 7;
 const op_destroy = 8;
 
@@ -185,6 +187,28 @@ pub const Pointer = struct {
             self.sync();
             gui_io.sleepNs(30 * std.time.ns_per_ms);
         }
+    }
+
+    /// A finger-source swipe of `total_px` px at the pointer, in `steps`
+    /// smooth axis events `step_ms` apart, then the fingers lifting
+    /// (axis_stop). Positive scrolls toward the end, as the wheel. A
+    /// compositor may drop the source: Hyprland's virtual pointer arrives as
+    /// fractional wheel steps.
+    pub fn swipe(self: *Pointer, total_px: f64, steps: u32, step_ms: u64) void {
+        const vertical: u32 = 0;
+        const finger_source: u32 = 1;
+        const per: f64 = total_px / @as(f64, @floatFromInt(steps));
+        var i: u32 = 0;
+        while (i < steps) : (i += 1) {
+            _ = wl_proxy_marshal_flags(self.ptr, op_axis_source, null, 1, 0, finger_source);
+            // wl_fixed_t: 24.8.
+            _ = wl_proxy_marshal_flags(self.ptr, op_axis, null, 1, 0, self.now(), vertical, @as(i32, @intFromFloat(per * 256)));
+            self.sync();
+            gui_io.sleepNs(step_ms * std.time.ns_per_ms);
+        }
+        _ = wl_proxy_marshal_flags(self.ptr, op_axis_source, null, 1, 0, finger_source);
+        _ = wl_proxy_marshal_flags(self.ptr, op_axis_stop, null, 1, 0, self.now(), vertical);
+        self.sync();
     }
 };
 

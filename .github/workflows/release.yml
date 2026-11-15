@@ -119,9 +119,67 @@ jobs:
           name: windows-release-${{ matrix.arch }}
           path: "*.zip"
 
+  build-linux:
+    name: Build Linux Release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` in build.zig can
+          # resolve the version string baked into the binary.
+          fetch-depth: 0
+
+      # Link-time system libraries (build.zig linux step). GTK 4.14+ is a
+      # runtime dependency of the released binary as well.
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgl-dev libegl-dev libgbm-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build Linux App (Release)
+        run: zig build linux -Doptimize=ReleaseFast
+
+      # The layout `zonvie --install` writes under $XDG_DATA_HOME, generated
+      # by the binary itself, with Exec/Icon made relocatable.
+      - name: Create Linux tarball
+        run: |
+          NAME="zonvie-${{ github.ref_name }}-linux-${{ matrix.arch }}"
+          STAGE="$NAME"
+          mkdir -p "$STAGE/bin" "$STAGE/share/icons/hicolor/256x256/apps"
+          cp linux/zig-out/zonvie "$STAGE/bin/zonvie"
+          XDG_DATA_HOME="$PWD/install_data" XDG_CONFIG_HOME="$PWD/install_config" \
+            "$STAGE/bin/zonvie" --install
+          mkdir -p "$STAGE/share/applications"
+          sed -e 's|^Exec="[^"]*"|Exec=zonvie|' \
+              -e 's|^Icon=.*|Icon=io.github.akiyosi.zonvie|' \
+            install_data/applications/io.github.akiyosi.zonvie.desktop \
+            > "$STAGE/share/applications/io.github.akiyosi.zonvie.desktop"
+          cp install_data/icons/io.github.akiyosi.zonvie.png \
+            "$STAGE/share/icons/hicolor/256x256/apps/io.github.akiyosi.zonvie.png"
+          tar -czf "$NAME.tar.gz" "$STAGE"
+
+      - name: Upload Linux tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-${{ matrix.arch }}
+          path: "*.tar.gz"
+
   create-release:
     name: Create GitHub Release
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

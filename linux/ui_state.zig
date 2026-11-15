@@ -42,11 +42,50 @@ pub const ToastMsg = struct {
     tone: u8 = 0,
 };
 
-pub const tab_cap = 32;
+/// Tabs the strip shows; later ones are left out.
+pub const tab_cap = 128;
 pub const Tab = struct {
     handle: i64 = 0,
+    /// The basename of the name's first line (tab_label.tabNameForStorage).
     name: TextBuf(128) = .{},
+    /// The 'guitablabel' chunks; line_count 0 when none came.
+    label: core.tab_label.TabLabel = .{},
 };
+
+/// The longest text labelLines makes: every line full, and the breaks.
+pub const label_text_cap = core.tab_label.TabLabel.MAX_LINES * core.tab_label.TabLabel.LINE_BYTES + core.tab_label.TabLabel.MAX_LINES;
+
+/// One styled run of a label laid out by labelLines: bytes [start, end) of
+/// its text, on line `line`.
+pub const LabelSpan = struct { start: u32, end: u32, line: u8, fg_rgb: u32, flags: u32 };
+
+pub const LabelLines = struct { text: []const u8, spans: []const LabelSpan };
+
+/// `label`'s lines joined by '\n' into `out`, empty and trailing lines kept so
+/// the label is as tall as it counts, with each run's range in that text.
+/// Runs past `out` or `spans` are left out.
+pub fn labelLines(label: *const core.tab_label.TabLabel, out: []u8, spans: []LabelSpan) LabelLines {
+    var n: usize = 0;
+    var k: usize = 0;
+    var line: u8 = 0;
+    for (label.runs[0..label.run_count]) |r| {
+        while (line < r.line and n < out.len) : (line += 1) {
+            out[n] = '\n';
+            n += 1;
+        }
+        const t = label.runText(r);
+        if (n + t.len > out.len or k == spans.len) break;
+        @memcpy(out[n..][0..t.len], t);
+        spans[k] = .{ .start = @intCast(n), .end = @intCast(n + t.len), .line = r.line, .fg_rgb = r.fg_rgb, .flags = r.flags };
+        k += 1;
+        n += t.len;
+    }
+    while (line + 1 < label.line_count and n < out.len) : (line += 1) {
+        out[n] = '\n';
+        n += 1;
+    }
+    return .{ .text = out[0..n], .spans = spans[0..k] };
+}
 
 /// An agent completion to announce (on_agent_status with bit 7).
 pub const Completion = struct {
@@ -96,7 +135,8 @@ pub const UiState = struct {
         if (announce and state & 0x80 != 0 and self.done_count < self.done.len) {
             const d = &self.done[self.done_count];
             d.title.clear();
-            d.title.append(title);
+            // No summary: the tab's name says which agent it was.
+            d.title.append(if (title.len != 0) title else self.tabName(handle));
             d.waiting = base == 4;
             self.done_count += 1;
         }
@@ -111,6 +151,12 @@ pub const UiState = struct {
         if (base == 0 or self.agent_count == self.agents.len) return;
         self.agents[self.agent_count] = .{ .handle = handle, .state = base };
         self.agent_count += 1;
+    }
+
+    /// The name of the tab with `handle`; "" when the tabline does not hold it.
+    pub fn tabName(self: *const UiState, handle: i64) []const u8 {
+        for (self.tabs[0..self.tab_count]) |*t| if (t.handle == handle) return t.name.text();
+        return "";
     }
 
     pub fn agentState(self: *const UiState, handle: i64) u8 {
@@ -238,7 +284,8 @@ pub const UiState = struct {
         for (tabs[0..self.tab_count], self.tabs[0..self.tab_count]) |src, *dst| {
             dst.handle = src.tab_handle;
             dst.name.clear();
-            dst.name.append(src.name[0..src.name_len]);
+            dst.name.append(core.tab_label.tabNameForStorage(src.name[0..src.name_len], dst.name.bytes.len));
+            dst.label.store(if (src.chunks) |c| c[0..src.chunk_count] else &.{});
         }
         self.tabline_visible = self.tab_count > 0;
     }
@@ -364,6 +411,34 @@ test "the tabline keeps at most tab_cap tabs" {
     try testing.expect(s.tabline_visible);
 }
 
+fn tabChunk(text: []const u8, flags: u32) core.TabChunk {
+    return .{ .fg_rgb = 0x112233, .bg_rgb = 0, .flags = flags, .text = text.ptr, .text_len = text.len };
+}
+
+test "a tab keeps the basename of its first line, and its label chunks" {
+    var s: UiState = .{};
+    const chunks = [_]core.TabChunk{ tabChunk("a.zig\n", 4), tabChunk("~/src", 0) };
+    const name = "/home/u/a.zig\n~/src";
+    const e = [_]core.TabEntry{.{ .tab_handle = 1, .name = name, .name_len = name.len, .chunks = &chunks, .chunk_count = 2 }};
+    s.tabline(1, &e);
+    try testing.expectEqualStrings("a.zig", s.tabs[0].name.text());
+    try testing.expectEqual(@as(u8, 2), s.tabs[0].label.line_count);
+}
+
+test "label lines keep empty and trailing lines, and each run's range" {
+    var label: core.tab_label.TabLabel = .{};
+    label.store(&.{ tabChunk("ab", 4), tabChunk("c\n\nd\n", 0) });
+    var out: [64]u8 = undefined;
+    var spans: [8]LabelSpan = undefined;
+    const l = labelLines(&label, &out, &spans);
+    try testing.expectEqualStrings("abc\n\nd\n", l.text);
+    try testing.expectEqual(@as(usize, 3), l.spans.len);
+    try testing.expectEqualStrings("ab", l.text[l.spans[0].start..l.spans[0].end]);
+    try testing.expectEqual(@as(u32, 4), l.spans[0].flags);
+    try testing.expectEqualStrings("d", l.text[l.spans[2].start..l.spans[2].end]);
+    try testing.expectEqual(@as(u8, 2), l.spans[2].line);
+}
+
 test "agent state per tab, and a flagged report queues one completion" {
     var s: UiState = .{};
     s.agentStatus(7, 2, "", true);
@@ -377,6 +452,17 @@ test "agent state per tab, and a flagged report queues one completion" {
     s.agentStatus(7, 0, "", true);
     try testing.expectEqual(@as(u8, 0), s.agentState(7));
     try testing.expect(!s.anyWorking());
+}
+
+test "a completion without a summary is named after its tab" {
+    var s: UiState = .{};
+    const name = "/w/claude";
+    const e = [_]core.TabEntry{.{ .tab_handle = 3, .name = name, .name_len = name.len, .chunks = null, .chunk_count = 0 }};
+    s.tabline(3, &e);
+    s.agentStatus(3, 0x80 | 1, "", true);
+    try testing.expectEqualStrings("claude", s.done[0].title.text());
+    s.agentStatus(9, 0x80 | 1, "", true);
+    try testing.expectEqualStrings("", s.done[1].title.text());
 }
 
 test "a completion message names one and counts several" {

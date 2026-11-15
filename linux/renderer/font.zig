@@ -9,7 +9,13 @@ const fc = @import("../fc.zig");
 const applog = @import("../app_log.zig");
 const atlas_pixels = @import("../atlas_pixels.zig");
 
+const font_spec = @import("../font_spec.zig");
+
 const Font = hbft.zonvie_ft_hb_font;
+
+/// The style a family's regular face is loaded in: a Bold or Italic face
+/// picked in the font dialog stays bold or italic (windows picked_font_*).
+pub const BaseStyle = struct { bold: bool = false, italic: bool = false };
 
 /// A face loaded for scalars the primary family lacks, by font file.
 const Fallback = struct {
@@ -38,6 +44,12 @@ pub const Fonts = struct {
     family: [128]u8 = undefined,
     family_len: usize = 0,
     pixel_size: u32 = 0,
+    /// The feature field and base style the faces were loaded with, so they
+    /// can be loaded again at another pixel size (a scale change) and a
+    /// per-grid font naming no family can take them.
+    features: [256]u8 = undefined,
+    features_len: usize = 0,
+    base: BaseStyle = .{},
     fallbacks: [max_fallbacks]Fallback = undefined,
     fallback_len: usize = 0,
     /// The colour emoji face, loaded on first use; `emoji_tried` stops a
@@ -75,29 +87,43 @@ pub const Fonts = struct {
     /// feature field ("+ss01,-liga,wght=500"), applied to every style, as
     /// macOS applies it: each entry is an OpenType feature for shaping and,
     /// where the font has that axis, a variation coordinate.
-    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32, features: []const u8) bool {
+    /// `base` is the style the regular face is (a Bold or Italic pick from
+    /// the font dialog); the styled faces add to it. Pre: `family` and
+    /// `features` do not alias this Fonts' own buffers.
+    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32, features: []const u8, base: BaseStyle) bool {
         if (pixel_size == 0) return false;
-        const regular = loadFace(alloc, family, false, false, pixel_size) orelse return false;
-        self.destroyFaces();
-        self.regular = regular;
-        self.bold = loadFace(alloc, family, true, false, pixel_size);
-        self.italic = loadFace(alloc, family, false, true, pixel_size);
-        self.bold_italic = loadFace(alloc, family, true, true, pixel_size);
         var list: [32]hbft.zonvie_font_feature = undefined;
         const n_features = core.zonvie_core_parse_font_features(features.ptr, features.len, @ptrCast(&list), list.len);
-        if (n_features != 0) {
-            for ([_]?*Font{ self.regular, self.bold, self.italic, self.bold_italic }) |face| {
-                const f = face orelse continue;
-                hbft.zonvie_ft_hb_font_set_features(f, &list, n_features);
-                hbft.zonvie_ft_hb_font_set_variations(f, &list, n_features);
-            }
-        }
+        const user = list[0..n_features];
+        const regular = loadFace(alloc, family, base.bold, base.italic, pixel_size, user) orelse return false;
+        self.destroyFaces();
+        self.regular = regular;
+        self.bold = loadFace(alloc, family, true, base.italic, pixel_size, user);
+        self.italic = loadFace(alloc, family, base.bold, true, pixel_size, user);
+        self.bold_italic = loadFace(alloc, family, true, true, pixel_size, user);
         const n = @min(family.len, self.family.len);
         @memcpy(self.family[0..n], family[0..n]);
         self.family_len = n;
+        const nf = @min(features.len, self.features.len);
+        @memcpy(self.features[0..nf], features[0..nf]);
+        self.features_len = nf;
+        self.base = base;
         self.pixel_size = pixel_size;
         self.computeCellMetrics();
         return true;
+    }
+
+    /// The same family, features and style at `pixel_size`. False keeps the
+    /// current faces.
+    pub fn reload(self: *Fonts, alloc: std.mem.Allocator, pixel_size: u32) bool {
+        if (self.regular == null) return false;
+        var family: [128]u8 = undefined;
+        var features: [256]u8 = undefined;
+        const fl = self.family_len;
+        const nf = self.features_len;
+        @memcpy(family[0..fl], self.family[0..fl]);
+        @memcpy(features[0..nf], self.features[0..nf]);
+        return self.load(alloc, family[0..fl], pixel_size, features[0..nf], self.base);
     }
 
     fn computeCellMetrics(self: *Fonts) void {
@@ -290,10 +316,41 @@ fn firstGlyph(font: *Font, scalars: []const u32) u32 {
     return gids[0];
 }
 
-fn loadFace(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic: bool, pixel_size: u32) ?*Font {
-    const path = findFontFile(alloc, family, bold, italic) orelse return null;
-    defer alloc.free(path);
-    return loadFile(alloc, path, 0, pixel_size);
+/// The face fontconfig picks for `family` in a style, opened as the face
+/// (and, for a variable font, the named instance) it matched, with the
+/// user's `[font]` features and axes, and with the style simulated when the
+/// family has no such face.
+fn loadFace(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic: bool, pixel_size: u32, user: []const hbft.zonvie_font_feature) ?*Font {
+    const m = findFontFile(alloc, family, bold, italic) orelse return null;
+    defer alloc.free(m.path);
+    const f = loadFile(alloc, m.path, m.index, pixel_size) orelse return null;
+    if (user.len != 0) hbft.zonvie_ft_hb_font_set_features(f, user.ptr, user.len);
+    applyAxes(f, m.variations[0..m.variations_len], user);
+    const synth = font_spec.synthetic(bold, italic, m.style);
+    if (synth.bold or synth.oblique) {
+        hbft.zonvie_ft_hb_font_set_synthetic(f, @intFromBool(synth.bold), @intFromBool(synth.oblique));
+        applog.appLog("[font] synthetic bold={} oblique={} for {s}\n", .{ synth.bold, synth.oblique, m.path });
+    }
+    return f;
+}
+
+/// A variable face's coordinates: the instance FreeType opened, then
+/// fontconfig's variations for the match, then the user's entries, each
+/// replacing the axes the one before set (macOS FontInstanceAxes.merged).
+/// set_variation_axes starts every axis it is not given from the font's
+/// default, so the instance's own coordinates must be passed back in.
+fn applyAxes(f: *Font, fc_variations: []const u8, user: []const hbft.zonvie_font_feature) void {
+    if (user.len == 0 and fc_variations.len == 0) return;
+    var instance: [32]hbft.zonvie_font_axis = undefined;
+    const ni = hbft.zonvie_ft_hb_font_get_variation_axes(f, &instance, instance.len);
+    if (ni == 0) return; // static: no axis to set
+    var fcv_buf: [16]hbft.zonvie_font_axis = undefined;
+    const fcv = font_spec.parseVariations(fc_variations, &fcv_buf);
+    var user_axes: [32]hbft.zonvie_font_axis = undefined;
+    for (user, 0..) |u, i| user_axes[i] = .{ .tag = u.tag, .value = @floatFromInt(u.value) };
+    var out: [80]hbft.zonvie_font_axis = undefined;
+    const merged = font_spec.mergeAxes(&out, &.{ instance[0..ni], fcv, user_axes[0..user.len] });
+    hbft.zonvie_ft_hb_font_set_variation_axes(f, merged.ptr, merged.len);
 }
 
 /// zonvie_ft_hb_font_create copies the bytes (HBFTBridge.c:150-152), so they
@@ -302,7 +359,13 @@ fn loadFile(alloc: std.mem.Allocator, path: []const u8, index: c_int, pixel_size
     const bytes = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, alloc, .unlimited) catch return null;
     defer alloc.free(bytes);
     const f = hbft.zonvie_ft_hb_font_create(bytes.ptr, bytes.len, pixel_size, @intCast(@max(0, index)));
-    if (f == null) applog.appLog("[font] failed to load {s}\n", .{path});
+    if (f == null) {
+        applog.appLog("[font] failed to load {s}\n", .{path});
+        return null;
+    }
+    // ClearType-like 3x1 coverage, as Windows rasterizes; atlas_pixels
+    // collapses it to one coverage value as Windows' shader does.
+    hbft.zonvie_ft_hb_font_set_lcd(f.?, 1);
     return f;
 }
 
@@ -342,7 +405,17 @@ fn matchFile(alloc: std.mem.Allocator, family: []const u8, scalar: ?u32, color: 
     return .{ .path = path, .index = index };
 }
 
-fn findFontFile(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic: bool) ?[]u8 {
+/// What fontconfig matched for a styled request. `index` carries the named
+/// instance in its high 16 bits, which FreeType opens directly.
+const StyledMatch = struct {
+    path: []u8,
+    index: c_int,
+    style: font_spec.MatchStyle,
+    variations: [128]u8,
+    variations_len: usize,
+};
+
+fn findFontFile(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic: bool) ?StyledMatch {
     const family_z = alloc.dupeZ(u8, family) catch return null;
     defer alloc.free(family_z);
     const pattern = fc.FcPatternCreate() orelse return null;
@@ -368,5 +441,25 @@ fn findFontFile(alloc: std.mem.Allocator, family: []const u8, bold: bool, italic
     if (!accepted) return null;
     var file_ptr: [*c]fc.FcChar8 = undefined;
     if (fc.FcPatternGetString(match, fc.FC_FILE, 0, &file_ptr) != .match) return null;
-    return alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)))) catch null;
+    var m: StyledMatch = .{ .path = undefined, .index = 0, .style = .{}, .variations = undefined, .variations_len = 0 };
+    _ = fc.FcPatternGetInteger(match, fc.FC_INDEX, 0, &m.index);
+    // A variable font's range is no single weight: left null (not missing).
+    var v: c_int = 0;
+    if (fc.FcPatternGetInteger(match, fc.FC_WEIGHT, 0, &v) == .match) m.style.weight = v;
+    if (fc.FcPatternGetInteger(match, fc.FC_SLANT, 0, &v) == .match) m.style.slant = v;
+    // fontconfig's synthesis rule (90-synthetic.conf) for a missing style.
+    var embolden: fc.FcBool = 0;
+    if (fc.FcPatternGetBool(match, fc.FC_EMBOLDEN, 0, &embolden) == .match) m.style.fc_embolden = embolden != 0;
+    var matrix: ?*const fc.FcMatrix = null;
+    if (fc.FcPatternGetMatrix(match, fc.FC_MATRIX, 0, &matrix) == .match) {
+        if (matrix) |mx| m.style.fc_oblique = mx.xy != 0;
+    }
+    var var_ptr: [*c]fc.FcChar8 = undefined;
+    if (fc.FcPatternGetString(match, fc.FC_FONT_VARIATIONS, 0, &var_ptr) == .match) {
+        const s = std.mem.span(@as([*:0]const u8, @ptrCast(var_ptr)));
+        m.variations_len = @min(s.len, m.variations.len);
+        @memcpy(m.variations[0..m.variations_len], s[0..m.variations_len]);
+    }
+    m.path = alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)))) catch return null;
+    return m;
 }

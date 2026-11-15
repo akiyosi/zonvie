@@ -25,6 +25,12 @@ fn idleOpen(data: ?*anyopaque) callconv(.c) c_int {
     const pt = app.font_pt;
     const drawn = app.surface.committedLayers().len != 0;
     app.mu.unlock(clock.io());
+    // guifont carries family and size only: a picked Bold/Italic in use is
+    // kept across this rewrite by passing it as a pick again (as Windows'
+    // resetGuifontToCurrent does).
+    const bold = app.picked_bold.load(.acquire);
+    const italic = app.picked_italic.load(.acquire);
+    if (bold or italic) app.font_picked.store(true, .release);
     writeGuifont(app, family[0..n], pt);
     if (!drawn or n == 0) return 0;
 
@@ -34,6 +40,10 @@ fn idleOpen(data: ?*anyopaque) callconv(.c) c_int {
     const seed_z = std.fmt.bufPrintZ(&seed, "{s} {d}", .{ family[0..n], @round(pt) }) catch return 0;
     const initial = gtk.pango_font_description_from_string(seed_z.ptr);
     defer gtk.pango_font_description_free(initial);
+    if (initial) |d| {
+        if (bold) gtk.pango_font_description_set_weight(d, gtk.PANGO_WEIGHT_BOLD);
+        if (italic) gtk.pango_font_description_set_style(d, gtk.PANGO_STYLE_ITALIC);
+    }
     gtk.gtk_font_dialog_choose_font(dialog, app.window, initial, null, &onChosen, app);
     return 0;
 }
@@ -52,6 +62,10 @@ fn onChosen(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callcon
     // An absolute size is device px: GTK's 96 dpi to points.
     if (gtk.pango_font_description_get_size_is_absolute(desc) != 0) size = size * 72.0 / 96.0;
     if (size <= 0) size = app.font_pt;
+    // The face's weight and slant become the regular face's style; the
+    // family name alone would load its Regular.
+    app.picked_bold.store(gtk.pango_font_description_get_weight(desc) >= gtk.PANGO_WEIGHT_SEMIBOLD, .release);
+    app.picked_italic.store(gtk.pango_font_description_get_style(desc) != gtk.PANGO_STYLE_NORMAL, .release);
     app.font_picked.store(true, .release);
     writeGuifont(app, family, size);
 }

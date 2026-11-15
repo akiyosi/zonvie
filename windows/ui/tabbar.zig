@@ -594,22 +594,7 @@ pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
         .{ .left = covered - w, .top = 0, .right = covered, .bottom = client.bottom };
 }
 
-/// The sidebar width a width drag asks for, both in logical px: at most half
-/// the client, but never below SIDEBAR_MIN_WIDTH even in a narrow client.
-pub fn clampSidebarWidth(want_px: c_int, client_w_px: c_int) u32 {
-    const max_px = @max(TablineState.SIDEBAR_MIN_WIDTH, @divTrunc(client_w_px, 2));
-    return @intCast(std.math.clamp(want_px, TablineState.SIDEBAR_MIN_WIDTH, max_px));
-}
-
-test "clampSidebarWidth: min 120, max half the client, min wins in a narrow client" {
-    try std.testing.expectEqual(@as(u32, 200), clampSidebarWidth(200, 1000));
-    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(50, 1000));
-    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(-30, 1000));
-    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(900, 1000));
-    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(500, 1000));
-    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(300, 200));
-    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(10, 200));
-}
+pub const clampSidebarWidth = core.frontend_rules.clampSidebarWidth;
 
 /// Whether client (x, y) is on the open sidebar's inner edge: the strip
 /// SIDEBAR_RESIZE_EDGE wide just inside the edge facing the editor, so it

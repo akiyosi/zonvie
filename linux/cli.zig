@@ -45,7 +45,7 @@ const usage =
     \\    --nvim <path>                 Path to Neovim executable (overrides config)
     \\    --log <path>                  Write application logs to specified file path
     \\    --extcmdline                  Enable external command line UI
-    \\    --extpopup                    Enable external popup menu UI
+    \\    --extpopup, --extpopupmenu    Enable external popup menu UI
     \\    --extmessages                 Enable external messages UI
     \\    --exttabline                  Enable external tabline UI
     \\    --extwindows                  Enable external windows (each Neovim window as OS window)
@@ -123,9 +123,9 @@ fn writeFile(path: []const u8, data: []const u8) !void {
 }
 
 /// The desktop entry and its icon under $XDG_DATA_HOME (~/.local/share),
-/// pointing at this executable. Rewritten on every install, so a moved
-/// binary is picked up again.
-fn installDesktopEntry(alloc: std.mem.Allocator) !void {
+/// pointing at this executable. Rewritten on every --install, so a moved
+/// binary is picked up again; a first launch keeps an existing entry.
+fn installDesktopEntry(alloc: std.mem.Allocator, overwrite: bool) !void {
     const data_home = if (std.c.getenv("XDG_DATA_HOME")) |x| (if (std.mem.span(x).len > 0) try alloc.dupe(u8, std.mem.span(x)) else null) else null;
     const base = data_home orelse blk: {
         const home = std.c.getenv("HOME") orelse return error.NoHome;
@@ -137,11 +137,12 @@ fn installDesktopEntry(alloc: std.mem.Allocator) !void {
     if (n <= 0) return error.NoExe;
     const exe = exe_buf[0..@intCast(n)];
 
+    const entry_path = try std.fs.path.join(alloc, &.{ base, "applications", app_id ++ ".desktop" });
+    defer alloc.free(entry_path);
+    if (!overwrite) if (std.Io.Dir.accessAbsolute(clock.io(), entry_path, .{})) |_| return else |_| {};
     const icon = try std.fs.path.join(alloc, &.{ base, "icons", app_id ++ ".png" });
     defer alloc.free(icon);
     try writeFile(icon, @embedFile("zonvie-256.png"));
-    const entry_path = try std.fs.path.join(alloc, &.{ base, "applications", app_id ++ ".desktop" });
-    defer alloc.free(entry_path);
     var buf: [4096]u8 = undefined;
     try writeFile(entry_path, try desktopEntry(&buf, exe, icon));
     std.debug.print("Desktop entry installed: {s}\n", .{entry_path});
@@ -150,7 +151,18 @@ fn installDesktopEntry(alloc: std.mem.Allocator) !void {
 /// Writes the default config.toml where the app reads it, never over an
 /// existing one, and the desktop entry. Returns the process exit code.
 pub fn install(alloc: std.mem.Allocator) u8 {
-    installDesktopEntry(alloc) catch |e| std.debug.print("Failed to install the desktop entry: {any}\n", .{e});
+    installDesktopEntry(alloc, true) catch |e| std.debug.print("Failed to install the desktop entry: {any}\n", .{e});
+    return writeDefaultConfig(alloc);
+}
+
+/// What a launch with no config file does first, as Windows does: the
+/// default config.toml, and the desktop entry unless one exists.
+pub fn installFirstLaunch(alloc: std.mem.Allocator) void {
+    installDesktopEntry(alloc, false) catch |e| std.debug.print("Failed to install the desktop entry: {any}\n", .{e});
+    _ = writeDefaultConfig(alloc);
+}
+
+fn writeDefaultConfig(alloc: std.mem.Allocator) u8 {
     const path = config_mod.configFilePath(alloc) catch {
         std.debug.print("Cannot determine the config path: HOME is not set\n", .{});
         return 1;
@@ -243,6 +255,71 @@ pub fn sshCommand(alloc: std.mem.Allocator, s: Ssh, remote_nvim: []const u8) ![:
 /// for every prompt, display or not. Before the core spawns ssh: it passes
 /// the environment as it is then.
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+/// Sets every variable `$SHELL -l -c 'env -0'` prints, but the ones that
+/// describe that shell rather than the user's environment. A shell that
+/// fails, or has not answered in 5 s, leaves the environment as it is.
+pub fn importLoginShellEnv(alloc: std.mem.Allocator) void {
+    const shell: []const u8 = if (std.c.getenv("SHELL")) |sh| std.mem.span(sh) else "/bin/sh";
+    const io = clock.io();
+    const r = std.process.run(alloc, io, .{
+        .argv = &.{ shell, "-l", "-c", "env -0" },
+        .stdout_limit = .limited(1 << 20),
+        .stderr_limit = .limited(1 << 16),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
+    }) catch return;
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    if (r.term != .exited or r.term.exited != 0) return;
+    var it = ShellEnv{ .bytes = r.stdout };
+    while (it.next()) |kv| _ = setenv(kv.key, kv.value, 1);
+}
+
+/// `KEY=VALUE\0` records, skipping the shell's own bookkeeping.
+pub const ShellEnv = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    pub const Pair = struct { key: [*:0]const u8, value: [*:0]const u8 };
+    const skipped = [_][]const u8{ "PWD", "OLDPWD", "SHLVL", "_" };
+
+    /// Each record must be NUL-terminated in `bytes`; the key's '=' is
+    /// overwritten in place, so `bytes` must be writable memory.
+    pub fn next(self: *ShellEnv) ?Pair {
+        while (self.pos < self.bytes.len) {
+            const start = self.pos;
+            const len = std.mem.indexOfScalar(u8, self.bytes[start..], 0) orelse return null;
+            self.pos = start + len + 1;
+            const rec = self.bytes[start .. start + len];
+            const eq = std.mem.indexOfScalar(u8, rec, '=') orelse continue;
+            if (eq == 0) continue;
+            if (isSkipped(rec[0..eq])) continue;
+            const w: [*]u8 = @constCast(self.bytes.ptr);
+            w[start + eq] = 0;
+            return .{ .key = @ptrCast(w + start), .value = @ptrCast(w + start + eq + 1) };
+        }
+        return null;
+    }
+
+    fn isSkipped(key: []const u8) bool {
+        for (skipped) |k| if (std.mem.eql(u8, k, key)) return true;
+        return false;
+    }
+};
+
+test "shell env records split at the first '=' and skip the shell's own" {
+    var bytes = "PATH=/a:/b\x00PWD=/x\x00EQ=a=b\x00=bad\x00MULTI=1\n2\x00".*;
+    var it = ShellEnv{ .bytes = &bytes };
+    const a = it.next().?;
+    try std.testing.expectEqualStrings("PATH", std.mem.span(a.key));
+    try std.testing.expectEqualStrings("/a:/b", std.mem.span(a.value));
+    const b = it.next().?;
+    try std.testing.expectEqualStrings("EQ", std.mem.span(b.key));
+    try std.testing.expectEqualStrings("a=b", std.mem.span(b.value));
+    const c = it.next().?;
+    try std.testing.expectEqualStrings("MULTI", std.mem.span(c.key));
+    try std.testing.expectEqualStrings("1\n2", std.mem.span(c.value));
+    try std.testing.expect(it.next() == null);
+}
 
 pub fn setAskpassEnv(env_mode: [:0]const u8) void {
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;
@@ -276,61 +353,48 @@ pub const Devcontainer = struct {
     rebuild: bool = false,
 };
 
-/// `s` double-quoted for sh.
-fn appendShDq(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    try out.append(alloc, '"');
-    for (s) |ch| {
-        if (ch == '\\' or ch == '"' or ch == '$' or ch == '`') try out.append(alloc, '\\');
-        try out.append(alloc, ch);
-    }
-    try out.append(alloc, '"');
-}
-
 /// The command the core spawns for `--devcontainer`: the core's `devcontainer
-/// exec` line into a running container, as macOS starts it. With rebuild,
-/// `devcontainer up` (the core's arguments: the Neovim feature, the nvim
-/// config mount, --remove-existing-container) runs first in a shell the
-/// core spawns as is (its "/bin/sh" mode); the single-quoted script reaches
-/// sh verbatim, so everything in it is double-quoted.
-pub fn devcontainerCommand(alloc: std.mem.Allocator, d: Devcontainer, nvim_config_dir: []const u8) ![:0]u8 {
+/// exec` line into a running container, as macOS starts it. A rebuild runs
+/// `devcontainerUpArgv` first, outside the core.
+pub fn devcontainerCommand(alloc: std.mem.Allocator, d: Devcontainer) ![:0]u8 {
     var exec_buf: [4096]u8 = undefined;
     const cfg = d.config orelse "";
     const n = core.zonvie_core_devcontainer_exec_cmd(&exec_buf, exec_buf.len, d.workspace.ptr, d.workspace.len, if (d.config != null) cfg.ptr else null, cfg.len);
-    const exec_cmd = exec_buf[0..n];
-    if (!d.rebuild) return alloc.dupeZ(u8, exec_cmd);
+    return alloc.dupeZ(u8, exec_buf[0..n]);
+}
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "/bin/sh -c 'devcontainer up --workspace-folder ");
-    try appendShDq(&out, alloc, d.workspace);
-    if (d.config) |c| {
-        try out.appendSlice(alloc, " --config ");
-        try appendShDq(&out, alloc, c);
-    }
+/// `devcontainer up` for a rebuild, as an argv for direct spawn: the
+/// workspace and config, then the core's arguments (the Neovim feature, the
+/// nvim config mount, --remove-existing-container), as macOS runs it.
+pub fn devcontainerUpArgv(alloc: std.mem.Allocator, d: Devcontainer, nvim_config_dir: []const u8) ![:null]?[*:0]const u8 {
+    var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+    errdefer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ "devcontainer", "up", "--workspace-folder", (try alloc.dupeZ(u8, d.workspace)).ptr });
+    if (d.config) |c| try argv.appendSlice(alloc, &.{ "--config", (try alloc.dupeZ(u8, c)).ptr });
     var args_buf: [4096]u8 = undefined;
-    const len = core.zonvie_core_devcontainer_up_args(&args_buf, args_buf.len, nvim_config_dir.ptr, nvim_config_dir.len, true);
+    const len = core.zonvie_core_devcontainer_up_args(&args_buf, args_buf.len, nvim_config_dir.ptr, nvim_config_dir.len, d.rebuild);
     var it = std.mem.splitScalar(u8, args_buf[0..len], 0);
     while (it.next()) |arg| {
         if (arg.len == 0) continue;
-        try out.append(alloc, ' ');
-        try appendShDq(&out, alloc, arg);
+        try argv.append(alloc, (try alloc.dupeZ(u8, arg)).ptr);
     }
-    try out.appendSlice(alloc, " && exec ");
-    try out.appendSlice(alloc, exec_cmd);
-    try out.append(alloc, '\'');
-    return out.toOwnedSliceSentinel(alloc, 0);
+    return argv.toOwnedSliceSentinel(alloc, null);
 }
 
-test "a devcontainer rebuild runs up, then execs nvim" {
-    const a = std.testing.allocator;
-    const plain = try devcontainerCommand(a, .{ .workspace = "/w s" }, "/home/u/.config/nvim");
-    defer a.free(plain);
+test "a devcontainer starts with exec; a rebuild runs up first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try devcontainerCommand(a, .{ .workspace = "/w s" });
     try std.testing.expect(std.mem.startsWith(u8, plain, "devcontainer exec --workspace-folder \"/w s\""));
-    const rebuild = try devcontainerCommand(a, .{ .workspace = "/w", .rebuild = true }, "/home/u/.config/nvim");
-    defer a.free(rebuild);
-    try std.testing.expect(std.mem.startsWith(u8, rebuild, "/bin/sh -c 'devcontainer up --workspace-folder \"/w\" \"--additional-features\" \"{\\\"ghcr.io/"));
-    try std.testing.expect(std.mem.indexOf(u8, rebuild, "\"--remove-existing-container\" && exec devcontainer exec --workspace-folder \"/w\"") != null);
-    try std.testing.expect(std.mem.endsWith(u8, rebuild, "nvim --embed'"));
+    try std.testing.expect(std.mem.endsWith(u8, plain, "nvim --embed"));
+    const up = try devcontainerUpArgv(a, .{ .workspace = "/w", .config = "/c.json", .rebuild = true }, "/home/u/.config/nvim");
+    try std.testing.expectEqualStrings("devcontainer", std.mem.span(up[0].?));
+    try std.testing.expectEqualStrings("up", std.mem.span(up[1].?));
+    try std.testing.expectEqualStrings("/w", std.mem.span(up[3].?));
+    try std.testing.expectEqualStrings("--config", std.mem.span(up[4].?));
+    try std.testing.expectEqualStrings("--additional-features", std.mem.span(up[6].?));
+    try std.testing.expectEqualStrings("--remove-existing-container", std.mem.span(up[up.len - 1].?));
 }
 
 test "the ssh command quotes the remote nvim for the login shell" {
@@ -357,4 +421,21 @@ test "flags after -- belong to nvim" {
     try std.testing.expect(!hasFlag(&args, "--help"));
     const connect = [_][]const u8{ "zonvie", "--connect-nvim=/tmp/s" };
     try std.testing.expect(hasPrefix(&connect, "--connect-nvim"));
+}
+
+/// Why `zonvie_core_start` / `_start_connect` returned `rc`, in the words of
+/// macOS's handleCoreStartFailure and Windows' showCoreStartFailed.
+pub fn startFailureReason(rc: c_int) []const u8 {
+    return switch (rc) {
+        -1 => "Invalid core handle.",
+        -2 => "Could not spawn the RPC run-loop thread.",
+        -3 => "Invalid or unsupported listen address. For --connect-nvim, use a TCP \"host:port\" or an absolute Unix-socket path.",
+        else => "Unknown error.",
+    };
+}
+
+test "every start failure names its reason" {
+    try std.testing.expectEqualStrings("Invalid core handle.", startFailureReason(-1));
+    try std.testing.expect(std.mem.indexOf(u8, startFailureReason(-3), "--connect-nvim") != null);
+    try std.testing.expectEqualStrings("Unknown error.", startFailureReason(-9));
 }

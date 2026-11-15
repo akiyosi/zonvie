@@ -1108,6 +1108,21 @@ pub fn dropInsertsPath(mode: []const u8, has_external_cmdline: bool, force: bool
     return std.mem.startsWith(u8, mode, "cmdline");
 }
 
+/// What a file drag shows over a surface: the "link" badge when the drop
+/// will insert its paths (`dropInsertsPath`), "copy" when it will open them
+/// (windows/ui/drop_target.zig effectFor). An action the source does not
+/// offer must not be answered, so the other one stands in rather than the
+/// drop being refused.
+pub const DropFeedback = enum { none, copy, link };
+
+pub fn dropFeedback(inserts_path: bool, offers_copy: bool, offers_link: bool) DropFeedback {
+    if (inserts_path and offers_link) return .link;
+    if (!inserts_path and offers_copy) return .copy;
+    if (offers_copy) return .copy;
+    if (offers_link) return .link;
+    return .none;
+}
+
 /// `path` as Neovim's fnameescape() writes it for a `:e`-style argument: its
 /// PATH_ESC_CHARS backslashed, plus a leading `>`, `+` or lone `-`, which are
 /// special at the start of :edit/:write/:cd. With `backslash_is_separator`
@@ -1141,6 +1156,14 @@ test "a drop inserts the path only onto a command line" {
     try std.testing.expect(dropInsertsPath("normal", true, true));
     try std.testing.expect(!dropInsertsPath("normal", false, false));
     try std.testing.expect(!dropInsertsPath("", false, false));
+}
+
+test "a drag shows link over a command line and copy elsewhere, within what the source offers" {
+    try std.testing.expectEqual(DropFeedback.link, dropFeedback(true, true, true));
+    try std.testing.expectEqual(DropFeedback.copy, dropFeedback(false, true, true));
+    try std.testing.expectEqual(DropFeedback.copy, dropFeedback(true, true, false));
+    try std.testing.expectEqual(DropFeedback.link, dropFeedback(false, false, true));
+    try std.testing.expectEqual(DropFeedback.none, dropFeedback(true, false, false));
 }
 
 test "a cmdline path is escaped as fnameescape escapes it" {
@@ -1849,4 +1872,221 @@ test "snapping a stable desired size is idempotent across an intermediate cell c
     const direct = snapTerminalPx(desired, 9);
     const via_other_cell = snapTerminalPx(snapTerminalPx(desired, 11), 9);
     try std.testing.expect(via_other_cell <= direct);
+}
+
+/// `[log] perf_only` / `scroll_only` for one frontend line, by its leading
+/// tag: the tiers src/core/log.zig applies to the core's own lines.
+/// `scroll_only` passes [perf] and [scroll_debug]; `perf_only` only [perf].
+pub fn logLineEmitted(line: []const u8, perf_only: bool, scroll_only: bool) bool {
+    const is_perf = std.mem.startsWith(u8, line, "[perf]") or std.mem.startsWith(u8, line, "[perf_");
+    const is_scroll = std.mem.startsWith(u8, line, "[scroll_debug]");
+    if (scroll_only) return is_perf or is_scroll;
+    if (perf_only) return is_perf;
+    return true;
+}
+
+test "log tiers pass only their tags" {
+    try std.testing.expect(logLineEmitted("[perf] flush", true, false));
+    try std.testing.expect(logLineEmitted("[perf_input] seq=1", true, false));
+    try std.testing.expect(!logLineEmitted("[performance] x", true, false));
+    try std.testing.expect(!logLineEmitted("[scroll_debug] r", true, false));
+    try std.testing.expect(logLineEmitted("[scroll_debug] r", false, true));
+    try std.testing.expect(logLineEmitted("[perf] flush", true, true));
+    try std.testing.expect(!logLineEmitted("[linux] x", false, true));
+    try std.testing.expect(logLineEmitted("[linux] x", false, false));
+}
+
+/// Whether the window buttons are drawn: always without hover reveal; with
+/// it while revealed, or while one is held pressed so its release lands on
+/// what the user sees.
+pub fn captionButtonsShown(reveal_on: bool, revealed: bool, pressed: bool) bool {
+    return !reveal_on or revealed or pressed;
+}
+
+/// Client point (x, y) in the top `band_px` of a `client_w` wide client.
+pub fn inCaptionBand(band_px: c_int, client_w: c_int, x: c_int, y: c_int) bool {
+    return x >= 0 and x < client_w and y >= 0 and y < band_px;
+}
+
+/// The bar that drags a captionless window (`titlebar_style = "hidden"`),
+/// revealed after the pointer rests in the band off the buttons. One state
+/// machine for every window of every frontend; the transitions are pure and
+/// the caller runs the timer.
+pub const DragBar = struct {
+    revealed: bool = false,
+    timer_armed: bool = false,
+    /// When the pending rest began; meaningful only while `timer_armed`.
+    armed_at_ms: u64 = 0,
+
+    /// How long the pointer rests in the band before the bar shows.
+    pub const reveal_ms: u32 = 2000;
+
+    pub const Timer = enum { keep, set, kill };
+    pub const Step = struct { next: DragBar, timer: Timer = .keep };
+
+    /// The pointer moved or left at `now_ms`. `in_band`: it is inside the
+    /// window and in the top band; `on_button`: over a caption button;
+    /// `allowed`: the window may show the bar now.
+    pub fn onPointer(self: DragBar, in_band: bool, on_button: bool, allowed: bool, now_ms: u64) Step {
+        if (on_button) return .{ .next = self };
+        if (in_band and allowed) {
+            if (self.revealed or self.timer_armed) return .{ .next = self };
+            return .{ .next = .{ .timer_armed = true, .armed_at_ms = now_ms }, .timer = .set };
+        }
+        return .{ .next = .{}, .timer = if (self.timer_armed) .kill else .keep };
+    }
+
+    /// The reveal timer fired at `now_ms`. A timer API may deliver a fire
+    /// already queued when it was killed or re-armed (Win32's WM_TIMER), so a fire is
+    /// stale unless armed and a rest has nearly elapsed: a stale fire keeps
+    /// the live timer. Half the delay separates the two, since a stale fire
+    /// lands right after a re-arm while timer and tick resolution jitter by
+    /// one clock tick.
+    pub fn onTimer(self: DragBar, in_band: bool, allowed: bool, now_ms: u64) Step {
+        if (!self.timer_armed) return .{ .next = self };
+        if (now_ms -| self.armed_at_ms < reveal_ms / 2) return .{ .next = self };
+        return .{ .next = .{ .revealed = in_band and allowed }, .timer = .kill };
+    }
+};
+
+test "buttonsShown: hidden only with reveal on, not revealed and nothing pressed" {
+    try std.testing.expect(captionButtonsShown(false, false, false));
+    try std.testing.expect(!captionButtonsShown(true, false, false));
+    try std.testing.expect(captionButtonsShown(true, true, false));
+    try std.testing.expect(captionButtonsShown(true, false, true));
+}
+
+test "DragBar: arms in the band, reveals after a full rest, conceals outside" {
+    const t0: u64 = 10_000;
+    const due = t0 + DragBar.reveal_ms;
+    const idle: DragBar = .{};
+    // Off the band or not allowed: nothing to arm.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(false, false, true, t0));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(true, false, false, t0));
+    // Over a button: the bar keeps whatever it had.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(true, true, true, t0));
+    // In the band: arm once, stamped with the rest's start.
+    const armed = idle.onPointer(true, false, true, t0);
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .timer_armed = true, .armed_at_ms = t0 }, .timer = .set }, armed);
+    try std.testing.expectEqual(DragBar.Step{ .next = armed.next }, armed.next.onPointer(true, false, true, t0 + 500));
+    // Resting on a button edge keeps the timer running.
+    try std.testing.expectEqual(DragBar.Step{ .next = armed.next }, armed.next.onPointer(true, true, true, t0 + 500));
+    // Leaving while armed kills the timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onPointer(false, false, true, t0 + 500));
+    // An editor drag starting while armed kills the pending reveal.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onPointer(true, false, false, t0 + 500));
+    // A full rest reveals only while the pointer is still in the band and
+    // allowed; every due fire kills the timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, armed.next.onTimer(true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onTimer(false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onTimer(true, false, due));
+    // Tick jitter: a fire one clock tick early still counts.
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, armed.next.onTimer(true, true, due - 16));
+    // Stale fires: none armed, or queued before a re-arm, keep the live timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onTimer(true, true, due));
+    const rearmed = idle.onPointer(true, false, true, due).next;
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, true, due + 1));
+    // A stale fire keeps the timer even out of the band: concealing is the
+    // pointer's job, not a stale message's.
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(false, true, due + 1));
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, false, due + 1));
+    // The rest threshold is half the delay: one ms short is stale, at it is due.
+    const half = DragBar.reveal_ms / 2;
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, true, due + half - 1));
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, rearmed.onTimer(true, true, due + half));
+    // Revealed: stays in the band and over buttons, conceals outside or on a drag.
+    const shown: DragBar = .{ .revealed = true };
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onPointer(true, false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onPointer(true, true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, shown.onPointer(false, false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, shown.onPointer(true, false, false, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(true, false, due));
+}
+
+test "inBand: the top band_px rows across the client width" {
+    try std.testing.expect(inCaptionBand(32, 400, 0, 0));
+    try std.testing.expect(inCaptionBand(32, 400, 399, 31));
+    try std.testing.expect(!inCaptionBand(32, 400, 399, 32));
+    try std.testing.expect(!inCaptionBand(32, 400, 400, 0));
+    try std.testing.expect(!inCaptionBand(32, 400, -1, 0));
+    try std.testing.expect(!inCaptionBand(32, 400, 0, -1));
+}
+
+/// Narrowest a sidebar width drag goes, logical px.
+pub const sidebar_min_width_pt: c_int = 120;
+
+/// The sidebar width a width drag asks for, both in logical px: at most half
+/// the client, but never below sidebar_min_width_pt even in a narrow client.
+pub fn clampSidebarWidth(want_px: c_int, client_w_px: c_int) u32 {
+    const max_px = @max(sidebar_min_width_pt, @divTrunc(client_w_px, 2));
+    return @intCast(std.math.clamp(want_px, sidebar_min_width_pt, max_px));
+}
+
+test "clampSidebarWidth: min 120, max half the client, min wins in a narrow client" {
+    try std.testing.expectEqual(@as(u32, 200), clampSidebarWidth(200, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(50, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(-30, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(900, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(500, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(300, 200));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(10, 200));
+}
+
+pub const MainWindowSnap = struct {
+    outer_w: i32,
+    outer_h: i32,
+    snapped_content_w: u32,
+    snapped_content_h: u32,
+};
+
+/// The main window's new outer size for WM_APP_SNAP_MAIN_WINDOW: snap the
+/// *desired* content size (0 falls back to the live `content_w`/`content_h`,
+/// i.e. before the first WM_SIZE) to a cell multiple, then apply the chrome
+/// delta already present between `outer_w`/`outer_h` and the live content.
+/// Snapping the desired size rather than the live content is what lets the
+/// window grow back after it shrank on a font-size change (windows/window.zig, linux/window_size.zig). Returns null when there is nothing to do: a
+/// degenerate cell size, a content area smaller than one cell, or the window
+/// already holding the snapped size.
+pub fn snapMainWindowOuterSize(
+    outer_w: i32,
+    outer_h: i32,
+    content_w: u32,
+    content_h: u32,
+    desired_content_w: u32,
+    desired_content_h: u32,
+    cell_w: u32,
+    cell_h: u32,
+) ?MainWindowSnap {
+    if (cell_w == 0 or cell_h == 0) return null;
+    if (content_w < cell_w or content_h < cell_h) return null;
+
+    const base_w: u32 = if (desired_content_w != 0) desired_content_w else content_w;
+    const base_h: u32 = if (desired_content_h != 0) desired_content_h else content_h;
+
+    const snapped_w = snapTerminalPx(base_w, cell_w);
+    const snapped_h = snapTerminalPx(base_h, cell_h);
+    if (snapped_w == 0 or snapped_h == 0) return null;
+    if (snapped_w == content_w and snapped_h == content_h) return null;
+
+    const delta_w: i32 = @as(i32, @intCast(content_w)) - @as(i32, @intCast(snapped_w));
+    const delta_h: i32 = @as(i32, @intCast(content_h)) - @as(i32, @intCast(snapped_h));
+    return .{
+        .outer_w = outer_w - delta_w,
+        .outer_h = outer_h - delta_h,
+        .snapped_content_w = snapped_w,
+        .snapped_content_h = snapped_h,
+    };
+}
+
+test "the window snaps its desired content, and holds still once snapped" {
+    // 1000 desired, 11 px cells: 990, so the outer shrinks by 10.
+    const s = snapMainWindowOuterSize(1020, 1040, 1000, 1000, 0, 0, 11, 11).?;
+    try std.testing.expectEqual(@as(i32, 1010), s.outer_w);
+    try std.testing.expectEqual(@as(u32, 990), s.snapped_content_h);
+    // Back to 9 px cells: the desired 1000 regrows to 999.
+    const g = snapMainWindowOuterSize(1010, 1030, 990, 990, 1000, 1000, 9, 9).?;
+    try std.testing.expectEqual(@as(u32, 999), g.snapped_content_w);
+    try std.testing.expect(snapMainWindowOuterSize(1000, 1000, 990, 990, 990, 990, 11, 11) == null);
 }

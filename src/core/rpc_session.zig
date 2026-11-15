@@ -1295,8 +1295,8 @@ pub fn setupClipboard(self: *Core) void {
 ///
 /// The provider is opt-in (`card_provider`, default off), because
 /// 'guitablabel' is a global Neovim option shared by every attached UI. It is
-/// enabled only where Zonvie draws multi-line labels: the macOS sidebar with
-/// `cards`, and the titlebar tab bar on either frontend. The titlebar case
+/// enabled only where Zonvie draws multi-line labels: the sidebar with
+/// `cards` (macOS and Linux), and the titlebar tab bar on every frontend. The titlebar case
 /// reads the attached ext_tabline state, not the `external` config key: the
 /// command line and the connection dialog can override it either way.
 pub fn setupAgentStatus(self: *Core) void {
@@ -1322,17 +1322,18 @@ pub fn setupAgentStatus(self: *Core) void {
 
 fn cardProviderEnabled(t: config.Config.TablineConfig, ext_tabline: bool, os_tag: std.Target.Os.Tag) bool {
     if (!t.card_provider) return false;
-    if (std.mem.eql(u8, t.style, "sidebar")) return os_tag == .macos and t.cards;
+    if (std.mem.eql(u8, t.style, "sidebar")) return os_tag != .windows and t.cards;
     return ext_tabline and std.mem.eql(u8, t.style, "titlebar");
 }
 
-test "card provider gate: opt-in, macOS sidebar cards or attached-ext_tabline titlebar" {
+test "card provider gate: opt-in, macOS/Linux sidebar cards or attached-ext_tabline titlebar" {
     // Off by default in every style.
     try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar" }, true, .macos));
     try std.testing.expect(!cardProviderEnabled(.{}, true, .macos));
 
     const sidebar: config.Config.TablineConfig = .{ .style = "sidebar", .card_provider = true };
     try std.testing.expect(cardProviderEnabled(sidebar, true, .macos));
+    try std.testing.expect(cardProviderEnabled(sidebar, true, .linux));
     try std.testing.expect(!cardProviderEnabled(sidebar, true, .windows));
     try std.testing.expect(!cardProviderEnabled(.{ .style = "sidebar", .card_provider = true, .cards = false }, true, .macos));
 
@@ -1911,14 +1912,14 @@ pub fn setupMouseScrollReporter(self: *Core) void {
 /// the restore are each a set, and Neovim fires OptionSet even when the value
 /// does not change), which user config can observe.
 ///
-/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
+/// macOS and Linux only: the frontends with sub-cell trackpad scrolling.
 ///
 /// Returns false when the request could not be issued — the grid lock was busy,
 /// or no window is known yet. Called from the input path, so it never blocks on
 /// the lock; the caller is expected to try again, which matters most for the
 /// restore.
 pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
-    if (comptime builtin.os.tag != .macos) return true;
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return true;
 
     const win = blk: {
         if (!self.grid_mu.tryLock()) {

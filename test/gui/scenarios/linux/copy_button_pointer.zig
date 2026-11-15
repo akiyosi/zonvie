@@ -39,12 +39,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
 
     // The message panel hangs 10 px in from the top-right corner of the
-    // editor view, which sits inside the card's margin and padding; its copy
-    // button is 18 px square, 8 px in from the panel's top and right edges
-    // (overlay_layout.copyButtonRect). The card's inset is
-    // frontend_rules.island_margin_pt + island_padding_pt, logical px.
-    const card = 12;
-    ptr.click(b.x + b.w - card - 10 - 8 - 9, b.y + card + 10 + 8 + 9, btn_left);
+    // editor view (wherever the window's chrome puts it); its copy button is
+    // 18 px square, 8 px in from the panel's top and right edges
+    // (overlay_layout.copyButtonRect).
+    const v = try app_log.viewInsets(alloc, log_path);
+    ptr.click(b.x + b.w - v.right - 10 - 8 - 9, b.y + v.top + 10 + 8 + 9, btn_left);
     gui_io.sleepNs(400 * std.time.ns_per_ms);
     const got = try g.remoteExpr("getreg('+')");
     defer alloc.free(got);

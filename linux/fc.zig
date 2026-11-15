@@ -38,11 +38,17 @@ pub const FC_SLANT: [*:0]const u8 = "slant";
 pub const FC_INDEX: [*:0]const u8 = "index";
 pub const FC_CHARSET: [*:0]const u8 = "charset";
 pub const FC_COLOR: [*:0]const u8 = "color";
+pub const FC_FONT_VARIATIONS: [*:0]const u8 = "fontvariations";
+pub const FC_EMBOLDEN: [*:0]const u8 = "embolden";
+pub const FC_MATRIX: [*:0]const u8 = "matrix";
+
+pub const FcMatrix = extern struct { xx: f64, xy: f64, yx: f64, yy: f64 };
 
 // Weight constants
 pub const FC_WEIGHT_BOLD: c_int = 200;
 
 // Slant constants
+pub const FC_SLANT_ROMAN: c_int = 0;
 pub const FC_SLANT_ITALIC: c_int = 100;
 
 // =========================================================================
@@ -55,6 +61,8 @@ pub extern "c" fn FcPatternAddString(p: *FcPattern, object: [*:0]const u8, s: [*
 pub extern "c" fn FcPatternAddInteger(p: *FcPattern, object: [*:0]const u8, i: c_int) FcBool;
 pub extern "c" fn FcPatternGetString(p: *FcPattern, object: [*:0]const u8, n: c_int, s: *[*c]FcChar8) FcResult;
 pub extern "c" fn FcPatternGetInteger(p: *FcPattern, object: [*:0]const u8, n: c_int, i: *c_int) FcResult;
+pub extern "c" fn FcPatternGetBool(p: *FcPattern, object: [*:0]const u8, n: c_int, b: *FcBool) FcResult;
+pub extern "c" fn FcPatternGetMatrix(p: *FcPattern, object: [*:0]const u8, n: c_int, m: *?*const FcMatrix) FcResult;
 pub extern "c" fn FcPatternAddBool(p: *FcPattern, object: [*:0]const u8, b: FcBool) FcBool;
 pub extern "c" fn FcPatternAddCharSet(p: *FcPattern, object: [*:0]const u8, c: *const FcCharSet) FcBool;
 pub extern "c" fn FcPatternGetCharSet(p: *FcPattern, object: [*:0]const u8, n: c_int, c: *?*FcCharSet) FcResult;
