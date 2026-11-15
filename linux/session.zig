@@ -12,6 +12,7 @@ const applog = @import("app_log.zig");
 const lifecycle = @import("lifecycle.zig");
 const blink = @import("blink.zig");
 const tray = @import("tray.zig");
+const ui_widgets = @import("ui_widgets.zig");
 
 fn appFrom(data: ?*anyopaque) *App {
     return @ptrCast(@alignCast(data.?));
@@ -33,7 +34,7 @@ pub fn onCloseRequest(app: *App) c_int {
     // here, so a cancelled quit leaves close-to-tray on), as on Windows.
     const tray_quit = app.tray.quit_requested;
     app.tray.quit_requested = false;
-    if (app.close_to_tray and app.tray.conn != null and !tray_quit) {
+    if (app.close_to_tray and app.tray.hosted and !tray_quit) {
         if (app.window) |w| gtk.gtk_widget_set_visible(w, 0);
         applog.appLog("[linux] close: hidden to the tray\n", .{});
         return 1;
@@ -109,10 +110,77 @@ pub fn parentWindow(app: *App) ?*anyopaque {
     return if (gtk.gtk_widget_get_visible(w) != 0) w else null;
 }
 
+/// No nvim will run in this window: say why, then quit with status 1.
+pub fn failWith(app: *App, heading: [*:0]const u8, detail: [*:0]const u8) void {
+    app.start_failed = true;
+    stopReveal(app);
+    ui_widgets.hideProgress(app);
+    const dialog = gtk.gtk_alert_dialog_new("%s", heading) orelse {
+        if (app.gtk_app) |a| gtk.g_application_quit(a);
+        return;
+    };
+    gtk.gtk_alert_dialog_set_detail(dialog, detail);
+    gtk.gtk_alert_dialog_choose(dialog, parentWindow(app), null, &onStartFailDone, app);
+}
+
+fn onStartFailDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    var err: ?*anyopaque = null;
+    _ = gtk.gtk_alert_dialog_choose_finish(source.?, result, &err);
+    if (err) |e| gtk.g_error_free(e);
+    gtk.g_object_unref(source.?);
+    if (appFrom(data).gtk_app) |a| gtk.g_application_quit(a);
+}
+
+/// nvim exited (on_exit reached the GTK thread). Returns true when the exit
+/// came before the first frame of a remote start, which then fails with
+/// what the process printed instead of vanishing (a hidden window would
+/// leave nothing on screen); the caller quits otherwise.
+pub fn failEarlyExit(app: *App, exit_code: i32) bool {
+    if (app.nvim_ready or app.start_failed) return false;
+    const heading = lifecycle.earlyExitHeading(app.start_kind) orelse return false;
+    app.start_output.open.store(false, .release);
+    var out_buf: [4096]u8 = undefined;
+    const out = app.start_output.copy(core.clock.io(), &out_buf);
+    var detail_buf: [1024]u8 = undefined;
+    const detail = lifecycle.earlyExitDetail(&detail_buf, out, exit_code);
+    applog.appLog("[linux] nvim exited before the first frame (code={d}): {s}\n", .{ exit_code, detail });
+    std.debug.print("zonvie: {s}: {s}\n", .{ heading, detail });
+    failWith(app, heading, detail);
+    return true;
+}
+
+/// Arms the reveal of a window waiting for the first frame (main, as the
+/// hidden window is realized).
+pub fn armReveal(app: *App) void {
+    if (lifecycle.revealText(app.start_kind) == null) return;
+    app.reveal_timer = gtk.g_timeout_add(lifecycle.connect_reveal_ms, &onReveal, app);
+}
+
+pub fn stopReveal(app: *App) void {
+    if (app.reveal_timer == 0) return;
+    _ = gtk.g_source_remove(app.reveal_timer);
+    app.reveal_timer = 0;
+}
+
+/// The start is slow: show the window with its progress, so the user sees
+/// it and can close it (which stops the start, as any close does).
+fn onReveal(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    app.reveal_timer = 0;
+    if (app.nvim_ready or app.start_failed) return 0;
+    const w = app.window orelse return 0;
+    applog.appLog("[linux] no frame after {d}ms: showing the window\n", .{lifecycle.connect_reveal_ms});
+    if (lifecycle.revealText(app.start_kind)) |text| ui_widgets.showProgress(app, text);
+    gtk.gtk_window_present(w);
+    return 0;
+}
+
 /// Neovim drew its first frame. Idempotent.
 pub fn onReady(app: *App) void {
     if (app.nvim_ready) return;
     app.nvim_ready = true;
+    app.start_output.open.store(false, .release);
+    stopReveal(app);
     if (app.show_when_ready) if (app.window) |w| gtk.gtk_window_present(w);
     const cp = app.corep orelse return;
     if (app.pending_opens.items.len == 0) return;

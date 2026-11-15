@@ -24,6 +24,7 @@ const overlay_layout = @import("overlay_layout.zig");
 const popup_place = @import("popup_place.zig");
 const input = @import("input.zig");
 const ui_widgets = @import("ui_widgets.zig");
+const blur = @import("blur.zig");
 const applog = @import("app_log.zig");
 const Kind = overlay_layout.Kind;
 
@@ -131,6 +132,9 @@ fn create(app: *App, view: *anyopaque, kind: Kind) ?*Popup {
     }
     gtk.gtk_popover_set_child(pop, overlay);
     gtk.gtk_widget_set_parent(pop, view);
+    // The popup surface is blurred behind as a whole, its shadow margin
+    // included, as the toplevels are (blur.zig).
+    if (app.window_cfg.blur) blur.watch(app, pop);
     return p;
 }
 
@@ -172,9 +176,10 @@ fn moveCopyButtons(app: *App, into: bool) void {
 }
 
 /// Shows, moves, resizes or hides every popup by the panels' layout on the
-/// main view, and redraws the shown ones. Hidden while the app is inactive,
-/// as macOS and Windows take their panels off the top level then. After
-/// every flush, a panel drag, a view resize and an activation change.
+/// main view, and redraws the shown ones. While the app is inactive only the
+/// panels popup_place.shownWhileInactive keeps stay shown, as macOS and
+/// Windows take the others off the top level then. After every flush, a
+/// panel drag, a view resize and an activation change.
 pub fn update(app: *App) void {
     if (!app.panel_popups) return;
     var scale: i32 = 1;
@@ -212,7 +217,7 @@ pub fn update(app: *App) void {
             hide(p);
             continue;
         };
-        if (!app.app_active) {
+        if (!app.app_active and !popup_place.shownWhileInactive(p.kind)) {
             hide(p);
             continue;
         }
@@ -223,9 +228,9 @@ pub fn update(app: *App) void {
 /// A surface's editor view and the toplevel holding it; null for an
 /// external window not (or no longer) open. Takes no lock: callers may hold
 /// App.mu (input.panelAt does, through panelRect).
-const Host = struct { view: *anyopaque, window: *anyopaque };
+pub const Host = struct { view: *anyopaque, window: *anyopaque };
 
-fn hostView(app: *App, surface_id: i64) ?Host {
+pub fn hostView(app: *App, surface_id: i64) ?Host {
     if (surface_id == 1) return .{ .view = app.widgets.overlay orelse return null, .window = app.window orelse return null };
     const w = app.ext_windows.get(surface_id) orelse return null;
     // The external window's child: an overlay over its GLArea.
@@ -235,7 +240,7 @@ fn hostView(app: *App, surface_id: i64) ?Host {
 
 /// Surface `surface_id`'s view size, device px; 0 x 0 for none. Caller
 /// holds App.mu.
-fn hostSizePx(app: *const App, surface_id: i64) [2]u32 {
+pub fn hostSizePx(app: *const App, surface_id: i64) [2]u32 {
     if (surface_id == 1) return .{ app.drawable_w_px, app.drawable_h_px };
     const w = app.ext_windows.get(surface_id) orelse return .{ 0, 0 };
     return .{ w.gl.w_px, w.gl.h_px };
@@ -301,6 +306,7 @@ fn hide(p: *Popup) void {
     p.committed_pos = null;
     p.pending_pos = null;
     gtk.gtk_popover_popdown(p.popover);
+    input.panelLeft(&p.pointer);
     applog.appLog("[panel_popup] hide {s}\n", .{@tagName(p.kind)});
 }
 

@@ -19,6 +19,7 @@ const rules = core.frontend_rules;
 const postfx = @import("postfx.zig");
 const scrollbar = @import("../scrollbar.zig");
 const layer_geom = @import("../layer_geom.zig");
+const chrome = @import("../chrome.zig");
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -40,6 +41,7 @@ pub const Target = struct {
     u_offset: i32 = -1,
     u_scroll_offset: i32 = -1,
     u_layer_origin_x: i32 = -1,
+    u_separator_fade: i32 = -1,
     u_mode: i32 = -1,
     u_clear_bg: i32 = -1,
     w_px: u32 = 0,
@@ -106,6 +108,7 @@ pub fn realize(t: *Target) bool {
     t.u_offset = gl.glGetUniformLocation(prog, "u_offset");
     t.u_scroll_offset = gl.glGetUniformLocation(prog, "u_scroll_offset_px");
     t.u_layer_origin_x = gl.glGetUniformLocation(prog, "u_layer_origin_x_px");
+    t.u_separator_fade = gl.glGetUniformLocation(prog, "u_separator_fade_px");
     t.u_mode = gl.glGetUniformLocation(prog, "u_mode");
     t.u_clear_bg = gl.glGetUniformLocation(prog, "u_clear_bg");
     gl.glUseProgram(prog);
@@ -218,6 +221,9 @@ fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Laye
     gl.glUniform2f(t.u_offset, x.offset[0], fy * x.offset[1]);
     gl.glUniform1f(t.u_scroll_offset, scroll_offset_px);
     gl.glUniform1f(t.u_layer_origin_x, @floatFromInt(layer.x_px));
+    // Separators are the root grid's, which only the main view holds.
+    const fade_px = if (layer.grid_id == 1) layer_geom.separatorFadePx(app.captionless(), chrome.band_pt, app.scale) else 0;
+    gl.glUniform1f(t.u_separator_fade, fade_px);
     gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(verts.len));
 }
 
@@ -641,6 +647,12 @@ fn surfaceOpen(app: *const App, id: i64) bool {
     return app.surface.committedSurfaceLayers(id).len != 0;
 }
 
+/// The surface msg_pos `mode` hangs message boxes on
+/// (overlay_layout.msgSurface). Caller holds App.mu.
+pub fn msgSurface(app: *const App, mode: core.config.MsgPosition) i64 {
+    return overlay_layout.msgSurface(mode, app.msg_anchor, app, surfaceOpen);
+}
+
 /// What places the ext UI panels on surface `surface_id` (1, the main view,
 /// or an external window), `w_px` x `h_px`: the one answer for the panels
 /// drawn here, the copy buttons over them (ui_widgets.placeCopyButtons) and
@@ -651,7 +663,7 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
     const cw: i32 = @intCast(app.cell_w_px);
     const ch: i32 = @intCast(app.cell_h_px);
     const main = surface_id == 1;
-    const msg_surface = overlay_layout.msgSurface(app.msg_pos.ext_float, app.msg_anchor, app, surfaceOpen);
+    const msg_surface = msgSurface(app, app.msg_pos.ext_float);
     return .{
         .surface_id = surface_id,
         .main_w_px = w,
@@ -662,9 +674,10 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
         .msg_target = overlay_layout.msgTargetOn(surface_id, app.msg_pos.ext_float, app.msg_anchor, w, h, cw, ch),
         .pum_surface = overlay_layout.popupSurface(app.overlays[@intFromEnum(overlay_layout.Kind.popupmenu)], app, surfaceOpen),
         .msg_surface = msg_surface,
-        // The copy buttons are widgets over the main view only.
+        // A copy button is a widget over the surface its panel is on
+        // (ui_widgets.placeCopyButtons): the cmdline's the main view.
         .copy_cmdline = app.copy_cmdline and main,
-        .copy_messages = app.copy_messages and main,
+        .copy_messages = app.copy_messages and surface_id == msg_surface,
         .confirm = if (main) app.confirm_rect else null,
         .cmdline_user = app.cmdline_user,
         .msg_show_user = app.msg_show_user,
@@ -748,7 +761,9 @@ fn drawPanel(app: *App, t: *Target, kind: overlay_layout.Kind, r: overlay_layout
             placed.x_px += r.x + origin[0];
             placed.y_px += r.y + origin[1];
             if (app.surface.committedGrid(layer.grid_id)) |grid| total += drawLayer(app, t, placed, grid, .{ 0, 0 }, 0);
-            if (cur.verts.len != 0 and cur.grid_id == layer.grid_id and app.cursor_blink.visible and !t.skip_cursor) {
+            if (cur.verts.len != 0 and cur.grid_id == layer.grid_id and app.cursor_blink.visible and !t.skip_cursor and
+                overlay_layout.panelCursorShown(kind, app.ime_composing.load(.acquire)))
+            {
                 total += cur.verts.len;
                 drawVerts(app, t, cur.verts, placed, 0);
             }

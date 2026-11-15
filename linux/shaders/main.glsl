@@ -11,6 +11,9 @@
 #define DECO_SCROLLABLE    (1u << 7)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
+// Window separators on the root grid: faded under a captionless window's
+// top band (separatorEdge).
+#define DECO_SEPARATOR     (1u << 12)
 
 #ifdef VERTEX
 layout(location = 0) in vec2 a_pos; // grid-local px
@@ -25,11 +28,16 @@ uniform vec2 u_offset;
 // rows put it, in px. Moves only DECO_SCROLLABLE vertices, so margins
 // (winbar, float borders) stay put. Zero when nothing eases.
 uniform float u_scroll_offset_px;
+// DECO_SEPARATOR glyphs within this many px of the layer top fade in. 0 px
+// leaves them alone.
+uniform float u_separator_fade_px;
 
 out vec2 v_uv;
 out vec4 v_col;
 flat out uint v_deco;
 out float v_phase;
+out float v_layer_y;
+flat out float v_separator_fade;
 
 void main() {
     vec2 p = a_pos;
@@ -39,6 +47,8 @@ void main() {
     v_col = a_col;
     v_deco = a_deco;
     v_phase = a_phase;
+    v_layer_y = p.y;
+    v_separator_fade = u_separator_fade_px;
 }
 #endif
 
@@ -59,8 +69,18 @@ in vec2 v_uv;
 in vec4 v_col;
 flat in uint v_deco;
 in float v_phase;
+in float v_layer_y;
+flat in float v_separator_fade;
 
 out vec4 o_color;
+
+// Alpha factor for a DECO_SEPARATOR glyph: 0 at the layer top, 1 below the
+// band, so a separator reaching under the window buttons does not start
+// abruptly (windows/shaders/main.hlsl separatorEdge).
+float separatorEdge() {
+    if ((v_deco & DECO_SEPARATOR) == 0u || v_separator_fade <= 0.0) return 1.0;
+    return smoothstep(0.0, v_separator_fade, v_layer_y);
+}
 
 // DirectWrite's coverage correction, as windows/shaders/main.hlsl applies it
 // (from Windows Terminal): gamma 1.8 ratios.
@@ -131,6 +151,6 @@ void main() {
     // the gamma 1.8 alpha correction.
     float k = dwriteLightOnDarkContrast(1.0, v_col.rgb);
     float a = dwriteEnhanceContrast(texture(u_atlas, v_uv).r, k);
-    o_color = premultiply(v_col) * dwriteAlphaCorrection(a, dot(v_col.rgb, vec3(0.30, 0.59, 0.11)));
+    o_color = premultiply(v_col) * dwriteAlphaCorrection(a, dot(v_col.rgb, vec3(0.30, 0.59, 0.11))) * separatorEdge();
 }
 #endif

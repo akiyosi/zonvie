@@ -502,6 +502,16 @@ test "gui:message_panel_pointer" {
     try gated(is_linux, @import("scenarios/linux/message_panel_pointer.zig"));
 }
 
+test "gui:message_hover_resting" {
+    // Linux only: linux/input.zig's hover re-read under a resting pointer.
+    try gated(is_linux, @import("scenarios/linux/message_hover_resting.zig"));
+}
+
+test "gui:clipboard_selections" {
+    // Linux only: linux/callbacks.zig's `*` / `+` selections.
+    try gated(is_linux, @import("scenarios/linux/clipboard_selections.zig"));
+}
+
 test "gui:cmdline_popup_pointer" {
     // Linux only: linux/panel_popup.zig through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/cmdline_popup_pointer.zig"));

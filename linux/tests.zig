@@ -14,6 +14,7 @@ test {
     _ = @import("ui_widgets.zig");
     _ = @import("tab_strip.zig");
     _ = @import("chrome.zig");
+    _ = @import("blink.zig");
     _ = @import("notify.zig");
     _ = @import("blur.zig");
     _ = @import("window_size.zig");
@@ -25,4 +26,6 @@ test {
     _ = @import("pixel_scroll.zig");
     _ = @import("lifecycle.zig");
     _ = @import("tray.zig");
+    _ = @import("callbacks.zig");
+    _ = @import("crash.zig");
 }

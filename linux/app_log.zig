@@ -115,10 +115,28 @@ pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
         f.writeStreamingAll(clock.io(), stampInto(&buf)) catch {};
         f.writeStreamingAll(clock.io(), prefix) catch {};
         f.writeStreamingAll(clock.io(), bytes) catch {};
-        f.writeStreamingAll(clock.io(), "\n") catch {};
+        f.writeStreamingAll(clock.io(), lineEnd(bytes)) catch {};
     } else {
-        std.debug.print("{s}{s}\n", .{ prefix, bytes });
+        std.debug.print("{s}{s}{s}", .{ prefix, bytes, lineEnd(bytes) });
     }
+}
+
+/// What ends a line of `bytes`: nothing when they end in a newline already
+/// (the core's lines do), so each line is followed by exactly one.
+fn lineEnd(bytes: []const u8) []const u8 {
+    return if (bytes.len != 0 and bytes[bytes.len - 1] == '\n') "" else "\n";
+}
+
+test "a log line gets exactly one newline" {
+    try std.testing.expectEqualStrings("", lineEnd("[rpc] x\n"));
+    try std.testing.expectEqualStrings("\n", lineEnd("[rpc] x"));
+    try std.testing.expectEqualStrings("\n", lineEnd(""));
+}
+
+/// The log file's descriptor, for the panic handler (crash.zig): it writes
+/// without the line lock, which the panicking thread may hold.
+pub fn fileFd() ?std.posix.fd_t {
+    return if (g_log_file) |f| f.handle else null;
 }
 
 /// Cleanup: close log file if open

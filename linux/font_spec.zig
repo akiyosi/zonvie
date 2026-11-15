@@ -117,6 +117,29 @@ const testing = std.testing;
 
 const test_global: Defaults = .{ .family = "Iosevka", .point_size = 12, .features = "+ss01" };
 
+/// FreeType's face_index for fontconfig's FC_INDEX: the face number in the
+/// low 16 bits, the named instance (1-based, 0 none) in bits 16-30.
+/// fontconfig gives a variable face's "any instance" pattern instance
+/// 0x8000, which makes the int negative and is no instance FreeType knows:
+/// that face opens at its default coordinates (instance 0), its face
+/// number kept.
+pub fn ftFaceIndex(fc_index: c_int) u32 {
+    const bits: u32 = @bitCast(fc_index);
+    const face = bits & 0xffff;
+    const instance = bits >> 16;
+    if (instance == 0x8000) return face;
+    return face | ((instance & 0x7fff) << 16);
+}
+
+test "a fontconfig index keeps its face and named instance for FreeType" {
+    try std.testing.expectEqual(@as(u32, 0), ftFaceIndex(0));
+    try std.testing.expectEqual(@as(u32, 2), ftFaceIndex(2));
+    // Face 1, named instance 3.
+    try std.testing.expectEqual(@as(u32, 0x30001), ftFaceIndex(0x30001));
+    // The variable "any instance" pattern of face 2 of a collection.
+    try std.testing.expectEqual(@as(u32, 2), ftFaceIndex(@bitCast(@as(u32, 0x80000002))));
+}
+
 test "an empty slot line is the global font at its size times scale" {
     const c = slotCandidate("", test_global, 1.5).?;
     try testing.expectEqualStrings("Iosevka", c.family);

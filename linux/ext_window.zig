@@ -18,6 +18,7 @@ const applog = @import("app_log.zig");
 const blink = @import("blink.zig");
 const scrollbar = @import("scrollbar.zig");
 const blur = @import("blur.zig");
+const chrome = @import("chrome.zig");
 const panel_popup = @import("panel_popup.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const x11_place = @import("x11_place.zig");
@@ -57,6 +58,11 @@ pub const ExtWindow = struct {
     cols: u32,
     /// The Neovim window handle, what on_win_move_cursor answers.
     win: i64,
+    /// The session it opened in (App.session_generation): grid ids restart
+    /// with each server, so a saved origin belongs to its session.
+    generation: u64 = 0,
+    /// Its captionless band (titlebar_style = "hidden"), as the main window's.
+    hover: chrome.Hover = .{},
     /// Where x11_place puts the window as it is first shown, root px.
     place_pos: ?[2]i32 = null,
 };
@@ -96,14 +102,25 @@ fn cellPx(app: *App, grid_id: i64) struct { w: u32, h: u32, scale: f32 } {
 }
 
 /// Logical px for a grid of rows x cols in the grid's own cell, with the
-/// "column" scrollbar's strip beside it.
-fn logicalSize(app: *App, grid_id: i64, rows: u32, cols: u32) [2]c_int {
+/// "column" scrollbar's strip beside it, on a surface of `scale`: the
+/// window's own, whose GLArea reports device px at it. The glyphs are the
+/// one atlas's, rasterized at the main window's scale.
+fn logicalSize(app: *App, grid_id: i64, rows: u32, cols: u32, scale: f32) [2]c_int {
     const c = cellPx(app, grid_id);
-    const strip = scrollbar.columnStripPx(app.scrollbar_cfg, c.scale);
+    const strip = scrollbar.columnStripPx(app.scrollbar_cfg, scale);
     return .{
-        @intFromFloat(@ceil(@as(f32, @floatFromInt(cols * c.w + strip)) / c.scale)),
-        @intFromFloat(@ceil(@as(f32, @floatFromInt(rows * c.h)) / c.scale)),
+        @intFromFloat(@ceil(@as(f32, @floatFromInt(cols * c.w + strip)) / scale)),
+        @intFromFloat(@ceil(@as(f32, @floatFromInt(rows * c.h)) / scale)),
     };
+}
+
+/// The scale of `w`'s surface: its area's, once it has one; until then the
+/// main window's, the closest guess for where it will open.
+fn windowScale(w: *const ExtWindow) f32 {
+    if (w.area) |a| if (gtk.gtk_widget_get_realized(a) != 0) return @floatFromInt(@max(1, gtk.gtk_widget_get_scale_factor(a)));
+    w.app.mu.lockUncancelable(clock.io());
+    defer w.app.mu.unlock(clock.io());
+    return w.app.scale;
 }
 
 fn open(app: *App, op: Op) void {
@@ -114,13 +131,13 @@ fn open(app: *App, op: Op) void {
         if (w.rows != op.rows or w.cols != op.cols) {
             w.rows = op.rows;
             w.cols = op.cols;
-            const sz = logicalSize(app, op.grid_id, op.rows, op.cols);
+            const sz = logicalSize(app, op.grid_id, op.rows, op.cols, windowScale(w));
             if (w.window) |win| gtk.gtk_window_set_default_size(win, sz[0], sz[1]);
         }
         return;
     }
     const w = app.alloc.create(ExtWindow) catch return;
-    w.* = .{ .app = app, .grid_id = op.grid_id, .rows = op.rows, .cols = op.cols, .win = op.win, .pointer = .{ .app = app, .surface_id = op.grid_id, .press_grid_id = op.grid_id } };
+    w.* = .{ .app = app, .grid_id = op.grid_id, .rows = op.rows, .cols = op.cols, .win = op.win, .generation = app.session_generation, .pointer = .{ .app = app, .surface_id = op.grid_id, .press_grid_id = op.grid_id } };
     app.ext_windows.put(app.alloc, op.grid_id, w) catch {
         app.alloc.destroy(w);
         return;
@@ -135,7 +152,7 @@ fn open(app: *App, op: Op) void {
     var title: [32]u8 = undefined;
     const t: [:0]const u8 = std.fmt.bufPrintZ(&title, "Window {d}", .{op.win}) catch "zonvie";
     gtk.gtk_window_set_title(win, t.ptr);
-    const sz = logicalSize(app, op.grid_id, op.rows, op.cols);
+    const sz = logicalSize(app, op.grid_id, op.rows, op.cols, windowScale(w));
     gtk.gtk_window_set_default_size(win, sz[0], sz[1]);
     if (x11_place.active()) {
         w.place_pos = openOrigin(app, op, sz[0]);
@@ -163,7 +180,7 @@ fn open(app: *App, op: Op) void {
         w.pointer.preedit_label = label;
         gtk.gtk_overlay_add_overlay(view, label);
     }
-    gtk.gtk_window_set_child(win, view);
+    gtk.gtk_window_set_child(win, chrome.decorateExternal(app, win, view, &w.pointer, &w.hover));
     _ = gtk.g_signal_connect(win, "close-request", @ptrCast(&onCloseRequest), w);
     blink.watchWindow(app, win);
     gtk.gtk_window_present(win);
@@ -178,8 +195,15 @@ fn close(app: *App, grid_id: i64) void {
     scrollbar.cancelTimers(&w.scrollbar);
     // A later window reusing this grid id starts unedited.
     app.cell_age.drop(grid_id);
-    // Panel popups hanging from this window go back to the main view.
+    chrome.releaseHover(&w.hover);
+    // Where it was, for the same grid reopening in this session (X11 only:
+    // Wayland gives no position).
+    if (w.window) |win| if (x11_place.frame(win)) |f|
+        app.ext_placement.save(grid_id, @floatFromInt(f.x), @floatFromInt(f.y), w.generation, app.session_generation);
+    // Panel popups and message widgets over this window go back to the
+    // main view.
     panel_popup.surfaceClosing(app, grid_id);
+    ui_widgets.surfaceClosing(app, grid_id);
     // Destroying unrealizes the area, which still reads `w`.
     if (w.window) |win| gtk.gtk_window_destroy(win);
     w.gl.deinit(app.alloc);
@@ -264,8 +288,20 @@ fn onRender(area: ?*anyopaque, context: ?*anyopaque, data: ?*anyopaque) callconv
     _ = area;
     _ = context;
     const w = extFrom(data);
+    if (postfx.active(w.app, &w.postfx)) noteWindowOffset(w);
     gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id);
     return 1;
+}
+
+/// The shader's iWindowOffset for `w`, read again when due (X11 only).
+fn noteWindowOffset(w: *ExtWindow) void {
+    if (!x11_place.active()) return;
+    const now = clock.nowNs();
+    if (!x11_place.windowOffsetDue(now, w.postfx.window_offset_ns)) return;
+    w.postfx.window_offset_ns = now;
+    const app = w.app;
+    const off = x11_place.windowOffset(w.window orelse return, w.area orelse return, app.window orelse return, app.gl_area orelse return) orelse return;
+    w.postfx.window_offset_px = off;
 }
 
 /// `w_px`/`h_px` are device px. A size the user dragged to asks Neovim for
@@ -285,18 +321,22 @@ fn fit(w: *ExtWindow) void {
     const c = cellPx(w.app, w.grid_id);
     if (c.w == 0 or c.h == 0) return;
     const rows: u32 = @max(1, w.gl.h_px / c.h);
-    const cols: u32 = @max(1, scrollbar.gridWidthPx(w.app.scrollbar_cfg, w.gl.w_px, c.scale) / c.w);
+    const cols: u32 = @max(1, scrollbar.gridWidthPx(w.app.scrollbar_cfg, w.gl.w_px, windowScale(w)) / c.w);
     if (rows == w.rows and cols == w.cols) return;
     const cp = w.app.corep orelse return;
     core.zonvie_core_try_resize_grid(cp, w.grid_id, rows, cols);
 }
 
-/// After the cell changed with no area resized (a scale change of the main
-/// window, whose font every window draws in): each window's grid is asked
-/// to fill its area again. GTK main thread.
+/// After the cell changed (guifont, linespace, the main window's scale):
+/// every external window keeps its grid's rows and columns and takes the
+/// size they now need, as macOS and Windows resize theirs. GTK main thread.
 pub fn refitAll(app: *App) void {
     var it = app.ext_windows.valueIterator();
-    while (it.next()) |w| fit(w.*);
+    while (it.next()) |w| {
+        const win = w.*.window orelse continue;
+        const sz = logicalSize(app, w.*.grid_id, w.*.rows, w.*.cols, windowScale(w.*));
+        gtk.gtk_window_set_default_size(win, sz[0], sz[1]);
+    }
 }
 
 /// The window goes only when Neovim confirms the close
@@ -322,15 +362,15 @@ fn onCloseRequest(window: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
 fn openOrigin(app: *App, op: Op, w_logical: c_int) ?[2]i32 {
     const main = app.window orelse return null;
     const now_ms: i64 = @intCast(@divTrunc(clock.nowNs(), std.time.ns_per_ms));
-    // No origin is saved per grid, so the generation is a constant.
-    const drop: ?[2]f64 = if (app.ext_placement.take(op.grid_id, 0, now_ms)) |p| .{ p.x, p.y } else null;
+    const placement = app.ext_placement.take(op.grid_id, app.session_generation, now_ms);
     const view: ?[2]f64 = if (app.widgets.overlay) |v| x11_place.widgetPoint(main, v, 0, 0) else null;
     app.mu.lockUncancelable(clock.io());
     const cw = app.cell_w_px;
     const ch = app.cell_h_px;
     app.mu.unlock(clock.io());
-    const o = x11_place.extOrigin(drop, op.start_row, op.start_col, view, cw, ch, w_logical * x11_place.scale(main));
-    if (o) |p| applog.appLog("[x11_place] ext window grid={d} opens at ({d},{d}) from {s}\n", .{ op.grid_id, p[0], p[1], if (drop != null) "drop point" else "win_pos" });
+    const o = x11_place.extOrigin(placement, op.start_row, op.start_col, view, cw, ch, w_logical * x11_place.scale(main));
+    const from: []const u8 = if (placement) |p| (if (p.kind == .pending) "drop point" else "saved") else "win_pos";
+    if (o) |p| applog.appLog("[x11_place] ext window grid={d} opens at ({d},{d}) from {s}\n", .{ op.grid_id, p[0], p[1], from });
     return o;
 }
 

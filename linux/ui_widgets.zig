@@ -18,6 +18,7 @@ const notify = @import("notify.zig");
 const window_size = @import("window_size.zig");
 const input = @import("input.zig");
 const popup_place = @import("popup_place.zig");
+const panel_popup = @import("panel_popup.zig");
 
 const margin_pt = 10;
 
@@ -46,6 +47,12 @@ pub const Widgets = struct {
     /// Copy buttons over the cmdline, msg_show and msg_history panels, by
     /// overlay_layout.Kind; null for the popupmenu.
     copy: [4]?*anyopaque = @splat(null),
+    /// The surface whose view holds the minis' box, the toast and (while
+    /// they are not in panel popups) each copy button: the one msg_pos puts
+    /// them on (rehost).
+    mini_host: i64 = 1,
+    toast_host: i64 = 1,
+    copy_host: [4]i64 = @splat(1),
     /// A click's remaining tries while the core's grid lock is busy.
     copy_tries: u8 = 0,
     copy_grid: i64 = 0,
@@ -248,10 +255,56 @@ fn notifyCompletions(app: *App, done: []const ui_state.Completion) void {
     notify.send(app, .agent, "Zonvie", msg);
 }
 
+/// The surface whose view a widget msg_pos `mode` places goes on: the
+/// external window overlay_layout.msgSurface names while its view exists,
+/// else the main view.
+fn widgetSurface(app: *App, mode: core.config.MsgPosition) i64 {
+    app.mu.lockUncancelable(clock.io());
+    const id = gl_renderer.msgSurface(app, mode);
+    app.mu.unlock(clock.io());
+    return if (id != 1 and panel_popup.hostView(app, id) != null) id else 1;
+}
+
+/// Moves overlay child `widget` onto surface `to`'s view and records it in
+/// `host`. Pre: `widget` is a child overlay of surface host.*'s view, or
+/// that surface's view is gone (ext_window.close: it is still the widget's
+/// parent). Post: host.* == to unless `to`'s view is gone.
+fn rehost(app: *App, widget: *anyopaque, host: *i64, to: i64) void {
+    if (host.* == to) return;
+    const view = (panel_popup.hostView(app, to) orelse return).view;
+    // The parent holds the widget's only reference.
+    _ = gtk.g_object_ref(widget);
+    defer gtk.g_object_unref(widget);
+    if (gtk.gtk_widget_get_parent(widget)) |from| gtk.gtk_overlay_remove_overlay(from, widget);
+    gtk.gtk_overlay_add_overlay(view, widget);
+    host.* = to;
+}
+
+/// Surface `surface_id` is about to close: the widgets over its view go
+/// back to the main view, as the panel popups do. Pre: GTK main thread,
+/// before the external window is destroyed.
+pub fn surfaceClosing(app: *App, surface_id: i64) void {
+    const w = &app.widgets;
+    if (w.mini_box) |b| if (w.mini_host == surface_id) rehost(app, b, &w.mini_host, 1);
+    if (w.toast) |t| if (w.toast_host == surface_id) rehost(app, t, &w.toast_host, 1);
+    for (w.copy, &w.copy_host) |btn, *host| {
+        if (btn) |b| if (host.* == surface_id) rehost(app, b, host, 1);
+    }
+}
+
+/// Surface `host`'s view size, device px; 0 x 0 for none.
+fn viewSizePx(app: *App, host: i64) [2]i32 {
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    const s = panel_popup.hostSizePx(app, host);
+    return .{ @intCast(s[0]), @intCast(s[1]) };
+}
+
 /// Hangs the toast from the top-right of msg_pos.ext_float's target and the
-/// minis from the bottom-right of msg_pos.mini's (overlay_layout.msgTarget),
-/// as macOS and Windows place them. Rerun after each flush: the cursor's
-/// window moves the targets. GTK main thread.
+/// minis from the bottom-right of msg_pos.mini's (overlay_layout.msgTargetOn),
+/// as macOS and Windows place them: over the external window msg_pos puts
+/// them on (overlay_layout.msgSurface), as the message panels are. Rerun
+/// after each flush: the cursor's window moves the targets. GTK main thread.
 pub fn placeMessages(app: *App) void {
     const w = &app.widgets;
     // A resize reaches here through the flush it causes.
@@ -274,9 +327,12 @@ pub fn placeMessages(app: *App) void {
     // in logical px, become the labels' character limits.
     const char_px: f32 = 0.6 * @as(f32, @floatFromInt(if (w.css_font_px == 0) 13 else @max(12, w.css_font_px)));
     if (w.toast) |t| {
-        const r = overlay_layout.msgTarget(pos.ext_float, anchor, vw, vh, cw, ch);
+        rehost(app, t, &w.toast_host, widgetSurface(app, pos.ext_float));
+        const host = w.toast_host;
+        const size = if (host == 1) [2]i32{ vw, vh } else viewSizePx(app, host);
+        const r = overlay_layout.msgTargetOn(host, pos.ext_float, anchor, size[0], size[1], cw, ch);
         gtk.gtk_widget_set_margin_top(t, @divTrunc(r.top, scale) + m);
-        gtk.gtk_widget_set_margin_end(t, @divTrunc(vw - r.right, scale) + m);
+        gtk.gtk_widget_set_margin_end(t, @divTrunc(size[0] - r.right, scale) + m);
         // macOS and Windows: at most 0.8 of the target and 600 wide.
         const max_px = @min(0.8 * @as(f32, @floatFromInt(@divTrunc(r.right - r.left, scale))), 600) - 24;
         gtk.gtk_label_set_max_width_chars(t, @intFromFloat(@max(1, max_px / char_px)));
@@ -306,8 +362,11 @@ pub fn placeMessages(app: *App) void {
     app.mu.unlock(clock.io());
     if (moved) app.queueRenderAll();
     if (w.mini_box) |b| {
-        const r = overlay_layout.msgTarget(pos.mini, anchor, vw, vh, cw, ch);
-        const place: [2]c_int = .{ @divTrunc(vw - r.right, scale) + m, @divTrunc(vh - r.bottom, scale) + m };
+        rehost(app, b, &w.mini_host, widgetSurface(app, pos.mini));
+        const host = w.mini_host;
+        const size = if (host == 1) [2]i32{ vw, vh } else viewSizePx(app, host);
+        const r = overlay_layout.msgTargetOn(host, pos.mini, anchor, size[0], size[1], cw, ch);
+        const place: [2]c_int = .{ @divTrunc(size[0] - r.right, scale) + m, @divTrunc(size[1] - r.bottom, scale) + m };
         gtk.gtk_widget_set_margin_end(b, place[0]);
         gtk.gtk_widget_set_margin_bottom(b, place[1]);
         // What the GUI harness reads the minis' corner from, on a change.
@@ -411,7 +470,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-panel.tone-prompt {{ border-color: #4d99ff; color: #99ccff; }}
         \\.zonvie-panel.tone-search {{ color: #99ff99; }}
         \\window.zonvie-translucent {{ background: transparent; }}
-        \\window.zonvie-blur {{ backdrop-filter: blur(20px); }}
+        \\window.zonvie-blur, popover.zonvie-blur {{ backdrop-filter: blur(20px); }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar button {{ background: none; color: inherit; border-radius: 0; border: none;
         \\  box-shadow: none; padding: 4px 14px; min-height: 0; }}
@@ -499,24 +558,30 @@ const copy_tries = 10;
 
 /// Puts each copy button on its panel's trailing edge, where the renderer
 /// left room for it, and hides those whose panel is closed. A panel popup
-/// holds its own button (panel_popup.zig), placed in the popup. After every
+/// holds its own button (panel_popup.zig), placed in the popup; otherwise
+/// the button is over the view of the surface its panel is on (the
+/// cmdline's the main view, the messages' msg_pos.ext_float's). After every
 /// flush: panels open, close and resize there. GTK main thread.
 pub fn placeCopyButtons(app: *App) void {
     const w = &app.widgets;
-    const view = w.overlay orelse return;
-    const vw = gtk.gtk_widget_get_width(view);
-    const vh = gtk.gtk_widget_get_height(view);
-    if (vw <= 0 or vh <= 0) return;
-    app.mu.lockUncancelable(clock.io());
-    const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
-    const in = gl_renderer.overlayInputs(app, 1, @intCast(vw * scale), @intCast(vh * scale));
-    const rects = overlay_layout.place(&app.overlays, in);
-    const popups = app.panel_popups;
-    app.mu.unlock(clock.io());
+    const msg_host = widgetSurface(app, app.msg_pos.ext_float);
     for (w.copy, 0..) |btn, i| {
         const b = btn orelse continue;
         const kind: overlay_layout.Kind = @enumFromInt(i);
-        const box = if (rects[i]) |r| overlay_layout.copyButtonRect(kind, if (popups) popup_place.frame(r, scale).inner else r, in) else null;
+        const host: i64 = if (kind == .cmdline) 1 else msg_host;
+        app.mu.lockUncancelable(clock.io());
+        const popups = app.panel_popups;
+        const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
+        const size = panel_popup.hostSizePx(app, host);
+        const box: ?overlay_layout.Rect = blk: {
+            if (size[0] == 0 or size[1] == 0) break :blk null;
+            const in = gl_renderer.overlayInputs(app, host, size[0], size[1]);
+            const r = overlay_layout.place(&app.overlays, in)[i] orelse break :blk null;
+            break :blk overlay_layout.copyButtonRect(kind, if (popups) popup_place.frame(r, scale).inner else r, in);
+        };
+        app.mu.unlock(clock.io());
+        // In a panel popup the button travels with the popup.
+        if (!popups) rehost(app, b, &w.copy_host[i], host);
         const r = box orelse {
             gtk.gtk_widget_set_visible(b, 0);
             continue;
@@ -605,6 +670,42 @@ pub fn hideProgress(app: *App) void {
 /// Shows `text` (null-terminated) in preedit label `label` with the IME's
 /// Pango `attrs` (its underlines and the converting clause) in the editor
 /// font, or hides it for an empty one. GTK main thread.
+/// A font the composition label draws in: family and logical px.
+pub const PreeditFont = struct {
+    family: [128]u8 = undefined,
+    family_len: usize = 0,
+    /// 0: no font.
+    px: f32 = 0,
+
+    /// `family` (cut to 128 bytes) at `pixel_size` device px on a `scale`
+    /// display. Pre: scale > 0.
+    pub fn of(family: []const u8, pixel_size: u32, scale: f32) PreeditFont {
+        std.debug.assert(scale > 0);
+        var f: PreeditFont = .{ .family_len = @min(family.len, 128), .px = @as(f32, @floatFromInt(pixel_size)) / scale };
+        @memcpy(f.family[0..f.family_len], family[0..f.family_len]);
+        return f;
+    }
+};
+
+/// The slot font a composition is drawn in: the cursor grid's own font
+/// (`font_id`, 0 for none) while its slot is loaded, as macOS and Windows
+/// take the cursor cell's face; null for the editor font.
+pub fn preeditSlot(slots: []const PreeditFont, font_id: u32) ?*const PreeditFont {
+    if (font_id == 0 or font_id >= slots.len) return null;
+    const f = &slots[font_id];
+    return if (f.px > 0) f else null;
+}
+
+test "a composition takes the cursor grid's loaded slot font, else the editor font" {
+    var slots: [4]PreeditFont = @splat(.{});
+    slots[2] = PreeditFont.of("Mono", 40, 2);
+    try std.testing.expectEqual(@as(f32, 20), preeditSlot(&slots, 2).?.px);
+    try std.testing.expectEqualStrings("Mono", preeditSlot(&slots, 2).?.family[0..4]);
+    try std.testing.expect(preeditSlot(&slots, 0) == null);
+    try std.testing.expect(preeditSlot(&slots, 1) == null);
+    try std.testing.expect(preeditSlot(&slots, 9) == null);
+}
+
 pub fn showPreedit(app: *App, label_widget: ?*anyopaque, text: [:0]const u8, attrs: ?*anyopaque, at: ?gtk.GdkRectangle) void {
     const l = label_widget orelse return;
     if (text.len == 0) {
@@ -613,9 +714,11 @@ pub fn showPreedit(app: *App, label_widget: ?*anyopaque, text: [:0]const u8, att
     }
     var family: [129]u8 = undefined;
     app.mu.lockUncancelable(clock.io());
-    const n = app.preedit_family_len;
-    @memcpy(family[0..n], app.preedit_family[0..n]);
-    const px = app.preedit_px;
+    const font_id: u32 = if (app.surface.gridFont(app.surface.committedCursor().grid_id)) |g| g.font_id else 0;
+    const slot = preeditSlot(&app.slot_preedit, font_id);
+    const n = if (slot) |f| f.family_len else app.preedit_family_len;
+    @memcpy(family[0..n], if (slot) |f| f.family[0..n] else app.preedit_family[0..n]);
+    const px = if (slot) |f| f.px else app.preedit_px;
     app.mu.unlock(clock.io());
     family[n] = 0;
     // Font first, so the IME's own attributes still apply over it.

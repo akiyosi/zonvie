@@ -17,8 +17,6 @@ const x11_place = @import("x11_place.zig");
 pub const Strip = struct {
     /// The strip's outer box: the scroller holding the tabs, then "+".
     root: ?*anyopaque = null,
-    /// The scrolled viewport over `tabs`; the strip's on-screen extent.
-    scroller: ?*anyopaque = null,
     /// One box per tab.
     tabs: ?*anyopaque = null,
     /// Over `tabs`: the drop line and the floating tab of a drag.
@@ -51,9 +49,15 @@ pub const Strip = struct {
 pub const Drag = struct {
     /// The tab pressed, by index; null when the press missed every tab.
     from: ?u32 = null,
+    /// That tab's handle: a press on a sidebar row selects it, which rebuilds
+    /// the strip mid-drag, and the drag goes on with the tab at its new index.
+    handle: i64 = 0,
     /// The press, in `tabs` coordinates.
     start: [2]f64 = .{ 0, 0 },
     mode: DragMode = .pending,
+    /// The tear-off is a GDK drag: its icon (the tab's name) follows the
+    /// pointer past the window, which an in-window preview cannot.
+    gdk_drag: ?*anyopaque = null,
 };
 
 pub const DragMode = enum { pending, reorder, tear_off };
@@ -82,6 +86,29 @@ test "a drag reorders past the threshold and tears off past the strip" {
     try std.testing.expectEqual(DragMode.reorder, dragMode(.{ 30, 79 }, size, .{ 0, 69 }));
     try std.testing.expectEqual(DragMode.tear_off, dragMode(.{ 30, 81 }, size, .{ 0, 71 }));
     try std.testing.expectEqual(DragMode.tear_off, dragMode(.{ -51, 10 }, size, .{ -60, 0 }));
+}
+
+/// What a torn-off tab's GDK drag carries: the process, so only this
+/// process's strip takes it back, and the tab's handle.
+pub fn tearToken(buf: []u8, pid: i32, handle: i64) ?[:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "zonvie-tab:{d}:{d}", .{ pid, handle }) catch null;
+}
+
+/// The tab handle in `token` when this process (`pid`) made it.
+pub fn tearTokenHandle(token: []const u8, pid: i32) ?i64 {
+    var it = std.mem.splitScalar(u8, token, ':');
+    if (!std.mem.eql(u8, it.next() orelse return null, "zonvie-tab")) return null;
+    const p = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+    if (p != pid) return null;
+    return std.fmt.parseInt(i64, it.next() orelse return null, 10) catch null;
+}
+
+test "a tear-off token comes back only to the process that made it" {
+    var buf: [48]u8 = undefined;
+    const t = tearToken(&buf, 41, 1003).?;
+    try std.testing.expectEqual(@as(?i64, 1003), tearTokenHandle(t, 41));
+    try std.testing.expectEqual(@as(?i64, null), tearTokenHandle(t, 42));
+    try std.testing.expectEqual(@as(?i64, null), tearTokenHandle("some dropped text", 41));
 }
 
 /// The insertion index for a drop at `pos` along the strip: the first tab
@@ -169,6 +196,13 @@ pub fn build(app: *App, sidebar: bool, window_overlay: *anyopaque) *anyopaque {
     _ = gtk.g_signal_connect(plus, "clicked", @ptrCast(&onNewTab), app);
     gtk.gtk_box_append(root, plus);
 
+    // A torn-off tab dropped back on the strip is moved there instead.
+    if (gtk.gtk_drop_target_new(gtk.G_TYPE_STRING, gtk.GDK_ACTION_MOVE)) |target| {
+        _ = gtk.g_signal_connect(target, "motion", @ptrCast(&onTearMotion), app);
+        _ = gtk.g_signal_connect(target, "leave", @ptrCast(&onTearLeave), app);
+        _ = gtk.g_signal_connect(target, "drop", @ptrCast(&onTearDrop), app);
+        gtk.gtk_widget_add_controller(tabs, target);
+    }
     if (gtk.gtk_gesture_drag_new()) |drag| {
         _ = gtk.g_signal_connect(drag, "drag-begin", @ptrCast(&onDragBegin), app);
         _ = gtk.g_signal_connect(drag, "drag-update", @ptrCast(&onDragUpdate), app);
@@ -189,7 +223,6 @@ pub fn build(app: *App, sidebar: bool, window_overlay: *anyopaque) *anyopaque {
 
     s.* = .{
         .root = root,
-        .scroller = scroller,
         .tabs = tabs,
         .drag_overlay = ov,
         .drop_line = line,
@@ -216,8 +249,9 @@ pub fn apply(app: *App, ui: *const ui_state.UiState) void {
         }
     }
     if (!same) {
-        // A drag addresses tabs by index: a new list ends it.
-        endDrag(s);
+        // The widgets go; a drag follows its tab by handle (dragIndexAfter).
+        const drag = s.drag;
+        hideDragFeedback(s);
         while (gtk.gtk_widget_get_first_child(tabs)) |c| gtk.gtk_box_remove(tabs, c);
         s.tab_count = ui.tab_count;
         s.curtab = ui.curtab;
@@ -227,6 +261,12 @@ pub fn apply(app: *App, ui: *const ui_state.UiState) void {
         }
         s.tab_w = 0;
         sizeTabs(app);
+        s.drag = .{};
+        if (drag.from != null) if (indexOfHandle(s.tab_handles[0..s.tab_count], drag.handle)) |i| {
+            s.drag = drag;
+            s.drag.from = i;
+            if (drag.mode != .pending) if (nthTab(s, i)) |t| gtk.gtk_widget_add_css_class(t, "dragging");
+        };
     }
     var child = gtk.gtk_widget_get_first_child(tabs);
     for (ui.tabs[0..ui.tab_count]) |*t| {
@@ -251,6 +291,9 @@ fn newTab(app: *App, current: bool, index: usize) ?*anyopaque {
     // must not shift between its frames.
     gtk.gtk_label_set_width_chars(ind, 2);
     gtk.gtk_label_set_xalign(ind, 0.5);
+    // Beside the name's first line, as the close button: a multi-line
+    // label would otherwise centre it on the whole tab (macOS/Windows don't).
+    gtk.gtk_widget_set_valign(ind, gtk.GTK_ALIGN_START);
     gtk.gtk_widget_set_visible(ind, 0);
     gtk.gtk_box_append(tab, ind);
     const name = gtk.gtk_label_new(null) orelse return null;
@@ -467,15 +510,29 @@ fn onDragBegin(gesture: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv
     _ = gesture;
     const app: *App = @ptrCast(@alignCast(data.?));
     const s = &app.widgets.strip;
-    s.drag = .{ .start = .{ x, y }, .from = tabAt(s, if (s.sidebar) y else x) };
+    const from = tabAt(s, if (s.sidebar) y else x);
+    s.drag = .{ .start = .{ x, y }, .from = from, .handle = if (from) |f| s.tab_handles[f] else 0 };
 }
 
-/// The pointer, in the scroller's (the visible strip's) coordinates.
-fn inViewport(s: *const Strip, x: f64, y: f64) [2]f64 {
+/// The index of the tab with `handle` in `handles`; null when it is gone.
+pub fn indexOfHandle(handles: []const i64, handle: i64) ?u32 {
+    for (handles, 0..) |h, i| if (h == handle) return @intCast(i);
+    return null;
+}
+
+test "a dragged tab is found again by its handle after the strip is rebuilt" {
+    try std.testing.expectEqual(@as(?u32, 2), indexOfHandle(&.{ 4, 9, 7 }, 7));
+    try std.testing.expectEqual(@as(?u32, null), indexOfHandle(&.{ 4, 9 }, 7));
+}
+
+/// The pointer, in the strip's coordinates: the whole bar or sidebar, its
+/// new-tab button included, which a tear-off must leave (macOS and Windows
+/// measure the whole strip, not the tabs).
+fn inStrip(s: *const Strip, x: f64, y: f64) [2]f64 {
     const tabs = s.tabs orelse return .{ x, y };
-    const scroller = s.scroller orelse return .{ x, y };
+    const root = s.root orelse return .{ x, y };
     var r: gtk.GrapheneRect = .{};
-    if (gtk.gtk_widget_compute_bounds(tabs, scroller, &r) == 0) return .{ x, y };
+    if (gtk.gtk_widget_compute_bounds(tabs, root, &r) == 0) return .{ x, y };
     return .{ x + r.x, y + r.y };
 }
 
@@ -485,9 +542,9 @@ fn onDragUpdate(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callc
     const from = s.drag.from orelse return;
     const x = s.drag.start[0] + dx;
     const y = s.drag.start[1] + dy;
-    const scroller = s.scroller orelse return;
-    const size = [2]f64{ @floatFromInt(gtk.gtk_widget_get_width(scroller)), @floatFromInt(gtk.gtk_widget_get_height(scroller)) };
-    const mode = dragMode(inViewport(s, x, y), size, .{ dx, dy });
+    const root = s.root orelse return;
+    const size = [2]f64{ @floatFromInt(gtk.gtk_widget_get_width(root)), @floatFromInt(gtk.gtk_widget_get_height(root)) };
+    const mode = dragMode(inStrip(s, x, y), size, .{ dx, dy });
     if (mode == .pending) return;
     // Claimed: the window handle around a titlebar strip must not move
     // the window, and the tab's click must not select on release.
@@ -504,9 +561,115 @@ fn onDragUpdate(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callc
         .tear_off => {
             if (s.drop_line) |l| gtk.gtk_widget_set_visible(l, 0);
             if (s.floating) |f| gtk.gtk_widget_set_visible(f, 0);
-            showPreview(app, from, x, y);
+            if (s.drag.gdk_drag == null and !startTearDrag(app, gesture.?, from, x, y)) showPreview(app, from, x, y);
         },
     }
+}
+
+/// Hands the tear-off to a GDK drag of the tab: the compositor moves its
+/// icon with the pointer anywhere on screen, and the drag ends in
+/// onTearCancel (dropped where nothing takes it: tear off) or onTearDrop
+/// (back on the strip: a move). False when no drag could start; the
+/// in-window preview stands in.
+fn startTearDrag(app: *App, gesture: *anyopaque, from: u32, x: f64, y: f64) bool {
+    const s = &app.widgets.strip;
+    const tabs = s.tabs orelse return false;
+    const native = gtk.gtk_widget_get_native(tabs) orelse return false;
+    const surface = gtk.gtk_native_get_surface(native) orelse return false;
+    const device = gtk.gtk_gesture_get_device(gesture) orelse return false;
+    var token_buf: [48]u8 = undefined;
+    const token = tearToken(&token_buf, std.c.getpid(), s.tab_handles[from]) orelse return false;
+    const content = gtk.gdk_content_provider_new_typed(gtk.G_TYPE_STRING, token.ptr) orelse return false;
+    defer gtk.g_object_unref(content);
+    // The press point in the surface, where the drag starts.
+    var r: gtk.GrapheneRect = .{};
+    if (gtk.gtk_widget_compute_bounds(tabs, native, &r) == 0) return false;
+    var tx: f64 = 0;
+    var ty: f64 = 0;
+    gtk.gtk_native_get_surface_transform(native, &tx, &ty);
+    const drag = gtk.gdk_drag_begin(surface, device, content, gtk.GDK_ACTION_MOVE, r.x + tx + x, r.y + ty + y) orelse return false;
+    if (gtk.gtk_drag_icon_get_for_drag(drag)) |icon| {
+        const label = gtk.gtk_label_new(tabText(s, from)).?;
+        gtk.gtk_widget_add_css_class(label, "zonvie-tab-floating");
+        gtk.gtk_widget_set_size_request(label, 150, 30);
+        gtk.gtk_drag_icon_set_child(icon, label);
+    }
+    _ = gtk.g_signal_connect(drag, "cancel", @ptrCast(&onTearCancel), app);
+    _ = gtk.g_signal_connect(drag, "dnd-finished", @ptrCast(&onTearFinished), app);
+    s.drag.gdk_drag = drag;
+    if (s.preview) |p| gtk.gtk_widget_set_visible(p, 0);
+    applog.appLog("[tabline] tear-off drag of tab {d}\n", .{from});
+    return true;
+}
+
+/// Whether a tear-off drag that ended as `reason` tears the tab off. A drop
+/// back on the strip finishes the drag instead (onTearDrop), so every end
+/// but the user's cancel (Esc) is a release away from it: no target took
+/// it, or the compositor ended the drag in error at the drop, as Hyprland
+/// does for some pointers; macOS and Windows tear off on any such release.
+pub fn tearsOff(reason: c_int) bool {
+    return reason != gtk.GDK_DRAG_CANCEL_USER_CANCELLED;
+}
+
+test "only the user's cancel keeps the tab" {
+    try std.testing.expect(tearsOff(gtk.GDK_DRAG_CANCEL_NO_TARGET));
+    try std.testing.expect(tearsOff(gtk.GDK_DRAG_CANCEL_ERROR));
+    try std.testing.expect(!tearsOff(gtk.GDK_DRAG_CANCEL_USER_CANCELLED));
+}
+
+/// Released away from the strip: the tab tears off, under X11 at the
+/// pointer.
+fn onTearCancel(drag: ?*anyopaque, reason: c_int, data: ?*anyopaque) callconv(.c) void {
+    _ = drag;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const s = &app.widgets.strip;
+    const from = s.drag.from;
+    endDrag(s);
+    applog.appLog("[tabline] tear-off drag cancelled reason={d}\n", .{reason});
+    if (!tearsOff(reason)) return;
+    const f = from orelse return;
+    const cp = app.corep orelse return;
+    if (x11_place.pointerRoot()) |p| app.ext_placement.setPending(p[0], p[1], @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms)));
+    if (applog.isEnabled()) applog.appLog("[tabline] tear off tab {d}\n", .{f});
+    core.zonvie_core_externalize_tab(cp, f);
+}
+
+fn onTearFinished(drag: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = drag;
+    applog.appLog("[tabline] tear-off drag dropped on the strip\n", .{});
+    endDrag(&@as(*App, @ptrCast(@alignCast(data.?))).widgets.strip);
+}
+
+/// A tab dragged back over the strip: the drop line where it would land.
+fn onTearMotion(target: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_uint {
+    _ = target;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const s = &app.widgets.strip;
+    const from = s.drag.from orelse return 0;
+    if (s.drag.gdk_drag == null) return 0;
+    showReorder(s, from, x, y);
+    return gtk.GDK_ACTION_MOVE;
+}
+
+fn onTearLeave(target: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = target;
+    const s = &@as(*App, @ptrCast(@alignCast(data.?))).widgets.strip;
+    if (s.drop_line) |l| gtk.gtk_widget_set_visible(l, 0);
+    if (s.floating) |f| gtk.gtk_widget_set_visible(f, 0);
+}
+
+/// Dropped back on the strip: a move to where it landed, not a tear-off.
+fn onTearDrop(target: ?*anyopaque, value: ?*const anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_int {
+    _ = target;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const s = &app.widgets.strip;
+    const token = gtk.g_value_get_string(value orelse return 0) orelse return 0;
+    const handle = tearTokenHandle(std.mem.span(token), std.c.getpid()) orelse return 0;
+    const from = indexOfHandle(s.tab_handles[0..s.tab_count], handle) orelse return 0;
+    const e = extents(s);
+    const cp = app.corep orelse return 0;
+    _ = core.zonvie_core_tab_move(cp, from, dropIndexAt(if (s.sidebar) y else x, e.centres[0..e.n]), @intCast(s.tab_count));
+    return 1;
 }
 
 fn nthTab(s: *const Strip, idx: u32) ?*anyopaque {
@@ -567,17 +730,24 @@ fn showPreview(app: *App, from: u32, x: f64, y: f64) void {
     gtk.gtk_widget_set_visible(p, 1);
 }
 
-fn endDrag(s: *Strip) void {
+/// Takes the drag's line, floating tab, preview and ghost off the screen.
+fn hideDragFeedback(s: *Strip) void {
     if (s.drag.from) |from| if (nthTab(s, from)) |t| gtk.gtk_widget_remove_css_class(t, "dragging");
     if (s.drop_line) |l| gtk.gtk_widget_set_visible(l, 0);
     if (s.floating) |f| gtk.gtk_widget_set_visible(f, 0);
     if (s.preview) |p| gtk.gtk_widget_set_visible(p, 0);
+}
+
+fn endDrag(s: *Strip) void {
+    hideDragFeedback(s);
     s.drag = .{};
 }
 
 fn onDragEnd(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(data.?));
     const s = &app.widgets.strip;
+    // A GDK drag owns the tear-off from its start: its own end decides.
+    if (s.drag.gdk_drag != null) return;
     const from = s.drag.from;
     const mode = s.drag.mode;
     const end = [2]f64{ s.drag.start[0] + dx, s.drag.start[1] + dy };

@@ -358,7 +358,7 @@ fn applyAxes(f: *Font, fc_variations: []const u8, user: []const hbft.zonvie_font
 fn loadFile(alloc: std.mem.Allocator, path: []const u8, index: c_int, pixel_size: u32) ?*Font {
     const bytes = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, alloc, .unlimited) catch return null;
     defer alloc.free(bytes);
-    const f = hbft.zonvie_ft_hb_font_create(bytes.ptr, bytes.len, pixel_size, @intCast(@max(0, index)));
+    const f = hbft.zonvie_ft_hb_font_create(bytes.ptr, bytes.len, pixel_size, font_spec.ftFaceIndex(index));
     if (f == null) {
         applog.appLog("[font] failed to load {s}\n", .{path});
         return null;

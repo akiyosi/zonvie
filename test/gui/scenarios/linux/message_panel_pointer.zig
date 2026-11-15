@@ -60,6 +60,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const b = g.mainWindowBounds() orelse return error.MainWindowNotFound;
 
     try g.exec("execute('call setline(1, range(1, 300))')");
+    // Off where the message opens: one opening under a resting pointer is
+    // hovered at once (message_hover_resting.zig), and the step below wants
+    // the hover from the move onto it.
+    ptr.moveTo(b.x + b.w / 2, b.y + b.h / 2);
+    gui_io.sleepNs(200 * std.time.ns_per_ms);
     // A plain message: its 4 s auto-hide is held while the pointer stays on
     // it, which the steps below rely on.
     var mark = try app_log.lineMark(alloc, log_path);

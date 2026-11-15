@@ -157,3 +157,33 @@ test "each panel's popup hangs from the surface that panel is placed on" {
     try std.testing.expectEqual(@as(i64, 1007), hostSurface(.msg_history, 1005, 1007));
     try std.testing.expectEqual(@as(i64, 1), hostSurface(.popupmenu, 1, 1));
 }
+
+/// Whether panel `kind`'s popup stays shown while the app is inactive. The
+/// cmdline does, so that a file dragged from another app (which activates
+/// that app) can be dropped on it, as macOS (hidesOnDeactivate = false) and
+/// Windows keep it; the other panels are taken off until the app is active.
+pub fn shownWhileInactive(kind: Kind) bool {
+    return kind == .cmdline;
+}
+
+test "only the cmdline popup stays shown while the app is inactive" {
+    try std.testing.expect(shownWhileInactive(.cmdline));
+    try std.testing.expect(!shownWhileInactive(.popupmenu));
+    try std.testing.expect(!shownWhileInactive(.msg_show));
+    try std.testing.expect(!shownWhileInactive(.msg_history));
+}
+
+/// Whether a file drop on panel `panel`'s popup (null: an editor view)
+/// inserts its paths whatever the mode (frontend_rules.dropInsertsPath's
+/// `force`): on the cmdline, as Windows registers its cmdline window's drop
+/// target; the other panels take a drop as the editor does.
+pub fn dropForcesInsert(panel: ?Kind) bool {
+    return if (panel) |k| k == .cmdline else false;
+}
+
+test "a drop on the cmdline popup always inserts, elsewhere it follows the mode" {
+    try std.testing.expect(dropForcesInsert(.cmdline));
+    try std.testing.expect(!dropForcesInsert(.popupmenu));
+    try std.testing.expect(!dropForcesInsert(.msg_show));
+    try std.testing.expect(!dropForcesInsert(null));
+}

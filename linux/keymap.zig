@@ -64,19 +64,46 @@ pub fn mouseModString(gdk_state: u32, buf: *[5]u8) [:0]const u8 {
     return core.frontend_rules.mouseModifierString(buf, coreMods(gdk_state));
 }
 
-/// Ctrl+Shift+N, the frontend's New Session (macOS's Cmd+N; Super is the
-/// compositor's on Linux). Neovim never sees it.
-pub fn isNewSession(keyval: u32, gdk_state: u32) bool {
+/// The frontend's own shortcuts, on Ctrl+Shift (macOS's Cmd: Super is the
+/// compositor's on Linux, and Ctrl alone is Neovim's). Neovim never sees
+/// them. The tab ones only with [tabline] style = "menu", as macOS binds
+/// Cmd+T, Cmd+W and Cmd+1..9 to its Tabs menu.
+pub const AppShortcut = union(enum) {
+    new_session,
+    quit,
+    new_tab,
+    close_tab,
+    /// The tab's 1-based number.
+    select_tab: u8,
+};
+
+/// The shortcut `base_keyval` (the key's keyval with no modifier held:
+/// '1', not '!') with `gdk_state` names; null for a key Neovim gets.
+pub fn appShortcut(base_keyval: u32, gdk_state: u32, menu_style: bool) ?AppShortcut {
     const mods = gdk_state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
-    return mods == GDK_SHIFT_MASK | GDK_CONTROL_MASK and (keyval == 'N' or keyval == 'n');
+    if (mods != GDK_SHIFT_MASK | GDK_CONTROL_MASK) return null;
+    const k = if (base_keyval >= 'A' and base_keyval <= 'Z') base_keyval + 32 else base_keyval;
+    return switch (k) {
+        'n' => .new_session,
+        'q' => .quit,
+        't' => if (menu_style) .new_tab else null,
+        'w' => if (menu_style) .close_tab else null,
+        '1'...'9' => if (menu_style) .{ .select_tab = @intCast(k - '0') } else null,
+        else => null,
+    };
 }
 
-test "only Ctrl+Shift+N is New Session" {
-    try testing.expect(isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK));
-    try testing.expect(isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK | 0x10)); // NumLock (Mod2)
-    try testing.expect(!isNewSession('n', GDK_CONTROL_MASK));
-    try testing.expect(!isNewSession('N', GDK_SHIFT_MASK));
-    try testing.expect(!isNewSession('N', GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_ALT_MASK));
+test "Ctrl+Shift shortcuts; the tab ones only with the menu style" {
+    const cs = GDK_CONTROL_MASK | GDK_SHIFT_MASK;
+    try testing.expectEqual(AppShortcut.new_session, appShortcut('N', cs, false).?);
+    try testing.expectEqual(AppShortcut.new_session, appShortcut('n', cs | 0x10, false).?); // NumLock (Mod2)
+    try testing.expectEqual(AppShortcut.quit, appShortcut('q', cs, false).?);
+    try testing.expect(appShortcut('t', cs, false) == null);
+    try testing.expectEqual(AppShortcut.new_tab, appShortcut('t', cs, true).?);
+    try testing.expectEqual(AppShortcut{ .select_tab = 3 }, appShortcut('3', cs, true).?);
+    try testing.expect(appShortcut('n', GDK_CONTROL_MASK, false) == null);
+    try testing.expect(appShortcut('N', GDK_SHIFT_MASK, false) == null);
+    try testing.expect(appShortcut('N', cs | GDK_ALT_MASK, false) == null);
 }
 
 /// While a preedit is active the IME owns every key, including Return.

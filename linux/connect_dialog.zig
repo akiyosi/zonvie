@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const gtk = @import("gtk_bindings.zig");
+const cli = @import("cli.zig");
 
 pub const Mode = enum(c_int) { local = 0, ssh = 1, devcontainer = 2 };
 
@@ -121,26 +122,6 @@ fn onBrowseDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) cal
     const path = gtk.g_file_get_path(f) orelse return;
     defer gtk.g_free(path);
     gtk.gtk_editable_set_text(ui.workspace, path);
-}
-
-/// The dialog's Neovim path as the spawn command can carry it (the --nvim
-/// rule of macOS and the Windows dialog): one pair of matching quotes around
-/// the whole path is dropped; a path still holding a quote is ignored
-/// (empty, so the default applies) and `ignored` is set.
-pub fn nvimPath(raw: []const u8) struct { path: []const u8, ignored: bool } {
-    var p = raw;
-    if (p.len >= 2 and (p[0] == '"' or p[0] == '\'') and p[p.len - 1] == p[0]) p = p[1 .. p.len - 1];
-    if (std.mem.indexOfAny(u8, p, "'\"") != null) return .{ .path = "", .ignored = true };
-    return .{ .path = p, .ignored = false };
-}
-
-test "the dialog's nvim path drops one pair of quotes and refuses the rest" {
-    try std.testing.expectEqualStrings("/opt/my nvim", nvimPath("\"/opt/my nvim\"").path);
-    try std.testing.expectEqualStrings("/a", nvimPath("'/a'").path);
-    try std.testing.expectEqualStrings("/a", nvimPath("/a").path);
-    try std.testing.expect(nvimPath("/a\"b").ignored);
-    try std.testing.expect(nvimPath("\"/a'").ignored);
-    try std.testing.expect(!nvimPath("").ignored);
 }
 
 /// Shows an alert and waits for it to be dismissed, on a loop of its own:
@@ -273,7 +254,7 @@ pub fn run(alloc: std.mem.Allocator, seed: Choice) !?Choice {
 
     var out: Choice = .{ .mode = @enumFromInt(gtk.gtk_notebook_get_current_page(ui.notebook)) };
     out.name = try text(alloc, ui.name);
-    const nvim = nvimPath(try text(alloc, ui.nvim));
+    const nvim = cli.nvimPath(try text(alloc, ui.nvim));
     if (nvim.ignored) alert(win, "The Neovim path contains a quote character and was ignored.", "The default Neovim is used.");
     out.nvim_path = nvim.path;
     out.ssh_host = try text(alloc, ui.host);

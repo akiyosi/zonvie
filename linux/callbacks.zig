@@ -336,6 +336,11 @@ fn onCmdlineShow(
     lock(app);
     app.cmdline_firstc = firstc;
     unlock(app);
+    queuePanelColors(app);
+}
+
+/// Any thread; at most one idle is outstanding.
+fn queuePanelColors(app: *App) void {
     if (!app.panel_colors_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idlePanelColors, app);
 }
 
@@ -521,6 +526,10 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             });
             committed = true;
             app.flush_outcome.store(.committed, .release);
+            if (app.panel_colors_stale) {
+                app.panel_colors_stale = false;
+                queuePanelColors(app);
+            }
         } else |_| {
             app.surface.cancel();
             core.zonvie_core_abort_flush(cp);
@@ -556,6 +565,7 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     ui_widgets.placeMessages(app);
     panel_popup.update(app);
     ui_widgets.placeCopyButtons(app);
+    input.refreshPanelHover(app);
     if (nvim_drawn) {
         ui_widgets.hideProgress(app);
         session.onReady(app);
@@ -674,6 +684,9 @@ fn slotFonts(app: *App, font_id: u32) ?*Fonts {
 
 fn releaseSlot(app: *App, font_id: u32) void {
     const f = slotFonts(app, font_id) orelse return;
+    lock(app);
+    app.slot_preedit[font_id] = .{};
+    unlock(app);
     f.deinit(app.alloc);
     app.alloc.destroy(f);
     app.slot_fonts[font_id] = null;
@@ -705,6 +718,9 @@ fn onFontSlotLoad(ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize,
         if (!fonts.load(app.alloc, cand.family, pixelSize(app, cand.point_size), cand.features, base)) continue;
         releaseSlot(app, font_id);
         app.slot_fonts[font_id] = fonts;
+        lock(app);
+        app.slot_preedit[font_id] = ui_widgets.PreeditFont.of(fonts.family[0..fonts.family_len], fonts.pixel_size, app.scale);
+        unlock(app);
         out_cell_w_px.* = fonts.cell_w_px;
         out_cell_h_px.* = rowHeightPx(fonts.cell_h_px, app.linespace_px);
         applog.appLog("[font_slot] load id={d} {s} {d}pt cell={d}x{d}\n", .{ font_id, cand.family, cand.point_size, out_cell_w_px.*, out_cell_h_px.* });
@@ -835,9 +851,11 @@ fn rowHeightPx(cell_h_px: u32, linespace_px: i32) u32 {
 
 /// The scale the surfaces now draw at changed: the global faces are loaded
 /// again at its pixel size and the core re-rasterizes and re-lays out, as
-/// for a guifont change. Per-grid fonts keep the pixel size they were loaded
-/// at until their window's font is set again (as on Windows: the core holds
-/// their cells). GTK main thread, not holding App.mu; blocks on grid_mu.
+/// for a guifont change. Per-grid fonts follow: the new global cell makes
+/// the core re-query every font window and load its slot again
+/// (noteGlobalCellChangeLocked), which onFontSlotLoad does at the new
+/// scale's pixel size. GTK main thread, not holding App.mu; blocks on
+/// grid_mu.
 pub fn applyScale(app: *App, scale: f32) void {
     lock(app);
     const changed = app.scale != scale;
@@ -959,6 +977,10 @@ fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void {
     lock(app);
     app.default_fg = fg;
     app.default_bg = bg;
+    // Search / Comment are read after the flush that ends this batch, when
+    // its hl_attr_define / hl_group_set are in as well (as Windows refreshes
+    // its cmdline colours on a colourscheme commit).
+    app.panel_colors_stale = true;
     unlock(app);
     // The widget stylesheet follows Normal.
     ui_widgets.queueRefresh(app);
@@ -994,6 +1016,12 @@ fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
 }
 
 fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    lock(app);
+    const code = app.exit_code orelse 0;
+    unlock(app);
+    // A remote start that ended before its first frame: an alert, then quit.
+    if (session.failEarlyExit(app, code)) return 0;
     // Neovim quitting (`:qa`) closes the window without a close-request,
     // so its frame is remembered here, while the window still exists.
     window_size.save(appFrom(data));
@@ -1041,13 +1069,40 @@ fn onQuitDialogDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque)
 /// windows open and close in the core's order through one queue, so there
 /// is nothing to reset; the address is logged.
 fn onRestart(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
     applog.appLog("[linux] on_restart: reconnecting to listen_addr={s}\n", .{addr[0..addr_len]});
+    onSessionSwap(appFrom(ctx));
 }
 
 fn onConnect(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
     applog.appLog("[linux] on_connect: hot-swap to server_addr={s}\n", .{addr[0..addr_len]});
+    onSessionSwap(appFrom(ctx));
+}
+
+/// `:restart` / `:connect`: another nvim takes over this window (the core
+/// swaps sessions without tearing the UI down). Core thread.
+/// Reset here: what names the old server's state.
+/// - cursor_grid_focus: grid ids restart with the server, and the core
+///   forgets its last cursor grid (windows/callbacks.zig onSessionSwap).
+/// - session_generation, nvim_ready (GTK thread, in the idle).
+/// Kept: the ext_ops queue (ordered; the core's closes for the old
+/// session's windows still have to reach them), the panel popups (redrawn
+/// from the next flush's state).
+fn onSessionSwap(app: *App) void {
+    lock(app);
+    app.cursor_grid_focus = 1;
+    unlock(app);
+    _ = gtk.g_idle_add(&idleSessionSwap, app);
+}
+
+fn idleSessionSwap(data: ?*anyopaque) callconv(.c) c_int {
+    const app = appFrom(data);
+    app.session_generation +%= 1;
+    // Files handed over now wait for the new server's first frame (its
+    // flushes only start once it is attached), as at startup. The window is
+    // already shown, so that frame must not present it again.
+    app.nvim_ready = false;
+    app.show_when_ready = false;
+    return 0;
 }
 
 fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
@@ -1055,7 +1110,7 @@ fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
-    ime_off.off(appFrom(data).pointer.im_context);
+    ime_off.off(blink.focusedImContext(appFrom(data)));
     return 0;
 }
 
@@ -1099,6 +1154,8 @@ fn idleResizeToGrid(data: ?*anyopaque) callconv(.c) c_int {
 
 fn onLog(ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
     const s = p[0..n];
+    // Before the first frame of a remote start: kept for an early exit.
+    appFrom(ctx).start_output.append(core.clock.io(), s);
     // The core's render traces carry no flush id: stamp this side's, which
     // counts the same flushes (windows/callbacks.zig onLog).
     const tag = "[render_trace] ";
@@ -1121,6 +1178,7 @@ fn onCallbackError(ctx: ?*anyopaque, code: u32, component: [*]const u8, componen
 const ClipboardTask = struct {
     app: *App,
     seq: u64,
+    selection: Selection,
     /// Owned NUL-terminated text for a set; empty for a get.
     buf: []u8,
 };
@@ -1188,18 +1246,36 @@ fn freeTask(task: *ClipboardTask) void {
     alloc.destroy(task);
 }
 
-fn defaultClipboard() ?*anyopaque {
+/// The X11 / Wayland selection a register is: `*` the PRIMARY selection
+/// (what a mouse selection sets and a middle click pastes), `+` (and any
+/// other) the CLIPBOARD, as Neovim's own Linux providers (xclip, xsel,
+/// wl-copy) map them.
+const Selection = enum { clipboard, primary };
+
+fn selectionFor(register_name: [*:0]const u8) Selection {
+    return if (register_name[0] == '*') .primary else .clipboard;
+}
+
+test "the star register is the primary selection, plus the clipboard" {
+    try std.testing.expectEqual(Selection.primary, selectionFor("*"));
+    try std.testing.expectEqual(Selection.clipboard, selectionFor("+"));
+    try std.testing.expectEqual(Selection.clipboard, selectionFor(""));
+}
+
+fn displayClipboard(selection: Selection) ?*anyopaque {
     const display = gtk.gdk_display_get_default() orelse return null;
-    return gtk.gdk_display_get_clipboard(display);
+    return switch (selection) {
+        .clipboard => gtk.gdk_display_get_clipboard(display),
+        .primary => gtk.gdk_display_get_primary_clipboard(display),
+    };
 }
 
 fn onClipboardGet(ctx: ?*anyopaque, register: [*]const u8, out_buf: [*]u8, out_len: *usize, max_len: usize) callconv(.c) c_int {
-    _ = register;
     const app = appFrom(ctx);
     out_len.* = 0;
     const seq = beginClipboardOp(app);
     const task = app.alloc.create(ClipboardTask) catch return 0;
-    task.* = .{ .app = app, .seq = seq, .buf = &.{} };
+    task.* = .{ .app = app, .seq = seq, .selection = selectionFor(@ptrCast(register)), .buf = &.{} };
     _ = gtk.g_idle_add(&idleClipboardGet, task);
 
     app.clipboard_mu.lockUncancelable(clock.io());
@@ -1222,7 +1298,7 @@ fn idleClipboardGet(data: ?*anyopaque) callconv(.c) c_int {
         freeTask(task);
         return 0;
     }
-    const clipboard = defaultClipboard() orelse {
+    const clipboard = displayClipboard(task.selection) orelse {
         signalClipboardDone(task.app, task.seq, 0, "");
         freeTask(task);
         return 0;
@@ -1243,7 +1319,6 @@ fn onClipboardReadFinish(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyop
 }
 
 fn onClipboardSet(ctx: ?*anyopaque, register: [*]const u8, data: [*]const u8, len: usize) callconv(.c) c_int {
-    _ = register;
     const app = appFrom(ctx);
     // An empty register empties the clipboard (it is set to ""), as on
     // macOS and Windows. The idle owns its copy, so a later set cannot
@@ -1255,7 +1330,7 @@ fn onClipboardSet(ctx: ?*anyopaque, register: [*]const u8, data: [*]const u8, le
         app.alloc.free(buf);
         return 0;
     };
-    task.* = .{ .app = app, .seq = beginClipboardOp(app), .buf = buf };
+    task.* = .{ .app = app, .seq = beginClipboardOp(app), .selection = selectionFor(@ptrCast(register)), .buf = buf };
     _ = gtk.g_idle_add(&idleClipboardSet, task);
 
     app.clipboard_mu.lockUncancelable(clock.io());
@@ -1277,7 +1352,7 @@ fn idleClipboardSet(data: ?*anyopaque) callconv(.c) c_int {
         defer app.clipboard_mu.unlock(clock.io());
         if (app.clipboard_seq != task.seq) return 0;
     }
-    const clipboard = defaultClipboard() orelse {
+    const clipboard = displayClipboard(task.selection) orelse {
         signalClipboardDone(app, task.seq, 0, "");
         return 0;
     };

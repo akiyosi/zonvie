@@ -240,15 +240,83 @@ pub fn sshCommand(alloc: std.mem.Allocator, s: Ssh, remote_nvim: []const u8) ![:
     try out.appendSlice(alloc, " -o StrictHostKeyChecking=accept-new ");
     try out.appendSlice(alloc, s.host);
     // '$SHELL --login -c "\"nvim\" --embed"': the core keeps the single-
-    // quoted span as one argument, and the remote shell reads \" as a quote
-    // protecting a path with spaces. Backslashes in the path are doubled.
-    try out.appendSlice(alloc, " '$SHELL --login -c \"\\\"");
+    // quoted span as one argument (its tokenizer steps over \' without
+    // ending it); the remote shell unquotes the outer "..." once and the
+    // login shell the inner "<path>" again, so every path byte survives both.
+    try out.appendSlice(alloc, " '$SHELL --login -c \"");
+    try appendRemoteOuter(alloc, &out, "\"");
     for (remote_nvim) |ch| {
-        if (ch == '\\') try out.append(alloc, '\\');
+        // Inner level: inside "...", these four bytes are special.
+        if (isDqSpecial(ch)) try appendRemoteOuter(alloc, &out, "\\");
+        try appendRemoteOuter(alloc, &out, &.{ch});
+    }
+    try appendRemoteOuter(alloc, &out, "\" --embed");
+    try out.appendSlice(alloc, "\"'");
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+fn isDqSpecial(ch: u8) bool {
+    return ch == '\\' or ch == '"' or ch == '$' or ch == '`';
+}
+
+/// `bytes` as the remote shell reads them inside the outer "...": the four
+/// special bytes backslash-escaped, and `'` (which would end the core's
+/// single-quoted span) as `"\'"`, a quote escaped outside the double quotes.
+fn appendRemoteOuter(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    for (bytes) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(alloc, "\"\\'\"");
+            continue;
+        }
+        if (isDqSpecial(ch)) try out.append(alloc, '\\');
         try out.append(alloc, ch);
     }
-    try out.appendSlice(alloc, "\\\" --embed\"'");
-    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// Appends `arg` to a spawn command for the core's tokenizer, quoted as
+/// `spawnArgQuote` says. error.Unquotable when no quote can carry it (empty,
+/// or a space with both quote kinds or a trailing backslash): the tokenizer
+/// would hand nvim a different argument.
+pub fn appendSpawnArg(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    const q = core.frontend_rules.spawnArgQuote(arg) orelse return error.Unquotable;
+    if (list.items.len != 0) try list.append(alloc, ' ');
+    if (q != 0) try list.append(alloc, q);
+    try list.appendSlice(alloc, arg);
+    if (q != 0) try list.append(alloc, q);
+}
+
+test "spawn arguments are quoted for the core, or refused" {
+    const a = std.testing.allocator;
+    var l: std.ArrayListUnmanaged(u8) = .empty;
+    defer l.deinit(a);
+    try appendSpawnArg(&l, a, "/opt/my nvim/bin/nvim");
+    try appendSpawnArg(&l, a, "it's.txt");
+    try appendSpawnArg(&l, a, "a \"b\"");
+    try std.testing.expectEqualStrings("\"/opt/my nvim/bin/nvim\" it's.txt 'a \"b\"'", l.items);
+    try std.testing.expectError(error.Unquotable, appendSpawnArg(&l, a, "it's \"x\""));
+    try std.testing.expectError(error.Unquotable, appendSpawnArg(&l, a, ""));
+}
+
+/// The Neovim path as the spawn command can carry it, for --nvim,
+/// `[neovim] path` and the dialog alike (macOS's --nvim rule, Windows'
+/// nvimPathArg): one pair of matching quotes around the whole path is
+/// dropped; a path still holding a quote is refused (`ignored`, empty path)
+/// so the caller falls back to the default and says so.
+pub fn nvimPath(raw: []const u8) struct { path: []const u8, ignored: bool } {
+    var p = raw;
+    if (p.len >= 2 and (p[0] == '"' or p[0] == '\'') and p[p.len - 1] == p[0]) p = p[1 .. p.len - 1];
+    if (std.mem.indexOfAny(u8, p, "'\"") != null) return .{ .path = "", .ignored = true };
+    return .{ .path = p, .ignored = false };
+}
+
+test "the nvim path drops one pair of quotes and refuses the rest" {
+    try std.testing.expectEqualStrings("/opt/my nvim", nvimPath("\"/opt/my nvim\"").path);
+    try std.testing.expectEqualStrings("/a", nvimPath("'/a'").path);
+    try std.testing.expectEqualStrings("/a", nvimPath("/a").path);
+    try std.testing.expect(nvimPath("/a\"b").ignored);
+    try std.testing.expect(nvimPath("\"/a'").ignored);
+    try std.testing.expect(nvimPath("\"\"/a\"\"").ignored);
+    try std.testing.expect(!nvimPath("").ignored);
 }
 
 /// Points ssh's SSH_ASKPASS at this executable in askpass mode (askpass.zig),
@@ -326,9 +394,30 @@ pub fn setAskpassEnv(env_mode: [:0]const u8) void {
     const n = std.c.readlink("/proc/self/exe", &buf, buf.len - 1);
     if (n <= 0) return;
     buf[@intCast(n)] = 0;
-    _ = setenv("SSH_ASKPASS", &buf, 1);
-    _ = setenv("SSH_ASKPASS_REQUIRE", "force", 1);
+    _ = setenv(askpass_env[0], &buf, 1);
+    _ = setenv(askpass_env[1], "force", 1);
     _ = setenv(env_mode, "1", 1);
+}
+
+/// The ssh variables setAskpassEnv sets besides its mode marker.
+const askpass_env = [_][:0]const u8{ "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE" };
+
+/// The variables a New Session's process must not inherit. With the askpass
+/// mode marker set (`askpass_marked`), this process ran setAskpassEnv, so
+/// the ssh variables point at zonvie and go with the marker; without it they
+/// are the user's own and stay.
+pub fn newSessionUnsetEnv(askpass_marked: bool) []const [:0]const u8 {
+    const all = comptime askpass_env ++ [_][:0]const u8{@import("askpass.zig").env_mode};
+    return if (askpass_marked) &all else &.{};
+}
+
+test "a new session drops zonvie's askpass environment, not the user's" {
+    const marked = newSessionUnsetEnv(true);
+    try std.testing.expectEqual(@as(usize, 3), marked.len);
+    try std.testing.expectEqualStrings("SSH_ASKPASS", marked[0]);
+    try std.testing.expectEqualStrings("SSH_ASKPASS_REQUIRE", marked[1]);
+    try std.testing.expectEqualStrings("ZONVIE_ASKPASS_MODE", marked[2]);
+    try std.testing.expectEqual(@as(usize, 0), newSessionUnsetEnv(false).len);
 }
 
 /// `~/...` against $HOME.
@@ -404,7 +493,12 @@ test "the ssh command quotes the remote nvim for the login shell" {
     try std.testing.expectEqualStrings("ssh-askpass ssh -o StrictHostKeyChecking=accept-new me@box '$SHELL --login -c \"\\\"nvim\\\" --embed\"'", plain);
     const keyed = try sshCommand(a, .{ .host = "box", .port = 2222, .identity = "/k/my key" }, "/opt/n\\vim");
     defer a.free(keyed);
-    try std.testing.expectEqualStrings("ssh-askpass ssh -p 2222 -i \"/k/my key\" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=accept-new box '$SHELL --login -c \"\\\"/opt/n\\\\vim\\\" --embed\"'", keyed);
+    try std.testing.expectEqualStrings("ssh-askpass ssh -p 2222 -i \"/k/my key\" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=accept-new box '$SHELL --login -c \"\\\"/opt/n\\\\\\\\vim\\\" --embed\"'", keyed);
+    // Spaces, both quotes, `$` and a trailing backslash: the outer level
+    // reads `"/a b/it's/\"q\"/\$x/\\" --embed` back, the inner the path.
+    const odd = try sshCommand(a, .{ .host = "box" }, "/a b/it's/\"q\"/$x/\\");
+    defer a.free(odd);
+    try std.testing.expectEqualStrings("ssh-askpass ssh -o StrictHostKeyChecking=accept-new box '$SHELL --login -c \"\\\"/a b/it\"\\'\"s/\\\\\\\"q\\\\\\\"/\\\\\\$x/\\\\\\\\\\\" --embed\"'", odd);
 }
 
 test "the desktop entry runs this executable with the chosen files" {

@@ -40,6 +40,14 @@ pub const State = struct {
     snap_queued: std.atomic.Value(bool) = .init(false),
     /// The position restorePosition still has to apply, X11 root px.
     restore_pos: ?[2]i32 = null,
+    /// What the window adds around the view (titlebar, tabs, sidebar, card),
+    /// device px, measured when a resize arrived: the one moment the view
+    /// and the window's size describe the same layout. Null before the first.
+    chrome_px: ?[2]i32 = null,
+    /// The window's size at the last resize, device px: a view resize with
+    /// the window's size unchanged is the chrome's (a sidebar slide), not
+    /// the user's, and is not snapped.
+    outer_px: [2]i32 = .{ 0, 0 },
 };
 
 /// The editor view's new size, device px. Records a size not of a snap's
@@ -47,11 +55,27 @@ pub const State = struct {
 pub fn noteResize(app: *App, w_px: u32, h_px: u32) void {
     const s = &app.window_size;
     s.pending_until_ns = 0;
+    const win = app.window orelse return;
+    app.mu.lockUncancelable(clock.io());
+    const scale = app.scale;
+    app.mu.unlock(clock.io());
+    const outer = defaultSizePx(win, scale);
+    s.chrome_px = chromePx(outer, .{ w_px, h_px });
+    const user_resize = !std.mem.eql(i32, &outer, &s.outer_px);
+    s.outer_px = outer;
     if (w_px == s.snapped_w_px and h_px == s.snapped_h_px) return;
     s.desired_w_px = w_px;
     s.desired_h_px = h_px;
+    // The chrome took or gave back room: the window keeps its size, and the
+    // view is what the user's window now holds.
+    if (!user_resize) return;
     if (s.settle_timer != 0) _ = gtk.g_source_remove(s.settle_timer);
     s.settle_timer = gtk.g_timeout_add(settle_ms, &onSettled, app);
+}
+
+/// What a window of `outer_px` adds around a view of `view_px`, device px.
+pub fn chromePx(outer_px: [2]i32, view_px: [2]u32) [2]i32 {
+    return .{ outer_px[0] - @as(i32, @intCast(view_px[0])), outer_px[1] - @as(i32, @intCast(view_px[1])) };
 }
 
 fn onSettled(data: ?*anyopaque) callconv(.c) c_int {
@@ -150,18 +174,25 @@ fn setOuterPx(win: *anyopaque, w_px: i32, h_px: i32, scale: f32) void {
     gtk.gtk_window_set_default_size(win, w, h);
 }
 
-/// The window's outer size, device px, for a view of `rows` x `cols` cells:
-/// the chrome around the view keeps its size.
-pub fn outerForGrid(outer_px: [2]i32, view_px: [2]u32, rows: u32, cols: u32, cell_w_px: u32, cell_h_px: u32) [2]i32 {
+/// The window's size, device px, for a view of `rows` x `cols` cells and a
+/// `strip_px` wide scrollbar column, with `chrome_px` around the view.
+pub fn outerForGrid(chrome_px: [2]i32, strip_px: u32, rows: u32, cols: u32, cell_w_px: u32, cell_h_px: u32) [2]i32 {
     return .{
-        outer_px[0] - @as(i32, @intCast(view_px[0])) + @as(i32, @intCast(cols * cell_w_px)),
-        outer_px[1] - @as(i32, @intCast(view_px[1])) + @as(i32, @intCast(rows * cell_h_px)),
+        chrome_px[0] + @as(i32, @intCast(cols * cell_w_px + strip_px)),
+        chrome_px[1] + @as(i32, @intCast(rows * cell_h_px)),
     };
 }
 
 test "a grid size keeps the chrome around the view" {
-    const o = outerForGrid(.{ 1040, 760 }, .{ 1000, 700 }, 30, 100, 9, 20);
-    try std.testing.expectEqual([2]i32{ 940, 660 }, o);
+    try std.testing.expectEqual([2]i32{ 940, 660 }, outerForGrid(chromePx(.{ 1040, 760 }, .{ 1000, 700 }), 0, 30, 100, 9, 20));
+}
+
+test "two grid sizes in a row give the second size, not twice the change" {
+    // :set lines=24 columns=80 sends two sizes before any resize arrives:
+    // the chrome measured at the last resize serves both.
+    const chrome = chromePx(.{ 1040, 760 }, .{ 1000, 700 });
+    _ = outerForGrid(chrome, 0, 24, 100, 9, 20);
+    try std.testing.expectEqual([2]i32{ 40 + 80 * 9, 60 + 24 * 20 }, outerForGrid(chrome, 0, 24, 80, 9, 20));
 }
 
 /// Neovim resized its grid (`:set lines` / `:set columns`): the window
@@ -176,12 +207,15 @@ pub fn resizeToGrid(app: *App, rows: u32, cols: u32) void {
     const scale = app.scale;
     app.mu.unlock(clock.io());
     if (rows == 0 or cols == 0 or cw == 0 or ch == 0 or vw == 0 or vh == 0) return;
-    const outer = defaultSizePx(win, scale);
+    // The chrome of the last resize, not this moment's window and view: a
+    // size asked a moment ago has changed the window but not yet the view.
+    const chrome = app.window_size.chrome_px orelse chromePx(defaultSizePx(win, scale), .{ vw, vh });
     const strip = vw - scrollbar.gridWidthPx(app.scrollbar_cfg, vw, scale);
-    const o = outerForGrid(outer, .{ vw - strip, vh }, rows, cols, cw, ch);
+    const o = outerForGrid(chrome, strip, rows, cols, cw, ch);
     // The asked size is what a later snap starts from.
     app.window_size.desired_w_px = cols * cw + strip;
     app.window_size.desired_h_px = rows * ch;
+    applog.appLog("[window_size] grid {d}x{d} -> window {d}x{d} px (chrome {d}x{d})\n", .{ rows, cols, o[0], o[1], chrome[0], chrome[1] });
     setOuterPx(win, o[0], o[1], scale);
 }
 

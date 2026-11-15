@@ -227,7 +227,7 @@ pub const Inputs = struct {
     cell_h_px: i32,
     /// Integer surface scale for the chrome constants.
     scale: i32,
-    /// What msg_show and msg_history hang from (msgTarget); the whole view
+    /// What msg_show and msg_history hang from (msgTargetOn); the whole view
     /// when null.
     msg_target: ?rules.Rect = null,
     /// The surfaces the popupmenu and the message panels draw on
@@ -287,17 +287,10 @@ pub fn copyButtonRect(kind: Kind, r: Rect, in: Inputs) ?Rect {
     };
 }
 
-/// The rect msg_pos `mode` places message boxes against, in main-view px:
-/// the cells of the window the cursor is in (.grid) when that window is on
-/// the main surface, else the whole view. Wayland lets no box sit outside
-/// the window, so .display is the view too, and the boxes of an external
-/// window's grid are drawn here as well.
-pub fn msgTarget(mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, main_w_px: i32, main_h_px: i32, cell_w_px: i32, cell_h_px: i32) rules.Rect {
-    return msgTargetOn(1, mode, anchor, main_w_px, main_h_px, cell_w_px, cell_h_px);
-}
-
-/// msgTarget on surface `surface_id`, `w_px` x `h_px`: the anchor's cells
-/// when they are on that surface, else the whole of it.
+/// The rect msg_pos `mode` places message boxes against on surface
+/// `surface_id`, `main_w_px` x `main_h_px`: the anchor's cells (.grid) when
+/// they are on that surface, else the whole of it. Wayland lets no box sit
+/// outside the window, so .display is the main view.
 pub fn msgTargetOn(surface_id: i64, mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, main_w_px: i32, main_h_px: i32, cell_w_px: i32, cell_h_px: i32) rules.Rect {
     const view: rules.Rect = .{ .left = 0, .top = 0, .right = main_w_px, .bottom = main_h_px };
     if (mode != .grid) return view;
@@ -329,6 +322,20 @@ pub fn msgSurface(mode: core.config.MsgPosition, anchor: ?core.MsgAnchor, ctx: a
 /// when that is open (a completion in that window), else the main view.
 pub fn popupSurface(pum: Surface, ctx: anytype, comptime isOpen: fn (@TypeOf(ctx), i64) bool) i64 {
     return if (pum.win > 1 and isOpen(ctx, pum.win)) pum.win else 1;
+}
+
+/// Whether panel `kind` draws the editor cursor it holds: not the cmdline
+/// while an IME composition is under way, whose preedit stands at the
+/// cursor, as Windows hides it.
+pub fn panelCursorShown(kind: Kind, composing: bool) bool {
+    return !(kind == .cmdline and composing);
+}
+
+test "the cmdline hides its cursor during a composition, other panels do not" {
+    try testing.expect(!panelCursorShown(.cmdline, true));
+    try testing.expect(panelCursorShown(.cmdline, false));
+    try testing.expect(panelCursorShown(.popupmenu, true));
+    try testing.expect(panelCursorShown(.msg_show, true));
 }
 
 /// The confirm dialog's top in a view `view_h` high, for a box `box_h` high
@@ -506,12 +513,12 @@ test "msg_show stacks below msg_history at the top-right" {
 
 test "msg_pos grid hangs messages from the cursor's window, the rest from the view" {
     const a: core.MsgAnchor = .{ .cursor_surface = 1, .anchor_surface = 1, .anchor_grid = 4, .start_row = 0, .start_col = 40, .rows = 28, .cols = 40 };
-    const grid = msgTarget(.grid, a, 800, 600, 10, 20);
+    const grid = msgTargetOn(1, .grid, a, 800, 600, 10, 20);
     try testing.expectEqual(rules.Rect{ .left = 400, .top = 0, .right = 800, .bottom = 560 }, grid);
-    try testing.expectEqual(rules.Rect{ .left = 0, .top = 0, .right = 800, .bottom = 600 }, msgTarget(.window, a, 800, 600, 10, 20));
+    try testing.expectEqual(rules.Rect{ .left = 0, .top = 0, .right = 800, .bottom = 600 }, msgTargetOn(1, .window, a, 800, 600, 10, 20));
     var ext = a;
     ext.anchor_surface = 7;
-    try testing.expectEqual(@as(i32, 0), msgTarget(.grid, ext, 800, 600, 10, 20).left);
+    try testing.expectEqual(@as(i32, 0), msgTargetOn(1, .grid, ext, 800, 600, 10, 20).left);
 
     var s: [4]Surface = @splat(.{});
     s[@intFromEnum(Kind.msg_show)] = open(1, 20, -2, -2);

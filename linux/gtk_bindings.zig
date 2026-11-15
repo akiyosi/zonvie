@@ -115,6 +115,7 @@ pub extern "c" fn g_application_quit(application: *anyopaque) void;
 pub const GAsyncReadyCallback = *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) void;
 pub extern "c" fn gdk_display_get_default() ?*anyopaque;
 pub extern "c" fn gdk_display_get_clipboard(display: *anyopaque) ?*anyopaque;
+pub extern "c" fn gdk_display_get_primary_clipboard(display: *anyopaque) ?*anyopaque;
 pub extern "c" fn gtk_widget_get_clipboard(widget: *anyopaque) ?*anyopaque;
 pub extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellable: ?*anyopaque, callback: GAsyncReadyCallback, user_data: ?*anyopaque) void;
 pub extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]u8;
@@ -242,6 +243,8 @@ pub extern "c" fn gtk_widget_get_preferred_size(widget: *anyopaque, minimum: ?*G
 pub const PANGO_SCALE: c_int = 1024;
 pub const PANGO_ELLIPSIZE_END: c_int = 3;
 pub const PANGO_UNDERLINE_SINGLE: c_int = 1;
+pub const PANGO_UNDERLINE_DOUBLE: c_int = 2;
+pub const PANGO_UNDERLINE_DOUBLE_LINE: c_int = 6;
 /// The common head of every PangoAttribute; the indices are UTF-8 bytes.
 pub const PangoAttribute = extern struct { klass: ?*const anyopaque, start_index: u32, end_index: u32 };
 pub extern "c" fn pango_attr_list_insert(list: *anyopaque, attr: *PangoAttribute) void;
@@ -276,7 +279,11 @@ pub extern "c" fn pango_attr_list_insert_before(list: *anyopaque, attr: *anyopaq
 pub extern "c" fn pango_attr_family_new(family: [*:0]const u8) ?*anyopaque;
 pub extern "c" fn pango_attr_size_new_absolute(size: c_int) ?*anyopaque;
 /// PangoAttrType (pango-attributes.h).
+pub const PANGO_ATTR_WEIGHT: c_int = 4;
 pub const PANGO_ATTR_BACKGROUND: c_int = 10;
+pub const PANGO_ATTR_UNDERLINE: c_int = 11;
+/// PangoAttrInt: a PangoAttribute carrying one int (weight, underline).
+pub const PangoAttrInt = extern struct { attr: PangoAttribute, value: c_int };
 pub extern "c" fn pango_attr_list_get_iterator(list: *anyopaque) ?*anyopaque;
 pub extern "c" fn pango_attr_iterator_range(iterator: *anyopaque, start: *c_int, end: *c_int) void;
 pub extern "c" fn pango_attr_iterator_get(iterator: *anyopaque, attr_type: c_int) ?*anyopaque;
@@ -521,3 +528,21 @@ pub extern "c" fn gtk_widget_queue_draw(widget: *anyopaque) void;
 // Icon theme lookup (linux/tray.zig).
 pub extern "c" fn gtk_icon_theme_get_for_display(display: *anyopaque) ?*anyopaque;
 pub extern "c" fn gtk_icon_theme_has_icon(theme: *anyopaque, icon_name: [*:0]const u8) c_int;
+pub extern "c" fn gtk_widget_get_realized(widget: *anyopaque) c_int;
+pub extern "c" fn g_set_prgname(prgname: [*:0]const u8) void;
+pub extern "c" fn gtk_window_set_default_icon_name(name: [*:0]const u8) void;
+pub extern "c" fn gdk_event_get_position(event: *anyopaque, x: *f64, y: *f64) c_int;
+
+// GDK drag-and-drop for the tab tear-off (linux/tab_strip.zig).
+pub const G_TYPE_STRING: usize = 16 << 2;
+pub const GDK_ACTION_MOVE: c_uint = 1 << 1;
+pub const GDK_DRAG_CANCEL_NO_TARGET: c_int = 0;
+pub const GDK_DRAG_CANCEL_USER_CANCELLED: c_int = 1;
+pub const GDK_DRAG_CANCEL_ERROR: c_int = 2;
+pub extern "c" fn gtk_widget_get_native(widget: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_gesture_get_device(gesture: *anyopaque) ?*anyopaque;
+pub extern "c" fn gdk_content_provider_new_typed(gtype: usize, ...) ?*anyopaque;
+pub extern "c" fn gdk_drag_begin(surface: *anyopaque, device: *anyopaque, content: *anyopaque, actions: c_uint, dx: f64, dy: f64) ?*anyopaque;
+pub extern "c" fn gtk_drag_icon_get_for_drag(drag: *anyopaque) ?*anyopaque;
+pub extern "c" fn gtk_drag_icon_set_child(icon: *anyopaque, child: ?*anyopaque) void;
+pub extern "c" fn g_value_get_string(value: *const anyopaque) ?[*:0]const u8;

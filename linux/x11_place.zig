@@ -12,6 +12,7 @@
 //! client-side shadow (_GTK_FRAME_EXTENTS) left out.
 
 const std = @import("std");
+const rules = @import("zonvie_core").frontend_rules;
 const gtk = @import("gtk_bindings.zig");
 const applog = @import("app_log.zig");
 
@@ -71,12 +72,16 @@ test "a drop point centres the window's top edge on it" {
 }
 
 /// Where an external window `w_px` wide opens, root px, as macOS and
-/// Windows choose: a tab's drop point beats the global cell (row, col)
-/// on_external_window names, which sits that many cells from `view`, the
-/// main grid's top-left. Null (the window manager's choice) for neither,
-/// or a cell of -1 (no position).
-pub fn extOrigin(drop: ?[2]f64, row: i32, col: i32, view: ?[2]f64, cell_w_px: u32, cell_h_px: u32, w_px: i32) ?[2]i32 {
-    if (drop) |d| return dropOrigin(d, w_px);
+/// Windows choose: a tab's drop point (`placement` pending) or where the
+/// grid's window was when it closed (saved, its top-left) beats the global
+/// cell (row, col) on_external_window names, which sits that many cells from
+/// `view`, the main grid's top-left. Null (the window manager's choice) for
+/// none, or a cell of -1 (no position).
+pub fn extOrigin(placement: ?rules.Placement, row: i32, col: i32, view: ?[2]f64, cell_w_px: u32, cell_h_px: u32, w_px: i32) ?[2]i32 {
+    if (placement) |p| return switch (p.kind) {
+        .pending => dropOrigin(.{ p.x, p.y }, w_px),
+        .saved => .{ @intFromFloat(@round(p.x)), @intFromFloat(@round(p.y)) },
+    };
     if (row < 0 or col < 0) return null;
     const v = view orelse return null;
     return .{
@@ -87,7 +92,9 @@ pub fn extOrigin(drop: ?[2]f64, row: i32, col: i32, view: ?[2]f64, cell_w_px: u3
 
 test "an external window opens at its drop point, else at its cell" {
     const view = [2]f64{ 100, 200 };
-    try std.testing.expectEqual([2]i32{ 600, 300 }, extOrigin(.{ 1000, 300 }, 3, 4, view, 10, 20, 800).?);
+    try std.testing.expectEqual([2]i32{ 600, 300 }, extOrigin(.{ .kind = .pending, .x = 1000, .y = 300 }, 3, 4, view, 10, 20, 800).?);
+    // A reopened window goes back where it closed, top-left as saved.
+    try std.testing.expectEqual([2]i32{ 1000, 300 }, extOrigin(.{ .kind = .saved, .x = 1000, .y = 300 }, 3, 4, view, 10, 20, 800).?);
     try std.testing.expectEqual([2]i32{ 140, 260 }, extOrigin(null, 3, 4, view, 10, 20, 800).?);
     try std.testing.expect(extOrigin(null, -1, -1, view, 10, 20, 800) == null);
     try std.testing.expect(extOrigin(null, 3, 4, null, 10, 20, 800) == null);
@@ -100,6 +107,32 @@ pub fn onAnyMonitor(x: i32, y: i32, monitors: []const Rect) bool {
         if (x >= m.x and y >= m.y and x < m.x + m.w and y < m.y + m.h) return true;
     }
     return false;
+}
+
+/// How often a shader's iWindowOffset is read again (windowOffset): two X
+/// round trips per window, and no signal tells a client its window moved.
+pub const window_offset_refresh_ns: i128 = 100 * std.time.ns_per_ms;
+
+/// Whether the offset read at `last_ns` (null: never) is due again at
+/// `now_ns`.
+pub fn windowOffsetDue(now_ns: i128, last_ns: ?i128) bool {
+    const last = last_ns orelse return true;
+    return now_ns - last >= window_offset_refresh_ns or now_ns < last;
+}
+
+test "a window offset is read first, then once per refresh period" {
+    try std.testing.expect(windowOffsetDue(5, null));
+    try std.testing.expect(!windowOffsetDue(window_offset_refresh_ns - 1, 0));
+    try std.testing.expect(windowOffsetDue(window_offset_refresh_ns, 0));
+}
+
+/// Device px from `main_view`'s top-left (in toplevel `main_win`) to
+/// `view`'s (in toplevel `win`), for a shader's iWindowOffset. Null on
+/// Wayland or while either is unrealized.
+pub fn windowOffset(win: *anyopaque, view: *anyopaque, main_win: *anyopaque, main_view: *anyopaque) ?[2]f32 {
+    const a = widgetPoint(win, view, 0, 0) orelse return null;
+    const b = widgetPoint(main_win, main_view, 0, 0) orelse return null;
+    return .{ @floatCast(a[0] - b[0]), @floatCast(a[1] - b[1]) };
 }
 
 test "a position is restored only onto an attached monitor" {
@@ -126,6 +159,8 @@ extern "c" fn XInternAtom(dpy: *Display, name: [*:0]const u8, only_if_exists: c_
 extern "c" fn XGetWindowProperty(dpy: *Display, w: XWindow, property: Atom, long_offset: c_long, long_length: c_long, delete: c_int, req_type: Atom, actual_type: *Atom, actual_format: *c_int, nitems: *c_ulong, bytes_after: *c_ulong, prop: *?[*]u8) c_int;
 extern "c" fn XFree(data: ?*anyopaque) c_int;
 extern "c" fn XFlush(dpy: *Display) c_int;
+extern "c" fn XDefaultRootWindow(dpy: *Display) XWindow;
+extern "c" fn XQueryPointer(dpy: *Display, w: XWindow, root: *XWindow, child: *XWindow, root_x: *c_int, root_y: *c_int, win_x: *c_int, win_y: *c_int, mask: *c_uint) c_int;
 
 extern "c" fn gdk_x11_display_get_type() usize;
 extern "c" fn gdk_x11_display_get_xdisplay(display: *anyopaque) ?*Display;
@@ -140,6 +175,21 @@ extern "c" fn gdk_monitor_get_geometry(monitor: *anyopaque, geometry: *GdkRectan
 extern "c" fn g_object_unref(object: *anyopaque) void;
 
 const GdkRectangle = extern struct { x: c_int = 0, y: c_int = 0, width: c_int = 0, height: c_int = 0 };
+
+/// The pointer on the root window, root px; null on Wayland, which tells a
+/// client no global position.
+pub fn pointerRoot() ?[2]f64 {
+    const dpy = xdisplay() orelse return null;
+    var root: XWindow = 0;
+    var child: XWindow = 0;
+    var rx: c_int = 0;
+    var ry: c_int = 0;
+    var wx: c_int = 0;
+    var wy: c_int = 0;
+    var mask: c_uint = 0;
+    if (XQueryPointer(dpy, XDefaultRootWindow(dpy), &root, &child, &rx, &ry, &wx, &wy, &mask) == 0) return null;
+    return .{ @floatFromInt(rx), @floatFromInt(ry) };
+}
 
 /// GDK's X display, or null under any other backend (Wayland).
 fn xdisplay() ?*Display {

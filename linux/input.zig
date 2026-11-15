@@ -8,12 +8,14 @@ const rules = core.frontend_rules;
 const App = @import("app.zig").App;
 const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
+const chrome = @import("chrome.zig");
 const transform = @import("transform.zig");
 const layer_geom = @import("layer_geom.zig");
 const ui_widgets = @import("ui_widgets.zig");
 const scrollbar = @import("scrollbar.zig");
 const core_timers = @import("core_timers.zig");
 const askpass = @import("askpass.zig");
+const cli = @import("cli.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const gl_renderer = @import("renderer/gl_renderer.zig");
 const preedit_target = @import("preedit_target.zig");
@@ -56,6 +58,11 @@ pub const Pointer = struct {
     panel_press: ?PanelPress = null,
     /// The message grid (-102 / -103) the pointer rests on, 0 for none.
     msg_hover: i64 = 0,
+    /// Logical px of the pointer over the overlay panelHover watches (a
+    /// popup's: its own area), null while it is elsewhere. Read again after
+    /// every flush (refreshPanelHover): a panel opens, moves or closes under
+    /// a pointer that sends no motion.
+    hover_at: ?[2]f64 = null,
     /// The touchpad gesture and the wheel's fractional steps.
     scroll: trackpad.State = .{},
     /// Latched when a file drag enters: its drop would insert the paths.
@@ -118,12 +125,7 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
         _ = gtk.g_signal_connect(click, "released", @ptrCast(&onReleased), p);
         gtk.gtk_widget_add_controller(area, click);
     }
-    if (gtk.gtk_drop_target_new(gtk.gdk_file_list_get_type(), gtk.GDK_ACTION_COPY | gtk.GDK_ACTION_LINK)) |drop| {
-        _ = gtk.g_signal_connect(drop, "drop", @ptrCast(&onDrop), p);
-        _ = gtk.g_signal_connect(drop, "enter", @ptrCast(&onDragEnter), p);
-        _ = gtk.g_signal_connect(drop, "motion", @ptrCast(&onDragMotion), p);
-        gtk.gtk_widget_add_controller(area, drop);
-    }
+    addDropTarget(p, area);
     if (gtk.gtk_event_controller_motion_new()) |motion| {
         _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onMotion), p);
         _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onLeave), p);
@@ -147,8 +149,10 @@ pub fn attach(p: *Pointer, area: *anyopaque) void {
 fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uint, data: ?*anyopaque) callconv(.c) c_int {
     const p = ptrFrom(data);
     const app = p.app;
-    if (keymap.isNewSession(keyval, state)) {
-        openNewSession();
+    // The keyval with no modifier held, in the event's layout.
+    const base_kv = baseKeyval(p, ctrl.?, keycode) orelse keyval;
+    if (keymap.appShortcut(base_kv, state, chrome.menuStyle(app))) |sc| {
+        chrome.runShortcut(app, sc);
         return 1;
     }
     const cp = app.corep orelse return 0;
@@ -167,10 +171,8 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     var ign_n: usize = n;
     @memcpy(ign[0..n], buf[0..n]);
     if (mods & (core.MOD_CTRL | core.MOD_ALT | core.MOD_SUPER) != 0) {
-        if (baseKeyval(p, ctrl.?, keycode)) |base| {
-            const base_u = gtk.gdk_keyval_to_unicode(base);
-            if (base_u != 0) ign_n = std.unicode.utf8Encode(@intCast(base_u), &ign) catch ign_n;
-        }
+        const base_u = gtk.gdk_keyval_to_unicode(base_kv);
+        if (base_u != 0) ign_n = std.unicode.utf8Encode(@intCast(base_u), &ign) catch ign_n;
     }
     core.zonvie_core_send_key_event(cp, code, mods, &buf, @intCast(n), &ign, @intCast(ign_n));
     return 1;
@@ -194,9 +196,11 @@ pub fn openNewSession() void {
     if (n <= 0) return;
     exe[@intCast(n)] = 0;
     const argv = [_:null]?[*:0]const u8{ &exe, "--dialog" };
-    // An SSH session marked this process's environment for its askpass
-    // children; the new session must start as zonvie, not as a prompt.
-    const envp = gtk.g_environ_unsetenv(gtk.g_get_environ(), askpass.env_mode);
+    // An SSH session pointed this process's environment at zonvie as askpass
+    // (cli.setAskpassEnv); the new session must start as zonvie, not as a
+    // prompt, and its own ssh children must not call zonvie without the mode.
+    var envp = gtk.g_get_environ();
+    for (cli.newSessionUnsetEnv(std.c.getenv(askpass.env_mode) != null)) |name| envp = gtk.g_environ_unsetenv(envp, name.ptr);
     defer gtk.g_strfreev(envp);
     // GLib reaps the child itself (no DO_NOT_REAP_CHILD) and gives it
     // /dev/null for stdin, so it never detaches from a terminal again.
@@ -217,7 +221,7 @@ fn onImCommit(im: ?*anyopaque, text: ?[*:0]const u8, data: ?*anyopaque) callconv
     const t = std.mem.span(text orelse return);
     // Plain typing also arrives here; only a real composition owns an extmark.
     if (app.preedit_active) {
-        app.preedit_active = false;
+        setComposing(app, false);
         core.zonvie_core_clear_preedit(cp);
         hidePreedit(ptrFrom(data));
     } else if (t.len == 1) {
@@ -242,11 +246,11 @@ fn onPreeditChanged(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const t: [:0]const u8 = if (str) |s| std.mem.span(s) else "";
     if (t.len == 0) {
         if (app.preedit_active) core.zonvie_core_clear_preedit(cp);
-        app.preedit_active = false;
+        setComposing(app, false);
         hidePreedit(p);
         return;
     }
-    app.preedit_active = true;
+    setComposing(app, true);
     // The clause being converted, as the IME's Pango attributes mark it; the
     // overlay label draws those attributes as they are.
     const clause = preedit_target.fromPango(attrs, t.len);
@@ -290,8 +294,17 @@ fn onPreeditEnd(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const app = appFrom(data);
     hidePreedit(ptrFrom(data));
     if (!app.preedit_active) return;
-    app.preedit_active = false;
+    setComposing(app, false);
     if (app.corep) |cp| core.zonvie_core_clear_preedit(cp);
+}
+
+/// A composition starts or ends. The cmdline panel hides its cursor while
+/// one is under way (overlay_layout.panelCursorShown), so a change redraws.
+fn setComposing(app: *App, on: bool) void {
+    if (app.preedit_active == on) return;
+    app.preedit_active = on;
+    app.ime_composing.store(on, .release);
+    app.queueRenderAll();
 }
 
 fn onFocusIn(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -531,18 +544,44 @@ fn panelHover(p: *Pointer, at: ?[2]f64) void {
 
 fn onPanelMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
-    panelHover(ptrFrom(data), .{ x, y });
+    const p = ptrFrom(data);
+    p.hover_at = .{ x, y };
+    panelHover(p, .{ x, y });
 }
 
 fn onPanelLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
-    panelHover(ptrFrom(data), null);
+    panelLeft(ptrFrom(data));
+}
+
+/// The pointer is off `p`'s view, or the view (a panel popup) was hidden
+/// under it, which GTK need not report as a leave.
+pub fn panelLeft(p: *Pointer) void {
+    p.hover_at = null;
+    panelHover(p, null);
+}
+
+/// Every pointer's panel hover, again where it rests: a flush can open a
+/// message under a still pointer (Windows seeds the hover as it creates a
+/// message window) or close the one it held. GTK main thread.
+pub fn refreshPanelHover(app: *App) void {
+    rehover(&app.pointer);
+    var it = app.ext_windows.valueIterator();
+    while (it.next()) |w| rehover(&w.*.pointer);
+    for (app.popups) |slot| if (slot) |pp| rehover(&pp.pointer);
+}
+
+fn rehover(p: *Pointer) void {
+    const at = p.hover_at orelse return;
+    panelHover(p, if (p.panel != null) popupToView(p, at[0], at[1]) else at);
 }
 
 /// Watches the pointer over `overlay`, `p`'s view and the widgets over it,
 /// for panelHover.
 pub fn attachPanelHover(p: *Pointer, overlay: *anyopaque) void {
     const motion = gtk.gtk_event_controller_motion_new() orelse return;
+    // Enter too: a pointer that rests where the view appears sends no motion.
+    _ = gtk.g_signal_connect(motion, "enter", @ptrCast(&onPanelMotion), p);
     _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onPanelMotion), p);
     _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onPanelLeave), p);
     gtk.gtk_widget_add_controller(overlay, motion);
@@ -580,7 +619,12 @@ pub fn attachPopup(p: *Pointer, area: *anyopaque, overlay: *anyopaque) void {
         _ = gtk.g_signal_connect(scroll, "scroll", @ptrCast(&onPopupScroll), p);
         gtk.gtk_widget_add_controller(area, scroll);
     }
+    // The popover is not inside the editor view's widget tree, so the
+    // view's drop target never sees a drop on it.
+    addDropTarget(p, area);
     if (gtk.gtk_event_controller_motion_new()) |motion| {
+        // Enter too: a popup shown under a resting pointer gets no motion.
+        _ = gtk.g_signal_connect(motion, "enter", @ptrCast(&onPopupHover), p);
         _ = gtk.g_signal_connect(motion, "motion", @ptrCast(&onPopupHover), p);
         _ = gtk.g_signal_connect(motion, "leave", @ptrCast(&onPanelLeave), p);
         gtk.gtk_widget_add_controller(overlay, motion);
@@ -626,6 +670,7 @@ fn onPopupScroll(ctrl: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) callcon
 fn onPopupHover(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
     const p = ptrFrom(data);
+    p.hover_at = .{ x, y };
     panelHover(p, popupToView(p, x, y));
 }
 
@@ -826,14 +871,26 @@ fn onMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) v
     core.zonvie_core_send_mouse_input(cp, name, "drag", m.ptr, c.grid_id, c.row, c.col);
 }
 
-/// Files dropped on a surface: their paths typed into the command line while
-/// it is up, `:drop`ped otherwise (frontend_rules.dropInsertsPath; the
-/// cmdline is drawn in this window, never one of its own).
+/// File drops on `widget`, for `p`'s surface or panel.
+fn addDropTarget(p: *Pointer, widget: *anyopaque) void {
+    const drop = gtk.gtk_drop_target_new(gtk.gdk_file_list_get_type(), gtk.GDK_ACTION_COPY | gtk.GDK_ACTION_LINK) orelse return;
+    _ = gtk.g_signal_connect(drop, "drop", @ptrCast(&onDrop), p);
+    _ = gtk.g_signal_connect(drop, "enter", @ptrCast(&onDragEnter), p);
+    _ = gtk.g_signal_connect(drop, "motion", @ptrCast(&onDragMotion), p);
+    gtk.gtk_widget_add_controller(widget, drop);
+}
+
+/// Files dropped on a surface or a panel: their paths typed into the command
+/// line while it is up or when dropped on the cmdline panel itself,
+/// `:drop`ped otherwise (frontend_rules.dropInsertsPath; on a view the
+/// cmdline counts as drawn in that window, never one of its own, since a
+/// drop on its popup lands on the popup's own target).
 fn onDrop(target: ?*anyopaque, value: ?*const anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_int {
     _ = target;
     _ = x;
     _ = y;
-    const app = appFrom(data);
+    const p = ptrFrom(data);
+    const app = p.app;
     const cp = app.corep orelse return 0;
     const list = gtk.g_value_get_boxed(value orelse return 0) orelse return 0;
     const files = gtk.gdk_file_list_get_files(list);
@@ -852,7 +909,7 @@ fn onDrop(target: ?*anyopaque, value: ?*const anyopaque, x: f64, y: f64, data: ?
     if (paths.items.len == 0) return 0;
 
     const mode = std.mem.span(core.zonvie_core_get_current_mode(cp));
-    if (core.frontend_rules.dropInsertsPath(mode, false, false)) {
+    if (core.frontend_rules.dropInsertsPath(mode, false, popup_place.dropForcesInsert(p.panel))) {
         var line: std.ArrayListUnmanaged(u8) = .empty;
         for (paths.items) |path| {
             const buf = a.alloc(u8, 2 * path.len + 1) catch return 0;
@@ -882,7 +939,7 @@ fn onDragEnter(target: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(
         var mode: [32]u8 = undefined;
         var visible: bool = true;
         if (core.zonvie_core_try_get_mode_state(cp, &mode, mode.len, &visible) == 1)
-            p.drag_inserts_path = core.frontend_rules.dropInsertsPath(std.mem.sliceTo(&mode, 0), false, false);
+            p.drag_inserts_path = core.frontend_rules.dropInsertsPath(std.mem.sliceTo(&mode, 0), false, popup_place.dropForcesInsert(p.panel));
     }
     return onDragMotion(target, x, y, data);
 }

@@ -25,6 +25,10 @@ const scrollbar = @import("scrollbar.zig");
 const session = @import("session.zig");
 const lifecycle = @import("lifecycle.zig");
 const tray = @import("tray.zig");
+const crash = @import("crash.zig");
+
+/// Panics reach the log and, without a terminal, a crash file and an alert.
+pub const panic = std.debug.FullPanic(crash.onPanic);
 
 const default_w_logical = 1000;
 const default_h_logical = 700;
@@ -56,7 +60,7 @@ const Startup = struct {
     /// The window waits for Neovim's first frame (SSH, --connect-nvim): an
     /// SSH password is asked in a window of its own (askpass.zig).
     hide_until_ready: bool = false,
-    /// The connection dialog's "Name".
+    /// The connection dialog's "Name", else one from the connection.
     session_name: []const u8 = "",
 };
 
@@ -285,7 +289,10 @@ fn startCore(app: *App, area: *anyopaque) void {
             _ = core.zonvie_core_load_config(cp, z.ptr);
         } else |_| {}
     } else |_| {}
-    if (applog.isEnabled()) core.zonvie_core_set_log_enabled(cp, 1);
+    // Both ways, as macOS and Windows: the core logs from creation on, and
+    // with logging off on_log must carry only the child's stderr (the
+    // early-exit alert reads it, session.failEarlyExit).
+    core.zonvie_core_set_log_enabled(cp, @intFromBool(applog.isEnabled()));
     if (applog.isVerbose()) core.zonvie_core_set_log_verbose(cp, 1);
     if (app.log_perf_only) core.zonvie_core_set_log_perf_only(cp, 1);
     if (app.log_scroll_only) core.zonvie_core_set_log_scroll_only(cp, 1);
@@ -317,6 +324,10 @@ fn launch(app: *App, area: *anyopaque) void {
     const h_px: u32 = @intFromFloat(@as(f32, @floatFromInt(if (h_logical > 0) h_logical else default_h_logical)) * scale);
     const rows: u32 = if (ch != 0) @max(1, h_px / ch) else 24;
     const cols: u32 = if (cw != 0) @max(1, w_px / cw) else 80;
+    // A remote start's stderr, for the alert if it ends before its first
+    // frame. With logging on, on_log also carries the core's own lines,
+    // which cannot be told apart: the alert then points at the log.
+    if (app.start_kind != .local and !applog.isEnabled()) app.start_output.open.store(true, .release);
     const rc = if (startup.connect_addr) |addr|
         core.zonvie_core_start_connect(cp, addr.ptr, addr.len, rows, cols)
     else
@@ -344,17 +355,7 @@ fn failStart(app: *App, rc: c_int) void {
     failWith(app, "Zonvie failed to start", detail);
 }
 
-/// No nvim will run in this window: say why, then quit with status 1.
-fn failWith(app: *App, heading: [*:0]const u8, detail: [*:0]const u8) void {
-    app.start_failed = true;
-    ui_widgets.hideProgress(app);
-    const dialog = gtk.gtk_alert_dialog_new("%s", heading) orelse {
-        if (app.gtk_app) |a| gtk.g_application_quit(a);
-        return;
-    };
-    gtk.gtk_alert_dialog_set_detail(dialog, detail);
-    gtk.gtk_alert_dialog_choose(dialog, session.parentWindow(app), null, &onStartFailDone, app);
-}
+const failWith = session.failWith;
 
 // =========================================================================
 // Devcontainer rebuild: `devcontainer up` before the core starts
@@ -434,14 +435,6 @@ fn onDevcontainerUpDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopa
     else
         std.fmt.bufPrintZ(&detail_buf, "{s}", .{tail}) catch unreachable;
     failWith(app, "Devcontainer failed to start", detail);
-}
-
-fn onStartFailDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    var err: ?*anyopaque = null;
-    _ = gtk.gtk_alert_dialog_choose_finish(source.?, result, &err);
-    if (err) |e| gtk.g_error_free(e);
-    gtk.g_object_unref(source.?);
-    if (appFrom(data).gtk_app) |a| gtk.g_application_quit(a);
 }
 
 // =========================================================================
@@ -527,6 +520,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
         // frame presents the window (session.onReady).
         app.show_when_ready = true;
         gtk.gtk_widget_realize(area);
+        session.armReveal(app);
     } else {
         gtk.gtk_window_present(win);
     }
@@ -537,13 +531,25 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 // Entry point
 // =========================================================================
 
-fn appendArg(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
-    if (list.items.len != 0) try list.append(alloc, ' ');
-    // An argument no quote can carry keeps double quotes, as on Windows.
-    const q = core.frontend_rules.spawnArgQuote(arg) orelse '"';
-    if (q != 0) try list.append(alloc, q);
-    try list.appendSlice(alloc, arg);
-    if (q != 0) try list.append(alloc, q);
+/// One nvim argument into the spawn command; an argument the core's
+/// tokenizer cannot carry is an option error naming it, since nvim would
+/// otherwise get a different argument (or fail to spawn) with no message.
+fn appendArg(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, arg: []const u8) ?u8 {
+    cli.appendSpawnArg(list, alloc, arg) catch |e| {
+        if (e != error.Unquotable) return 1;
+        const msg = std.fmt.allocPrintSentinel(alloc, "zonvie: this argument cannot be passed to nvim (a space together with both quote kinds, or a trailing backslash): {s}", .{arg}, 0) catch return 1;
+        return optionError(msg);
+    };
+    return null;
+}
+
+/// A refused Neovim path (cli.nvimPath): on stderr, in the log, and in an
+/// alert when no terminal shows stderr, as the dialog's own warning. The
+/// start goes on with the default.
+fn nvimPathWarning(what: []const u8) void {
+    std.debug.print("zonvie: {s} contains a quote character and was ignored; the default Neovim is used.\n", .{what});
+    if (applog.isEnabled()) applog.appLog("[linux] {s} contains a quote character; ignored\n", .{what});
+    if (std.c.isatty(0) == 0) connect_dialog.alert(null, "The Neovim path contains a quote character and was ignored.", "The default Neovim is used.");
 }
 
 /// An option error: on stderr, and in an alert when no terminal shows
@@ -567,6 +573,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ssh running this executable as its SSH_ASKPASS, with the prompt.
     if (askpass.requested()) return askpass.run(if (args.len > 1) args[1] else "Password:");
+    // This executable started by the panic handler to show its report.
+    if (crash.requested()) return crash.runAlert(if (args.len > 1) args[1] else "");
 
     if (cli.hasFlag(args, "--help") or cli.hasFlag(args, "-h")) {
         cli.printHelp();
@@ -600,7 +608,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var config = config_mod.load(alloc);
     defer config.deinit();
 
-    var nvim_path: []const u8 = if (config.neovim.path.len > 0) config.neovim.path else "nvim";
+    // `[neovim] path` written with quotes loses one pair, as on Windows.
+    const config_nvim = cli.nvimPath(config.neovim.path);
+    const default_nvim: []const u8 = if (config_nvim.path.len > 0) config_nvim.path else "nvim";
+    var nvim_path = default_nvim;
     var log_path: ?[]const u8 = null;
     var ext_cmdline = config.cmdline.external;
     var ext_popupmenu = config.popup.external;
@@ -731,6 +742,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer applog.deinit();
 
+    // --nvim follows the same rule; a refused one falls back to the config's
+    // path or nvim, as macOS and Windows do. For --ssh it names the remote
+    // nvim, which the same quoting carries.
+    if (config_nvim.ignored) nvimPathWarning("[neovim] path in config.toml");
+    if (cli_nvim_path) |raw| {
+        const p = cli.nvimPath(raw);
+        if (p.ignored) nvimPathWarning("The --nvim path");
+        cli_nvim_path = if (p.path.len != 0) p.path else null;
+        nvim_path = cli_nvim_path orelse default_nvim;
+    }
+
     if (connect_addr) |a| if (a.len == 0) {
         return optionError("zonvie: --connect-nvim / --remote-ui requires a non-empty address (e.g. /tmp/nvim.sock or 127.0.0.1:6789).");
     };
@@ -791,9 +813,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return optionError("--connect-nvim, --ssh (or [neovim] ssh in config.toml) and --devcontainer are mutually exclusive. Remove the conflicting option and retry.");
     }
     var dc_up_argv: ?[*:null]const ?[*:0]const u8 = null;
-    var cmd: std.ArrayListUnmanaged(u8) = .empty;
-    appendArg(&cmd, aa, nvim_path) catch return 1;
-    for (extra.items) |a| appendArg(&cmd, aa, a) catch return 1;
     // --ssh: nvim runs on the host; local file arguments do not apply there,
     // as on macOS and Windows. --nvim names the remote executable.
     const nvim_cmd: [:0]const u8 = if (ssh) |s| blk: {
@@ -811,7 +830,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         };
         if (devcontainer_rebuild) dc_up_argv = cli.devcontainerUpArgv(aa, target, cli.nvimConfigDir(aa) catch return 1) catch return 1;
         break :blk cli.devcontainerCommand(aa, target) catch return 1;
-    } else aa.dupeZ(u8, cmd.items) catch return 1;
+    } else blk: {
+        var cmd: std.ArrayListUnmanaged(u8) = .empty;
+        if (appendArg(&cmd, aa, nvim_path)) |rc| return rc;
+        // An empty argument has no token; the tokenizer always dropped it.
+        for (extra.items) |a| if (a.len != 0) if (appendArg(&cmd, aa, a)) |rc| return rc;
+        break :blk aa.dupeZ(u8, cmd.items) catch return 1;
+    };
+    const start_kind: lifecycle.StartKind = if (ssh != null) .ssh else if (connect_addr != null) .connect else if (devcontainer != null) .devcontainer else .local;
+    if (session_name.len == 0) {
+        var name_buf: [256]u8 = undefined;
+        const target = if (ssh) |s| s.host else if (devcontainer) |d| d.workspace else "";
+        session_name = aa.dupe(u8, lifecycle.defaultSessionName(&name_buf, start_kind, target)) catch "";
+    }
     const progress: ?[:0]const u8 = if (devcontainer != null)
         (if (devcontainer_rebuild) "Building devcontainer..." else "Connecting to devcontainer...")
     else
@@ -842,6 +873,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // A `--dialog` launch is a new session (New Session spawns one), so it
     // never hands itself to a running instance.
     const single = config.server.single_instance and !dialog;
+    // The X11 WM_CLASS GTK derives from the program name, and the icon the
+    // desktop shows for every window: both the desktop entry's
+    // (StartupWMClass, Icon), so the window is matched to it as under Wayland,
+    // where the application id already does it.
+    gtk.g_set_prgname(cli.app_id);
+    gtk.gtk_window_set_default_icon_name(cli.app_id);
     const gapp = gtk.gtk_application_new(cli.app_id, if (single) gtk.G_APPLICATION_HANDLES_OPEN else gtk.G_APPLICATION_NON_UNIQUE) orelse return 1;
     if (single and gtk.g_application_register(gapp, null, null) != 0 and gtk.g_application_get_is_remote(gapp) != 0) {
         // GApplication's own command line turns these into an Open call on
@@ -878,6 +915,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .cell_age = core.cell_age_store.Stores.init(alloc),
         .session_name = session_name,
         .close_to_tray = config.server.close_to_tray,
+        .start_kind = start_kind,
     };
     defer app.deinit();
     ui_widgets.the_app = app;
@@ -887,6 +925,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = gtk.g_signal_connect(gapp, "activate", @ptrCast(&onActivate), app);
     if (single) _ = gtk.g_signal_connect(gapp, "open", @ptrCast(&onOpen), app);
     _ = gtk.g_application_run(gapp, 0, null);
+    // Its source would outlive the App in the iterations below.
+    session.stopReveal(app);
 
     // The loop no longer serves clipboard idles; release a core thread
     // waiting on one so destroy does not sit out its timeout.

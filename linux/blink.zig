@@ -40,6 +40,14 @@ fn anyWindowActive(app: *App) bool {
     return false;
 }
 
+/// The IM context of the window holding the focus: the active external
+/// window's, else the main window's (also while no window is active).
+pub fn focusedImContext(app: *App) ?*anyopaque {
+    var it = app.ext_windows.valueIterator();
+    while (it.next()) |e| if (e.*.window) |w| if (gtk.gtk_window_is_active(w) != 0) return e.*.pointer.im_context;
+    return app.pointer.im_context;
+}
+
 fn idleSettleActive(data: ?*anyopaque) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(data.?));
     app.active_idle_queued = false;
@@ -49,7 +57,7 @@ fn idleSettleActive(data: ?*anyopaque) callconv(.c) c_int {
     if (app.corep) |cp| core.zonvie_core_set_focus(cp, active);
     // [input] ime_disable_on_activate, as on Windows: the IME starts each
     // activation off.
-    if (active and app.input_cfg.ime_disable_on_activate) ime_off.off(app.pointer.im_context);
+    if (active and app.input_cfg.ime_disable_on_activate) ime_off.off(focusedImContext(app));
     // The timer stops with the app, as on macOS and Windows; activation
     // re-arms it through the gate.
     if (active) update(app) else pause(app);
@@ -122,6 +130,27 @@ fn onLockRetry(data: ?*anyopaque) callconv(.c) c_int {
 
 /// Re-reads guicursor's cadence for the current mode and (re)arms the timer
 /// when it changed or was stopped. Called after every committed flush.
+/// The blinking cursor can be seen: the app is active, in a main window
+/// that is not minimized or suspended, or in an external window (which has
+/// focus, so it is shown) while the main one is hidden.
+pub fn blinkSeen(app_active: bool, main_hidden: bool, ext_active: bool) bool {
+    return app_active and (!main_hidden or ext_active);
+}
+
+test "an external window keeps the cursor blinking while the main one is hidden" {
+    try std.testing.expect(blinkSeen(true, false, false));
+    try std.testing.expect(blinkSeen(true, true, true));
+    try std.testing.expect(!blinkSeen(true, true, false));
+    try std.testing.expect(!blinkSeen(false, false, true));
+}
+
+/// An external window has keyboard focus. GTK main thread.
+fn extWindowActive(app: *App) bool {
+    var it = app.ext_windows.valueIterator();
+    while (it.next()) |w| if (w.*.window) |win| if (gtk.gtk_window_is_active(win) != 0) return true;
+    return false;
+}
+
 pub fn update(app: *App) void {
     const cp = app.corep orelse return;
     // try_get leaves these untouched on a busy lock, which retries instead.
@@ -139,7 +168,7 @@ pub fn update(app: *App) void {
     if (Blink.blinks(on_ms, off_ms)) {
         // Only where it can be seen: a background, minimized or occluded
         // window does not repaint twice a second.
-        if (!app.app_active or app.window_hidden) {
+        if (!blinkSeen(app.app_active, app.window_hidden, extWindowActive(app))) {
             if (app.blink_timer != 0) pause(app);
             return;
         }

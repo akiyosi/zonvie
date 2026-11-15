@@ -151,8 +151,10 @@ fn vertical(p: *input.Pointer, cp: *core.zonvie_core, delta_px: f64, mods: [*:0]
         break :blk c;
     };
     p.scroll.last_step_ns = @intCast(clock.nowNs());
+    // The grid's own row height, as the painter plans its ease by
+    // (gl_renderer layerGeom): GridEase.pan restarts on any other.
     app.mu.lockUncancelable(clock.io());
-    const row_h = app.cell_h_px;
+    const row_h = app.surface.rowHeightPx(t.grid_id, app.cell_h_px);
     app.mu.unlock(clock.io());
     if (row_h == 0) return false;
     if (!p.scroll.pixel) {

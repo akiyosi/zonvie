@@ -65,6 +65,13 @@ const introspection =
 /// The tray's state; lives in the App.
 pub const Tray = struct {
     conn: ?*anyopaque = null,
+    /// A StatusNotifierWatcher has the item: closing hides to the tray. A
+    /// host that exits or restarts takes it away; its return registers the
+    /// item again (onWatcherAppeared).
+    hosted: bool = false,
+    /// The item's bus name, `org.kde.StatusNotifierItem-<pid>-1`.
+    name: [64]u8 = undefined,
+    name_len: usize = 0,
     /// The icon, built once (a(iiay)), owned.
     pixmap: ?*anyopaque = null,
     /// The icon theme has the app's icon (an `--install`ed desktop entry):
@@ -91,6 +98,7 @@ extern "c" fn g_dbus_connection_register_object(conn: *anyopaque, path: [*:0]con
 extern "c" fn g_dbus_connection_call_sync(conn: *anyopaque, bus_name: ?[*:0]const u8, path: [*:0]const u8, iface: [*:0]const u8, method: [*:0]const u8, params: ?*anyopaque, reply_type: ?*const anyopaque, flags: c_uint, timeout_ms: c_int, cancellable: ?*anyopaque, err: ?*?*anyopaque) ?*anyopaque;
 extern "c" fn g_dbus_method_invocation_return_value(invocation: *anyopaque, params: ?*anyopaque) void;
 extern "c" fn g_variant_new(format: [*:0]const u8, ...) ?*anyopaque;
+extern "c" fn g_bus_watch_name_on_connection(connection: *anyopaque, name: [*:0]const u8, flags: c_uint, appeared: ?*const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, vanished: ?*const fn (?*anyopaque, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, user_data: ?*anyopaque, free: ?*anyopaque) c_uint;
 extern "c" fn g_variant_new_parsed(format: [*:0]const u8, ...) ?*anyopaque;
 extern "c" fn g_variant_get(v: *anyopaque, format: [*:0]const u8, ...) void;
 extern "c" fn g_variant_new_fixed_array(elem_type: [*:0]const u8, elements: ?*const anyopaque, n: usize, elem_size: usize) ?*anyopaque;
@@ -173,10 +181,11 @@ fn buildPixmap() ?*anyopaque {
     return g_variant_ref_sink(arr);
 }
 
-/// Registers the tray item with the session's StatusNotifierWatcher.
-/// Returns false, leaving nothing registered that a later call depends on,
-/// when there is no session bus or no watcher (no tray host): closing then
-/// quits, as Windows does when its icon cannot be added.
+/// Exports the tray item on the session bus and keeps it registered with
+/// whichever StatusNotifierWatcher (tray host) is running, now or later.
+/// Returns false when there is no session bus: closing then always quits.
+/// Closing hides to the tray only while a host has the item (Tray.hosted),
+/// as Windows hides only while its icon is added.
 pub fn init(app: *App) bool {
     const conn = g_bus_get_sync(2, null, null) orelse return false;
     const info = g_dbus_node_info_new_for_xml(introspection, null) orelse return false;
@@ -187,25 +196,48 @@ pub fn init(app: *App) bool {
     if (g_dbus_connection_register_object(conn, item_path, g_dbus_node_info_lookup_interface(info, "org.kde.StatusNotifierItem").?, &vt.v, app, null, null) == 0) return false;
     if (g_dbus_connection_register_object(conn, menu_path, g_dbus_node_info_lookup_interface(info, "com.canonical.dbusmenu").?, &vt.v, app, null, null) == 0) return false;
 
-    var name_buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "org.kde.StatusNotifierItem-{d}-1", .{std.c.getpid()}) catch unreachable;
+    const name = std.fmt.bufPrintZ(&app.tray.name, "org.kde.StatusNotifierItem-{d}-1", .{std.c.getpid()}) catch unreachable;
+    app.tray.name_len = name.len;
     // DBUS_NAME_FLAG_DO_NOT_QUEUE (4).
     if (g_dbus_connection_call_sync(conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", g_variant_new("(su)", name.ptr, @as(c_uint, 4)), null, 0, 1000, null, null)) |r| g_variant_unref(r) else return false;
-    var err: ?*anyopaque = null;
-    const reply = g_dbus_connection_call_sync(conn, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem", g_variant_new("(s)", name.ptr), null, 0, 1000, null, &err);
-    if (reply) |r| g_variant_unref(r) else {
-        const msg: [*:0]const u8 = if (err) |e| (@as(*gtk.GError, @ptrCast(@alignCast(e))).message orelse "") else "";
-        applog.appLog("[linux] tray: no StatusNotifierWatcher ({s}); close_to_tray off\n", .{msg});
-        if (err) |e| gtk.g_error_free(e);
-        return false;
-    }
     app.tray.conn = conn;
     app.tray.pixmap = buildPixmap();
     if (gtk.gdk_display_get_default()) |d| {
         if (gtk.gtk_icon_theme_get_for_display(d)) |theme| app.tray.icon_installed = gtk.gtk_icon_theme_has_icon(theme, icon_id) != 0;
     }
-    applog.appLog("[linux] tray: registered {s}\n", .{name});
+    // Calls onWatcherAppeared now if a host runs, and again whenever one
+    // starts; onWatcherVanished when it goes.
+    _ = g_bus_watch_name_on_connection(conn, "org.kde.StatusNotifierWatcher", 0, &onWatcherAppeared, &onWatcherVanished, app, null);
     return true;
+}
+
+fn onWatcherAppeared(conn: ?*anyopaque, name: ?[*:0]const u8, owner: ?[*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = name;
+    _ = owner;
+    const app = appFrom(data);
+    const item: [*:0]const u8 = @ptrCast(&app.tray.name);
+    var err: ?*anyopaque = null;
+    const reply = g_dbus_connection_call_sync(conn.?, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem", g_variant_new("(s)", item), null, 0, 1000, null, &err);
+    if (reply) |r| g_variant_unref(r) else {
+        const msg: [*:0]const u8 = if (err) |e| (@as(*gtk.GError, @ptrCast(@alignCast(e))).message orelse "") else "";
+        applog.appLog("[linux] tray: watcher refused the item ({s})\n", .{msg});
+        if (err) |e| gtk.g_error_free(e);
+        return;
+    }
+    app.tray.hosted = true;
+    applog.appLog("[linux] tray: registered {s}\n", .{app.tray.name[0..app.tray.name_len]});
+}
+
+/// The tray host went: a window hidden to it would have no way back, so it
+/// comes back now, and closing quits until a host returns.
+fn onWatcherVanished(conn: ?*anyopaque, name: ?[*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = conn;
+    _ = name;
+    const app = appFrom(data);
+    if (!app.tray.hosted) return;
+    app.tray.hosted = false;
+    applog.appLog("[linux] tray: host gone; closing quits\n", .{});
+    show(app);
 }
 
 fn appFrom(data: ?*anyopaque) *App {

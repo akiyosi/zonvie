@@ -121,6 +121,13 @@ pub const PostFx = struct {
     frame: i32 = 0,
     uniforms: Uniforms = .{},
     cursor_cur: [4]f32 = .{ 0, 0, 0, 0 },
+    /// iWindowOffset: this window's view from the main window's, device px,
+    /// as the GTK thread last read it (ext_window, X11 only); (0,0) for the
+    /// main window and on Wayland, which gives a client no window position,
+    /// its own or another's, so there every window is its own origin.
+    window_offset_px: [2]f32 = .{ 0, 0 },
+    /// When window_offset_px was read; null never.
+    window_offset_ns: ?i128 = null,
 };
 
 /// Whether a surface drawn with `p` needs the offscreen path this frame.
@@ -461,10 +468,7 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     u.iFrame = p.frame;
     p.frame +%= 1;
     fillDate(p, u);
-    // An external window's offset from the main window's surface: Wayland
-    // gives a client no window position, its own or another's, so every
-    // window reports (0,0) and is its own origin.
-    u.iWindowOffset = .{ 0, 0 };
+    u.iWindowOffset = p.window_offset_px;
     u.iWindowSize = .{ w, h };
     const cursor = cursorState(app, surface_id);
     if (cursor) |c| {

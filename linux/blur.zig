@@ -40,7 +40,8 @@ test "GTK owns the blur protocol from 4.23.3" {
     try std.testing.expect(gtkOwnsBlur(5, 0, 0));
 }
 
-/// Asks for blur behind `window` while it is mapped.
+/// Asks for blur behind `window` (a toplevel or a panel popover: any
+/// GtkNative) while it is mapped.
 /// Pre: `[window] blur` is on.
 pub fn watch(app: *App, window: *anyopaque) void {
     std.debug.assert(app.window_cfg.blur);

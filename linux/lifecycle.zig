@@ -143,6 +143,140 @@ test "the output tail keeps the last lines and bytes" {
     try std.testing.expectEqualStrings("b", outputTail("\xc3\xa9b", 5, 2));
 }
 
+/// Where the session's nvim runs, as the start chose it.
+pub const StartKind = enum { local, ssh, connect, devcontainer };
+
+/// How long a start that keeps its window hidden until nvim's first frame
+/// (--ssh, --connect-nvim) stays invisible before the window shows its
+/// progress, so a host that never answers can still be closed.
+pub const connect_reveal_ms = 5000;
+
+/// The progress text a hidden start's window shows once revealed; null for
+/// a start whose window is never hidden.
+pub fn revealText(kind: StartKind) ?[:0]const u8 {
+    return switch (kind) {
+        .ssh => "Connecting over SSH...",
+        .connect => "Connecting to Neovim...",
+        .local, .devcontainer => null,
+    };
+}
+
+/// The alert heading when nvim exits before its first frame: a remote start
+/// that failed (ssh refused, devcontainer exec failed, server gone) says so,
+/// as a failed `devcontainer up` does. Null for a local start, whose nvim
+/// may end early on purpose (`zonvie -- --version`) and passes its code on.
+pub fn earlyExitHeading(kind: StartKind) ?[:0]const u8 {
+    return switch (kind) {
+        .local => null,
+        .ssh => "SSH connection failed",
+        .connect => "Could not connect to Neovim",
+        .devcontainer => "Devcontainer failed to start",
+    };
+}
+
+/// The early exit's alert text: the tail of what the process printed on
+/// stderr, else its exit code and a pointer to the log.
+pub fn earlyExitDetail(buf: []u8, output: []const u8, exit_code: i32) [:0]const u8 {
+    const tail = outputTail(output, 20, 800);
+    const s = if (tail.len != 0)
+        std.fmt.bufPrintZ(buf, "{s}", .{tail})
+    else
+        std.fmt.bufPrintZ(buf, "Neovim exited with code {d} before the session was ready. See the log for details.", .{exit_code});
+    return s catch "Neovim exited before the session was ready.";
+}
+
+test "a remote start that ends early explains itself; a local one does not" {
+    try std.testing.expect(earlyExitHeading(.local) == null);
+    try std.testing.expectEqualStrings("SSH connection failed", earlyExitHeading(.ssh).?);
+    try std.testing.expect(revealText(.devcontainer) == null);
+    try std.testing.expect(revealText(.ssh) != null);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("Permission denied (publickey).", earlyExitDetail(&buf, "Permission denied (publickey).\r\n", 255));
+    try std.testing.expectEqualStrings("Neovim exited with code 255 before the session was ready. See the log for details.", earlyExitDetail(&buf, "", 255));
+}
+
+/// The last bytes a starting session's process wrote to stderr, for the
+/// early-exit alert. Written by the core's stderr thread (on_log), read on
+/// the GTK thread once nvim has exited; its own lock, since on_log may run
+/// while the app lock is held elsewhere.
+pub const StartOutput = struct {
+    mu: std.Io.Mutex = .init,
+    /// Cleared on nvim's first frame: later stderr is not about the start.
+    open: std.atomic.Value(bool) = .init(false),
+    buf: [4096]u8 = undefined,
+    len: usize = 0,
+
+    /// Keeps the last `buf.len` bytes. Lines the core itself emits through
+    /// on_log without logging enabled (its run-loop markers) are not the
+    /// process's output and are skipped.
+    pub fn append(self: *StartOutput, io: std.Io, bytes: []const u8) void {
+        if (!self.open.load(.acquire)) return;
+        if (std.mem.startsWith(u8, bytes, "[RUNLOOP] ") or std.mem.startsWith(u8, bytes, "[DIRECT] ")) return;
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        self.appendLocked(bytes);
+    }
+
+    fn appendLocked(self: *StartOutput, bytes: []const u8) void {
+        const in = bytes[bytes.len - @min(bytes.len, self.buf.len) ..];
+        const keep = @min(self.len, self.buf.len - in.len);
+        std.mem.copyForwards(u8, self.buf[0..keep], self.buf[self.len - keep .. self.len]);
+        @memcpy(self.buf[keep..][0..in.len], in);
+        self.len = keep + in.len;
+    }
+
+    /// The captured bytes into `out`; the result is a slice of `out`.
+    pub fn copy(self: *StartOutput, io: std.Io, out: []u8) []const u8 {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        const n = @min(self.len, out.len);
+        @memcpy(out[0..n], self.buf[self.len - n .. self.len]);
+        return out[0..n];
+    }
+};
+
+test "the start output keeps the newest bytes" {
+    var o: StartOutput = .{};
+    o.open.store(true, .release);
+    o.appendLocked("abc");
+    o.appendLocked("def");
+    try std.testing.expectEqualStrings("abcdef", o.buf[0..o.len]);
+    var big: [5000]u8 = undefined;
+    @memset(&big, 'x');
+    big[big.len - 1] = 'y';
+    o.appendLocked(&big);
+    try std.testing.expectEqual(@as(usize, 4096), o.len);
+    try std.testing.expectEqual(@as(u8, 'y'), o.buf[o.len - 1]);
+    o.len = 0;
+    o.appendLocked("12");
+    o.appendLocked(big[0..4095]);
+    try std.testing.expectEqual(@as(u8, '2'), o.buf[0]);
+}
+
+/// The session's name when the dialog gave none, as macOS names a session
+/// from its connection: "SSH: <host>", "Devcontainer: <workspace folder>".
+/// Empty for a local or --connect-nvim start, whose title stays nvim's.
+/// The result is `buf`'s or `target`'s memory.
+pub fn defaultSessionName(buf: []u8, kind: StartKind, target: []const u8) []const u8 {
+    const prefix = switch (kind) {
+        .ssh => "SSH",
+        .devcontainer => "Devcontainer",
+        .local, .connect => return "",
+    };
+    const shown = if (kind == .devcontainer) std.fs.path.basename(std.mem.trimEnd(u8, target, "/")) else target;
+    if (shown.len == 0) return prefix;
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ prefix, shown }) catch prefix;
+}
+
+test "a remote session without a name is named from its connection" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("SSH: me@box", defaultSessionName(&buf, .ssh, "me@box"));
+    try std.testing.expectEqualStrings("Devcontainer: proj", defaultSessionName(&buf, .devcontainer, "/home/u/proj/"));
+    try std.testing.expectEqualStrings("Devcontainer", defaultSessionName(&buf, .devcontainer, ""));
+    try std.testing.expectEqualStrings("", defaultSessionName(&buf, .local, "x"));
+    try std.testing.expectEqualStrings("", defaultSessionName(&buf, .connect, "/tmp/s"));
+}
+
 /// The window title: nvim's, followed by the session's name when the
 /// connection dialog gave one, so windows of several sessions tell apart.
 /// `buf` must hold at least one byte; the result is truncated to fit.

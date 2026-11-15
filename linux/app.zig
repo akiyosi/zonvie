@@ -102,6 +102,10 @@ pub const App = struct {
     preedit_family: [128]u8 = undefined,
     preedit_family_len: usize = 0,
     preedit_px: f32 = 0,
+    /// The same for each per-grid font slot (on_font_slot_load), for a
+    /// composition in a grid with its own font; px 0 while the slot is
+    /// empty. Under `mu`.
+    slot_preedit: [core.font_slots.max_slots]ui_widgets.PreeditFont = @splat(.{}),
     /// The size the font in use was loaded at, in points; under `mu`.
     font_pt: f32 = 0,
     /// The next guifont broadcast is a font-dialog pick (font_picker.zig),
@@ -158,11 +162,16 @@ pub const App = struct {
     /// search icon, the rest the chevron.
     cmdline_firstc: u8 = 0,
     /// Search bg (the cmdline and popupmenu border) and Comment fg (the
-    /// cmdline icon), as Windows and macOS colour them; read on the GTK
-    /// thread when a cmdline shows, since a core callback cannot.
+    /// cmdline icon, the close badge's tint), as Windows and macOS colour
+    /// them; read on the GTK thread when a cmdline shows and after a flush
+    /// that follows a default-colour change, since a core callback cannot.
     cmdline_border_rgb: u32 = 0xffff00,
     cmdline_icon_rgb: u32 = 0x808080,
     panel_colors_queued: std.atomic.Value(bool) = .init(false),
+    /// The default colours changed (a colourscheme, or Neovim's first
+    /// redraw) and the panel colours are read again once the flush carrying
+    /// the batch's highlight definitions has committed. Guarded by mu.
+    panel_colors_stale: bool = false,
     /// config.scroll.large_jump_behavior; set before the core starts.
     large_jump: scroll_ease.LargeJumpBehavior = .snap,
     title: [256]u8 = undefined,
@@ -218,6 +227,9 @@ pub const App = struct {
     /// A torn-off tab's drop point for the next external window (X11 only;
     /// x11_place). GTK main thread only.
     ext_placement: core.frontend_rules.PlacementMemory = .{},
+    /// Bumped by every :restart / reconnect (on_restart, on_connect): grid
+    /// ids restart with the server. GTK main thread.
+    session_generation: u64 = 0,
     /// A frame-clock tick callback is installed and redraws every frame
     /// while some grid eases.
     ease_tick_active: bool = false,
@@ -250,9 +262,18 @@ pub const App = struct {
     nvim_ready: bool = false,
     /// The main window stays hidden until `nvim_ready` (SSH, --connect-nvim).
     show_when_ready: bool = false,
+    /// Where this session's nvim runs; decides what an early exit shows.
+    start_kind: lifecycle.StartKind = .local,
+    /// The timeout that shows a hidden start's window with its progress
+    /// (lifecycle.connect_reveal_ms); 0 when none is armed.
+    reveal_timer: c_uint = 0,
+    /// stderr of the starting process, for the early-exit alert. Written
+    /// from the core's stderr thread (its own lock).
+    start_output: lifecycle.StartOutput = .{},
     /// Files handed over before nvim could take them, owned by `alloc`.
     pending_opens: std.ArrayListUnmanaged([:0]u8) = .empty,
-    /// The connection dialog's "Name", shown in the window title; borrowed
+    /// The connection dialog's "Name", else one from the connection
+    /// (lifecycle.defaultSessionName), shown in the window title; borrowed
     /// from main's arena, which outlives the App.
     session_name: []const u8 = "",
     /// The main window is minimized or suspended (occluded).
@@ -269,6 +290,9 @@ pub const App = struct {
     layout_retry_queued: bool = false,
     start_failed: bool = false,
     preedit_active: bool = false,
+    /// preedit_active, for the renderer, which may draw on another thread
+    /// (input.setComposing writes both).
+    ime_composing: std.atomic.Value(bool) = .init(false),
     /// Cursor blink phase; `visible` is read by the renderer under `mu`.
     cursor_blink: core.frontend_rules.Blink = .{},
     /// GTK main thread only, as are the fields below (blink.zig).
@@ -345,6 +369,17 @@ pub const App = struct {
     /// (Config.TitlebarLayout.island; the rest of the layout is
     /// linux/chrome.zig's). Fixed at startup.
     pub fn island(self: *const App) bool {
+        return self.titlebarLayout().island();
+    }
+
+    /// No caption band: the editor reaches the window top under the band
+    /// the window buttons reveal in (Config.TitlebarLayout.captionless).
+    /// Fixed at startup.
+    pub fn captionless(self: *const App) bool {
+        return self.titlebarLayout().captionless();
+    }
+
+    fn titlebarLayout(self: *const App) core.config.Config.TitlebarLayout {
         const Config = core.config.Config;
         const tabline: Config.TablinePlacement = if (!self.ext_tabline)
             .other
@@ -354,8 +389,7 @@ pub const App = struct {
             .titlebar
         else
             .other;
-        const layout: Config.TitlebarLayout = .{ .style = self.window_cfg.titlebar_style, .tabline = tabline };
-        return layout.island();
+        return .{ .style = self.window_cfg.titlebar_style, .tabline = tabline };
     }
 
     /// GTK main thread: every window draws the committed frame.

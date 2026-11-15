@@ -75,6 +75,20 @@ pub fn scrollAnchor(layer: core.Layer, scrolled_in_own_right: bool, layers: []co
 
 const testing = std.testing;
 
+/// Height, in px of the root grid at integer-or-not `scale`, across which
+/// window separators fade in: a captionless window's top band (`band_pt`),
+/// which lies over the grid since its editor reaches the window top, as
+/// Windows fades them (sidebar_caption.separatorFadePx). 0 with a caption
+/// or title band, below which the grid starts.
+pub fn separatorFadePx(captionless: bool, band_pt: i32, scale: f32) f32 {
+    return if (captionless) @as(f32, @floatFromInt(band_pt)) * scale else 0;
+}
+
+test "separators fade across a captionless band only" {
+    try std.testing.expectEqual(@as(f32, 64), separatorFadePx(true, 32, 2));
+    try std.testing.expectEqual(@as(f32, 0), separatorFadePx(false, 32, 2));
+}
+
 test "a buffer-tracking float follows the window it is anchored to" {
     const win: core.Layer = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 10, .cols = 10, .z = 1, .flags = core.LAYER_MOUSE_ENABLED };
     var float: core.Layer = .{ .grid_id = 5, .anchor_grid = 2, .x_px = 0, .y_px = 0, .rows = 2, .cols = 4, .z = 2, .flags = core.LAYER_FLOAT | core.LAYER_FOLLOWS_SCROLL };
