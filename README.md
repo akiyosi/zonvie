@@ -52,12 +52,14 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
   behind it through the `ext-background-effect-v1` protocol (KDE Plasma,
   GNOME, Hyprland, niri); elsewhere the blur is the compositor's own rules.
   The compositor picks the strength, so `blur_radius` has no effect.
-- **Titlebar**: zonvie draws its own (client-side) titlebar. `"native"` is a
-  GTK header bar; `"hidden"` removes it, showing the window buttons over the
-  top band on hover and a drag bar after resting there; `"unified"` draws a
-  title band in the editor's colours. Titlebar tabs take the titlebar's
-  place. The app menu (New Session, About, Quit) sits next to the window
-  buttons, and `[tabline] style = "menu"` adds a Tabs menu there.
+- **Titlebar**: `"native"` keeps the desktop's own titlebar (none on a
+  tiling compositor such as Hyprland); with a sidebar, its toggle and the app
+  menu (New Session, About, Quit) sit on a rail beside it, and
+  `[tabline] style = "menu"` puts the app and Tabs menus in a bar over the
+  editor. Titlebar tabs take the titlebar's place. `"hidden"` removes the
+  titlebar, showing the window buttons over the top band on hover and a drag
+  bar after resting there; `"unified"` draws a title band in the editor's
+  colours.
 - **Window placement**: Wayland lets no client place its windows, so a torn
   off tab or an external window opens where the compositor puts it, and only
   the window size is remembered between runs.

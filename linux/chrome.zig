@@ -18,8 +18,13 @@ const input = @import("input.zig");
 
 /// What sits where the desktop's titlebar would.
 pub const Header = enum {
-    /// A GtkHeaderBar: the desktop's look, holding the title (or the
-    /// titlebar tabs), the sidebar toggle and the menus.
+    /// The desktop's own titlebar (titlebar_style = "native" without
+    /// titlebar tabs): nothing is drawn in its place. A sidebar's toggle and
+    /// the menus go on a rail beside it, the menu tab style's menus in a bar
+    /// over the editor.
+    desktop,
+    /// A bar of the titlebar tabs, the menus and the window buttons in the
+    /// caption's place.
     header_bar,
     /// No caption: the editor reaches the window top; the window buttons
     /// show while the pointer is in the top band, a drag bar after it rests
@@ -51,7 +56,7 @@ pub fn plan(layout: Config.TitlebarLayout) Plan {
     };
     if (layout.captionless()) return .{ .header = .captionless, .tabs_in_header = false, .tint = .editor_bg };
     if (layout.titleBand()) return .{ .header = .title_band, .tabs_in_header = false, .tint = .ground };
-    return .{ .header = .header_bar, .tabs_in_header = false, .tint = .theme };
+    return .{ .header = .desktop, .tabs_in_header = false, .tint = .theme };
 }
 
 test "the chrome follows the titlebar layout table" {
@@ -65,12 +70,12 @@ test "the chrome follows the titlebar layout table" {
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .ground }, at(.native, .titlebar));
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .editor_bg }, at(.hidden, .titlebar));
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .ground }, at(.unified, .titlebar));
-    try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = false, .tint = .theme }, at(.native, .sidebar));
+    try std.testing.expectEqual(Plan{ .header = .desktop, .tabs_in_header = false, .tint = .theme }, at(.native, .sidebar));
     try std.testing.expectEqual(Header.captionless, at(.hidden, .sidebar).header);
     try std.testing.expectEqual(Header.captionless, at(.hidden, .other).header);
     try std.testing.expectEqual(Header.title_band, at(.unified, .sidebar).header);
     try std.testing.expectEqual(Header.title_band, at(.unified, .other).header);
-    try std.testing.expectEqual(Header.header_bar, at(.native, .other).header);
+    try std.testing.expectEqual(Header.desktop, at(.native, .other).header);
 }
 
 /// The top band of a captionless window, logical px: where the window
@@ -145,9 +150,9 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
     const column = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
     gtk.gtk_widget_set_hexpand(column, 1);
     switch (c.plan.header) {
-        .header_bar => if (c.plan.tabs_in_header) {
-            // The tabs from the window's left edge, the menus and window
-            // buttons after them: a header bar would centre them.
+        // The tabs from the window's left edge, the menus and window
+        // buttons after them.
+        .header_bar => {
             const bar = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
             gtk.gtk_widget_add_css_class(bar, "zonvie-header");
             gtk.gtk_widget_add_css_class(bar, "zonvie-tab-header");
@@ -162,14 +167,14 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
             gtk.gtk_window_handle_set_child(handle, bar);
             gtk.gtk_window_set_titlebar(win, handle);
             c.header = bar;
-        } else {
-            const hb = gtk.gtk_header_bar_new().?;
-            gtk.gtk_widget_add_css_class(hb, "zonvie-header");
-            tintClass(hb, c.plan.tint);
-            if (layout.tabline == .sidebar) gtk.gtk_header_bar_pack_start(hb, sidebarToggle(app));
-            packMenus(app, hb, gtk.gtk_header_bar_pack_end);
-            gtk.gtk_window_set_titlebar(win, hb);
-            c.header = hb;
+        },
+        // The desktop's titlebar stays. The menu tab style's menus need a
+        // home, as macOS's menu bar: a bar of them over the editor.
+        .desktop => if (menuStyle(app)) {
+            const bar = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
+            gtk.gtk_widget_add_css_class(bar, "zonvie-menubar");
+            packMenus(app, bar, gtk.gtk_box_append);
+            gtk.gtk_box_append(column, bar);
         },
         .title_band => {
             setNoTitlebar(win);
@@ -192,10 +197,23 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
     if (layout.tabline == .sidebar) {
         root = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
         const side = buildSidebar(app, strip.?);
+        // Under the desktop's titlebar the toggle and the menus have no
+        // caption to sit in: a rail on the sidebar's outer edge, which stays
+        // when the sidebar slides away, so the toggle can bring it back.
+        const rail: ?*anyopaque = if (c.plan.header == .desktop) blk: {
+            const r = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
+            gtk.gtk_widget_add_css_class(r, "zonvie-sidebar-rail");
+            if (app.widgets.card != null) gtk.gtk_widget_add_css_class(r, "ground");
+            gtk.gtk_box_append(r, sidebarToggle(app));
+            packMenus(app, r, gtk.gtk_box_append);
+            break :blk r;
+        } else null;
         if (c.sidebar_right) {
             gtk.gtk_box_append(root, column);
             gtk.gtk_box_append(root, side);
+            if (rail) |r| gtk.gtk_box_append(root, r);
         } else {
+            if (rail) |r| gtk.gtk_box_append(root, r);
             gtk.gtk_box_append(root, side);
             gtk.gtk_box_append(root, column);
         }
@@ -526,7 +544,7 @@ fn titleBand(win: *anyopaque, tint: Tint, start: ?*anyopaque, end: ?*anyopaque) 
 pub fn decorateExternal(app: *App, win: *anyopaque, content: *anyopaque, pointer: *const input.Pointer, h: *Hover) *anyopaque {
     const p = plan(.{ .style = app.window_cfg.titlebar_style, .tabline = .other });
     switch (p.header) {
-        .header_bar => return content,
+        .desktop, .header_bar => return content,
         .captionless => {
             setNoTitlebar(win);
             buildHover(h, content, gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?, pointer);

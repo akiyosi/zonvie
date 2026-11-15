@@ -502,6 +502,8 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-tab-header > menubutton, .zonvie-tab-header > windowcontrols {{ margin: 2px 4px; }}
         \\.zonvie-band > box > menubutton {{ margin: 0 2px; }}
         \\.zonvie-header.editor-bg {{ background: #{x:0>6}; color: #{x:0>6}; box-shadow: none; border: none; }}
+        \\.zonvie-sidebar-rail, .zonvie-menubar {{ padding: 2px; }}
+        \\.zonvie-sidebar-rail > button, .zonvie-sidebar-rail > menubutton {{ margin: 2px 0; }}
         \\.zonvie-hover-controls {{ opacity: 0; transition: opacity 150ms; padding: 2px 4px; }}
         \\.zonvie-hover-controls.revealed {{ opacity: 1; }}
         \\.zonvie-drag-bar {{ background-color: alpha(#{x:0>6}, 0.12); }}
@@ -535,7 +537,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
             \\.zonvie-card {{ margin: {d}px; border: {d}px solid {s}; outline: 1px solid {s};
             \\  border-radius: {d}px; box-shadow: 0 0 0 {d}px {s}; }}
             \\.zonvie-card.under-tabs {{ margin-top: 1px; }}
-            \\.zonvie-tabbar.ground, .zonvie-header.ground, .zonvie-sidebar.ground {{ background: {s}; border: none; box-shadow: none; }}
+            \\.zonvie-tabbar.ground, .zonvie-header.ground, .zonvie-sidebar.ground, .zonvie-sidebar-rail.ground {{ background: {s}; border: none; box-shadow: none; }}
             \\.zonvie-header.ground {{ color: #{x:0>6}; }}
             \\.zonvie-tabbar.ground:not(.sidebar) {{ color: #{x:0>6}; padding-left: {d}px; }}
             \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab {{ border-radius: 8px 8px 0 0; }}
