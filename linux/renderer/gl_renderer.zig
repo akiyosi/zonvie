@@ -35,6 +35,11 @@ pub const Target = struct {
     /// Size the atlas texture was allocated at; 0 until it holds the atlas.
     atlas_w: u32 = 0,
     atlas_h: u32 = 0,
+    /// Rows of the atlas texture, from the top, that hold the mirror's
+    /// pixels; the rest has storage only (drainAtlas).
+    atlas_rows: u32 = 0,
+    /// The pipeline has drawn once (renderMain).
+    warmed: bool = false,
     /// AtlasOps.gen this texture matches; external windows sync by it.
     atlas_gen: u64 = 0,
     u_scale: i32 = -1,
@@ -166,19 +171,31 @@ fn drainAtlas(app: *App, t: *Target) void {
     gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
     // On atlas create, or a context realized again (atlas_w reset to 0),
-    // the texture is rebuilt from the full mirror, which already holds every
-    // queued upload.
+    // the texture gets new storage and no pixels: the rows the mirror has
+    // glyphs in follow below, and no glyph samples a row past them.
     if (ops.recreate or (ops.w != 0 and (t.atlas_w != ops.w or t.atlas_h != ops.h))) {
         if (ops.w != 0 and ops.h != 0) {
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items.ptr);
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, null);
             t.atlas_w = ops.w;
             t.atlas_h = ops.h;
+            t.atlas_rows = 0;
             ops.clearQueued();
         }
         ops.recreate = false;
     }
     if (t.atlas_w != 0) {
+        // Rows the uploads reached for the first time come whole from the
+        // mirror, which already holds those uploads and is zero around them;
+        // one row more is the last glyph row's padding.
+        const first_new_row = t.atlas_rows;
+        const rows = if (ops.dirty_rows == 0) 0 else @min(ops.h, ops.dirty_rows + 1);
+        if (rows > first_new_row) {
+            const stride = @as(usize, ops.w) * 4;
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, @intCast(first_new_row), @intCast(ops.w), @intCast(rows - first_new_row), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items[stride * first_new_row ..].ptr);
+            t.atlas_rows = rows;
+        }
         for (ops.uploads.items) |u| {
+            if (u.y >= first_new_row) continue;
             gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, @intCast(u.x), @intCast(u.y), @intCast(u.w), @intCast(u.h), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.pixels.items[u.offset..].ptr);
         }
         ops.clearQueued();
@@ -413,6 +430,15 @@ pub fn renderMain(app: *App, t: *Target) Frame {
     drainAtlas(app, t);
     const seq = app.flush_seq;
     if (!begin(app, t)) return .{ .flush_seq = seq };
+    if (!t.warmed) {
+        // A driver may finish compiling the program only at its first draw.
+        // One zero-area triangle makes that happen in the frame before
+        // Neovim's first one, which is empty, instead of delaying its content.
+        t.warmed = true;
+        const zero: [3 * @sizeOf(core.Vertex)]u8 = @splat(0);
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, zero.len, &zero);
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3);
+    }
 
     const layers = app.surface.committedLayers();
     const d = drawSurface(app, t, layers, @intCast(t0));
