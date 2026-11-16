@@ -1,7 +1,7 @@
 //! Core callbacks. They run with grid_mu held, on the core thread or, for a
-//! flush a core_timers tick runs, on the GTK thread; so they never call a
-//! core API that takes grid_mu, never paint, and reach GTK only through
-//! g_idle_add.
+//! flush a core_timers tick runs, on the main thread; so they never call a
+//! core API that takes grid_mu, never paint, and reach the window only
+//! through g_idle_add.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -9,24 +9,25 @@ const clock = core.clock;
 const rules = core.frontend_rules;
 const App = @import("app.zig").App;
 const atlas_pixels = @import("atlas_pixels.zig");
-const gtk = @import("gtk_bindings.zig");
+const glib = @import("glib.zig");
+const ui = @import("ui.zig");
 const applog = @import("app_log.zig");
-const input = @import("input.zig");
+const input = @import("ui.zig").input;
 const overlay_layout = @import("overlay_layout.zig");
-const ui_widgets = @import("ui_widgets.zig");
-const ext_window = @import("ext_window.zig");
-const panel_popup = @import("panel_popup.zig");
-const blink = @import("blink.zig");
+const ui_widgets = @import("ui.zig").ui_widgets;
+const ext_window = @import("ui.zig").ext_window;
+const panel_popup = @import("ui.zig").panel_popup;
+const blink = @import("ui.zig").blink;
 const scrollbar = @import("scrollbar.zig");
 const core_timers = @import("core_timers.zig");
-const font_picker = @import("font_picker.zig");
-const window_size = @import("window_size.zig");
-const ime_off = @import("ime_off.zig");
+const font_picker = @import("ui.zig").font_picker;
+const window_size = @import("ui.zig").window_size;
+const ime_off = @import("ui.zig").ime_off;
 const font_mod = @import("renderer/font.zig");
 const Fonts = font_mod.Fonts;
 const font_spec = @import("font_spec.zig");
 const layer_geom = @import("layer_geom.zig");
-const session = @import("session.zig");
+const session = @import("ui.zig").session;
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -92,7 +93,7 @@ pub fn addWindowLayout(cb: *core.Callbacks) void {
     cb.on_win_move_cursor = onWinMoveCursor;
 }
 
-/// Queued behind the opens and closes before it, for the GTK thread. A
+/// Queued behind the opens and closes before it, for the main thread. A
 /// user command, so a failed append drops it rather than the flush.
 fn queueLayout(app: *App, op: ext_window.Op) void {
     {
@@ -264,7 +265,7 @@ fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u
             app.overlays[@intFromEnum(kind)] = .{ .open = true, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col };
             return;
         }
-        // An ext_windows grid: a window of its own, opened on the GTK thread.
+        // An ext_windows grid: a window of its own, opened on the main thread.
         app.ext_ops.append(app.alloc, .{ .kind = .open, .grid_id = grid_id, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col }) catch return failFlush(app);
     }
     ext_window.queueApply(app);
@@ -341,10 +342,10 @@ fn onCmdlineShow(
 
 /// Any thread; at most one idle is outstanding.
 fn queuePanelColors(app: *App) void {
-    if (!app.panel_colors_queued.swap(true, .acq_rel)) _ = gtk.g_idle_add(&idlePanelColors, app);
+    if (!app.panel_colors_queued.swap(true, .acq_rel)) _ = glib.g_idle_add(&idlePanelColors, app);
 }
 
-/// GTK thread: the highlight lookups take grid_mu, which the core holds
+/// main thread: the highlight lookups take grid_mu, which the core holds
 /// around every callback.
 fn idlePanelColors(data: ?*anyopaque) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(data.?));
@@ -364,7 +365,7 @@ fn idlePanelColors(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 // The frontend-drawn ext UI (ui_state.zig). Immediate callbacks: state is
-// written under App.mu and the GTK thread is asked to refresh.
+// written under App.mu and the main thread is asked to refresh.
 
 fn onMsgShow(
     ctx: ?*anyopaque,
@@ -548,50 +549,31 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 /// Callable from any thread; at most one idle is outstanding. The render
-/// thread is woken here directly, not through the GTK loop.
+/// thread is woken here directly, not through the main loop.
 pub fn queueRender(app: *App) void {
     if (app.render_thread) |rt| rt.request();
     if (app.render_idle_queued.swap(true, .acq_rel)) return;
-    _ = gtk.g_idle_add(&idleQueueRender, app);
+    _ = glib.g_idle_add(&idleQueueRender, app);
 }
 
 fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
-    // Not set when a key handler drew this request already (renderKeyFrame).
     if (app.render_idle_queued.swap(false, .acq_rel)) runQueuedRender(app);
     return 0;
 }
 
-/// How long a key handler waits for the flush that answers its key: under
-/// half a 60 Hz frame, where missing the cycle costs a whole one.
-const key_frame_wait_ns = 8 * std.time.ns_per_ms;
-const key_frame_poll_ns = 200 * std.time.ns_per_us;
+/// How long the resize handler waits for Neovim's answer, and how often it
+/// looks: under half a 60 Hz frame.
+const resize_wait_ns = 8 * std.time.ns_per_ms;
+const resize_poll_ns = 200 * std.time.ns_per_us;
 
-/// From a key handler, after the key went to Neovim. GDK runs a frame cycle
-/// for every input event and starts the next no sooner than a refresh
-/// interval later, so a flush that arrives after the handler returned is
-/// drawn a whole frame late. Neovim usually answers within a millisecond or
-/// two: waiting here puts the answer's draw in the key's own cycle. Polls,
-/// as the flush path then pays nothing for it. The render thread presents by
-/// itself, off GTK's cycle. GTK main thread.
-pub fn renderKeyFrame(app: *App) void {
-    if (app.render_thread != null) return;
-    const io = clock.io();
-    const deadline_ns = clock.nowNs() + key_frame_wait_ns;
-    while (!app.render_idle_queued.load(.acquire)) {
-        if (clock.nowNs() >= deadline_ns) return;
-        std.Io.sleep(io, .{ .nanoseconds = key_frame_poll_ns }, .awake) catch {};
-    }
-    if (app.render_idle_queued.swap(false, .acq_rel)) runQueuedRender(app);
-}
-
-/// From the main area's resize handler, after the new layout went to the
-/// core. GTK delivers a resize inside the frame cycle that draws the new
-/// size, and Neovim answers one within a few ms: without waiting, that
-/// cycle draws the grid laid out for the old size, clipped or short, and
-/// the right one a frame later. Waits only while Neovim's screen is up and
-/// is not the grid the area holds; a Neovim that keeps its size (another UI
-/// holds it smaller) costs the full wait. GTK main thread.
+/// From the window's configure handler, after the new layout went to the
+/// core. The new size is drawn right after, and Neovim answers a resize
+/// within a few ms: without waiting, that draw shows the grid laid out for
+/// the old size, clipped or short, and the right one a frame later. Waits
+/// only while Neovim's screen is up and is not the grid the window holds; a
+/// Neovim that keeps its size (another UI holds it smaller) costs the full
+/// wait. Main thread.
 pub fn awaitResizeAnswer(app: *App) void {
     if (app.render_thread != null) return;
     lock(app);
@@ -604,7 +586,7 @@ pub fn awaitResizeAnswer(app: *App) void {
     const rows = @max(1, h / ch);
     const cols = @max(1, grid_w / cw);
     const io = clock.io();
-    const deadline_ns = clock.nowNs() + key_frame_wait_ns;
+    const deadline_ns = clock.nowNs() + resize_wait_ns;
     while (true) {
         lock(app);
         const root: [2]u32 = for (app.surface.committedLayers()) |l| {
@@ -616,7 +598,7 @@ pub fn awaitResizeAnswer(app: *App) void {
         // GTK's size allocation.
         if (root[0] == 0 or (root[0] == rows and root[1] == cols)) return;
         if (clock.nowNs() >= deadline_ns) return;
-        std.Io.sleep(io, .{ .nanoseconds = key_frame_poll_ns }, .awake) catch {};
+        std.Io.sleep(io, .{ .nanoseconds = resize_poll_ns }, .awake) catch {};
     }
 }
 
@@ -888,7 +870,7 @@ fn pixelSize(app: *App, pt: f32) u32 {
     lock(app);
     const scale = app.scale;
     unlock(app);
-    // GTK's logical 96 dpi, times the surface scale.
+    // A logical 96 dpi, times the surface scale.
     return @intFromFloat(@max(1.0, @round(pt * 96.0 / 72.0 * scale)));
 }
 
@@ -966,7 +948,7 @@ fn rowHeightPx(cell_h_px: u32, linespace_px: i32) u32 {
 /// for a guifont change. Per-grid fonts follow: the new global cell makes
 /// the core re-query every font window and load its slot again
 /// (noteGlobalCellChangeLocked), which onFontSlotLoad does at the new
-/// scale's pixel size. GTK main thread, not holding App.mu; blocks on
+/// scale's pixel size. main thread, not holding App.mu; blocks on
 /// grid_mu.
 pub fn applyScale(app: *App, scale: f32) void {
     lock(app);
@@ -1105,13 +1087,11 @@ fn onSetTitle(ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.
     lock(app);
     app.title_len = rules.copyUtf8Truncated(app.title[0 .. app.title.len - 1], title[0..title_len]);
     unlock(app);
-    _ = gtk.g_idle_add(&idleSetTitle, app);
+    _ = glib.g_idle_add(&idleSetTitle, app);
 }
 
 fn idleSetTitle(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
-    const window = app.window orelse return 0;
-    _ = window;
     var buf: [256]u8 = undefined;
     lock(app);
     @memcpy(buf[0..app.title_len], app.title[0..app.title_len]);
@@ -1126,7 +1106,7 @@ fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
     lock(app);
     app.exit_code = exit_code;
     unlock(app);
-    _ = gtk.g_idle_add(&idleQuit, app);
+    _ = glib.g_idle_add(&idleQuit, app);
 }
 
 fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
@@ -1139,42 +1119,25 @@ fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
     // Neovim quitting (`:qa`) closes the window without a close-request,
     // so its frame is remembered here, while the window still exists.
     window_size.save(appFrom(data));
-    if (appFrom(data).gtk_app) |a| gtk.g_application_quit(a);
+    ui.window.quit(appFrom(data));
     return 0;
 }
 
 fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
     const app = appFrom(ctx);
     app.quit_has_unsaved.store(has_unsaved != 0, .release);
-    _ = gtk.g_idle_add(&idleQuitRequested, app);
+    _ = glib.g_idle_add(&idleQuitRequested, app);
 }
 
+/// Closing the window sends Neovim its own `:confirm qa` (main.zig onClose)
+/// and never asks the core, so this answers only a quit the core raised by
+/// itself: with nothing unsaved it may go on; otherwise it is left unanswered,
+/// as a cancelled dialog would leave it.
 fn idleQuitRequested(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     const cp = app.corep orelse return 0;
-    if (!session.takeQuitReply(app)) return 0;
-    if (!app.quit_has_unsaved.load(.acquire)) {
-        core.zonvie_core_quit_confirmed(cp, 0);
-        return 0;
-    }
-    const dialog = gtk.gtk_alert_dialog_new("%s", "Quit with unsaved changes?") orelse return 0;
-    gtk.gtk_alert_dialog_set_detail(dialog, "Some buffers have unsaved changes. They will be lost.");
-    const labels = [_:null]?[*:0]const u8{ "Cancel", "Discard and Quit" };
-    gtk.gtk_alert_dialog_set_buttons(dialog, &labels);
-    gtk.gtk_alert_dialog_set_cancel_button(dialog, 0);
-    gtk.gtk_alert_dialog_set_default_button(dialog, 0);
-    gtk.gtk_alert_dialog_choose(dialog, session.parentWindow(app), null, &onQuitDialogDone, app);
+    if (!app.quit_has_unsaved.load(.acquire)) core.zonvie_core_quit_confirmed(cp, 0);
     return 0;
-}
-
-fn onQuitDialogDone(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    const app = appFrom(data);
-    var err: ?*anyopaque = null;
-    const choice = gtk.gtk_alert_dialog_choose_finish(source.?, result, &err);
-    if (err) |e| gtk.g_error_free(e);
-    gtk.g_object_unref(source.?);
-    if (choice != 1) return;
-    if (app.corep) |cp| core.zonvie_core_quit_confirmed(cp, 1);
 }
 
 /// `:restart` / `:connect`: the core reconnects by itself and no on_exit
@@ -1197,7 +1160,7 @@ fn onConnect(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) 
 /// Reset here: what names the old server's state.
 /// - cursor_grid_focus: grid ids restart with the server, and the core
 ///   forgets its last cursor grid (windows/callbacks.zig onSessionSwap).
-/// - session_generation, nvim_ready (GTK thread, in the idle).
+/// - session_generation, nvim_ready (main thread, in the idle).
 /// Kept: the ext_ops queue (ordered; the core's closes for the old
 /// session's windows still have to reach them), the panel popups (redrawn
 /// from the next flush's state).
@@ -1205,7 +1168,7 @@ fn onSessionSwap(app: *App) void {
     lock(app);
     app.cursor_grid_focus = 1;
     unlock(app);
-    _ = gtk.g_idle_add(&idleSessionSwap, app);
+    _ = glib.g_idle_add(&idleSessionSwap, app);
 }
 
 fn idleSessionSwap(data: ?*anyopaque) callconv(.c) c_int {
@@ -1220,7 +1183,7 @@ fn idleSessionSwap(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
-    _ = gtk.g_idle_add(&idleImeOff, appFrom(ctx));
+    _ = glib.g_idle_add(&idleImeOff, appFrom(ctx));
 }
 
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
@@ -1229,13 +1192,13 @@ fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 /// The cursor moved to another grid: the window showing it comes forward.
-/// Core thread; the GTK thread presents it.
+/// Core thread; the main thread presents it.
 fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = appFrom(ctx);
     lock(app);
     app.cursor_grid_focus = grid_id;
     unlock(app);
-    _ = gtk.g_idle_add(&idleFocusGrid, app);
+    _ = glib.g_idle_add(&idleFocusGrid, app);
 }
 
 fn idleFocusGrid(data: ?*anyopaque) callconv(.c) c_int {
@@ -1253,7 +1216,7 @@ fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void {
     app.requested_rows = rows;
     app.requested_cols = cols;
     unlock(app);
-    _ = gtk.g_idle_add(&idleResizeToGrid, app);
+    _ = glib.g_idle_add(&idleResizeToGrid, app);
 }
 
 fn idleResizeToGrid(data: ?*anyopaque) callconv(.c) c_int {
@@ -1286,7 +1249,7 @@ fn onCallbackError(ctx: ?*anyopaque, code: u32, component: [*]const u8, componen
 }
 
 // =========================================================================
-// Clipboard: the core thread blocks (bounded) while GTK does the work.
+// Clipboard: the core thread blocks (bounded) while the main thread does the work.
 // =========================================================================
 
 const ClipboardTask = struct {
@@ -1309,7 +1272,7 @@ fn beginClipboardOp(app: *App) u64 {
 
 /// Called and returns with clipboard_mu held. std.Io.Condition has no timed
 /// wait, so this polls for up to 5 s, releasing the mutex while sleeping.
-/// On timeout it bumps the seq so a late GTK completion is ignored.
+/// On timeout it bumps the seq so a late completion is ignored.
 fn waitClipboardReadyLocked(app: *App) bool {
     const io = clock.io();
     const deadline_ns = clock.nowNs() + 5 * std.time.ns_per_s;
@@ -1376,21 +1339,13 @@ test "the star register is the primary selection, plus the clipboard" {
     try std.testing.expectEqual(Selection.clipboard, selectionFor(""));
 }
 
-fn displayClipboard(selection: Selection) ?*anyopaque {
-    const display = gtk.gdk_display_get_default() orelse return null;
-    return switch (selection) {
-        .clipboard => gtk.gdk_display_get_clipboard(display),
-        .primary => gtk.gdk_display_get_primary_clipboard(display),
-    };
-}
-
 fn onClipboardGet(ctx: ?*anyopaque, register: [*]const u8, out_buf: [*]u8, out_len: *usize, max_len: usize) callconv(.c) c_int {
     const app = appFrom(ctx);
     out_len.* = 0;
     const seq = beginClipboardOp(app);
     const task = app.alloc.create(ClipboardTask) catch return 0;
     task.* = .{ .app = app, .seq = seq, .selection = selectionFor(@ptrCast(register)), .buf = &.{} };
-    _ = gtk.g_idle_add(&idleClipboardGet, task);
+    _ = glib.g_idle_add(&idleClipboardGet, task);
 
     app.clipboard_mu.lockUncancelable(clock.io());
     defer app.clipboard_mu.unlock(clock.io());
@@ -1412,31 +1367,21 @@ fn idleClipboardGet(data: ?*anyopaque) callconv(.c) c_int {
         freeTask(task);
         return 0;
     }
-    const clipboard = displayClipboard(task.selection) orelse {
+    defer freeTask(task);
+    const text = ui.window.selectionGet(task.selection == .primary) orelse {
         signalClipboardDone(task.app, task.seq, 0, "");
-        freeTask(task);
         return 0;
     };
-    gtk.gdk_clipboard_read_text_async(clipboard, null, &onClipboardReadFinish, task);
+    defer std.c.free(text.ptr);
+    signalClipboardDone(task.app, task.seq, 1, text);
     return 0;
-}
-
-fn onClipboardReadFinish(source: ?*anyopaque, result: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    const task: *ClipboardTask = @ptrCast(@alignCast(data.?));
-    defer freeTask(task);
-    var err: ?*anyopaque = null;
-    const text = gtk.gdk_clipboard_read_text_finish(source.?, result, &err);
-    if (err) |e| gtk.g_error_free(e);
-    const t = text orelse return signalClipboardDone(task.app, task.seq, 0, "");
-    defer gtk.g_free(t);
-    signalClipboardDone(task.app, task.seq, 1, std.mem.span(t));
 }
 
 fn onClipboardSet(ctx: ?*anyopaque, register: [*]const u8, data: [*]const u8, len: usize) callconv(.c) c_int {
     const app = appFrom(ctx);
     // An empty register empties the clipboard (it is set to ""), as on
     // macOS and Windows. The idle owns its copy, so a later set cannot
-    // overwrite text GDK is still reading.
+    // overwrite text still being handed over.
     const buf = app.alloc.alloc(u8, len + 1) catch return 0;
     @memcpy(buf[0..len], data[0..len]);
     buf[len] = 0;
@@ -1445,7 +1390,7 @@ fn onClipboardSet(ctx: ?*anyopaque, register: [*]const u8, data: [*]const u8, le
         return 0;
     };
     task.* = .{ .app = app, .seq = beginClipboardOp(app), .selection = selectionFor(@ptrCast(register)), .buf = buf };
-    _ = gtk.g_idle_add(&idleClipboardSet, task);
+    _ = glib.g_idle_add(&idleClipboardSet, task);
 
     app.clipboard_mu.lockUncancelable(clock.io());
     defer app.clipboard_mu.unlock(clock.io());
@@ -1466,11 +1411,8 @@ fn idleClipboardSet(data: ?*anyopaque) callconv(.c) c_int {
         defer app.clipboard_mu.unlock(clock.io());
         if (app.clipboard_seq != task.seq) return 0;
     }
-    const clipboard = displayClipboard(task.selection) orelse {
-        signalClipboardDone(app, task.seq, 0, "");
-        return 0;
-    };
-    gtk.gdk_clipboard_set_text(clipboard, @ptrCast(task.buf.ptr));
-    signalClipboardDone(app, task.seq, 1, "");
+    // `buf` carries a trailing 0 the selection does not.
+    const ok = ui.window.selectionSet(task.selection == .primary, task.buf[0 .. task.buf.len - 1]);
+    signalClipboardDone(app, task.seq, @intFromBool(ok), "");
     return 0;
 }

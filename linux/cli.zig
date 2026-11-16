@@ -47,8 +47,6 @@ const usage =
     \\    --extcmdline                  Enable external command line UI
     \\    --extpopup, --extpopupmenu    Enable external popup menu UI
     \\    --extmessages                 Enable external messages UI
-    \\    --exttabline                  Enable external tabline UI
-    \\    --extwindows                  Enable external windows (each Neovim window as OS window)
     \\    --ssh=<user@host[:port]>      Connect to remote host via SSH
     \\    --ssh-identity=<path>         Path to SSH private key file
     \\    --devcontainer=<workspace>    Run inside a devcontainer
@@ -58,9 +56,6 @@ const usage =
     \\                                    Address: TCP "host:port" or Unix socket path.
     \\                                    Mutually exclusive with --ssh / --devcontainer.
     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
-    \\    --renderer=<glarea|thread>    Draw in GTK's GLArea (default) or on a render thread
-    \\    --dialog                      Show a dialog at startup to choose the connection
-    \\                                    (Local / SSH / Devcontainer) before launching nvim.
     \\    --install                     Create default config file and exit
     \\    --version                     Show version information and exit
     \\    --help, -h                    Show this help message and exit
@@ -87,7 +82,7 @@ pub fn printVersion() void {
 
 pub const app_id = "io.github.akiyosi.zonvie";
 
-/// The desktop entry: named after the GtkApplication id, which is the
+/// The desktop entry: named after the window's app id, which is the
 /// Wayland app_id, so the compositor and launchers match the window to it.
 /// `%F` hands chosen files to nvim; the MIME list puts Zonvie under "Open
 /// with" for text files, the role Windows' Applications\zonvie.exe has.
@@ -109,7 +104,7 @@ fn desktopEntry(buf: []u8, exe: []const u8, icon: []const u8) ![]const u8 {
         \\
         \\[Desktop Action new-session]
         \\Name=New Session
-        \\Exec="{s}" --dialog
+        \\Exec="{s}"
         \\
     , .{ exe, icon, app_id, exe });
 }
@@ -319,9 +314,6 @@ test "the nvim path drops one pair of quotes and refuses the rest" {
     try std.testing.expect(!nvimPath("").ignored);
 }
 
-/// Points ssh's SSH_ASKPASS at this executable in askpass mode (askpass.zig),
-/// for every prompt, display or not. Before the core spawns ssh: it passes
-/// the environment as it is then.
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 /// Sets every variable `$SHELL -l -c 'env -0'` prints, but the ones that
 /// describe that shell rather than the user's environment. A shell that
@@ -387,37 +379,6 @@ test "shell env records split at the first '=' and skip the shell's own" {
     try std.testing.expectEqualStrings("MULTI", std.mem.span(c.key));
     try std.testing.expectEqualStrings("1\n2", std.mem.span(c.value));
     try std.testing.expect(it.next() == null);
-}
-
-pub fn setAskpassEnv(env_mode: [:0]const u8) void {
-    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    const n = std.c.readlink("/proc/self/exe", &buf, buf.len - 1);
-    if (n <= 0) return;
-    buf[@intCast(n)] = 0;
-    _ = setenv(askpass_env[0], &buf, 1);
-    _ = setenv(askpass_env[1], "force", 1);
-    _ = setenv(env_mode, "1", 1);
-}
-
-/// The ssh variables setAskpassEnv sets besides its mode marker.
-const askpass_env = [_][:0]const u8{ "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE" };
-
-/// The variables a New Session's process must not inherit. With the askpass
-/// mode marker set (`askpass_marked`), this process ran setAskpassEnv, so
-/// the ssh variables point at zonvie and go with the marker; without it they
-/// are the user's own and stay.
-pub fn newSessionUnsetEnv(askpass_marked: bool) []const [:0]const u8 {
-    const all = comptime askpass_env ++ [_][:0]const u8{@import("askpass.zig").env_mode};
-    return if (askpass_marked) &all else &.{};
-}
-
-test "a new session drops zonvie's askpass environment, not the user's" {
-    const marked = newSessionUnsetEnv(true);
-    try std.testing.expectEqual(@as(usize, 3), marked.len);
-    try std.testing.expectEqualStrings("SSH_ASKPASS", marked[0]);
-    try std.testing.expectEqualStrings("SSH_ASKPASS_REQUIRE", marked[1]);
-    try std.testing.expectEqualStrings("ZONVIE_ASKPASS_MODE", marked[2]);
-    try std.testing.expectEqual(@as(usize, 0), newSessionUnsetEnv(false).len);
 }
 
 /// `~/...` against $HOME.
@@ -506,7 +467,7 @@ test "the desktop entry runs this executable with the chosen files" {
     const e = try desktopEntry(&buf, "/opt/zonvie/zonvie", "/x/icon.png");
     try std.testing.expect(std.mem.indexOf(u8, e, "Exec=\"/opt/zonvie/zonvie\" %F\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, e, "StartupWMClass=io.github.akiyosi.zonvie\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, e, "[Desktop Action new-session]\nName=New Session\nExec=\"/opt/zonvie/zonvie\" --dialog\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "[Desktop Action new-session]\nName=New Session\nExec=\"/opt/zonvie/zonvie\"\n") != null);
 }
 
 test "flags after -- belong to nvim" {

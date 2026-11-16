@@ -1,6 +1,6 @@
 //! What the frontend-drawn ext UI shows: the minis (showmode, showcmd,
 //! ruler, mini-routed messages), a confirm prompt, a toast, OS
-//! notifications and the ext tabline. Core callbacks write it under App.mu; the GTK thread copies it
+//! notifications and the ext tabline. Core callbacks write it under App.mu; the main thread copies it
 //! out and updates the widgets (ui_widgets.zig). Fixed buffers, so a
 //! callback never allocates.
 
@@ -110,7 +110,7 @@ pub const UiState = struct {
     mini_timeout_ms: u32 = 0,
     mini_seq: u32 = 0,
     /// A message for the "notification" view, not yet handed to the OS;
-    /// the GTK thread sends it and clears `notice_pending`.
+    /// the main thread sends it and clears `notice_pending`.
     notice: TextBuf(1024) = .{},
     notice_pending: bool = false,
     /// showmode, showcmd and ruler routed to ext_float, by Mini: state,
@@ -124,7 +124,7 @@ pub const UiState = struct {
     /// AI-agent state by tab handle, `state & 0x7f`; none for 0.
     agents: [tab_cap]Agent = @splat(.{}),
     agent_count: usize = 0,
-    /// Completions not yet announced; the GTK thread drains them.
+    /// Completions not yet announced; the main thread drains them.
     done: [8]Completion = @splat(.{}),
     done_count: usize = 0,
 

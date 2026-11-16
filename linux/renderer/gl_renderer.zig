@@ -1,7 +1,6 @@
-//! OpenGL 3.3 painter for the committed surface snapshot. Runs on the GTK
-//! main thread with a GtkGLArea's context current and its FBO bound. Each
-//! GLArea (the main window, every external window) owns a Target: GTK gives
-//! every area a context of its own, so nothing GL is shared between them.
+//! OpenGL 3.3 painter for the committed surface snapshot. Runs on the main
+//! thread with the window's EGL context current and its framebuffer bound
+//! (wl/window.c). The window owns a Target: its GL objects.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -10,7 +9,7 @@ const gl = @import("../gl.zig");
 const App = @import("../app.zig").App;
 const transform = @import("../transform.zig");
 const applog = @import("../app_log.zig");
-const gtk = @import("../gtk_bindings.zig");
+const ui = @import("../ui.zig");
 const surface_store = @import("../surface_store.zig");
 const GridRows = surface_store.GridRows;
 const Row = surface_store.Row;
@@ -19,13 +18,13 @@ const rules = core.frontend_rules;
 const postfx = @import("postfx.zig");
 const scrollbar = @import("../scrollbar.zig");
 const layer_geom = @import("../layer_geom.zig");
-const chrome = @import("../chrome.zig");
+const chrome = @import("../ui.zig").chrome;
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
 
-/// One GLArea's GL objects, valid between realize and unrealize, and the
-/// size it draws at (device px), set by its resize handler.
+/// One window's GL objects, valid between realize and unrealize, and the
+/// size it draws at (device px), set before each draw.
 pub const Target = struct {
     program: u32 = 0,
     vao: u32 = 0,
@@ -51,8 +50,8 @@ pub const Target = struct {
     u_clear_bg: i32 = -1,
     w_px: u32 = 0,
     h_px: u32 = 0,
-    /// Row 0 of the framebuffer is the image's top: an FBO over a dmabuf
-    /// that GTK reads top-down, unlike a GLArea's.
+    /// Row 0 of the framebuffer is the image's top. A window's framebuffer
+    /// is bottom-up, so this stays false.
     flip_y: bool = false,
     /// Framebuffer px per surface px: 0.5 while the bloom extracts into its
     /// half-resolution texture, so scissors land on the same content.
@@ -61,7 +60,7 @@ pub const Target = struct {
     /// (postfx.renderFrame): the native cursor pass is skipped.
     skip_cursor: bool = false,
     /// One layer's rows concatenated for a single upload; capacity reused
-    /// across frames. Per target, so the render thread and the GTK thread
+    /// across frames. Per target, so the render thread and the main thread
     /// never share one.
     scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
 
@@ -419,8 +418,7 @@ pub const Frame = struct {
 };
 
 /// The main surface and its overlays into `t`, sized `t.w_px` x `t.h_px`.
-/// Takes App.mu. Any thread with `t`'s context current: the GLArea's render
-/// signal, or the render thread.
+/// Takes App.mu. The thread with `t`'s context current.
 pub fn renderMain(app: *App, t: *Target) Frame {
     if (t.program == 0) return .{};
     const t0 = clock.nowNs();
@@ -483,7 +481,7 @@ pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void 
     gl.glUniform1i(t.u_mode, 0);
 }
 
-/// The main GLArea's render signal.
+/// One frame of the main window (main.zig draw).
 pub fn render(app: *App) void {
     app.gl.w_px = app.drawable_w_px;
     app.gl.h_px = app.drawable_h_px;
@@ -830,31 +828,9 @@ fn pushCloseBadge(app: *App, t: *Target, box: overlay_layout.Rect, look: rules.M
     pushSegment(app, t, .{ x0 + hi, y0 + lo }, .{ x0 + lo, y0 + hi }, half_w, tint);
 }
 
-/// Redraws every window on each frame-clock tick while some grid eases; the
-/// tick that finds every ease at rest removes itself. GTK main thread.
+/// Some grid eases, or a shader animates: the window draws the frame after
+/// this one too, and so on until a frame finds everything at rest. Called
+/// from inside a draw. Main thread.
 pub fn startEaseTick(app: *App) void {
-    if (app.ease_tick_active) return;
-    const widget = app.frame_widget orelse return;
-    app.ease_tick_active = true;
-    _ = gtk.gtk_widget_add_tick_callback(widget, &onEaseTick, app, null);
-}
-
-fn onEaseTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
-    _ = widget;
-    _ = frame_clock;
-    const app: *App = @ptrCast(@alignCast(data.?));
-    app.queueRenderAll();
-    app.mu.lockUncancelable(clock.io());
-    defer app.mu.unlock(clock.io());
-    // An animated custom shader keeps frames coming as an ease does.
-    var moving = app.postfx.animating;
-    if (app.render_thread) |rt| {
-        if (rt.animating.load(.acquire)) moving = true;
-    }
-    var it = app.surface.grids.valueIterator();
-    while (it.next()) |g| {
-        if (g.*.ease.moving()) moving = true;
-    }
-    if (!moving) app.ease_tick_active = false;
-    return @intFromBool(moving);
+    ui.window.keepFrames(app);
 }

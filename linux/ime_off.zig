@@ -1,22 +1,21 @@
 //! Switching the input method off ([input] ime_disable_on_activate,
 //! ime_disable_on_modechange, on_ime_off), as Windows closes the IME with
-//! ImmSetOpenStatus. GTK has no call for it, so the IM framework is asked
+//! ImmSetOpenStatus. Wayland has no call for it, so the IM framework is asked
 //! over D-Bus: Fcitx5 deactivates the focused input context
 //! (org.fcitx.Fcitx.Controller1.Deactivate); IBus has no off state since
 //! 1.5, so its global engine becomes the first keyboard-layout ("xkb:")
 //! engine among the active ones, which is what its own "off" means. The
-//! composition is reset first either way, which is all that happens when
-//! neither framework answers. GTK main thread only.
+//! caller resets the composition first, which is all that happens when
+//! neither framework answers. Main thread only.
 
 const std = @import("std");
-const gtk = @import("gtk_bindings.zig");
+const glib = @import("glib.zig");
 
-/// Turns the IME of `im` (an IM context, may be null) off.
-pub fn off(im: ?*anyopaque) void {
-    if (im) |c| gtk.gtk_im_context_reset(c);
-    const bus = gtk.g_bus_get_sync(gtk.G_BUS_TYPE_SESSION, null, null) orelse return ibusOff();
-    defer gtk.g_object_unref(bus);
-    gtk.g_dbus_connection_call(bus, "org.fcitx.Fcitx5", "/controller", "org.fcitx.Fcitx.Controller1", "Deactivate", null, null, 0, call_timeout_ms, null, &onFcitxDone, null);
+/// Turns the input method off.
+pub fn off() void {
+    const bus = glib.g_bus_get_sync(glib.G_BUS_TYPE_SESSION, null, null) orelse return ibusOff();
+    defer glib.g_object_unref(bus);
+    glib.g_dbus_connection_call(bus, "org.fcitx.Fcitx5", "/controller", "org.fcitx.Fcitx.Controller1", "Deactivate", null, null, 0, call_timeout_ms, null, &onFcitxDone, null);
 }
 
 const call_timeout_ms = 500;
@@ -24,9 +23,9 @@ const call_timeout_ms = 500;
 fn onFcitxDone(source: ?*anyopaque, res: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     var err: ?*anyopaque = null;
-    const reply = gtk.g_dbus_connection_call_finish(source.?, res, &err);
-    if (reply) |r| return gtk.g_variant_unref(r);
-    if (err) |e| gtk.g_error_free(e);
+    const reply = glib.g_dbus_connection_call_finish(source.?, res, &err);
+    if (reply) |r| return glib.g_variant_unref(r);
+    if (err) |e| glib.g_error_free(e);
     // No Fcitx5 on the session bus.
     ibusOff();
 }
@@ -38,38 +37,38 @@ var ibus_conn: ?*anyopaque = null;
 fn ibusOff() void {
     const conn = ibus_conn orelse connectIbus() orelse return;
     ibus_conn = conn;
-    gtk.g_dbus_connection_call(conn, "org.freedesktop.IBus", "/org/freedesktop/IBus", "org.freedesktop.IBus", "ListActiveEngines", null, null, 0, call_timeout_ms, null, &onIbusEngines, null);
+    glib.g_dbus_connection_call(conn, "org.freedesktop.IBus", "/org/freedesktop/IBus", "org.freedesktop.IBus", "ListActiveEngines", null, null, 0, call_timeout_ms, null, &onIbusEngines, null);
 }
 
 fn dropIbus(err: ?*anyopaque) void {
-    if (err) |e| gtk.g_error_free(e);
-    if (ibus_conn) |c| gtk.g_object_unref(c);
+    if (err) |e| glib.g_error_free(e);
+    if (ibus_conn) |c| glib.g_object_unref(c);
     ibus_conn = null;
 }
 
 fn onIbusEngines(source: ?*anyopaque, res: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     var err: ?*anyopaque = null;
-    const reply = gtk.g_dbus_connection_call_finish(source.?, res, &err) orelse return dropIbus(err);
-    defer gtk.g_variant_unref(reply);
+    const reply = glib.g_dbus_connection_call_finish(source.?, res, &err) orelse return dropIbus(err);
+    defer glib.g_variant_unref(reply);
     // (av): each an IBusEngineDesc serialized as (s a{sv} name ...).
-    const list = gtk.g_variant_get_child_value(reply, 0) orelse return;
-    defer gtk.g_variant_unref(list);
+    const list = glib.g_variant_get_child_value(reply, 0) orelse return;
+    defer glib.g_variant_unref(list);
     var i: usize = 0;
-    const n = gtk.g_variant_n_children(list);
+    const n = glib.g_variant_n_children(list);
     while (i < n) : (i += 1) {
-        const boxed = gtk.g_variant_get_child_value(list, i) orelse continue;
-        defer gtk.g_variant_unref(boxed);
-        const desc = gtk.g_variant_get_variant(boxed) orelse continue;
-        defer gtk.g_variant_unref(desc);
-        if (gtk.g_variant_get_type_string(desc)[0] != '(' or gtk.g_variant_n_children(desc) < 3) continue;
-        const name_v = gtk.g_variant_get_child_value(desc, 2) orelse continue;
-        defer gtk.g_variant_unref(name_v);
-        if (!std.mem.eql(u8, std.mem.span(gtk.g_variant_get_type_string(name_v)), "s")) continue;
-        const name = gtk.g_variant_get_string(name_v, null) orelse continue;
+        const boxed = glib.g_variant_get_child_value(list, i) orelse continue;
+        defer glib.g_variant_unref(boxed);
+        const desc = glib.g_variant_get_variant(boxed) orelse continue;
+        defer glib.g_variant_unref(desc);
+        if (glib.g_variant_get_type_string(desc)[0] != '(' or glib.g_variant_n_children(desc) < 3) continue;
+        const name_v = glib.g_variant_get_child_value(desc, 2) orelse continue;
+        defer glib.g_variant_unref(name_v);
+        if (!std.mem.eql(u8, std.mem.span(glib.g_variant_get_type_string(name_v)), "s")) continue;
+        const name = glib.g_variant_get_string(name_v, null) orelse continue;
         if (!isLayoutEngine(std.mem.span(name))) continue;
-        const args = gtk.g_variant_new_tuple(&[_]*anyopaque{gtk.g_variant_new_string(name).?}, 1);
-        gtk.g_dbus_connection_call(source.?, "org.freedesktop.IBus", "/org/freedesktop/IBus", "org.freedesktop.IBus", "SetGlobalEngine", args, null, 0, call_timeout_ms, null, &onIbusSet, null);
+        const args = glib.g_variant_new_tuple(&[_]*anyopaque{glib.g_variant_new_string(name).?}, 1);
+        glib.g_dbus_connection_call(source.?, "org.freedesktop.IBus", "/org/freedesktop/IBus", "org.freedesktop.IBus", "SetGlobalEngine", args, null, 0, call_timeout_ms, null, &onIbusSet, null);
         return;
     }
 }
@@ -77,8 +76,8 @@ fn onIbusEngines(source: ?*anyopaque, res: ?*anyopaque, data: ?*anyopaque) callc
 fn onIbusSet(source: ?*anyopaque, res: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     var err: ?*anyopaque = null;
-    const reply = gtk.g_dbus_connection_call_finish(source.?, res, &err) orelse return dropIbus(err);
-    gtk.g_variant_unref(reply);
+    const reply = glib.g_dbus_connection_call_finish(source.?, res, &err) orelse return dropIbus(err);
+    glib.g_variant_unref(reply);
 }
 
 /// An IBus engine that types the keyboard layout as it is: IBus's "off".
@@ -90,13 +89,13 @@ pub fn isLayoutEngine(name: []const u8) bool {
 /// $XDG_CONFIG_HOME/ibus/bus. Null when there is none or it does not answer.
 fn connectIbus() ?*anyopaque {
     var buf: [512]u8 = undefined;
-    const addr: [:0]const u8 = if (gtk.g_getenv("IBUS_ADDRESS")) |a|
+    const addr: [:0]const u8 = if (glib.g_getenv("IBUS_ADDRESS")) |a|
         (std.fmt.bufPrintZ(&buf, "{s}", .{std.mem.span(a)}) catch return null)
     else
         busFileAddress(&buf) orelse return null;
     var err: ?*anyopaque = null;
-    const conn = gtk.g_dbus_connection_new_for_address_sync(addr.ptr, gtk.G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | gtk.G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION, null, null, &err);
-    if (err) |e| gtk.g_error_free(e);
+    const conn = glib.g_dbus_connection_new_for_address_sync(addr.ptr, glib.G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | glib.G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION, null, null, &err);
+    if (err) |e| glib.g_error_free(e);
     return conn;
 }
 
@@ -106,27 +105,27 @@ fn span(s: ?[*:0]const u8) ?[]const u8 {
 
 fn busFileAddress(out: []u8) ?[:0]const u8 {
     const id_c = machineId() orelse return null;
-    defer gtk.g_free(id_c);
+    defer glib.g_free(id_c);
     const id = std.mem.trim(u8, std.mem.span(id_c), " \t\r\n");
     var dir_buf: [1024]u8 = undefined;
-    const dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/ibus/bus", .{std.mem.span(gtk.g_get_user_config_dir())}) catch return null;
-    const dir = gtk.g_dir_open(dir_path.ptr, 0, null) orelse return null;
-    defer gtk.g_dir_close(dir);
+    const dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/ibus/bus", .{std.mem.span(glib.g_get_user_config_dir())}) catch return null;
+    const dir = glib.g_dir_open(dir_path.ptr, 0, null) orelse return null;
+    defer glib.g_dir_close(dir);
     var names: [16][]const u8 = undefined;
     var n: usize = 0;
     // The names live until g_dir_close.
-    while (gtk.g_dir_read_name(dir)) |name| {
+    while (glib.g_dir_read_name(dir)) |name| {
         if (n == names.len) break;
         names[n] = std.mem.span(name);
         n += 1;
     }
-    const name = pickBusFile(names[0..n], id, span(gtk.g_getenv("WAYLAND_DISPLAY")), span(gtk.g_getenv("DISPLAY"))) orelse return null;
+    const name = pickBusFile(names[0..n], id, span(glib.g_getenv("WAYLAND_DISPLAY")), span(glib.g_getenv("DISPLAY"))) orelse return null;
     var path_buf: [1280]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, name }) catch return null;
     var text: ?[*:0]u8 = null;
     var len: usize = 0;
-    if (gtk.g_file_get_contents(path.ptr, &text, &len, null) == 0) return null;
-    defer gtk.g_free(text);
+    if (glib.g_file_get_contents(path.ptr, &text, &len, null) == 0) return null;
+    defer glib.g_free(text);
     const addr = busAddress(text.?[0..len]) orelse return null;
     return std.fmt.bufPrintZ(out, "{s}", .{addr}) catch null;
 }
@@ -135,7 +134,7 @@ fn machineId() ?[*:0]u8 {
     for ([_][*:0]const u8{ "/etc/machine-id", "/var/lib/dbus/machine-id" }) |path| {
         var text: ?[*:0]u8 = null;
         var len: usize = 0;
-        if (gtk.g_file_get_contents(path, &text, &len, null) != 0) return text;
+        if (glib.g_file_get_contents(path, &text, &len, null) != 0) return text;
     }
     return null;
 }

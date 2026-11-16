@@ -1,5 +1,5 @@
 //! All Linux frontend state. Core callbacks write it on the core thread;
-//! the GTK main thread reads it. `mu` guards everything both threads touch.
+//! the main thread reads it. `mu` guards everything both threads touch.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -8,18 +8,18 @@ const Fonts = @import("renderer/font.zig").Fonts;
 const scroll_ease = core.scroll_ease;
 const overlay_layout = @import("overlay_layout.zig");
 const ui_state = @import("ui_state.zig");
-const ui_widgets = @import("ui_widgets.zig");
+const ui_widgets = @import("ui.zig").ui_widgets;
 const gl_renderer = @import("renderer/gl_renderer.zig");
-const input = @import("input.zig");
-const ext_window = @import("ext_window.zig");
-const panel_popup = @import("panel_popup.zig");
-const gtk = @import("gtk_bindings.zig");
-const render_thread = @import("render_thread.zig");
+const input = @import("ui.zig").input;
+const ext_window = @import("ui.zig").ext_window;
+const panel_popup = @import("ui.zig").panel_popup;
+const ui = @import("ui.zig");
+const render_thread = @import("ui.zig").render_thread;
 const postfx = @import("renderer/postfx.zig");
 const scrollbar = @import("scrollbar.zig");
-const window_size = @import("window_size.zig");
+const window_size = @import("ui.zig").window_size;
 const lifecycle = @import("lifecycle.zig");
-const tray = @import("tray.zig");
+const tray = @import("ui.zig").tray;
 
 pub const AtlasUpload = struct { x: u32, y: u32, w: u32, h: u32, offset: usize };
 
@@ -81,9 +81,6 @@ pub const App = struct {
     /// The desktop draws a titlebar for "native" (chrome.desktopDrawsTitlebar).
     /// Fixed at startup.
     desktop_titlebar: bool = true,
-    /// [server] open_mode = "current": a single forwarded file replaces the
-    /// current window instead of opening a tab.
-    open_mode_current: bool = false,
     /// config.toml [log] perf_only / scroll_only, applied to the core.
     log_perf_only: bool = false,
     log_scroll_only: bool = false,
@@ -94,12 +91,8 @@ pub const App = struct {
     tabline_cfg: core.config.Config.TablineConfig = .{},
     /// ext_tabline is on (config.toml or --exttabline).
     ext_tabline: bool = false,
-    /// The notification server's ids per slot. GTK main thread.
-    notify: @import("notify.zig").State = .{},
     /// The grid the cursor last moved to (on_cursor_grid_changed).
     cursor_grid_focus: i64 = 1,
-    /// The main window's size against the cell grid. GTK main thread.
-    window_size: window_size.State = .{},
     /// ext_cmdline is on (config.toml or --extcmdline); without it Neovim
     /// draws its cmdline on the grid's last row.
     ext_cmdline: bool = false,
@@ -133,17 +126,17 @@ pub const App = struct {
     msg_pos: core.config.Config.MsgPosConfig = .{},
     /// The core's message anchor (zonvie_core_msg_anchor); null before the
     /// first. Written under `mu` with each commit, on the core thread, so a
-    /// frame drawn from it has both, and again by the GTK thread's idle
+    /// frame drawn from it has both, and again by the main thread's idle
     /// that places the panels.
     msg_anchor: ?core.MsgAnchor = null,
     /// The confirm dialog's box in surface px while it shows; written by
-    /// ui_widgets.placeMessages on the GTK thread under `mu`, read by the
+    /// ui_widgets.placeMessages on the main thread under `mu`, read by the
     /// overlay layout wherever the frame is drawn.
     confirm_rect: ?overlay_layout.Rect = null,
     /// config.toml's [font]; `family` borrows the Config, which outlives the app.
     font_cfg: core.config.Config.FontConfig = .{},
-    /// GLArea size in device pixels and its integer scale factor; written by
-    /// the GTK thread, read by the core thread, both under `mu`.
+    /// The window's size in device pixels and its integer scale factor; written by
+    /// the main thread, read by the core thread, both under `mu`.
     drawable_w_px: u32 = 0,
     drawable_h_px: u32 = 0,
     scale: f32 = 1.0,
@@ -156,7 +149,7 @@ pub const App = struct {
     /// on_external_window and its close, read by the paint.
     overlays: [4]overlay_layout.Surface = @splat(.{}),
     /// The cmdline panel where the user dropped it, for the rest of the
-    /// session (overlay_layout.Inputs.cmdline_user). GTK thread writes, the
+    /// session (overlay_layout.Inputs.cmdline_user). main thread writes, the
     /// paint reads; under `mu`.
     cmdline_user: ?overlay_layout.Rect = null,
     /// msg_show's pointer and pin (frontend_rules.MsgShowChrome) and the
@@ -164,7 +157,7 @@ pub const App = struct {
     msg_chrome: core.frontend_rules.MsgShowChrome = .{},
     msg_show_user: ?[2]i32 = null,
     /// The main view's panels are popup surfaces (panel_popup.zig), not
-    /// drawn in the view. GTK thread writes, the paint reads; under `mu`.
+    /// drawn in the view. main thread writes, the paint reads; under `mu`.
     panel_popups: bool = false,
     /// The width of the output the main window is on, device px; 0 until
     /// known (panel_popup.noteMonitor). Under `mu`.
@@ -178,7 +171,7 @@ pub const App = struct {
     cmdline_firstc: u8 = 0,
     /// Search bg (the cmdline and popupmenu border) and Comment fg (the
     /// cmdline icon, the close badge's tint), as Windows and macOS colour
-    /// them; read on the GTK thread when a cmdline shows and after a flush
+    /// them; read on the main thread when a cmdline shows and after a flush
     /// that follows a default-colour change, since a core callback cannot.
     cmdline_border_rgb: u32 = 0xffff00,
     cmdline_icon_rgb: u32 = 0x808080,
@@ -195,9 +188,9 @@ pub const App = struct {
 
     atlas_pending: AtlasOps = .{},
 
-    /// The main GLArea's GL objects; GTK main thread only.
+    /// The main window's GL objects; main thread only.
     gl: gl_renderer.Target = .{},
-    /// The main GLArea's bloom and custom shader chain; GTK main thread only.
+    /// The main window's bloom and custom shader chain; main thread only.
     postfx: postfx.PostFx = .{},
     /// config.toml [shaders] paths when enabled; borrowed from the config,
     /// which outlives the App.
@@ -213,65 +206,32 @@ pub const App = struct {
     /// Bumped by every committed flush (under `mu`), so a frame can say
     /// which commit it shows.
     flush_seq: u64 = 0,
-    /// flush_seq of the frame the main window last handed to GTK; GTK main
-    /// thread only.
+    /// flush_seq of the frame the main window last drew; main thread only.
     presented_seq: u64 = 0,
-    /// When presented_seq last moved, for the latency bench's breakdown.
-    presented_ns: i128 = 0,
 
-    // GTK objects; written and read only on the GTK main thread.
-    gl_area: ?*anyopaque = null,
-    /// Set when the render thread draws the main window instead of a GLArea.
+    // Window-side state; written and read only on the main thread.
+    /// A thread that presents by itself: never set (unbuilt.zig).
     render_thread: ?*render_thread.RenderThread = null,
-    /// The widget whose frame clock paces the main window: the GLArea, or
-    /// the picture the render thread's frames are shown in.
-    frame_widget: ?*anyopaque = null,
     window: ?*anyopaque = null,
-    gtk_app: ?*anyopaque = null,
     /// The main window's input; set up with the window.
     pointer: input.Pointer = undefined,
-    /// The panel popups, by overlay_layout.Kind; GTK main thread only.
-    popups: [4]?*panel_popup.Popup = @splat(null),
-    /// ext_windows by root grid id; GTK main thread only.
+    /// ext_windows by root grid id; main thread only.
     ext_windows: std.AutoHashMapUnmanaged(i64, *ext_window.ExtWindow) = .empty,
-    /// Opens and closes the core queued (under `mu`), and the list the GTK
-    /// idle swaps them into, so neither side allocates while the other reads.
+    /// Opens and closes the core queued (under `mu`), and the list the main
+    /// thread's idle swaps them into, so neither side allocates while the other reads.
     ext_ops: std.ArrayListUnmanaged(ext_window.Op) = .empty,
     ext_ops_gtk: std.ArrayListUnmanaged(ext_window.Op) = .empty,
-    ext_idle_queued: std.atomic.Value(bool) = .init(false),
-    /// A torn-off tab's drop point for the next external window (X11 only;
-    /// x11_place). GTK main thread only.
-    ext_placement: core.frontend_rules.PlacementMemory = .{},
     /// Bumped by every :restart / reconnect (on_restart, on_connect): grid
-    /// ids restart with the server. GTK main thread.
+    /// ids restart with the server. main thread.
     session_generation: u64 = 0,
-    /// A frame-clock tick callback is installed and redraws every frame
-    /// while some grid eases.
-    ease_tick_active: bool = false,
-    widgets: ui_widgets.Widgets = .{},
-    /// ui_widgets' copy of `ui`, taken under `mu` and applied without it.
-    ui_snapshot: ui_widgets.SnapshotStorage = undefined,
-    /// NUL-terminated label text, sized for the largest ui_state buffer.
-    ui_text_scratch: [4097]u8 = undefined,
-    /// The toast_seq a hide timer is pending for.
-    toast_timer_seq: u32 = 0,
-    /// The mini_seq a hide timer is pending for.
-    mini_timer_seq: u32 = 0,
-    ui_idle_queued: std.atomic.Value(bool) = .init(false),
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
     /// on_quit_requested's argument, read by its idle.
     quit_has_unsaved: std.atomic.Value(bool) = .init(false),
 
-    // Lifecycle (session.zig); GTK main thread only.
+    // Lifecycle (session.zig); main thread only.
     /// The close / quit-timeout state machine.
     quit: lifecycle.Quit = .{},
-    /// The armed quit timeout's source id, 0 when none.
-    quit_timer: c_uint = 0,
-    /// Set while `devcontainer up` runs before the core starts; cancelling
-    /// it abandons the start (the `up` itself keeps running, as on macOS
-    /// and Windows).
-    dc_up_cancel: ?*anyopaque = null,
     /// Neovim drew its first frame: the window is shown (if it waited for
     /// that) and queued file opens are sent.
     nvim_ready: bool = false,
@@ -279,9 +239,6 @@ pub const App = struct {
     show_when_ready: bool = false,
     /// Where this session's nvim runs; decides what an early exit shows.
     start_kind: lifecycle.StartKind = .local,
-    /// The timeout that shows a hidden start's window with its progress
-    /// (lifecycle.connect_reveal_ms); 0 when none is armed.
-    reveal_timer: c_uint = 0,
     /// stderr of the starting process, for the early-exit alert. Written
     /// from the core's stderr thread (its own lock).
     start_output: lifecycle.StartOutput = .{},
@@ -291,37 +248,23 @@ pub const App = struct {
     /// (lifecycle.defaultSessionName), shown in the window title; borrowed
     /// from main's arena, which outlives the App.
     session_name: []const u8 = "",
-    /// The main window is minimized or suspended (occluded).
-    window_hidden: bool = false,
-    /// [server] close_to_tray, and the tray item when it registered.
-    close_to_tray: bool = false,
     tray: tray.Tray = .{},
 
-    // Window and input state; GTK main thread only.
-    /// main.zig's Startup, alive for the whole GTK run.
-    startup: ?*anyopaque = null,
-    gl_realized_once: bool = false,
+    // Window and input state; main thread only.
     layout_ready_sent: bool = false,
     layout_retry_queued: bool = false,
-    start_failed: bool = false,
     preedit_active: bool = false,
     /// preedit_active, for the renderer, which may draw on another thread
     /// (input.setComposing writes both).
     ime_composing: std.atomic.Value(bool) = .init(false),
     /// Cursor blink phase; `visible` is read by the renderer under `mu`.
     cursor_blink: core.frontend_rules.Blink = .{},
-    /// GTK main thread only, as are the fields below (blink.zig).
-    blink_timer: c_uint = 0,
-    blink_retry_queued: bool = false,
-    /// Some window of the app has focus.
-    app_active: bool = false,
-    active_idle_queued: bool = false,
     /// Last complete visible-grid snapshot for pointer hit tests; kept when
     /// the non-blocking query finds grid_mu busy.
     pointer_grids: [32]core.GridInfo = undefined,
     pointer_grids_len: usize = 0,
 
-    /// core_timers.zig. GTK main thread only.
+    /// core_timers.zig. main thread only.
     msg_timer: c_uint = 0,
     flush_retry_timer: c_uint = 0,
     flush_retry_delay_ms: c_uint = 16,
@@ -329,7 +272,7 @@ pub const App = struct {
     /// wins, since a commit after an abort carries the aborted rows.
     flush_outcome: std.atomic.Value(FlushOutcome) = .init(.none),
 
-    // The flushing thread only: the core thread, or the GTK thread while a
+    // The flushing thread only: the core thread, or the main thread while a
     // core_timers tick runs a flush. grid_mu is held either way.
     flush_failed: bool = false,
     /// Between on_flush_begin and on_flush_end.
@@ -348,17 +291,10 @@ pub const App = struct {
     clipboard_text: std.ArrayListUnmanaged(u8) = .empty,
     clipboard_result: c_int = 0,
     clipboard_ready: bool = false,
-    /// Bumped per clipboard operation; a GTK completion whose seq is stale
+    /// Bumped per clipboard operation; a completion whose seq is stale
     /// belongs to a caller that timed out and must not signal.
     clipboard_seq: u64 = 0,
 
-    /// on_win_move_cursor's answer from the GTK thread (X11 only), as the
-    /// clipboard's: the core thread polls `win_find_ready` under
-    /// `win_find_mu`; an answer whose seq is stale is dropped.
-    win_find_mu: std.Io.Mutex = .init,
-    win_find_ready: bool = false,
-    win_find_result: i64 = 0,
-    win_find_seq: u64 = 0,
 
     pub fn deinit(self: *App) void {
         self.surface.deinit(self.alloc);
@@ -406,10 +342,10 @@ pub const App = struct {
             .titlebar
         else
             .other;
-        return .{ .style = @import("chrome.zig").effectiveStyle(self.window_cfg.titlebar_style, tabline, self.desktop_titlebar), .tabline = tabline };
+        return .{ .style = @import("ui.zig").chrome.effectiveStyle(self.window_cfg.titlebar_style, tabline, self.desktop_titlebar), .tabline = tabline };
     }
 
-    /// GTK main thread: every window draws the committed frame.
+    /// main thread: every window draws the committed frame.
     pub fn translucent(self: *const App) bool {
         return self.window_cfg.opacity < 1.0 or self.window_cfg.blur;
     }
@@ -419,12 +355,8 @@ pub const App = struct {
         self.queueRenderGtk();
     }
 
-    /// Every surface GTK draws (all but the render thread's) draws the
-    /// committed frame. GTK main thread.
+    /// The window draws the committed frame. Main thread.
     pub fn queueRenderGtk(self: *App) void {
-        if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);
-        var it = self.ext_windows.valueIterator();
-        while (it.next()) |w| if (w.*.area) |a| gtk.gtk_gl_area_queue_render(a);
-        panel_popup.queueRender(self);
+        ui.window.queueRender(self);
     }
 };

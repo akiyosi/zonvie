@@ -1,4 +1,4 @@
-//! Window lifecycle rules, free of GTK: what closing the main window does,
+//! Window lifecycle rules, free of any window system: what closing the main window does,
 //! the quit timeout ("Neovim Not Responding", as macOS's requestQuit and
 //! Windows' WM_CLOSE / TIMER_QUIT_TIMEOUT), the failure text of a
 //! `devcontainer up`, and the window title a named session carries.
@@ -197,7 +197,7 @@ test "a remote start that ends early explains itself; a local one does not" {
 
 /// The last bytes a starting session's process wrote to stderr, for the
 /// early-exit alert. Written by the core's stderr thread (on_log), read on
-/// the GTK thread once nvim has exited; its own lock, since on_log may run
+/// the main thread once nvim has exited; its own lock, since on_log may run
 /// while the app lock is held elsewhere.
 pub const StartOutput = struct {
     mu: std.Io.Mutex = .init,

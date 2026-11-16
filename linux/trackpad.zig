@@ -1,18 +1,19 @@
-//! Touchpad scrolling: GTK's kinetic scroll controller in surface px →
+//! Touchpad scrolling: the pointer's scroll travel in surface px →
 //! pixel_scroll.zig's model on the grid's ease (grid_ease.zig). The content
-//! follows the fingers by a sub-cell offset, keeps going under momentum after
-//! a flick, and stretches then springs back at a buffer edge. GTK main thread
-//! only. Mouse wheels never come here (input.zig onScroll).
+//! follows the fingers by a sub-cell offset, and stretches then springs back
+//! at a buffer edge. No momentum after a flick: Wayland sends none, and
+//! nothing here makes it up. Main thread only. Mouse wheels never come here
+//! (main.zig onPointerAxis).
 
 const std = @import("std");
 const core = @import("zonvie_core");
 const clock = core.clock;
-const gtk = @import("gtk_bindings.zig");
+const glib = @import("glib.zig");
 const applog = @import("app_log.zig");
-const input = @import("input.zig");
+const input = @import("pointer.zig");
 const pixel_scroll = @import("pixel_scroll.zig");
 
-/// One GLArea's touchpad gesture, from scroll-begin through its momentum.
+/// One window's touchpad gesture, from its first step to its end.
 pub const State = struct {
     /// The grid the gesture's vertical travel addresses, chosen at its first
     /// step and kept to its end, as macOS's ScrollTargetLock.
@@ -23,108 +24,20 @@ pub const State = struct {
     /// Fractional wheel events gathered from travel that is not pixel-scrolled.
     v_acc: f64 = 0,
     h_acc: f64 = 0,
-    /// Fractional steps of a high-resolution wheel (input.zig onScroll).
-    wheel_x: f64 = 0,
-    wheel_y: f64 = 0,
-    /// Momentum after a flick, in device px/s, positive moving the content
-    /// down; its tick callback id and the previous frame's time.
-    momentum_px_s: f64 = 0,
-    /// The horizontal momentum, device px/s, positive scrolling right.
-    momentum_x_px_s: f64 = 0,
-    momentum_tick: c_uint = 0,
-    last_frame_us: i64 = 0,
     /// The grid whose window lends its 'smoothscroll' to the gesture; 0 none.
     borrowed_grid: i64 = 0,
-    /// The modifiers of the last step, sent with the momentum's events.
+    /// The modifiers of the last step.
     mods: [5]u8 = .{ 0, 0, 0, 0, 0 },
-    end_queued: bool = false,
-    /// When the last vertical step arrived, and the timer that ends a
-    /// gesture whose end never comes (X11 reports no scroll stop).
+    /// When the last vertical step arrived, and the timer that ends the
+    /// gesture once no step follows.
     last_step_ns: i64 = 0,
     watchdog: c_uint = 0,
 };
 
-/// A gesture with no step for this long, and no momentum, has ended.
+/// A gesture with no step for this long has ended.
 const idle_end_ns: i64 = 500 * std.time.ns_per_ms;
 
-pub fn onBegin(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = ctrl;
-    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    // A new gesture may address another grid: the old one lets go.
-    finish(p);
-}
-
-/// Fingers lifted. A flick follows with decelerate in the same dispatch;
-/// without one the gesture ends once the dispatch is over.
-pub fn onEnd(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    _ = ctrl;
-    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    applog.appLog("[trackpad] end\n", .{});
-    if (p.scroll.end_queued) return;
-    p.scroll.end_queued = true;
-    _ = gtk.g_idle_add(&idleEnd, p);
-}
-
-fn idleEnd(data: ?*anyopaque) callconv(.c) c_int {
-    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    p.scroll.end_queued = false;
-    if (p.scroll.momentum_tick == 0) finish(p);
-    return 0;
-}
-
-/// A flick: vertical momentum for a pixel-scrolled target, horizontal
-/// momentum as further wheel events on any grid.
-pub fn onDecelerate(ctrl: ?*anyopaque, vel_x: f64, vel_y: f64, data: ?*anyopaque) callconv(.c) void {
-    _ = ctrl;
-    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    applog.appLog("[trackpad] decelerate vx={d:.0} vy={d:.0} pixel={}\n", .{ vel_x, vel_y, p.scroll.pixel });
-    const scale: f64 = p.app.scale;
-    const v = -vel_y * scale;
-    const vx = vel_x * scale;
-    const vertical_on = p.scroll.pixel and p.scroll.target != null and @abs(v) >= pixel_scroll.momentum_stop_px_s;
-    const horizontal_on = @abs(vx) >= pixel_scroll.momentum_stop_px_s;
-    if (!vertical_on and !horizontal_on) return;
-    const area = p.area orelse return;
-    p.scroll.momentum_px_s = if (vertical_on) v else 0;
-    p.scroll.momentum_x_px_s = if (horizontal_on) vx else 0;
-    p.scroll.last_frame_us = 0;
-    if (p.scroll.momentum_tick == 0) p.scroll.momentum_tick = gtk.gtk_widget_add_tick_callback(area, &onMomentumTick, p, null);
-}
-
-fn onMomentumTick(widget: ?*anyopaque, frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) c_int {
-    _ = widget;
-    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    const now_us = gtk.gdk_frame_clock_get_frame_time(frame_clock.?);
-    const dt_s: f64 = if (p.scroll.last_frame_us == 0) 1.0 / 60.0 else @as(f64, @floatFromInt(now_us - p.scroll.last_frame_us)) / std.time.us_per_s;
-    p.scroll.last_frame_us = now_us;
-    const cp = p.app.corep orelse return stopMomentum(p);
-    if (p.scroll.momentum_px_s != 0) {
-        const step = pixel_scroll.momentumStep(p.scroll.momentum_px_s, dt_s);
-        const at_edge = vertical(p, cp, step.delta_px, @ptrCast(&p.scroll.mods));
-        // Like the native rubber band, momentum reaching an edge is
-        // swallowed and the bounce starts at once.
-        p.scroll.momentum_px_s = if (at_edge) 0 else step.velocity_px_s;
-    }
-    if (p.scroll.momentum_x_px_s != 0) {
-        const step = pixel_scroll.momentumStep(p.scroll.momentum_x_px_s, dt_s);
-        p.scroll.momentum_x_px_s = step.velocity_px_s;
-        horizontal(p, cp, step.delta_px, 0, @ptrCast(&p.scroll.mods));
-    }
-    if (p.scroll.momentum_px_s != 0 or p.scroll.momentum_x_px_s != 0) return 1;
-    p.scroll.momentum_tick = 0;
-    finish(p);
-    return 0;
-}
-
-fn stopMomentum(p: *input.Pointer) c_int {
-    p.scroll.momentum_tick = 0;
-    p.scroll.momentum_px_s = 0;
-    p.scroll.momentum_x_px_s = 0;
-    finish(p);
-    return 0;
-}
-
-/// One touchpad step of (dx, dy) logical px, GTK's sign (positive scrolls
+/// One touchpad step of (dx, dy) logical px, the pointer axis's sign (positive scrolls
 /// toward the end, moving the content up / left).
 pub fn scroll(p: *input.Pointer, cp: *core.zonvie_core, dx: f64, dy: f64, mods: [*:0]const u8) void {
     const len = std.mem.len(mods);
@@ -147,7 +60,7 @@ fn vertical(p: *input.Pointer, cp: *core.zonvie_core, delta_px: f64, mods: [*:0]
         const c = input.resolve(p, cp, p.x, p.y, 1) orelse return false;
         p.scroll.target = c;
         p.scroll.pixel = pixelScrolls(cp, c.grid_id);
-        if (p.scroll.watchdog == 0) p.scroll.watchdog = gtk.g_timeout_add(100, &watchdog, p);
+        if (p.scroll.watchdog == 0) p.scroll.watchdog = glib.g_timeout_add(100, &watchdog, p);
         break :blk c;
     };
     p.scroll.last_step_ns = @intCast(clock.nowNs());
@@ -231,18 +144,12 @@ fn send(cp: *core.zonvie_core, c: input.Cell, dir: [*:0]const u8, mods: [*:0]con
     while (i < @min(n, 16)) : (i += 1) core.zonvie_core_send_mouse_scroll(cp, c.grid_id, c.row, c.col, dir, mods);
 }
 
-/// The gesture is over: momentum stops, the target's offset springs back
+/// The gesture is over: the target's offset springs back
 /// (its edge bounce), and its window gets its 'smoothscroll' back.
 pub fn finish(p: *input.Pointer) void {
     const app = p.app;
-    if (p.scroll.momentum_tick != 0) {
-        if (p.area) |a| gtk.gtk_widget_remove_tick_callback(a, p.scroll.momentum_tick);
-        p.scroll.momentum_tick = 0;
-    }
-    p.scroll.momentum_px_s = 0;
-    p.scroll.momentum_x_px_s = 0;
     if (p.scroll.watchdog != 0) {
-        _ = gtk.g_source_remove(p.scroll.watchdog);
+        _ = glib.g_source_remove(p.scroll.watchdog);
         p.scroll.watchdog = 0;
     }
     if (p.scroll.target) |t| {
@@ -276,7 +183,7 @@ fn restoreSmoothScroll(p: *input.Pointer) void {
         p.scroll.borrowed_grid = 0;
         return;
     }
-    _ = gtk.g_timeout_add(20, &retryRestore, p);
+    _ = glib.g_timeout_add(20, &retryRestore, p);
 }
 
 fn retryRestore(data: ?*anyopaque) callconv(.c) c_int {
@@ -289,7 +196,7 @@ fn retryRestore(data: ?*anyopaque) callconv(.c) c_int {
 
 fn watchdog(data: ?*anyopaque) callconv(.c) c_int {
     const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    if (p.scroll.momentum_tick != 0 or clock.nowNs() - p.scroll.last_step_ns < idle_end_ns) return 1;
+    if (clock.nowNs() - p.scroll.last_step_ns < idle_end_ns) return 1;
     // finish must not remove the source returning here.
     p.scroll.watchdog = 0;
     finish(p);

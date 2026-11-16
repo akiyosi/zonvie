@@ -3,7 +3,7 @@
 //! offset, Neovim is asked for rows before the finger reaches them, and each
 //! answer is cancelled against the offset so the picture never jumps. At a
 //! buffer edge the offset stretches with resistance and springs back once the
-//! fingers lift. Pure; the GTK shell (trackpad.zig) and the grid's ease
+//! fingers lift. Pure; its caller (trackpad.zig) and the grid's ease
 //! (grid_ease.zig) own the state.
 //!
 //! Signs follow scroll_ease.zig: a positive offset draws the content lower,

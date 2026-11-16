@@ -1,30 +1,11 @@
 //! The panic handler, as windows/main.zig's: the message and the stack go to
 //! the log file and stderr. Without a terminal (a detached or launcher
 //! start, whose stderr nobody reads) the report is also kept in
-//! $XDG_STATE_HOME/zonvie/crash.log and a separate zonvie process shows it
-//! in an alert, since this process may be on any thread and is about to
-//! abort. No allocation: everything uses fixed buffers.
+//! $XDG_STATE_HOME/zonvie/crash.log. Nothing shows it on screen: there is no
+//! dialog to show it in. No allocation: everything uses fixed buffers.
 
 const std = @import("std");
 const applog = @import("app_log.zig");
-const connect_dialog = @import("connect_dialog.zig");
-
-/// Set in the alert process's environment; its argv[1] is the alert text.
-pub const env_mode = "ZONVIE_CRASH_REPORT";
-
-pub fn requested() bool {
-    return std.c.getenv(env_mode) != null;
-}
-
-/// The alert process (main, before anything else).
-pub fn runAlert(detail: []const u8) u8 {
-    var buf: [2048]u8 = undefined;
-    const n = @min(detail.len, buf.len - 1);
-    @memcpy(buf[0..n], detail[0..n]);
-    buf[n] = 0;
-    connect_dialog.alert(null, "Zonvie crashed", @ptrCast(&buf));
-    return 0;
-}
 
 var g_entered = std.atomic.Value(bool).init(false);
 var g_report: [16 * 1024]u8 = undefined;
@@ -51,8 +32,6 @@ pub fn onPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
         const state: ?[]const u8 = if (std.c.getenv("XDG_STATE_HOME")) |s| std.mem.span(s) else null;
         const path = crashPath(&path_buf, state, home);
         if (path) |p| writeCrashFile(p, report);
-        var detail_buf: [1024]u8 = undefined;
-        showAlert(alertText(&detail_buf, msg, path));
     }
     // stderr, then abort, as without this handler.
     std.debug.defaultPanic(msg, first_trace_addr);
@@ -77,19 +56,6 @@ test "the crash file lives under XDG_STATE_HOME, else ~/.local/state" {
     try std.testing.expect(crashPath(&buf, null, null) == null);
     var tiny: [8]u8 = undefined;
     try std.testing.expect(crashPath(&tiny, "/s", null) == null);
-}
-
-/// The alert's text: the panic message and where the report went.
-pub fn alertText(buf: []u8, msg: []const u8, path: ?[]const u8) []const u8 {
-    const short = msg[0..@min(msg.len, 400)];
-    if (path) |p| return std.fmt.bufPrint(buf, "{s}\n\nThe report was written to {s}.", .{ short, p }) catch short;
-    return short;
-}
-
-test "the crash alert names the message and the report file" {
-    var buf: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("boom\n\nThe report was written to /s/zonvie/crash.log.", alertText(&buf, "boom", "/s/zonvie/crash.log"));
-    try std.testing.expectEqualStrings("boom", alertText(&buf, "boom", null));
 }
 
 fn writeAll(fd: std.posix.fd_t, bytes: []const u8) void {
@@ -117,34 +83,4 @@ fn writeCrashFile(path: [:0]const u8, report: []const u8) void {
     if (fd < 0) return;
     defer _ = std.c.close(fd);
     writeAll(fd, report);
-}
-
-/// Starts this executable in alert mode, detached: the parent aborts right
-/// after, so only fork + execve run in the child.
-fn showAlert(text: []const u8) void {
-    var exe: [std.fs.max_path_bytes:0]u8 = undefined;
-    const n = std.c.readlink("/proc/self/exe", &exe, exe.len - 1);
-    if (n <= 0) return;
-    exe[@intCast(n)] = 0;
-    var arg: [1024:0]u8 = undefined;
-    const len = @min(text.len, arg.len);
-    @memcpy(arg[0..len], text[0..len]);
-    arg[len] = 0;
-    const argv = [_:null]?[*:0]const u8{ &exe, &arg };
-    // This process's environment plus the mode marker.
-    var envp: [1024:null]?[*:0]const u8 = undefined;
-    var count: usize = 0;
-    var src = std.c.environ;
-    while (src[0]) |e| : (src += 1) {
-        if (count == envp.len - 1) break;
-        envp[count] = e;
-        count += 1;
-    }
-    envp[count] = env_mode ++ "=1";
-    envp[count + 1] = null;
-    const pid = std.c.fork();
-    if (pid != 0) return;
-    _ = std.c.setsid();
-    _ = std.c.execve(&exe, &argv, @ptrCast(&envp));
-    std.c._exit(127);
 }

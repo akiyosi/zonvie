@@ -2,14 +2,14 @@
 //! showing the viewport of the grid the core names for it. The rules are the
 //! core's (zonvie_core_try_scrollbar_grid, _scrollbar_metrics,
 //! _scrollbar_drag_target); this file keeps the fade, the timers, the hit
-//! test and the drag, after windows/ui/scrollbar.zig. GTK main thread, but
+//! test and the drag, after windows/ui/scrollbar.zig. main thread, but
 //! for `alpha`, which the renderer reads under App.mu, and commitViews.
 
 const std = @import("std");
 const core = @import("zonvie_core");
 const clock = core.clock;
 const App = @import("app.zig").App;
-const gtk = @import("gtk_bindings.zig");
+const glib = @import("glib.zig");
 const applog = @import("app_log.zig");
 
 /// Logical px, as windows/app.zig's SCROLLBAR_*.
@@ -128,15 +128,12 @@ pub fn drawn(app: *const App, st: *const State, id: i64) ?Viewport {
 // Surfaces
 // =========================================================================
 
-const Surface = struct { st: *State, widget: *anyopaque, id: i64 };
+const Surface = struct { st: *State, id: i64 };
 
+/// Only the main surface exists: external windows are not built yet.
 fn surface(app: *App, id: i64) ?Surface {
-    if (id == 1) {
-        const w = app.widgets.overlay orelse return null;
-        return .{ .st = &app.scrollbar, .widget = w, .id = 1 };
-    }
-    const ext = app.ext_windows.get(id) orelse return null;
-    return .{ .st = &ext.scrollbar, .widget = ext.area orelse return null, .id = id };
+    if (id != 1) return null;
+    return .{ .st = &app.scrollbar, .id = 1 };
 }
 
 /// The surface's geometry from its last viewport, in px.
@@ -144,11 +141,11 @@ fn surfaceGeometry(app: *App, sf: Surface) ?Geometry {
     app.mu.lockUncancelable(clock.io());
     const vp = sf.st.vp;
     const scale = app.scale;
+    const w_px: f32 = @floatFromInt(app.drawable_w_px);
+    const h_px: f32 = @floatFromInt(app.drawable_h_px);
     app.mu.unlock(clock.io());
     const v = vp orelse return null;
-    const w: f32 = @floatFromInt(gtk.gtk_widget_get_width(sf.widget));
-    const h: f32 = @floatFromInt(gtk.gtk_widget_get_height(sf.widget));
-    return geometry(v, w * scale, h * scale, scale);
+    return geometry(v, w_px, h_px, scale);
 }
 
 // =========================================================================
@@ -209,12 +206,12 @@ fn show(app: *App, sf: Surface) void {
     st.target_alpha = 1;
     armFade(app, sf);
     if (st.hide_timer != 0) {
-        _ = gtk.g_source_remove(st.hide_timer);
+        _ = glib.g_source_remove(st.hide_timer);
         st.hide_timer = 0;
     }
     const cfg = app.scrollbar_cfg;
     if (cfg.isScroll() and !cfg.isAlways()) {
-        st.hide_timer = gtk.g_timeout_add(@intFromFloat(cfg.delay * 1000), &onHideTimer, surfaceTag(app, sf.id));
+        st.hide_timer = glib.g_timeout_add(@intFromFloat(cfg.delay * 1000), &onHideTimer, surfaceTag(app, sf.id));
     }
 }
 
@@ -236,7 +233,7 @@ fn surfaceTag(app: *App, id: i64) *Tag {
 
 fn armFade(app: *App, sf: Surface) void {
     if (sf.st.fade_timer != 0 or sf.st.alpha == sf.st.target_alpha) return;
-    sf.st.fade_timer = gtk.g_timeout_add(fade_interval_ms, &onFade, surfaceTag(app, sf.id));
+    sf.st.fade_timer = glib.g_timeout_add(fade_interval_ms, &onFade, surfaceTag(app, sf.id));
 }
 
 fn onFade(data: ?*anyopaque) callconv(.c) c_int {
@@ -251,7 +248,7 @@ fn onFade(data: ?*anyopaque) callconv(.c) c_int {
     app.mu.unlock(clock.io());
     app.queueRenderAll();
     if (!done) {
-        st.fade_timer = gtk.g_timeout_add(fade_interval_ms, &onFade, surfaceTag(app, sf.id));
+        st.fade_timer = glib.g_timeout_add(fade_interval_ms, &onFade, surfaceTag(app, sf.id));
     } else st.fade_timer = 0;
     return 0;
 }
@@ -287,7 +284,7 @@ pub fn press(app: *App, id: i64, x: f64, y: f64) bool {
             const dir: i8 = if (hit == .track_above) -1 else 1;
             pageScroll(app, sf, dir);
             sf.st.repeat_dir = dir;
-            sf.st.repeat_timer = gtk.g_timeout_add(repeat_delay_ms, &onRepeat, surfaceTag(app, id));
+            sf.st.repeat_timer = glib.g_timeout_add(repeat_delay_ms, &onRepeat, surfaceTag(app, id));
         },
     }
     show(app, sf);
@@ -314,7 +311,7 @@ fn onRepeat(data: ?*anyopaque) callconv(.c) c_int {
         return 0;
     }
     pageScroll(tag.app, sf, sf.st.repeat_dir);
-    sf.st.repeat_timer = gtk.g_timeout_add(repeat_interval_ms, &onRepeat, surfaceTag(tag.app, tag.id));
+    sf.st.repeat_timer = glib.g_timeout_add(repeat_interval_ms, &onRepeat, surfaceTag(tag.app, tag.id));
     return 0;
 }
 
@@ -340,7 +337,7 @@ pub fn motion(app: *App, id: i64, x: f64, y: f64) bool {
     const wait_ns = drag_throttle_ns - (now - sf.st.last_send_ns);
     if (wait_ns > 0) {
         // A trailing send, so a pause mid-drag lands where the knob is.
-        if (sf.st.drag_timer == 0) sf.st.drag_timer = gtk.g_timeout_add(@intCast(@divTrunc(wait_ns, std.time.ns_per_ms) + 1), &onDragFlush, surfaceTag(app, id));
+        if (sf.st.drag_timer == 0) sf.st.drag_timer = glib.g_timeout_add(@intCast(@divTrunc(wait_ns, std.time.ns_per_ms) + 1), &onDragFlush, surfaceTag(app, id));
         return true;
     }
     flushDrag(app, sf);
@@ -376,7 +373,7 @@ pub fn release(app: *App, id: i64) bool {
     }
     st.repeat_dir = 0;
     if (st.repeat_timer != 0) {
-        _ = gtk.g_source_remove(st.repeat_timer);
+        _ = glib.g_source_remove(st.repeat_timer);
         st.repeat_timer = 0;
     }
     return was;
@@ -410,7 +407,7 @@ pub fn leave(app: *App, id: i64) void {
 /// An external window closes: its timers must not outlive it.
 pub fn cancelTimers(st: *State) void {
     for ([_]*c_uint{ &st.fade_timer, &st.hide_timer, &st.repeat_timer, &st.drag_timer }) |t| {
-        if (t.* != 0) _ = gtk.g_source_remove(t.*);
+        if (t.* != 0) _ = glib.g_source_remove(t.*);
         t.* = 0;
     }
 }

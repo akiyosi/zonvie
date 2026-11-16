@@ -2,6 +2,8 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const testing = std.testing;
 
+// The modifier masks wl/window.c reports (GDK's values, kept from the
+// toolkit this table was written against).
 const GDK_SHIFT_MASK: u32 = 1;
 const GDK_CONTROL_MASK: u32 = 4;
 const GDK_ALT_MASK: u32 = 8;

@@ -32,41 +32,41 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
 
 - **macOS**: AppKit + Swift + Metal
 - **Windows**: Win32 + D3D11/DXGI + DirectWrite
-- **Linux**: GTK 4 + OpenGL (EGL) + FreeType/HarfBuzz/Fontconfig
+- **Linux**: Wayland (no toolkit) + OpenGL (EGL) + FreeType/HarfBuzz/Fontconfig
 
 ### Linux notes
 
-- **New Session**: Ctrl+Shift+N opens another zonvie with the connection
-  dialog (macOS: Cmd+N). The key never reaches Neovim. The desktop entry
-  written by `--install` has the same "New Session" action.
-- **Shortcuts**: Ctrl+Shift+Q quits (macOS: Cmd+Q); Ctrl+Shift+? opens About. With
-  `[tabline] style = "menu"`, Ctrl+Shift+T, Ctrl+Shift+W and
-  Ctrl+Shift+1..9 open, close and select tabs (macOS: Cmd+T, Cmd+W,
-  Cmd+1..9). Super belongs to the compositor and Ctrl alone to Neovim, so
-  the frontend's keys take Ctrl+Shift; Neovim never sees them.
-- **External UI**: the external cmdline, popup menu, messages and tabline
-  are drawn inside the main window, not as separate OS windows. Message
-  views follow `[messages] msg_pos` within it.
+The Linux frontend is a Wayland client that uses no toolkit: it draws on a
+bare `xdg_toplevel` through EGL. It does not run under an X11 session.
+
+- **External UI**: the external cmdline, popup menu and messages are drawn
+  inside the main window. Message views follow `[messages] msg_pos` within
+  it.
+- **Input method**: through `text-input-unstable-v3` (Fcitx5, IBus). The
+  composition is shown in the buffer with `[input] ime_preedit_mode =
+  "inline"`; with the default `"overlay"` nothing draws it yet.
+- **Closing the window** sends Neovim `:confirm qa`, so an unsaved buffer is
+  asked about in Neovim's own command line.
 - **Translucency**: `[window] opacity` and `blur` make the window
   translucent. With `blur`, zonvie asks the compositor to blur what lies
-  behind it through the `ext-background-effect-v1` protocol (KDE Plasma,
-  GNOME, Hyprland, niri); elsewhere the blur is the compositor's own rules.
-  The compositor picks the strength, so `blur_radius` has no effect.
-- **Titlebar**: `"native"` keeps the desktop's own titlebar; with a
-  sidebar, its toggle and the app menu (New Session, About, Quit) sit on a
-  rail beside it, and `[tabline] style = "menu"` puts the app and Tabs
-  menus in a bar over the editor. Where the desktop draws no titlebar
-  (Hyprland, niri, river, by `$XDG_CURRENT_DESKTOP`), `"native"` acts as
-  `"hidden"`. Titlebar tabs take the titlebar's place under either. `"hidden"` removes the
-  titlebar, showing the window buttons (top left with a right sidebar) and a
-  drag bar over the top band after the pointer rests there two seconds; `"unified"` draws a title band in the editor's
-  colours, which with a sidebar spans the window and holds the toggle in
-  the sidebar's corner beside the window buttons.
-- **Window placement**: Wayland lets no client place its windows, so a torn
-  off tab or an external window opens where the compositor puts it, and only
-  the window size is remembered between runs.
+  behind it through the `ext-background-effect-v1` protocol; the compositor
+  picks the strength, so `blur_radius` has no effect.
+- **Titlebar**: zonvie asks the compositor for one
+  (`xdg-decoration-unstable-v1`). A compositor without that protocol
+  (GNOME) shows the window bare; `[window] titlebar_style` has no effect.
+- **Window size**: remembered between runs when the window was free to
+  choose it (not tiled, maximized or fullscreen). Wayland lets no client
+  place its windows.
+- **SSH**: there is no password dialog, so the host must accept a key or an
+  agent.
 - **Devcontainer**: Docker must already be running; zonvie does not start
-  it.
+  it. `devcontainer up` runs before the window appears, its output on
+  stderr.
+- **Not built yet**: external windows (`--extwindows`), the external tab
+  line, the tray, desktop notifications, the font dialog (`:set
+  guifont=*`), the connection dialog, `[server] single_instance`, the
+  frontend's own shortcuts (New Session, About, tab keys), and momentum
+  after a touchpad flick.
 
 ## Installation
 
@@ -89,7 +89,8 @@ zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
 ### Linux
 
 Build from source (requires Zig 0.16.x and the development packages of
-GTK 4, EGL/OpenGL, GBM, FreeType, HarfBuzz and Fontconfig):
+Wayland (client, egl, cursor), xkbcommon, EGL/OpenGL (libglvnd), GLib,
+FreeType, HarfBuzz and Fontconfig):
 
 ```bash
 zig build linux -Doptimize=ReleaseFast

@@ -7,7 +7,7 @@
 //! the D3D11 renderer (windows/shaders/main.hlsl, PSKawase*); the chain's
 //! geometry is the core's (glow_chain.zig). Each PostFx belongs to one GL
 //! context and is used only on the thread that has it current: a GLArea's
-//! on the GTK main thread, the render thread's on that thread.
+//! on the main thread, the render thread's on that thread.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -122,7 +122,7 @@ pub const PostFx = struct {
     uniforms: Uniforms = .{},
     cursor_cur: [4]f32 = .{ 0, 0, 0, 0 },
     /// iWindowOffset: this window's view from the main window's, device px,
-    /// as the GTK thread last read it (ext_window, X11 only); (0,0) for the
+    /// as the main thread last read it (ext_window, X11 only); (0,0) for the
     /// main window and on Wayland, which gives a client no window position,
     /// its own or another's, so there every window is its own origin.
     window_offset_px: [2]f32 = .{ 0, 0 },

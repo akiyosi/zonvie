@@ -268,9 +268,11 @@ pub fn build(b: *std.Build) !void {
     wake_state_test_step.dependOn(&b.addInstallArtifact(wake_state_tests, .{}).step);
     // Linux frontend
     //
-    // All GTK4/GLib/GDK/OpenGL/fontconfig/hbft functions use hand-written
-    // extern "c" declarations (no @cImport, no zig-gobject). This enables
-    // cross-compilation from macOS without system headers.
+    // A Wayland client with no toolkit (linux/main.zig, linux/wl/window.c).
+    // GLib, EGL, OpenGL, fontconfig and hbft are reached through hand-written
+    // extern "c" declarations (no @cImport), so a cross build from macOS
+    // compiles the Zig without system headers. No GTK and no X11: a toolkit
+    // call would be a link error.
     const linux_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -290,42 +292,42 @@ pub fn build(b: *std.Build) !void {
     });
     linux_mod.linkLibrary(core_lib);
 
-    // System libraries (linked at link time only, no C header processing).
+    // C sources and system libraries: they need the system's headers and
+    // .so files, so a cross build omits them.
     if (target.result.os.tag == .linux and !is_cross) {
         // HarfBuzz/FreeType bridge (shared C implementation used by all
-        // frontends). It needs FreeType headers, so a cross build omits it.
+        // frontends).
         linux_mod.addCSourceFile(.{
             .file = b.path("macos/Sources/Font/HBFTBridge.c"),
             .flags = &.{},
         });
-        // ext-background-effect-v1 (compositor blur behind the windows).
+        // The window: xdg-shell, EGL, keyboard, pointer, selections, IME.
+        linux_mod.addCSourceFile(.{
+            .file = b.path("linux/wl/window.c"),
+            .flags = &.{},
+        });
+        // ext-background-effect-v1 (compositor blur behind the window).
         linux_mod.addCSourceFile(.{
             .file = b.path("linux/wl_blur.c"),
             .flags = &.{},
         });
-        // zwp_linux_dmabuf_v1 (the modifiers the compositor imports).
-        linux_mod.addCSourceFile(.{
-            .file = b.path("linux/wl_dmabuf.c"),
-            .flags = &.{},
-        });
         linux_mod.linkSystemLibrary("wayland-client", .{});
-        linux_mod.linkSystemLibrary("gtk-4", .{});
-        // Xlib, which GTK's X11 backend already loads: window placement
-        // under an X11 session (linux/x11_place.zig).
-        linux_mod.linkSystemLibrary("X11", .{});
-        linux_mod.linkSystemLibrary("GL", .{});
+        linux_mod.linkSystemLibrary("wayland-egl", .{});
+        linux_mod.linkSystemLibrary("wayland-cursor", .{});
+        linux_mod.linkSystemLibrary("xkbcommon", .{});
+        // libOpenGL, not libGL: the same entry points without GLX, which
+        // would load Xlib.
+        linux_mod.linkSystemLibrary("OpenGL", .{});
         linux_mod.linkSystemLibrary("EGL", .{});
-        linux_mod.linkSystemLibrary("gbm", .{});
         linux_mod.linkSystemLibrary("freetype2", .{});
         linux_mod.linkSystemLibrary("harfbuzz", .{});
         linux_mod.linkSystemLibrary("fontconfig", .{});
-        // GLib/GObject/GIO (needed explicitly when pkg-config transitive deps
-        // are not propagated by the Zig build system linker).
+        // GLib for the main loop. GObject and GIO for D-Bus alone (the IM
+        // framework's off switch): its bus connection opens at the first
+        // call, never at startup.
         linux_mod.linkSystemLibrary("glib-2.0", .{});
         linux_mod.linkSystemLibrary("gobject-2.0", .{});
         linux_mod.linkSystemLibrary("gio-2.0", .{});
-        // Pango attribute lists for the IME preedit label.
-        linux_mod.linkSystemLibrary("pango-1.0", .{});
     }
 
     const linux_step = b.step("linux", "Build Linux frontend");

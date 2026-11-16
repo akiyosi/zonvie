@@ -11,22 +11,17 @@ test {
     _ = @import("ui_state.zig");
     _ = @import("cli.zig");
     _ = @import("scrollbar.zig");
-    _ = @import("ui_widgets.zig");
-    _ = @import("tab_strip.zig");
     _ = @import("chrome.zig");
-    _ = @import("blink.zig");
-    _ = @import("notify.zig");
-    _ = @import("blur.zig");
     _ = @import("egl.zig");
     _ = @import("window_size.zig");
-    _ = @import("x11_place.zig");
-    _ = @import("preedit_target.zig");
     _ = @import("ime_off.zig");
     _ = @import("layer_geom.zig");
     _ = @import("font_spec.zig");
     _ = @import("pixel_scroll.zig");
     _ = @import("lifecycle.zig");
-    _ = @import("tray.zig");
     _ = @import("callbacks.zig");
     _ = @import("crash.zig");
+    _ = @import("unbuilt.zig");
+    _ = @import("trackpad.zig");
+    _ = @import("pointer.zig");
 }
