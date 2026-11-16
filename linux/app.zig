@@ -120,9 +120,10 @@ pub const App = struct {
     picked_italic: std.atomic.Value(bool) = .init(false),
     /// config.toml's [messages] msg_pos.
     msg_pos: core.config.Config.MsgPosConfig = .{},
-    /// The core's message anchor as of the last committed flush; null before
-    /// the first (zonvie_core_msg_anchor). Written on the GTK main thread
-    /// under `mu`.
+    /// The core's message anchor (zonvie_core_msg_anchor); null before the
+    /// first. Written under `mu` with each commit, on the core thread, so a
+    /// frame drawn from it has both, and again by the GTK thread's idle
+    /// that places the panels.
     msg_anchor: ?core.MsgAnchor = null,
     /// The confirm dialog's box in surface px while it shows; written by
     /// ui_widgets.placeMessages on the GTK thread under `mu`, read by the
@@ -404,6 +405,12 @@ pub const App = struct {
 
     pub fn queueRenderAll(self: *App) void {
         if (self.render_thread) |rt| rt.request();
+        self.queueRenderGtk();
+    }
+
+    /// Every surface GTK draws (all but the render thread's) draws the
+    /// committed frame. GTK main thread.
+    pub fn queueRenderGtk(self: *App) void {
         if (self.gl_area) |a| gtk.gtk_gl_area_queue_render(a);
         var it = self.ext_windows.valueIterator();
         while (it.next()) |w| if (w.*.area) |a| gtk.gtk_gl_area_queue_render(a);

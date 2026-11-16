@@ -175,5 +175,6 @@ pub extern "c" fn glPixelStorei(pname: GLenum, param: GLint) void;
 
 // Draw
 pub extern "c" fn glFinish() void;
+pub extern "c" fn glFlush() void;
 pub extern "c" fn glCheckFramebufferStatus(target: GLenum) GLenum;
 pub extern "c" fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) void;

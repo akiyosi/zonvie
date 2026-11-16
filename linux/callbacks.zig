@@ -500,6 +500,10 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     app.flush_failed = false;
     var committed = false;
     defer traceRender(app, "event=end outcome={s}\n", .{if (committed) "commit" else "abort"});
+    // The anchor this flush published (before on_flush_end), taken before
+    // App.mu: the core's anchor lock is a leaf, never held under App.mu.
+    var anchor: core.MsgAnchor = undefined;
+    const have_anchor = !failed and core.zonvie_core_msg_anchor(cp, &anchor);
     {
         lock(app);
         defer unlock(app);
@@ -515,6 +519,9 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             }
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
             app.flush_seq += 1;
+            // With the rows it places messages against, so a frame drawn
+            // from this commit (the render thread's, at once) has both.
+            app.msg_anchor = if (have_anchor) anchor else null;
             // The grids this commit frees, released with it.
             for (app.surface.destroyed.items) |id| traceRender(app, "event=destroy_release grid={d}\n", .{id});
             app.surface.commit(app.alloc, .{
@@ -550,7 +557,9 @@ pub fn queueRender(app: *App) void {
 fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
     app.render_idle_queued.store(false, .release);
-    // The anchor the flush just committed published; taken before App.mu,
+    // The anchor as the core holds it now, which a flush not yet committed
+    // may have moved: the panels are placed against it at once, as the
+    // commit that follows draws the rows (onFlushEnd). Taken before App.mu,
     // which the core's own lock is never held under.
     var anchor: core.MsgAnchor = undefined;
     const have_anchor = if (app.corep) |cp| core.zonvie_core_msg_anchor(cp, &anchor) else false;
@@ -570,8 +579,14 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
         ui_widgets.hideProgress(app);
         session.onReady(app);
     }
-    app.queueRenderAll();
-    input.updateImeCursor(app);
+    // The render thread was woken with the commit (queueRender) and draws
+    // it whole; what the steps above change for it requests its own frame.
+    app.queueRenderGtk();
+    // Moving the IME's cursor rectangle makes GTK run a frame cycle. With a
+    // render thread the flush's frame does not exist yet, and would wait
+    // out that cycle: the thread's handoff moves the rectangle, with the
+    // frame that shows the cursor there (render_thread.idlePresent).
+    if (app.render_thread == null) input.updateImeCursor(app);
     // Every flush may carry a mode change, and with it a new cadence.
     blink.update(app);
     scrollbar.update(app);

@@ -303,6 +303,11 @@ pub fn build(b: *std.Build) !void {
             .file = b.path("linux/wl_blur.c"),
             .flags = &.{},
         });
+        // zwp_linux_dmabuf_v1 (the modifiers the compositor imports).
+        linux_mod.addCSourceFile(.{
+            .file = b.path("linux/wl_dmabuf.c"),
+            .flags = &.{},
+        });
         linux_mod.linkSystemLibrary("wayland-client", .{});
         linux_mod.linkSystemLibrary("gtk-4", .{});
         // Xlib, which GTK's X11 backend already loads: window placement

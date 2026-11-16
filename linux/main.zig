@@ -175,7 +175,7 @@ fn onAreaResize(area: ?*anyopaque, w: c_int, h: c_int, data: ?*anyopaque) callco
     app.drawable_h_px = h_px;
     unlock(app);
     setScale(app, area.?);
-    if (app.render_thread) |rt| rt.resize(w_px, h_px);
+    if (app.render_thread) |rt| rt.resize(w_px, h_px, @intCast(scale));
     window_size.noteResize(app, w_px, h_px);
     pushLayout(app);
 }
@@ -197,10 +197,6 @@ fn buildThreaded(app: *App) ?[2]*anyopaque {
     _ = gtk.g_signal_connect(area, "realize", @ptrCast(&onAreaRealize), app);
     _ = gtk.g_signal_connect(area, "resize", @ptrCast(&onAreaResize), app);
     app.frame_widget = picture;
-    // Not in a GtkGraphicsOffload: GTK hands the dmabuf to the compositor
-    // with the modifier GBM reports (LINEAR for an implicit-modifier buffer),
-    // which a compositor may reject as a protocol error that kills the
-    // client. GTK's own renderer imports it instead.
     return .{ area, picture };
 }
 
@@ -490,6 +486,7 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     if (threaded) |t| {
         area = t[0];
         frames = t[1];
+        render_thread.attachWindow(app.render_thread.?, win);
     } else {
         if (startup.threaded) applog.appLog("[linux] render thread unavailable; using the GLArea\n", .{});
         area = gtk.gtk_gl_area_new() orelse return;

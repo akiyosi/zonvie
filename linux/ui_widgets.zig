@@ -470,6 +470,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-panel.tone-prompt {{ border-color: #4d99ff; color: #99ccff; }}
         \\.zonvie-panel.tone-search {{ color: #99ff99; }}
         \\window.zonvie-translucent {{ background: transparent; }}
+        \\window.zonvie-subsurface {{ background: transparent; }}
         \\window.zonvie-blur, popover.zonvie-blur {{ backdrop-filter: blur(20px); }}
         \\.zonvie-preedit {{ background-color: #{x:0>6}; color: #{x:0>6}; padding: 0; }}
         \\.zonvie-tabbar button {{ background: none; color: inherit; border-radius: 0; border: none;

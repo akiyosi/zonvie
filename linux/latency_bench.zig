@@ -115,8 +115,21 @@ fn onAfterPaint(frame_clock: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const b: *Bench = @ptrCast(@alignCast(data.?));
     if (!b.waiting or b.app.presented_seq <= b.base_seq) return;
     const now_ns = clock.nowNs();
-    const dt_ns = now_ns - b.t0_ns;
     if (@import("app_log.zig").isEnabled()) @import("app_log.zig").appLog("[perf] bench present_to_paint_us={d}\n", .{@divTrunc(now_ns - b.app.presented_ns, 1000)});
+    sample(b, now_ns);
+}
+
+/// The render thread committed App.presented_seq to its own subsurface at
+/// App.presented_ns: there the frame left for the compositor, as a GTK
+/// frame does by its after-paint, which may not come for it at all.
+pub fn presented(app: *App) void {
+    const b = bench_state orelse return;
+    if (!b.started or !b.waiting or app.presented_seq <= b.base_seq) return;
+    sample(b, app.presented_ns);
+}
+
+fn sample(b: *Bench, now_ns: i128) void {
+    const dt_ns = now_ns - b.t0_ns;
     b.waiting = false;
     // A frame held back for longer (an occluded window gets no frame
     // callbacks) measures the compositor, not the renderer.

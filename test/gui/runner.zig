@@ -544,6 +544,11 @@ test "gui:main_float_mouse_disabled_wheel" {
     try gated(is_linux, @import("scenarios/linux/main_float_mouse_disabled_wheel.zig"));
 }
 
+test "gui:render_thread_subsurface" {
+    // Linux only: linux/render_thread.zig's own subsurface.
+    try gated(is_linux, @import("scenarios/linux/render_thread_subsurface.zig"));
+}
+
 test "gui:cursor_blinks" {
     // Linux only: the timer and its log line are linux/blink.zig's.
     try gated(is_linux, @import("scenarios/linux/cursor_blinks.zig"));

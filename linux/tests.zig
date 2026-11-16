@@ -17,6 +17,7 @@ test {
     _ = @import("blink.zig");
     _ = @import("notify.zig");
     _ = @import("blur.zig");
+    _ = @import("egl.zig");
     _ = @import("window_size.zig");
     _ = @import("x11_place.zig");
     _ = @import("preedit_target.zig");
