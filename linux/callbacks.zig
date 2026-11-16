@@ -852,37 +852,60 @@ fn configPt(app: *App) f32 {
     return if (app.font_cfg.size > 0) app.font_cfg.size else (core.config.Config.FontConfig{}).size;
 }
 
+const FontLoad = enum { failed, loaded, unchanged };
+
+/// What a candidate list loads depends on, besides [font] size, which is
+/// fixed for the session. Never 0, which App.font_request keeps for "none".
+fn fontRequestKey(list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(list);
+    h.update(&.{ @intFromBool(size_explicit), @intFromBool(base.bold), @intFromBool(base.italic) });
+    return h.final() | 1;
+}
+
 /// Loads the first candidate of a newline-separated list (a guifont payload,
 /// or [font] family through the core's formatter) that fontconfig accepts.
-fn loadFirst(app: *App, list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) bool {
+/// `unchanged` when the faces already come from this very list: Neovim's
+/// default guifont at attach names what a config-less start loaded, and an
+/// explicit [font] family is asked for again at every guifont.
+fn loadFirst(app: *App, list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) FontLoad {
+    const key = fontRequestKey(list, size_explicit, base);
+    if (app.fonts.regular != null and app.font_request == key) return .unchanged;
     var it = std.mem.splitScalar(u8, list, '\n');
     while (it.next()) |line| {
         const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
         if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features, base)) {
             applog.appLog("[linux] font: {s} {d}pt features={s}\n", .{ cand.name, cand.point_size, cand.features });
+            app.font_request = key;
             lock(app);
             app.font_pt = cand.point_size;
             unlock(app);
-            return true;
+            return .loaded;
         }
     }
-    return false;
+    return .failed;
 }
 
 /// [font] family as a candidate list: each entry inherits [font] size
 /// unless it carries its own `:hN`.
-fn loadConfigFamily(app: *App) bool {
+fn loadConfigFamily(app: *App) FontLoad {
     var arena = std.heap.ArenaAllocator.init(app.alloc);
     defer arena.deinit();
-    const list = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.font_cfg.family, configPt(app), default_family) catch return false;
+    const list = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.font_cfg.family, configPt(app), default_family) catch return .failed;
     return loadFirst(app, list, false, .{});
+}
+
+/// The last resort: fontconfig's own monospace at [font] size.
+fn loadDefaultFamily(app: *App) bool {
+    app.font_request = 0;
+    return app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{});
 }
 
 /// Loads [font] (or its defaults) when no guifont has been applied yet.
 /// Core thread, or any thread before zonvie_core_start.
 pub fn ensureFont(app: *App) void {
     if (app.fonts.regular != null) return;
-    if (!loadConfigFamily(app)) _ = app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{});
+    if (loadConfigFamily(app) == .failed) _ = loadDefaultFamily(app);
     updateMetrics(app);
 }
 
@@ -995,9 +1018,10 @@ fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void
         loadConfigFamily(app)
     else
         loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked, base);
-    if (!loaded) {
+    if (loaded == .unchanged) return;
+    if (loaded == .failed) {
         if (app.fonts.regular != null) return;
-        if (!app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{})) return;
+        if (!loadDefaultFamily(app)) return;
     }
     updateMetrics(app);
     if (app.corep) |cp| core.zonvie_core_invalidate_glyph_cache(cp);

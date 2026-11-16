@@ -110,6 +110,9 @@ pub const App = struct {
     slot_preedit: [core.font_slots.max_slots]ui_widgets.PreeditFont = @splat(.{}),
     /// The size the font in use was loaded at, in points; under `mu`.
     font_pt: f32 = 0,
+    /// What the global faces were loaded from (callbacks.fontRequestKey), 0
+    /// for none. Core thread, or any thread before zonvie_core_start.
+    font_request: u64 = 0,
     /// The next guifont broadcast is a font-dialog pick (font_picker.zig),
     /// which wins over an explicit [font] family and size.
     font_picked: std.atomic.Value(bool) = .init(false),
