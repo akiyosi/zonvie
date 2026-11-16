@@ -171,6 +171,15 @@ pub fn build(app: *App, area: *anyopaque, frames: ?*anyopaque) *anyopaque {
         w.css = css;
         if (gtk.gtk_widget_get_display(root)) |d| gtk.gtk_style_context_add_provider_for_display(d, css, gtk.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
+    // A tiled window's outline is the only border node of the first frame;
+    // without it GSK compiles no border program at startup. `w.css` is filled
+    // when the colours arrive, after that frame, so this rule has a provider
+    // of its own.
+    if (gtk.gtk_css_provider_new()) |css| {
+        gtk.gtk_css_provider_load_from_string(css, "window.tiled, window.tiled-top, window.tiled-bottom, window.tiled-left, window.tiled-right { box-shadow: none; }");
+        if (gtk.gtk_widget_get_display(root)) |d| gtk.gtk_style_context_add_provider_for_display(d, css, gtk.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk.g_object_unref(css);
+    }
     return root;
 }
 
