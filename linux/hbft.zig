@@ -14,6 +14,8 @@ pub const zonvie_ft_hb_font = opaque {};
 // Font lifecycle
 // =========================================================================
 
+/// `font_bytes` must stay valid until the font is destroyed.
+pub extern "c" fn zonvie_ft_hb_font_create_borrowed(font_bytes: [*]const u8, font_len: usize, pixel_size: u32, face_index: u32) ?*zonvie_ft_hb_font;
 pub extern "c" fn zonvie_ft_hb_font_create(
     font_bytes: [*]const u8,
     font_len: usize,

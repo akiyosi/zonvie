@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const core = @import("zonvie_core");
-const clock = core.clock;
 const hbft = @import("../hbft.zig");
 const fc = @import("../fc.zig");
 const applog = @import("../app_log.zig");
@@ -353,12 +352,39 @@ fn applyAxes(f: *Font, fc_variations: []const u8, user: []const hbft.zonvie_font
     hbft.zonvie_ft_hb_font_set_variation_axes(f, merged.ptr, merged.len);
 }
 
-/// zonvie_ft_hb_font_create copies the bytes (HBFTBridge.c:150-152), so they
-/// are freed right after.
+/// Font files by path, mapped read-only and never unmapped: a face borrows
+/// its file's bytes for its whole life, the four styles of a family and every
+/// reload at another size share one mapping, and a session names few files.
+/// Guarded like the rest of this file (the core's grid lock).
+var mapped_files: std.StringHashMapUnmanaged([]const u8) = .empty;
+
+fn mapFile(alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (mapped_files.get(path)) |bytes| return bytes;
+    const path_z = alloc.dupeZ(u8, path) catch return null;
+    defer alloc.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const len = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (len <= 0) return null;
+    const ptr = std.c.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    if (ptr == std.c.MAP_FAILED) return null;
+    const bytes = @as([*]const u8, @ptrCast(ptr))[0..@intCast(len)];
+    const key = alloc.dupe(u8, path) catch {
+        _ = std.c.munmap(@alignCast(ptr), bytes.len);
+        return null;
+    };
+    mapped_files.put(alloc, key, bytes) catch {
+        alloc.free(key);
+        _ = std.c.munmap(@alignCast(ptr), bytes.len);
+        return null;
+    };
+    return bytes;
+}
+
 fn loadFile(alloc: std.mem.Allocator, path: []const u8, index: c_int, pixel_size: u32) ?*Font {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, alloc, .unlimited) catch return null;
-    defer alloc.free(bytes);
-    const f = hbft.zonvie_ft_hb_font_create(bytes.ptr, bytes.len, pixel_size, font_spec.ftFaceIndex(index));
+    const bytes = mapFile(alloc, path) orelse return null;
+    const f = hbft.zonvie_ft_hb_font_create_borrowed(bytes.ptr, bytes.len, pixel_size, font_spec.ftFaceIndex(index));
     if (f == null) {
         applog.appLog("[font] failed to load {s}\n", .{path});
         return null;
