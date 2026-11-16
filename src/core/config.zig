@@ -120,7 +120,10 @@ pub const Config = struct {
             .linux => "Source Code Pro,DejaVu Sans Mono,Courier New,monospace",
             else => "DejaVu Sans Mono,Courier New,monospace",
         },
-        size: f32 = if (builtin.os.tag == .macos) 14.0 else 18.0,
+        // What a guifont entry without `:hN` gets, on every platform: with
+        // the family above, the font a config-less start loads is the one
+        // Neovim's default guifont names at attach, and nothing reloads.
+        size: f32 = redraw_handler.guifont_default_pt,
         linespace: i32 = 0,
         // Whether the user explicitly set the value in config.toml. When true,
         // the frontend should prefer config over nvim's default `guifont`

@@ -2057,7 +2057,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     // users. If the user wants :set guifont=... to control the font, they
     // should leave [font] out of config.toml.
     const os_default_font = "Consolas";
-    const default_font_pt: f32 = 18.0;
+    const default_font_pt: f32 = (core.config.Config.FontConfig{}).size;
 
     // Get config font (fallback to OS default if empty)
     const config_font = if (app.config.font.family.len > 0) app.config.font.family else os_default_font;

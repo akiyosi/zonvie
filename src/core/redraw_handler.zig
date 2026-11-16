@@ -662,12 +662,16 @@ pub fn resolveGuiFontList(arena: std.mem.Allocator, raw: []const u8) ![]const u8
     return combined.items;
 }
 
+/// The size of a guifont entry that names none (no `:hN`), as Neovim's own
+/// default guifont does. [font] size defaults to the same (config.zig), so a
+/// start with no font configured loads the font that default then asks for.
+pub const guifont_default_pt: f64 = 14.0;
+
 pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
-    // point_size default: 14
     var name_part: []const u8 = cand;
-    var point: f64 = 14.0;
+    var point: f64 = guifont_default_pt;
     var features: std.ArrayListUnmanaged(FontFeature) = .empty;
 
     if (std.mem.indexOfScalar(u8, cand, ':')) |colon| {
