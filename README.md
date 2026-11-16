@@ -43,30 +43,39 @@ bare `xdg_toplevel` through EGL. It does not run under an X11 session.
   inside the main window. Message views follow `[messages] msg_pos` within
   it.
 - **Input method**: through `text-input-unstable-v3` (Fcitx5, IBus). The
-  composition is shown in the buffer with `[input] ime_preedit_mode =
-  "inline"`; with the default `"overlay"` nothing draws it yet.
+  composition is drawn at the cursor (`[input] ime_preedit_mode =
+  "overlay"`, the default) or in the buffer (`"inline"`).
 - **Closing the window** sends Neovim `:confirm qa`, so an unsaved buffer is
-  asked about in Neovim's own command line.
+  asked about in Neovim's own command line. With `[server] close_to_tray`
+  and a tray host running (StatusNotifierItem), it hides to the tray
+  instead.
 - **Translucency**: `[window] opacity` and `blur` make the window
   translucent. With `blur`, zonvie asks the compositor to blur what lies
   behind it through the `ext-background-effect-v1` protocol; the compositor
   picks the strength, so `blur_radius` has no effect.
-- **Titlebar**: zonvie asks the compositor for one
-  (`xdg-decoration-unstable-v1`). A compositor without that protocol
-  (GNOME) shows the window bare; `[window] titlebar_style` has no effect.
+- **Titlebar**: `[window] titlebar_style = "native"` asks the compositor
+  for one (`xdg-decoration-unstable-v1`); where it has none to give (GNOME,
+  tiling compositors) the style acts as `"hidden"`. With `"hidden"`,
+  `"unified"` or titlebar tabs zonvie draws the caption itself: the window
+  buttons, a menu (New Session, About, Quit), and edges that resize.
+- **Tab line** (`--exttabline`): along the header, down a sidebar or in a
+  Tabs menu by `[tabline] style`. A tab is reordered by dragging it and
+  becomes a window of its own when let go away from the strip.
+- **External windows** (`--extwindows`): each in a toplevel of its own.
+  Wayland lets no client read or set where its windows are, so the
+  window-layout commands (`<C-w>H`, `<C-w>x`, ...) leave them where they
+  are, and the cursor cannot be moved to the window in a direction.
+- **Dialogs** are zonvie windows that ask through Neovim's own prompts: the
+  connection dialog (`--dialog`), SSH passwords and passphrases, crash and
+  connection-failure reports. `:set guifont=*` lists the installed
+  monospace families through `vim.ui.select`.
 - **Window size**: remembered between runs when the window was free to
   choose it (not tiled, maximized or fullscreen). Wayland lets no client
   place its windows.
-- **SSH**: there is no password dialog, so the host must accept a key or an
-  agent.
 - **Devcontainer**: Docker must already be running; zonvie does not start
-  it. `devcontainer up` runs before the window appears, its output on
-  stderr.
-- **Not built yet**: external windows (`--extwindows`), the external tab
-  line, the tray, desktop notifications, the font dialog (`:set
-  guifont=*`), the connection dialog, `[server] single_instance`, the
-  frontend's own shortcuts (New Session, About, tab keys), and momentum
-  after a touchpad flick.
+  it. The window shows the progress while `devcontainer up` runs.
+- **`--renderer=`** is accepted and ignored: the frontend always presents
+  its own surface directly, which is what the render thread was for.
 
 ## Installation
 

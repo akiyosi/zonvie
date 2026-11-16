@@ -10,6 +10,7 @@ const App = @import("../app.zig").App;
 const transform = @import("../transform.zig");
 const applog = @import("../app_log.zig");
 const ui = @import("../ui.zig");
+const ui_layer = @import("../ui_layer.zig");
 const surface_store = @import("../surface_store.zig");
 const GridRows = surface_store.GridRows;
 const Row = surface_store.Row;
@@ -26,6 +27,16 @@ const initial_vbo_bytes: usize = 64 * 1024;
 /// One window's GL objects, valid between realize and unrealize, and the
 /// size it draws at (device px), set before each draw.
 pub const Target = struct {
+    /// Where this view sits in the window's framebuffer: its top-left, in
+    /// px from the framebuffer's top-left, and the framebuffer's size. All 0
+    /// while the target is a framebuffer of the view's own size (an FBO).
+    ox_px: i32 = 0,
+    oy_px: i32 = 0,
+    fb_w_px: u32 = 0,
+    fb_h_px: u32 = 0,
+    /// The UI layer's atlas (ui_layer.zig) and the Atlas.gen it holds.
+    ui_tex: u32 = 0,
+    ui_gen: u64 = 0,
     program: u32 = 0,
     vao: u32 = 0,
     vbo: u32 = 0,
@@ -142,6 +153,11 @@ pub fn realize(t: *Target) bool {
     // Point sampling and clamp, as the D3D11 atlas sampler.
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
+    gl.glGenTextures(1, &t.ui_tex);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.ui_tex);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
     // A fresh texture has no storage; the first render allocates it.
@@ -152,6 +168,7 @@ pub fn realize(t: *Target) bool {
 
 pub fn unrealize(t: *Target) void {
     if (t.atlas_tex != 0) gl.glDeleteTextures(1, &t.atlas_tex);
+    if (t.ui_tex != 0) gl.glDeleteTextures(1, &t.ui_tex);
     if (t.vbo != 0) gl.glDeleteBuffers(1, &t.vbo);
     if (t.vao != 0) gl.glDeleteVertexArrays(1, &t.vao);
     if (t.program != 0) gl.glDeleteProgram(t.program);
@@ -245,14 +262,16 @@ fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Laye
 
 /// Clips to a rect given top-down in surface px.
 fn scissor(t: *const Target, x: i32, top: i32, w: i32, h: i32) void {
-    const y = if (t.flip_y) top else @as(i32, @intCast(t.h_px)) - top - h;
+    // Bottom-up in the framebuffer, which the view may be a part of.
+    const fb_h: i32 = @intCast(if (t.fb_h_px != 0) t.fb_h_px else t.h_px);
+    const y = if (t.flip_y) top else fb_h - t.oy_px - top - h;
     const s = t.px_scale;
     const f = struct {
         fn px(v: i32, k: f32) i32 {
             return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * k));
         }
     }.px;
-    gl.glScissor(f(x, s), f(y, s), f(w, s), f(@max(0, h), s));
+    gl.glScissor(f(x + t.ox_px, s), f(y, s), f(w, s), f(@max(0, h), s));
 }
 
 /// `layer`'s cell and box: its grid's own font when it has one. Caller
@@ -316,6 +335,12 @@ fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, re
     return total;
 }
 
+/// The view's rectangle in the framebuffer it is drawn into.
+pub fn viewport(t: *const Target) void {
+    const fb_h: i32 = @intCast(if (t.fb_h_px != 0) t.fb_h_px else t.h_px);
+    gl.glViewport(t.ox_px, fb_h - t.oy_px - @as(i32, @intCast(t.h_px)), @intCast(t.w_px), @intCast(t.h_px));
+}
+
 /// Clears the target and binds its pipeline. False when there is nothing to
 /// draw with yet.
 fn begin(app: *App, t: *Target) bool {
@@ -323,7 +348,12 @@ fn begin(app: *App, t: *Target) bool {
     // Premultiplied: [window] opacity is the background's alpha, as Windows
     // clears its swapchain.
     const a = std.math.clamp(app.window_cfg.opacity, 0, 1);
-    gl.glViewport(0, 0, @intCast(t.w_px), @intCast(t.h_px));
+    viewport(t);
+    // The clear takes the view alone: the window around it is the UI
+    // layer's (drawUi).
+    gl.glEnable(gl.GL_SCISSOR_TEST);
+    scissor(t, 0, 0, @intCast(t.w_px), @intCast(t.h_px));
+    defer gl.glDisable(gl.GL_SCISSOR_TEST);
     gl.glClearColor(
         @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0 * a,
         @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0 * a,
@@ -483,19 +513,61 @@ pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void 
 
 /// One frame of the main window (main.zig draw).
 pub fn render(app: *App) void {
-    app.gl.w_px = app.drawable_w_px;
-    app.gl.h_px = app.drawable_h_px;
-    if (postfx.active(app, &app.postfx)) {
-        const f = postfx.renderFrame(app, &app.gl, &app.postfx, 1);
-        app.presented_seq = f.flush_seq;
-        if (f.moving or app.postfx.animating) startEaseTick(app);
-        if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
-        return;
-    }
-    const f = renderMain(app, &app.gl);
+    const t = &app.gl;
+    t.w_px = app.drawable_w_px;
+    t.h_px = app.drawable_h_px;
+    t.ox_px = app.view_x_px;
+    t.oy_px = app.view_y_px;
+    t.fb_w_px = if (app.win_w_px != 0) app.win_w_px else t.w_px;
+    t.fb_h_px = if (app.win_h_px != 0) app.win_h_px else t.h_px;
+    const f = if (postfx.active(app, &app.postfx)) postfx.renderFrame(app, t, &app.postfx, 1) else renderMain(app, t);
+    drawUi(app, t);
     app.presented_seq = f.flush_seq;
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
-    if (f.moving) startEaseTick(app);
+    if (f.moving or app.postfx.animating) startEaseTick(app);
+}
+
+/// The UI layer over the whole window: its solid quads, then its text from
+/// its own atlas. Takes App.mu. The window's context current.
+fn drawUi(app: *App, t: *Target) void {
+    if (t.program == 0 or t.fb_w_px == 0 or t.fb_h_px == 0) return;
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    const layer = &app.chrome_layer;
+    if (layer.solid.items.len == 0 and layer.text.items.len == 0) return;
+    // The window is the target for this pass.
+    const view = .{ t.w_px, t.h_px, t.ox_px, t.oy_px };
+    t.w_px = t.fb_w_px;
+    t.h_px = t.fb_h_px;
+    t.ox_px = 0;
+    t.oy_px = 0;
+    defer {
+        t.w_px = view[0];
+        t.h_px = view[1];
+        t.ox_px = view[2];
+        t.oy_px = view[3];
+    }
+    viewport(t);
+    gl.glUseProgram(t.program);
+    gl.glUniform1i(t.u_mode, 0);
+    gl.glBindVertexArray(t.vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
+    gl.glEnable(gl.GL_BLEND);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+    gl.glDisable(gl.GL_SCISSOR_TEST);
+    drawVerts(app, t, layer.solid.items, surface_layer, 0);
+    if (layer.text.items.len == 0) return;
+    const a = &app.ui_atlas;
+    if (a.pixels.len == 0) return;
+    gl.glActiveTexture(gl.GL_TEXTURE0);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.ui_tex);
+    if (t.ui_gen != a.gen) {
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, ui_layer.atlas_size, ui_layer.atlas_size, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, a.pixels.ptr);
+        t.ui_gen = a.gen;
+    }
+    drawVerts(app, t, layer.text.items, surface_layer, 0);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
 }
 
 /// An external window: the surface rooted at `surface_id`.

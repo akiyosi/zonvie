@@ -47,6 +47,8 @@ const usage =
     \\    --extcmdline                  Enable external command line UI
     \\    --extpopup, --extpopupmenu    Enable external popup menu UI
     \\    --extmessages                 Enable external messages UI
+    \\    --exttabline                  Enable external tabline UI
+    \\    --extwindows                  Enable external windows UI
     \\    --ssh=<user@host[:port]>      Connect to remote host via SSH
     \\    --ssh-identity=<path>         Path to SSH private key file
     \\    --devcontainer=<workspace>    Run inside a devcontainer
@@ -56,6 +58,8 @@ const usage =
     \\                                    Address: TCP "host:port" or Unix socket path.
     \\                                    Mutually exclusive with --ssh / --devcontainer.
     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
+    \\    --dialog                      Ask for the connection (Local / SSH / Devcontainer)
+    \\                                    before launching nvim.
     \\    --install                     Create default config file and exit
     \\    --version                     Show version information and exit
     \\    --help, -h                    Show this help message and exit
@@ -104,7 +108,7 @@ fn desktopEntry(buf: []u8, exe: []const u8, icon: []const u8) ![]const u8 {
         \\
         \\[Desktop Action new-session]
         \\Name=New Session
-        \\Exec="{s}"
+        \\Exec="{s}" --dialog
         \\
     , .{ exe, icon, app_id, exe });
 }
@@ -315,6 +319,23 @@ test "the nvim path drops one pair of quotes and refuses the rest" {
 }
 
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+/// Points ssh's SSH_ASKPASS at this executable in askpass mode (form.zig),
+/// for every prompt, display or not. Before the core spawns ssh: it passes
+/// the environment as it is then.
+pub fn setAskpassEnv(env_mode: [:0]const u8) void {
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &buf, buf.len - 1);
+    if (n <= 0) return;
+    buf[@intCast(n)] = 0;
+    _ = setenv(askpass_env[0], &buf, 1);
+    _ = setenv(askpass_env[1], "force", 1);
+    _ = setenv(env_mode, "1", 1);
+}
+
+/// The ssh variables setAskpassEnv sets besides its mode marker.
+pub const askpass_env = [_][:0]const u8{ "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE" };
 /// Sets every variable `$SHELL -l -c 'env -0'` prints, but the ones that
 /// describe that shell rather than the user's environment. A shell that
 /// fails, or has not answered in 5 s, leaves the environment as it is.
@@ -467,7 +488,7 @@ test "the desktop entry runs this executable with the chosen files" {
     const e = try desktopEntry(&buf, "/opt/zonvie/zonvie", "/x/icon.png");
     try std.testing.expect(std.mem.indexOf(u8, e, "Exec=\"/opt/zonvie/zonvie\" %F\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, e, "StartupWMClass=io.github.akiyosi.zonvie\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, e, "[Desktop Action new-session]\nName=New Session\nExec=\"/opt/zonvie/zonvie\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "[Desktop Action new-session]\nName=New Session\nExec=\"/opt/zonvie/zonvie\" --dialog\n") != null);
 }
 
 test "flags after -- belong to nvim" {

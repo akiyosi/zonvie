@@ -114,6 +114,7 @@ enum { XDG_TOPLEVEL_SET_TITLE = 2, XDG_TOPLEVEL_SET_APP_ID = 3 };
 // ---------------------------------------------------------------------------
 
 #define MAX_OUTPUTS 8
+#define MAX_EXT 16
 
 static struct {
     const zwl_listener* l;
@@ -167,6 +168,10 @@ static struct {
     double axis_px[2];
     int32_t axis_steps[2];
     int axis_seen;
+    // A touchpad's recent travel, for the speed the fingers lift at.
+    struct axis_sample { uint32_t time_ms; double px[2]; } axis_recent[8];
+    int axis_recent_n;
+    int axis_finger, axis_stopped;
     struct wl_output* outputs[MAX_OUTPUTS];
     int32_t output_scale[MAX_OUTPUTS];
     int n_outputs;
@@ -174,10 +179,16 @@ static struct {
     struct wl_surface* surface;
     struct wl_proxy* xdg_surface;
     struct wl_proxy* toplevel;
+    struct wl_proxy* decoration;
+    int server_decorations;
     struct wl_callback* frame;
     int32_t pending_w, pending_h;
     // The compositor sizes the window (maximized, fullscreen or tiled).
     int pending_placed, placed;
+    int pending_maximized, maximized;
+    // The serial of the last pointer button press: a move or a resize the
+    // compositor takes over names it.
+    uint32_t button_serial;
     struct wl_proxy* decoration_manager;
 
     struct wl_egl_window* egl_window;
@@ -185,6 +196,19 @@ static struct {
     EGLContext egl_context;
     EGLSurface egl_surface;
     EGLConfig egl_config;
+
+    // External windows (zwl_ext_open).
+    struct zwl_ext {
+        int64_t id; // 0: free
+        struct wl_surface* surface;
+        struct wl_proxy* xdg_surface;
+        struct wl_proxy* toplevel;
+        struct wl_proxy* decoration;
+        struct wl_callback* frame;
+        struct wl_egl_window* egl_window;
+        EGLSurface egl_surface;
+        int32_t pending_w, pending_h;
+    } ext[MAX_EXT];
 
     struct xkb_context* xkb;
     struct xkb_keymap* keymap;
@@ -195,6 +219,16 @@ static struct {
 // ---------------------------------------------------------------------------
 // Outputs: the scale is known before the window exists.
 // ---------------------------------------------------------------------------
+
+static struct zwl_ext* ext_of_surface(struct wl_surface* s) {
+    for (int i = 0; i < MAX_EXT; i++) if (w.ext[i].id && w.ext[i].surface == s) return &w.ext[i];
+    return NULL;
+}
+static struct zwl_ext* ext_of_id(int64_t id) {
+    if (!id) return NULL;
+    for (int i = 0; i < MAX_EXT; i++) if (w.ext[i].id == id) return &w.ext[i];
+    return NULL;
+}
 
 static void output_geometry(void* d, struct wl_output* o, int32_t x, int32_t y, int32_t pw, int32_t ph,
                             int32_t sub, const char* make, const char* model, int32_t tr) {
@@ -333,26 +367,46 @@ static const struct wl_interface cursor_shape_device_interface = {
     "wp_cursor_shape_device_v1", 1, 2, cursor_shape_device_requests, 0, NULL,
 };
 enum { CURSOR_SHAPE_MANAGER_GET_POINTER = 1, CURSOR_SHAPE_DEVICE_SET_SHAPE = 1 };
-// wp_cursor_shape_device_v1.shape, and the cursor theme's names for them.
-enum { CURSOR_SHAPE_DEFAULT = 1, CURSOR_SHAPE_POINTER = 4, CURSOR_SHAPE_TEXT = 9 };
+// The cursor theme's name for a wp_cursor_shape_device_v1.shape, with an
+// older name some themes still carry.
+static void cursor_names(int shape, const char** name, const char** old) {
+    switch (shape) {
+    case 1: *name = "default"; *old = "left_ptr"; break;
+    case 4: *name = "pointer"; *old = "hand2"; break;
+    case 13: *name = "move"; *old = "fleur"; break;
+    case 18: *name = "e-resize"; *old = "right_side"; break;
+    case 19: *name = "n-resize"; *old = "top_side"; break;
+    case 20: *name = "ne-resize"; *old = "top_right_corner"; break;
+    case 21: *name = "nw-resize"; *old = "top_left_corner"; break;
+    case 22: *name = "s-resize"; *old = "bottom_side"; break;
+    case 23: *name = "se-resize"; *old = "bottom_right_corner"; break;
+    case 24: *name = "sw-resize"; *old = "bottom_left_corner"; break;
+    case 25: *name = "w-resize"; *old = "left_side"; break;
+    case 26: *name = "ew-resize"; *old = "sb_h_double_arrow"; break;
+    default: *name = "text"; *old = "xterm"; break;
+    }
+}
 
 static void set_cursor(uint32_t serial) {
-    const int hand = w.cursor_shape == ZWL_CURSOR_HAND;
+    const int shape = w.cursor_shape ? w.cursor_shape : 9;
     if (w.cursor_shape_manager) {
         if (!w.cursor_shape_device) {
             w.cursor_shape_device = wl_proxy_marshal_flags(w.cursor_shape_manager, CURSOR_SHAPE_MANAGER_GET_POINTER,
                                                            &cursor_shape_device_interface, 1, 0, NULL, w.pointer);
         }
         wl_proxy_marshal_flags(w.cursor_shape_device, CURSOR_SHAPE_DEVICE_SET_SHAPE, NULL, 1, 0, serial,
-                               hand ? CURSOR_SHAPE_POINTER : CURSOR_SHAPE_TEXT);
+                               (uint32_t)shape);
         return;
     }
     if (!w.shm) return;
     const int scale = zwl_scale();
     if (!w.cursor_theme) w.cursor_theme = wl_cursor_theme_load(NULL, 24 * scale, w.shm);
     if (!w.cursor_theme) return;
-    struct wl_cursor* c = wl_cursor_theme_get_cursor(w.cursor_theme, hand ? "pointer" : "text");
-    if (!c) c = wl_cursor_theme_get_cursor(w.cursor_theme, hand ? "hand2" : "xterm");
+    const char* name;
+    const char* old;
+    cursor_names(shape, &name, &old);
+    struct wl_cursor* c = wl_cursor_theme_get_cursor(w.cursor_theme, name);
+    if (!c) c = wl_cursor_theme_get_cursor(w.cursor_theme, old);
     if (!c) c = wl_cursor_theme_get_cursor(w.cursor_theme, "left_ptr");
     if (!c || c->image_count == 0) return;
     struct wl_cursor_image* img = c->images[0];
@@ -365,9 +419,11 @@ static void set_cursor(uint32_t serial) {
 }
 
 static void ptr_enter(void* d, struct wl_pointer* p, uint32_t serial, struct wl_surface* s, wl_fixed_t x, wl_fixed_t y) {
-    (void)d; (void)p; (void)s;
+    (void)d; (void)p;
     w.pointer_serial = serial;
     set_cursor(serial);
+    struct zwl_ext* e = ext_of_surface(s);
+    if (w.l->pointer_window) w.l->pointer_window(w.data, e ? e->id : 0);
     if (w.l->pointer_motion) w.l->pointer_motion(w.data, wl_fixed_to_double(x), wl_fixed_to_double(y));
 }
 void zwl_cursor(int shape) {
@@ -387,17 +443,56 @@ static void ptr_motion(void* d, struct wl_pointer* p, uint32_t time, wl_fixed_t 
 static void ptr_button(void* d, struct wl_pointer* p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
     (void)d; (void)p; (void)time;
     const int pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
-    if (pressed) w.input_serial = serial;
+    if (pressed) {
+        w.input_serial = serial;
+        w.button_serial = serial;
+    }
     if (w.l->pointer_button) w.l->pointer_button(w.data, button, pressed, mods_mask());
 }
 static void ptr_axis(void* d, struct wl_pointer* p, uint32_t time, uint32_t axis, wl_fixed_t value) {
     (void)d; (void)p; (void)time;
     if (axis > 1) return;
-    w.axis_px[axis] += wl_fixed_to_double(value);
+    const double px = wl_fixed_to_double(value);
+    w.axis_px[axis] += px;
     w.axis_seen = 1;
+    // One sample per event time: both axes of a frame share it.
+    const int n = w.axis_recent_n;
+    if (n > 0 && w.axis_recent[n - 1].time_ms == time) {
+        w.axis_recent[n - 1].px[axis] += px;
+        return;
+    }
+    const int cap = (int)(sizeof w.axis_recent / sizeof *w.axis_recent);
+    if (n == cap) memmove(w.axis_recent, w.axis_recent + 1, (size_t)(cap - 1) * sizeof *w.axis_recent);
+    struct axis_sample* s = &w.axis_recent[n == cap ? cap - 1 : n];
+    if (n < cap) w.axis_recent_n = n + 1;
+    s->time_ms = time;
+    s->px[0] = s->px[1] = 0;
+    s->px[axis] = px;
 }
 static void ptr_frame(void* d, struct wl_pointer* p) {
     (void)d; (void)p;
+    if (w.axis_stopped) {
+        // The fingers left the pad: their speed over the last tenth of a
+        // second, in px/s, is what a flick carries on with.
+        w.axis_stopped = 0;
+        double sum[2] = { 0, 0 };
+        uint32_t first = 0, last = 0;
+        int used = 0;
+        for (int i = w.axis_recent_n - 1; i >= 0; i--) {
+            const struct axis_sample* s = &w.axis_recent[i];
+            if (used == 0) last = s->time_ms;
+            if (last - s->time_ms > 100) break;
+            first = s->time_ms;
+            sum[0] += s->px[0];
+            sum[1] += s->px[1];
+            used++;
+        }
+        w.axis_recent_n = 0;
+        if (w.axis_finger && used >= 2 && last > first && w.l->pointer_axis_stop) {
+            const double dt = (double)(last - first) / 1000.0;
+            w.l->pointer_axis_stop(w.data, sum[1] / dt, sum[0] / dt);
+        }
+    }
     if (!w.axis_seen) return;
     // Vertical is axis 0, horizontal axis 1.
     if (w.l->pointer_axis) {
@@ -407,9 +502,13 @@ static void ptr_frame(void* d, struct wl_pointer* p) {
     w.axis_steps[0] = w.axis_steps[1] = 0;
     w.axis_seen = 0;
 }
-static void ptr_axis_source(void* d, struct wl_pointer* p, uint32_t source) { (void)d; (void)p; (void)source; }
+static void ptr_axis_source(void* d, struct wl_pointer* p, uint32_t source) {
+    (void)d; (void)p;
+    w.axis_finger = source == WL_POINTER_AXIS_SOURCE_FINGER;
+}
 static void ptr_axis_stop(void* d, struct wl_pointer* p, uint32_t time, uint32_t axis) {
     (void)d; (void)p; (void)time; (void)axis;
+    w.axis_stopped = 1;
 }
 static void ptr_axis_discrete(void* d, struct wl_pointer* p, uint32_t axis, int32_t discrete) {
     (void)d; (void)p;
@@ -976,10 +1075,12 @@ static void toplevel_configure(void* d, struct wl_proxy* t, int32_t width, int32
     w.pending_w = width;
     w.pending_h = height;
     w.pending_placed = 0;
+    w.pending_maximized = 0;
     // 1 maximized, 2 fullscreen, 5..8 tiled on an edge.
     const uint32_t* st;
     wl_array_for_each(st, states) {
         if (*st == 1 || *st == 2 || (*st >= 5 && *st <= 8)) w.pending_placed = 1;
+        if (*st == 1) w.pending_maximized = 1;
     }
 }
 static void toplevel_close(void* d, struct wl_proxy* t) {
@@ -995,6 +1096,7 @@ static void xdg_surface_configure(void* d, struct wl_proxy* s, uint32_t serial) 
     (void)d;
     wl_proxy_marshal_flags(s, XDG_SURFACE_ACK_CONFIGURE, NULL, 1, 0, serial);
     w.placed = w.pending_placed;
+    w.maximized = w.pending_maximized;
     if (w.l->configure) w.l->configure(w.data, w.pending_w, w.pending_h);
 }
 static const struct { void (*configure)(void*, struct wl_proxy*, uint32_t); } xdg_surface_listener = {
@@ -1033,6 +1135,24 @@ static const struct { void (*configure)(void*, struct wl_proxy*, uint32_t); } de
 };
 
 int zwl_placed(void) { return w.placed; }
+int zwl_maximized(void) { return w.maximized; }
+int zwl_server_decorations(void) { return w.decoration_manager != NULL; }
+
+// xdg_toplevel requests the frontend's own title bar makes: the compositor
+// takes the pointer over for a move or a resize (`edge`: xdg_toplevel's
+// resize_edge), started by the button press last seen.
+void zwl_move(void) {
+    if (w.toplevel && w.seat) wl_proxy_marshal_flags(w.toplevel, 5, NULL, 1, 0, w.seat, w.button_serial);
+}
+void zwl_resize(uint32_t edge) {
+    if (w.toplevel && w.seat) wl_proxy_marshal_flags(w.toplevel, 6, NULL, 1, 0, w.seat, w.button_serial, edge);
+}
+void zwl_toggle_maximize(void) {
+    if (w.toplevel) wl_proxy_marshal_flags(w.toplevel, w.maximized ? 10 : 9, NULL, 1, 0);
+}
+void zwl_minimize(void) {
+    if (w.toplevel) wl_proxy_marshal_flags(w.toplevel, 13, NULL, 1, 0);
+}
 
 void* zonvie_wl_blur_surface(struct wl_surface* surface, struct wl_compositor* compositor);
 int zonvie_wl_blur_init(struct wl_display* display);
@@ -1042,9 +1162,9 @@ void zwl_blur(void) {
     if (zonvie_wl_blur_init(w.display) != 0) zonvie_wl_blur_surface(w.surface, w.compositor);
 }
 
-int zwl_window(const char* app_id, const char* title) {
-    w.surface = wl_compositor_create_surface(w.compositor);
-    if (!w.surface) return -1;
+// Gives the surface its toplevel role and commits it without a buffer: the
+// compositor answers with a configure.
+static void make_toplevel(const char* app_id, const char* title) {
     w.xdg_surface = wl_proxy_marshal_flags(w.wm_base, XDG_WM_BASE_GET_XDG_SURFACE, &xdg_surface_interface, 1, 0, NULL,
                                            w.surface);
     wl_proxy_add_listener(w.xdg_surface, (void (**)(void))&xdg_surface_listener, NULL);
@@ -1052,16 +1172,23 @@ int zwl_window(const char* app_id, const char* title) {
     wl_proxy_add_listener(w.toplevel, (void (**)(void))&toplevel_listener, NULL);
     wl_proxy_marshal_flags(w.toplevel, XDG_TOPLEVEL_SET_APP_ID, NULL, 1, 0, app_id);
     wl_proxy_marshal_flags(w.toplevel, XDG_TOPLEVEL_SET_TITLE, NULL, 1, 0, title);
-    if (w.decoration_manager) {
-        struct wl_proxy* dec = wl_proxy_marshal_flags(w.decoration_manager, 1, &toplevel_decoration_interface, 1, 0,
-                                                     NULL, w.toplevel);
-        wl_proxy_add_listener(dec, (void (**)(void))&decoration_listener, NULL);
+    // No decoration object: the compositor leaves the title bar to the client.
+    if (w.decoration_manager && w.server_decorations) {
+        w.decoration = wl_proxy_marshal_flags(w.decoration_manager, 1, &toplevel_decoration_interface, 1, 0, NULL,
+                                              w.toplevel);
+        wl_proxy_add_listener(w.decoration, (void (**)(void))&decoration_listener, NULL);
         // 2: server-side.
-        wl_proxy_marshal_flags(dec, 1, NULL, 1, 0, 2);
+        wl_proxy_marshal_flags(w.decoration, 1, NULL, 1, 0, 2);
     }
-    // No buffer yet: the compositor answers with the first configure.
     wl_surface_commit(w.surface);
     wl_display_flush(w.display);
+}
+
+int zwl_window(const char* app_id, const char* title, int server_decorations) {
+    w.surface = wl_compositor_create_surface(w.compositor);
+    if (!w.surface) return -1;
+    w.server_decorations = server_decorations;
+    make_toplevel(app_id, title);
     return 0;
 }
 
@@ -1088,6 +1215,32 @@ void zwl_request_frame(void) {
 }
 
 int zwl_frame_pending(void) { return w.frame != NULL; }
+
+// Unmaps the window: its toplevel role is given up and the buffer taken
+// off. No frame callback comes for a surface that is not shown.
+void zwl_hide(void) {
+    if (!w.toplevel) return;
+    if (w.frame) {
+        wl_callback_destroy(w.frame);
+        w.frame = NULL;
+    }
+    // Opcode 0 is destroy in each of the three interfaces.
+    if (w.decoration) wl_proxy_marshal_flags(w.decoration, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_proxy_marshal_flags(w.toplevel, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_proxy_marshal_flags(w.xdg_surface, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    w.decoration = NULL;
+    w.toplevel = NULL;
+    w.xdg_surface = NULL;
+    wl_surface_attach(w.surface, NULL, 0, 0);
+    wl_surface_commit(w.surface);
+    wl_display_flush(w.display);
+}
+
+// Maps it again: a new toplevel, whose first configure the buffer follows.
+void zwl_show(const char* app_id, const char* title) {
+    if (w.toplevel || !w.surface) return;
+    make_toplevel(app_id, title);
+}
 
 // ---------------------------------------------------------------------------
 // EGL
@@ -1134,10 +1287,144 @@ int zwl_swap(void) {
 }
 
 // ---------------------------------------------------------------------------
+// External windows
+// ---------------------------------------------------------------------------
+
+static void ext_toplevel_configure(void* d, struct wl_proxy* t, int32_t width, int32_t height, struct wl_array* states) {
+    (void)t; (void)states;
+    struct zwl_ext* e = d;
+    e->pending_w = width;
+    e->pending_h = height;
+}
+static void ext_toplevel_close(void* d, struct wl_proxy* t) {
+    (void)t;
+    struct zwl_ext* e = d;
+    if (w.l->ext_close) w.l->ext_close(w.data, e->id);
+}
+static const struct {
+    void (*configure)(void*, struct wl_proxy*, int32_t, int32_t, struct wl_array*);
+    void (*close)(void*, struct wl_proxy*);
+} ext_toplevel_listener = { ext_toplevel_configure, ext_toplevel_close };
+
+static void ext_surface_configure(void* d, struct wl_proxy* s, uint32_t serial) {
+    struct zwl_ext* e = d;
+    wl_proxy_marshal_flags(s, XDG_SURFACE_ACK_CONFIGURE, NULL, 1, 0, serial);
+    if (w.l->ext_configure) w.l->ext_configure(w.data, e->id, e->pending_w, e->pending_h);
+}
+static const struct { void (*configure)(void*, struct wl_proxy*, uint32_t); } ext_surface_listener = {
+    ext_surface_configure,
+};
+
+static void ext_frame_done(void* d, struct wl_callback* cb, uint32_t time) {
+    (void)time;
+    struct zwl_ext* e = d;
+    wl_callback_destroy(cb);
+    e->frame = NULL;
+    if (w.l->ext_frame) w.l->ext_frame(w.data, e->id);
+}
+static const struct wl_callback_listener ext_frame_listener = { ext_frame_done };
+
+int zwl_ext_open(int64_t id, const char* app_id, const char* title, int32_t w_px, int32_t h_px, int32_t scale) {
+    if (!id || ext_of_id(id) || w.egl_context == EGL_NO_CONTEXT) return -1;
+    struct zwl_ext* e = NULL;
+    for (int i = 0; i < MAX_EXT && !e; i++) if (!w.ext[i].id) e = &w.ext[i];
+    if (!e) return -1;
+    memset(e, 0, sizeof *e);
+    e->surface = wl_compositor_create_surface(w.compositor);
+    if (!e->surface) return -1;
+    wl_surface_set_buffer_scale(e->surface, scale);
+    e->egl_window = wl_egl_window_create(e->surface, w_px, h_px);
+    e->egl_surface = e->egl_window
+        ? eglCreateWindowSurface(w.egl_display, w.egl_config, (EGLNativeWindowType)e->egl_window, NULL)
+        : EGL_NO_SURFACE;
+    if (e->egl_surface == EGL_NO_SURFACE) {
+        if (e->egl_window) wl_egl_window_destroy(e->egl_window);
+        wl_surface_destroy(e->surface);
+        return -1;
+    }
+    e->id = id;
+    e->xdg_surface = wl_proxy_marshal_flags(w.wm_base, XDG_WM_BASE_GET_XDG_SURFACE, &xdg_surface_interface, 1, 0, NULL,
+                                            e->surface);
+    wl_proxy_add_listener(e->xdg_surface, (void (**)(void))&ext_surface_listener, e);
+    e->toplevel = wl_proxy_marshal_flags(e->xdg_surface, XDG_SURFACE_GET_TOPLEVEL, &xdg_toplevel_interface, 1, 0, NULL);
+    wl_proxy_add_listener(e->toplevel, (void (**)(void))&ext_toplevel_listener, e);
+    wl_proxy_marshal_flags(e->toplevel, XDG_TOPLEVEL_SET_APP_ID, NULL, 1, 0, app_id);
+    wl_proxy_marshal_flags(e->toplevel, XDG_TOPLEVEL_SET_TITLE, NULL, 1, 0, title);
+    // The desktop's title bar where it draws one: these windows have no
+    // header of their own.
+    if (w.decoration_manager) {
+        e->decoration = wl_proxy_marshal_flags(w.decoration_manager, 1, &toplevel_decoration_interface, 1, 0, NULL,
+                                               e->toplevel);
+        wl_proxy_add_listener(e->decoration, (void (**)(void))&decoration_listener, NULL);
+        wl_proxy_marshal_flags(e->decoration, 1, NULL, 1, 0, 2);
+    }
+    wl_surface_commit(e->surface);
+    wl_display_flush(w.display);
+    return 0;
+}
+
+void zwl_ext_close(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    if (!e) return;
+    // The surface GL draws to goes with the window: back to the main one.
+    eglMakeCurrent(w.egl_display, w.egl_surface, w.egl_surface, w.egl_context);
+    if (e->frame) wl_callback_destroy(e->frame);
+    eglDestroySurface(w.egl_display, e->egl_surface);
+    wl_egl_window_destroy(e->egl_window);
+    if (e->decoration) wl_proxy_marshal_flags(e->decoration, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_proxy_marshal_flags(e->toplevel, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_proxy_marshal_flags(e->xdg_surface, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_surface_destroy(e->surface);
+    e->id = 0;
+    wl_display_flush(w.display);
+}
+
+void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px) {
+    struct zwl_ext* e = ext_of_id(id);
+    if (e) wl_egl_window_resize(e->egl_window, w_px, h_px, 0, 0);
+}
+
+int zwl_ext_make_current(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    EGLSurface s = e ? e->egl_surface : w.egl_surface;
+    if (id && !e) return -1;
+    return eglMakeCurrent(w.egl_display, s, s, w.egl_context) ? 0 : -1;
+}
+
+int zwl_ext_swap(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    if (!e) return -1;
+    return eglSwapBuffers(w.egl_display, e->egl_surface) ? 0 : -1;
+}
+
+void zwl_ext_request_frame(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    if (!e || e->frame) return;
+    e->frame = wl_surface_frame(e->surface);
+    wl_callback_add_listener(e->frame, &ext_frame_listener, e);
+}
+
+int zwl_ext_frame_pending(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    return e && e->frame != NULL;
+}
+
+// ---------------------------------------------------------------------------
 // Event pump
 // ---------------------------------------------------------------------------
 
-int zwl_dispatch(void) { return wl_display_dispatch(w.display); }
+// Reads what the socket has and dispatches it. Called when the socket is
+// readable, it never waits: what was read may hold nothing for this queue
+// (an event for EGL's queue, a delete_id), and wl_display_dispatch would
+// then sleep until something for it came.
+int zwl_dispatch(void) {
+    while (wl_display_prepare_read(w.display) != 0) {
+        if (wl_display_dispatch_pending(w.display) < 0) return -1;
+    }
+    wl_display_flush(w.display);
+    if (wl_display_read_events(w.display) < 0) return -1;
+    return wl_display_dispatch_pending(w.display);
+}
 int zwl_dispatch_pending(void) { return wl_display_dispatch_pending(w.display); }
 int zwl_flush(void) { return wl_display_flush(w.display); }
 int zwl_roundtrip(void) { return wl_display_roundtrip(w.display); }

@@ -24,4 +24,6 @@ test {
     _ = @import("unbuilt.zig");
     _ = @import("trackpad.zig");
     _ = @import("pointer.zig");
+    _ = @import("form.zig");
+    _ = @import("tray.zig");
 }

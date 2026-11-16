@@ -8,6 +8,30 @@ const std = @import("std");
 const applog = @import("app_log.zig");
 
 var g_entered = std.atomic.Value(bool).init(false);
+/// This process is a form (form.zig): its own crash opens no report window.
+pub var is_form = false;
+
+extern "c" fn fork() c_int;
+extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn _exit(code: c_int) noreturn;
+
+/// Shows `text` in a window of its own: this executable again, as the
+/// message form, which outlives this process. `text` ends in a 0 byte
+/// within `buf`.
+pub fn showReport(text: [:0]const u8) void {
+    if (is_form) return;
+    var exe: [std.fs.max_path_bytes:0]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &exe, exe.len - 1);
+    if (n <= 0) return;
+    exe[@intCast(n)] = 0;
+    if (fork() != 0) return;
+    _ = std.c.setsid();
+    _ = setenv("ZONVIE_CRASH_REPORT", "1", 1);
+    const argv = [_:null]?[*:0]const u8{ &exe, text.ptr };
+    _ = execv(&exe, &argv);
+    _exit(127);
+}
 var g_report: [16 * 1024]u8 = undefined;
 
 pub fn onPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -32,6 +56,11 @@ pub fn onPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
         const state: ?[]const u8 = if (std.c.getenv("XDG_STATE_HOME")) |s| std.mem.span(s) else null;
         const path = crashPath(&path_buf, state, home);
         if (path) |p| writeCrashFile(p, report);
+    }
+    // The report in a window: a start from the desktop has no terminal.
+    if (report.len < g_report.len) {
+        g_report[report.len] = 0;
+        showReport(g_report[0..report.len :0]);
     }
     // stderr, then abort, as without this handler.
     std.debug.defaultPanic(msg, first_trace_addr);

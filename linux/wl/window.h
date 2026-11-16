@@ -25,6 +25,8 @@ typedef struct {
     // One frame's scroll: logical px along each axis, positive right / down,
     // and a wheel's notches (0 for a touchpad).
     void (*pointer_axis)(void* data, double dx, double dy, int32_t steps_x, int32_t steps_y, uint32_t mods);
+    // A touchpad's fingers lifted while moving at (vx, vy) logical px/s.
+    void (*pointer_axis_stop)(void* data, double vx, double vy);
     // The input method's composition, UTF-8: "" ends it. `begin` / `end`:
     // the cursor's byte range within it.
     void (*ime_preedit)(void* data, const char* text, int32_t begin, int32_t end);
@@ -34,6 +36,14 @@ typedef struct {
     void (*keys_reset)(void* data);
     // Files dropped on the window: a text/uri-list of `len` bytes.
     void (*drop)(void* data, const char* uri_list, size_t len);
+    // An external window (zwl_ext_open) was configured, asked to close, or
+    // had its frame shown. `id` is the one it was opened with.
+    void (*ext_configure)(void* data, int64_t id, int32_t w, int32_t h);
+    void (*ext_close)(void* data, int64_t id);
+    void (*ext_frame)(void* data, int64_t id);
+    // The pointer entered a window: the events after it are that window's.
+    // 0 is the main window.
+    void (*pointer_window)(void* data, int64_t id);
 } zwl_listener;
 
 // Connects and binds the globals. 0, or -1 when no compositor answers.
@@ -41,8 +51,9 @@ int zwl_open(const zwl_listener* l, void* data);
 int zwl_fd(void);
 // The largest scale among the outputs, known once zwl_open returned.
 int zwl_scale(void);
-// The surface and its toplevel, committed without a buffer.
-int zwl_window(const char* app_id, const char* title);
+// The surface and its toplevel, committed without a buffer. With
+// `server_decorations` the compositor is asked to draw the title bar.
+int zwl_window(const char* app_id, const char* title, int server_decorations);
 void zwl_set_title(const char* title);
 // The compositor sizes the window: maximized, fullscreen or tiled.
 int zwl_placed(void);
@@ -51,10 +62,23 @@ void zwl_blur(void);
 void zwl_set_buffer_scale(int32_t scale);
 void zwl_request_frame(void);
 int zwl_frame_pending(void);
+// Unmaps the window, and maps it again (a configure follows; no buffer may
+// be attached between the two).
+void zwl_hide(void);
+void zwl_show(const char* app_id, const char* title);
 void zwl_repeat_info(int32_t* rate, int32_t* delay);
-// The pointer's shape over the window.
-enum { ZWL_CURSOR_TEXT = 0, ZWL_CURSOR_HAND = 1 };
+// The pointer's shape over the window: a wp_cursor_shape_device_v1.shape
+// (1 default, 4 pointer, 9 text, 18..25 the resize edges); 0 is text.
 void zwl_cursor(int shape);
+// The frontend's own title bar: a move or a resize the compositor takes over
+// (`edge`: xdg_toplevel.resize_edge), from the button press last seen.
+void zwl_move(void);
+void zwl_resize(uint32_t edge);
+void zwl_toggle_maximize(void);
+void zwl_minimize(void);
+int zwl_maximized(void);
+// The compositor offers to draw the title bar (xdg-decoration).
+int zwl_server_decorations(void);
 // The modifiers held, as the masks keymap.zig takes.
 uint32_t zwl_mods(void);
 
@@ -79,5 +103,17 @@ int zwl_dispatch(void);
 int zwl_dispatch_pending(void);
 int zwl_flush(void);
 int zwl_roundtrip(void);
+
+// External windows: further toplevels of the same client, drawn with the main
+// window's GL context. `id` is nonzero and the caller's own. The window is
+// committed without a buffer; ext_configure says when to draw.
+int zwl_ext_open(int64_t id, const char* app_id, const char* title, int32_t w_px, int32_t h_px, int32_t scale);
+void zwl_ext_close(int64_t id);
+void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
+// Makes the window's surface the one GL draws to; id 0 is the main window.
+int zwl_ext_make_current(int64_t id);
+int zwl_ext_swap(int64_t id);
+void zwl_ext_request_frame(int64_t id);
+int zwl_ext_frame_pending(int64_t id);
 
 #endif

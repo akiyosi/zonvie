@@ -510,6 +510,20 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     var screen_fbo: gl.GLint = 0;
     gl.glGetIntegerv(gl.GL_FRAMEBUFFER_BINDING, &screen_fbo);
     if (!setup(app, p) or t.w_px == 0 or t.h_px == 0) return scene(app, t, surface_id);
+    // The passes below draw into framebuffers of the view's own size; only
+    // the last one lands in the window, at the view's place in it
+    // (`in_window`).
+    const in_window = t.*;
+    t.ox_px = 0;
+    t.oy_px = 0;
+    t.fb_w_px = 0;
+    t.fb_h_px = 0;
+    defer {
+        t.ox_px = in_window.ox_px;
+        t.oy_px = in_window.oy_px;
+        t.fb_w_px = in_window.fb_w_px;
+        t.fb_h_px = in_window.fb_h_px;
+    }
 
     // Offscreen textures are top-down already; only a bottom-up screen
     // needs the final pass to flip.
@@ -531,6 +545,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     gl.glViewport(0, 0, @intCast(t.w_px), @intCast(t.h_px));
     if (p.custom_len == 0) {
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
+        gl_renderer.viewport(&in_window);
         gl.glUseProgram(p.copy.prog);
         gl.glUniform1f(p.copy.u_scale, 1);
         drawFullscreen(p.copy, p.scene.tex, to_screen);
@@ -555,6 +570,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         const last = i + 1 == p.custom_len;
         if (last) {
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, if (p.uses_prev) p.out.fbo else @intCast(screen_fbo));
+            if (!p.uses_prev) gl_renderer.viewport(&in_window);
         } else {
             const dst = &p.ping[i % 2];
             dst.ensure(t.w_px, t.h_px);
@@ -568,6 +584,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         // iPrevFrame and copied to the screen from there; a blit out of the
         // render thread's dmabuf reads nothing on some drivers.
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
+        gl_renderer.viewport(&in_window);
         gl.glUseProgram(p.copy.prog);
         gl.glUniform1f(p.copy.u_scale, 1);
         drawFullscreen(p.copy, p.out.tex, to_screen);

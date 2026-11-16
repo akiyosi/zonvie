@@ -1,26 +1,25 @@
-//! What this frontend has not built yet. The modules that face the core
-//! (callbacks.zig, app.zig, renderer/gl_renderer.zig) were written against a
-//! toolkit that drew these pieces; they still call them, through ui.zig, and
-//! each name here is that call's other end.
+//! The other end of calls the core-facing modules (callbacks.zig, app.zig,
+//! renderer/gl_renderer.zig) make through ui.zig for pieces that are main.zig's
+//! or shell.zig's own here, and for the two that do not exist:
 //!
-//! - A function that does nothing is a feature that does not exist: external
-//!   windows, the tab line, panels in their own surfaces, the tray,
-//!   notifications, a font dialog, an overlay for the IME's composition.
-//!   Building the feature is writing the function.
-//! - A type holds the state the callers keep for such a piece, cut down to
-//!   the fields they read.
+//! - panel_popup: the ext UI panels in popup surfaces of their own. They are
+//!   drawn inside the window that holds them.
+//! - render_thread: a thread presenting off the window's frame cycle. The
+//!   frontend presents its own surface; there is no such cycle to go around.
+//!
+//! A type holds the state the callers keep for such a piece, cut down to the
+//! fields they read.
 
 const std = @import("std");
 const core = @import("zonvie_core");
 const App = @import("app.zig").App;
-const scrollbar = @import("scrollbar.zig");
 const pointer = @import("pointer.zig");
 
 pub const input = struct {
     pub const Pointer = pointer.Pointer;
-    /// A panel under a pointer that did not move (ext UI panels take no
-    /// pointer yet).
-    pub fn refreshPanelHover(_: *App) void {}
+    pub fn refreshPanelHover(app: *App) void {
+        pointer.refreshPanelHover(app);
+    }
     /// main.zig's own.
     pub fn updateImeCursor(app: *App) void {
         @import("root").updateImeCursor(app);
@@ -47,42 +46,21 @@ pub const ui_widgets = struct {
             return f;
         }
     };
-    pub fn hideProgress(_: *App) void {}
-    pub fn placeCopyButtons(_: *App) void {}
-    pub fn placeMessages(_: *App) void {}
-    pub fn queueRefresh(_: *App) void {}
-};
-
-pub const ext_window = struct {
-    /// An external grid's own OS window: none is ever opened.
-    pub const ExtWindow = struct {
-        area: ?*anyopaque = null,
-        scrollbar: scrollbar.State = .{},
-    };
-    pub const Op = struct {
-        kind: enum { open, close, layout },
-        grid_id: i64 = 0,
-        /// The Neovim window handle, which names the OS window ("Window N").
-        win: i64 = 0,
-        rows: u32 = 0,
-        cols: u32 = 0,
-        /// on_external_window's global cell, -1 for none.
-        start_row: i32 = -1,
-        start_col: i32 = -1,
-        /// `.layout`: a win_move / win_exchange / win_rotate / win_resize_equal
-        /// for win_layout.plan, from the window showing `source_grid` (null:
-        /// the main window).
-        layout_op: core.win_layout.Op = .move,
-        arg: i32 = 0,
-        count: i32 = 0,
-        source_grid: ?i64 = null,
-    };
-    pub fn findWindow(_: *App, _: i64, _: i32, _: i32, main_win: i64) i64 {
-        return main_win;
+    /// Neovim has drawn: the start's progress text goes (shell.zig draws it).
+    pub fn hideProgress(app: *App) void {
+        if (app.progress.len == 0) return;
+        app.progress = "";
+        @import("shell.zig").rebuild(app, true);
     }
-    pub fn focusGrid(_: *App, _: i64) void {}
-    pub fn queueApply(_: *App) void {}
-    pub fn queueRefit(_: *App) void {}
+    pub fn placeCopyButtons(_: *App) void {}
+    /// After a flush: the labels follow the cursor's window, and the frame
+    /// the flush queues draws them (shell.zig).
+    pub fn placeMessages(app: *App) void {
+        @import("shell.zig").rebuild(app, false);
+    }
+    pub fn queueRefresh(app: *App) void {
+        @import("shell.zig").queueRefresh(app);
+    }
 };
 
 pub const panel_popup = struct {
@@ -94,29 +72,21 @@ pub const panel_popup = struct {
     pub fn update(_: *App) void {}
 };
 
-pub const blink = struct {
-    pub fn focusedImContext(_: *App) ?*anyopaque {
-        return null;
-    }
-    pub fn update(_: *App) void {}
-};
-
-pub const font_picker = struct {
-    /// `:set guifont=*`: no font dialog.
-    pub fn request(_: *App) void {}
-};
-
 pub const window_size = struct {
-    /// The window follows a grid size Neovim asks for: not yet.
-    pub fn queueSnap(_: *App) void {}
-    pub fn resizeToGrid(_: *App, _: u32, _: u32) void {}
+    /// main.zig's own.
+    pub fn queueSnap(app: *App) void {
+        @import("root").queueSnap(app);
+    }
+    pub fn resizeToGrid(app: *App, rows: u32, cols: u32) void {
+        @import("root").resizeToGrid(app, rows, cols);
+    }
     /// main.zig saves the size itself, when its loop ends.
     pub fn save(_: *App) void {}
 };
 
 pub const ime_off = struct {
     /// main.zig's own.
-    pub fn off(_: ?*anyopaque) void {
+    pub fn off() void {
         @import("root").imeOff();
     }
 };
@@ -126,12 +96,26 @@ pub const session = struct {
     pub fn applyTitle(app: *App, title: []const u8) void {
         @import("root").setTitle(app, title);
     }
-    /// A remote start that ended before its first frame: no alert, the
-    /// reason is on stderr.
-    pub fn failEarlyExit(_: *App, _: i32) bool {
+    /// A remote start that ended before its first frame: what the process
+    /// printed goes to stderr and into a report window, and the caller
+    /// quits as for any exit.
+    pub fn failEarlyExit(app: *App, exit_code: i32) bool {
+        const lifecycle = @import("lifecycle.zig");
+        if (app.nvim_ready) return false;
+        const heading = lifecycle.earlyExitHeading(app.start_kind) orelse return false;
+        app.start_output.open.store(false, .release);
+        var out_buf: [4096]u8 = undefined;
+        const out = app.start_output.copy(core.clock.io(), &out_buf);
+        var detail_buf: [1024]u8 = undefined;
+        const detail = lifecycle.earlyExitDetail(&detail_buf, out, exit_code);
+        std.debug.print("zonvie: {s}: {s}\n", .{ heading, detail });
+        var text: [1200]u8 = undefined;
+        if (std.fmt.bufPrintZ(&text, "{s}\n\n{s}", .{ heading, detail })) |t| @import("crash.zig").showReport(t) else |_| {}
         return false;
     }
-    pub fn onReady(_: *App) void {}
+    pub fn onReady(app: *App) void {
+        @import("session.zig").onReady(app);
+    }
 };
 
 pub const render_thread = struct {
@@ -143,12 +127,4 @@ pub const render_thread = struct {
     pub fn idlePresent(_: ?*anyopaque) callconv(.c) c_int {
         return 0;
     }
-};
-
-pub const tray = struct {
-    pub const Tray = struct {};
-};
-
-pub const notify = struct {
-    pub const State = struct {};
 };

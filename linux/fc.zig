@@ -98,3 +98,13 @@ test "a fallback family is not the requested one" {
     try std.testing.expect(familyAccepted("dejavu sans mono", "DejaVu Sans Mono"));
     try std.testing.expect(familyAccepted("monospace", "JetBrainsMono Nerd Font"));
 }
+
+// Listing the installed families (font_picker.zig).
+pub const FcObjectSet = opaque {};
+pub const FcFontSet = extern struct { nfont: c_int, sfont: c_int, fonts: ?[*]*FcPattern };
+pub const FC_SPACING: [*:0]const u8 = "spacing";
+pub const FC_MONO: c_int = 100;
+pub extern "c" fn FcObjectSetBuild(first: [*:0]const u8, ...) ?*FcObjectSet;
+pub extern "c" fn FcObjectSetDestroy(os: *FcObjectSet) void;
+pub extern "c" fn FcFontList(config: ?*FcConfig, p: *FcPattern, os: *FcObjectSet) ?*FcFontSet;
+pub extern "c" fn FcFontSetDestroy(s: *FcFontSet) void;

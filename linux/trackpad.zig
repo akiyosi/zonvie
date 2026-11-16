@@ -1,9 +1,10 @@
 //! Touchpad scrolling: the pointer's scroll travel in surface px →
 //! pixel_scroll.zig's model on the grid's ease (grid_ease.zig). The content
-//! follows the fingers by a sub-cell offset, and stretches then springs back
-//! at a buffer edge. No momentum after a flick: Wayland sends none, and
-//! nothing here makes it up. Main thread only. Mouse wheels never come here
-//! (main.zig onPointerAxis).
+//! follows the fingers by a sub-cell offset, keeps going under momentum after
+//! a flick, and stretches then springs back at a buffer edge. Wayland sends
+//! no momentum: the fingers' speed as they lift (wl/window.c) starts one
+//! here. Main thread only. Mouse wheels never come here (main.zig
+//! onPointerAxis).
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -26,7 +27,14 @@ pub const State = struct {
     h_acc: f64 = 0,
     /// The grid whose window lends its 'smoothscroll' to the gesture; 0 none.
     borrowed_grid: i64 = 0,
-    /// The modifiers of the last step.
+    /// Momentum after a flick, in device px/s, positive moving the content
+    /// down, and the horizontal one, positive scrolling right; their timer
+    /// (0: none) and when it last ran.
+    momentum_px_s: f64 = 0,
+    momentum_x_px_s: f64 = 0,
+    momentum_timer: c_uint = 0,
+    last_tick_ns: i128 = 0,
+    /// The modifiers of the last step, sent with the momentum's events.
     mods: [5]u8 = .{ 0, 0, 0, 0, 0 },
     /// When the last vertical step arrived, and the timer that ends the
     /// gesture once no step follows.
@@ -34,12 +42,71 @@ pub const State = struct {
     watchdog: c_uint = 0,
 };
 
-/// A gesture with no step for this long has ended.
+/// A gesture with no step for this long, and no momentum, has ended.
 const idle_end_ns: i64 = 500 * std.time.ns_per_ms;
+
+const momentum_tick_ms = 8;
+
+/// The fingers lifted at (vel_x, vel_y) logical px/s, the pointer axis's
+/// sign: vertical momentum for a pixel-scrolled target, horizontal momentum
+/// as further wheel events on any grid.
+pub fn decelerate(p: *input.Pointer, vel_x: f64, vel_y: f64) void {
+    applog.appLog("[trackpad] decelerate vx={d:.0} vy={d:.0} pixel={}\n", .{ vel_x, vel_y, p.scroll.pixel });
+    const scale: f64 = p.app.scale;
+    const v = -vel_y * scale;
+    const vx = vel_x * scale;
+    const vertical_on = p.scroll.pixel and p.scroll.target != null and @abs(v) >= pixel_scroll.momentum_stop_px_s;
+    const horizontal_on = @abs(vx) >= pixel_scroll.momentum_stop_px_s;
+    if (!vertical_on and !horizontal_on) return;
+    p.scroll.momentum_px_s = if (vertical_on) v else 0;
+    p.scroll.momentum_x_px_s = if (horizontal_on) vx else 0;
+    p.scroll.last_tick_ns = clock.nowNs();
+    if (p.scroll.momentum_timer == 0) p.scroll.momentum_timer = glib.g_timeout_add(momentum_tick_ms, &onMomentumTick, p);
+}
+
+fn onMomentumTick(data: ?*anyopaque) callconv(.c) c_int {
+    const p: *input.Pointer = @ptrCast(@alignCast(data.?));
+    const now = clock.nowNs();
+    const dt_s: f64 = @as(f64, @floatFromInt(now - p.scroll.last_tick_ns)) / std.time.ns_per_s;
+    p.scroll.last_tick_ns = now;
+    const cp = p.app.corep orelse {
+        p.scroll.momentum_timer = 0;
+        finish(p);
+        return 0;
+    };
+    if (p.scroll.momentum_px_s != 0) {
+        const step = pixel_scroll.momentumStep(p.scroll.momentum_px_s, dt_s);
+        const at_edge = vertical(p, cp, step.delta_px, @ptrCast(&p.scroll.mods));
+        // Like the native rubber band, momentum reaching an edge is
+        // swallowed and the bounce starts at once.
+        p.scroll.momentum_px_s = if (at_edge) 0 else step.velocity_px_s;
+    }
+    if (p.scroll.momentum_x_px_s != 0) {
+        const step = pixel_scroll.momentumStep(p.scroll.momentum_x_px_s, dt_s);
+        p.scroll.momentum_x_px_s = step.velocity_px_s;
+        horizontal(p, cp, step.delta_px, 0, @ptrCast(&p.scroll.mods));
+    }
+    if (p.scroll.momentum_px_s != 0 or p.scroll.momentum_x_px_s != 0) return 1;
+    // finish must not remove the source returning here.
+    p.scroll.momentum_timer = 0;
+    finish(p);
+    return 0;
+}
+
+fn stopMomentumTimer(p: *input.Pointer) void {
+    if (p.scroll.momentum_timer != 0) {
+        _ = glib.g_source_remove(p.scroll.momentum_timer);
+        p.scroll.momentum_timer = 0;
+    }
+    p.scroll.momentum_px_s = 0;
+    p.scroll.momentum_x_px_s = 0;
+}
 
 /// One touchpad step of (dx, dy) logical px, the pointer axis's sign (positive scrolls
 /// toward the end, moving the content up / left).
 pub fn scroll(p: *input.Pointer, cp: *core.zonvie_core, dx: f64, dy: f64, mods: [*:0]const u8) void {
+    // Fingers back on the pad end a momentum under way.
+    stopMomentumTimer(p);
     const len = std.mem.len(mods);
     @memset(&p.scroll.mods, 0);
     @memcpy(p.scroll.mods[0..@min(len, p.scroll.mods.len - 1)], mods[0..@min(len, p.scroll.mods.len - 1)]);
@@ -148,6 +215,7 @@ fn send(cp: *core.zonvie_core, c: input.Cell, dir: [*:0]const u8, mods: [*:0]con
 /// (its edge bounce), and its window gets its 'smoothscroll' back.
 pub fn finish(p: *input.Pointer) void {
     const app = p.app;
+    stopMomentumTimer(p);
     if (p.scroll.watchdog != 0) {
         _ = glib.g_source_remove(p.scroll.watchdog);
         p.scroll.watchdog = 0;
@@ -196,7 +264,7 @@ fn retryRestore(data: ?*anyopaque) callconv(.c) c_int {
 
 fn watchdog(data: ?*anyopaque) callconv(.c) c_int {
     const p: *input.Pointer = @ptrCast(@alignCast(data.?));
-    if (clock.nowNs() - p.scroll.last_step_ns < idle_end_ns) return 1;
+    if (p.scroll.momentum_timer != 0 or clock.nowNs() - p.scroll.last_step_ns < idle_end_ns) return 1;
     // finish must not remove the source returning here.
     p.scroll.watchdog = 0;
     finish(p);

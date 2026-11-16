@@ -14,6 +14,7 @@ const input = @import("ui.zig").input;
 const ext_window = @import("ui.zig").ext_window;
 const panel_popup = @import("ui.zig").panel_popup;
 const ui = @import("ui.zig");
+const ui_layer = @import("ui_layer.zig");
 const render_thread = @import("ui.zig").render_thread;
 const postfx = @import("renderer/postfx.zig");
 const scrollbar = @import("scrollbar.zig");
@@ -217,6 +218,8 @@ pub const App = struct {
     pointer: input.Pointer = undefined,
     /// ext_windows by root grid id; main thread only.
     ext_windows: std.AutoHashMapUnmanaged(i64, *ext_window.ExtWindow) = .empty,
+    /// An idle that applies `ext_ops` is queued.
+    ext_idle_queued: std.atomic.Value(bool) = .init(false),
     /// Opens and closes the core queued (under `mu`), and the list the main
     /// thread's idle swaps them into, so neither side allocates while the other reads.
     ext_ops: std.ArrayListUnmanaged(ext_window.Op) = .empty,
@@ -248,6 +251,8 @@ pub const App = struct {
     /// (lifecycle.defaultSessionName), shown in the window title; borrowed
     /// from main's arena, which outlives the App.
     session_name: []const u8 = "",
+    /// [server] close_to_tray, and the tray item when it registered.
+    close_to_tray: bool = false,
     tray: tray.Tray = .{},
 
     // Window and input state; main thread only.
@@ -291,6 +296,50 @@ pub const App = struct {
     clipboard_text: std.ArrayListUnmanaged(u8) = .empty,
     clipboard_result: c_int = 0,
     clipboard_ready: bool = false,
+    /// [server] open_mode = "current": a single forwarded file replaces the
+    /// current window instead of opening a tab.
+    open_mode_current: bool = false,
+    /// The notification server's ids per slot. Main thread.
+    notify: ui.notify.State = .{},
+    /// The toast and mini timers' sequence numbers, so a timer hides only
+    /// the message that set it (shell.zig). Main thread.
+    toast_timer_seq: u32 = 0,
+    mini_timer_seq: u32 = 0,
+    ui_idle_queued: std.atomic.Value(bool) = .init(false),
+    /// The panel grid a copy button's press reads, the retries left while
+    /// the core's lock is busy, and the panel whose button shows the check
+    /// (shell.zig). Main thread.
+    copy_grid: i64 = 0,
+    copy_tries: u8 = 0,
+    copied_kind: ?usize = null,
+    /// The IME's composition while the core does not show it in the buffer:
+    /// shell.zig draws it at the cursor. Main thread.
+    preedit_text: [512]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_clause: [2]usize = .{ 0, 0 },
+    /// The window's framebuffer, device px, and the editor view's top-left
+    /// in it: the view is `drawable_w_px` x `drawable_h_px`, and the rest of
+    /// the window is the UI layer's (title bar, tab strip). Under `mu`.
+    win_w_px: u32 = 0,
+    win_h_px: u32 = 0,
+    view_x_px: i32 = 0,
+    view_y_px: i32 = 0,
+    /// What a slow start says in the middle of the window until Neovim
+    /// draws (a static string; empty: nothing). Main thread.
+    progress: []const u8 = "",
+    /// The title bar, the tab strip and the menus (chrome.zig). Main thread.
+    chrome: ui.chrome.State = .{},
+    /// The UI layer the renderer draws (under `mu`), the one being built
+    /// (main thread), and their glyphs (main thread). shell.zig.
+    chrome_layer: ui_layer.Layer = .{},
+    chrome_back: ui_layer.Layer = .{},
+    ui_atlas: ui_layer.Atlas = .{},
+    /// The cursor blink's one-shot timer (0: none) and its lock retry
+    /// (blink.zig); main thread only.
+    blink_timer: c_uint = 0,
+    blink_retry_queued: bool = false,
+    /// One of the app's windows has the keyboard focus. Main thread.
+    app_active: bool = false,
     /// Bumped per clipboard operation; a completion whose seq is stale
     /// belongs to a caller that timed out and must not signal.
     clipboard_seq: u64 = 0,
@@ -311,6 +360,9 @@ pub const App = struct {
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
         self.ext_ops_gtk.deinit(self.alloc);
+        self.chrome_layer.deinit(self.alloc);
+        self.chrome_back.deinit(self.alloc);
+        self.ui_atlas.deinit(self.alloc);
         self.cell_age.deinit();
         for (self.pending_opens.items) |p| self.alloc.free(p);
         self.pending_opens.deinit(self.alloc);

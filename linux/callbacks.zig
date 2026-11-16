@@ -1187,7 +1187,8 @@ fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
-    ime_off.off(blink.focusedImContext(appFrom(data)));
+    _ = data;
+    ime_off.off();
     return 0;
 }
 

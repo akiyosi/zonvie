@@ -76,3 +76,8 @@ pub extern "c" fn g_variant_new_string(string: [*:0]const u8) ?*anyopaque;
 pub extern "c" fn g_variant_new_tuple(children: [*]const *anyopaque, n_children: usize) ?*anyopaque;
 
 pub extern "c" fn g_variant_unref(value: *anyopaque) void;
+
+pub const G_IO_IN: c_uint = 1;
+/// Calls `func` on the main loop whenever `fd` meets `condition`, until it
+/// returns 0.
+pub extern "c" fn g_unix_fd_add(fd: c_int, condition: c_uint, func: *const fn (c_int, c_uint, ?*anyopaque) callconv(.c) c_int, data: ?*anyopaque) c_uint;

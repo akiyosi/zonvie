@@ -11,6 +11,9 @@ const transform = @import("transform.zig");
 const layer_geom = @import("layer_geom.zig");
 const overlay_layout = @import("overlay_layout.zig");
 const trackpad = @import("trackpad.zig");
+const gl_renderer = @import("renderer/gl_renderer.zig");
+const core_timers = @import("core_timers.zig");
+const applog = @import("app_log.zig");
 
 /// One window's pointer: the surface it addresses and the press it is
 /// tracking. The main window's lives in App.
@@ -161,4 +164,146 @@ pub fn inPressGrid(p: *Pointer, x: f64, y: f64, allow_negative: bool) ?Cell {
         if (gridCell(p, p.press_grid_id, x, y)) |c| return c;
     }
     return rootCell(p, x, y, allow_negative);
+}
+
+// =========================================================================
+// The ext UI panels drawn in the view
+// =========================================================================
+
+const panel_drag_threshold = 3.0;
+
+/// The panels drawn on the view and what placed them. Caller holds App.mu.
+fn surfacePanels(p: *const Pointer) ?struct { rects: [4]?overlay_layout.Rect, in: overlay_layout.Inputs } {
+    const app = p.app;
+    if (app.drawable_w_px == 0 or app.cell_w_px == 0 or app.cell_h_px == 0) return null;
+    const in = gl_renderer.overlayInputs(app, p.surface_id, app.drawable_w_px, app.drawable_h_px);
+    return .{ .rects = overlay_layout.place(&app.overlays, in), .in = in };
+}
+
+/// A main-window position on a panel, surface px, with what placed it.
+pub const PanelHit = struct {
+    kind: overlay_layout.Kind,
+    rect: overlay_layout.Rect,
+    in: overlay_layout.Inputs,
+    x_px: i32,
+    y_px: i32,
+
+    pub fn onBadge(self: PanelHit) bool {
+        const b = overlay_layout.closeBadgeRect(self.kind, self.rect, self.in.scale) orelse return false;
+        return overlay_layout.contains(b, self.x_px, self.y_px);
+    }
+
+    /// The panel grid's cell under the position.
+    pub fn cell(self: PanelHit) Cell {
+        const rc = overlay_layout.panelCell(self.kind, self.rect, self.x_px, self.y_px, self.in);
+        return .{ .grid_id = overlay_layout.gridId(self.kind), .row = rc[0], .col = rc[1] };
+    }
+};
+
+/// The panel at logical px (x, y) of the view, by the layout its frames are
+/// drawn with; null elsewhere.
+pub fn panelAt(p: *const Pointer, x: f64, y: f64) ?PanelHit {
+    const app = p.app;
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    const panels = surfacePanels(p) orelse return null;
+    const rects = panels.rects;
+    const xp: i32 = @intFromFloat(@floor(x * app.scale));
+    const yp: i32 = @intFromFloat(@floor(y * app.scale));
+    const kind = overlay_layout.hit(&rects, xp, yp) orelse return null;
+    return .{ .kind = kind, .rect = rects[@intFromEnum(kind)].?, .in = panels.in, .x_px = xp, .y_px = yp };
+}
+
+/// A press on a panel. Every button is swallowed: the core refuses buttons
+/// on its own grids (pointer_target.buttonReachesNeovim), and neither macOS
+/// nor Windows selects a popupmenu item on a click. A left press with no
+/// editor button held may close msg_show by its badge or drag the cmdline or
+/// msg_show.
+pub fn pressPanel(p: *Pointer, h: PanelHit, left: bool, x: f64, y: f64) void {
+    if (!left or p.claim.held_mask != 0 or p.panel_press != null) return;
+    const badge = h.onBadge();
+    if (!badge and h.kind != .cmdline and h.kind != .msg_show) return;
+    p.panel_press = .{ .kind = h.kind, .badge = badge, .x = x, .y = y, .rect = h.rect };
+}
+
+/// The left button let go of a panel press: a badge click dismisses
+/// msg_show when it ends on the badge too.
+pub fn releasePanel(p: *Pointer, pp: PanelPress, x: f64, y: f64) void {
+    if (!pp.badge) return;
+    const h = panelAt(p, x, y) orelse return;
+    if (h.kind != .msg_show or !h.onBadge()) return;
+    const cp = p.app.corep orelse return;
+    core.zonvie_core_dismiss_msg_show(cp);
+    core_timers.scheduleMsg(p.app);
+}
+
+/// Moves the dragged panel with the pointer once it is past the threshold.
+/// The first real move pins msg_show until it closes
+/// (MsgShowChrome.dragEnded), as Windows' WM_MOVING does; the cmdline keeps
+/// its spot for the session.
+pub fn dragPanel(p: *Pointer, pp: *PanelPress, x: f64, y: f64) void {
+    const dx = x - pp.x;
+    const dy = y - pp.y;
+    if (!pp.moved and @abs(dx) < panel_drag_threshold and @abs(dy) < panel_drag_threshold) return;
+    pp.moved = true;
+    const app = p.app;
+    {
+        app.mu.lockUncancelable(clock.io());
+        defer app.mu.unlock(clock.io());
+        var r = pp.rect;
+        r.x += @intFromFloat(@round(dx * app.scale));
+        r.y += @intFromFloat(@round(dy * app.scale));
+        switch (pp.kind) {
+            .cmdline => app.cmdline_user = r,
+            .msg_show => {
+                app.msg_show_user = .{ r.x, r.y };
+                app.msg_chrome.dragEnded(true);
+            },
+            .popupmenu, .msg_history => unreachable,
+        }
+    }
+    app.queueRenderAll();
+    // The copy button travels with its panel.
+    @import("shell.zig").rebuild(app, true);
+}
+
+/// The pointer over the view (logical px), or gone when null: the message
+/// panel it rests on stops its auto-hide countdown
+/// (zonvie_core_set_msg_hover) and msg_show shows its close badge.
+pub fn panelHover(p: *Pointer, at: ?[2]f64) void {
+    const app = p.app;
+    const h: ?PanelHit = if (at) |pt| panelAt(p, pt[0], pt[1]) else null;
+    const grid: i64 = if (h) |v| switch (v.kind) {
+        .msg_show, .msg_history => overlay_layout.gridId(v.kind),
+        else => 0,
+    } else 0;
+    const on_show = if (h) |v| v.kind == .msg_show else false;
+    const on_badge = if (h) |v| v.onBadge() else false;
+    app.mu.lockUncancelable(clock.io());
+    const badge_changed = app.msg_chrome.pointer(on_show, on_badge);
+    app.mu.unlock(clock.io());
+    if (badge_changed) app.queueRenderAll();
+    if (grid == p.msg_hover) return;
+    const cp = app.corep orelse return;
+    if (p.msg_hover != 0) core.zonvie_core_set_msg_hover(cp, p.msg_hover, 0);
+    if (grid != 0) core.zonvie_core_set_msg_hover(cp, grid, 1);
+    p.msg_hover = grid;
+    // What the GUI harness reads the hover from.
+    applog.appLog("[msg_hover] surface={d} grid={d}\n", .{ p.surface_id, grid });
+    // Both transitions move the earliest deadline (zonvie_core.h).
+    core_timers.scheduleMsg(app);
+}
+
+/// The pointer is off the view.
+pub fn panelLeft(p: *Pointer) void {
+    p.hover_at = null;
+    panelHover(p, null);
+}
+
+/// The panel hover again where the pointer rests: a flush can open a message
+/// under a still pointer or close the one it held. Main thread.
+pub fn refreshPanelHover(app: *App) void {
+    const p = &app.pointer;
+    const at = p.hover_at orelse return;
+    panelHover(p, at);
 }
