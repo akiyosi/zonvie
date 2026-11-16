@@ -432,7 +432,8 @@ fn bloom(app: *App, t: *gl_renderer.Target, p: *PostFx, cp: *core.zonvie_core, s
 /// The cursor as Ghostty's uniforms carry it: (left, bottom, w, h) in
 /// drawable px, y down, and its colour; null when it is not on this surface.
 /// Takes App.mu.
-fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32, cell: [2]f32 } {
+/// `shown`: the cursor is lit, not in the off phase of a `guicursor` blink.
+fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32, cell: [2]f32, shown: bool } {
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
     const cur = app.surface.committedCursor();
@@ -447,7 +448,7 @@ fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32
         @floatFromInt(if (f) |g| g.cell_w_px else app.cell_w_px),
         @floatFromInt(if (f) |g| g.cell_h_px else app.cell_h_px),
     };
-    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color, .cell = cell };
+    return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color, .cell = cell, .shown = app.cursor_blink.visible };
 }
 
 fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id: i64) void {
@@ -490,7 +491,9 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
         cell[1],
         .{ 0, 0 },
         p.age_cache.last_edit,
-        cursor != null,
+        // Blinked off as macOS and Windows pass it: a shader that draws the
+        // cursor itself (@zonvie-owns-cursor) blinks it from here.
+        if (cursor) |c| c.shown else false,
         p.uses_edit,
     );
 }
