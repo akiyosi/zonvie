@@ -3655,6 +3655,11 @@ pub const Core = struct {
     pub fn tryScrollbarGridForSurface(self: *Core, surface_id: i64) ?i64 {
         if (!self.grid_mu.tryLock()) return null;
         defer self.grid_mu.unlock(clock.io());
+        return self.scrollbarGridForSurfaceLocked(surface_id);
+    }
+
+    /// tryScrollbarGridForSurface with grid_mu already held.
+    pub fn scrollbarGridForSurfaceLocked(self: *Core, surface_id: i64) i64 {
         const cursor_grid = self.grid.cursor_grid;
         if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
             // Only a window's grid (one Neovim sent a viewport for): the cursor
@@ -3945,8 +3950,8 @@ pub const Core = struct {
         return self.getViewportInfoLocked(grid_id, out);
     }
 
-    /// Internal: get viewport info assuming grid_mu is already held.
-    fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
+    /// Get viewport info assuming grid_mu is already held.
+    pub fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
         const vp = self.grid.getViewport(grid_id) orelse {
             // self.log.write("[getViewportInfo] grid_id={d} not found\n", .{grid_id});
             return 0;

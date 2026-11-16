@@ -416,7 +416,7 @@ pub fn renderMain(app: *App, t: *Target) Frame {
 
     const layers = app.surface.committedLayers();
     const d = drawSurface(app, t, layers, @intCast(t0));
-    drawScrollbar(app, t, &app.scrollbar);
+    drawScrollbar(app, t, &app.scrollbar, 1);
     const overlay_verts = drawOverlays(app, t, 1);
 
     if (applog.isEnabled()) {
@@ -487,15 +487,15 @@ pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
     const seq = app.flush_seq;
     if (!begin(app, t)) return .{ .flush_seq = seq };
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
-    if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar);
+    if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar, surface_id);
     _ = drawOverlays(app, t, surface_id);
     return .{ .moving = d.moving, .flush_seq = seq };
 }
 
 /// The surface's scrollbar over its grids, under the ext UI overlays.
 /// Caller holds App.mu.
-fn drawScrollbar(app: *App, t: *Target, st: *const scrollbar.State) void {
-    const vp = scrollbar.drawn(app, st) orelse return;
+fn drawScrollbar(app: *App, t: *Target, st: *const scrollbar.State, surface_id: i64) void {
+    const vp = scrollbar.drawn(app, st, surface_id) orelse return;
     const g = scrollbar.geometry(vp, @floatFromInt(t.w_px), @floatFromInt(t.h_px), app.scale);
     if (!g.scrollable and !app.scrollbar_cfg.isAlways()) return;
     const c = scrollbar.colors(app, st.alpha);

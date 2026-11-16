@@ -3,7 +3,7 @@
 //! core's (zonvie_core_try_scrollbar_grid, _scrollbar_metrics,
 //! _scrollbar_drag_target); this file keeps the fade, the timers, the hit
 //! test and the drag, after windows/ui/scrollbar.zig. GTK main thread, but
-//! for `vp` and `alpha`, which the renderer reads under App.mu.
+//! for `alpha`, which the renderer reads under App.mu, and commitViews.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -21,9 +21,8 @@ const fade_step: f32 = 0.15;
 const repeat_delay_ms = 400;
 const repeat_interval_ms = 100;
 const drag_throttle_ns = 32 * std.time.ns_per_ms;
-const lock_retry_ms = 16;
 
-pub const Viewport = struct { topline: i64, botline: i64, line_count: i64 };
+pub const Viewport = @import("surface_store.zig").ScrollView;
 
 /// Device px the "column" layout takes off a surface's right edge for the
 /// strip the track sits in (windows/app.zig scrollbarReservedWidth); 0 when
@@ -41,12 +40,14 @@ pub fn gridWidthPx(cfg: core.config.Config.ScrollbarConfig, w_px: u32, scale: f3
 }
 
 pub const State = struct {
-    /// Under App.mu: what the renderer draws.
+    /// The committed view (SurfaceStore.scrollView) `update` last saw: what
+    /// the pointer is tested against. Written under App.mu.
     vp: ?Viewport = null,
+    /// Under App.mu: the renderer reads it.
     alpha: f32 = 0,
 
     target_alpha: f32 = 0,
-    /// The grid the core last named; kept while its lock is busy.
+    /// The grid the core last named; kept while it has no viewport.
     grid: i64 = 0,
     hover: bool = false,
     dragging: bool = false,
@@ -116,10 +117,11 @@ pub fn colors(app: *const App, alpha: f32) struct { track: [4]f32, knob: [4]f32 
     return .{ .track = .{ 0.2, 0.2, 0.2, track_a }, .knob = .{ 0.7, 0.7, 0.7, a } };
 }
 
-/// Whether the renderer draws a bar for `st`. Caller holds App.mu.
-pub fn drawn(app: *const App, st: *const State) ?Viewport {
+/// The view the renderer draws surface `id`'s bar for, null for none.
+/// Caller holds App.mu.
+pub fn drawn(app: *const App, st: *const State, id: i64) ?Viewport {
     if (!app.scrollbar_cfg.enabled or st.alpha <= 0.001) return null;
-    return st.vp;
+    return app.surface.scrollView(id);
 }
 
 // =========================================================================
@@ -153,54 +155,49 @@ fn surfaceGeometry(app: *App, sf: Surface) ?Geometry {
 // Viewport updates
 // =========================================================================
 
-/// After every committed flush: each surface's bar follows its viewport.
+/// At a commit, on the core thread inside the flush (the core's grid lock
+/// and App.mu held): each surface's bar takes the viewport the commit's rows
+/// are of, so the frame that draws them draws the knob there too.
+pub fn commitViews(app: *App) void {
+    if (!app.scrollbar_cfg.enabled) return;
+    const cp = app.corep orelse return;
+    app.surface.main.scroll_view = viewLocked(cp, 1);
+    var it = app.surface.others.iterator();
+    while (it.next()) |kv| kv.value_ptr.*.scroll_view = viewLocked(cp, kv.key_ptr.*);
+}
+
+fn viewLocked(cp: *core.zonvie_core, id: i64) ?Viewport {
+    const grid = core.zonvie_core_scrollbar_grid_locked(cp, id);
+    var info: core.ViewportInfo = undefined;
+    if (core.zonvie_core_get_viewport_locked(cp, grid, &info) != 1) return null;
+    return .{ .grid = grid, .topline = info.topline, .botline = info.botline, .line_count = info.line_count };
+}
+
+/// After every committed flush: each surface's bar shows or hides for the
+/// view the commit gave it. The commit's own frame draws the knob.
 pub fn update(app: *App) void {
     if (!app.scrollbar_cfg.enabled or app.corep == null) return;
-    var busy = updateSurface(app, 1);
+    updateSurface(app, 1);
     var it = app.ext_windows.keyIterator();
-    while (it.next()) |id| busy = updateSurface(app, id.*) or busy;
-    // The flush that queued this is consumed: a busy lock retries.
-    if (busy and !app.scrollbar_retry_queued) {
-        app.scrollbar_retry_queued = true;
-        _ = gtk.g_timeout_add(lock_retry_ms, &onRetry, app);
-    }
+    while (it.next()) |id| updateSurface(app, id.*);
 }
 
-fn onRetry(data: ?*anyopaque) callconv(.c) c_int {
-    const app: *App = @ptrCast(@alignCast(data.?));
-    app.scrollbar_retry_queued = false;
-    update(app);
-    return 0;
-}
-
-/// False when it acted, true when the core's lock was busy.
-fn updateSurface(app: *App, id: i64) bool {
-    const sf = surface(app, id) orelse return false;
-    const cp = app.corep.?;
-    var grid: i64 = if (sf.st.grid != 0) sf.st.grid else id;
-    if (core.zonvie_core_try_scrollbar_grid(cp, id, &grid) == 0) return true;
-    sf.st.grid = grid;
-    var info: core.ViewportInfo = undefined;
-    const r = core.zonvie_core_try_get_viewport(cp, grid, &info);
-    if (r < 0) return true;
-    const vp: ?Viewport = if (r == 1) .{ .topline = info.topline, .botline = info.botline, .line_count = info.line_count } else null;
+fn updateSurface(app: *App, id: i64) void {
+    const sf = surface(app, id) orelse return;
     app.mu.lockUncancelable(clock.io());
+    const vp = app.surface.scrollView(id);
     const prev = sf.st.vp;
     sf.st.vp = vp;
     app.mu.unlock(clock.io());
-    const v = vp orelse return false;
-    if (prev) |p| if (std.meta.eql(p, v)) return false;
+    const v = vp orelse return;
+    sf.st.grid = v.grid;
+    if (prev) |p| if (std.meta.eql(p, v)) return;
 
     var m: core.zonvie_scrollbar_metrics = undefined;
     core.zonvie_core_scrollbar_metrics(v.topline, v.botline, v.line_count, &m);
     const cfg = app.scrollbar_cfg;
-    if (m.is_scrollable == 0 and !cfg.isAlways()) {
-        hide(app, sf);
-        return false;
-    }
+    if (m.is_scrollable == 0 and !cfg.isAlways()) return hide(app, sf);
     if (cfg.isScroll() or cfg.isAlways()) show(app, sf);
-    app.queueRenderAll();
-    return false;
 }
 
 // =========================================================================

@@ -141,10 +141,17 @@ pub const GridRows = struct {
 };
 
 /// One surface's layer list, staged like the rows.
+/// What a surface's scrollbar shows: the grid the core names for it and that
+/// grid's viewport (scrollbar.zig).
+pub const ScrollView = struct { grid: i64 = 0, topline: i64, botline: i64, line_count: i64 };
+
 pub const Layers = struct {
     front: std.ArrayListUnmanaged(core.Layer) = .empty,
     back: std.ArrayListUnmanaged(core.Layer) = .empty,
     staged: bool = false,
+    /// As of the last commit, taken with it (scrollbar.commitViews) so the
+    /// frame that draws the commit's rows draws the knob where they are.
+    scroll_view: ?ScrollView = null,
 
     fn deinit(self: *Layers, alloc: std.mem.Allocator) void {
         self.front.deinit(alloc);
@@ -372,6 +379,13 @@ pub const SurfaceStore = struct {
     /// The main surface's layers.
     pub fn committedLayers(self: *const SurfaceStore) []const core.Layer {
         return self.main.front.items;
+    }
+
+    /// Surface `surface_id`'s committed scrollbar view. Caller holds App.mu.
+    pub fn scrollView(self: *const SurfaceStore, surface_id: i64) ?ScrollView {
+        if (surface_id == 1) return self.main.scroll_view;
+        const l = self.others.get(surface_id) orelse return null;
+        return l.scroll_view;
     }
 
     /// An external surface's layers; empty when it is not open.

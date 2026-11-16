@@ -2485,6 +2485,27 @@ pub export fn zonvie_core_try_get_viewport(
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
 }
 
+/// zonvie_core_try_scrollbar_grid and zonvie_core_get_viewport for a callback
+/// the core runs inside a flush, where grid_mu is held: they read without
+/// locking, so they always answer, and with the state that flush commits.
+pub export fn zonvie_core_scrollbar_grid_locked(p: ?*zonvie_core, surface_id: i64) callconv(.c) i64 {
+    if (p == null) return surface_id;
+    const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
+    return box.core.scrollbarGridForSurfaceLocked(surface_id);
+}
+
+pub export fn zonvie_core_get_viewport_locked(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    out_viewport: ?*ViewportInfo,
+) callconv(.c) i32 {
+    if (p == null or out_viewport == null) return 0;
+    const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
+    return box.core.getViewportInfoLocked(grid_id, out_viewport.?);
+}
+
 /// Whether the view of `grid_id` moved in the batch being flushed (a
 /// win_viewport with a nonzero scroll_delta). Reads grid state without
 /// locking: call only from a callback the core runs inside a flush.

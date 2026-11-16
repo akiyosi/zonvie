@@ -1577,6 +1577,20 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
     zonvie_viewport_info *out_viewport
 );
 
+/* zonvie_core_try_scrollbar_grid and zonvie_core_get_viewport for a callback
+   the core runs inside a flush (on_flush_end), where its grid lock is held:
+   they read without locking, so they always answer, and with the state that
+   flush commits. A frontend that takes the scrollbar's viewport there draws
+   the knob with the rows it belongs to, with no second frame for it.
+   Call ONLY from such a callback. _scrollbar_grid_locked returns the grid;
+   _get_viewport_locked returns 1 if found, 0 if the grid has no viewport. */
+ZONVIE_API int64_t zonvie_core_scrollbar_grid_locked(zonvie_core *core, int64_t surface_id);
+ZONVIE_API int32_t zonvie_core_get_viewport_locked(
+    zonvie_core *core,
+    int64_t grid_id,
+    zonvie_viewport_info *out_viewport
+);
+
 /* Whether the view of grid_id moved in the batch being flushed: a win_viewport
    of the batch carried a nonzero scroll_delta. A row shift that arrives
    without it is an edit moving rows (a line deleted or opened) rather than a

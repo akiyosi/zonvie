@@ -531,6 +531,7 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(cp), 32)),
                 .large_jump = app.large_jump,
             });
+            scrollbar.commitViews(app);
             committed = true;
             app.flush_outcome.store(.committed, .release);
             if (app.panel_colors_stale) {

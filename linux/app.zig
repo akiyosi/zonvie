@@ -97,7 +97,6 @@ pub const App = struct {
     /// config.toml's [scrollbar], and the main window's bar.
     scrollbar_cfg: core.config.Config.ScrollbarConfig = .{},
     scrollbar: scrollbar.State = .{},
-    scrollbar_retry_queued: bool = false,
     /// config.toml's [input].
     input_cfg: core.config.Config.InputConfig = .{},
     /// The editor font as the preedit label draws it: family and logical px.
