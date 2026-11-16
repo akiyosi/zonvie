@@ -109,6 +109,13 @@ int zwl_roundtrip(void);
 // committed without a buffer; ext_configure says when to draw.
 int zwl_ext_open(int64_t id, const char* app_id, const char* title, int32_t w_px, int32_t h_px, int32_t scale);
 void zwl_ext_close(int64_t id);
+// A popup of window `parent_id` (0: the main window) in the same table as
+// the external windows, without a grab: its top-left (x, y) from the
+// parent's, logical px, the anchor a point inside the parent. ext_configure
+// follows with its size; ext_close when the compositor dismisses it.
+int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t w_logical, int32_t h_logical,
+                   int32_t anchor_x, int32_t anchor_y, int32_t scale);
+void zwl_popup_position(int64_t id, int32_t* x, int32_t* y);
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
 // Makes the window's surface the one GL draws to; id 0 is the main window.
 int zwl_ext_make_current(int64_t id);

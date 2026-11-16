@@ -33,6 +33,8 @@
 static const struct wl_interface xdg_surface_interface;
 static const struct wl_interface decoration_manager_interface;
 static const struct wl_interface xdg_toplevel_interface;
+static const struct wl_interface xdg_popup_interface;
+static const struct wl_interface xdg_positioner_interface;
 
 static const struct wl_interface* xdg_types[] = {
     NULL, NULL, NULL, NULL,
@@ -40,8 +42,8 @@ static const struct wl_interface* xdg_types[] = {
     &xdg_surface_interface, &wl_surface_interface,
     // xdg_surface.get_toplevel
     &xdg_toplevel_interface,
-    // xdg_surface.get_popup (unused: no interface is ever instantiated)
-    NULL, &xdg_surface_interface, NULL,
+    // xdg_surface.get_popup
+    &xdg_popup_interface, &xdg_surface_interface, &xdg_positioner_interface,
     // xdg_toplevel.set_parent
     &xdg_toplevel_interface,
     // xdg_toplevel.show_window_menu
@@ -52,11 +54,15 @@ static const struct wl_interface* xdg_types[] = {
     &wl_seat_interface, NULL, NULL,
     // xdg_toplevel.set_fullscreen
     &wl_output_interface,
+    // xdg_wm_base.create_positioner (21)
+    &xdg_positioner_interface,
+    // xdg_popup.grab (22)
+    &wl_seat_interface, NULL,
 };
 
 static const struct wl_message xdg_wm_base_requests[] = {
     { "destroy", "", xdg_types + 0 },
-    { "create_positioner", "n", xdg_types + 0 },
+    { "create_positioner", "n", xdg_types + 21 },
     { "get_xdg_surface", "no", xdg_types + 4 },
     { "pong", "u", xdg_types + 0 },
 };
@@ -105,7 +111,33 @@ static const struct wl_interface xdg_toplevel_interface = {
     "xdg_toplevel", 2, 14, xdg_toplevel_requests, 2, xdg_toplevel_events,
 };
 
-enum { XDG_WM_BASE_GET_XDG_SURFACE = 2, XDG_WM_BASE_PONG = 3 };
+static const struct wl_message xdg_positioner_requests[] = {
+    { "destroy", "", xdg_types + 0 },
+    { "set_size", "ii", xdg_types + 0 },
+    { "set_anchor_rect", "iiii", xdg_types + 0 },
+    { "set_anchor", "u", xdg_types + 0 },
+    { "set_gravity", "u", xdg_types + 0 },
+    { "set_constraint_adjustment", "u", xdg_types + 0 },
+    { "set_offset", "ii", xdg_types + 0 },
+};
+static const struct wl_interface xdg_positioner_interface = {
+    "xdg_positioner", 2, 7, xdg_positioner_requests, 0, NULL,
+};
+
+static const struct wl_message xdg_popup_requests[] = {
+    { "destroy", "", xdg_types + 0 },
+    { "grab", "ou", xdg_types + 22 },
+};
+static const struct wl_message xdg_popup_events[] = {
+    { "configure", "iiii", xdg_types + 0 },
+    { "popup_done", "", xdg_types + 0 },
+};
+static const struct wl_interface xdg_popup_interface = {
+    "xdg_popup", 2, 2, xdg_popup_requests, 2, xdg_popup_events,
+};
+
+enum { XDG_WM_BASE_CREATE_POSITIONER = 1, XDG_WM_BASE_GET_XDG_SURFACE = 2, XDG_WM_BASE_PONG = 3 };
+enum { XDG_SURFACE_GET_POPUP = 2 };
 enum { XDG_SURFACE_GET_TOPLEVEL = 1, XDG_SURFACE_ACK_CONFIGURE = 4 };
 enum { XDG_TOPLEVEL_SET_TITLE = 2, XDG_TOPLEVEL_SET_APP_ID = 3 };
 
@@ -203,6 +235,9 @@ static struct {
         struct wl_surface* surface;
         struct wl_proxy* xdg_surface;
         struct wl_proxy* toplevel;
+        // A popup of another window instead of a toplevel.
+        struct wl_proxy* popup;
+        int32_t popup_x, popup_y;
         struct wl_proxy* decoration;
         struct wl_callback* frame;
         struct wl_egl_window* egl_window;
@@ -1363,6 +1398,78 @@ int zwl_ext_open(int64_t id, const char* app_id, const char* title, int32_t w_px
     return 0;
 }
 
+static void popup_configure(void* d, struct wl_proxy* p, int32_t x, int32_t y, int32_t width, int32_t height) {
+    (void)p;
+    struct zwl_ext* e = d;
+    e->popup_x = x;
+    e->popup_y = y;
+    e->pending_w = width;
+    e->pending_h = height;
+}
+static void popup_done(void* d, struct wl_proxy* p) {
+    (void)p;
+    struct zwl_ext* e = d;
+    if (w.l->ext_close) w.l->ext_close(w.data, e->id);
+}
+static const struct {
+    void (*configure)(void*, struct wl_proxy*, int32_t, int32_t, int32_t, int32_t);
+    void (*popup_done)(void*, struct wl_proxy*);
+} popup_listener = { popup_configure, popup_done };
+
+int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t w_logical, int32_t h_logical,
+                   int32_t anchor_x, int32_t anchor_y, int32_t scale) {
+    if (!id || ext_of_id(id) || w.egl_context == EGL_NO_CONTEXT) return -1;
+    struct zwl_ext* parent = ext_of_id(parent_id);
+    struct wl_proxy* parent_surface = parent ? parent->xdg_surface : w.xdg_surface;
+    if (!parent_surface || (parent_id && !parent)) return -1;
+    struct zwl_ext* e = NULL;
+    for (int i = 0; i < MAX_EXT && !e; i++) if (!w.ext[i].id) e = &w.ext[i];
+    if (!e) return -1;
+    memset(e, 0, sizeof *e);
+    e->surface = wl_compositor_create_surface(w.compositor);
+    if (!e->surface) return -1;
+    wl_surface_set_buffer_scale(e->surface, scale);
+    e->egl_window = wl_egl_window_create(e->surface, w_logical * scale, h_logical * scale);
+    e->egl_surface = e->egl_window
+        ? eglCreateWindowSurface(w.egl_display, w.egl_config, (EGLNativeWindowType)e->egl_window, NULL)
+        : EGL_NO_SURFACE;
+    if (e->egl_surface == EGL_NO_SURFACE) {
+        if (e->egl_window) wl_egl_window_destroy(e->egl_window);
+        wl_surface_destroy(e->surface);
+        return -1;
+    }
+    e->id = id;
+    // The popup's top-left goes (x, y) from the parent's: the anchor is a
+    // point inside the parent, as the positioner wants, and the offset
+    // carries the rest. Past an output's edge the compositor slides it.
+    struct wl_proxy* pos = wl_proxy_marshal_flags(w.wm_base, XDG_WM_BASE_CREATE_POSITIONER, &xdg_positioner_interface,
+                                                  1, 0, NULL);
+    wl_proxy_marshal_flags(pos, 1, NULL, 1, 0, w_logical, h_logical);
+    wl_proxy_marshal_flags(pos, 2, NULL, 1, 0, anchor_x, anchor_y, 1, 1);
+    wl_proxy_marshal_flags(pos, 3, NULL, 1, 0, 5); // anchor: top_left
+    wl_proxy_marshal_flags(pos, 4, NULL, 1, 0, 8); // gravity: bottom_right
+    wl_proxy_marshal_flags(pos, 5, NULL, 1, 0, 1 | 2); // slide_x | slide_y
+    wl_proxy_marshal_flags(pos, 6, NULL, 1, 0, x - anchor_x, y - anchor_y);
+    e->xdg_surface = wl_proxy_marshal_flags(w.wm_base, XDG_WM_BASE_GET_XDG_SURFACE, &xdg_surface_interface, 1, 0, NULL,
+                                            e->surface);
+    wl_proxy_add_listener(e->xdg_surface, (void (**)(void))&ext_surface_listener, e);
+    e->popup = wl_proxy_marshal_flags(e->xdg_surface, XDG_SURFACE_GET_POPUP, &xdg_popup_interface, 1, 0, NULL,
+                                      parent_surface, pos);
+    wl_proxy_add_listener(e->popup, (void (**)(void))&popup_listener, e);
+    wl_proxy_marshal_flags(pos, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    // No input region for keys: a popup without a grab never has the focus.
+    wl_surface_commit(e->surface);
+    wl_display_flush(w.display);
+    return 0;
+}
+
+// Where the compositor put popup `id`, from its parent's top-left.
+void zwl_popup_position(int64_t id, int32_t* x, int32_t* y) {
+    struct zwl_ext* e = ext_of_id(id);
+    *x = e ? e->popup_x : 0;
+    *y = e ? e->popup_y : 0;
+}
+
 void zwl_ext_close(int64_t id) {
     struct zwl_ext* e = ext_of_id(id);
     if (!e) return;
@@ -1372,7 +1479,8 @@ void zwl_ext_close(int64_t id) {
     eglDestroySurface(w.egl_display, e->egl_surface);
     wl_egl_window_destroy(e->egl_window);
     if (e->decoration) wl_proxy_marshal_flags(e->decoration, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
-    wl_proxy_marshal_flags(e->toplevel, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    if (e->toplevel) wl_proxy_marshal_flags(e->toplevel, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    if (e->popup) wl_proxy_marshal_flags(e->popup, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
     wl_proxy_marshal_flags(e->xdg_surface, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
     wl_surface_destroy(e->surface);
     e->id = 0;

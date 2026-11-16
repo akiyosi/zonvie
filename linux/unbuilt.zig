@@ -1,9 +1,7 @@
 //! The other end of calls the core-facing modules (callbacks.zig, app.zig,
 //! renderer/gl_renderer.zig) make through ui.zig for pieces that are main.zig's
-//! or shell.zig's own here, and for the two that do not exist:
+//! or shell.zig's own here, and for the one that does not exist:
 //!
-//! - panel_popup: the ext UI panels in popup surfaces of their own. They are
-//!   drawn inside the window that holds them.
 //! - render_thread: a thread presenting off the window's frame cycle. The
 //!   frontend presents its own surface; there is no such cycle to go around.
 //!
@@ -61,15 +59,6 @@ pub const ui_widgets = struct {
     pub fn queueRefresh(app: *App) void {
         @import("shell.zig").queueRefresh(app);
     }
-};
-
-pub const panel_popup = struct {
-    /// A panel in a popup surface of its own: panels are drawn in the main
-    /// view only.
-    pub const Popup = struct {};
-    pub fn noteMonitor(_: *App) void {}
-    pub fn queueRender(_: *App) void {}
-    pub fn update(_: *App) void {}
 };
 
 pub const window_size = struct {

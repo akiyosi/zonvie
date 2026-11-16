@@ -39,9 +39,10 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
 The Linux frontend is a Wayland client that uses no toolkit: it draws on a
 bare `xdg_toplevel` through EGL. It does not run under an X11 session.
 
-- **External UI**: the external cmdline, popup menu and messages are drawn
-  inside the main window. Message views follow `[messages] msg_pos` within
-  it.
+- **External UI**: the external cmdline, popup menu and messages are popup
+  surfaces of the window they belong to (`xdg_popup`), so they may reach
+  past its edge as far as the compositor allows. Message views follow
+  `[messages] msg_pos`.
 - **Input method**: through `text-input-unstable-v3` (Fcitx5, IBus). The
   composition is drawn at the cursor (`[input] ime_preedit_mode =
   "overlay"`, the default) or in the buffer (`"inline"`).

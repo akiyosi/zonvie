@@ -35,6 +35,8 @@ const single_instance = @import("single_instance.zig");
 const form = @import("form.zig");
 const tray = @import("tray.zig");
 const ext_window = @import("ext_window.zig");
+const panel_popup = @import("panel_popup.zig");
+const overlay_layout = @import("overlay_layout.zig");
 
 /// A panic's report goes to the log and, without a terminal, a crash file.
 pub const panic = std.debug.FullPanic(crash.onPanic);
@@ -157,6 +159,7 @@ fn unlock(app: *App) void {
 /// shown. main thread. ui.zig's queueRenderMain.
 pub fn queueRender(app: *App) void {
     ext_window.renderAll(app);
+    panel_popup.queueRender(app);
     if (!window.configured or window.hidden) return;
     if (!window.shown and !firstFrameReady(app)) return;
     if (zwl_frame_pending() != 0) {
@@ -403,6 +406,8 @@ fn onClose(_: ?*anyopaque) callconv(.c) void {
     if (app.close_to_tray and app.tray.hosted and !tray_quit and window.shown and !window.hidden) {
         window.hidden = true;
         stopRepeat();
+        // A popup dies with its parent's mapping.
+        panel_popup.hideAll(app);
         zwl_hide();
         return;
     }
@@ -546,6 +551,8 @@ fn onKeysReset(_: ?*anyopaque) callconv(.c) void {
 fn onFocus(_: ?*anyopaque, focused: c_int) callconv(.c) void {
     if (focused == 0) stopRepeat();
     blink.setActive(window.app, focused != 0);
+    // Most panels are taken off while the app is inactive.
+    panel_popup.update(window.app);
 }
 
 // =========================================================================
@@ -715,8 +722,16 @@ fn uiHit(app: *App) ?ui_layer.Hit {
     return app.chrome_layer.hitAt(@intFromFloat(@floor(pointer_win[0] * app.scale)), @intFromFloat(@floor(pointer_win[1] * app.scale)));
 }
 
-fn onPointerMotion(_: ?*anyopaque, wx: f64, wy: f64) callconv(.c) void {
+fn onPointerMotion(_: ?*anyopaque, sx: f64, sy: f64) callconv(.c) void {
     const app = window.app;
+    var wx = sx;
+    var wy = sy;
+    if (pointer_popup) |kind| {
+        const h = panel_popup.toHost(app, kind, sx, sy);
+        wx = h.x;
+        wy = h.y;
+        ext_window.onPointerWindow(app, if (h.host == 1) 0 else h.host);
+    }
     const ext = ext_window.pointer_target;
     const p = if (ext) |e| &e.pointer else &app.pointer;
     pointer_win = .{ wx, wy };
@@ -1070,20 +1085,32 @@ const listener: Listener = .{
     .pointer_window = &onPointerWindow,
 };
 
+// wl/window.c's further windows: an external window by its grid's id, a
+// panel's popup by a negative one (panel_popup.kindOfId).
+
 fn onExtConfigure(_: ?*anyopaque, id: i64, w: i32, h: i32) callconv(.c) void {
+    if (panel_popup.kindOfId(id)) |kind| return panel_popup.onConfigure(window.app, kind);
     ext_window.onConfigure(window.app, id, w, h);
+    panel_popup.update(window.app);
 }
 
 fn onExtClose(_: ?*anyopaque, id: i64) callconv(.c) void {
+    if (panel_popup.kindOfId(id)) |kind| return panel_popup.onDismissed(window.app, kind);
     ext_window.onClose(window.app, id);
 }
 
 fn onExtFrame(_: ?*anyopaque, id: i64) callconv(.c) void {
+    if (panel_popup.kindOfId(id)) |kind| return panel_popup.onFrame(window.app, kind);
     ext_window.onFrame(window.app, id);
 }
 
+/// The popup the pointer is in: its events are its host's, at the place
+/// the panel was laid out there (panel_popup.toHost).
+var pointer_popup: ?overlay_layout.Kind = null;
+
 fn onPointerWindow(_: ?*anyopaque, id: i64) callconv(.c) void {
-    ext_window.onPointerWindow(window.app, id);
+    pointer_popup = panel_popup.kindOfId(id);
+    if (pointer_popup == null) ext_window.onPointerWindow(window.app, id);
 }
 
 fn onWayland(_: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c_int {
@@ -1617,6 +1644,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     }
     if (!gl_renderer.realize(&app.gl)) return 1;
+    panel_popup.init(app);
     if (dc_up_argv) |argv| {
         const pid = fork();
         if (pid == 0) {
@@ -1630,6 +1658,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = g_unix_fd_add(zwl_fd(), G_IO_IN, &onWayland, null);
     pump();
     g_main_loop_run(loop);
+    panel_popup.deinit(app);
     ext_window.closeAll(app);
     if (form_kind) |kind| return finishForm(aa, kind, form_result, form_script);
     // The size for the next run, unless the compositor chose it (a tile, a

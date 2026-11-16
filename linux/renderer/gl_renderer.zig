@@ -530,17 +530,29 @@ pub fn render(app: *App) void {
 /// The UI layer over the whole window: its solid quads, then its text from
 /// its own atlas. Takes App.mu. The window's context current.
 fn drawUi(app: *App, t: *Target) void {
-    if (t.program == 0 or t.fb_w_px == 0 or t.fb_h_px == 0) return;
+    drawUiAt(app, t, t.fb_w_px, t.fb_h_px, 0, 0);
+}
+
+/// The main window's UI layer into a surface whose top-left is (x_px, y_px)
+/// of that window (a panel's popup): what of the layer lies over it.
+pub fn drawUiShifted(app: *App, t: *Target, x_px: i32, y_px: i32) void {
+    drawUiAt(app, t, app.win_w_px, app.win_h_px, -x_px, -y_px);
+}
+
+/// The layer, laid out for a window of win_w x win_h px, with that window's
+/// top-left at (ox, oy) of the target's framebuffer.
+fn drawUiAt(app: *App, t: *Target, win_w: u32, win_h: u32, ox: i32, oy: i32) void {
+    if (t.program == 0 or win_w == 0 or win_h == 0 or t.fb_h_px == 0) return;
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
     const layer = &app.chrome_layer;
     if (layer.solid.items.len == 0 and layer.text.items.len == 0) return;
     // The window is the target for this pass.
     const view = .{ t.w_px, t.h_px, t.ox_px, t.oy_px };
-    t.w_px = t.fb_w_px;
-    t.h_px = t.fb_h_px;
-    t.ox_px = 0;
-    t.oy_px = 0;
+    t.w_px = win_w;
+    t.h_px = win_h;
+    t.ox_px = ox;
+    t.oy_px = oy;
     defer {
         t.w_px = view[0];
         t.h_px = view[1];

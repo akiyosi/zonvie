@@ -160,6 +160,8 @@ pub const App = struct {
     /// The main view's panels are popup surfaces (panel_popup.zig), not
     /// drawn in the view. main thread writes, the paint reads; under `mu`.
     panel_popups: bool = false,
+    /// The panels' popups by overlay_layout.Kind. Main thread.
+    popups: [4]panel_popup.Popup = undefined,
     /// The width of the output the main window is on, device px; 0 until
     /// known (panel_popup.noteMonitor). Under `mu`.
     monitor_w_px: u32 = 0,

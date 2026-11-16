@@ -160,6 +160,7 @@ fn close(app: *App, grid_id: i64) void {
     const kv = app.ext_windows.fetchRemove(grid_id) orelse return;
     const w = kv.value;
     if (pointer_target == w) pointer_target = null;
+    @import("panel_popup.zig").surfaceClosing(app, grid_id);
     scrollbar.cancelTimers(&w.scrollbar);
     // A later window reusing this grid id starts unedited.
     app.cell_age.drop(grid_id);
