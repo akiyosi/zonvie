@@ -505,7 +505,24 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-header.editor-bg {{ background: #{x:0>6}; color: #{x:0>6}; box-shadow: none; border: none; }}
         \\.zonvie-sidebar-rail, .zonvie-menubar {{ padding: 2px; }}
         \\.zonvie-sidebar-rail > button, .zonvie-sidebar-rail > menubutton {{ margin: 2px 0; }}
-        \\.zonvie-hover-controls {{ opacity: 0; transition: opacity 150ms; padding: 2px 4px; }}
+        \\.zonvie-hover-controls {{ opacity: 0; transition: opacity 150ms; padding: 2px 4px; color: #{x:0>6}; }}
+        \\.zonvie-header.editor-bg menubutton > button, .zonvie-header.editor-bg windowcontrols > button,
+        \\.zonvie-header.editor-bg button.zonvie-sidebar-toggle,
+        \\.zonvie-header.ground menubutton > button, .zonvie-header.ground windowcontrols > button,
+        \\.zonvie-header.ground button.zonvie-sidebar-toggle,
+        \\.zonvie-sidebar-rail.ground menubutton > button, .zonvie-sidebar-rail.ground button.zonvie-sidebar-toggle,
+        \\.zonvie-hover-controls menubutton > button, .zonvie-hover-controls windowcontrols > button,
+        \\.zonvie-hover-controls button.zonvie-sidebar-toggle {{ background: none; color: inherit; box-shadow: none; border: none; }}
+        \\.zonvie-header windowcontrols > button > image, .zonvie-hover-controls windowcontrols > button > image {{ color: inherit; }}
+        \\.zonvie-header.editor-bg menubutton > button:hover, .zonvie-header.editor-bg menubutton > button:checked,
+        \\.zonvie-header.editor-bg windowcontrols > button:hover, .zonvie-header.editor-bg button.zonvie-sidebar-toggle:hover,
+        \\.zonvie-header.ground menubutton > button:hover, .zonvie-header.ground menubutton > button:checked,
+        \\.zonvie-header.ground windowcontrols > button:hover, .zonvie-header.ground button.zonvie-sidebar-toggle:hover,
+        \\.zonvie-sidebar-rail.ground menubutton > button:hover, .zonvie-sidebar-rail.ground menubutton > button:checked,
+        \\.zonvie-sidebar-rail.ground button.zonvie-sidebar-toggle:hover,
+        \\.zonvie-hover-controls menubutton > button:hover, .zonvie-hover-controls menubutton > button:checked,
+        \\.zonvie-hover-controls windowcontrols > button:hover, .zonvie-hover-controls button.zonvie-sidebar-toggle:hover {{
+        \\  background-color: alpha(currentColor, 0.15); }}
         \\.zonvie-hover-controls.revealed {{ opacity: 1; }}
         \\.zonvie-drag-bar {{ background-color: alpha(#{x:0>6}, 0.12); }}
         \\button.zonvie-copy {{ min-width: 0; min-height: 0; padding: 0; background: none; border: none;
@@ -517,6 +534,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         rgbOf(sb.bg), rgbOf(sb.text), rgbOf(sb.separator), rgbOf(sb.hover), rgbOf(sb.selected), fg, rgbOf(sb.indicator),
         rgbOf(sb.separator),
         bg, fg,
+        fg,
         fg,
         fg, fg,
     }) catch return;
@@ -539,7 +557,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
             \\  border-radius: {d}px; box-shadow: 0 0 0 {d}px {s}; }}
             \\.zonvie-card.under-tabs {{ margin-top: 1px; }}
             \\.zonvie-tabbar.ground, .zonvie-header.ground, .zonvie-sidebar.ground, .zonvie-sidebar-rail.ground {{ background: {s}; border: none; box-shadow: none; }}
-            \\.zonvie-header.ground {{ color: #{x:0>6}; }}
+            \\.zonvie-header.ground, .zonvie-sidebar-rail.ground {{ color: #{x:0>6}; }}
             \\.zonvie-tabbar.ground:not(.sidebar) {{ color: #{x:0>6}; padding-left: {d}px; }}
             \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab {{ border-radius: 8px 8px 0 0; }}
             \\.zonvie-tabbar.ground:not(.sidebar) .zonvie-tab.current {{ background-color: {s}; }}
