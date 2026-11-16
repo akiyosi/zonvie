@@ -4104,6 +4104,24 @@ pub const FlushCtx = struct {
             return;
         }
 
+        // Kept for the flush: only the last value a frontend would draw with
+        // is worth loading. At attach Neovim sends its default guifont and
+        // then the user's, with no flush between; applying each loaded a font
+        // and re-laid the grid out for a value no frame ever showed.
+        ctx.core.pending_guifont.clearRetainingCapacity();
+        try ctx.core.pending_guifont.appendSlice(ctx.core.alloc, font);
+        ctx.core.pending_guifont_set = true;
+    }
+
+    /// Applies the guifont the batches since the last flush left, before the
+    /// flush generates vertices. From the redraw's own flush only, not a
+    /// retried one: a frontend takes on_guifont on the redraw thread. Caller
+    /// holds grid_mu as the redraw owner.
+    pub fn applyPendingGuifont(ctx: *FlushCtx) void {
+        if (!ctx.core.pending_guifont_set) return;
+        ctx.core.pending_guifont_set = false;
+        const font = ctx.core.pending_guifont.items;
+
         // Invalidate caches BEFORE emitting the callback: a frontend may answer
         // it with a layout update that generates vertices, which must use
         // fresh cache lookups.

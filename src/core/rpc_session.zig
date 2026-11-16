@@ -1976,6 +1976,9 @@ pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
 fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     const self = ctx.core;
 
+    // First: the font decides what everything below lays out and draws.
+    ctx.applyPendingGuifont();
+
     // hl_group_set changes can alter decoration geometry. Resolve them before
     // vertex generation so the flush that terminates this redraw batch carries
     // the new glow state.
@@ -3665,6 +3668,62 @@ const RedrawDriver = struct {
         );
     }
 };
+
+test "only the last guifont before a flush reaches the frontend" {
+    // At attach Neovim sends its default guifont, then the user's, and only
+    // then flushes: the frontend must load one font, not two.
+    const State = struct {
+        calls: u32 = 0,
+        last: [64]u8 = undefined,
+        last_len: usize = 0,
+
+        fn onGuifont(ctx: ?*anyopaque, utf8: [*]const u8, len: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.last_len = @min(len, self.last.len);
+            @memcpy(self.last[0..self.last_len], utf8[0..self.last_len]);
+        }
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 40;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_guifont = State.onGuifont;
+
+    var fctx = flush.FlushCtx{ .core = &core };
+
+    var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
+    var ev_resize_main = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_main } };
+    var opt_default = [_]mp.Value{ .{ .str = "guifont" }, .{ .str = "Source Code Pro,monospace" } };
+    var ev_default = [_]mp.Value{ .{ .str = "option_set" }, .{ .arr = &opt_default } };
+    var batch1 = [_]mp.Value{ .{ .arr = &ev_resize_main }, .{ .arr = &ev_default } };
+    try RedrawDriver.run(&fctx, arena, &batch1);
+    // No flush yet: nothing loaded.
+    try std.testing.expectEqual(@as(u32, 0), state.calls);
+
+    var opt_user = [_]mp.Value{ .{ .str = "guifont" }, .{ .str = "Iosevka:h12" } };
+    var ev_user = [_]mp.Value{ .{ .str = "option_set" }, .{ .arr = &opt_user } };
+    var ev_flush = [_]mp.Value{.{ .str = "flush" }};
+    var batch2 = [_]mp.Value{ .{ .arr = &ev_user }, .{ .arr = &ev_flush } };
+    try RedrawDriver.run(&fctx, arena, &batch2);
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try std.testing.expectEqualStrings("Iosevka\t12", state.last[0..state.last_len]);
+
+    // A flush with no guifont since the last one applies nothing.
+    var batch3 = [_]mp.Value{.{ .arr = &ev_flush }};
+    try RedrawDriver.run(&fctx, arena, &batch3);
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+}
 
 test "a grid that stops being external publishes its real row count" {
     // Drives the transition through the core's own redraw handling: an

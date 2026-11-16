@@ -657,6 +657,10 @@ pub const Core = struct {
     row_cells: RenderCells = .{},
     grid_entries: c_api.render_layout.List(GridEntry) = .{},
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// The last guifont a redraw batch set, applied by the flush that follows
+    /// (flush.FlushCtx.applyPendingGuifont). Redraw thread only.
+    pending_guifont: std.ArrayListUnmanaged(u8) = .empty,
+    pending_guifont_set: bool = false,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
     // well as the normal per-keystroke caller, so the shared scratch buffer
@@ -1414,6 +1418,7 @@ pub const Core = struct {
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
         self.key_buf.deinit(self.alloc);
+        self.pending_guifont.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
 
