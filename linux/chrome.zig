@@ -444,6 +444,10 @@ fn buildHover(h: *Hover, window_overlay: *anyopaque, extras: *anyopaque, at_star
     if (gtk.gtk_window_controls_new(gtk.GTK_PACK_START)) |wc| gtk.gtk_box_append(controls, wc);
     if (gtk.gtk_window_controls_new(gtk.GTK_PACK_END)) |wc| gtk.gtk_box_append(controls, wc);
     if (at_start) gtk.gtk_box_append(controls, extras);
+    // Not drawn until its first reveal: at opacity 0 GTK still renders the
+    // buttons, and their shadows, gradients and icons would have GSK build
+    // three more shader programs for the window's first frame.
+    gtk.gtk_widget_set_visible(controls, 0);
     gtk.gtk_overlay_add_overlay(window_overlay, controls);
     h.controls = controls;
     showControls(h, false);
@@ -472,6 +476,7 @@ fn buildHoverChrome(app: *App, window_overlay: *anyopaque, has_sidebar: bool) vo
 fn showControls(h: *Hover, on: bool) void {
     const w = h.controls orelse return;
     h.shown = on;
+    if (on) gtk.gtk_widget_set_visible(w, 1);
     if (on) gtk.gtk_widget_add_css_class(w, "revealed") else gtk.gtk_widget_remove_css_class(w, "revealed");
     gtk.gtk_widget_set_can_target(w, @intFromBool(on));
 }
