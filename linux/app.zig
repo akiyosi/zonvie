@@ -38,6 +38,8 @@ pub const AtlasOps = struct {
     /// The whole atlas as RGBA8, w*h*4. A GL context realized again starts
     /// with an empty texture; uploading this restores what the core caches.
     mirror: std.ArrayListUnmanaged(u8) = .empty,
+    /// `mirror` is zero from this row down.
+    dirty_rows: u32 = 0,
     /// Bumped by every create and upload; external windows resync from
     /// `mirror` when theirs differs.
     gen: u64 = 0,
