@@ -637,17 +637,20 @@ fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void
     ops.clearQueued();
     // Allocates only on create; the texture is recreated from this mirror.
     const stride = @as(usize, atlas_w) * 4;
-    if (ops.w == atlas_w and ops.h == atlas_h and ops.mirror.items.len == stride * atlas_h) {
+    if (ops.w == atlas_w and ops.h == atlas_h and ops.mirror.len == stride * atlas_h) {
         // Same size: only the rows uploads reached hold anything but zero.
-        @memset(ops.mirror.items[0 .. stride * ops.dirty_rows], 0);
+        @memset(ops.mirror[0 .. stride * ops.dirty_rows], 0);
     } else {
-        ops.mirror.resize(app.alloc, stride * atlas_h) catch {
-            ops.mirror.clearRetainingCapacity();
+        // The kernel hands anonymous pages out zeroed, and only as they are
+        // written: zeroing 16 MB here would sit in Neovim's first flush.
+        ops.unmapMirror();
+        const p = std.c.mmap(null, stride * atlas_h, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        if (p == std.c.MAP_FAILED) {
             ops.w = 0;
             ops.h = 0;
             return core.zonvie_core_abort_flush(app.corep);
-        };
-        @memset(ops.mirror.items, 0);
+        }
+        ops.mirror = @as([*]u8, @ptrCast(p))[0 .. stride * atlas_h];
     }
     ops.dirty_rows = 0;
     ops.recreate = true;
@@ -677,7 +680,7 @@ fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height:
     var r: usize = 0;
     while (r < height) : (r += 1) {
         const dst_off = (@as(usize, dest_y) + r) * stride + @as(usize, dest_x) * 4;
-        @memcpy(ops.mirror.items[dst_off..][0..row_bytes], src[r * row_bytes ..][0..row_bytes]);
+        @memcpy(ops.mirror[dst_off..][0..row_bytes], src[r * row_bytes ..][0..row_bytes]);
     }
     ops.dirty_rows = @max(ops.dirty_rows, dest_y + height);
     ops.uploads.appendAssumeCapacity(.{ .x = dest_x, .y = dest_y, .w = width, .h = height, .offset = offset });

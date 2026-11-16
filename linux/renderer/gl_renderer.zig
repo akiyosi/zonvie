@@ -191,7 +191,7 @@ fn drainAtlas(app: *App, t: *Target) void {
         const rows = if (ops.dirty_rows == 0) 0 else @min(ops.h, ops.dirty_rows + 1);
         if (rows > first_new_row) {
             const stride = @as(usize, ops.w) * 4;
-            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, @intCast(first_new_row), @intCast(ops.w), @intCast(rows - first_new_row), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items[stride * first_new_row ..].ptr);
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, @intCast(first_new_row), @intCast(ops.w), @intCast(rows - first_new_row), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror[stride * first_new_row ..].ptr);
             t.atlas_rows = rows;
         }
         for (ops.uploads.items) |u| {
@@ -214,7 +214,7 @@ fn syncAtlas(app: *App, t: *Target) void {
     if (ops.w == 0 or ops.h == 0) return;
     if (t.atlas_w != 0 and t.atlas_gen == ops.gen) return;
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.items.ptr);
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.ptr);
     t.atlas_w = ops.w;
     t.atlas_h = ops.h;
     t.atlas_gen = ops.gen;
