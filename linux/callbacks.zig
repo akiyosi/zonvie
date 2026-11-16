@@ -556,7 +556,35 @@ pub fn queueRender(app: *App) void {
 
 fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
-    app.render_idle_queued.store(false, .release);
+    // Not set when a key handler drew this request already (renderKeyFrame).
+    if (app.render_idle_queued.swap(false, .acq_rel)) runQueuedRender(app);
+    return 0;
+}
+
+/// How long a key handler waits for the flush that answers its key: under
+/// half a 60 Hz frame, where missing the cycle costs a whole one.
+const key_frame_wait_ns = 8 * std.time.ns_per_ms;
+const key_frame_poll_ns = 200 * std.time.ns_per_us;
+
+/// From a key handler, after the key went to Neovim. GDK runs a frame cycle
+/// for every input event and starts the next no sooner than a refresh
+/// interval later, so a flush that arrives after the handler returned is
+/// drawn a whole frame late. Neovim usually answers within a millisecond or
+/// two: waiting here puts the answer's draw in the key's own cycle. Polls,
+/// as the flush path then pays nothing for it. The render thread presents by
+/// itself, off GTK's cycle. GTK main thread.
+pub fn renderKeyFrame(app: *App) void {
+    if (app.render_thread != null) return;
+    const io = clock.io();
+    const deadline_ns = clock.nowNs() + key_frame_wait_ns;
+    while (!app.render_idle_queued.load(.acquire)) {
+        if (clock.nowNs() >= deadline_ns) return;
+        std.Io.sleep(io, .{ .nanoseconds = key_frame_poll_ns }, .awake) catch {};
+    }
+    if (app.render_idle_queued.swap(false, .acq_rel)) runQueuedRender(app);
+}
+
+fn runQueuedRender(app: *App) void {
     // The anchor as the core holds it now, which a flush not yet committed
     // may have moved: the panels are placed against it at once, as the
     // commit that follows draws the rows (onFlushEnd). Taken before App.mu,
@@ -593,7 +621,6 @@ fn idleQueueRender(data: ?*anyopaque) callconv(.c) c_int {
     // A flush can arm, move or clear the core's message deadline.
     core_timers.scheduleMsg(app);
     core_timers.settleFlush(app);
-    return 0;
 }
 
 // =========================================================================

@@ -6,6 +6,7 @@ const core = @import("zonvie_core");
 const clock = core.clock;
 const rules = core.frontend_rules;
 const App = @import("app.zig").App;
+const callbacks = @import("callbacks.zig");
 const gtk = @import("gtk_bindings.zig");
 const keymap = @import("keymap.zig");
 const chrome = @import("chrome.zig");
@@ -175,6 +176,7 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
         if (base_u != 0) ign_n = std.unicode.utf8Encode(@intCast(base_u), &ign) catch ign_n;
     }
     core.zonvie_core_send_key_event(cp, code, mods, &buf, @intCast(n), &ign, @intCast(ign_n));
+    callbacks.renderKeyFrame(app);
     return 1;
 }
 
@@ -229,9 +231,11 @@ fn onImCommit(im: ?*anyopaque, text: ?[*:0]const u8, data: ?*anyopaque) callconv
         // the one place [input] swap_colon_semicolon applies.
         const ch: u8 = @intCast(keymap.swapColonSemicolon(t[0], app.input_cfg.swap_colon_semicolon));
         core.zonvie_core_send_input(cp, &[_]u8{ch}, 1);
-        return;
+        return callbacks.renderKeyFrame(app);
     }
-    if (t.len != 0) core.zonvie_core_send_input(cp, t.ptr, t.len);
+    if (t.len == 0) return;
+    core.zonvie_core_send_input(cp, t.ptr, t.len);
+    callbacks.renderKeyFrame(app);
 }
 
 fn onPreeditChanged(im: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
