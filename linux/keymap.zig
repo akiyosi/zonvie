@@ -71,6 +71,9 @@ pub fn mouseModString(gdk_state: u32, buf: *[5]u8) [:0]const u8 {
 pub const AppShortcut = union(enum) {
     new_session,
     quit,
+    /// Ctrl+Shift+?: the only way to About when no app menu is drawn
+    /// (titlebar_style "native" without sidebar or menu).
+    about,
     new_tab,
     close_tab,
     /// The tab's 1-based number.
@@ -79,9 +82,12 @@ pub const AppShortcut = union(enum) {
 
 /// The shortcut `base_keyval` (the key's keyval with no modifier held:
 /// '1', not '!') with `gdk_state` names; null for a key Neovim gets.
-pub fn appShortcut(base_keyval: u32, gdk_state: u32, menu_style: bool) ?AppShortcut {
+/// `keyval` is the produced one: '?' sits on a different key per layout,
+/// so About matches what the key types, the others the key itself.
+pub fn appShortcut(base_keyval: u32, keyval: u32, gdk_state: u32, menu_style: bool) ?AppShortcut {
     const mods = gdk_state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
     if (mods != GDK_SHIFT_MASK | GDK_CONTROL_MASK) return null;
+    if (keyval == '?') return .about;
     const k = if (base_keyval >= 'A' and base_keyval <= 'Z') base_keyval + 32 else base_keyval;
     return switch (k) {
         'n' => .new_session,
@@ -95,15 +101,18 @@ pub fn appShortcut(base_keyval: u32, gdk_state: u32, menu_style: bool) ?AppShort
 
 test "Ctrl+Shift shortcuts; the tab ones only with the menu style" {
     const cs = GDK_CONTROL_MASK | GDK_SHIFT_MASK;
-    try testing.expectEqual(AppShortcut.new_session, appShortcut('N', cs, false).?);
-    try testing.expectEqual(AppShortcut.new_session, appShortcut('n', cs | 0x10, false).?); // NumLock (Mod2)
-    try testing.expectEqual(AppShortcut.quit, appShortcut('q', cs, false).?);
-    try testing.expect(appShortcut('t', cs, false) == null);
-    try testing.expectEqual(AppShortcut.new_tab, appShortcut('t', cs, true).?);
-    try testing.expectEqual(AppShortcut{ .select_tab = 3 }, appShortcut('3', cs, true).?);
-    try testing.expect(appShortcut('n', GDK_CONTROL_MASK, false) == null);
-    try testing.expect(appShortcut('N', GDK_SHIFT_MASK, false) == null);
-    try testing.expect(appShortcut('N', cs | GDK_ALT_MASK, false) == null);
+    try testing.expectEqual(AppShortcut.new_session, appShortcut('N', 'N', cs, false).?);
+    try testing.expectEqual(AppShortcut.new_session, appShortcut('n', 'n', cs | 0x10, false).?); // NumLock (Mod2)
+    try testing.expectEqual(AppShortcut.quit, appShortcut('q', 'q', cs, false).?);
+    try testing.expectEqual(AppShortcut.about, appShortcut('/', '?', cs, false).?); // US
+    try testing.expectEqual(AppShortcut.about, appShortcut(0xdf, '?', cs, false).?); // DE: Shift+ß
+    try testing.expect(appShortcut('/', '/', GDK_CONTROL_MASK, false) == null);
+    try testing.expect(appShortcut('t', 't', cs, false) == null);
+    try testing.expectEqual(AppShortcut.new_tab, appShortcut('t', 't', cs, true).?);
+    try testing.expectEqual(AppShortcut{ .select_tab = 3 }, appShortcut('3', '#', cs, true).?);
+    try testing.expect(appShortcut('n', 'n', GDK_CONTROL_MASK, false) == null);
+    try testing.expect(appShortcut('N', 'N', GDK_SHIFT_MASK, false) == null);
+    try testing.expect(appShortcut('N', 'N', cs | GDK_ALT_MASK, false) == null);
 }
 
 /// While a preedit is active the IME owns every key, including Return.

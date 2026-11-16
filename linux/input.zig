@@ -151,7 +151,7 @@ fn onKeyPressed(ctrl: ?*anyopaque, keyval: c_uint, keycode: c_uint, state: c_uin
     const app = p.app;
     // The keyval with no modifier held, in the event's layout.
     const base_kv = baseKeyval(p, ctrl.?, keycode) orelse keyval;
-    if (keymap.appShortcut(base_kv, state, chrome.menuStyle(app))) |sc| {
+    if (keymap.appShortcut(base_kv, keyval, state, chrome.menuStyle(app))) |sc| {
         chrome.runShortcut(app, sc);
         return 1;
     }

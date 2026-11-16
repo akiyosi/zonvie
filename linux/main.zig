@@ -900,6 +900,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .msg_pos = config.messages.msg_pos,
         .input_cfg = config.input,
         .window_cfg = config.window,
+        .desktop_titlebar = @import("chrome.zig").desktopDrawsTitlebar(if (std.c.getenv("XDG_CURRENT_DESKTOP")) |v| std.mem.span(v) else null),
         .scrollbar_cfg = config.scrollbar,
         .tabline_cfg = config.tabline,
         .ext_tabline = startup.ext_tabline,

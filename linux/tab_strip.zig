@@ -272,19 +272,31 @@ pub fn apply(app: *App, ui: *const ui_state.UiState) void {
     for (ui.tabs[0..ui.tab_count]) |*t| {
         const tab = child orelse break;
         child = gtk.gtk_widget_get_next_sibling(tab);
-        const ind = gtk.gtk_widget_get_first_child(tab) orelse continue;
+        const ind = indicatorOf(tab) orelse continue;
         const name = gtk.gtk_widget_get_next_sibling(ind) orelse continue;
         setLabel(name, t, !s.sidebar or s.cards);
     }
     applyIndicators(app, ui);
 }
 
-/// Children: the indicator, the name, the close button.
+/// A tab's indicator; the name and the close button follow it.
+fn indicatorOf(tab: *anyopaque) ?*anyopaque {
+    const row = gtk.gtk_widget_get_first_child(tab) orelse return null;
+    return gtk.gtk_widget_get_first_child(row);
+}
+
+/// One child, a row of the indicator, the name and the close button. The
+/// row is centred in the tab, which a titlebar makes taller than its text;
+/// inside it the indicator and the button sit on the name's first line.
 fn newTab(app: *App, current: bool, index: usize) ?*anyopaque {
     const s = &app.widgets.strip;
     const tab = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0) orelse return null;
     gtk.gtk_widget_add_css_class(tab, "zonvie-tab");
     if (current) gtk.gtk_widget_add_css_class(tab, "current");
+    const row = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0) orelse return null;
+    gtk.gtk_widget_set_hexpand(row, 1);
+    gtk.gtk_widget_set_valign(row, gtk.GTK_ALIGN_CENTER);
+    gtk.gtk_box_append(tab, row);
     const ind = gtk.gtk_label_new(null) orelse return null;
     gtk.gtk_widget_add_css_class(ind, "zonvie-agent");
     // A fixed cell: the spinner's glyphs differ in width, and the name
@@ -295,7 +307,7 @@ fn newTab(app: *App, current: bool, index: usize) ?*anyopaque {
     // label would otherwise centre it on the whole tab (macOS/Windows don't).
     gtk.gtk_widget_set_valign(ind, gtk.GTK_ALIGN_START);
     gtk.gtk_widget_set_visible(ind, 0);
-    gtk.gtk_box_append(tab, ind);
+    gtk.gtk_box_append(row, ind);
     const name = gtk.gtk_label_new(null) orelse return null;
     gtk.gtk_widget_add_css_class(name, "zonvie-tab-name");
     gtk.gtk_label_set_xalign(name, if (s.sidebar) 0 else 0.5);
@@ -303,7 +315,7 @@ fn newTab(app: *App, current: bool, index: usize) ?*anyopaque {
     // A long name must not widen the tab past its share (sizeTabs).
     gtk.gtk_label_set_max_width_chars(name, 1);
     gtk.gtk_widget_set_hexpand(name, 1);
-    gtk.gtk_box_append(tab, name);
+    gtk.gtk_box_append(row, name);
     const close = gtk.gtk_button_new_with_label("\u{00d7}") orelse return null;
     gtk.gtk_widget_add_css_class(close, "zonvie-tab-close");
     gtk.gtk_widget_set_focusable(close, 0);
@@ -311,7 +323,7 @@ fn newTab(app: *App, current: bool, index: usize) ?*anyopaque {
     // Signal data is the 1-based tab number: the strip is rebuilt whenever
     // the list changes, so it never outlives its tab.
     _ = gtk.g_signal_connect(close, "clicked", @ptrCast(&onTabClose), @ptrFromInt(index + 1));
-    gtk.gtk_box_append(tab, close);
+    gtk.gtk_box_append(row, close);
     if (gtk.gtk_gesture_click_new()) |click| {
         gtk.gtk_gesture_single_set_button(click, 1);
         // A sidebar row selects on press, a titlebar tab on release, as on
@@ -407,7 +419,7 @@ fn applyIndicators(app: *App, ui: *const ui_state.UiState) void {
     for (ui.tabs[0..ui.tab_count]) |t| {
         const tab = child orelse break;
         child = gtk.gtk_widget_get_next_sibling(tab);
-        const ind = gtk.gtk_widget_get_first_child(tab) orelse continue;
+        const ind = indicatorOf(tab) orelse continue;
         const glyph = indicatorGlyph(ui.agentState(t.handle), s.spinner_frame);
         gtk.gtk_label_set_text(ind, glyph.ptr);
         gtk.gtk_widget_set_visible(ind, @intFromBool(glyph.len != 0));
@@ -684,7 +696,7 @@ fn nthTab(s: *const Strip, idx: u32) ?*anyopaque {
 
 fn tabText(s: *const Strip, idx: u32) [*:0]const u8 {
     const tab = nthTab(s, idx) orelse return "";
-    const ind = gtk.gtk_widget_get_first_child(tab) orelse return "";
+    const ind = indicatorOf(tab) orelse return "";
     const name = gtk.gtk_widget_get_next_sibling(ind) orelse return "";
     return gtk.gtk_label_get_text(name);
 }

@@ -482,6 +482,16 @@ test "gui:tab_tearoff" {
     try gated(is_linux, @import("scenarios/linux/tab_tearoff.zig"));
 }
 
+test "gui:sidebar_toggle_corner" {
+    // Linux only: the unified band's corner holds the sidebar toggle.
+    try gated(is_linux, @import("scenarios/linux/sidebar_toggle_corner.zig"));
+}
+
+test "gui:native_titlebar_fallback" {
+    // Linux only: "native" where the desktop draws no titlebar is "hidden".
+    try gated(is_linux, @import("scenarios/linux/native_titlebar_fallback.zig"));
+}
+
 test "gui:tabline_pointer" {
     // Linux only: linux/ui_widgets.zig's tab strip through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));

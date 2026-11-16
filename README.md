@@ -39,7 +39,7 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
 - **New Session**: Ctrl+Shift+N opens another zonvie with the connection
   dialog (macOS: Cmd+N). The key never reaches Neovim. The desktop entry
   written by `--install` has the same "New Session" action.
-- **Shortcuts**: Ctrl+Shift+Q quits (macOS: Cmd+Q). With
+- **Shortcuts**: Ctrl+Shift+Q quits (macOS: Cmd+Q); Ctrl+Shift+? opens About. With
   `[tabline] style = "menu"`, Ctrl+Shift+T, Ctrl+Shift+W and
   Ctrl+Shift+1..9 open, close and select tabs (macOS: Cmd+T, Cmd+W,
   Cmd+1..9). Super belongs to the compositor and Ctrl alone to Neovim, so
@@ -52,14 +52,16 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
   behind it through the `ext-background-effect-v1` protocol (KDE Plasma,
   GNOME, Hyprland, niri); elsewhere the blur is the compositor's own rules.
   The compositor picks the strength, so `blur_radius` has no effect.
-- **Titlebar**: `"native"` keeps the desktop's own titlebar (none on a
-  tiling compositor such as Hyprland); with a sidebar, its toggle and the app
-  menu (New Session, About, Quit) sit on a rail beside it, and
-  `[tabline] style = "menu"` puts the app and Tabs menus in a bar over the
-  editor. Titlebar tabs take the titlebar's place. `"hidden"` removes the
-  titlebar, showing the window buttons over the top band on hover and a drag
-  bar after resting there; `"unified"` draws a title band in the editor's
-  colours.
+- **Titlebar**: `"native"` keeps the desktop's own titlebar; with a
+  sidebar, its toggle and the app menu (New Session, About, Quit) sit on a
+  rail beside it, and `[tabline] style = "menu"` puts the app and Tabs
+  menus in a bar over the editor. Where the desktop draws no titlebar
+  (Hyprland, niri, river, by `$XDG_CURRENT_DESKTOP`), `"native"` acts as
+  `"hidden"`. Titlebar tabs take the titlebar's place under either. `"hidden"` removes the
+  titlebar, showing the window buttons (top left with a right sidebar) and a
+  drag bar over the top band after the pointer rests there two seconds; `"unified"` draws a title band in the editor's
+  colours, which with a sidebar spans the window and holds the toggle in
+  the sidebar's corner beside the window buttons.
 - **Window placement**: Wayland lets no client place its windows, so a torn
   off tab or an external window opens where the compositor puts it, and only
   the window size is remembered between runs.

@@ -69,6 +69,9 @@ pub const App = struct {
     /// config.toml's [window]. Below 1 opacity, or with blur, the windows
     /// are translucent and the compositor blurs what shows through.
     window_cfg: core.config.Config.WindowConfig = .{},
+    /// The desktop draws a titlebar for "native" (chrome.desktopDrawsTitlebar).
+    /// Fixed at startup.
+    desktop_titlebar: bool = true,
     /// [server] open_mode = "current": a single forwarded file replaces the
     /// current window instead of opening a tab.
     open_mode_current: bool = false,
@@ -379,7 +382,9 @@ pub const App = struct {
         return self.titlebarLayout().captionless();
     }
 
-    fn titlebarLayout(self: *const App) core.config.Config.TitlebarLayout {
+    /// The chrome's layout: the configured style as the desktop allows it
+    /// (chrome.effectiveStyle). Fixed at startup.
+    pub fn titlebarLayout(self: *const App) core.config.Config.TitlebarLayout {
         const Config = core.config.Config;
         const tabline: Config.TablinePlacement = if (!self.ext_tabline)
             .other
@@ -389,7 +394,7 @@ pub const App = struct {
             .titlebar
         else
             .other;
-        return .{ .style = self.window_cfg.titlebar_style, .tabline = tabline };
+        return .{ .style = @import("chrome.zig").effectiveStyle(self.window_cfg.titlebar_style, tabline, self.desktop_titlebar), .tabline = tabline };
     }
 
     /// GTK main thread: every window draws the committed frame.

@@ -1,0 +1,7 @@
+# Sidebar tabline under the native titlebar style, for the
+# native_titlebar_fallback scenario: on a desktop that draws no titlebar
+# (Hyprland) the chrome falls back to "hidden"'s.
+[tabline]
+external = true
+style = "sidebar"
+sidebar_width = 200

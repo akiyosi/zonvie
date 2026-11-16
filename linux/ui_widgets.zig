@@ -497,7 +497,7 @@ fn applyCss(w: *Widgets, fg: u32, bg: u32, font_px: u32) void {
         \\.zonvie-tabbar.sidebar > button {{ padding: 6px 12px; }}
         \\.zonvie-sidebar-handle {{ box-shadow: inset -1px 0 #{x:0>6}; }}
         \\.zonvie-sidebar.ground .zonvie-sidebar-handle {{ box-shadow: none; }}
-        \\.zonvie-agent {{ margin-left: 8px; }}
+        \\.zonvie-agent {{ margin-left: 8px; padding-top: 5px; }}
         \\headerbar.zonvie-header {{ min-height: 0; padding-top: 0; padding-bottom: 0; }}
         \\.zonvie-tab-header > menubutton, .zonvie-tab-header > windowcontrols {{ margin: 2px 4px; }}
         \\.zonvie-band > box > menubutton {{ margin: 0 2px; }}

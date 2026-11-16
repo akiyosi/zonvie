@@ -14,6 +14,7 @@ const gtk = @import("gtk_bindings.zig");
 const ui_state = @import("ui_state.zig");
 const tab_strip = @import("tab_strip.zig");
 const about = @import("about.zig");
+const applog = @import("app_log.zig");
 const input = @import("input.zig");
 
 /// What sits where the desktop's titlebar would.
@@ -27,11 +28,10 @@ pub const Header = enum {
     /// caption's place.
     header_bar,
     /// No caption: the editor reaches the window top; the window buttons
-    /// show while the pointer is in the top band, a drag bar after it rests
-    /// there.
+    /// and a drag bar show after the pointer rests in the top band.
     captionless,
-    /// A band above the editor with the title in the editor's colours; a
-    /// sidebar still reaches the window top.
+    /// A band above the editor with the title in the editor's colours; with
+    /// a sidebar it spans the window, the sidebar's toggle in its corner.
     title_band,
 };
 
@@ -108,16 +108,40 @@ pub const Chrome = struct {
     tab_menu_key: ?u64 = null,
 };
 
-fn layoutOf(app: *const App) Config.TitlebarLayout {
-    const tabline: Config.TablinePlacement = if (!app.ext_tabline)
-        .other
-    else if (std.mem.eql(u8, app.tabline_cfg.style, "sidebar"))
-        .sidebar
-    else if (std.mem.eql(u8, app.tabline_cfg.style, "titlebar"))
-        .titlebar
-    else
-        .other;
-    return .{ .style = app.window_cfg.titlebar_style, .tabline = tabline };
+/// Desktops that draw no titlebar for a client that asks for one (tiling
+/// compositors that grant server-side decorations and draw only a border).
+/// `xdg_current_desktop` is $XDG_CURRENT_DESKTOP, a colon-separated list.
+pub fn desktopDrawsTitlebar(xdg_current_desktop: ?[]const u8) bool {
+    const list = xdg_current_desktop orelse return true;
+    var it = std.mem.splitScalar(u8, list, ':');
+    while (it.next()) |name| {
+        for ([_][]const u8{ "Hyprland", "niri", "river" }) |bare|
+            if (std.ascii.eqlIgnoreCase(name, bare)) return false;
+    }
+    return true;
+}
+
+/// The style the chrome follows: "native" asks for the desktop's titlebar,
+/// and where the desktop draws none the window gets "hidden"'s caption (and
+/// its edge-to-edge editor) rather than no caption at all. Titlebar tabs
+/// draw their own bar and keep "native".
+pub fn effectiveStyle(style: Config.TitlebarStyle, tabline: Config.TablinePlacement, desktop_titlebar: bool) Config.TitlebarStyle {
+    if (style == .native and tabline != .titlebar and !desktop_titlebar) return .hidden;
+    return style;
+}
+
+test "native falls back to hidden where the desktop draws no titlebar" {
+    try std.testing.expect(!desktopDrawsTitlebar("Hyprland"));
+    try std.testing.expect(!desktopDrawsTitlebar("ubuntu:niri"));
+    try std.testing.expect(desktopDrawsTitlebar("KDE"));
+    try std.testing.expect(desktopDrawsTitlebar("ubuntu:GNOME"));
+    try std.testing.expect(desktopDrawsTitlebar("sway"));
+    try std.testing.expect(desktopDrawsTitlebar(null));
+    try std.testing.expectEqual(Config.TitlebarStyle.hidden, effectiveStyle(.native, .sidebar, false));
+    try std.testing.expectEqual(Config.TitlebarStyle.hidden, effectiveStyle(.native, .other, false));
+    try std.testing.expectEqual(Config.TitlebarStyle.native, effectiveStyle(.native, .titlebar, false));
+    try std.testing.expectEqual(Config.TitlebarStyle.native, effectiveStyle(.native, .sidebar, true));
+    try std.testing.expectEqual(Config.TitlebarStyle.unified, effectiveStyle(.unified, .sidebar, false));
 }
 
 /// The tabs are a menu, not a strip ([tabline] style = "menu").
@@ -130,8 +154,9 @@ pub fn menuStyle(app: *const App) bool {
 pub fn build(app: *App, content: *anyopaque) *anyopaque {
     const c = &app.widgets.chrome;
     const win = app.window.?;
-    const layout = layoutOf(app);
+    const layout = app.titlebarLayout();
     c.plan = plan(layout);
+    c.sidebar_right = std.mem.eql(u8, app.tabline_cfg.sidebar_position, "right");
     const window_overlay = gtk.gtk_overlay_new().?;
 
     const strip: ?*anyopaque = switch (layout.tabline) {
@@ -149,6 +174,8 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
     // The column: a title band over the editor.
     const column = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
     gtk.gtk_widget_set_hexpand(column, 1);
+    // A title band over the sidebar and the column both.
+    var wide_band: ?*anyopaque = null;
     switch (c.plan.header) {
         // The tabs from the window's left edge, the menus and window
         // buttons after them.
@@ -176,14 +203,18 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
             packMenus(app, bar, gtk.gtk_box_append);
             gtk.gtk_box_append(column, bar);
         },
+        // With a sidebar the band spans the window, as macOS's titlebar:
+        // the toggle beside the window buttons in the sidebar's corner, where
+        // it stays while the sidebar slides away. The band and the sidebar
+        // share the ground, so the sidebar still reads as reaching the top.
         .title_band => {
             setNoTitlebar(win);
             const start = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
-            if (layout.tabline == .sidebar) gtk.gtk_box_append(start, sidebarToggle(app));
             const end = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
             packMenus(app, end, gtk.gtk_box_append);
+            if (layout.tabline == .sidebar) gtk.gtk_box_append(if (c.sidebar_right) end else start, sidebarToggle(app));
             const band = titleBand(win, c.plan.tint, start, end);
-            gtk.gtk_box_append(column, band.handle);
+            if (layout.tabline == .sidebar) wide_band = band.handle else gtk.gtk_box_append(column, band.handle);
             c.header = band.band;
         },
         .captionless => {
@@ -216,6 +247,13 @@ pub fn build(app: *App, content: *anyopaque) *anyopaque {
             if (rail) |r| gtk.gtk_box_append(root, r);
             gtk.gtk_box_append(root, side);
             gtk.gtk_box_append(root, column);
+        }
+        if (wide_band) |b| {
+            const outer = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
+            gtk.gtk_box_append(outer, b);
+            gtk.gtk_widget_set_vexpand(root, 1);
+            gtk.gtk_box_append(outer, root);
+            root = outer;
         }
     }
     // macOS's floor, 400 x 300; a sidebar adds its own width.
@@ -252,7 +290,6 @@ fn setNoTitlebar(win: *anyopaque) void {
 
 fn buildSidebar(app: *App, strip: *anyopaque) *anyopaque {
     const c = &app.widgets.chrome;
-    c.sidebar_right = std.mem.eql(u8, app.tabline_cfg.sidebar_position, "right");
     c.sidebar_w = @intCast(std.math.clamp(app.tabline_cfg.sidebar_width, 100, 500));
     const box = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
     gtk.gtk_widget_add_css_class(box, "zonvie-sidebar");
@@ -271,24 +308,12 @@ fn buildSidebar(app: *App, strip: *anyopaque) *anyopaque {
         _ = gtk.g_signal_connect(drag, "drag-update", @ptrCast(&onHandleUpdate), app);
         gtk.gtk_widget_add_controller(handle, drag);
     }
-    // Beside a title band the sidebar reaches the window top: its top is
-    // the band's continuation, and drags the window as the band does.
-    var column = strip;
-    if (c.plan.header == .title_band) {
-        column = gtk.gtk_box_new(gtk.GTK_ORIENTATION_VERTICAL, 0).?;
-        gtk.gtk_widget_set_hexpand(column, 1);
-        const top = gtk.gtk_window_handle_new().?;
-        gtk.gtk_window_handle_set_child(top, gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?);
-        gtk.gtk_widget_set_size_request(top, -1, band_pt);
-        gtk.gtk_box_append(column, top);
-        gtk.gtk_box_append(column, strip);
-    }
     // The handle on the edge facing the editor.
     if (c.sidebar_right) {
         gtk.gtk_box_append(box, handle);
-        gtk.gtk_box_append(box, column);
+        gtk.gtk_box_append(box, strip);
     } else {
-        gtk.gtk_box_append(box, column);
+        gtk.gtk_box_append(box, strip);
         gtk.gtk_box_append(box, handle);
     }
     const rev = gtk.gtk_revealer_new().?;
@@ -378,9 +403,8 @@ fn onHandleUpdate(gesture: ?*anyopaque, dx: f64, dy: f64, data: ?*anyopaque) cal
 // Captionless: window buttons over the top band, and the drag bar
 // =========================================================================
 
-/// One captionless window's top band: its buttons, revealed while the
-/// pointer is in the band, and its drag bar, revealed after a rest there
-/// (frontend_rules.DragBar). The main window and every external window
+/// One captionless window's top band: its buttons and its drag bar, both
+/// revealed after the pointer rests there (frontend_rules.DragBar). The main window and every external window
 /// have one each.
 pub const Hover = struct {
     controls: ?*anyopaque = null,
@@ -396,7 +420,10 @@ pub const Hover = struct {
 /// The band's drag bar and buttons over `window_overlay`, `controls` holding
 /// whatever the window adds before its window buttons. Pre: `h` outlives
 /// the window.
-fn buildHover(h: *Hover, window_overlay: *anyopaque, controls: *anyopaque, pointer: *const input.Pointer) void {
+/// `extras` (the app's own buttons) go beside the window buttons, in the
+/// band's top-right corner, or its top-left with `at_start`, mirrored so the
+/// window buttons keep the outer edge.
+fn buildHover(h: *Hover, window_overlay: *anyopaque, extras: *anyopaque, at_start: bool, pointer: *const input.Pointer) void {
     h.pointer = pointer;
     // The drag bar: the window handle across the band, shown after a rest.
     const bar = gtk.gtk_window_handle_new().?;
@@ -409,11 +436,14 @@ fn buildHover(h: *Hover, window_overlay: *anyopaque, controls: *anyopaque, point
     gtk.gtk_overlay_add_overlay(window_overlay, bar);
     h.drag_bar = bar;
 
+    const controls = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
     gtk.gtk_widget_add_css_class(controls, "zonvie-hover-controls");
-    gtk.gtk_widget_set_halign(controls, gtk.GTK_ALIGN_END);
+    gtk.gtk_widget_set_halign(controls, if (at_start) gtk.GTK_ALIGN_START else gtk.GTK_ALIGN_END);
     gtk.gtk_widget_set_valign(controls, gtk.GTK_ALIGN_START);
+    if (!at_start) gtk.gtk_box_append(controls, extras);
     if (gtk.gtk_window_controls_new(gtk.GTK_PACK_START)) |wc| gtk.gtk_box_append(controls, wc);
     if (gtk.gtk_window_controls_new(gtk.GTK_PACK_END)) |wc| gtk.gtk_box_append(controls, wc);
+    if (at_start) gtk.gtk_box_append(controls, extras);
     gtk.gtk_overlay_add_overlay(window_overlay, controls);
     h.controls = controls;
     showControls(h, false);
@@ -427,11 +457,15 @@ fn buildHover(h: *Hover, window_overlay: *anyopaque, controls: *anyopaque, point
     }
 }
 
+/// A right sidebar puts the buttons at the top left, clear of the sidebar's
+/// first tab: the window buttons outermost, the toggle innermost.
 fn buildHoverChrome(app: *App, window_overlay: *anyopaque, has_sidebar: bool) void {
-    const controls = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
-    if (has_sidebar) gtk.gtk_box_append(controls, sidebarToggle(app));
-    packMenus(app, controls, gtk.gtk_box_append);
-    buildHover(&app.widgets.chrome.hover, window_overlay, controls, &app.pointer);
+    const at_start = has_sidebar and app.widgets.chrome.sidebar_right;
+    const extras = gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?;
+    if (has_sidebar and !at_start) gtk.gtk_box_append(extras, sidebarToggle(app));
+    packMenus(app, extras, gtk.gtk_box_append);
+    if (at_start) gtk.gtk_box_append(extras, sidebarToggle(app));
+    buildHover(&app.widgets.chrome.hover, window_overlay, extras, at_start, &app.pointer);
 }
 
 /// Faded out, the buttons take no clicks either.
@@ -455,21 +489,19 @@ fn onWindowMotion(ctrl: ?*anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv
     const h: *Hover = @ptrCast(@alignCast(data.?));
     const widget = gtk.gtk_event_controller_get_widget(ctrl.?).?;
     const in_band = rules.inCaptionBand(band_pt, gtk.gtk_widget_get_width(widget), @intFromFloat(x), @intFromFloat(y));
+    // Hidden buttons take no pointer: their spot is band like the rest.
     var on_button = false;
-    if (h.controls) |c| {
+    if (h.controls) |c| if (h.shown) {
         var r: gtk.GrapheneRect = .{};
         if (gtk.gtk_widget_compute_bounds(c, widget, &r) != 0)
             on_button = x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h;
-    }
-    const want = in_band or on_button;
-    if (want != h.shown) showControls(h, want);
+    };
     stepDragBar(h, h.state.onPointer(in_band, on_button, barAllowed(h), nowMs()));
 }
 
 fn onWindowLeave(ctrl: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     _ = ctrl;
     const h: *Hover = @ptrCast(@alignCast(data.?));
-    showControls(h, false);
     stepDragBar(h, h.state.onPointer(false, false, false, nowMs()));
 }
 
@@ -495,7 +527,13 @@ fn stepDragBar(h: *Hover, step: rules.DragBar.Step) void {
     }
     const changed = h.state.revealed != step.next.revealed;
     h.state = step.next;
-    if (changed) if (h.drag_bar) |b| gtk.gtk_widget_set_visible(b, @intFromBool(step.next.revealed));
+    // The buttons and the drag bar show together, after the rest, as on
+    // macOS and Windows.
+    if (changed) {
+        if (h.drag_bar) |b| gtk.gtk_widget_set_visible(b, @intFromBool(step.next.revealed));
+        showControls(h, step.next.revealed);
+        applog.appLog("[drag_bar] revealed={}\n", .{step.next.revealed});
+    }
 }
 
 /// Stops `h`'s reveal timer: its window is going. Pre: GTK main thread.
@@ -542,12 +580,12 @@ fn titleBand(win: *anyopaque, tint: Tint, start: ?*anyopaque, end: ?*anyopaque) 
 /// Pre: `content` is an overlay (the hover chrome goes over it); `h` lives
 /// as long as the window.
 pub fn decorateExternal(app: *App, win: *anyopaque, content: *anyopaque, pointer: *const input.Pointer, h: *Hover) *anyopaque {
-    const p = plan(.{ .style = app.window_cfg.titlebar_style, .tabline = .other });
+    const p = plan(.{ .style = effectiveStyle(app.window_cfg.titlebar_style, .other, app.desktop_titlebar), .tabline = .other });
     switch (p.header) {
         .desktop, .header_bar => return content,
         .captionless => {
             setNoTitlebar(win);
-            buildHover(h, content, gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?, pointer);
+            buildHover(h, content, gtk.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 0).?, false, pointer);
             return content;
         },
         .title_band => {
@@ -698,6 +736,7 @@ pub fn runShortcut(app: *App, sc: @import("keymap.zig").AppShortcut) void {
     switch (sc) {
         .new_session => input.openNewSession(),
         .quit => onQuit(null, null, app),
+        .about => about.show(app),
         .new_tab => command(app, "tabnew"),
         .close_tab => command(app, "tabclose"),
         .select_tab => |n| {
