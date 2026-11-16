@@ -2325,10 +2325,9 @@ pub const Core = struct {
     /// Reset shaping result cache. Called on guifont/font feature change.
     /// NOT called on atlas reset (shaping results are atlas-independent).
     pub fn resetShapeCache(self: *Core) void {
+        // A hit requires the entry's font_gen to equal font_generation, so
+        // the bump alone retires every entry.
         self.font_generation +%= 1;
-        if (self.shape_cache) |buf| {
-            @memset(buf, .{});
-        }
         self.ascii_tables_valid = false;
     }
 
