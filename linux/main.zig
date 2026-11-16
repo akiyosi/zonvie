@@ -91,7 +91,9 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     // A realize after an unrealize leaves the texture empty; the next render
     // rebuilds it from the CPU atlas mirror (gl_renderer.drainAtlas).
     if (!gl_renderer.realize(&app.gl)) return;
-    if (app.gl_realized_once) return;
+    // The core may have started before the window was presented, at the
+    // first monitor's scale: the surface's own is known from here on.
+    if (app.gl_realized_once) return setScale(app, area);
     app.gl_realized_once = true;
     startCore(app, area);
 }
@@ -121,6 +123,7 @@ fn onResize(area: ?*anyopaque, w_px: c_int, h_px: c_int, data: ?*anyopaque) call
     setScale(app, area.?);
     window_size.noteResize(app, @intCast(w_px), @intCast(h_px));
     pushLayout(app);
+    callbacks.awaitResizeAnswer(app);
 }
 
 /// The main window's integer scale, read from `widget`. A change reloads the
@@ -158,7 +161,7 @@ fn onScaleFactor(widget: ?*anyopaque, pspec: ?*anyopaque, data: ?*anyopaque) cal
 
 fn onAreaRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const app = appFrom(data);
-    if (app.gl_realized_once) return;
+    if (app.gl_realized_once) return setScale(app, widget.?);
     app.gl_realized_once = true;
     startCore(app, widget.?);
 }
@@ -329,10 +332,10 @@ fn launch(app: *App, area: *anyopaque) void {
     else
         core.zonvie_core_start(cp, startup.nvim_cmd.ptr, rows, cols);
     if (rc != 0) return failStart(app, rc);
-    // A window waiting for the first frame is not allocated, so no resize
-    // comes before nvim attaches: lay out at the start size; the resize on
-    // presenting corrects it.
-    if (app.show_when_ready) {
+    // A window waiting for the first frame, or one not presented yet, is not
+    // allocated, so no resize comes before nvim attaches: lay out at the
+    // start size; the resize on presenting corrects it.
+    if (app.show_when_ready or gtk.gtk_widget_get_realized(area) == 0) {
         lock(app);
         if (app.drawable_w_px == 0 or app.drawable_h_px == 0) {
             app.drawable_w_px = w_px;
@@ -519,6 +522,15 @@ fn onActivate(gapp: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
         gtk.gtk_widget_realize(area);
         session.armReveal(app);
     } else {
+        // Presenting creates the surface and its GL context, tens of ms in
+        // which Neovim can already load: the core starts first. Unrealized,
+        // the area reports the first monitor's scale; its realize corrects
+        // a wrong guess (setScale). `devcontainer up` keeps its start at the
+        // realize, where its progress has a window.
+        if (startup.dc_up_argv == null) {
+            app.gl_realized_once = true;
+            startCore(app, area);
+        }
         gtk.gtk_window_present(win);
     }
     _ = gtk.gtk_widget_grab_focus(area);

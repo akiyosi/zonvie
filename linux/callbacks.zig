@@ -585,6 +585,41 @@ pub fn renderKeyFrame(app: *App) void {
     if (app.render_idle_queued.swap(false, .acq_rel)) runQueuedRender(app);
 }
 
+/// From the main area's resize handler, after the new layout went to the
+/// core. GTK delivers a resize inside the frame cycle that draws the new
+/// size, and Neovim answers one within a few ms: without waiting, that
+/// cycle draws the grid laid out for the old size, clipped or short, and
+/// the right one a frame later. Waits only while Neovim's screen is up and
+/// is not the grid the area holds; a Neovim that keeps its size (another UI
+/// holds it smaller) costs the full wait. GTK main thread.
+pub fn awaitResizeAnswer(app: *App) void {
+    if (app.render_thread != null) return;
+    lock(app);
+    const cw = app.cell_w_px;
+    const ch = app.cell_h_px;
+    const grid_w = scrollbar.gridWidthPx(app.scrollbar_cfg, app.drawable_w_px, app.scale);
+    const h = app.drawable_h_px;
+    unlock(app);
+    if (cw == 0 or ch == 0) return;
+    const rows = @max(1, h / ch);
+    const cols = @max(1, grid_w / cw);
+    const io = clock.io();
+    const deadline_ns = clock.nowNs() + key_frame_wait_ns;
+    while (true) {
+        lock(app);
+        const root: [2]u32 = for (app.surface.committedLayers()) |l| {
+            if (l.grid_id == 1) break .{ l.rows, l.cols };
+        } else .{ 0, 0 };
+        unlock(app);
+        // The area draws what is committed in this cycle's paint. The idle
+        // the flush queued still places the widgets: not from here, inside
+        // GTK's size allocation.
+        if (root[0] == 0 or (root[0] == rows and root[1] == cols)) return;
+        if (clock.nowNs() >= deadline_ns) return;
+        std.Io.sleep(io, .{ .nanoseconds = key_frame_poll_ns }, .awake) catch {};
+    }
+}
+
 fn runQueuedRender(app: *App) void {
     // The anchor as the core holds it now, which a flush not yet committed
     // may have moved: the panels are placed against it at once, as the
