@@ -187,25 +187,29 @@ fn render(app: *App, p: *Popup) void {
 
 fn draw(app: *App, p: *Popup) void {
     const id = idOf(p.kind);
-    if (zwl_ext_make_current(id) != 0) return;
-    defer _ = zwl_ext_make_current(0);
-    if (!p.realized) {
-        if (!gl_renderer.realize(&p.gl)) return fallBack(app);
-        p.realized = true;
+    {
+        if (zwl_ext_make_current(id) != 0) return;
+        defer _ = zwl_ext_make_current(0);
+        if (!p.realized) {
+            if (!gl_renderer.realize(&p.gl)) return fallBack(app);
+            p.realized = true;
+        }
+        p.dirty = false;
+        p.gl.w_px = @intCast(p.frame.size_pt[0] * p.scale);
+        p.gl.h_px = @intCast(p.frame.size_pt[1] * p.scale);
+        p.gl.ox_px = 0;
+        p.gl.oy_px = 0;
+        p.gl.fb_w_px = p.gl.w_px;
+        p.gl.fb_h_px = p.gl.h_px;
+        gl_renderer.renderPanel(app, &p.gl, p.kind, p.frame.inner, p.rect);
+        // The main window's UI layer where the popup covers it: the panel's
+        // copy button and the IME's composition are drawn there.
+        if (p.host == 1) gl_renderer.drawUiShifted(app, &p.gl, (p.view_at_pt[0] + p.frame.origin_pt[0]) * p.scale, (p.view_at_pt[1] + p.frame.origin_pt[1]) * p.scale);
+        zwl_ext_request_frame(id);
+        _ = zwl_ext_swap(id);
     }
-    p.dirty = false;
-    p.gl.w_px = @intCast(p.frame.size_pt[0] * p.scale);
-    p.gl.h_px = @intCast(p.frame.size_pt[1] * p.scale);
-    p.gl.ox_px = 0;
-    p.gl.oy_px = 0;
-    p.gl.fb_w_px = p.gl.w_px;
-    p.gl.fb_h_px = p.gl.h_px;
-    gl_renderer.renderPanel(app, &p.gl, p.kind, p.frame.inner, p.rect);
-    // The main window's UI layer where the popup covers it: the panel's
-    // copy button and the IME's composition are drawn there.
-    if (p.host == 1) gl_renderer.drawUiShifted(app, &p.gl, (p.view_at_pt[0] + p.frame.origin_pt[0]) * p.scale, (p.view_at_pt[1] + p.frame.origin_pt[1]) * p.scale);
-    zwl_ext_request_frame(id);
-    _ = zwl_ext_swap(id);
+    // Dispatched with the main window's surface current again: a handler
+    // may draw the main window (ext_window.draw).
     _ = zwl_dispatch_pending();
     _ = zwl_flush();
 }

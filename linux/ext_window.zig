@@ -200,22 +200,27 @@ fn setSize(w: *ExtWindow, w_px: u32, h_px: u32) void {
 /// Draws the window's surface now and leaves the main window's current.
 fn draw(w: *ExtWindow) void {
     if (!w.configured or w.w_px == 0 or w.h_px == 0) return;
-    if (zwl_ext_make_current(w.grid_id) != 0) return;
-    defer _ = zwl_ext_make_current(0);
-    if (!w.realized) {
-        if (!gl_renderer.realize(&w.gl)) return;
-        w.realized = true;
+    {
+        if (zwl_ext_make_current(w.grid_id) != 0) return;
+        defer _ = zwl_ext_make_current(0);
+        if (!w.realized) {
+            if (!gl_renderer.realize(&w.gl)) return;
+            w.realized = true;
+        }
+        w.dirty = false;
+        w.gl.w_px = w.w_px;
+        w.gl.h_px = w.h_px;
+        w.gl.fb_w_px = w.w_px;
+        w.gl.fb_h_px = w.h_px;
+        // Still moving: this window's own frame callback draws again.
+        if (gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id)) w.dirty = true;
+        zwl_ext_request_frame(w.grid_id);
+        _ = zwl_ext_swap(w.grid_id);
     }
-    w.dirty = false;
-    w.gl.w_px = w.w_px;
-    w.gl.h_px = w.h_px;
-    w.gl.fb_w_px = w.w_px;
-    w.gl.fb_h_px = w.h_px;
-    // Still moving: this window's own frame callback draws again.
-    if (gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id)) w.dirty = true;
-    zwl_ext_request_frame(w.grid_id);
-    _ = zwl_ext_swap(w.grid_id);
-    // EGL reads the socket too: what it read for this queue is dispatched.
+    // EGL reads the socket too: what it read for this queue is dispatched,
+    // with the main window's surface current again, since a handler may
+    // draw the main window (a configure), whose swap fails on another
+    // surface and leaves that frame unshown.
     _ = zwl_dispatch_pending();
     _ = zwl_flush();
 }
