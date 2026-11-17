@@ -121,6 +121,12 @@ const Window = struct {
     /// The toplevel's size as last configured, logical px.
     w_logical: i32 = 0,
     h_logical: i32 = 0,
+    /// The view a user, the compositor or Neovim last chose, device px; 0
+    /// before the first. The snap's own resize never changes it: that is
+    /// what is snapped again when the cell changes
+    /// (frontend_rules.snapTerminalPx).
+    desired_w_px: u32 = 0,
+    desired_h_px: u32 = 0,
     /// A configure arrived, so a buffer may be attached.
     configured: bool = false,
     /// A change waits for the frame callback of the frame before it.
@@ -184,10 +190,9 @@ fn firstFrameReady(app: *App) bool {
     lock(app);
     defer unlock(app);
     if (app.cell_w_px == 0 or app.cell_h_px == 0) return false;
-    const rows = @max(1, app.drawable_h_px / app.cell_h_px);
-    const cols = @max(1, scrollbar.gridWidthPx(app.scrollbar_cfg, app.drawable_w_px, app.scale) / app.cell_w_px);
+    const g = scrollbar.gridFor(app.scrollbar_cfg, app.drawable_w_px, app.drawable_h_px, app.cell_w_px, app.cell_h_px, app.scale);
     for (app.surface.committedLayers()) |l| {
-        if (l.grid_id == 1) return l.rows == rows and l.cols == cols;
+        if (l.grid_id == 1) return l.rows == g.rows and l.cols == g.cols;
     }
     return false;
 }
@@ -263,11 +268,13 @@ fn pushLayout(app: *App) void {
     }
     if (!window.layout_ready_sent) {
         window.layout_ready_sent = true;
-        core.zonvie_core_notify_layout_ready(cp, @max(1, h / ch), @max(1, grid_w / cw));
+        const g = scrollbar.gridFor(app.scrollbar_cfg, w, h, cw, ch, scale);
+        core.zonvie_core_notify_layout_ready(cp, g.rows, g.cols);
     }
 }
 
 fn onConfigure(_: ?*anyopaque, w_logical: i32, h_logical: i32) callconv(.c) void {
+    const was = [2]i32{ window.w_logical, window.h_logical };
     window.w_logical = if (w_logical > 0) w_logical else window.free_w;
     window.h_logical = if (h_logical > 0) h_logical else window.free_h;
     if (window.hidden) {
@@ -289,6 +296,15 @@ fn onConfigure(_: ?*anyopaque, w_logical: i32, h_logical: i32) callconv(.c) void
         _ = g_timeout_add(first_frame_wait_ms, &onFirstFrameTimeout, null);
     }
     applyWindowSize(first);
+    // A size other than the one the window had is someone's choice. A
+    // configure that repeats the size a snap set is not.
+    if (window.w_logical != was[0] or window.h_logical != was[1]) {
+        const app = window.app;
+        lock(app);
+        window.desired_w_px = app.drawable_w_px;
+        window.desired_h_px = app.drawable_h_px;
+        unlock(app);
+    }
     scheduleSnap();
 }
 
@@ -351,6 +367,8 @@ pub fn resizeToGrid(app: *App, rows: u32, cols: u32) void {
     // The cells are the grid's: a "column" scrollbar's strip stays as it is.
     const strip = vw - scrollbar.gridWidthPx(app.scrollbar_cfg, vw, scale);
     applog.appLog("[window_size] grid {d}x{d} -> view {d}x{d} px\n", .{ rows, cols, cols * cw + strip, rows * ch });
+    window.desired_w_px = cols * cw + strip;
+    window.desired_h_px = rows * ch;
     setViewPx(cols * cw + strip, rows * ch);
 }
 
@@ -372,8 +390,9 @@ pub fn queueSnap(app: *App) void {
     _ = g_idle_add(&onSnap, null);
 }
 
-/// Shrinks the window so the view holds whole cells: the remainder of a
-/// free size would be a strip of background at the right and the bottom.
+/// Sizes the window so the view holds whole cells of the size last chosen
+/// for it: the remainder of a free size would be a strip of background at
+/// the right and the bottom.
 fn onSnap(_: ?*anyopaque) callconv(.c) c_int {
     snap_timer = 0;
     snap_queued.store(false, .release);
@@ -385,11 +404,13 @@ fn onSnap(_: ?*anyopaque) callconv(.c) c_int {
     const vh = app.drawable_h_px;
     const scale = app.scale;
     unlock(app);
-    if (cw == 0 or ch == 0 or vw < cw or vh < ch) return 0;
-    const strip = vw - scrollbar.gridWidthPx(app.scrollbar_cfg, vw, scale);
-    const w = (vw - strip) / cw * cw + strip;
-    const h = vh / ch * ch;
-    if (w != vw or h != vh) setViewPx(w, h);
+    const strip = scrollbar.columnStripPx(app.scrollbar_cfg, scale);
+    if (vw <= strip) return 0;
+    // The view is the grid's cells and the "column" scrollbar's strip
+    // beside them: the strip is the "chrome" between the two sizes.
+    const desired_w = if (window.desired_w_px > strip) window.desired_w_px - strip else 0;
+    const snap = core.frontend_rules.snapMainWindowOuterSize(@intCast(vw), @intCast(vh), vw - strip, vh, desired_w, window.desired_h_px, cw, ch) orelse return 0;
+    setViewPx(@intCast(snap.outer_w), @intCast(snap.outer_h));
     return 0;
 }
 
@@ -639,22 +660,13 @@ pub fn updateImeCursor(app: *App) void {
     const layer = for (app.surface.committedSurfaceLayers(1)) |l| {
         if (l.grid_id == cur.grid_id) break l;
     } else return;
-    var x0: f32 = std.math.floatMax(f32);
-    var y0: f32 = std.math.floatMax(f32);
-    var x1: f32 = -std.math.floatMax(f32);
-    var y1: f32 = -std.math.floatMax(f32);
-    for (cur.verts) |v| {
-        x0 = @min(x0, v.position[0]);
-        y0 = @min(y0, v.position[1]);
-        x1 = @max(x1, v.position[0]);
-        y1 = @max(y1, v.position[1]);
-    }
+    const b = core.cursor_rect.bounds(core.Vertex, cur.verts, @floatFromInt(layer.x_px + app.view_x_px), @floatFromInt(layer.y_px + app.view_y_px)) orelse return;
     const s = app.scale;
     zwl_ime_cursor(
-        @intFromFloat((x0 + @as(f32, @floatFromInt(layer.x_px + app.view_x_px))) / s),
-        @intFromFloat((y0 + @as(f32, @floatFromInt(layer.y_px + app.view_y_px))) / s),
-        @intFromFloat(@max(1.0, (x1 - x0) / s)),
-        @intFromFloat(@max(1.0, (y1 - y0) / s)),
+        @intFromFloat(b.left / s),
+        @intFromFloat(b.top / s),
+        @intFromFloat(@max(1.0, (b.right - b.left) / s)),
+        @intFromFloat(@max(1.0, (b.bottom - b.top) / s)),
     );
 }
 
@@ -1195,6 +1207,17 @@ var start: Start = undefined;
 /// Creates the core and starts Neovim (or connects to one), attached at the
 /// start size; the first configure corrects it. False when it did not start,
 /// the reason on stderr.
+/// Stops the core and joins its threads, so that no callback runs while or
+/// after the app is torn down (zonvie_core.h zonvie_core_destroy). Main
+/// thread, outside any callback; a second call does nothing.
+fn stopCore(app: *App) void {
+    const cp = app.corep orelse return;
+    // A core thread waiting on the clipboard would hold the join back.
+    callbacks.abandonClipboardWait(app);
+    core.zonvie_core_destroy(cp);
+    app.corep = null;
+}
+
 fn startCore(app: *App) bool {
     var cb = callbacks.makeCallbacks();
     app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
@@ -1227,8 +1250,13 @@ fn startCore(app: *App) bool {
     }
     const w_px = app.drawable_w_px;
     const h_px = app.drawable_h_px;
-    const rows: u32 = if (app.cell_h_px != 0) @max(1, h_px / app.cell_h_px) else 24;
-    const cols: u32 = if (app.cell_w_px != 0) @max(1, w_px / app.cell_w_px) else 80;
+    // Before the faces gave a cell there is only Neovim's own default.
+    const g: scrollbar.Grid = if (app.cell_w_px != 0 and app.cell_h_px != 0)
+        scrollbar.gridFor(app.scrollbar_cfg, w_px, h_px, app.cell_w_px, app.cell_h_px, app.scale)
+    else
+        .{ .rows = 24, .cols = 80 };
+    const rows = g.rows;
+    const cols = g.cols;
     unlock(app);
     const rc = if (start.connect_addr) |addr|
         core.zonvie_core_start_connect(cp, addr.ptr, addr.len, rows, cols)
@@ -1584,6 +1612,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),
     };
     defer app.deinit();
+    // Before the app goes: the core's threads call back into it.
+    defer stopCore(app);
     if (single) single_instance.serve(app);
     defer single_instance.stop();
     app.pointer = .{ .app = app };
@@ -1658,6 +1688,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = g_unix_fd_add(zwl_fd(), G_IO_IN, &onWayland, null);
     pump();
     g_main_loop_run(loop);
+    stopCore(app);
     panel_popup.deinit(app);
     ext_window.closeAll(app);
     if (form_kind) |kind| return finishForm(aa, kind, form_result, form_script);

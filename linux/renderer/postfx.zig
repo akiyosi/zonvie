@@ -3,11 +3,10 @@
 //! config.toml). When either is active the grid is drawn into an offscreen
 //! texture, stored top-down as the Shadertoy preamble's vUV expects; the
 //! bloom is added onto it, then each custom shader reads the previous
-//! output and the last one writes the GLArea's framebuffer. Same passes as
+//! output and the last one writes the window's framebuffer. Same passes as
 //! the D3D11 renderer (windows/shaders/main.hlsl, PSKawase*); the chain's
 //! geometry is the core's (glow_chain.zig). Each PostFx belongs to one GL
-//! context and is used only on the thread that has it current: a GLArea's
-//! on the main thread, the render thread's on that thread.
+//! context and is used only with it current, on the main thread.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -504,8 +503,7 @@ fn scene(app: *App, t: *gl_renderer.Target, surface_id: i64) gl_renderer.Frame {
 }
 
 /// A surface through the bloom and the shader chain, ending in the
-/// framebuffer bound on entry: a GLArea's (bottom-up), or the render
-/// thread's dmabuf, top-down as `t.flip_y` says.
+/// framebuffer bound on entry: bottom-up, or top-down as `t.flip_y` says.
 pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i64) gl_renderer.Frame {
     var screen_fbo: gl.GLint = 0;
     gl.glGetIntegerv(gl.GL_FRAMEBUFFER_BINDING, &screen_fbo);
@@ -581,8 +579,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     }
     if (p.uses_prev) {
         // The output is kept offscreen, top-down, for next frame's
-        // iPrevFrame and copied to the screen from there; a blit out of the
-        // render thread's dmabuf reads nothing on some drivers.
+        // iPrevFrame and copied to the screen from there.
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, @intCast(screen_fbo));
         gl_renderer.viewport(&in_window);
         gl.glUseProgram(p.copy.prog);

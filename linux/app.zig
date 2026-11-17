@@ -15,7 +15,6 @@ const ext_window = @import("ui.zig").ext_window;
 const panel_popup = @import("ui.zig").panel_popup;
 const ui = @import("ui.zig");
 const ui_layer = @import("ui_layer.zig");
-const render_thread = @import("ui.zig").render_thread;
 const postfx = @import("renderer/postfx.zig");
 const scrollbar = @import("scrollbar.zig");
 const window_size = @import("ui.zig").window_size;
@@ -96,8 +95,6 @@ pub const App = struct {
     tabline_cfg: core.config.Config.TablineConfig = .{},
     /// ext_tabline is on (config.toml or --exttabline).
     ext_tabline: bool = false,
-    /// The grid the cursor last moved to (on_cursor_grid_changed).
-    cursor_grid_focus: i64 = 1,
     /// ext_cmdline is on (config.toml or --extcmdline); without it Neovim
     /// draws its cmdline on the grid's last row.
     ext_cmdline: bool = false,
@@ -166,9 +163,6 @@ pub const App = struct {
     panel_popups: bool = false,
     /// The panels' popups by overlay_layout.Kind. Main thread.
     popups: [4]panel_popup.Popup = undefined,
-    /// The width of the output the main window is on, device px; 0 until
-    /// known (panel_popup.noteMonitor). Under `mu`.
-    monitor_w_px: u32 = 0,
     /// The frontend-drawn ext UI: messages, minis, the tabline.
     ui: ui_state.UiState = .{},
     /// Pmenu's background from on_popupmenu_show; the popupmenu panel's fill.
@@ -210,16 +204,8 @@ pub const App = struct {
     /// iCellAge mirrors (main and external windows); the core thread writes
     /// them from on_cell_age_stamps, each window's draw uploads its own.
     cell_age: core.cell_age_store.Stores = undefined,
-    /// Bumped by every committed flush (under `mu`), so a frame can say
-    /// which commit it shows.
-    flush_seq: u64 = 0,
-    /// flush_seq of the frame the main window last drew; main thread only.
-    presented_seq: u64 = 0,
 
     // Window-side state; written and read only on the main thread.
-    /// A thread that presents by itself: never set (unbuilt.zig).
-    render_thread: ?*render_thread.RenderThread = null,
-    window: ?*anyopaque = null,
     /// The main window's input; set up with the window.
     pointer: input.Pointer = undefined,
     /// ext_windows by root grid id; main thread only.
@@ -229,10 +215,7 @@ pub const App = struct {
     /// Opens and closes the core queued (under `mu`), and the list the main
     /// thread's idle swaps them into, so neither side allocates while the other reads.
     ext_ops: std.ArrayListUnmanaged(ext_window.Op) = .empty,
-    ext_ops_gtk: std.ArrayListUnmanaged(ext_window.Op) = .empty,
-    /// Bumped by every :restart / reconnect (on_restart, on_connect): grid
-    /// ids restart with the server. main thread.
-    session_generation: u64 = 0,
+    ext_ops_main: std.ArrayListUnmanaged(ext_window.Op) = .empty,
     /// Coalesces queue-render idles to at most one outstanding.
     render_idle_queued: std.atomic.Value(bool) = .init(false),
     /// on_quit_requested's argument, read by its idle.
@@ -262,8 +245,6 @@ pub const App = struct {
     tray: tray.Tray = .{},
 
     // Window and input state; main thread only.
-    layout_ready_sent: bool = false,
-    layout_retry_queued: bool = false,
     preedit_active: bool = false,
     /// preedit_active, for the renderer, which may draw on another thread
     /// (input.setComposing writes both).
@@ -365,7 +346,7 @@ pub const App = struct {
         }
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
-        self.ext_ops_gtk.deinit(self.alloc);
+        self.ext_ops_main.deinit(self.alloc);
         self.chrome_layer.deinit(self.alloc);
         self.chrome_back.deinit(self.alloc);
         self.ui_atlas.deinit(self.alloc);
@@ -409,12 +390,6 @@ pub const App = struct {
     }
 
     pub fn queueRenderAll(self: *App) void {
-        if (self.render_thread) |rt| rt.request();
-        self.queueRenderGtk();
-    }
-
-    /// The window draws the committed frame. Main thread.
-    pub fn queueRenderGtk(self: *App) void {
         ui.window.queueRender(self);
     }
 };

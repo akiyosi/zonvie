@@ -131,9 +131,6 @@ pub const header_pt = 36;
 const button_pt = 30;
 /// The sidebar's width handle, logical px.
 const handle_pt = 5;
-/// How long the pointer rests in a captionless window's top band before the
-/// window buttons and the drag bar show.
-const reveal_ms = 2000;
 const spinner_interval_ms = 120;
 const drag_threshold_px = 6;
 /// How far off the strip, across it, a dragged tab is let go to become a
@@ -176,14 +173,17 @@ const Item = struct {
 pub const State = struct {
     /// The sidebar is slid in.
     sidebar_shown: bool = true,
-    /// Its width, logical px; 0 until the config's is taken.
+    /// Its width once the handle was dragged, logical px; 0 for the config's.
     sidebar_w_pt: i32 = 0,
     menu: Menu = .none,
     /// Where the open menu hangs from: its button's bottom-left, window px.
     menu_at: [2]i32 = .{ 0, 0 },
-    /// Captionless: the window buttons and the drag bar are shown.
-    revealed: bool = false,
+    /// Captionless: whether the window buttons and the drag bar are shown,
+    /// and the rest that leads to it. `reveal_timer` is the state's timer.
+    drag_bar: rules.DragBar = .{},
     reveal_timer: c_uint = 0,
+    /// The pointer was last in the top band: what the timer asks.
+    pointer_in_band: bool = false,
     spinner_frame: u32 = 0,
     spinner_timer: c_uint = 0,
     /// The region under the pointer, for its highlight.
@@ -192,14 +192,24 @@ pub const State = struct {
     tab_drag: ?TabDrag = null,
     /// A press on the sidebar's handle: the width and the pointer then.
     handle_drag: ?struct { from_w: i32, from_x: i32 } = null,
-    /// The tabs as last drawn, along the strip, window px: a drop finds its
-    /// index among them.
-    tab_starts: [ui_state.tab_cap]i32 = undefined,
-    tab_ends: [ui_state.tab_cap]i32 = undefined,
-    tab_n: usize = 0,
+    /// The tabs as `build` last drew them: a drop finds its index among them.
+    tabs: TabExtents = .{},
     /// When the header's drag area was last pressed, for the double click
     /// that maximizes.
     last_drag_press_ns: i128 = 0,
+};
+
+/// Where each drawn tab starts and ends along the strip, window px.
+pub const TabExtents = struct {
+    starts: [ui_state.tab_cap]i32 = undefined,
+    ends: [ui_state.tab_cap]i32 = undefined,
+    n: usize = 0,
+
+    fn add(self: *TabExtents, start: i32, end: i32) void {
+        self.starts[self.n] = start;
+        self.ends[self.n] = end;
+        self.n += 1;
+    }
 };
 
 const TabDrag = struct { from: u32, start: [2]i32, reorder: bool = false, at: [2]i32 = .{ 0, 0 } };
@@ -220,15 +230,9 @@ fn sidebarRight(app: *const App) bool {
     return std.mem.eql(u8, app.tabline_cfg.sidebar_position, "right");
 }
 
-fn sidebarWidthPt(app: *App) i32 {
-    if (app.chrome.sidebar_w_pt == 0) app.chrome.sidebar_w_pt = @intCast(app.tabline_cfg.sidebar_width);
-    return app.chrome.sidebar_w_pt;
-}
-
-/// The frontend draws the window buttons: there is a header of its own, or
-/// none at all.
-fn ownButtons(p: Plan) bool {
-    return p.header != .desktop;
+/// The width a drag of the handle left, else the config's.
+fn sidebarWidthPt(app: *const App) i32 {
+    return if (app.chrome.sidebar_w_pt != 0) app.chrome.sidebar_w_pt else @intCast(app.tabline_cfg.sidebar_width);
 }
 
 /// What the chrome takes of the window around the editor view, device px.
@@ -387,7 +391,7 @@ fn tabLine(b: *Builder, x: i32, y: i32, max_w: i32, t: *const ui_state.Tab, line
 
 /// The tabs along `strip` (a header's part), each `tab_w` wide with its
 /// indicator, first label line and close button, then "+".
-fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, strip: Rect, selected: [4]f32) void {
+fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, strip: Rect, selected: [4]f32, tabs: *TabExtents) void {
     const ui = in.ui;
     const st = &app.chrome;
     const plus_w = button_pt * in.scale;
@@ -396,7 +400,6 @@ fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, st
     const tw = rules.titlebarTabWidth(@divTrunc(strip.w - plus_w, in.scale), count, rules.tab_min_width_pt, rules.tab_max_width_pt) * in.scale;
     const pad = 8 * in.scale;
     var x = strip.x;
-    st.tab_n = 0;
     for (ui.tabs[0..ui.tab_count], 0..) |*t, i| {
         if (x + tw > strip.x + strip.w - plus_w) break;
         const r: Rect = .{ .x = x, .y = strip.y + 3 * in.scale, .w = tw - 2 * in.scale, .h = strip.h - 3 * in.scale };
@@ -415,9 +418,7 @@ fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, st
         if (isHot(app, .tab_close, @intCast(i))) b.rect(cr, pal.hover);
         _ = b.text(cr.x + @divTrunc(cr.w - in.cell_w, 2), cr.y, cr.w, "\u{00d7}", pal.close, .{});
         b.hit(cr, @intFromEnum(Id.tab_close), @intCast(i));
-        st.tab_starts[st.tab_n] = x;
-        st.tab_ends[st.tab_n] = x + tw;
-        st.tab_n += 1;
+        tabs.add(x, x + tw);
         x += tw;
     }
     button(app, b, in, pal, .{ .x = x, .y = strip.y + @divTrunc(strip.h - plus_w, 2), .w = plus_w, .h = plus_w }, "+", .tab_new, 0);
@@ -425,12 +426,11 @@ fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, st
 
 /// The tabs down the sidebar: a row each, with every label line when
 /// [tabline] cards allows it, then "+".
-fn sidebarTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, area: Rect) void {
+fn sidebarTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, area: Rect, tabs: *TabExtents) void {
     const ui = in.ui;
     const st = &app.chrome;
     const pad = 8 * in.scale;
     var y = area.y + pad;
-    st.tab_n = 0;
     for (ui.tabs[0..ui.tab_count], 0..) |*t, i| {
         const lines: i32 = if (app.tabline_cfg.cards and t.label.line_count != 0) @intCast(t.label.line_count) else 1;
         const row_h = lines * in.cell_h + pad;
@@ -454,9 +454,7 @@ fn sidebarTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, a
         if (isHot(app, .tab_close, @intCast(i))) b.rect(cr, pal.hover);
         _ = b.text(cr.x + @divTrunc(cr.w - in.cell_w, 2), cr.y, cr.w, "\u{00d7}", pal.close, .{});
         b.hit(cr, @intFromEnum(Id.tab_close), @intCast(i));
-        st.tab_starts[st.tab_n] = y;
-        st.tab_ends[st.tab_n] = y + row_h;
-        st.tab_n += 1;
+        tabs.add(y, y + row_h);
         y += row_h + 2 * in.scale;
     }
     const box = button_pt * in.scale;
@@ -517,9 +515,11 @@ fn card(app: *const App, b: *Builder, in: *const Inputs, pal: *const Palette) vo
     }
 }
 
-/// Draws the chrome around `in.view` and its hit regions.
-pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
+/// Draws the chrome around `in.view` and its hit regions. Returns where it
+/// drew the tabs, which the caller keeps for a drop (State.tabs).
+pub fn build(app: *App, b: *Builder, in: *const Inputs) TabExtents {
     const st = &app.chrome;
+    var tabs: TabExtents = .{};
     const p = plan(app.titlebarLayout());
     const island = app.island();
     const pal = palette(in.fg, in.bg, p.tint, island);
@@ -540,7 +540,7 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
         // On a card's ground the card's margin sets the sidebar apart.
         const edge_x = if (right) area.x else area.x + area.w - scale;
         if (!island) b.rect(.{ .x = edge_x, .y = area.y, .w = scale, .h = area.h }, pal.separator);
-        sidebarTabs(app, b, in, &pal, area);
+        sidebarTabs(app, b, in, &pal, area, &tabs);
         const hw = handle_pt * scale;
         b.hit(.{ .x = if (right) area.x - @divTrunc(hw, 2) else area.x + area.w - @divTrunc(hw, 2), .y = area.y, .w = hw, .h = area.h }, @intFromEnum(Id.sidebar_handle), 0);
     }
@@ -566,14 +566,14 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
             button(app, b, in, &pal, .{ .x = left, .y = @divTrunc(header_h - box, 2), .w = w, .h = box }, label, .menu_tabs, 0);
             left += w + 4 * scale;
         }
-        const tabs = p.tabs_in_header and tabs_shown;
+        const in_header = p.tabs_in_header and tabs_shown;
         // On a card the current tab is the card's colour and reaches its top
         // edge, so the first tab starts clear of the card's corner.
-        const joined = tabs and island;
+        const joined = in_header and island;
         if (joined) left = @max(left, (rules.island_margin_pt + rules.island_radius_pt) * scale);
         const strip: Rect = .{ .x = left, .y = 0, .w = menu_r.x - left - 4 * scale, .h = if (joined) header_h else header_h - scale };
-        if (tabs) {
-            headerTabs(app, b, in, &pal, strip, if (joined) op(rgb3(in.bg)) else pal.selected);
+        if (in_header) {
+            headerTabs(app, b, in, &pal, strip, if (joined) op(rgb3(in.bg)) else pal.selected, &tabs);
         } else {
             const w = @min(b.textWidth(in.title), strip.w);
             _ = b.text(strip.x + @divTrunc(strip.w - w, 2), @divTrunc(header_h - in.cell_h, 2), strip.w, in.title, pal.text_selected, .{});
@@ -593,7 +593,7 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
     } else if (p.header == .captionless) {
         // No caption: the top band drags the window once revealed, and the
         // window buttons sit over the editor's corner.
-        if (st.revealed) {
+        if (st.drag_bar.revealed) {
             const band: Rect = .{ .x = in.view.x, .y = 0, .w = in.view.w, .h = band_pt * scale };
             const fg = rgb3(in.fg);
             b.rect(band, .{ fg[0] * 0.12, fg[1] * 0.12, fg[2] * 0.12, 0.12 });
@@ -606,10 +606,10 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
     }
 
     // A tab being moved: the line where it would land.
-    if (st.tab_drag) |d| if (d.reorder and st.tab_n != 0 and !tornOff(app, d.at)) {
+    if (st.tab_drag) |d| if (d.reorder and tabs.n != 0 and !tornOff(app, d.at)) {
         const along = if (sidebarStyle(app)) d.at[1] else d.at[0];
-        const idx = dropIndex(st, along);
-        const pos = if (idx < st.tab_n) st.tab_starts[idx] else st.tab_ends[st.tab_n - 1];
+        const idx = dropIndex(&tabs, along);
+        const pos = if (idx < tabs.n) tabs.starts[idx] else tabs.ends[tabs.n - 1];
         if (sidebarStyle(app)) {
             const w = sidebarWidthPt(app) * scale;
             b.rect(.{ .x = if (sidebarRight(app)) in.win_w - w else 0, .y = pos - scale, .w = w, .h = 2 * scale }, pal.text_selected);
@@ -638,15 +638,16 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
             menuBox(app, b, in, &pal, labels[0..n], items[0..n]);
         },
     }
+    return tabs;
 }
 
 /// The insertion index a drop at `along` (px along the strip) names: before
 /// the first tab whose middle lies past it.
-fn dropIndex(st: *const State, along: i32) u32 {
-    for (0..st.tab_n) |i| {
-        if (along < @divTrunc(st.tab_starts[i] + st.tab_ends[i], 2)) return @intCast(i);
+fn dropIndex(tabs: *const TabExtents, along: i32) u32 {
+    for (0..tabs.n) |i| {
+        if (along < @divTrunc(tabs.starts[i] + tabs.ends[i], 2)) return @intCast(i);
     }
-    return @intCast(st.tab_n);
+    return @intCast(tabs.n);
 }
 
 // =========================================================================
@@ -729,10 +730,11 @@ pub fn motion(app: *App, x: i32, y: i32, hit: ?ui_layer.Hit) bool {
     const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
     if (st.handle_drag) |d| {
         // The handle follows the pointer's whole travel, within the bounds
-        // the config's own width has.
+        // every frontend gives a width drag.
         const dx = @divTrunc(x - d.from_x, scale);
-        const w = std.math.clamp(d.from_w + (if (sidebarRight(app)) -dx else dx), 100, 500);
-        if (w != st.sidebar_w_pt) {
+        const win_w_pt: i32 = @divTrunc(@as(i32, @intCast(app.win_w_px)), scale);
+        const w: i32 = @intCast(rules.clampSidebarWidth(d.from_w + (if (sidebarRight(app)) -dx else dx), win_w_pt));
+        if (w != sidebarWidthPt(app)) {
             st.sidebar_w_pt = w;
             seam.window.relayout();
         }
@@ -752,40 +754,51 @@ pub fn motion(app: *App, x: i32, y: i32, hit: ?ui_layer.Hit) bool {
     }
     // Captionless: the pointer resting in the top band reveals the window
     // buttons and the drag bar; leaving it hides them again.
-    if (plan(app.titlebarLayout()).header == .captionless) {
-        const in_band = y >= 0 and y < band_pt * scale;
-        if (in_band and !st.revealed and st.reveal_timer == 0) {
-            st.reveal_timer = glib.g_timeout_add(reveal_ms, &onReveal, app);
-        } else if (!in_band) {
-            cancelReveal(app);
-        }
-    }
+    if (plan(app.titlebarLayout()).header == .captionless) revealPointer(app, y >= 0 and y < band_pt * scale);
     return false;
+}
+
+fn nowMs() u64 {
+    return @intCast(@divTrunc(clock.nowNs(), std.time.ns_per_ms));
+}
+
+/// The pointer is in the top band, or not (it may have left the window).
+/// An open menu hangs from the bar, which keeps what it has meanwhile, as
+/// it does over a caption button (rules.DragBar.onPointer).
+fn revealPointer(app: *App, in_band: bool) void {
+    const st = &app.chrome;
+    st.pointer_in_band = in_band;
+    applyReveal(app, st.drag_bar.onPointer(in_band, st.menu != .none, true, nowMs()));
+}
+
+/// Takes a step of the reveal's state machine and runs the timer it asks for.
+fn applyReveal(app: *App, step: rules.DragBar.Step) void {
+    const st = &app.chrome;
+    const was = st.drag_bar.revealed;
+    st.drag_bar = step.next;
+    if (step.timer != .keep and st.reveal_timer != 0) {
+        _ = glib.g_source_remove(st.reveal_timer);
+        st.reveal_timer = 0;
+    }
+    if (step.timer == .set) st.reveal_timer = glib.g_timeout_add(rules.DragBar.reveal_ms, &onReveal, app);
+    if (was != st.drag_bar.revealed) seam.window.rebuildChrome();
 }
 
 fn onReveal(data: ?*anyopaque) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(data.?));
-    app.chrome.reveal_timer = 0;
-    app.chrome.revealed = true;
-    seam.window.rebuildChrome();
-    return 0;
-}
-
-fn cancelReveal(app: *App) void {
     const st = &app.chrome;
-    if (st.reveal_timer != 0) {
-        _ = glib.g_source_remove(st.reveal_timer);
-        st.reveal_timer = 0;
-    }
-    if (st.revealed and st.menu == .none) {
-        st.revealed = false;
-        seam.window.rebuildChrome();
-    }
+    const step = st.drag_bar.onTimer(st.pointer_in_band, true, nowMs());
+    // A fire the state calls stale leaves the rest pending: the source repeats.
+    if (step.timer == .keep and step.next.timer_armed) return 1;
+    // The source ends with this return: nothing left to remove.
+    st.reveal_timer = 0;
+    applyReveal(app, step);
+    return 0;
 }
 
 /// The pointer left the window.
 pub fn leave(app: *App) void {
-    cancelReveal(app);
+    if (plan(app.titlebarLayout()).header == .captionless) revealPointer(app, false);
     if (app.chrome.hot != null) {
         app.chrome.hot = null;
         seam.window.rebuildChrome();
@@ -811,7 +824,7 @@ pub fn release(app: *App) bool {
             } else {
                 // Selects the dragged tab and moves it in one command;
                 // nothing for a drop onto its own slot.
-                _ = core.zonvie_core_tab_move(cp, d.from, dropIndex(st, if (side) d.at[1] else d.at[0]), @intCast(st.tab_n));
+                _ = core.zonvie_core_tab_move(cp, d.from, dropIndex(&st.tabs, if (side) d.at[1] else d.at[0]), @intCast(st.tabs.n));
             }
         }
         seam.window.rebuildChrome();
@@ -849,14 +862,10 @@ fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 test "a drop names the slot before the first tab whose middle lies past it" {
-    var st: State = .{};
-    st.tab_n = 3;
-    st.tab_starts[0] = 0;
-    st.tab_ends[0] = 100;
-    st.tab_starts[1] = 100;
-    st.tab_ends[1] = 200;
-    st.tab_starts[2] = 200;
-    st.tab_ends[2] = 300;
+    var st: TabExtents = .{};
+    st.add(0, 100);
+    st.add(100, 200);
+    st.add(200, 300);
     try std.testing.expectEqual(@as(u32, 0), dropIndex(&st, -5));
     try std.testing.expectEqual(@as(u32, 0), dropIndex(&st, 49));
     try std.testing.expectEqual(@as(u32, 1), dropIndex(&st, 50));

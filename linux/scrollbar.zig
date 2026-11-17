@@ -39,6 +39,15 @@ pub fn gridWidthPx(cfg: core.config.Config.ScrollbarConfig, w_px: u32, scale: f3
     return if (w_px > strip) w_px - strip else @min(w_px, 1);
 }
 
+pub const Grid = struct { rows: u32, cols: u32 };
+
+/// The grid a surface of `w_px` x `h_px` holds at a cell of `cell_w_px` x
+/// `cell_h_px`: whole cells of what the column strip leaves, at least one
+/// each way. Pre: both cell sizes are non-zero.
+pub fn gridFor(cfg: core.config.Config.ScrollbarConfig, w_px: u32, h_px: u32, cell_w_px: u32, cell_h_px: u32, scale: f32) Grid {
+    return .{ .rows = @max(1, h_px / cell_h_px), .cols = @max(1, gridWidthPx(cfg, w_px, scale) / cell_w_px) };
+}
+
 pub const State = struct {
     /// The committed view (SurfaceStore.scrollView) `update` last saw: what
     /// the pointer is tested against. Written under App.mu.
@@ -443,4 +452,13 @@ test "the column layout takes the track's strip off the grid, the overlay nothin
     try std.testing.expectEqual(@as(u32, 800), gridWidthPx(cfg, 800, 2));
     cfg = .{ .enabled = false, .layout = .column };
     try std.testing.expectEqual(@as(u32, 0), columnStripPx(cfg, 2));
+}
+
+test "a surface's grid is whole cells of what the strip leaves, at least one" {
+    var cfg: core.config.Config.ScrollbarConfig = .{ .enabled = true, .layout = .column };
+    // 800 px less the 32 px strip is 768 px: 76 cells of 10, 21 rows of 19.
+    try std.testing.expectEqual(Grid{ .rows = 21, .cols = 76 }, gridFor(cfg, 800, 400, 10, 19, 2));
+    try std.testing.expectEqual(Grid{ .rows = 1, .cols = 1 }, gridFor(cfg, 20, 5, 10, 19, 2));
+    cfg.layout = .overlay;
+    try std.testing.expectEqual(Grid{ .rows = 21, .cols = 80 }, gridFor(cfg, 800, 400, 10, 19, 2));
 }

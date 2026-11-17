@@ -162,8 +162,15 @@ fn look(in: *const Inputs, tone: u8) Look {
     };
 }
 
+/// The cells a character takes in a label: two for a wide one, as the
+/// layer's text draws it (ui_layer.Builder.textWidth).
+fn cellsOf(scalar: u21) usize {
+    return if (core.flush_mod.isWideChar(scalar) or core.flush_mod.isEmojiPresentation(scalar)) 2 else 1;
+}
+
 /// `text` as lines no wider than `max_cells`: at its newlines, then by width.
-/// A line is a slice of `text`. Returns how many fit `out`.
+/// A line is a slice of `text` and holds at least one character. Returns
+/// how many fit `out`.
 fn wrap(text: []const u8, max_cells: usize, out: [][]const u8) usize {
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -171,13 +178,15 @@ fn wrap(text: []const u8, max_cells: usize, out: [][]const u8) usize {
         var rest = line;
         while (true) {
             if (n == out.len) return n;
-            // Cut on a character boundary at most max_cells characters in.
+            // Cut on a character boundary at most max_cells cells in.
             var cells: usize = 0;
             var i: usize = 0;
-            while (i < rest.len and cells < max_cells) {
-                const len = std.unicode.utf8ByteSequenceLength(rest[i]) catch 1;
-                i = @min(rest.len, i + len);
-                cells += 1;
+            while (i < rest.len) {
+                const len = @min(rest.len - i, std.unicode.utf8ByteSequenceLength(rest[i]) catch 1);
+                const w = cellsOf(std.unicode.utf8Decode(rest[i..][0..len]) catch ' ');
+                if (i != 0 and cells + w > max_cells) break;
+                i += len;
+                cells += w;
             }
             out[n] = rest[0..i];
             n += 1;
@@ -210,8 +219,9 @@ fn labelSize(b: *Builder, in: *const Inputs, lines: []const []const u8) [2]i32 {
 
 /// The toast hangs from the top-right of msg_pos.ext_float's target, the
 /// minis from the bottom-right of msg_pos.mini's, as macOS and Windows
-/// place them; the confirm prompt is centred across the view.
-fn buildMessages(app: *App, b: *Builder, in: *const Inputs) void {
+/// place them; the confirm prompt is centred across the view. Returns the
+/// confirm prompt's rect in the view, device px; null when there is none.
+fn buildMessages(b: *Builder, in: *const Inputs) ?overlay_layout.Rect {
     const m = margin_pt * in.scale;
     const cw = @max(1, in.cell_w);
     var lines: [64][]const u8 = undefined;
@@ -260,9 +270,7 @@ fn buildMessages(app: *App, b: *Builder, in: *const Inputs) void {
         _ = label(b, in, in.view.x + x, in.view.y + y, lines[0..n], look(in, 3));
         confirm_rect = .{ .x = x, .y = y, .w = size[0], .h = size[1] };
     }
-    app.mu.lockUncancelable(clock.io());
-    app.confirm_rect = confirm_rect;
-    app.mu.unlock(clock.io());
+    return confirm_rect;
 }
 
 /// A copy button on each panel that has room for one (the cmdline, the
@@ -378,15 +386,10 @@ fn cursorOrigin(app: *App) ?[2]i32 {
     const layer = for (app.surface.committedSurfaceLayers(1)) |l| {
         if (l.grid_id == cur.grid_id) break l;
     } else return null;
-    var x0: f32 = std.math.floatMax(f32);
-    var y0: f32 = std.math.floatMax(f32);
-    for (cur.verts) |v| {
-        x0 = @min(x0, v.position[0]);
-        y0 = @min(y0, v.position[1]);
-    }
+    const b = core.cursor_rect.bounds(core.Vertex, cur.verts, 0, 0) orelse return null;
     // The cell's top, whatever part of it the cursor's shape covers.
     const ch: f32 = @floatFromInt(@max(1, app.cell_h_px));
-    return .{ @as(i32, @intFromFloat(x0)) + layer.x_px, @as(i32, @intFromFloat(@floor(y0 / ch) * ch)) + layer.y_px };
+    return .{ @as(i32, @intFromFloat(b.left)) + layer.x_px, @as(i32, @intFromFloat(@floor(b.top / ch) * ch)) + layer.y_px };
 }
 
 /// What the frontend's own chrome takes of the window around the editor
@@ -447,7 +450,7 @@ pub fn rebuild(app: *App, request_frame: bool) void {
     chrome.updateSpinner(app, app.tabline_cfg.agent_indicator and in.ui.tabline_visible and in.ui.anyWorking());
     const layer = &app.chrome_back;
     var b = Builder.begin(app, layer);
-    chrome.build(app, &b, &.{
+    app.chrome.tabs = chrome.build(app, &b, &.{
         .ui = &in.ui,
         .fg = in.fg,
         .bg = in.bg,
@@ -459,7 +462,12 @@ pub fn rebuild(app: *App, request_frame: bool) void {
         .cell_h = in.cell_h,
         .title = title,
     });
-    buildMessages(app, &b, &in);
+    // Stored before the copy buttons are placed: the panels they sit on are
+    // laid out around the prompt (gl_renderer.overlayInputs).
+    const confirm_rect = buildMessages(&b, &in);
+    app.mu.lockUncancelable(clock.io());
+    app.confirm_rect = confirm_rect;
+    app.mu.unlock(clock.io());
     buildCopyButtons(app, &b, &in);
     buildPreedit(app, &b, &in);
     if (app.progress.len != 0) {
@@ -473,5 +481,19 @@ pub fn rebuild(app: *App, request_frame: bool) void {
     std.mem.swap(ui_layer.Layer, &app.chrome_layer, &app.chrome_back);
     const is_empty = app.chrome_layer.solid.items.len == 0 and app.chrome_layer.text.items.len == 0;
     app.mu.unlock(clock.io());
-    if (request_frame and !(was_empty and is_empty)) app.queueRenderGtk();
+    if (request_frame and !(was_empty and is_empty)) app.queueRenderAll();
+}
+
+test "wrap cuts by cells, a wide character taking two" {
+    var out: [8][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), wrap("abcdef", 4, &out));
+    try std.testing.expectEqualStrings("abcd", out[0]);
+    try std.testing.expectEqualStrings("ef", out[1]);
+    // Three wide characters are six cells: two fit in four.
+    try std.testing.expectEqual(@as(usize, 2), wrap("\u{65e5}\u{672c}\u{8a9e}", 4, &out));
+    try std.testing.expectEqualStrings("\u{65e5}\u{672c}", out[0]);
+    try std.testing.expectEqualStrings("\u{8a9e}", out[1]);
+    // A line narrower than one wide character still takes it.
+    try std.testing.expectEqual(@as(usize, 2), wrap("\u{65e5}\u{672c}", 1, &out));
+    try std.testing.expectEqual(@as(usize, 2), wrap("a\nb", 10, &out));
 }

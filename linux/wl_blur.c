@@ -109,7 +109,7 @@ void* zonvie_wl_blur_surface(struct wl_surface* surface, struct wl_compositor* c
     wl_region_add(region, 0, 0, INT32_MAX, INT32_MAX);
     wl_proxy_marshal_flags(effect, 1, NULL, wl_proxy_get_version(effect), 0, region);
     wl_region_destroy(region);
-    // Applied with the surface's next commit, which GTK's next frame makes.
+    // Applied with the surface's next commit, which the next frame makes.
     return effect;
 }
 

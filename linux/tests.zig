@@ -12,7 +12,6 @@ test {
     _ = @import("cli.zig");
     _ = @import("scrollbar.zig");
     _ = @import("chrome.zig");
-    _ = @import("egl.zig");
     _ = @import("window_size.zig");
     _ = @import("ime_off.zig");
     _ = @import("layer_geom.zig");
@@ -27,4 +26,5 @@ test {
     _ = @import("form.zig");
     _ = @import("panel_popup.zig");
     _ = @import("tray.zig");
+    _ = @import("shell.zig");
 }

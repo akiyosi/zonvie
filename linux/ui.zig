@@ -21,7 +21,6 @@ pub const font_picker = @import("font_picker.zig");
 pub const window_size = unbuilt.window_size;
 pub const ime_off = unbuilt.ime_off;
 pub const session = unbuilt.session;
-pub const render_thread = unbuilt.render_thread;
 pub const tray = @import("tray.zig");
 pub const notify = @import("notify.zig");
 pub const chrome = @import("chrome.zig");

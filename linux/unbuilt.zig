@@ -1,12 +1,6 @@
 //! The other end of calls the core-facing modules (callbacks.zig, app.zig,
 //! renderer/gl_renderer.zig) make through ui.zig for pieces that are main.zig's
-//! or shell.zig's own here, and for the one that does not exist:
-//!
-//! - render_thread: a thread presenting off the window's frame cycle. The
-//!   frontend presents its own surface; there is no such cycle to go around.
-//!
-//! A type holds the state the callers keep for such a piece, cut down to the
-//! fields they read.
+//! or shell.zig's own here.
 
 const std = @import("std");
 const core = @import("zonvie_core");
@@ -25,9 +19,6 @@ pub const input = struct {
 };
 
 pub const ui_widgets = struct {
-    /// The widgets over the editor: none.
-    pub const Widgets = struct {};
-    pub const SnapshotStorage = struct {};
     /// A font the IME's composition would be drawn in: family and logical px.
     pub const PreeditFont = struct {
         family: [128]u8 = undefined,
@@ -50,7 +41,6 @@ pub const ui_widgets = struct {
         app.progress = "";
         @import("shell.zig").rebuild(app, true);
     }
-    pub fn placeCopyButtons(_: *App) void {}
     /// After a flush: the labels follow the cursor's window, and the frame
     /// the flush queues draws them (shell.zig).
     pub fn placeMessages(app: *App) void {
@@ -69,8 +59,6 @@ pub const window_size = struct {
     pub fn resizeToGrid(app: *App, rows: u32, cols: u32) void {
         @import("root").resizeToGrid(app, rows, cols);
     }
-    /// main.zig saves the size itself, when its loop ends.
-    pub fn save(_: *App) void {}
 };
 
 pub const ime_off = struct {
@@ -104,16 +92,5 @@ pub const session = struct {
     }
     pub fn onReady(app: *App) void {
         @import("session.zig").onReady(app);
-    }
-};
-
-pub const render_thread = struct {
-    /// A thread that presents by itself, off the window's frame cycle: none.
-    pub const RenderThread = struct {
-        animating: std.atomic.Value(bool) = .init(false),
-        pub fn request(_: *RenderThread) void {}
-    };
-    pub fn idlePresent(_: ?*anyopaque) callconv(.c) c_int {
-        return 0;
     }
 };

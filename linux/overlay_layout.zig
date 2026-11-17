@@ -3,7 +3,7 @@
 //! say over where its toplevels go, so a panel is either a popup surface
 //! parented to the view (panel_popup.zig, `Inputs.free`), which may reach
 //! past the window, or, as the fallback, drawn over the grid in the main
-//! GLArea and kept inside it. All values are view surface px, Y growing
+//! view and kept inside it. All values are view surface px, Y growing
 //! down; a free panel may have negative or out-of-view coordinates.
 
 const std = @import("std");

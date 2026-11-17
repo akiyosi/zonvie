@@ -1,5 +1,5 @@
 //! Where a panel's popup surface goes (panel_popup.zig): the popup around a
-//! panel placed by overlay_layout, the GtkPopover anchor that puts it there,
+//! panel placed by overlay_layout, the positioner anchor that puts it there,
 //! and the panel's rect back from where the compositor put the popup. Pure.
 //! `_px` are view device px, `_pt` view logical px; y grows down.
 
@@ -57,9 +57,9 @@ pub fn panelRect(f: Frame, origin_pt: [2]i32, scale: i32) Rect {
     return .{ .x = origin_pt[0] * scale + f.inner.x, .y = origin_pt[1] * scale + f.inner.y, .w = f.inner.w, .h = f.inner.h };
 }
 
-/// A GtkPopover placement (GTK_POS_BOTTOM, halign START, no arrow): the
-/// popup's top-left goes `offset` from the bottom-left corner of the 1x1
-/// rect at `point` (gtk_popover_set_pointing_to, gtk_popover_set_offset).
+/// An xdg_positioner placement (wl/window.c zwl_popup_open): the popup's
+/// top-left goes `offset` from the bottom-left corner of the 1x1 rect at
+/// `point`.
 pub const Anchor = struct { point: [2]i32, offset: [2]i32 };
 
 /// The anchor that puts a popup's top-left at `origin_pt`. xdg_positioner

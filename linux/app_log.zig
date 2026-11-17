@@ -6,7 +6,7 @@ const clock = core.clock;
 
 var g_enabled: bool = false;
 var g_log_file: ?std.Io.File = null;
-/// The core, GTK and render threads all log: one line is one locked write.
+/// The core and main threads both log: one line is one locked write.
 var g_mu: std.Io.Mutex = .init;
 var g_start_ns: i128 = 0;
 

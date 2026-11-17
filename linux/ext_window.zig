@@ -1,7 +1,6 @@
 //! `--extwindows`: each external grid in an OS window of its own, a further
 //! toplevel of this client drawn with the main window's GL context
-//! (wl/window.c zwl_ext_*). Main thread, except queueApply, queueRefit and
-//! findWindow.
+//! (wl/window.c zwl_ext_*). Main thread, except queueApply and queueRefit.
 //!
 //! What Wayland leaves out: a client neither reads nor sets where its
 //! windows are, so the window-layout operations (`<C-w>H`, `<C-w>x`, ...)
@@ -18,7 +17,6 @@ const postfx = @import("renderer/postfx.zig");
 const pointer = @import("pointer.zig");
 const applog = @import("app_log.zig");
 const scrollbar = @import("scrollbar.zig");
-const win_layout = core.win_layout;
 
 extern "c" fn zwl_ext_open(id: i64, app_id: [*:0]const u8, title: [*:0]const u8, w_px: i32, h_px: i32, scale: i32) c_int;
 extern "c" fn zwl_ext_close(id: i64) void;
@@ -33,7 +31,7 @@ extern "c" fn zwl_flush() c_int;
 const app_id = "io.github.akiyosi.zonvie";
 
 pub const Op = struct {
-    kind: enum { open, close, layout },
+    kind: enum { open, close },
     grid_id: i64 = 0,
     /// The Neovim window handle, which names the OS window ("Window N").
     win: i64 = 0,
@@ -42,12 +40,6 @@ pub const Op = struct {
     /// on_external_window's global cell, -1 for none.
     start_row: i32 = -1,
     start_col: i32 = -1,
-    /// `.layout`: a win_move / win_exchange / win_rotate / win_resize_equal
-    /// from the window showing `source_grid` (null: the main window).
-    layout_op: win_layout.Op = .move,
-    arg: i32 = 0,
-    count: i32 = 0,
-    source_grid: ?i64 = null,
 };
 
 pub const ExtWindow = struct {
@@ -70,8 +62,6 @@ pub const ExtWindow = struct {
     realized: bool = false,
     /// A change waits for the frame callback of the frame before it.
     dirty: bool = false,
-    /// Placeholder for the callers that test for a widget (scrollbar.zig).
-    area: ?*anyopaque = null,
 };
 
 /// The window the pointer is in, null for the main one (main.zig routes the
@@ -88,14 +78,12 @@ fn idleApply(data: ?*anyopaque) callconv(.c) c_int {
     const app: *App = @ptrCast(@alignCast(data.?));
     app.ext_idle_queued.store(false, .release);
     app.mu.lockUncancelable(clock.io());
-    std.mem.swap(std.ArrayListUnmanaged(Op), &app.ext_ops, &app.ext_ops_gtk);
+    std.mem.swap(std.ArrayListUnmanaged(Op), &app.ext_ops, &app.ext_ops_main);
     app.mu.unlock(clock.io());
-    defer app.ext_ops_gtk.clearRetainingCapacity();
-    for (app.ext_ops_gtk.items) |op| switch (op.kind) {
+    defer app.ext_ops_main.clearRetainingCapacity();
+    for (app.ext_ops_main.items) |op| switch (op.kind) {
         .open => open(app, op),
         .close => close(app, op.grid_id),
-        // No window positions on Wayland: nothing to arrange.
-        .layout => {},
     };
     return 0;
 }
@@ -134,7 +122,7 @@ fn open(app: *App, op: Op) void {
         }
         return;
     }
-    const w = app.alloc.create(ExtWindow) catch return;
+    const w = app.alloc.create(ExtWindow) catch return openFailed(app, op.grid_id);
     w.* = .{ .app = app, .grid_id = op.grid_id, .rows = op.rows, .cols = op.cols, .win = op.win, .pointer = .{ .app = app, .surface_id = op.grid_id, .press_grid_id = op.grid_id } };
     const sz = sizePx(app, op.grid_id, op.rows, op.cols);
     w.w_px = sz[0];
@@ -145,15 +133,23 @@ fn open(app: *App, op: Op) void {
     const scale: i32 = @max(1, @as(i32, @intFromFloat(cellPx(app, op.grid_id).scale)));
     if (zwl_ext_open(op.grid_id, app_id, t.ptr, @intCast(sz[0]), @intCast(sz[1]), scale) != 0) {
         app.alloc.destroy(w);
-        return;
+        return openFailed(app, op.grid_id);
     }
     app.ext_windows.put(app.alloc, op.grid_id, w) catch {
         zwl_ext_close(op.grid_id);
         app.alloc.destroy(w);
-        return;
+        return openFailed(app, op.grid_id);
     };
     // The GUI harness's marker for a new external window (test/gui/app_log.zig).
     applog.appLog("[external_window] open gridId={d} rows={d} cols={d}\n", .{ op.grid_id, op.rows, op.cols });
+}
+
+/// The core has `grid_id` open (on_external_window returned) but no window
+/// could be made for it: nothing would ever draw the grid, so Neovim is
+/// asked to close its window, which ends in on_external_window_close.
+fn openFailed(app: *App, grid_id: i64) void {
+    const sent = if (app.corep) |cp| core.zonvie_core_request_win_close(cp, grid_id) else 0;
+    applog.appLog("[linux] ext window open failed grid={d}, close requested sent={d}\n", .{ grid_id, sent });
 }
 
 fn close(app: *App, grid_id: i64) void {
@@ -205,7 +201,8 @@ fn draw(w: *ExtWindow) void {
     w.gl.h_px = w.h_px;
     w.gl.fb_w_px = w.w_px;
     w.gl.fb_h_px = w.h_px;
-    gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id);
+    // Still moving: this window's own frame callback draws again.
+    if (gl_renderer.renderExternal(w.app, &w.gl, &w.postfx, w.grid_id)) w.dirty = true;
     zwl_ext_request_frame(w.grid_id);
     _ = zwl_ext_swap(w.grid_id);
     // EGL reads the socket too: what it read for this queue is dispatched.
@@ -227,8 +224,9 @@ pub fn renderAll(app: *App) void {
 fn fit(w: *ExtWindow) void {
     const c = cellPx(w.app, w.grid_id);
     if (c.w == 0 or c.h == 0) return;
-    const rows: u32 = @max(1, w.h_px / c.h);
-    const cols: u32 = @max(1, scrollbar.gridWidthPx(w.app.scrollbar_cfg, w.w_px, c.scale) / c.w);
+    const g = scrollbar.gridFor(w.app.scrollbar_cfg, w.w_px, w.h_px, c.w, c.h, c.scale);
+    const rows = g.rows;
+    const cols = g.cols;
     if (rows == w.rows and cols == w.cols) return;
     const cp = w.app.corep orelse return;
     core.zonvie_core_try_resize_grid(cp, w.grid_id, rows, cols);
@@ -283,16 +281,5 @@ fn idleRefit(data: ?*anyopaque) callconv(.c) c_int {
         setSize(w, sz[0], sz[1]);
         draw(w);
     }
-    return 0;
-}
-
-/// The cursor moved to `grid_id` from another window. A Wayland client
-/// cannot raise its own window: the compositor's focus stays where it is.
-pub fn focusGrid(_: *App, _: i64) void {}
-
-/// on_win_move_cursor: the Neovim window in a direction by screen geometry.
-/// 0, none: Wayland gives no geometry, and Neovim then moves within its own
-/// layout, as with no callback.
-pub fn findWindow(_: *App, _: i64, _: i32, _: i32, _: i64) i64 {
     return 0;
 }

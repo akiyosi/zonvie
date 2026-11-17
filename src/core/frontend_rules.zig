@@ -2046,7 +2046,8 @@ pub const MainWindowSnap = struct {
 /// i.e. before the first WM_SIZE) to a cell multiple, then apply the chrome
 /// delta already present between `outer_w`/`outer_h` and the live content.
 /// Snapping the desired size rather than the live content is what lets the
-/// window grow back after it shrank on a font-size change (windows/window.zig, linux/window_size.zig). Returns null when there is nothing to do: a
+/// window grow back after it shrank on a font-size change (windows/window.zig,
+/// linux/main.zig onSnap). Returns null when there is nothing to do: a
 /// degenerate cell size, a content area smaller than one cell, or the window
 /// already holding the snapped size.
 pub fn snapMainWindowOuterSize(

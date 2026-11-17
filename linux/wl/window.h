@@ -1,4 +1,4 @@
-// The Wayland backend's window (window.c), as main_wl.zig sees it.
+// The Wayland backend's window (window.c), as main.zig sees it.
 #ifndef ZONVIE_WL_WINDOW_H
 #define ZONVIE_WL_WINDOW_H
 
@@ -102,7 +102,6 @@ int zwl_swap(void);
 int zwl_dispatch(void);
 int zwl_dispatch_pending(void);
 int zwl_flush(void);
-int zwl_roundtrip(void);
 
 // External windows: further toplevels of the same client, drawn with the main
 // window's GL context. `id` is nonzero and the caller's own. The window is
@@ -115,7 +114,6 @@ void zwl_ext_close(int64_t id);
 // follows with its size; ext_close when the compositor dismisses it.
 int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t w_logical, int32_t h_logical,
                    int32_t anchor_x, int32_t anchor_y, int32_t scale);
-void zwl_popup_position(int64_t id, int32_t* x, int32_t* y);
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
 // Makes the window's surface the one GL draws to; id 0 is the main window.
 int zwl_ext_make_current(int64_t id);

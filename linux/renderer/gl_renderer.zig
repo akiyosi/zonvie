@@ -71,8 +71,7 @@ pub const Target = struct {
     /// (postfx.renderFrame): the native cursor pass is skipped.
     skip_cursor: bool = false,
     /// One layer's rows concatenated for a single upload; capacity reused
-    /// across frames. Per target, so the render thread and the main thread
-    /// never share one.
+    /// across frames.
     scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
 
     pub fn deinit(self: *Target, alloc: std.mem.Allocator) void {
@@ -466,8 +465,6 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
 pub const Frame = struct {
     /// Some grid eases: the caller keeps frames coming (startEaseTick).
     moving: bool = false,
-    /// App.flush_seq of the committed frame drawn.
-    flush_seq: u64 = 0,
 };
 
 /// The main surface and its overlays into `t`, sized `t.w_px` x `t.h_px`.
@@ -479,8 +476,7 @@ pub fn renderMain(app: *App, t: *Target) Frame {
     defer app.mu.unlock(clock.io());
 
     drainAtlas(app, t);
-    const seq = app.flush_seq;
-    if (!begin(app, t)) return .{ .flush_seq = seq };
+    if (!begin(app, t)) return .{};
     if (!t.warmed) {
         // A driver may finish compiling the program only at its first draw.
         // One zero-area triangle makes that happen in the frame before
@@ -500,7 +496,7 @@ pub fn renderMain(app: *App, t: *Target) Frame {
         const us = @divTrunc(clock.nowNs() - t0, 1000);
         applog.appLog("[perf] linux_render us={d} layers={d} verts={d} easing={}\n", .{ us, layers.len, d.verts + overlay_verts, d.moving });
     }
-    return .{ .moving = d.moving, .flush_seq = seq };
+    return .{ .moving = d.moving };
 }
 
 /// A surface's glow-flagged glyphs, in extract mode, into the bound
@@ -546,7 +542,6 @@ pub fn render(app: *App) void {
     if (app.island()) clearCardPadding(app, t);
     const f = if (postfx.active(app, &app.postfx)) postfx.renderFrame(app, t, &app.postfx, 1) else renderMain(app, t);
     drawUi(app, t);
-    app.presented_seq = f.flush_seq;
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
     if (f.moving or app.postfx.animating) startEaseTick(app);
 }
@@ -621,12 +616,11 @@ pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
     defer app.mu.unlock(clock.io());
 
     syncAtlas(app, t);
-    const seq = app.flush_seq;
-    if (!begin(app, t)) return .{ .flush_seq = seq };
+    if (!begin(app, t)) return .{};
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
     if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar, surface_id);
     _ = drawOverlays(app, t, surface_id);
-    return .{ .moving = d.moving, .flush_seq = seq };
+    return .{ .moving = d.moving };
 }
 
 /// The surface's scrollbar over its grids, under the ext UI overlays.
@@ -645,13 +639,15 @@ fn drawScrollbar(app: *App, t: *Target, st: *const scrollbar.State, surface_id: 
 }
 
 /// An external window's render signal: the surface rooted at `surface_id`.
-pub fn renderExternal(app: *App, t: *Target, p: *postfx.PostFx, surface_id: i64) void {
+/// True when a grid of it eases or its shader animates: the window draws
+/// the frame after this one too.
+pub fn renderExternal(app: *App, t: *Target, p: *postfx.PostFx, surface_id: i64) bool {
     const f = if (postfx.active(app, p))
         postfx.renderFrame(app, t, p, surface_id)
     else
         renderExternalScene(app, t, surface_id);
-    if (f.moving or p.animating) startEaseTick(app);
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{surface_id});
+    return f.moving or p.animating;
 }
 
 /// A panel popup's render signal (panel_popup.zig): panel `kind` at
@@ -792,7 +788,7 @@ pub fn msgSurface(app: *const App, mode: core.config.MsgPosition) i64 {
 
 /// What places the ext UI panels on surface `surface_id` (1, the main view,
 /// or an external window), `w_px` x `h_px`: the one answer for the panels
-/// drawn here, the copy buttons over them (ui_widgets.placeCopyButtons) and
+/// drawn here, the copy buttons over them (shell.zig buildCopyButtons) and
 /// the pointer's hit tests. Caller holds App.mu.
 pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) overlay_layout.Inputs {
     const w: i32 = @intCast(w_px);
@@ -811,8 +807,8 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
         .msg_target = overlay_layout.msgTargetOn(surface_id, app.msg_pos.ext_float, app.msg_anchor, w, h, cw, ch),
         .pum_surface = overlay_layout.popupSurface(app.overlays[@intFromEnum(overlay_layout.Kind.popupmenu)], app, surfaceOpen),
         .msg_surface = msg_surface,
-        // A copy button is a widget over the surface its panel is on
-        // (ui_widgets.placeCopyButtons): the cmdline's the main view.
+        // A copy button sits over the surface its panel is on: the
+        // cmdline's the main view.
         .copy_cmdline = app.copy_cmdline and main,
         .copy_messages = app.copy_messages and surface_id == msg_surface,
         .confirm = if (main) app.confirm_rect else null,

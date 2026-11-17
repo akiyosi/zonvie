@@ -75,70 +75,9 @@ pub fn makeCallbacks() core.Callbacks {
         .on_callback_error = onCallbackError,
         .on_quit_requested = onQuitRequested,
         .on_ime_off = onImeOff,
-        .on_cursor_grid_changed = onCursorGridChanged,
         .on_restart = onRestart,
         .on_connect = onConnect,
     };
-}
-
-/// `wincmd H/J/K/L`, `x`, `r`, `=` and `h/j/k/l` over external OS windows,
-/// set only under X11 (x11_place). On Wayland no client can read or move a
-/// toplevel, so they stay unset and the core does what it does without
-/// them: nothing for the layout operations, and win_move_cursor answers 0.
-pub fn addWindowLayout(cb: *core.Callbacks) void {
-    cb.on_win_move = onWinMove;
-    cb.on_win_exchange = onWinExchange;
-    cb.on_win_rotate = onWinRotate;
-    cb.on_win_resize_equal = onWinResizeEqual;
-    cb.on_win_move_cursor = onWinMoveCursor;
-}
-
-/// Queued behind the opens and closes before it, for the main thread. A
-/// user command, so a failed append drops it rather than the flush.
-fn queueLayout(app: *App, op: ext_window.Op) void {
-    {
-        lock(app);
-        defer unlock(app);
-        app.ext_ops.append(app.alloc, op) catch {
-            applog.appLog("[linux] window layout {s} dropped: out of memory\n", .{@tagName(op.layout_op)});
-            return;
-        };
-    }
-    ext_window.queueApply(app);
-}
-
-fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
-    _ = win;
-    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .move, .arg = flags, .count = 1, .source_grid = grid_id });
-}
-
-fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
-    _ = win;
-    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .exchange, .count = count, .source_grid = grid_id });
-}
-
-fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
-    _ = grid_id;
-    _ = win;
-    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .rotate, .arg = direction, .count = count });
-}
-
-/// Every window takes the average size, top-left corners kept.
-fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
-    queueLayout(appFrom(ctx), .{ .kind = .layout, .layout_op = .resize_equal });
-}
-
-/// Synchronous (zonvie_core.h). Called while the core handles Neovim's
-/// request, with grid_mu not held, so it may ask the core for the cursor
-/// and the grids (as Windows does).
-fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
-    const app = appFrom(ctx);
-    const cp = app.corep orelse return 0;
-    const cursor_grid = core.zonvie_core_get_cursor_position(cp, null, null);
-    var grids: [64]core.GridInfo = undefined;
-    const n = core.zonvie_core_get_visible_grids(cp, &grids, grids.len);
-    const main_win = core.zonvie_core_get_win_id(cp, core.win_layout.mainTargetGrid(core.GridInfo, grids[0..n]));
-    return ext_window.findWindow(app, cursor_grid, direction, count, main_win);
 }
 
 /// One structured render-trace line, stamped with the flush it belongs to
@@ -161,7 +100,10 @@ fn unlock(app: *App) void {
 }
 
 /// The flush cannot be accepted; on_flush_end cancels the staged frame.
+/// A callback the core sends outside a flush (a session reset's closes) has
+/// no flush to abort and nothing that retries it: its failure is logged.
 fn failFlush(app: *App) void {
+    if (!app.in_flush) return applog.appLog("[linux] a callback outside a flush failed and is not retried\n", .{});
     app.flush_failed = true;
     core.zonvie_core_abort_flush(app.corep);
 }
@@ -519,9 +461,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 app.flush_outcome.store(.aborted, .release);
             }
         } else if (app.surface.prepareCommit(app.alloc)) |_| {
-            app.flush_seq += 1;
             // With the rows it places messages against, so a frame drawn
-            // from this commit (the render thread's, at once) has both.
+            // from this commit has both.
             app.msg_anchor = if (have_anchor) anchor else null;
             // The grids this commit frees, released with it.
             for (app.surface.destroyed.items) |id| traceRender(app, "event=destroy_release grid={d}\n", .{id});
@@ -550,10 +491,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     queueRender(app);
 }
 
-/// Callable from any thread; at most one idle is outstanding. The render
-/// thread is woken here directly, not through the main loop.
+/// Callable from any thread; at most one idle is outstanding.
 pub fn queueRender(app: *App) void {
-    if (app.render_thread) |rt| rt.request();
     if (app.render_idle_queued.swap(true, .acq_rel)) return;
     _ = glib.g_idle_add(&idleQueueRender, app);
 }
@@ -577,16 +516,17 @@ const resize_poll_ns = 200 * std.time.ns_per_us;
 /// Neovim that keeps its size (another UI holds it smaller) costs the full
 /// wait. Main thread.
 pub fn awaitResizeAnswer(app: *App) void {
-    if (app.render_thread != null) return;
     lock(app);
     const cw = app.cell_w_px;
     const ch = app.cell_h_px;
-    const grid_w = scrollbar.gridWidthPx(app.scrollbar_cfg, app.drawable_w_px, app.scale);
+    const w = app.drawable_w_px;
     const h = app.drawable_h_px;
+    const scale = app.scale;
     unlock(app);
     if (cw == 0 or ch == 0) return;
-    const rows = @max(1, h / ch);
-    const cols = @max(1, grid_w / cw);
+    const want = scrollbar.gridFor(app.scrollbar_cfg, w, h, cw, ch, scale);
+    const rows = want.rows;
+    const cols = want.cols;
     const io = clock.io();
     const deadline_ns = clock.nowNs() + resize_wait_ns;
     while (true) {
@@ -595,9 +535,7 @@ pub fn awaitResizeAnswer(app: *App) void {
             if (l.grid_id == 1) break .{ l.rows, l.cols };
         } else .{ 0, 0 };
         unlock(app);
-        // The area draws what is committed in this cycle's paint. The idle
-        // the flush queued still places the widgets: not from here, inside
-        // GTK's size allocation.
+        // The frame drawn after this wait shows what is committed by then.
         if (root[0] == 0 or (root[0] == rows and root[1] == cols)) return;
         if (clock.nowNs() >= deadline_ns) return;
         std.Io.sleep(io, .{ .nanoseconds = resize_poll_ns }, .awake) catch {};
@@ -621,20 +559,13 @@ fn runQueuedRender(app: *App) void {
     unlock(app);
     ui_widgets.placeMessages(app);
     panel_popup.update(app);
-    ui_widgets.placeCopyButtons(app);
     input.refreshPanelHover(app);
     if (nvim_drawn) {
         ui_widgets.hideProgress(app);
         session.onReady(app);
     }
-    // The render thread was woken with the commit (queueRender) and draws
-    // it whole; what the steps above change for it requests its own frame.
-    app.queueRenderGtk();
-    // Moving the IME's cursor rectangle makes GTK run a frame cycle. With a
-    // render thread the flush's frame does not exist yet, and would wait
-    // out that cycle: the thread's handoff moves the rectangle, with the
-    // frame that shows the cursor there (render_thread.idlePresent).
-    if (app.render_thread == null) input.updateImeCursor(app);
+    app.queueRenderAll();
+    input.updateImeCursor(app);
     // Every flush may carry a mode change, and with it a new cadence.
     blink.update(app);
     scrollbar.update(app);
@@ -951,40 +882,6 @@ fn rowHeightPx(cell_h_px: u32, linespace_px: i32) u32 {
     return @intCast(@max(1, @as(i32, @intCast(cell_h_px)) + linespace_px));
 }
 
-/// The scale the surfaces now draw at changed: the global faces are loaded
-/// again at its pixel size and the core re-rasterizes and re-lays out, as
-/// for a guifont change. Per-grid fonts follow: the new global cell makes
-/// the core re-query every font window and load its slot again
-/// (noteGlobalCellChangeLocked), which onFontSlotLoad does at the new
-/// scale's pixel size. main thread, not holding App.mu; blocks on
-/// grid_mu.
-pub fn applyScale(app: *App, scale: f32) void {
-    lock(app);
-    const changed = app.scale != scale;
-    app.scale = scale;
-    unlock(app);
-    if (!changed) return;
-    const cp = app.corep orelse return; // ensureFont loads at this scale
-    core.zonvie_core_lock_grid(cp);
-    defer core.zonvie_core_unlock_grid(cp);
-    lock(app);
-    const pt = app.font_pt;
-    unlock(app);
-    if (pt <= 0 or !app.fonts.reload(app.alloc, pixelSize(app, pt))) return;
-    applog.appLog("[linux] scale {d}: font reloaded at {d}px\n", .{ scale, app.fonts.pixel_size });
-    updateMetrics(app);
-    core.zonvie_core_invalidate_glyph_cache(cp);
-    lock(app);
-    const w = app.drawable_w_px;
-    const h = app.drawable_h_px;
-    const cw = app.cell_w_px;
-    const ch = app.cell_h_px;
-    unlock(app);
-    if (w != 0 and h != 0) core.zonvie_core_update_layout_px_locked(cp, w, h, cw, ch);
-    // update_layout_px_locked leaves the flush to its caller.
-    core.zonvie_core_retry_flush_locked(cp);
-}
-
 /// Publishes the font cell plus linespace.
 fn updateMetrics(app: *App) void {
     const h = rowHeightPx(app.fonts.cell_h_px, app.linespace_px);
@@ -1020,18 +917,15 @@ fn sendLayout(app: *App) void {
 }
 
 /// The cmdline's width budget, less the panel chrome and the screen margin:
-/// the output's width while the cmdline is a popup that may reach past the
-/// window (panel_popup.zig), as Windows grows it to its monitor's work
-/// area, else the main view's. Caller does not hold App.mu.
+/// the main view's width. Caller does not hold App.mu.
 pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols {
     lock(app);
     const scale: u32 = @intFromFloat(app.scale);
     const copy = app.copy_cmdline;
-    const work_w_px = if (app.panel_popups) @max(main_w_px, app.monitor_w_px) else main_w_px;
     unlock(app);
     const chrome: u32 = @intCast(overlay_layout.cmdlineChromePx(@intCast(scale), copy));
     const margin: u32 = 2 * scale * @as(u32, @intCast(overlay_layout.cmdline_screen_margin_pt));
-    return rules.cmdlineCols(work_w_px, main_w_px, chrome, margin, cell_w_px);
+    return rules.cmdlineCols(main_w_px, main_w_px, chrome, margin, cell_w_px);
 }
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
@@ -1124,9 +1018,6 @@ fn idleQuit(data: ?*anyopaque) callconv(.c) c_int {
     unlock(app);
     // A remote start that ended before its first frame: an alert, then quit.
     if (session.failEarlyExit(app, code)) return 0;
-    // Neovim quitting (`:qa`) closes the window without a close-request,
-    // so its frame is remembered here, while the window still exists.
-    window_size.save(appFrom(data));
     ui.window.quit(appFrom(data));
     return 0;
 }
@@ -1165,23 +1056,17 @@ fn onConnect(ctx: ?*anyopaque, addr: [*]const u8, addr_len: usize) callconv(.c) 
 
 /// `:restart` / `:connect`: another nvim takes over this window (the core
 /// swaps sessions without tearing the UI down). Core thread.
-/// Reset here: what names the old server's state.
-/// - cursor_grid_focus: grid ids restart with the server, and the core
-///   forgets its last cursor grid (windows/callbacks.zig onSessionSwap).
-/// - session_generation, nvim_ready (main thread, in the idle).
+/// Reset here: what names the old server's state, nvim_ready (main thread,
+/// in the idle).
 /// Kept: the ext_ops queue (ordered; the core's closes for the old
 /// session's windows still have to reach them), the panel popups (redrawn
 /// from the next flush's state).
 fn onSessionSwap(app: *App) void {
-    lock(app);
-    app.cursor_grid_focus = 1;
-    unlock(app);
     _ = glib.g_idle_add(&idleSessionSwap, app);
 }
 
 fn idleSessionSwap(data: ?*anyopaque) callconv(.c) c_int {
     const app = appFrom(data);
-    app.session_generation +%= 1;
     // Files handed over now wait for the new server's first frame (its
     // flushes only start once it is attached), as at startup. The window is
     // already shown, so that frame must not present it again.
@@ -1197,25 +1082,6 @@ fn onImeOff(ctx: ?*anyopaque) callconv(.c) void {
 fn idleImeOff(data: ?*anyopaque) callconv(.c) c_int {
     _ = data;
     ime_off.off();
-    return 0;
-}
-
-/// The cursor moved to another grid: the window showing it comes forward.
-/// Core thread; the main thread presents it.
-fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
-    const app = appFrom(ctx);
-    lock(app);
-    app.cursor_grid_focus = grid_id;
-    unlock(app);
-    _ = glib.g_idle_add(&idleFocusGrid, app);
-}
-
-fn idleFocusGrid(data: ?*anyopaque) callconv(.c) c_int {
-    const app = appFrom(data);
-    lock(app);
-    const grid = app.cursor_grid_focus;
-    unlock(app);
-    ext_window.focusGrid(app, grid);
     return 0;
 }
 

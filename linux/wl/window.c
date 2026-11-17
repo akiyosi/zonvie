@@ -1,5 +1,5 @@
 // The Wayland backend's window: one xdg_toplevel with an EGL surface, its
-// keyboard through xkbcommon, and the protocol's event pump. main_wl.zig
+// keyboard through xkbcommon, and the protocol's event pump. main.zig
 // drives it; nothing here knows the core.
 //
 // The build has no wayland-scanner step, so xdg-shell's three interfaces are
@@ -237,7 +237,6 @@ static struct {
         struct wl_proxy* toplevel;
         // A popup of another window instead of a toplevel.
         struct wl_proxy* popup;
-        int32_t popup_x, popup_y;
         struct wl_proxy* decoration;
         struct wl_callback* frame;
         struct wl_egl_window* egl_window;
@@ -513,6 +512,7 @@ static void ptr_frame(void* d, struct wl_pointer* p) {
         double sum[2] = { 0, 0 };
         uint32_t first = 0, last = 0;
         int used = 0;
+        const struct axis_sample* oldest = NULL;
         for (int i = w.axis_recent_n - 1; i >= 0; i--) {
             const struct axis_sample* s = &w.axis_recent[i];
             if (used == 0) last = s->time_ms;
@@ -520,7 +520,14 @@ static void ptr_frame(void* d, struct wl_pointer* p) {
             first = s->time_ms;
             sum[0] += s->px[0];
             sum[1] += s->px[1];
+            oldest = s;
             used++;
+        }
+        // A sample holds the travel since the one before it: the oldest
+        // one's was covered before `first`, outside the time divided by.
+        if (oldest) {
+            sum[0] -= oldest->px[0];
+            sum[1] -= oldest->px[1];
         }
         w.axis_recent_n = 0;
         if (w.axis_finger && used >= 2 && last > first && w.l->pointer_axis_stop) {
@@ -1399,10 +1406,8 @@ int zwl_ext_open(int64_t id, const char* app_id, const char* title, int32_t w_px
 }
 
 static void popup_configure(void* d, struct wl_proxy* p, int32_t x, int32_t y, int32_t width, int32_t height) {
-    (void)p;
+    (void)p; (void)x; (void)y;
     struct zwl_ext* e = d;
-    e->popup_x = x;
-    e->popup_y = y;
     e->pending_w = width;
     e->pending_h = height;
 }
@@ -1461,13 +1466,6 @@ int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t 
     wl_surface_commit(e->surface);
     wl_display_flush(w.display);
     return 0;
-}
-
-// Where the compositor put popup `id`, from its parent's top-left.
-void zwl_popup_position(int64_t id, int32_t* x, int32_t* y) {
-    struct zwl_ext* e = ext_of_id(id);
-    *x = e ? e->popup_x : 0;
-    *y = e ? e->popup_y : 0;
 }
 
 void zwl_ext_close(int64_t id) {
@@ -1535,4 +1533,3 @@ int zwl_dispatch(void) {
 }
 int zwl_dispatch_pending(void) { return wl_display_dispatch_pending(w.display); }
 int zwl_flush(void) { return wl_display_flush(w.display); }
-int zwl_roundtrip(void) { return wl_display_roundtrip(w.display); }
