@@ -508,8 +508,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     {
         lock(app);
         defer unlock(app);
-        // atlas_pending is left alone either way: uploads that returned are
-        // cached by the core, whatever happens to the rows.
+        // atlas_pending's uploads are left alone either way: those that
+        // returned are cached by the core, whatever happens to the rows.
         if (failed) {
             app.surface.cancel();
             // An abort causes no further flush by itself; core_timers
@@ -533,6 +533,8 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 .large_jump = app.large_jump,
             });
             scrollbar.commitViews(app);
+            // The committed rows are the new atlas's from here on.
+            app.atlas_pending.held = false;
             committed = true;
             app.flush_outcome.store(.committed, .release);
             if (app.panel_colors_stale) {
@@ -671,6 +673,7 @@ fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void
     }
     ops.dirty_rows = 0;
     ops.recreate = true;
+    ops.held = true;
     ops.gen +%= 1;
     ops.w = atlas_w;
     ops.h = atlas_h;
@@ -700,7 +703,12 @@ fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height:
         @memcpy(ops.mirror[dst_off..][0..row_bytes], src[r * row_bytes ..][0..row_bytes]);
     }
     ops.dirty_rows = @max(ops.dirty_rows, dest_y + height);
-    ops.uploads.appendAssumeCapacity(.{ .x = dest_x, .y = dest_y, .w = width, .h = height, .offset = offset });
+    if (ops.recreate) {
+        // The new texture is filled from the mirror: nothing to queue.
+        ops.pixels.shrinkRetainingCapacity(offset);
+    } else {
+        ops.uploads.appendAssumeCapacity(.{ .x = dest_x, .y = dest_y, .w = width, .h = height, .offset = offset });
+    }
     ops.gen +%= 1;
 }
 

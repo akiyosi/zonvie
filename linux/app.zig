@@ -31,6 +31,10 @@ pub const AtlasOps = struct {
     /// Set by on_atlas_create; the GL side recreates a zeroed w x h texture
     /// before applying `uploads`.
     recreate: bool = false,
+    /// Set with `recreate`, cleared when a flush commits. Until then the
+    /// committed rows carry UVs of the texture being replaced, so the GL
+    /// side keeps drawing them with that texture and applies nothing.
+    held: bool = false,
     w: u32 = 0,
     h: u32 = 0,
     uploads: std.ArrayListUnmanaged(AtlasUpload) = .empty,

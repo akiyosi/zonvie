@@ -185,6 +185,9 @@ fn drainAtlas(app: *App, t: *Target) void {
     const ops = &app.atlas_pending;
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    // The committed rows still sample the atlas being replaced
+    // (AtlasOps.held). A texture without storage has nothing to keep.
+    if (ops.held and t.atlas_w != 0) return;
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
     // On atlas create, or a context realized again (atlas_w reset to 0),
     // the texture gets new storage and no pixels: the rows the mirror has
@@ -228,6 +231,7 @@ fn syncAtlas(app: *App, t: *Target) void {
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
     if (ops.w == 0 or ops.h == 0) return;
+    if (ops.held and t.atlas_w != 0) return;
     if (t.atlas_w != 0 and t.atlas_gen == ops.gen) return;
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.ptr);
