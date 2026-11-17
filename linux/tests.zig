@@ -20,7 +20,6 @@ test {
     _ = @import("lifecycle.zig");
     _ = @import("callbacks.zig");
     _ = @import("crash.zig");
-    _ = @import("unbuilt.zig");
     _ = @import("trackpad.zig");
     _ = @import("pointer.zig");
     _ = @import("form.zig");

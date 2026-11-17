@@ -3,7 +3,7 @@
 // drops the theme's button look, hover included, so this is the frontend's
 // own rule to keep. Driven through the compositor's virtual pointer.
 //
-// Linux-only: linux/ui_widgets.zig's tab strip.
+// Linux-only: linux/chrome.zig's tab strip.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

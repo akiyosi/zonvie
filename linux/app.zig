@@ -8,7 +8,6 @@ const Fonts = @import("renderer/font.zig").Fonts;
 const scroll_ease = core.scroll_ease;
 const overlay_layout = @import("overlay_layout.zig");
 const ui_state = @import("ui_state.zig");
-const ui_widgets = @import("ui.zig").ui_widgets;
 const gl_renderer = @import("renderer/gl_renderer.zig");
 const input = @import("ui.zig").input;
 const ext_window = @import("ui.zig").ext_window;
@@ -103,15 +102,10 @@ pub const App = struct {
     scrollbar: scrollbar.State = .{},
     /// config.toml's [input].
     input_cfg: core.config.Config.InputConfig = .{},
-    /// The editor font as the preedit label draws it: family and logical px.
-    /// Written with the metrics under `mu`.
+    /// The family of the editor font in use, which `:set guifont=*` starts
+    /// from (font_picker.zig). Written with the metrics under `mu`.
     preedit_family: [128]u8 = undefined,
     preedit_family_len: usize = 0,
-    preedit_px: f32 = 0,
-    /// The same for each per-grid font slot (on_font_slot_load), for a
-    /// composition in a grid with its own font; px 0 while the slot is
-    /// empty. Under `mu`.
-    slot_preedit: [core.font_slots.max_slots]ui_widgets.PreeditFont = @splat(.{}),
     /// The size the font in use was loaded at, in points; under `mu`.
     font_pt: f32 = 0,
     /// What the global faces were loaded from (callbacks.fontRequestKey), 0
@@ -132,7 +126,7 @@ pub const App = struct {
     /// that places the panels.
     msg_anchor: ?core.MsgAnchor = null,
     /// The confirm dialog's box in surface px while it shows; written by
-    /// ui_widgets.placeMessages on the main thread under `mu`, read by the
+    /// shell.zig's rebuild on the main thread under `mu`, read by the
     /// overlay layout wherever the frame is drawn.
     confirm_rect: ?overlay_layout.Rect = null,
     /// config.toml's [font]; `family` borrows the Config, which outlives the app.

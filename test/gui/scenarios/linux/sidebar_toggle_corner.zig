@@ -5,8 +5,7 @@
 // toggle not having moved with the sidebar.
 //
 // Linux-only: linux/chrome.zig's title band. The click lands on the band's
-// first button: the desktop's decoration layout must put no window button
-// at the band's start (Hyprland's GTK default puts them all at the end).
+// first button: the window buttons are drawn at the band's end.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

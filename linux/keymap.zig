@@ -2,12 +2,11 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const testing = std.testing;
 
-// The modifier masks wl/window.c reports (GDK's values, kept from the
-// toolkit this table was written against).
-const GDK_SHIFT_MASK: u32 = 1;
-const GDK_CONTROL_MASK: u32 = 4;
-const GDK_ALT_MASK: u32 = 8;
-const GDK_SUPER_MASK: u32 = 1 << 26;
+// The modifier masks wl/window.c reports (its MASK_*).
+const MASK_SHIFT: u32 = 1;
+const MASK_CTRL: u32 = 4;
+const MASK_ALT: u32 = 8;
+const MASK_SUPER: u32 = 1 << 26;
 
 /// Keys the core names in `winSpecialName` (src/core/nvim_core.zig), as
 /// `0x10000 | VK`. Everything else, including keypad digits, reaches the core
@@ -53,17 +52,17 @@ test "colon and semicolon swap only when enabled" {
     try testing.expectEqual(@as(u32, ':'), swapColonSemicolon(':', false));
 }
 
-pub fn coreMods(gdk_state: u32) u32 {
+pub fn coreMods(mask: u32) u32 {
     var m: u32 = 0;
-    if (gdk_state & GDK_CONTROL_MASK != 0) m |= core.MOD_CTRL;
-    if (gdk_state & GDK_ALT_MASK != 0) m |= core.MOD_ALT;
-    if (gdk_state & GDK_SHIFT_MASK != 0) m |= core.MOD_SHIFT;
-    if (gdk_state & GDK_SUPER_MASK != 0) m |= core.MOD_SUPER;
+    if (mask & MASK_CTRL != 0) m |= core.MOD_CTRL;
+    if (mask & MASK_ALT != 0) m |= core.MOD_ALT;
+    if (mask & MASK_SHIFT != 0) m |= core.MOD_SHIFT;
+    if (mask & MASK_SUPER != 0) m |= core.MOD_SUPER;
     return m;
 }
 
-pub fn mouseModString(gdk_state: u32, buf: *[5]u8) [:0]const u8 {
-    return core.frontend_rules.mouseModifierString(buf, coreMods(gdk_state));
+pub fn mouseModString(mask: u32, buf: *[5]u8) [:0]const u8 {
+    return core.frontend_rules.mouseModifierString(buf, coreMods(mask));
 }
 
 /// The frontend's own shortcuts, on Ctrl+Shift (macOS's Cmd: Super is the
@@ -83,12 +82,12 @@ pub const AppShortcut = union(enum) {
 };
 
 /// The shortcut `base_keyval` (the key's keyval with no modifier held:
-/// '1', not '!') with `gdk_state` names; null for a key Neovim gets.
+/// '1', not '!') with `mask` names; null for a key Neovim gets.
 /// `keyval` is the produced one: '?' sits on a different key per layout,
 /// so About matches what the key types, the others the key itself.
-pub fn appShortcut(base_keyval: u32, keyval: u32, gdk_state: u32, menu_style: bool) ?AppShortcut {
-    const mods = gdk_state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
-    if (mods != GDK_SHIFT_MASK | GDK_CONTROL_MASK) return null;
+pub fn appShortcut(base_keyval: u32, keyval: u32, mask: u32, menu_style: bool) ?AppShortcut {
+    const mods = mask & (MASK_SHIFT | MASK_CTRL | MASK_ALT | MASK_SUPER);
+    if (mods != MASK_SHIFT | MASK_CTRL) return null;
     if (keyval == '?') return .about;
     const k = if (base_keyval >= 'A' and base_keyval <= 'Z') base_keyval + 32 else base_keyval;
     return switch (k) {
@@ -102,19 +101,19 @@ pub fn appShortcut(base_keyval: u32, keyval: u32, gdk_state: u32, menu_style: bo
 }
 
 test "Ctrl+Shift shortcuts; the tab ones only with the menu style" {
-    const cs = GDK_CONTROL_MASK | GDK_SHIFT_MASK;
+    const cs = MASK_CTRL | MASK_SHIFT;
     try testing.expectEqual(AppShortcut.new_session, appShortcut('N', 'N', cs, false).?);
     try testing.expectEqual(AppShortcut.new_session, appShortcut('n', 'n', cs | 0x10, false).?); // NumLock (Mod2)
     try testing.expectEqual(AppShortcut.quit, appShortcut('q', 'q', cs, false).?);
     try testing.expectEqual(AppShortcut.about, appShortcut('/', '?', cs, false).?); // US
     try testing.expectEqual(AppShortcut.about, appShortcut(0xdf, '?', cs, false).?); // DE: Shift+ß
-    try testing.expect(appShortcut('/', '/', GDK_CONTROL_MASK, false) == null);
+    try testing.expect(appShortcut('/', '/', MASK_CTRL, false) == null);
     try testing.expect(appShortcut('t', 't', cs, false) == null);
     try testing.expectEqual(AppShortcut.new_tab, appShortcut('t', 't', cs, true).?);
     try testing.expectEqual(AppShortcut{ .select_tab = 3 }, appShortcut('3', '#', cs, true).?);
-    try testing.expect(appShortcut('n', 'n', GDK_CONTROL_MASK, false) == null);
-    try testing.expect(appShortcut('N', 'N', GDK_SHIFT_MASK, false) == null);
-    try testing.expect(appShortcut('N', 'N', cs | GDK_ALT_MASK, false) == null);
+    try testing.expect(appShortcut('n', 'n', MASK_CTRL, false) == null);
+    try testing.expect(appShortcut('N', 'N', MASK_SHIFT, false) == null);
+    try testing.expect(appShortcut('N', 'N', cs | MASK_ALT, false) == null);
 }
 
 /// While a preedit is active the IME owns every key, including Return.

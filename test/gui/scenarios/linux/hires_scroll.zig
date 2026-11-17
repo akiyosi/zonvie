@@ -1,12 +1,12 @@
 // hires_scroll — fractional scroll events (smooth axis values from the
-// compositor's virtual pointer, which GTK reports as fractions of a wheel
+// compositor's virtual pointer, which arrive as fractions of a wheel
 // step) gather into whole steps that scroll the buffer, and a scroll past the
 // top leaves line 1 in place. A compositor that forwards the finger source
 // (Hyprland's virtual pointer does not) makes these touchpad events instead,
 // which linux/trackpad.zig pixel-scrolls; its model is unit-tested in
 // linux/pixel_scroll.zig.
 //
-// Linux-only: linux/input.zig onScroll and linux/pixel_scroll.zig takeSteps.
+// Linux-only: linux/trackpad.zig scroll and linux/pixel_scroll.zig takeSteps.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

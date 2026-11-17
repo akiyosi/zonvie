@@ -5,7 +5,7 @@
 // from the float's corners. Linux draws both inside the main window, so the
 // harness reads their places from the log instead of from new OS windows.
 //
-// Linux-only: linux/ui_widgets.zig placeMessages and the overlay panels.
+// Linux-only: linux/shell.zig rebuild and the overlay panels.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

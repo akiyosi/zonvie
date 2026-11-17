@@ -87,16 +87,6 @@ pub fn hitRects(rects: [4]?Rect, popups: bool, own: ?Kind) [4]?Rect {
     return if (popups) out else rects;
 }
 
-/// Logical px from a popup's area to the view: where its parent surface put
-/// the popup (gdk_popup_get_position) plus the area inside it, less the view
-/// inside the window's surface.
-pub fn viewOrigin(popup_pos_pt: [2]f64, area_in_popup_pt: [2]f64, view_in_window_pt: [2]f64) [2]f64 {
-    return .{
-        popup_pos_pt[0] + area_in_popup_pt[0] - view_in_window_pt[0],
-        popup_pos_pt[1] + area_in_popup_pt[1] - view_in_window_pt[1],
-    };
-}
-
 const testing = std.testing;
 
 test "a popup frames its panel with room for the shadow, on whole logical px" {
@@ -134,9 +124,6 @@ test "a popup's pointer hits only its panel, the main view none while they are p
     for (hitRects(rects, false, null)) |r| try testing.expect(r != null);
 }
 
-test "a popup's area maps to the view by the popup's position" {
-    try testing.expectEqual([2]f64{ 90, 33 }, viewOrigin(.{ 100, 50 }, .{ 0, 0 }, .{ 10, 17 }));
-}
 
 /// The surface whose view panel `kind`'s popup hangs from: the cmdline the
 /// main view's always, the popupmenu the surface its completion is in

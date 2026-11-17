@@ -4,7 +4,7 @@
 // message window), and the hover is let go when the panel closes under that
 // pointer. Through the compositor's virtual pointer.
 //
-// Linux-only: linux/input.zig refreshPanelHover / panelLeft.
+// Linux-only: linux/pointer.zig refreshPanelHover / panelLeft.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

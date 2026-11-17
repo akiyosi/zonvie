@@ -1,7 +1,7 @@
 //! What the frontend-drawn ext UI shows: the minis (showmode, showcmd,
 //! ruler, mini-routed messages), a confirm prompt, a toast, OS
 //! notifications and the ext tabline. Core callbacks write it under App.mu; the main thread copies it
-//! out and updates the widgets (ui_widgets.zig). Fixed buffers, so a
+//! out and draws it (shell.zig). Fixed buffers, so a
 //! callback never allocates.
 
 const std = @import("std");

@@ -493,7 +493,7 @@ test "gui:native_titlebar_fallback" {
 }
 
 test "gui:tabline_pointer" {
-    // Linux only: linux/ui_widgets.zig's tab strip through the virtual pointer.
+    // Linux only: linux/chrome.zig's tab strip through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/tabline_pointer.zig"));
 }
 
@@ -503,17 +503,17 @@ test "gui:tabline_hover" {
 }
 
 test "gui:copy_button_pointer" {
-    // Linux only: linux/ui_widgets.zig's copy buttons through the virtual pointer.
+    // Linux only: linux/shell.zig's copy buttons through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/copy_button_pointer.zig"));
 }
 
 test "gui:message_panel_pointer" {
-    // Linux only: linux/input.zig's ext UI panels through the virtual pointer.
+    // Linux only: linux/pointer.zig's ext UI panels through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/message_panel_pointer.zig"));
 }
 
 test "gui:message_hover_resting" {
-    // Linux only: linux/input.zig's hover re-read under a resting pointer.
+    // Linux only: linux/pointer.zig's hover re-read under a resting pointer.
     try gated(is_linux, @import("scenarios/linux/message_hover_resting.zig"));
 }
 
@@ -527,9 +527,9 @@ test "gui:cmdline_popup_pointer" {
     try gated(is_linux, @import("scenarios/linux/cmdline_popup_pointer.zig"));
 }
 
-test "gui:font_dialog_pointer" {
-    // Linux only: linux/font_picker.zig through the virtual pointer.
-    try gated(is_linux, @import("scenarios/linux/font_dialog_pointer.zig"));
+test "gui:font_picker" {
+    // Linux only: linux/font_picker.zig, answered by keys.
+    try gated(is_linux, @import("scenarios/linux/font_picker.zig"));
 }
 
 test "gui:msg_pos_float_anchor" {
@@ -542,11 +542,6 @@ test "gui:main_float_mouse_disabled_wheel" {
     // Linux only: the main_float_mouse_disabled_scroll rule through
     // virtual-pointer wheel notches.
     try gated(is_linux, @import("scenarios/linux/main_float_mouse_disabled_wheel.zig"));
-}
-
-test "gui:render_thread_subsurface" {
-    // Linux only: linux/render_thread.zig's own subsurface.
-    try gated(is_linux, @import("scenarios/linux/render_thread_subsurface.zig"));
 }
 
 test "gui:cursor_blinks" {

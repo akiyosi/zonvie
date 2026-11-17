@@ -21,7 +21,7 @@ pub const Pointer = struct {
     app: *App,
     /// 1 for the main window.
     surface_id: i64 = 1,
-    /// Logical widget px of the last pointer motion; the wheel has no position.
+    /// Logical surface px of the last pointer motion; the wheel has no position.
     x: f64 = 0,
     y: f64 = 0,
     /// The buttons held since a press sent to Neovim, and the grid the
@@ -57,7 +57,7 @@ pub const Pointer = struct {
 pub const PanelPress = struct {
     kind: overlay_layout.Kind,
     badge: bool,
-    /// Logical widget px of the press.
+    /// Logical surface px of the press.
     x: f64,
     y: f64,
     /// The panel at the press, surface px.
@@ -74,7 +74,7 @@ fn refreshGrids(app: *App, cp: *core.zonvie_core) void {
     if (n >= 0) app.pointer_grids_len = @intCast(n);
 }
 
-/// Surface cell under logical widget px (x, y).
+/// Surface cell under logical surface px (x, y).
 fn surfaceCell(app: *App, x: f64, y: f64) ?@TypeOf(transform.pxToCell(0, 0, 1, 1)) {
     app.mu.lockUncancelable(clock.io());
     const cw = app.cell_w_px;
@@ -85,7 +85,7 @@ fn surfaceCell(app: *App, x: f64, y: f64) ?@TypeOf(transform.pxToCell(0, 0, 1, 1
     return transform.pxToCell(x * s, y * s, cw, ch);
 }
 
-/// The cell logical widget px (x, y) names in `grid_id`, by the core's rule:
+/// The cell logical surface px (x, y) names in `grid_id`, by the core's rule:
 /// where the grid's committed layer sits and the sub-row ease the last frame
 /// drew it with. Null when the surface has no layer for the grid.
 fn gridCell(p: *Pointer, grid_id: i64, x: f64, y: f64) ?Cell {

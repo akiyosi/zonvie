@@ -136,12 +136,14 @@ jobs:
           # resolve the version string baked into the binary.
           fetch-depth: 0
 
-      # Link-time system libraries (build.zig linux step). GTK 4.14+ is a
-      # runtime dependency of the released binary as well.
+      # Link-time system libraries (build.zig linux step): Wayland,
+      # xkbcommon, libOpenGL and EGL, the font libraries, and GLib with
+      # GObject and GIO.
       - name: Install dependencies (apt)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgl-dev libegl-dev libgbm-dev \
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libopengl-dev libegl-dev libglib2.0-dev \
             libfreetype-dev libharfbuzz-dev libfontconfig-dev
 
       - name: Setup Zig

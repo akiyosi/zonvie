@@ -44,9 +44,6 @@ pub extern "c" fn g_dir_read_name(dir: *anyopaque) ?[*:0]const u8;
 pub extern "c" fn g_error_free(err: *anyopaque) void;
 
 pub extern "c" fn g_file_get_contents(filename: [*:0]const u8, contents: *?[*:0]u8, length: ?*usize, err: ?*?*anyopaque) c_int;
-// Window lifecycle: realizing a window before it is shown, its toplevel
-// state, `devcontainer up` as a subprocess, the workspace folder picker.
-
 pub extern "c" fn g_free(ptr: ?*anyopaque) void;
 
 pub extern "c" fn g_get_user_config_dir() [*:0]const u8;

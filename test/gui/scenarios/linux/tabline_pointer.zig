@@ -3,7 +3,7 @@
 // tab past the last moves it there. Driven through the compositor's
 // virtual pointer.
 //
-// Linux-only: linux/ui_widgets.zig's tab strip.
+// Linux-only: linux/chrome.zig's tab strip.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -17,7 +17,7 @@ const log_path = "tmp/gui_tabline_pointer.log";
 
 /// The new-tab button's width and the strip's height, logical px, near
 /// enough for a click. Each tab gets an equal share of what is left of the
-/// width, held to 100..200 (ui_widgets.sizeTabs), and + follows the last.
+/// width, held to 100..200 (chrome.zig headerTabs), and + follows the last.
 const plus_w = 40;
 const strip_mid_y = 14;
 /// Where the first tab starts: past the editor card's corner, its margin

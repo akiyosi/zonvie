@@ -5,7 +5,7 @@
 // virtual-pointer wheel notches where macOS drives a trackpad gesture;
 // asserted on Neovim's own toplines.
 //
-// Linux-only: linux/input.zig's wheel path.
+// Linux-only: linux/pointer.zig's wheel path.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

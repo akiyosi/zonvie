@@ -14,7 +14,7 @@ const ui = @import("ui.zig");
 const applog = @import("app_log.zig");
 const input = @import("ui.zig").input;
 const overlay_layout = @import("overlay_layout.zig");
-const ui_widgets = @import("ui.zig").ui_widgets;
+const shell = @import("ui.zig").shell;
 const ext_window = @import("ui.zig").ext_window;
 const panel_popup = @import("ui.zig").panel_popup;
 const blink = @import("ui.zig").blink;
@@ -328,7 +328,7 @@ fn onMsgShow(
     lock(app);
     app.ui.msgShow(view, kind[0..kind_len], chunks[0..chunk_count], replace_last != 0, append != 0, timeout_ms);
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
@@ -336,7 +336,7 @@ fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
     lock(app);
     app.ui.msgClear();
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 fn msgStatus(ctx: ?*anyopaque, which: @import("ui_state.zig").Mini, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) void {
@@ -344,7 +344,7 @@ fn msgStatus(ctx: ?*anyopaque, which: @import("ui_state.zig").Mini, view: core.z
     lock(app);
     app.ui.status(which, view, chunks[0..chunk_count]);
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 fn onMsgShowmode(ctx: ?*anyopaque, view: core.zonvie_msg_view_type, chunks: [*]const core.MsgChunk, chunk_count: usize) callconv(.c) void {
@@ -375,7 +375,7 @@ fn onTablineUpdate(
     lock(app);
     app.ui.tabline(curtab, tabs[0..tab_count]);
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 /// Cells the core stamped as just edited, for iCellAge: into the CPU mirror,
@@ -394,7 +394,7 @@ fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*c]const 
     lock(app);
     app.ui.agentStatus(tab_handle, state, t, app.tabline_cfg.agent_notification);
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
@@ -402,7 +402,7 @@ fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
     lock(app);
     app.ui.tabline_visible = false;
     unlock(app);
-    ui_widgets.queueRefresh(app);
+    shell.queueRefresh(app);
 }
 
 fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
@@ -557,11 +557,11 @@ fn runQueuedRender(app: *App) void {
         if (l.rows != 0) break true;
     } else false;
     unlock(app);
-    ui_widgets.placeMessages(app);
+    shell.placeMessages(app);
     panel_popup.update(app);
     input.refreshPanelHover(app);
     if (nvim_drawn) {
-        ui_widgets.hideProgress(app);
+        shell.hideProgress(app);
         session.onReady(app);
     }
     app.queueRenderAll();
@@ -694,9 +694,6 @@ fn slotFonts(app: *App, font_id: u32) ?*Fonts {
 
 fn releaseSlot(app: *App, font_id: u32) void {
     const f = slotFonts(app, font_id) orelse return;
-    lock(app);
-    app.slot_preedit[font_id] = .{};
-    unlock(app);
     f.deinit(app.alloc);
     app.alloc.destroy(f);
     app.slot_fonts[font_id] = null;
@@ -728,9 +725,6 @@ fn onFontSlotLoad(ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize,
         if (!fonts.load(app.alloc, cand.family, pixelSize(app, cand.point_size), cand.features, base)) continue;
         releaseSlot(app, font_id);
         app.slot_fonts[font_id] = fonts;
-        lock(app);
-        app.slot_preedit[font_id] = ui_widgets.PreeditFont.of(fonts.family[0..fonts.family_len], fonts.pixel_size, app.scale);
-        unlock(app);
         out_cell_w_px.* = fonts.cell_w_px;
         out_cell_h_px.* = rowHeightPx(fonts.cell_h_px, app.linespace_px);
         applog.appLog("[font_slot] load id={d} {s} {d}pt cell={d}x{d}\n", .{ font_id, cand.family, cand.point_size, out_cell_w_px.*, out_cell_h_px.* });
@@ -891,7 +885,6 @@ fn updateMetrics(app: *App) void {
     const n = app.fonts.family_len;
     @memcpy(app.preedit_family[0..n], app.fonts.family[0..n]);
     app.preedit_family_len = n;
-    app.preedit_px = @as(f32, @floatFromInt(app.fonts.pixel_size)) / app.scale;
     unlock(app);
     // The line the GUI harness reads the cell size from, as on Windows.
     applog.appLog("[cell_metrics] cellW={d} cellH={d}\n", .{ app.fonts.cell_w_px, h });
@@ -980,8 +973,8 @@ fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void {
     // its cmdline colours on a colourscheme commit).
     app.panel_colors_stale = true;
     unlock(app);
-    // The widget stylesheet follows Normal.
-    ui_widgets.queueRefresh(app);
+    // The chrome's colours follow Normal.
+    shell.queueRefresh(app);
 }
 
 fn onSetTitle(ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.c) void {

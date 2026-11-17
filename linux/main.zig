@@ -1,7 +1,7 @@
 //! The Linux frontend: Zonvie on a bare Wayland xdg_toplevel, with no
 //! toolkit. The window, its EGL surface, the keyboard and pointer, the
 //! selections and the input method are wl/window.c; this file drives it and
-//! the core. What is not built yet is listed by unbuilt.zig. There is no X11
+//! the core. There is no X11
 //! backend.
 //!
 //! One thread runs a GLib main loop (GLib alone): the modules that face the
@@ -355,7 +355,7 @@ fn setViewPx(w_px: u32, h_px: u32) void {
 }
 
 /// Neovim resized its grid (`:set lines` / `:set columns`): the window
-/// follows. Main thread. unbuilt.zig's window_size.resizeToGrid.
+/// follows. Main thread. ui.zig's window_size.resizeToGrid.
 pub fn resizeToGrid(app: *App, rows: u32, cols: u32) void {
     lock(app);
     const cw = app.cell_w_px;
@@ -383,7 +383,7 @@ fn scheduleSnap() void {
 }
 
 /// The cell changed (a font, a scale): the window snaps to whole cells
-/// again. Callable from any thread. unbuilt.zig's window_size.queueSnap.
+/// again. Callable from any thread. ui.zig's window_size.queueSnap.
 pub fn queueSnap(app: *App) void {
     _ = app;
     if (snap_queued.swap(true, .acq_rel)) return;
@@ -638,7 +638,7 @@ fn onImeCommit(_: ?*anyopaque, text: [*:0]const u8) callconv(.c) void {
 
 /// Switches the input method off ([input] ime_disable_on_modechange and the
 /// like): the composition is dropped, then the IM framework is asked over
-/// D-Bus (ime_off.zig). main thread. unbuilt.zig's ime_off.off.
+/// D-Bus (ime_off.zig). main thread. ui.zig's ime_off.off.
 pub fn imeOff() void {
     const app = window.app;
     if (app.preedit_active) {

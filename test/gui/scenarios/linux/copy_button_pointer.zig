@@ -3,7 +3,7 @@
 // pointer; read back through Neovim's `+` register, which this frontend
 // serves from the same clipboard.
 //
-// Linux-only: linux/ui_widgets.zig's copy buttons.
+// Linux-only: linux/shell.zig's copy buttons.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

@@ -300,19 +300,3 @@ test "a named session carries its name in the title" {
     var small: [4]u8 = undefined;
     try std.testing.expectEqualStrings("abc", sessionTitle(&small, "abcdef", ""));
 }
-
-/// GdkToplevelState bits that mean nothing of the window can be seen.
-pub const toplevel_minimized: c_uint = 1 << 0;
-/// GTK 4.12: the compositor stopped showing the window (occluded).
-pub const toplevel_suspended: c_uint = 1 << 16;
-
-/// Whether a toplevel in `state` cannot be seen, so its cursor need not blink.
-pub fn toplevelHidden(state: c_uint) bool {
-    return state & (toplevel_minimized | toplevel_suspended) != 0;
-}
-
-test "minimized or suspended toplevels are hidden" {
-    try std.testing.expect(toplevelHidden(toplevel_minimized));
-    try std.testing.expect(toplevelHidden(toplevel_suspended | (1 << 6)));
-    try std.testing.expect(!toplevelHidden(1 << 1));
-}

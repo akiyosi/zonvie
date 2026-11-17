@@ -72,7 +72,7 @@ static const struct { void (*capabilities)(void*, struct wl_proxy*, uint32_t); }
 
 int zonvie_wl_blur_init(struct wl_display* display) {
     if (manager) return (capabilities & CAPABILITY_BLUR) != 0;
-    // A private queue: GDK dispatches the default one, and these events must
+    // A private queue: the window dispatches the default one, and these events must
     // be read here, now.
     struct wl_event_queue* queue = wl_display_create_queue(display);
     if (!queue) return 0;
@@ -89,7 +89,7 @@ int zonvie_wl_blur_init(struct wl_display* display) {
         wl_proxy_add_listener(manager, (void (**)(void))&manager_listener, NULL);
         // The capabilities event follows the bind.
         wl_display_roundtrip_queue(display, queue);
-        // Back on the default queue, which GDK dispatches, before this
+        // Back on the default queue, which the window dispatches, before this
         // queue goes: a later capabilities event still updates the bits.
         wl_proxy_set_queue(manager, NULL);
     }

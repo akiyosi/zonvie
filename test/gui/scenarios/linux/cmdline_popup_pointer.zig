@@ -2,7 +2,7 @@
 // (linux/panel_popup.zig): a drag moves it and the next cmdline opens where
 // it was left. Through the compositor's virtual pointer.
 //
-// Linux-only: linux/panel_popup.zig and linux/input.zig's panel drag.
+// Linux-only: linux/panel_popup.zig and linux/pointer.zig's panel drag.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

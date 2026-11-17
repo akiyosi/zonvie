@@ -4,7 +4,7 @@
 // drag moves it, and msg_show's close badge dismisses it. Through the
 // compositor's virtual pointer.
 //
-// Linux-only: linux/input.zig's panel hit test (overlay_layout.place).
+// Linux-only: linux/pointer.zig's panel hit test (overlay_layout.place).
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

@@ -166,7 +166,7 @@ pub const Config = struct {
     /// The window chrome one `TitlebarStyle` yields with one tabline
     /// placement. Every frontend follows this table; macOS mirrors it as
     /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift, Linux maps it
-    /// to GTK widgets in linux/chrome.zig `plan`.
+    /// to the chrome it draws in linux/chrome.zig `plan`.
     ///
     ///                 native          hidden              unified
     ///   titlebar      tabs, card      tabs, editor bg     tabs on ground, card

@@ -4,7 +4,7 @@
 // a stock Neovim gives through ext_multigrid. Driven through the
 // compositor's virtual pointer.
 //
-// Linux-only: linux/tab_strip.zig's tear-off.
+// Linux-only: linux/chrome.zig's tear-off.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
