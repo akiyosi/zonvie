@@ -68,6 +68,12 @@ pub const AtlasOps = struct {
 
 pub const FlushOutcome = enum(u8) { none, committed, aborted };
 
+/// `restoring`: the picker wrote the font in use back over the "*", and
+/// that broadcast is still to come. `armed`: the broadcast after it is the
+/// pick. A picker left without an answer stays `armed`, so the next
+/// 'guifont' set by hand is taken as the pick.
+pub const FontPick = enum(u8) { none, restoring, armed };
+
 pub const App = struct {
     alloc: std.mem.Allocator,
     mu: std.Io.Mutex = .init,
@@ -111,13 +117,10 @@ pub const App = struct {
     /// What the global faces were loaded from (callbacks.fontRequestKey), 0
     /// for none. Core thread, or any thread before zonvie_core_start.
     font_request: u64 = 0,
-    /// The next guifont broadcast is a font-dialog pick (font_picker.zig),
-    /// which wins over an explicit [font] family and size.
-    font_picked: std.atomic.Value(bool) = .init(false),
-    /// The weight and slant of that pick (Pango: weight >= semibold, slant
-    /// not normal), applied with it as the regular face's style.
-    picked_bold: std.atomic.Value(bool) = .init(false),
-    picked_italic: std.atomic.Value(bool) = .init(false),
+    /// Where a `:set guifont=*` stands (font_picker.zig), which says what
+    /// the next guifont broadcasts are. A pick wins over an explicit [font]
+    /// family and size, as a font dialog's does on Windows.
+    font_pick: std.atomic.Value(FontPick) = .init(.none),
     /// config.toml's [messages] msg_pos.
     msg_pos: core.config.Config.MsgPosConfig = .{},
     /// The core's message anchor (zonvie_core_msg_anchor); null before the
@@ -221,8 +224,6 @@ pub const App = struct {
     /// Neovim drew its first frame: the window is shown (if it waited for
     /// that) and queued file opens are sent.
     nvim_ready: bool = false,
-    /// The main window stays hidden until `nvim_ready` (SSH, --connect-nvim).
-    show_when_ready: bool = false,
     /// Where this session's nvim runs; decides what an early exit shows.
     start_kind: lifecycle.StartKind = .local,
     /// stderr of the starting process, for the early-exit alert. Written

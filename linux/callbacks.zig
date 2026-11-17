@@ -721,8 +721,7 @@ fn onFontSlotLoad(ctx: ?*anyopaque, font_id: u32, utf8: [*]const u8, len: usize,
     var it = std.mem.splitScalar(u8, payload, '\n');
     while (it.next()) |line| {
         const cand = font_spec.slotCandidate(line, global, scale) orelse continue;
-        const base: font_mod.BaseStyle = if (cand.global_face) app.fonts.base else .{};
-        if (!fonts.load(app.alloc, cand.family, pixelSize(app, cand.point_size), cand.features, base)) continue;
+        if (!fonts.load(app.alloc, cand.family, pixelSize(app, cand.point_size), cand.features)) continue;
         releaseSlot(app, font_id);
         app.slot_fonts[font_id] = fonts;
         out_cell_w_px.* = fonts.cell_w_px;
@@ -817,10 +816,10 @@ const FontLoad = enum { failed, loaded, unchanged };
 
 /// What a candidate list loads depends on, besides [font] size, which is
 /// fixed for the session. Never 0, which App.font_request keeps for "none".
-fn fontRequestKey(list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) u64 {
+fn fontRequestKey(list: []const u8, size_explicit: bool) u64 {
     var h = std.hash.Wyhash.init(0);
     h.update(list);
-    h.update(&.{ @intFromBool(size_explicit), @intFromBool(base.bold), @intFromBool(base.italic) });
+    h.update(&.{@intFromBool(size_explicit)});
     return h.final() | 1;
 }
 
@@ -829,13 +828,13 @@ fn fontRequestKey(list: []const u8, size_explicit: bool, base: font_mod.BaseStyl
 /// `unchanged` when the faces already come from this very list: Neovim's
 /// default guifont at attach names what a config-less start loaded, and an
 /// explicit [font] family is asked for again at every guifont.
-fn loadFirst(app: *App, list: []const u8, size_explicit: bool, base: font_mod.BaseStyle) FontLoad {
-    const key = fontRequestKey(list, size_explicit, base);
+fn loadFirst(app: *App, list: []const u8, size_explicit: bool) FontLoad {
+    const key = fontRequestKey(list, size_explicit);
     if (app.fonts.regular != null and app.font_request == key) return .unchanged;
     var it = std.mem.splitScalar(u8, list, '\n');
     while (it.next()) |line| {
         const cand = core.config.parseFontCandidateLine(line, configPt(app), size_explicit) orelse continue;
-        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features, base)) {
+        if (app.fonts.load(app.alloc, cand.name, pixelSize(app, cand.point_size), cand.features)) {
             applog.appLog("[linux] font: {s} {d}pt features={s}\n", .{ cand.name, cand.point_size, cand.features });
             app.font_request = key;
             lock(app);
@@ -853,13 +852,13 @@ fn loadConfigFamily(app: *App) FontLoad {
     var arena = std.heap.ArenaAllocator.init(app.alloc);
     defer arena.deinit();
     const list = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.font_cfg.family, configPt(app), default_family) catch return .failed;
-    return loadFirst(app, list, false, .{});
+    return loadFirst(app, list, false);
 }
 
 /// The last resort: fontconfig's own monospace at [font] size.
 fn loadDefaultFamily(app: *App) bool {
     app.font_request = 0;
-    return app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "", .{});
+    return app.fonts.load(app.alloc, default_family, pixelSize(app, configPt(app)), "");
 }
 
 /// Loads [font] (or its defaults) when no guifont has been applied yet.
@@ -923,24 +922,28 @@ pub fn cmdlineCols(app: *App, main_w_px: u32, cell_w_px: u32) rules.CmdlineCols 
 
 fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
     const app = appFrom(ctx);
-    // `:set guifont=*` asks for the font dialog.
+    // `:set guifont=*` asks for the font in Neovim (font_picker.zig).
     if (len == 1 and bytes[0] == '*') return font_picker.request(app);
     // An explicit [font] family wins over guifont, as on macOS and Windows:
     // Neovim sends its own default guifont at attach even when the user set
     // none. An explicit [font] size wins over each entry's `:hN`. A pick
-    // from the font dialog wins over both.
-    const picked = app.font_picked.swap(false, .acq_rel);
-    // The pick's weight and slant are the regular face's; any other guifont
-    // is the family's regular face, and the next dialog starts from that.
-    const base: font_mod.BaseStyle = if (picked) .{ .bold = app.picked_bold.load(.acquire), .italic = app.picked_italic.load(.acquire) } else .{};
-    if (!picked) {
-        app.picked_bold.store(false, .release);
-        app.picked_italic.store(false, .release);
-    }
+    // from the picker wins over both.
+    const picked = switch (app.font_pick.load(.acquire)) {
+        .none => false,
+        // The picker's own write of the font in use; the pick comes next.
+        .restoring => blk: {
+            app.font_pick.store(.armed, .release);
+            break :blk false;
+        },
+        .armed => blk: {
+            app.font_pick.store(.none, .release);
+            break :blk true;
+        },
+    };
     const loaded = if (app.font_cfg.family_explicit and !picked)
         loadConfigFamily(app)
     else
-        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked, base);
+        loadFirst(app, bytes[0..len], app.font_cfg.size_explicit and !picked);
     if (loaded == .unchanged) return;
     if (loaded == .failed) {
         if (app.fonts.regular != null) return;
@@ -1064,7 +1067,8 @@ fn idleSessionSwap(data: ?*anyopaque) callconv(.c) c_int {
     // flushes only start once it is attached), as at startup. The window is
     // already shown, so that frame must not present it again.
     app.nvim_ready = false;
-    app.show_when_ready = false;
+    // A pick the old server was asked for is not this one's to answer.
+    app.font_pick.store(.none, .release);
     return 0;
 }
 

@@ -12,10 +12,6 @@ const font_spec = @import("../font_spec.zig");
 
 const Font = hbft.zonvie_ft_hb_font;
 
-/// The style a family's regular face is loaded in: a Bold or Italic face
-/// picked in the font dialog stays bold or italic (windows picked_font_*).
-pub const BaseStyle = struct { bold: bool = false, italic: bool = false };
-
 /// A face loaded for scalars the primary family lacks, by font file.
 const Fallback = struct {
     path_hash: u64,
@@ -128,12 +124,11 @@ pub const Fonts = struct {
     family: [128]u8 = undefined,
     family_len: usize = 0,
     pixel_size: u32 = 0,
-    /// The feature field and base style the faces were loaded with, so they
-    /// can be loaded again at another pixel size (a scale change) and a
-    /// per-grid font naming no family can take them.
+    /// The feature field the faces were loaded with, so they can be loaded
+    /// again at another pixel size (a scale change) and a per-grid font
+    /// naming no family can take them.
     features: [256]u8 = undefined,
     features_len: usize = 0,
-    base: BaseStyle = .{},
     fallbacks: [max_fallbacks]Fallback = undefined,
     fallback_len: usize = 0,
     /// Built at the first fallback lookup for the loaded family;
@@ -178,19 +173,17 @@ pub const Fonts = struct {
     /// feature field ("+ss01,-liga,wght=500"), applied to every style, as
     /// macOS applies it: each entry is an OpenType feature for shaping and,
     /// where the font has that axis, a variation coordinate.
-    /// `base` is the style the regular face is (a Bold or Italic pick from
-    /// the font dialog); the styled faces add to it. Pre: `family` and
-    /// `features` do not alias this Fonts' own buffers.
-    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32, features: []const u8, base: BaseStyle) bool {
+    /// Pre: `family` and `features` do not alias this Fonts' own buffers.
+    pub fn load(self: *Fonts, alloc: std.mem.Allocator, family: []const u8, pixel_size: u32, features: []const u8) bool {
         if (pixel_size == 0) return false;
         var list: [32]hbft.zonvie_font_feature = undefined;
         const n_features = core.zonvie_core_parse_font_features(features.ptr, features.len, @ptrCast(&list), list.len);
         const user = list[0..n_features];
-        const regular = loadFace(alloc, family, base.bold, base.italic, pixel_size, user) orelse return false;
+        const regular = loadFace(alloc, family, false, false, pixel_size, user) orelse return false;
         self.destroyFaces(alloc);
         self.regular = regular;
-        self.bold = loadFace(alloc, family, true, base.italic, pixel_size, user);
-        self.italic = loadFace(alloc, family, base.bold, true, pixel_size, user);
+        self.bold = loadFace(alloc, family, true, false, pixel_size, user);
+        self.italic = loadFace(alloc, family, false, true, pixel_size, user);
         self.bold_italic = loadFace(alloc, family, true, true, pixel_size, user);
         const n = @min(family.len, self.family.len);
         @memcpy(self.family[0..n], family[0..n]);
@@ -198,14 +191,13 @@ pub const Fonts = struct {
         const nf = @min(features.len, self.features.len);
         @memcpy(self.features[0..nf], features[0..nf]);
         self.features_len = nf;
-        self.base = base;
         self.pixel_size = pixel_size;
         self.computeCellMetrics();
         return true;
     }
 
-    /// The same family, features and style at `pixel_size`. False keeps the
-    /// current faces.
+    /// The same family and features at `pixel_size`. False keeps the current
+    /// faces.
     pub fn reload(self: *Fonts, alloc: std.mem.Allocator, pixel_size: u32) bool {
         if (self.regular == null) return false;
         var family: [128]u8 = undefined;
@@ -214,7 +206,7 @@ pub const Fonts = struct {
         const nf = self.features_len;
         @memcpy(family[0..fl], self.family[0..fl]);
         @memcpy(features[0..nf], self.features[0..nf]);
-        return self.load(alloc, family[0..fl], pixel_size, features[0..nf], self.base);
+        return self.load(alloc, family[0..fl], pixel_size, features[0..nf]);
     }
 
     fn computeCellMetrics(self: *Fonts) void {

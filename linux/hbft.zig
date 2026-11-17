@@ -16,12 +16,6 @@ pub const zonvie_ft_hb_font = opaque {};
 
 /// `font_bytes` must stay valid until the font is destroyed.
 pub extern "c" fn zonvie_ft_hb_font_create_borrowed(font_bytes: [*]const u8, font_len: usize, pixel_size: u32, face_index: u32) ?*zonvie_ft_hb_font;
-pub extern "c" fn zonvie_ft_hb_font_create(
-    font_bytes: [*]const u8,
-    font_len: usize,
-    pixel_size: u32,
-    face_index: u32,
-) ?*zonvie_ft_hb_font;
 
 pub extern "c" fn zonvie_ft_hb_font_destroy(f: *zonvie_ft_hb_font) void;
 
@@ -29,7 +23,6 @@ pub extern "c" fn zonvie_ft_hb_font_destroy(f: *zonvie_ft_hb_font) void;
 /// variation axis value.
 pub const zonvie_font_feature = extern struct { tag: [4]u8, value: i32 };
 pub extern "c" fn zonvie_ft_hb_font_set_features(f: *zonvie_ft_hb_font, features: [*]const zonvie_font_feature, count: usize) void;
-pub extern "c" fn zonvie_ft_hb_font_set_variations(f: *zonvie_ft_hb_font, variations: [*]const zonvie_font_feature, count: usize) void;
 pub extern "c" fn zonvie_ft_hb_font_strike_px(f: *const zonvie_ft_hb_font) u32;
 /// include/zonvie_hbft.h zonvie_font_axis: a fractional axis coordinate.
 pub const zonvie_font_axis = extern struct { tag: [4]u8, value: f32 };

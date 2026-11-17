@@ -39,7 +39,7 @@ pub const Header = enum {
 };
 
 /// The header's colours.
-pub const Tint = enum { theme, ground, editor_bg };
+pub const Tint = enum { ground, editor_bg };
 
 pub const Plan = struct {
     header: Header,
@@ -59,7 +59,7 @@ pub fn plan(layout: Config.TitlebarLayout) Plan {
     };
     if (layout.captionless()) return .{ .header = .captionless, .tabs_in_header = false, .tint = .editor_bg };
     if (layout.titleBand()) return .{ .header = .title_band, .tabs_in_header = false, .tint = .ground };
-    return .{ .header = .desktop, .tabs_in_header = false, .tint = .theme };
+    return .{ .header = .desktop, .tabs_in_header = false, .tint = .ground };
 }
 
 test "the chrome follows the titlebar layout table" {
@@ -73,7 +73,7 @@ test "the chrome follows the titlebar layout table" {
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .ground }, at(.native, .titlebar));
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .editor_bg }, at(.hidden, .titlebar));
     try std.testing.expectEqual(Plan{ .header = .header_bar, .tabs_in_header = true, .tint = .ground }, at(.unified, .titlebar));
-    try std.testing.expectEqual(Plan{ .header = .desktop, .tabs_in_header = false, .tint = .theme }, at(.native, .sidebar));
+    try std.testing.expectEqual(Plan{ .header = .desktop, .tabs_in_header = false, .tint = .ground }, at(.native, .sidebar));
     try std.testing.expectEqual(Header.captionless, at(.hidden, .sidebar).header);
     try std.testing.expectEqual(Header.captionless, at(.hidden, .other).header);
     try std.testing.expectEqual(Header.title_band, at(.unified, .sidebar).header);

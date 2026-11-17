@@ -3,7 +3,8 @@
 // drawn there under its cursor; closing the external window hands the popup
 // back to the main view and the app keeps running.
 //
-// Linux-only: linux/panel_popup.zig hostSurface / reparent / surfaceClosing.
+// Linux-only: linux/popup_place.zig hostSurface and linux/panel_popup.zig
+// surfaceClosing.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

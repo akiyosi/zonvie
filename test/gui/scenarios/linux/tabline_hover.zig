@@ -1,7 +1,7 @@
 // tabline_hover — the Linux ext_tabline strip shows the pointer where it
 // would act: resting on a tab's × or on + paints a wash behind it. The strip
-// drops the theme's button look, hover included, so this is the frontend's
-// own rule to keep. Driven through the compositor's virtual pointer.
+// is the frontend's own drawing, so the hover is its own rule to keep.
+// Driven through the compositor's virtual pointer.
 //
 // Linux-only: linux/chrome.zig's tab strip.
 

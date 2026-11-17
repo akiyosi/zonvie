@@ -323,8 +323,8 @@ pub fn build(b: *std.Build) !void {
         linux_mod.linkSystemLibrary("harfbuzz", .{});
         linux_mod.linkSystemLibrary("fontconfig", .{});
         // GLib for the main loop. GObject and GIO for D-Bus alone (the IM
-        // framework's off switch): its bus connection opens at the first
-        // call, never at startup.
+        // framework's off switch, the tray item, notifications): a bus
+        // connection opens at the first call, never at startup.
         linux_mod.linkSystemLibrary("glib-2.0", .{});
         linux_mod.linkSystemLibrary("gobject-2.0", .{});
         linux_mod.linkSystemLibrary("gio-2.0", .{});

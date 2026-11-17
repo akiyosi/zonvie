@@ -29,34 +29,45 @@ fn idleOpen(data: ?*anyopaque) callconv(.c) c_int {
     const pt = app.font_pt;
     const drawn = app.surface.committedLayers().len != 0;
     app.mu.unlock(clock.io());
-    // 'guifont' is "*" now: it goes back to the font in use, so a cancelled
-    // pick leaves a value that names a font.
-    writeGuifont(app, family[0..n], pt);
-    if (!drawn or n == 0) return 0;
     const cp = app.corep orelse return 0;
 
     var arena = std.heap.ArenaAllocator.init(app.alloc);
     defer arena.deinit();
-    const a = arena.allocator();
-    const families = listFamilies(a) catch return 0;
-    if (families.len == 0) return 0;
+    const ask: ?[]const u8 = if (drawn and n != 0) pickCommand(arena.allocator(), family[0..n], pt) else null;
+    // 'guifont' is "*" now: it goes back to the font in use, so a cancelled
+    // pick leaves a value that names a font. With a pick to follow, this
+    // write and then the pick are the next two guifont broadcasts
+    // (App.font_pick).
+    if (ask != null) app.font_pick.store(.restoring, .release);
+    if (!writeGuifont(app, family[0..n], pt)) {
+        app.font_pick.store(.none, .release);
+        return 0;
+    }
+    if (ask) |lua| core.zonvie_core_send_command(cp, lua.ptr, lua.len);
+    return 0;
+}
+
+/// The command that asks for a family, then a size, and sets 'guifont' to
+/// the answer. Null without a family to offer.
+fn pickCommand(a: std.mem.Allocator, family: []const u8, pt: f32) ?[]const u8 {
+    const families = listFamilies(a) catch return null;
+    if (families.len == 0) return null;
     var lua: std.ArrayListUnmanaged(u8) = .empty;
-    lua.appendSlice(a, "lua local f={") catch return 0;
+    lua.appendSlice(a, "lua local f={") catch return null;
     for (families) |name| {
-        appendLuaString(&lua, a, name) catch return 0;
-        lua.append(a, ',') catch return 0;
+        appendLuaString(&lua, a, name) catch return null;
+        lua.append(a, ',') catch return null;
     }
     lua.print(a,
         \\}};vim.ui.select(f,{{prompt='Font (now {s}):'}},function(c) if not c then return end;
         \\vim.ui.input({{prompt='Size (pt): ',default='{d}'}},function(s) local n=tonumber(s);
         \\if not n or n<1 then return end;vim.o.guifont=c:gsub(',','\\,')..':h'..n end) end)
-    , .{ luaSafe(a, family[0..n]) catch return 0, @max(1, @as(i32, @intFromFloat(@round(pt)))) }) catch return 0;
+    , .{ luaSafe(a, family) catch return null, @max(1, @as(i32, @intFromFloat(@round(pt)))) }) catch return null;
     // One line: nvim_command takes no newline.
     for (lua.items) |*ch| {
         if (ch.* == '\n') ch.* = ' ';
     }
-    core.zonvie_core_send_command(cp, lua.items.ptr, lua.items.len);
-    return 0;
+    return lua.items;
 }
 
 /// `s` as a Lua string literal.
@@ -110,19 +121,20 @@ fn listFamilies(a: std.mem.Allocator) ![]const []const u8 {
     return names.items[0..n];
 }
 
-/// Sets 'guifont' to `family` at `pt`.
-fn writeGuifont(app: *App, family: []const u8, pt: f32) void {
-    const cp = app.corep orelse return;
-    if (family.len == 0) return;
+/// Sets 'guifont' to `family` at `pt`. False when nothing was written.
+fn writeGuifont(app: *App, family: []const u8, pt: f32) bool {
+    const cp = app.corep orelse return false;
+    if (family.len == 0) return false;
     var buf: [320]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     for (family) |ch| {
-        if (ch == ',') w.writeByte('\\') catch return;
-        w.writeByte(ch) catch return;
+        if (ch == ',') w.writeByte('\\') catch return false;
+        w.writeByte(ch) catch return false;
     }
-    w.print(":h{d}", .{@max(1, @as(i32, @intFromFloat(@round(pt))))}) catch return;
+    w.print(":h{d}", .{@max(1, @as(i32, @intFromFloat(@round(pt))))}) catch return false;
     const value = w.buffered();
     applog.appLog("[font_picker] guifont={s}\n", .{value});
     const name = "guifont";
     core.zonvie_core_set_option_value(cp, name.ptr, name.len, value.ptr, value.len);
+    return true;
 }

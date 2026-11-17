@@ -100,7 +100,7 @@ See `.github/workflows/test.yml` for full configuration.
 ### GUI Visual Failures
 1. Check `tmp/` directory for `actual.png` and `diff.png` on test failure
 2. Regenerate golden with `ZONVIE_GUI_UPDATE_GOLDEN=1` if expected
-3. Verify window capture on platform (macOS/Windows only; Linux skips)
+3. Verify window capture on platform (Linux captures with `grim`)
 
 ## Adding New Tests
 

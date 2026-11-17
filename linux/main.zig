@@ -451,7 +451,8 @@ pub fn setTitle(app: *App, title: []const u8) void {
 fn sendKey(k: Key) void {
     const app = window.app;
     const cp = app.corep orelse return;
-    if (keymap.swallowDuringPreedit(app.preedit_active, k.sym)) return;
+    // While a preedit is active the IME owns every key, including Return.
+    if (app.preedit_active) return;
     const code = keymap.coreKeycode(k.sym);
     const mods = keymap.coreMods(k.mods);
     var buf: [4]u8 = undefined;
@@ -1476,8 +1477,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--dialog")) {
             dialog = true;
         } else if (std.mem.startsWith(u8, arg, "--renderer=")) {
-            // Taken and ignored: the frontend presents its own surface, with
-            // no toolkit frame cycle for a render thread to go around.
+            // Taken and ignored, so that an older command line still starts:
+            // there is one renderer.
         } else if (std.mem.eql(u8, arg, "--nofork") or std.mem.eql(u8, arg, "--install")) {
             // Handled above.
         } else {

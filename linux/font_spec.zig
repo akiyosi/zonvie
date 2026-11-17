@@ -17,8 +17,6 @@ pub const SlotFont = struct {
     family: []const u8,
     point_size: f32,
     features: []const u8,
-    /// The line named no family: the global face, in the global style.
-    global_face: bool,
 };
 
 /// One `<name>\t<size>[\t<features>]` line of an on_font_slot_load payload
@@ -38,7 +36,6 @@ pub fn slotCandidate(line: []const u8, global: Defaults, scale: f32) ?SlotFont {
         .family = family,
         .point_size = pt,
         .features = if (features.len != 0 or name.len != 0) features else global.features,
-        .global_face = name.len == 0,
     };
 }
 
@@ -145,7 +142,6 @@ test "an empty slot line is the global font at its size times scale" {
     try testing.expectEqualStrings("Iosevka", c.family);
     try testing.expectEqual(@as(f32, 18), c.point_size);
     try testing.expectEqualStrings("+ss01", c.features);
-    try testing.expect(c.global_face);
 }
 
 test "a named slot line keeps its own size and features" {

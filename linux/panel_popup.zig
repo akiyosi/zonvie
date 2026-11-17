@@ -272,10 +272,6 @@ fn fallBack(app: *App) void {
     app.queueRenderAll();
 }
 
-/// The cmdline's width budget would take the output's width; no output
-/// geometry is read here, so it stays the window's.
-pub fn noteMonitor(_: *App) void {}
-
 test "a popup's id is negative and names its panel back" {
     inline for (.{ Kind.cmdline, Kind.popupmenu, Kind.msg_show, Kind.msg_history }) |k| {
         try std.testing.expect(idOf(k) < 0);

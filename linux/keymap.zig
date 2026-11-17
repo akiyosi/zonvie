@@ -116,12 +116,6 @@ test "Ctrl+Shift shortcuts; the tab ones only with the menu style" {
     try testing.expect(appShortcut('N', 'N', cs | MASK_ALT, false) == null);
 }
 
-/// While a preedit is active the IME owns every key, including Return.
-pub fn swallowDuringPreedit(preedit_active: bool, keyval: u32) bool {
-    _ = keyval;
-    return preedit_active;
-}
-
 
 test "special keys map to Win32 VK and the core treats them as special" {
     const cases = [_][2]u32{
@@ -162,7 +156,3 @@ test "mouse modifier string matches the core's S/C/A/D form" {
     try testing.expectEqualStrings("SCAD", mouseModString(1 | 4 | 8 | (1 << 26), &buf));
 }
 
-test "key during preedit is swallowed" {
-    try testing.expect(swallowDuringPreedit(true, 0xff0d)); // Return
-    try testing.expect(!swallowDuringPreedit(false, 0xff0d));
-}

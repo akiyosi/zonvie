@@ -100,7 +100,6 @@ extern "c" fn g_dbus_method_invocation_return_value(invocation: *anyopaque, para
 extern "c" fn g_variant_new(format: [*:0]const u8, ...) ?*anyopaque;
 extern "c" fn g_bus_watch_name_on_connection(connection: *anyopaque, name: [*:0]const u8, flags: c_uint, appeared: ?*const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, vanished: ?*const fn (?*anyopaque, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, user_data: ?*anyopaque, free: ?*anyopaque) c_uint;
 extern "c" fn g_variant_new_parsed(format: [*:0]const u8, ...) ?*anyopaque;
-extern "c" fn g_variant_get(v: *anyopaque, format: [*:0]const u8, ...) void;
 extern "c" fn g_variant_new_fixed_array(elem_type: [*:0]const u8, elements: ?*const anyopaque, n: usize, elem_size: usize) ?*anyopaque;
 extern "c" fn g_variant_new_array(child_type: ?[*:0]const u8, children: [*]const ?*anyopaque, n: usize) ?*anyopaque;
 extern "c" fn g_variant_ref_sink(v: *anyopaque) *anyopaque;

@@ -45,10 +45,6 @@ pub const Pointer = struct {
     hover_at: ?[2]f64 = null,
     /// The touchpad gesture and the wheel's fractional steps.
     scroll: trackpad.State = .{},
-    /// Latched when a file drag enters: its drop would insert the paths.
-    /// The mode cannot change while the drag is held, and motion fires on
-    /// every move, so it is not re-read there.
-    drag_inserts_path: bool = false,
 };
 
 /// A left press held on a panel: on msg_show's close badge (a click

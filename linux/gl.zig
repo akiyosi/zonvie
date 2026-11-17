@@ -1,8 +1,8 @@
 // gl.zig — Hand-written OpenGL function declarations for Linux frontend.
 //
 // Hand-written OpenGL declarations instead of @cImport, so the frontend
-// cross-compiles from macOS. The gl* symbols resolve from libGL (glvnd
-// dispatches them to the current context); libepoxy is not used.
+// cross-compiles from macOS. The gl* symbols resolve from libOpenGL (glvnd
+// dispatches them to the current context).
 
 // =========================================================================
 // Types
@@ -141,7 +141,6 @@ pub extern "c" fn glVertexAttribIPointer(index: GLuint, size: GLint, @"type": GL
 // Texture
 pub extern "c" fn glGenTextures(n: GLsizei, textures: *GLuint) void;
 pub extern "c" fn glBindTexture(target: GLenum, texture: GLuint) void;
-pub extern "c" fn glBlitFramebuffer(srcX0: GLint, srcY0: GLint, srcX1: GLint, srcY1: GLint, dstX0: GLint, dstY0: GLint, dstX1: GLint, dstY1: GLint, mask: GLbitfield, filter: GLenum) void;
 pub extern "c" fn glTexImage2D(target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, @"type": GLenum, data: ?*const anyopaque) void;
 pub extern "c" fn glTexSubImage2D(target: GLenum, level: GLint, xoffset: GLint, yoffset: GLint, width: GLsizei, height: GLsizei, format: GLenum, @"type": GLenum, data: ?*const anyopaque) void;
 pub extern "c" fn glTexParameteri(target: GLenum, pname: GLenum, param: GLint) void;
@@ -174,7 +173,4 @@ pub extern "c" fn glScissor(x: GLint, y: GLint, width: GLsizei, height: GLsizei)
 pub extern "c" fn glPixelStorei(pname: GLenum, param: GLint) void;
 
 // Draw
-pub extern "c" fn glFinish() void;
-pub extern "c" fn glFlush() void;
-pub extern "c" fn glCheckFramebufferStatus(target: GLenum) GLenum;
 pub extern "c" fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) void;

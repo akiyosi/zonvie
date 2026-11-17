@@ -6,7 +6,7 @@
 // right sidebar so they stay clear of it. Before that the toggle's spot
 // takes no click; after it the toggle closes the sidebar.
 //
-// Linux-only: linux/chrome.zig effectiveStyle and buildHoverChrome. Skipped
+// Linux-only: linux/chrome.zig effectiveStyle and its captionless reveal. Skipped
 // where the desktop draws a titlebar, which keeps "native".
 
 const std = @import("std");

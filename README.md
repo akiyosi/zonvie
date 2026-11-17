@@ -81,8 +81,9 @@ bare `xdg_toplevel` through EGL. It does not run under an X11 session.
   place its windows.
 - **Devcontainer**: Docker must already be running; zonvie does not start
   it. The window shows the progress while `devcontainer up` runs.
-- **`--renderer=`** is accepted and ignored: the frontend always presents
-  its own surface directly, which is what the render thread was for.
+- **`--renderer=`** is accepted and ignored, so that a command line written
+  for an earlier version still starts: there is one renderer, which
+  presents the window's own surface.
 
 ## Installation
 
@@ -328,7 +329,7 @@ paths = [
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true). Not applicable on Linux, where the compositor blurs |
-| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. Linux follows the same table with a GTK header bar, the hover-revealed buttons and the title band (default: `"native"`) |
+| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. Linux follows the same table with a header bar, the hover-revealed buttons and the title band it draws itself (default: `"native"`) |
 
 #### [scrollbar]
 | Key | Description |
