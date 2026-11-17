@@ -785,3 +785,27 @@ fn onSpinner(data: ?*anyopaque) callconv(.c) c_int {
     seam.window.rebuildChrome();
     return 1;
 }
+
+test "a drop names the slot before the first tab whose middle lies past it" {
+    var st: State = .{};
+    st.tab_n = 3;
+    st.tab_starts[0] = 0;
+    st.tab_ends[0] = 100;
+    st.tab_starts[1] = 100;
+    st.tab_ends[1] = 200;
+    st.tab_starts[2] = 200;
+    st.tab_ends[2] = 300;
+    try std.testing.expectEqual(@as(u32, 0), dropIndex(&st, -5));
+    try std.testing.expectEqual(@as(u32, 0), dropIndex(&st, 49));
+    try std.testing.expectEqual(@as(u32, 1), dropIndex(&st, 50));
+    try std.testing.expectEqual(@as(u32, 2), dropIndex(&st, 199));
+    try std.testing.expectEqual(@as(u32, 3), dropIndex(&st, 250));
+    try std.testing.expectEqual(@as(u32, 3), dropIndex(&st, 10_000));
+}
+
+test "the indicator spins only while an agent works" {
+    try std.testing.expectEqualStrings("", indicatorGlyph(0, 3));
+    try std.testing.expectEqualStrings(indicatorGlyph(1, 0), indicatorGlyph(1, 5));
+    try std.testing.expect(!std.mem.eql(u8, indicatorGlyph(2, 0), indicatorGlyph(2, 1)));
+    try std.testing.expectEqualStrings(indicatorGlyph(3, 0), indicatorGlyph(3, braille_frames.len));
+}
