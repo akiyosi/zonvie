@@ -106,10 +106,10 @@ pub const Builder = struct {
 
     pub fn begin(app: *App, layer: *Layer) Builder {
         layer.clear();
-        const locked = if (app.corep) |cp| blk: {
-            core.zonvie_core_lock_grid(cp);
-            break :blk true;
-        } else false;
+        // Before the core exists (a start that announces its progress)
+        // nothing else touches the faces: they are as good as locked.
+        if (app.corep) |cp| core.zonvie_core_lock_grid(cp);
+        const locked = true;
         const f = &app.fonts;
         if (app.ui_atlas.pixels.len != 0 and app.ui_atlas.pixel_size != f.pixel_size) app.ui_atlas.reset(f.pixel_size);
         return .{

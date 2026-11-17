@@ -431,6 +431,9 @@ pub fn rebuild(app: *App, request_frame: bool) void {
         };
     }
     if (in.cell_w == 0 or in.cell_h == 0 or in.view.w == 0) return;
+    // Before Neovim has named its colors (a start still in progress) both
+    // are 0: the progress text is drawn light on the dark ground.
+    if (in.fg == in.bg) in.fg = 0xd8d8d8;
     // The chrome's share of the window follows the tab line coming and
     // going: the window is laid out again, which ends in a build of its own.
     const want = chrome.insets(app, in.ui.tabline_visible);
