@@ -263,8 +263,9 @@ pub fn dragPanel(p: *Pointer, pp: *PanelPress, x: f64, y: f64) void {
         }
     }
     app.queueRenderAll();
-    // The copy button travels with its panel.
+    // The copy button travels with its panel, and so does its popup.
     @import("shell.zig").rebuild(app, true);
+    @import("panel_popup.zig").update(app);
 }
 
 /// The pointer over the view (logical px), or gone when null: the message
