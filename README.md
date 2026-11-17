@@ -58,7 +58,10 @@ bare `xdg_toplevel` through EGL. It does not run under an X11 session.
   for one (`xdg-decoration-unstable-v1`); where it has none to give (GNOME,
   tiling compositors) the style acts as `"hidden"`. With `"hidden"`,
   `"unified"` or titlebar tabs zonvie draws the caption itself: the window
-  buttons, a menu (New Session, About, Quit), and edges that resize.
+  buttons, a menu (New Session, About, Quit), and edges that resize where
+  the compositor does not report the window as tiled or maximized
+  (Hyprland reports both for every window, so its own resize binding is
+  the way there).
 - **Tab line** (`--exttabline`): along the header, down a sidebar or in a
   Tabs menu by `[tabline] style`. A tab is reordered by dragging it and
   becomes a window of its own when let go away from the strip.
@@ -66,6 +69,9 @@ bare `xdg_toplevel` through EGL. It does not run under an X11 session.
   Wayland lets no client read or set where its windows are, so the
   window-layout commands (`<C-w>H`, `<C-w>x`, ...) leave them where they
   are, and the cursor cannot be moved to the window in a direction.
+  Untested as an option on Linux: it needs a Neovim that accepts the
+  `ext_windows` UI option, which stock Neovim rejects. Windows opened with
+  `nvim_open_win(..., {external = true})` work.
 - **Dialogs** are zonvie windows that ask through Neovim's own prompts: the
   connection dialog (`--dialog`), SSH passwords and passphrases, crash and
   connection-failure reports. `:set guifont=*` lists the installed
