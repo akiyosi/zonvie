@@ -85,16 +85,25 @@ jobs:
         run: zig build windows -Dtarget=x86_64-windows-gnu
         timeout-minutes: 30
 
-  unit-tests:
-    runs-on: ubuntu-latest
+  # Installs what build.zig's linux step links, as the macOS and Windows jobs
+  # install their platform's prerequisites.
+  unit-tests-linux:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: actions/checkout@v4
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libopengl-dev libegl-dev libglib2.0-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Unit Tests
-        run: zig build test
-        timeout-minutes: 20
+        run: zig build test --summary all
+        timeout-minutes: 30
 
   # Releases ship ReleaseFast, where a failed assert is undefined behaviour
   # rather than a panic. ReleaseSafe keeps the asserts and runs the optimized
