@@ -65,17 +65,22 @@ pub const Layer = struct {
     /// Solid quads, then glyph quads: two draws, as the glyphs sample this
     /// layer's atlas.
     solid: std.ArrayListUnmanaged(core.Vertex) = .empty,
+    /// Rounded corners, drawn over the solid quads in the shader's corner
+    /// mode (Builder.corner).
+    round: std.ArrayListUnmanaged(core.Vertex) = .empty,
     text: std.ArrayListUnmanaged(core.Vertex) = .empty,
     hits: std.ArrayListUnmanaged(Hit) = .empty,
 
     pub fn deinit(self: *Layer, alloc: std.mem.Allocator) void {
         self.solid.deinit(alloc);
+        self.round.deinit(alloc);
         self.text.deinit(alloc);
         self.hits.deinit(alloc);
     }
 
     pub fn clear(self: *Layer) void {
         self.solid.clearRetainingCapacity();
+        self.round.clearRetainingCapacity();
         self.text.clearRetainingCapacity();
         self.hits.clearRetainingCapacity();
     }
@@ -150,6 +155,23 @@ pub const Builder = struct {
         const q = [_][2]f32{ .{ a[0] + nx, a[1] + ny }, .{ b[0] + nx, b[1] + ny }, .{ a[0] - nx, a[1] - ny }, .{ b[0] + nx, b[1] + ny }, .{ b[0] - nx, b[1] - ny }, .{ a[0] - nx, a[1] - ny } };
         for (q) |p| {
             self.layer.solid.append(self.app.alloc, .{ .position = p, .texCoord = .{ -1, -1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 }) catch return;
+        }
+    }
+
+    /// One corner of a rounded box: the arc of `radius` px about `centre`,
+    /// in the quadrant `dir` (each -1 or 1) points to. `color` fills what
+    /// of the quadrant's square lies outside the arc, or with `stroke_px`
+    /// draws a line that wide just inside it. Antialiased.
+    pub fn corner(self: *Builder, centre: [2]i32, dir: [2]i32, radius: i32, color: [4]f32, stroke_px: u32) void {
+        const r: f32 = @floatFromInt(radius);
+        const cx: f32 = @floatFromInt(centre[0]);
+        const cy: f32 = @floatFromInt(centre[1]);
+        const ox = r * @as(f32, @floatFromInt(dir[0]));
+        const oy = r * @as(f32, @floatFromInt(dir[1]));
+        // texCoord is the offset from the centre, which the shader measures.
+        const offsets = [_][2]f32{ .{ 0, 0 }, .{ ox, 0 }, .{ 0, oy }, .{ ox, 0 }, .{ ox, oy }, .{ 0, oy } };
+        for (offsets) |o| {
+            self.layer.round.append(self.app.alloc, .{ .position = .{ cx + o[0], cy + o[1] }, .texCoord = o, .color = color, .grid_id = 0, .deco_flags = stroke_px, .deco_phase = r }) catch return;
         }
     }
 

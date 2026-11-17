@@ -246,7 +246,23 @@ pub fn insets(app: *App, tabline_visible: bool) struct { top: i32, left: i32, ri
         const w = sidebarWidthPt(app) * scale;
         if (sidebarRight(app)) right = w else left = w;
     }
-    return .{ .top = top, .left = left, .right = right, .bottom = 0 };
+    var bottom: i32 = 0;
+    if (app.island()) {
+        // The card's margin of ground, then its padding, on every side.
+        // Titlebar tabs sit on the card's top edge, with no ground between.
+        const pad = cardPaddingPx(app);
+        const frame = rules.island_margin_pt * scale + pad;
+        top += if (p.tabs_in_header and tabline_visible) pad else frame;
+        left += frame;
+        right += frame;
+        bottom = frame;
+    }
+    return .{ .top = top, .left = left, .right = right, .bottom = bottom };
+}
+
+/// The editor's background between the card's edge and the view, device px.
+pub fn cardPaddingPx(app: *const App) i32 {
+    return rules.island_padding_pt * @max(1, @as(i32, @intFromFloat(app.scale)));
 }
 
 // =========================================================================
@@ -272,9 +288,11 @@ fn op(c: [3]f32) [4]f32 {
     return .{ c[0], c[1], c[2], 1 };
 }
 
-fn palette(fg: u32, bg: u32, tint: Tint) Palette {
+/// `island`: the strip and a ground-tinted header take the card's ground.
+fn palette(fg: u32, bg: u32, tint: Tint, island: bool) Palette {
     const b = rgb3(bg);
-    const sb = rules.sidebarPalette(rgb3(fg), b, null);
+    const ground: ?[3]f32 = if (island) rules.oklabLightnessShifted(b, .island_ground) else null;
+    const sb = rules.sidebarPalette(rgb3(fg), b, ground);
     return .{
         .strip = op(sb.bg),
         .header = if (tint == .editor_bg) op(b) else op(sb.bg),
@@ -369,7 +387,7 @@ fn tabLine(b: *Builder, x: i32, y: i32, max_w: i32, t: *const ui_state.Tab, line
 
 /// The tabs along `strip` (a header's part), each `tab_w` wide with its
 /// indicator, first label line and close button, then "+".
-fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, strip: Rect) void {
+fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, strip: Rect, selected: [4]f32) void {
     const ui = in.ui;
     const st = &app.chrome;
     const plus_w = button_pt * in.scale;
@@ -383,7 +401,7 @@ fn headerTabs(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, st
         if (x + tw > strip.x + strip.w - plus_w) break;
         const r: Rect = .{ .x = x, .y = strip.y + 3 * in.scale, .w = tw - 2 * in.scale, .h = strip.h - 3 * in.scale };
         const current = t.handle == ui.curtab;
-        if (current) b.rect(r, pal.selected) else if (isHot(app, .tab, @intCast(i))) b.rect(r, pal.hover);
+        if (current) b.rect(r, selected) else if (isHot(app, .tab, @intCast(i))) b.rect(r, pal.hover);
         b.hit(r, @intFromEnum(Id.tab), @intCast(i));
         var tx = r.x + pad;
         const ty = r.y + @divTrunc(r.h - in.cell_h, 2);
@@ -465,14 +483,52 @@ fn menuBox(app: *App, b: *Builder, in: *const Inputs, pal: *const Palette, label
     }
 }
 
+/// The editor card (Config.TitlebarLayout.island): the ground around the
+/// card, then its edge and rounded corners. The card's inside, the view and
+/// the padding around it, is the renderer's (gl_renderer clearCardPadding).
+fn card(app: *const App, b: *Builder, in: *const Inputs, pal: *const Palette) void {
+    const s = in.scale;
+    const pad = cardPaddingPx(app);
+    const r = rules.island_radius_pt * s;
+    const c: Rect = .{ .x = in.view.x - pad, .y = in.view.y - pad, .w = in.view.w + 2 * pad, .h = in.view.h + 2 * pad };
+    const x1 = c.x + c.w;
+    const y1 = c.y + c.h;
+    const ground = pal.strip;
+    b.rect(.{ .x = 0, .y = 0, .w = in.win_w, .h = c.y }, ground);
+    b.rect(.{ .x = 0, .y = y1, .w = in.win_w, .h = in.win_h - y1 }, ground);
+    b.rect(.{ .x = 0, .y = c.y, .w = c.x, .h = c.h }, ground);
+    b.rect(.{ .x = x1, .y = c.y, .w = in.win_w - x1, .h = c.h }, ground);
+    // The card's outermost device pixel, as the other frontends' shaders
+    // draw it (Shaders.metal ps_island).
+    const edge = op(rules.islandBorder(rgb3(in.bg)));
+    b.rect(.{ .x = c.x + r, .y = c.y, .w = c.w - 2 * r, .h = 1 }, edge);
+    b.rect(.{ .x = c.x + r, .y = y1 - 1, .w = c.w - 2 * r, .h = 1 }, edge);
+    b.rect(.{ .x = c.x, .y = c.y + r, .w = 1, .h = c.h - 2 * r }, edge);
+    b.rect(.{ .x = x1 - 1, .y = c.y + r, .w = 1, .h = c.h - 2 * r }, edge);
+    const corners = [_]struct { centre: [2]i32, dir: [2]i32 }{
+        .{ .centre = .{ c.x + r, c.y + r }, .dir = .{ -1, -1 } },
+        .{ .centre = .{ x1 - r, c.y + r }, .dir = .{ 1, -1 } },
+        .{ .centre = .{ c.x + r, y1 - r }, .dir = .{ -1, 1 } },
+        .{ .centre = .{ x1 - r, y1 - r }, .dir = .{ 1, 1 } },
+    };
+    for (corners) |k| {
+        b.corner(k.centre, k.dir, r, ground, 0);
+        b.corner(k.centre, k.dir, r, edge, 1);
+    }
+}
+
 /// Draws the chrome around `in.view` and its hit regions.
 pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
     const st = &app.chrome;
     const p = plan(app.titlebarLayout());
-    const pal = palette(in.fg, in.bg, p.tint);
+    const island = app.island();
+    const pal = palette(in.fg, in.bg, p.tint, island);
     const tabs_shown = in.ui.tabline_visible;
     const scale = in.scale;
     const header_h = header_pt * scale;
+
+    // Under everything else: the sidebar and the header are on its ground.
+    if (island) card(app, b, in, &pal);
 
     // The sidebar: the strip's ground, its tabs, its toggle and width handle.
     if (sidebarStyle(app) and tabs_shown and st.sidebar_shown) {
@@ -481,8 +537,9 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
         const top: i32 = if (p.header == .title_band) header_h else 0;
         const area: Rect = .{ .x = if (right) in.win_w - w else 0, .y = top, .w = w, .h = in.win_h - top };
         b.rect(area, pal.strip);
+        // On a card's ground the card's margin sets the sidebar apart.
         const edge_x = if (right) area.x else area.x + area.w - scale;
-        b.rect(.{ .x = edge_x, .y = area.y, .w = scale, .h = area.h }, pal.separator);
+        if (!island) b.rect(.{ .x = edge_x, .y = area.y, .w = scale, .h = area.h }, pal.separator);
         sidebarTabs(app, b, in, &pal, area);
         const hw = handle_pt * scale;
         b.hit(.{ .x = if (right) area.x - @divTrunc(hw, 2) else area.x + area.w - @divTrunc(hw, 2), .y = area.y, .w = hw, .h = area.h }, @intFromEnum(Id.sidebar_handle), 0);
@@ -492,7 +549,7 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
     if (p.header == .header_bar or p.header == .title_band) {
         const band: Rect = .{ .x = 0, .y = 0, .w = in.win_w, .h = header_h };
         b.rect(band, pal.header);
-        b.rect(.{ .x = 0, .y = header_h - scale, .w = in.win_w, .h = scale }, pal.separator);
+        if (!island) b.rect(.{ .x = 0, .y = header_h - scale, .w = in.win_w, .h = scale }, pal.separator);
         b.hit(band, @intFromEnum(Id.drag_area), 0);
         const buttons_x = windowButtons(app, b, in, &pal, band);
         const box = button_pt * scale;
@@ -509,9 +566,14 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
             button(app, b, in, &pal, .{ .x = left, .y = @divTrunc(header_h - box, 2), .w = w, .h = box }, label, .menu_tabs, 0);
             left += w + 4 * scale;
         }
-        const strip: Rect = .{ .x = left, .y = 0, .w = menu_r.x - left - 4 * scale, .h = header_h - scale };
-        if (p.tabs_in_header and tabs_shown) {
-            headerTabs(app, b, in, &pal, strip);
+        const tabs = p.tabs_in_header and tabs_shown;
+        // On a card the current tab is the card's colour and reaches its top
+        // edge, so the first tab starts clear of the card's corner.
+        const joined = tabs and island;
+        if (joined) left = @max(left, (rules.island_margin_pt + rules.island_radius_pt) * scale);
+        const strip: Rect = .{ .x = left, .y = 0, .w = menu_r.x - left - 4 * scale, .h = if (joined) header_h else header_h - scale };
+        if (tabs) {
+            headerTabs(app, b, in, &pal, strip, if (joined) op(rgb3(in.bg)) else pal.selected);
         } else {
             const w = @min(b.textWidth(in.title), strip.w);
             _ = b.text(strip.x + @divTrunc(strip.w - w, 2), @divTrunc(header_h - in.cell_h, 2), strip.w, in.title, pal.text_selected, .{});
@@ -520,7 +582,7 @@ pub fn build(app: *App, b: *Builder, in: *const Inputs) void {
         // Under the desktop's titlebar: the app and Tabs menus in a bar.
         const band: Rect = .{ .x = 0, .y = 0, .w = in.win_w, .h = header_h };
         b.rect(band, pal.header);
-        b.rect(.{ .x = 0, .y = header_h - scale, .w = in.win_w, .h = scale }, pal.separator);
+        if (!island) b.rect(.{ .x = 0, .y = header_h - scale, .w = in.win_w, .h = scale }, pal.separator);
         const box = button_pt * scale;
         var x = 4 * scale;
         for ([_]struct { l: []const u8, id: Id }{ .{ .l = "Zonvie", .id = .menu_app }, .{ .l = "Tabs", .id = .menu_tabs } }) |m| {

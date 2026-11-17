@@ -344,16 +344,23 @@ pub fn viewport(t: *const Target) void {
 /// Clears the target and binds its pipeline. False when there is nothing to
 /// draw with yet.
 fn begin(app: *App, t: *Target) bool {
-    const bg = app.default_bg;
-    // Premultiplied: [window] opacity is the background's alpha, as Windows
-    // clears its swapchain.
-    const a = std.math.clamp(app.window_cfg.opacity, 0, 1);
     viewport(t);
     // The clear takes the view alone: the window around it is the UI
     // layer's (drawUi).
     gl.glEnable(gl.GL_SCISSOR_TEST);
     scissor(t, 0, 0, @intCast(t.w_px), @intCast(t.h_px));
     defer gl.glDisable(gl.GL_SCISSOR_TEST);
+    clearToBg(app);
+    return bind(t);
+}
+
+/// Clears what the scissor leaves to the editor's background. Caller holds
+/// App.mu.
+fn clearToBg(app: *const App) void {
+    const bg = app.default_bg;
+    // Premultiplied: [window] opacity is the background's alpha, as Windows
+    // clears its swapchain.
+    const a = std.math.clamp(app.window_cfg.opacity, 0, 1);
     gl.glClearColor(
         @as(f32, @floatFromInt((bg >> 16) & 0xff)) / 255.0 * a,
         @as(f32, @floatFromInt((bg >> 8) & 0xff)) / 255.0 * a,
@@ -361,7 +368,19 @@ fn begin(app: *App, t: *Target) bool {
         a,
     );
     gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-    return bind(t);
+}
+
+/// The editor card's padding (App.island): the editor's background around
+/// the view, cleared as the view is. The UI layer paints only what lies
+/// outside the card and its corners. Takes App.mu.
+fn clearCardPadding(app: *App, t: *const Target) void {
+    const pad = chrome.cardPaddingPx(app);
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    gl.glEnable(gl.GL_SCISSOR_TEST);
+    defer gl.glDisable(gl.GL_SCISSOR_TEST);
+    scissor(t, -pad, -pad, @as(i32, @intCast(t.w_px)) + 2 * pad, @as(i32, @intCast(t.h_px)) + 2 * pad);
+    clearToBg(app);
 }
 
 /// Binds the target's pipeline over what the caller cleared. False when
@@ -520,6 +539,7 @@ pub fn render(app: *App) void {
     t.oy_px = app.view_y_px;
     t.fb_w_px = if (app.win_w_px != 0) app.win_w_px else t.w_px;
     t.fb_h_px = if (app.win_h_px != 0) app.win_h_px else t.h_px;
+    if (app.island()) clearCardPadding(app, t);
     const f = if (postfx.active(app, &app.postfx)) postfx.renderFrame(app, t, &app.postfx, 1) else renderMain(app, t);
     drawUi(app, t);
     app.presented_seq = f.flush_seq;
@@ -568,6 +588,11 @@ fn drawUiAt(app: *App, t: *Target, win_w: u32, win_h: u32, ox: i32, oy: i32) voi
     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
     gl.glDisable(gl.GL_SCISSOR_TEST);
     drawVerts(app, t, layer.solid.items, surface_layer, 0);
+    if (layer.round.items.len != 0) {
+        gl.glUniform1i(t.u_mode, 2);
+        drawVerts(app, t, layer.round.items, surface_layer, 0);
+        gl.glUniform1i(t.u_mode, 0);
+    }
     if (layer.text.items.len == 0) return;
     const a = &app.ui_atlas;
     if (a.pixels.len == 0) return;

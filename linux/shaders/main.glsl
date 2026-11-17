@@ -58,7 +58,8 @@ uniform sampler2D u_atlas;
 // layer's own edge instead of the window's.
 uniform float u_layer_origin_x_px;
 // 0 draws the grid; 1 extracts the glyphs the core marked DECO_GLOW, in their
-// own colour, for the bloom (windows/shaders/main.hlsl PSGlowExtract).
+// own colour, for the bloom (windows/shaders/main.hlsl PSGlowExtract); 2
+// draws the UI layer's rounded corners (ui_layer.zig Builder.corner).
 uniform int u_mode;
 // A panel's own bg (alpha >= 0): solid cells of that colour are left out so
 // the panel fill shows through, as windows/ui/external_windows.zig
@@ -113,6 +114,16 @@ void main() {
         }
         float cov = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
         o_color = vec4(v_col.rgb * cov, cov);
+        return;
+    }
+    if (u_mode == 2) {
+        // v_uv is the fragment's offset from the arc's centre in px, v_phase
+        // the radius. The colour fills what lies outside the arc, or with a
+        // stroke width in v_deco draws that many px just inside it.
+        float d = length(v_uv) - v_phase;
+        float w = float(v_deco);
+        float cov = w == 0.0 ? clamp(d + 0.5, 0.0, 1.0) : clamp(d + w + 0.5, 0.0, 1.0) * clamp(0.5 - d, 0.0, 1.0);
+        o_color = premultiply(v_col) * cov;
         return;
     }
     // Solid quads (backgrounds, decorations, cursor) carry uv.x < 0; for
