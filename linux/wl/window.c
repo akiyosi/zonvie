@@ -242,6 +242,8 @@ static struct {
         struct wl_egl_window* egl_window;
         EGLSurface egl_surface;
         int32_t pending_w, pending_h;
+        // The compositor sizes the window (maximized, fullscreen or tiled).
+        int pending_placed, placed;
     } ext[MAX_EXT];
 
     struct xkb_context* xkb;
@@ -1333,10 +1335,16 @@ int zwl_swap(void) {
 // ---------------------------------------------------------------------------
 
 static void ext_toplevel_configure(void* d, struct wl_proxy* t, int32_t width, int32_t height, struct wl_array* states) {
-    (void)t; (void)states;
+    (void)t;
     struct zwl_ext* e = d;
     e->pending_w = width;
     e->pending_h = height;
+    e->pending_placed = 0;
+    // As toplevel_configure: 1 maximized, 2 fullscreen, 5..8 tiled on an edge.
+    const uint32_t* st;
+    wl_array_for_each(st, states) {
+        if (*st == 1 || *st == 2 || (*st >= 5 && *st <= 8)) e->pending_placed = 1;
+    }
 }
 static void ext_toplevel_close(void* d, struct wl_proxy* t) {
     (void)t;
@@ -1351,6 +1359,7 @@ static const struct {
 static void ext_surface_configure(void* d, struct wl_proxy* s, uint32_t serial) {
     struct zwl_ext* e = d;
     wl_proxy_marshal_flags(s, XDG_SURFACE_ACK_CONFIGURE, NULL, 1, 0, serial);
+    e->placed = e->pending_placed;
     if (w.l->ext_configure) w.l->ext_configure(w.data, e->id, e->pending_w, e->pending_h);
 }
 static const struct { void (*configure)(void*, struct wl_proxy*, uint32_t); } ext_surface_listener = {
@@ -1488,6 +1497,11 @@ void zwl_ext_close(int64_t id) {
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px) {
     struct zwl_ext* e = ext_of_id(id);
     if (e) wl_egl_window_resize(e->egl_window, w_px, h_px, 0, 0);
+}
+
+int zwl_ext_placed(int64_t id) {
+    struct zwl_ext* e = ext_of_id(id);
+    return e ? e->placed : 0;
 }
 
 int zwl_ext_make_current(int64_t id) {

@@ -115,6 +115,8 @@ void zwl_ext_close(int64_t id);
 int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t w_logical, int32_t h_logical,
                    int32_t anchor_x, int32_t anchor_y, int32_t scale);
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
+// The compositor sizes window `id`: maximized, fullscreen or tiled.
+int zwl_ext_placed(int64_t id);
 // Makes the window's surface the one GL draws to; id 0 is the main window.
 int zwl_ext_make_current(int64_t id);
 int zwl_ext_swap(int64_t id);

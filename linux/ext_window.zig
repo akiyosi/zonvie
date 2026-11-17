@@ -21,6 +21,7 @@ const scrollbar = @import("scrollbar.zig");
 extern "c" fn zwl_ext_open(id: i64, app_id: [*:0]const u8, title: [*:0]const u8, w_px: i32, h_px: i32, scale: i32) c_int;
 extern "c" fn zwl_ext_close(id: i64) void;
 extern "c" fn zwl_ext_resize(id: i64, w_px: i32, h_px: i32) void;
+extern "c" fn zwl_ext_placed(id: i64) c_int;
 extern "c" fn zwl_ext_make_current(id: i64) c_int;
 extern "c" fn zwl_ext_swap(id: i64) c_int;
 extern "c" fn zwl_ext_request_frame(id: i64) void;
@@ -111,13 +112,22 @@ fn sizePx(app: *App, grid_id: i64, rows: u32, cols: u32) [2]u32 {
 fn open(app: *App, op: Op) void {
     if (app.ext_windows.get(op.grid_id)) |w| {
         w.win = op.win;
-        // A repeat is an update of the same window: follow a size Neovim
-        // chose (a :resize), which the window did not ask for.
+        // A repeat is an update of the same window: a size Neovim chose (a
+        // :resize), which the window did not ask for.
         if (w.rows != op.rows or w.cols != op.cols) {
             w.rows = op.rows;
             w.cols = op.cols;
-            const sz = sizePx(app, op.grid_id, op.rows, op.cols);
-            setSize(w, sz[0], sz[1]);
+            if (zwl_ext_placed(op.grid_id) != 0) {
+                // The compositor holds the window at its size, and a buffer
+                // of another size would be scaled to it: the grid is asked
+                // back to the size that fills the window.
+                fit(w);
+            } else if (app.corep == null or core.zonvie_core_external_resize_outstanding(app.corep.?, op.grid_id, op.rows, op.cols) == 0) {
+                // The window follows, unless this answers an older OS size
+                // and a newer one is out (as macOS and Windows).
+                const sz = sizePx(app, op.grid_id, op.rows, op.cols);
+                setSize(w, sz[0], sz[1]);
+            }
             if (w.configured) draw(w);
         }
         return;
@@ -276,6 +286,11 @@ fn idleRefit(data: ?*anyopaque) callconv(.c) c_int {
     var it = app.ext_windows.valueIterator();
     while (it.next()) |wp| {
         const w = wp.*;
+        // A window the compositor sizes keeps its size: its grid follows.
+        if (zwl_ext_placed(w.grid_id) != 0) {
+            fit(w);
+            continue;
+        }
         const sz = sizePx(app, w.grid_id, w.rows, w.cols);
         if (sz[0] == w.w_px and sz[1] == w.h_px) continue;
         setSize(w, sz[0], sz[1]);
