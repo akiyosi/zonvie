@@ -23,6 +23,91 @@ const Fallback = struct {
     font: *Font,
 };
 
+/// The fallback for one scalar: fontconfig's best match for the family among
+/// the fonts that cover the scalar, without scoring every installed font for
+/// every scalar. The covering fonts are passed in the order FcFontMatch walks
+/// them (system, then application), so a tie resolves as it does there.
+///
+/// This is FcFontMatch's pick for {family, charset = scalar} whenever that
+/// pick covers the scalar. Where it does not (the substituted family asks
+/// for something fontconfig ranks above charset, such as color), the best
+/// covering font is returned instead of nothing. A font without a charset
+/// cannot be known to cover a scalar and is never a candidate. A config rule
+/// that tests the pattern's charset does not apply: the family is
+/// substituted once, without one.
+const FallbackIndex = struct {
+    /// Held so its font sets, which `fonts` points into, stay alive.
+    config: *fc.FcConfig,
+    /// The family, substituted once as matchFile substitutes it per scalar.
+    pattern: *fc.FcPattern,
+    /// Every font with a charset, in walk order: `fonts[0..fonts_len]`.
+    fonts: []Candidate,
+    fonts_len: usize,
+    /// The covering subset of `fonts` for one lookup; same capacity.
+    covering: []*fc.FcPattern,
+
+    const Candidate = struct { pattern: *fc.FcPattern, charset: *const fc.FcCharSet };
+
+    fn build(alloc: std.mem.Allocator, family: []const u8) !FallbackIndex {
+        const config = fc.FcConfigReference(null) orelse return error.NoConfig;
+        errdefer fc.FcConfigDestroy(config);
+        const family_z = try alloc.dupeZ(u8, family);
+        defer alloc.free(family_z);
+        const pattern = fc.FcPatternCreate() orelse return error.OutOfMemory;
+        errdefer fc.FcPatternDestroy(pattern);
+        _ = fc.FcPatternAddString(pattern, fc.FC_FAMILY, family_z.ptr);
+        _ = fc.FcConfigSubstitute(config, pattern, .pattern);
+        fc.FcDefaultSubstitute(pattern);
+        var n: usize = 0;
+        for ([_]fc.FcSetName{ .system, .application }) |name| {
+            if (fc.FcConfigGetFonts(config, name)) |s| n += @intCast(s.nfont);
+        }
+        const fonts = try alloc.alloc(Candidate, n);
+        errdefer alloc.free(fonts);
+        const covering = try alloc.alloc(*fc.FcPattern, n);
+        var len: usize = 0;
+        for ([_]fc.FcSetName{ .system, .application }) |name| {
+            const s = fc.FcConfigGetFonts(config, name) orelse continue;
+            const list = s.fonts orelse continue;
+            for (list[0..@intCast(s.nfont)]) |p| {
+                var cs: ?*fc.FcCharSet = null;
+                if (fc.FcPatternGetCharSet(p, fc.FC_CHARSET, 0, &cs) != .match) continue;
+                fonts[len] = .{ .pattern = p, .charset = cs.? };
+                len += 1;
+            }
+        }
+        return .{ .config = config, .pattern = pattern, .fonts = fonts, .fonts_len = len, .covering = covering };
+    }
+
+    fn deinit(self: *FallbackIndex, alloc: std.mem.Allocator) void {
+        alloc.free(self.fonts);
+        alloc.free(self.covering);
+        fc.FcPatternDestroy(self.pattern);
+        fc.FcConfigDestroy(self.config);
+    }
+
+    fn match(self: *FallbackIndex, alloc: std.mem.Allocator, scalar: u32) ?Match {
+        var n: usize = 0;
+        for (self.fonts[0..self.fonts_len]) |f| {
+            if (fc.FcCharSetHasChar(f.charset, scalar) == 0) continue;
+            self.covering[n] = f.pattern;
+            n += 1;
+        }
+        if (n == 0) return null;
+        var set: fc.FcFontSet = .{ .nfont = @intCast(n), .sfont = @intCast(n), .fonts = self.covering.ptr };
+        const sets = [_]*fc.FcFontSet{&set};
+        var result: fc.FcResult = undefined;
+        const m = fc.FcFontSetMatch(self.config, &sets, 1, self.pattern, &result) orelse return null;
+        defer fc.FcPatternDestroy(m);
+        var file_ptr: [*c]fc.FcChar8 = undefined;
+        if (fc.FcPatternGetString(m, fc.FC_FILE, 0, &file_ptr) != .match) return null;
+        var index: c_int = 0;
+        _ = fc.FcPatternGetInteger(m, fc.FC_INDEX, 0, &index);
+        const path = alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)))) catch return null;
+        return .{ .path = path, .index = index };
+    }
+};
+
 const max_fallbacks = 16;
 /// Scalars no installed face covers, remembered so a run of them does not
 /// query fontconfig for every cell.
@@ -51,6 +136,10 @@ pub const Fonts = struct {
     base: BaseStyle = .{},
     fallbacks: [max_fallbacks]Fallback = undefined,
     fallback_len: usize = 0,
+    /// Built at the first fallback lookup for the loaded family;
+    /// `fallback_index_tried` stops a failed build from being retried.
+    fallback_index: ?FallbackIndex = null,
+    fallback_index_tried: bool = false,
     /// The colour emoji face, loaded on first use; `emoji_tried` stops a
     /// system without one from searching again.
     emoji: ?*Font = null,
@@ -63,12 +152,15 @@ pub const Fonts = struct {
     scaled: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn deinit(self: *Fonts, alloc: std.mem.Allocator) void {
-        self.destroyFaces();
+        self.destroyFaces(alloc);
         self.y_advance_scratch.deinit(alloc);
         self.scaled.deinit(alloc);
     }
 
-    fn destroyFaces(self: *Fonts) void {
+    fn destroyFaces(self: *Fonts, alloc: std.mem.Allocator) void {
+        if (self.fallback_index) |*fi| fi.deinit(alloc);
+        self.fallback_index = null;
+        self.fallback_index_tried = false;
         inline for (.{ "regular", "bold", "italic", "bold_italic" }) |f| {
             if (@field(self, f)) |h| hbft.zonvie_ft_hb_font_destroy(h);
             @field(self, f) = null;
@@ -95,7 +187,7 @@ pub const Fonts = struct {
         const n_features = core.zonvie_core_parse_font_features(features.ptr, features.len, @ptrCast(&list), list.len);
         const user = list[0..n_features];
         const regular = loadFace(alloc, family, base.bold, base.italic, pixel_size, user) orelse return false;
-        self.destroyFaces();
+        self.destroyFaces(alloc);
         self.regular = regular;
         self.bold = loadFace(alloc, family, true, base.italic, pixel_size, user);
         self.italic = loadFace(alloc, family, base.bold, true, pixel_size, user);
@@ -194,7 +286,13 @@ pub const Fonts = struct {
 
     fn fallbackFace(self: *Fonts, alloc: std.mem.Allocator, scalar: u32) ?*Font {
         for (self.misses[0..self.miss_len]) |m| if (m == scalar) return null;
-        const m = matchFile(alloc, self.family[0..self.family_len], scalar, false) orelse {
+        const family = self.family[0..self.family_len];
+        if (!self.fallback_index_tried) {
+            self.fallback_index_tried = true;
+            self.fallback_index = FallbackIndex.build(alloc, family) catch null;
+        }
+        const found = if (self.fallback_index) |*fi| fi.match(alloc, scalar) else matchFile(alloc, family, scalar, false);
+        const m = found orelse {
             self.misses[self.miss_next] = scalar;
             self.miss_next = (self.miss_next + 1) % miss_cap;
             self.miss_len = @min(self.miss_len + 1, miss_cap);

@@ -108,3 +108,10 @@ pub extern "c" fn FcObjectSetBuild(first: [*:0]const u8, ...) ?*FcObjectSet;
 pub extern "c" fn FcObjectSetDestroy(os: *FcObjectSet) void;
 pub extern "c" fn FcFontList(config: ?*FcConfig, p: *FcPattern, os: *FcObjectSet) ?*FcFontSet;
 pub extern "c" fn FcFontSetDestroy(s: *FcFontSet) void;
+
+// Fallback lookup by scalar (renderer/font.zig FallbackIndex).
+pub const FcSetName = enum(c_int) { system = 0, application = 1 };
+pub extern "c" fn FcConfigReference(config: ?*FcConfig) ?*FcConfig;
+pub extern "c" fn FcConfigDestroy(config: *FcConfig) void;
+pub extern "c" fn FcConfigGetFonts(config: ?*FcConfig, set: FcSetName) ?*FcFontSet;
+pub extern "c" fn FcFontSetMatch(config: ?*FcConfig, sets: [*]const *FcFontSet, nsets: c_int, p: *FcPattern, result: *FcResult) ?*FcPattern;
