@@ -278,9 +278,13 @@ fn setup(app: *App, p: *PostFx) bool {
     gl.glBindTexture(gl.GL_TEXTURE_2D, p.black);
     const zero = [_]u8{ 0, 0, 0, 0 };
     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, 1, 1, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, &zero);
+    // The loaded shaders' sources joined in load order, for the core's
+    // `@zonvie-hl-groups:` declaration.
+    var hl_src: std.ArrayListUnmanaged(u8) = .empty;
+    defer hl_src.deinit(app.alloc);
     for (app.shader_paths) |path| {
         if (p.custom_len == max_custom) break;
-        if (loadCustom(app, path)) |c| {
+        if (loadCustom(app, path, &hl_src)) |c| {
             p.custom[p.custom_len] = c;
             p.custom_len += 1;
             if (c.needs_animation) p.animating = true;
@@ -300,6 +304,7 @@ fn setup(app: *App, p: *PostFx) bool {
         nearest();
         app.shader_wants_cell_text.store(true, .release);
     }
+    if (app.corep) |cp| core.zonvie_core_set_shader_hl_groups(cp, hl_src.items.ptr, hl_src.items.len);
     // The core records no stamps until a shader wants them. Every window
     // compiles the same config, so the answer is the same for all.
     if (p.uses_edit or p.uses_cell_text) {
@@ -315,7 +320,7 @@ fn setup(app: *App, p: *PostFx) bool {
 /// One configured shader file: GLSL cross-compiled by the core to GLSL 330
 /// (zonvie_shader_compile_glsl), linked against our vertex stage, its
 /// samplers and uniform block bound by name.
-fn loadCustom(app: *App, path: []const u8) ?Custom {
+fn loadCustom(app: *App, path: []const u8, hl_src: *std.ArrayListUnmanaged(u8)) ?Custom {
     const src = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, app.alloc, .limited(4 * 1024 * 1024)) catch {
         applog.appLog("[postfx] cannot read shader {s}\n", .{path});
         return null;
@@ -355,6 +360,11 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
     if (u_text >= 0) gl.glUniform1i(u_text, 4);
     if (u_row >= 0) gl.glUniform1i(u_row, 5);
     applog.appLog("[postfx] loaded shader {s}\n", .{path});
+    // A shader whose text cannot be kept still loads; it declares no groups.
+    if (hl_src.ensureUnusedCapacity(app.alloc, src.len + 1)) |_| {
+        hl_src.appendSliceAssumeCapacity(src);
+        hl_src.appendAssumeCapacity('\n');
+    } else |_| {}
     return .{
         .pass = pass,
         .u_prev = u_prev,
@@ -560,6 +570,8 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, s: *const S
         if (cursor) |c| c.shown else false,
         p.uses_edit,
     );
+    // Seqlocked in the core: no App.mu.
+    if (app.corep) |cp| core.zonvie_shader_fill_colors(cp, u);
 }
 
 /// The main surface (with its overlays), or an external window's.
