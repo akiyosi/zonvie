@@ -24,7 +24,7 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windo
 | 1 | Standard Neovim GUI functionality | ✅ |
 | 2 | Multigrid Events compliance and rich window integration | ⚠️ |
 | 3 | Basic customization (fonts, colors, blur, variable fonts, etc.) | ✅ |
-| 4 | Cross-platform (macOS, Windows, Linux) | ⚠️ |
+| 4 | Cross-platform (macOS, Windows, Linux) | ✅ |
 | 5 | Remote connection (SSH, server mode, devcontainer) | ⚠️ |
 | 6 | Fancy features (cursor animation, neon/glow, smooth scroll, etc.) | ⚠️ |
 
@@ -69,8 +69,8 @@ bare `xdg_toplevel` through EGL. It does not run under an X11 session.
   Wayland lets no client read or set where its windows are, so the
   window-layout commands (`<C-w>H`, `<C-w>x`, ...) leave them where they
   are, and the cursor cannot be moved to the window in a direction.
-  Untested as an option on Linux: it needs a Neovim that accepts the
-  `ext_windows` UI option, which stock Neovim rejects. Windows opened with
+  The option needs a Neovim that accepts the `ext_windows` UI option,
+  which stock Neovim rejects. Windows opened with
   `nvim_open_win(..., {external = true})` work.
 - **Dialogs** are zonvie windows that ask through Neovim's own prompts: the
   connection dialog (`--dialog`), SSH passwords and passphrases, crash and
@@ -286,7 +286,7 @@ ime_preedit_mode = "overlay"  # "overlay" (floating overlay) or "inline" (inline
 [server]
 single_instance = false  # route `zonvie <file>` to a running instance (Windows and Linux)
 open_mode = "tab"        # "tab" (new tab) or "current" (replace current window)
-close_to_tray = false    # close button hides to the notification area instead of quitting (Windows only)
+close_to_tray = false    # close button hides to the notification area instead of quitting (Windows and Linux)
 
 [shaders]
 enabled = false
@@ -459,7 +459,7 @@ The `"titlebar"` style draws the same multi-line label in each tab, up to 4 line
 |-----|-------------|
 | `single_instance` | **Windows and Linux.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS; Linux routes through the session bus (D-Bus). |
 | `open_mode` | How a routed file is shown: `"tab"` opens a new tab (`:tab drop`), `"current"` replaces the current window (`:drop`). Multiple files always open as tabs. Default `"tab"`. |
-| `close_to_tray` | **Windows only.** When true, the close button hides the window to the notification area (system tray) instead of quitting; Neovim keeps running, so the instance stays resident (and reusable via `single_instance`). Left-click the tray icon to restore, right-click for Open/Quit. Default false. |
+| `close_to_tray` | **Windows and Linux.** When true, the close button hides the window to the notification area (system tray) instead of quitting; Neovim keeps running, so the instance stays resident (and reusable via `single_instance`). Left-click the tray icon to restore, right-click for Open/Quit. Linux needs a tray host running (StatusNotifierItem); without one the close button quits as usual. Default false. |
 
 #### [shaders]
 | Key | Description |
