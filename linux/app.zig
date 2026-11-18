@@ -202,6 +202,13 @@ pub const App = struct {
     /// iCellAge mirrors (main and external windows); the core thread writes
     /// them from on_cell_age_stamps, each window's draw uploads its own.
     cell_age: core.cell_age_store.Stores = undefined,
+    /// iCellText mirrors, keyed like `cell_age`: on_cell_text_row stages
+    /// rows, on_flush_end commits them with the surfaces' rows or discards
+    /// them, each window's draw uploads its own.
+    cell_text: core.cell_text_store.Stores = undefined,
+    /// A loaded shader reads iCellText; set by postfx setup (every window
+    /// compiles the same config), latched per flush in `flush_wants_cell_text`.
+    shader_wants_cell_text: std.atomic.Value(bool) = .init(false),
 
     // Window-side state; written and read only on the main thread.
     /// The main window's input; set up with the window.
@@ -263,6 +270,8 @@ pub const App = struct {
     // The flushing thread only: the core thread, or the main thread while a
     // core_timers tick runs a flush. grid_mu is held either way.
     flush_failed: bool = false,
+    /// `shader_wants_cell_text` as of on_flush_begin, for the whole flush.
+    flush_wants_cell_text: bool = false,
     /// Between on_flush_begin and on_flush_end.
     in_flush: bool = false,
     /// Counts on_flush_begin, as the core counts its flushes, so render
@@ -349,6 +358,8 @@ pub const App = struct {
         self.chrome_back.deinit(self.alloc);
         self.ui_atlas.deinit(self.alloc);
         self.cell_age.deinit();
+        self.cell_text.deinit();
+        postfx.deinit(&self.postfx, self.alloc);
         for (self.pending_opens.items) |p| self.alloc.free(p);
         self.pending_opens.deinit(self.alloc);
     }

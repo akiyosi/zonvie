@@ -28,6 +28,7 @@ const Fonts = font_mod.Fonts;
 const font_spec = @import("font_spec.zig");
 const layer_geom = @import("layer_geom.zig");
 const session = @import("ui.zig").session;
+const shader_inputs = @import("shader_inputs.zig");
 
 pub fn makeCallbacks() core.Callbacks {
     return .{
@@ -51,6 +52,7 @@ pub fn makeCallbacks() core.Callbacks {
         .on_tabline_hide = onTablineHide,
         .on_agent_status = onAgentStatus,
         .on_cell_age_stamps = onCellAgeStamps,
+        .on_cell_text_row = onCellTextRow,
         .on_atlas_create = onAtlasCreate,
         .on_atlas_upload = onAtlasUpload,
         .on_rasterize_glyph = onRasterizeGlyph,
@@ -387,6 +389,14 @@ fn onCellAgeStamps(ctx: ?*anyopaque, stamps: ?[*]const core.zonvie_cell_stamp, n
     app.cell_age.apply(slice, clear != 0, now);
 }
 
+/// One row's codepoints for iCellText, staged until on_flush_end commits or
+/// discards it. Core thread, grid_mu held; takes only the store's leaf lock,
+/// never App.mu, which would stall the main thread for the flush.
+fn onCellTextRow(ctx: ?*anyopaque, row: *const core.zonvie_cell_text_row) callconv(.c) void {
+    const app = appFrom(ctx);
+    shader_inputs.stageCellText(&app.cell_text, app.flush_wants_cell_text, row.*);
+}
+
 /// Not coupled to a flush: a background tab's agent still updates.
 fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*c]const u8, title_len: usize) callconv(.c) void {
     const app = appFrom(ctx);
@@ -428,6 +438,7 @@ fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
 fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     const app = appFrom(ctx);
     app.flush_failed = false;
+    app.flush_wants_cell_text = app.shader_wants_cell_text.load(.acquire);
     app.in_flush = true;
     app.trace_flush += 1;
     traceRender(app, "event=begin\n", .{});
@@ -454,6 +465,7 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // returned are cached by the core, whatever happens to the rows.
         if (failed) {
             app.surface.cancel();
+            app.cell_text.discard();
             // An abort causes no further flush by itself; core_timers
             // retries it. A fixed resource limit would only fail again.
             if (core.zonvie_core_flush_is_retryable(cp)) {
@@ -473,6 +485,11 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                 .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(cp), 32)),
                 .large_jump = app.large_jump,
             });
+            // The text the committed rows show, published with them under
+            // App.mu, which each draw holds to read both.
+            app.cell_text.commit(1);
+            var ext_it = app.surface.others.keyIterator();
+            while (ext_it.next()) |id| app.cell_text.commit(id.*);
             scrollbar.commitViews(app);
             // The committed rows are the new atlas's from here on.
             app.atlas_pending.held = false;
@@ -484,6 +501,7 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             }
         } else |_| {
             app.surface.cancel();
+            app.cell_text.discard();
             core.zonvie_core_abort_flush(cp);
             app.flush_outcome.store(.aborted, .release);
         }

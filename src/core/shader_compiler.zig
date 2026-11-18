@@ -678,6 +678,19 @@ test "a Shadertoy shader compiles to GL 3.3 GLSL with name-bound resources" {
     try std.testing.expect(std.mem.indexOf(u8, out, "in vec2 vUV;") != null);
 }
 
+test "a GL 3.3 shader reading cell text declares iCellText and iRowOffset by name" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = vec4(float(zonvieCellText(ivec2(0))));
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .glsl);
+    defer std.testing.allocator.free(out);
+    // postfx.zig binds these names to units 4 and 5.
+    try std.testing.expect(std.mem.indexOf(u8, out, "uniform usampler2D iCellText;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "uniform sampler2D iRowOffset;") != null);
+}
+
 test "Thymer reference shader compiles to MSL with the Zonvie edit inputs" {
     const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .msl);
     defer std.testing.allocator.free(out);

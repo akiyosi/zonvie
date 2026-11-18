@@ -1608,6 +1608,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .shader_preserve_alpha = config.shaders.preserve_alpha,
         .shader_epoch_ns = clock.nowNs(),
         .cell_age = core.cell_age_store.Stores.init(alloc),
+        .cell_text = core.cell_text_store.Stores.init(alloc),
         .session_name = session_name,
         .start_kind = start_kind,
         .open_mode_current = std.mem.eql(u8, config.server.open_mode, "current"),

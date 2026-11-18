@@ -170,10 +170,12 @@ fn close(app: *App, grid_id: i64) void {
     scrollbar.cancelTimers(&w.scrollbar);
     // A later window reusing this grid id starts unedited.
     app.cell_age.drop(grid_id);
+    app.cell_text.drop(grid_id);
     if (w.realized and zwl_ext_make_current(grid_id) == 0) {
         postfx.unrealize(&w.postfx);
         gl_renderer.unrealize(&w.gl);
     }
+    postfx.deinit(&w.postfx, app.alloc);
     // Leaves the main window's surface current.
     zwl_ext_close(grid_id);
     w.gl.deinit(app.alloc);
