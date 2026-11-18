@@ -5610,7 +5610,9 @@ pub const Core = struct {
     pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool) void {
         if (groups_changed) self.rebuildShaderHlMasks();
         if (self.hl.default_colors_changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
-        if (self.hl.default_colors_changed) self.publishShaderColors();
+        // Every flush: an attr redefinition or a mode change can recolour
+        // the cursor without a cursor emission.
+        self.publishShaderColors();
     }
 
     /// Publish the shader colour snapshot from the current defaults and
@@ -10254,6 +10256,7 @@ test "with cursor attr 0 the shader colours swap the defaults" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     core.hl.setDefaults(0x112233, 0x445566, null);
+    core.hl.default_colors_changed = false; // published regardless
     core.grid.cursor_attr_id = 0;
     core.refreshShaderTexelSources(false);
     const s = core.shader_colors.read();
@@ -10273,6 +10276,31 @@ test "a cursor attr gives the cursor its bg and the cursor text its fg" {
     const s = core.shader_colors.read();
     try std.testing.expectEqual(@as(u32, 0x00BB00), s.cursor);
     try std.testing.expectEqual(@as(u32, 0xAA0000), s.cursor_text);
+}
+
+test "a redefined cursor attr is republished by the next flush without a cursor emission" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.hl.define(7, 0xAA0000, 0x00BB00, null, false, 0, .{}, false);
+    core.grid.cursor_attr_id = 7;
+    core.publishShaderColors();
+    try core.hl.define(7, 0xAA0000, 0x0000CC, null, false, 0, .{}, false);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x0000CC), core.shader_colors.read().cursor);
+}
+
+test "a mode change of the cursor attr is republished by the next flush" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    try core.hl.define(9, 0x010101, 0x020202, null, false, 0, .{}, false);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x112233), core.shader_colors.read().cursor);
+    // What applyModeInfo does on mode_change / mode_info_set.
+    core.grid.cursor_attr_id = 9;
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x020202), core.shader_colors.read().cursor);
+    try std.testing.expectEqual(@as(u32, 0x010101), core.shader_colors.read().cursor_text);
 }
 
 test "a shader colour read never returns a mix of two snapshots" {

@@ -1309,8 +1309,7 @@ ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
    `u` from the core's latest colour snapshot: Neovim's default colours,
    and the cursor attr's bg (fill) and fg (text), or default fg and bg
    when the cursor has attr 0 (the Nvim swap the drawn cursor uses). The
-   snapshot is published at each cursor emission and on a default-colour
-   change, and is read whole (never a mix of two). Any thread.
+   snapshot is republished once per flush, and is read whole (never a mix of two). Any thread.
    Pre: u non-NULL; core NULL leaves u unchanged.
    Post: only bytes 976..1039 written; each channel = byte/255, [3] = 0. */
 ZONVIE_API void zonvie_shader_fill_colors(const zonvie_core *core, zonvie_shader_uniforms *u);

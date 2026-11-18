@@ -5184,9 +5184,6 @@ fn sendGridCursor(
             const cell_idx: usize = @as(usize, cur_row) * @as(usize, buf.cols) + @as(usize, cursor_col);
             const cursor_cell: grid_mod.Cell = if (cell_idx < buf.cells.len) buf.cells[cell_idx] else .{ .cp = 0, .hl = 0 };
             const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
-            // The shader's iCursorColor/iCursorText follow the cursor drawn here.
-            self.publishShaderColors();
-
             self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
                 @tagName(self.grid.cursor_shape), @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100)), self.grid.cursor_style_enabled,
             });
