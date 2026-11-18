@@ -5531,14 +5531,22 @@ pub const Core = struct {
         if (self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
     }
 
+    /// Whether group `name` is `wanted` or falls back to it by Neovim's
+    /// dotted-name rule: Treesitter applies `@markup.heading.1.markdown`,
+    /// which resolves through `@markup.heading.1` and `@markup.heading`.
+    pub fn hlNameFallsBackTo(name: []const u8, wanted: []const u8) bool {
+        if (!std.mem.startsWith(u8, name, wanted)) return false;
+        return name.len == wanted.len or name[wanted.len] == '.';
+    }
+
     /// Bit i is set when `names` (the groups an attr id was composed from)
-    /// holds wanted[i]. Pre: wanted.len <= max_hl_groups.
+    /// holds wanted[i] or a name falling back to it. Pre: wanted.len <= max_hl_groups.
     pub fn hlGroupMask(names: []const []const u8, wanted: []const []const u8) u32 {
         std.debug.assert(wanted.len <= frontend_rules.max_hl_groups);
         var mask: u32 = 0;
         for (wanted, 0..) |w, i| {
             for (names) |n| {
-                if (std.mem.eql(u8, n, w)) {
+                if (hlNameFallsBackTo(n, w)) {
                     mask |= @as(u32, 1) << @intCast(i);
                     break;
                 }
@@ -10177,6 +10185,15 @@ test "hlGroupMask sets bit i for the i-th wanted name present in names" {
     try std.testing.expectEqual(@as(u32, 0b10), Core.hlGroupMask(&.{ "Normal", "@markup.quote" }, &.{ "@markup.heading.1", "@markup.quote" }));
     try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"Normal"}, &.{"@markup.quote"}));
     try std.testing.expectEqual(@as(u32, 0b11), Core.hlGroupMask(&.{ "B", "A" }, &.{ "A", "B" }));
+}
+
+test "a Treesitter group with a language suffix matches the group it falls back to" {
+    const names: []const []const u8 = &.{"@markup.heading.1.markdown"};
+    try std.testing.expectEqual(@as(u32, 0b11), Core.hlGroupMask(names, &.{ "@markup.heading.1", "@markup.heading" }));
+    // Only at a dot boundary, and never the other way round.
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.heading.10"}));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.head"}));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"@markup"}, &.{"@markup.quote"}));
 }
 
 test "a mask rebuild that changes an existing id marks every surface dirty" {
