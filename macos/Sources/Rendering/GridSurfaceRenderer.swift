@@ -5033,6 +5033,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     gridOrigin: CGPoint(x: inset.left, y: inset.top),
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
+                (view as? MetalTerminalView)?.core?.fillShaderColors(&u)
                 SharedRenderResources.fillShaderLayers(
                     &u, layers: layerSnapshot, rootGridId: Self.rootGridId,
                     rootRows: layerSnapshot.first(where: { $0.layer.gridId == Self.rootGridId })?.layer.rows ?? 0,

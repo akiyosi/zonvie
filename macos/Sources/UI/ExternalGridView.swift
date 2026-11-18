@@ -3563,6 +3563,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     cellAgeGrid: self.gridId,
                     lastLoggedCursor: &self.lastLoggedShaderCursor
                 )
+                self.core?.fillShaderColors(&u)
                 SharedRenderResources.fillShaderLayers(
                     &u, layers: self.layerSnapshot, rootGridId: self.gridId,
                     rootRows: Int(f.snapGridRows), rootHasFont: f.rootFont != nil,

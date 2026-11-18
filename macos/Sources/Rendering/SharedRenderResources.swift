@@ -305,7 +305,8 @@ final class SharedRenderResources {
     /// Fired when the loaded chain starts or stops reading the edit inputs.
     /// The main view forwards it to the core, so stamp lists are built only
     /// while something reads them.
-    var onShaderEditInputsChanged: ((_ editInputs: Bool, _ cellText: Bool) -> Void)?
+    /// `hlGroupsSource` is the loaded sources joined in load order.
+    var onShaderEditInputsChanged: ((_ editInputs: Bool, _ cellText: Bool, _ hlGroupsSource: String) -> Void)?
     /// The iCellAge state of every surface, keyed the way the core stamps it.
     let cellAge = SurfaceCellAgeStores()
     /// The iCellText state of every surface, keyed the same way.
@@ -1693,7 +1694,8 @@ extension SharedRenderResources {
             if !shaderWantsCellText { cellText.removeAll() }
             let wantsCellText = shaderWantsCellText
             cellTextOptIn.withLock { $0 = wantsCellText }
-            onShaderEditInputsChanged?(shaderWantsEditInputs, shaderWantsCellText)
+            let hlGroupsSource = customShaderPipelines.map(\.glslSource).joined(separator: "\n")
+            onShaderEditInputsChanged?(shaderWantsEditInputs, shaderWantsCellText, hlGroupsSource)
         }
         if !config.enabled || config.paths.isEmpty {
             return

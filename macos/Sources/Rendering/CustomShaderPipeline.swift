@@ -32,6 +32,8 @@ final class CustomShaderPipeline {
     let usesPrevFrame: Bool
     /// True when the source declared `@zonvie-owns-cursor`.
     let ownsCursor: Bool
+    /// The GLSL text, for the core's `@zonvie-hl-groups:` declaration.
+    let glslSource: String
 
     private init(
         sourcePath: String,
@@ -40,8 +42,10 @@ final class CustomShaderPipeline {
         usesEditInputs: Bool,
         usesCellText: Bool,
         usesPrevFrame: Bool,
-        ownsCursor: Bool
+        ownsCursor: Bool,
+        glslSource: String
     ) {
+        self.glslSource = glslSource
         self.sourcePath = sourcePath
         self.pipelineState = pipelineState
         self.needsAnimation = needsAnimation
@@ -169,7 +173,8 @@ final class CustomShaderPipeline {
             usesEditInputs: usesEditInputs,
             usesCellText: usesCellText,
             usesPrevFrame: usesPrevFrame,
-            ownsCursor: ownsCursor
+            ownsCursor: ownsCursor,
+            glslSource: glslSource
         )
     }
 

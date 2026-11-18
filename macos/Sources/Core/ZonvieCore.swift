@@ -3148,8 +3148,18 @@ final class ZonvieCore {
     /// for a shader that reads the edit inputs, and cell-text rows for one that
     /// reads iCellText. Driven by the loaded shader set, so the default path
     /// costs nothing and an iCellAge-only shader never pays for cell text.
-    func setShaderInputsEnabled(editInputs: Bool, cellText: Bool) {
+    /// Ghostty colour uniforms from the core's seqlocked snapshot; any thread.
+    func fillShaderColors(_ u: inout zonvie_shader_uniforms) {
         guard let core else { return }
+        zonvie_shader_fill_colors(core, &u)
+    }
+
+    /// `hlGroupsSource` is the loaded chain's sources joined in load order;
+    /// its `@zonvie-hl-groups:` lines are declared before cell text turns on.
+    func setShaderInputsEnabled(editInputs: Bool, cellText: Bool, hlGroupsSource: String) {
+        guard let core else { return }
+        var source = hlGroupsSource
+        source.withUTF8 { zonvie_core_set_shader_hl_groups(core, $0.baseAddress, $0.count) }
         var flags: UInt32 = 0
         if editInputs { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_AGE) }
         if cellText { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_TEXT) }
