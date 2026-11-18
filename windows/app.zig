@@ -475,6 +475,8 @@ pub const SurfaceLayer = struct {
     /// it -- Neovim refuses an event addressed to such a window rather than
     /// passing it to what is behind.
     mouse_enabled: bool = true,
+    /// A floating window (Neovim zindex > 0), not a split.
+    is_float: bool = false,
     /// A grid drawn in its own font (on_grid_font), stamped at commit
     /// (App.commitGridFonts): its cell and the pixel box the core clips it
     /// to, margin included. 0 = the surface's cell.
@@ -578,15 +580,15 @@ fn setLayerFont(l: *SurfaceLayer, gf: ?GridFontPx) void {
     l.font_extent_h_px = f.extent_h_px;
 }
 
-/// Hand a surface's renderer iRootRows and iGridRects for its custom shader
-/// (core.fillGridRects). `layers` is the paint's pinned list, root first;
+/// Hand a surface's renderer iRootRows and iLayers for its custom shader
+/// (core.fillLayers). `layers` is the paint's pinned list, root first;
 /// rects are placed from `origin`, the renderer's iGridOrigin, by each
 /// layer's offset from the root. Layers are placed in global cells
 /// (`cell_w_px`/`row_h_px`) whatever the root's font; under a root in its
 /// own font every layer has a band of its own, as the core writes it. The
 /// buffer holds the topmost layers, the ones the table can list.
-pub fn fillShaderGridRects(r: anytype, layers: []const SurfaceLayer, origin: [2]f32, cell_w_px: u32, row_h_px: u32) void {
-    var in: [256]core.zonvie_shader_grid_rect = undefined;
+pub fn fillShaderLayers(r: anytype, layers: []const SurfaceLayer, origin: [2]f32, cell_w_px: u32, row_h_px: u32) void {
+    var in: [256]core.zonvie_shader_layer = undefined;
     const root_rows: u32 = if (layers.len != 0) layers[0].rows else 0;
     const root_font = layers.len != 0 and layers[0].font_cell_w_px > 0;
     const placed = if (layers.len > 1) layers[1..] else layers[0..0];
@@ -604,14 +606,15 @@ pub fn fillShaderGridRects(r: anytype, layers: []const SurfaceLayer, origin: [2]
             .rows = l.rows,
             .cols = l.cols,
             .z = @intCast(@max(l.z, 0)),
+            .flags = if (l.is_float) core.SHADER_LAYER_FLOAT else 0,
         };
         n += 1;
     }
     var u: core.zonvie_shader_uniforms = .{};
-    core.fillGridRects(&u, in[0..n], root_rows);
+    core.fillLayers(&u, in[0..n], root_rows);
     r.shader_root_rows = u.iRootRows;
-    r.shader_grid_rect_count = u.iGridRectCount;
-    r.shader_grid_rects = u.iGridRects;
+    r.shader_layer_count = u.iLayerCount;
+    r.shader_layers = u.iLayers;
 }
 
 /// The row height and cell width of `grid_id`'s layer, or the surface's when

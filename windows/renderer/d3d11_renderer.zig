@@ -450,11 +450,11 @@ pub const Renderer = struct {
     cursor_blink_on: bool = true,
     /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
     shader_grid_origin: [2]f32 = .{ 0, 0 },
-    /// iRootRows and iGridRects (core.fillGridRects), set by the paint driver
-    /// from the layers it pinned (app.fillShaderGridRects).
+    /// iRootRows and iLayers (core.fillLayers), set by the paint driver
+    /// from the layers it pinned (app.fillShaderLayers).
     shader_root_rows: i32 = 0,
-    shader_grid_rect_count: i32 = 0,
-    shader_grid_rects: [core.SHADER_GRID_RECTS_MAX * 3][4]f32 = @splat(@splat(0)),
+    shader_layer_count: i32 = 0,
+    shader_layers: [core.SHADER_LAYERS_MAX * 3][4]f32 = @splat(@splat(0)),
     shader_owns_cursor: bool = false,
     /// Feedback pair: the LAST pass writes here instead of the backbuffer so
     /// the NEXT frame can sample it as iPrevFrame; a copy then moves it to
@@ -3627,8 +3627,8 @@ pub const Renderer = struct {
             self.shader_wants_edit_inputs,
         );
         u.iRootRows = self.shader_root_rows;
-        u.iGridRectCount = self.shader_grid_rect_count;
-        u.iGridRects = self.shader_grid_rects;
+        u.iLayerCount = self.shader_layer_count;
+        u.iLayers = self.shader_layers;
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto just lists the fields as "Year, month, day,
         // time in seconds" without spelling out indexing. Forward

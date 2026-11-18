@@ -3906,28 +3906,35 @@ pub const zonvie_shader_uniforms = extern struct {
     iPreviousCursorStyle: i32 = 0, // 188..191
     // Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
     // the surface root's cell; iCursorCellSize the cell of the grid the
-    // cursor is in. iGridRects lists, topmost first, the layers down to the
-    // lowest one in its own font, three vec4 each (fillGridRects).
+    // cursor is in. iLayers lists, topmost first, the layers down to the
+    // lowest one in its own font, three vec4 each (fillLayers).
     iCursorCellSize: [2]f32 = .{ 0, 0 }, // 192..199
-    iGridRectCount: i32 = 0, // 200..203
+    iLayerCount: i32 = 0, // 200..203
     iRootRows: i32 = 0, // 204..207
-    iGridRects: [SHADER_GRID_RECTS_MAX * 3][4]f32 = @splat(@splat(0)), // 208..975
+    iLayers: [SHADER_LAYERS_MAX * 3][4]f32 = @splat(@splat(0)), // 208..975
 };
 
-pub const SHADER_GRID_RECTS_MAX = 16;
+pub const SHADER_LAYERS_MAX = 16;
+
+/// iLayers entry flags, the [3i+2].w word. fillLayers derives FONT_GRID from
+/// the layer's cell; a caller supplies the others.
+pub const SHADER_LAYER_FLOAT: u32 = 1 << 0;
+pub const SHADER_LAYER_FONT_GRID: u32 = 1 << 1;
+pub const SHADER_LAYER_FOCUSABLE: u32 = 1 << 2;
+pub const SHADER_LAYER_BORDER: u32 = 1 << 3;
 
 comptime {
     std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 976);
-    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iGridRects") == 208);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iLayers") == 208);
 }
 
-/// One layer of a surface as zonvie_shader_fill_grid_rects reads it. The
+/// One layer of a surface as zonvie_shader_fill_layers reads it. The
 /// rect is in fragCoord space (the surface's iGridOrigin plus the layer's
 /// origin); a grid in its own font gives its cell and its extent (margin
 /// included), any other
 /// layer cell 0 and rows x cols global cells, except under a root in its own
 /// font, where every layer gives a cell (its text has a band).
-pub const zonvie_shader_grid_rect = extern struct {
+pub const zonvie_shader_layer = extern struct {
     grid_id: i64,
     x_px: f32,
     y_px: f32,
@@ -3939,7 +3946,9 @@ pub const zonvie_shader_grid_rect = extern struct {
     cols: u32,
     /// Back-to-front rank, as zonvie_layer.z; unique per surface.
     z: u32,
-    _pad: u32 = 0,
+    /// SHADER_LAYER_* the caller knows (FLOAT, FOCUSABLE, BORDER); FONT_GRID
+    /// is set by fillLayers whatever is passed here.
+    flags: u32 = 0,
 };
 
 /// One contiguous run of cells stamped as "just edited". The core-side type
@@ -4116,17 +4125,21 @@ pub export fn zonvie_shader_fill_edit_uniforms(
     fillEditUniforms(u, cell_w_px, row_h_px, .{ cursor_cell_w_px, cursor_row_h_px }, .{ grid_origin_x_px, grid_origin_y_px }, time_last_edit, cursor_visible, wants_edit_inputs);
 }
 
-/// Fill iRootRows and iGridRects from a surface's layers. A surface with no
+/// Fill iRootRows and iLayers from a surface's layers. A surface with no
 /// layer in its own font gets an empty table: every cell is on its lattice.
 /// Otherwise the table holds, topmost first, every layer down to the lowest
 /// font layer, so a float over a font grid still owns its pixels. Per entry:
 /// [0] the rect; [1] cell w, h and the first iCellText row of the grid's
-/// band, or all zero for a layer on the surface lattice; [2] rows, cols.
+/// band, or all zero for a layer on the surface lattice; [2] rows, cols, grid
+/// id, flags (FONT_GRID derived from the cell). Pure; |grid id| is below 1 << 24.
 /// Bands follow the root's rows in grid-id order, the rule the core writes
 /// them by (flush.cellTextBandRow0).
-pub fn fillGridRects(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_grid_rect, root_rows: u32) void {
+pub fn fillLayers(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_layer, root_rows: u32) void {
+    // |grid_id| < 1 << 24 keeps the id exact in f32; the core's special
+    // grids are negative (CMDLINE -100 ...).
+    for (rects) |r| std.debug.assert(r.grid_id > -(1 << 24) and r.grid_id < (1 << 24));
     u.iRootRows = @intCast(root_rows);
-    u.iGridRectCount = 0;
+    u.iLayerCount = 0;
     var lowest_font_z: ?u32 = null;
     for (rects) |r| {
         if (r.cell_w_px > 0) lowest_font_z = @min(lowest_font_z orelse r.z, r.z);
@@ -4134,7 +4147,7 @@ pub fn fillGridRects(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_gr
     const floor_z = lowest_font_z orelse return;
     var n: usize = 0;
     var below: u32 = std.math.maxInt(u32);
-    while (n < SHADER_GRID_RECTS_MAX) {
+    while (n < SHADER_LAYERS_MAX) {
         // The next layer down: the highest z under the last one taken.
         var pick: ?usize = null;
         for (rects, 0..) |r, i| {
@@ -4144,28 +4157,29 @@ pub fn fillGridRects(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_gr
         const i = pick orelse break;
         const r = rects[i];
         below = r.z;
-        u.iGridRects[n * 3] = .{ r.x_px, r.y_px, r.w_px, r.h_px };
-        u.iGridRects[n * 3 + 1] = .{ 0, 0, 0, 0 };
+        u.iLayers[n * 3] = .{ r.x_px, r.y_px, r.w_px, r.h_px };
+        u.iLayers[n * 3 + 1] = .{ 0, 0, 0, 0 };
         if (r.cell_w_px > 0) {
             var row0: u32 = root_rows;
             for (rects) |o| {
                 if (o.cell_w_px > 0 and o.grid_id < r.grid_id) row0 += o.rows;
             }
-            u.iGridRects[n * 3 + 1] = .{ r.cell_w_px, r.cell_h_px, @floatFromInt(row0), 0 };
+            u.iLayers[n * 3 + 1] = .{ r.cell_w_px, r.cell_h_px, @floatFromInt(row0), 0 };
         }
-        u.iGridRects[n * 3 + 2] = .{ @floatFromInt(r.rows), @floatFromInt(r.cols), 0, 0 };
+        const flags = if (r.cell_w_px > 0) r.flags | SHADER_LAYER_FONT_GRID else r.flags & ~SHADER_LAYER_FONT_GRID;
+        u.iLayers[n * 3 + 2] = .{ @floatFromInt(r.rows), @floatFromInt(r.cols), @floatFromInt(r.grid_id), @floatFromInt(flags) };
         n += 1;
     }
-    u.iGridRectCount = @intCast(n);
+    u.iLayerCount = @intCast(n);
 }
 
-pub export fn zonvie_shader_fill_grid_rects(
+pub export fn zonvie_shader_fill_layers(
     u: *zonvie_shader_uniforms,
-    rects: ?[*]const zonvie_shader_grid_rect,
+    rects: ?[*]const zonvie_shader_layer,
     n: usize,
     root_rows: u32,
 ) callconv(.c) void {
-    fillGridRects(u, if (rects) |p| p[0..n] else &.{}, root_rows);
+    fillLayers(u, if (rects) |p| p[0..n] else &.{}, root_rows);
 }
 
 test "fillEditUniforms: row height sizes the cell, styles follow the rects, last edit is gated" {
@@ -4200,51 +4214,51 @@ test "fillEditUniforms: row height sizes the cell, styles follow the rects, last
     try std.testing.expectEqual(@as(i32, 2), u.iPreviousCursorStyle);
 }
 
-test "fillGridRects: font layers get bands in grid-id order, the table runs topmost first down to the lowest font layer" {
+test "fillLayers: font layers get bands in grid-id order, the table runs topmost first down to the lowest font layer" {
     var u: zonvie_shader_uniforms = .{};
     // No layer in its own font: an empty table.
-    const plain = [_]zonvie_shader_grid_rect{
+    const plain = [_]zonvie_shader_layer{
         .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 90, .h_px = 40, .cell_w_px = 0, .cell_h_px = 0, .rows = 2, .cols = 10, .z = 1 },
     };
-    fillGridRects(&u, &plain, 30);
-    try std.testing.expectEqual(@as(i32, 0), u.iGridRectCount);
+    fillLayers(&u, &plain, 30);
+    try std.testing.expectEqual(@as(i32, 0), u.iLayerCount);
     try std.testing.expectEqual(@as(i32, 30), u.iRootRows);
 
-    const rects = [_]zonvie_shader_grid_rect{
+    const rects = [_]zonvie_shader_layer{
         // A split under everything, a font split, a float over it, a font float.
         .{ .grid_id = 2, .x_px = 0, .y_px = 0, .w_px = 100, .h_px = 100, .cell_w_px = 0, .cell_h_px = 0, .rows = 5, .cols = 10, .z = 1 },
         .{ .grid_id = 7, .x_px = 100, .y_px = 0, .w_px = 100, .h_px = 100, .cell_w_px = 15, .cell_h_px = 30, .rows = 3, .cols = 6, .z = 2 },
         .{ .grid_id = 9, .x_px = 120, .y_px = 20, .w_px = 40, .h_px = 20, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 4, .z = 4 },
         .{ .grid_id = 5, .x_px = 10, .y_px = 10, .w_px = 30, .h_px = 30, .cell_w_px = 5, .cell_h_px = 10, .rows = 3, .cols = 6, .z = 3 },
     };
-    fillGridRects(&u, &rects, 30);
-    try std.testing.expectEqual(@as(i32, 3), u.iGridRectCount);
+    fillLayers(&u, &rects, 30);
+    try std.testing.expectEqual(@as(i32, 3), u.iLayerCount);
     // Topmost first; grid 2 lies below the lowest font layer and is left out.
-    try std.testing.expectEqual([4]f32{ 120, 20, 40, 20 }, u.iGridRects[0]);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iGridRects[1]);
-    try std.testing.expectEqual([4]f32{ 1, 4, 0, 0 }, u.iGridRects[2]);
+    try std.testing.expectEqual([4]f32{ 120, 20, 40, 20 }, u.iLayers[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iLayers[1]);
+    try std.testing.expectEqual([4]f32{ 1, 4, 9, 0 }, u.iLayers[2]);
     // Grid 5 sorts first by id: its band starts right after the root's rows.
-    try std.testing.expectEqual([4]f32{ 10, 10, 30, 30 }, u.iGridRects[3]);
-    try std.testing.expectEqual([4]f32{ 5, 10, 30, 0 }, u.iGridRects[4]);
-    try std.testing.expectEqual([4]f32{ 3, 6, 0, 0 }, u.iGridRects[5]);
-    try std.testing.expectEqual([4]f32{ 100, 0, 100, 100 }, u.iGridRects[6]);
-    try std.testing.expectEqual([4]f32{ 15, 30, 33, 0 }, u.iGridRects[7]);
-    try std.testing.expectEqual([4]f32{ 3, 6, 0, 0 }, u.iGridRects[8]);
+    try std.testing.expectEqual([4]f32{ 10, 10, 30, 30 }, u.iLayers[3]);
+    try std.testing.expectEqual([4]f32{ 5, 10, 30, 0 }, u.iLayers[4]);
+    try std.testing.expectEqual([4]f32{ 3, 6, 5, 2 }, u.iLayers[5]);
+    try std.testing.expectEqual([4]f32{ 100, 0, 100, 100 }, u.iLayers[6]);
+    try std.testing.expectEqual([4]f32{ 15, 30, 33, 0 }, u.iLayers[7]);
+    try std.testing.expectEqual([4]f32{ 3, 6, 7, 2 }, u.iLayers[8]);
 
     // A table filled before is cleared, not merged: the count drops to 0
     // and a plain entry's cell is zeroed over whatever it held.
-    u.iGridRects[1] = .{ 9, 9, 9, 9 };
-    fillGridRects(&u, &plain, 30);
-    try std.testing.expectEqual(@as(i32, 0), u.iGridRectCount);
-    fillGridRects(&u, &rects, 30);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iGridRects[1]);
+    u.iLayers[1] = .{ 9, 9, 9, 9 };
+    fillLayers(&u, &plain, 30);
+    try std.testing.expectEqual(@as(i32, 0), u.iLayerCount);
+    fillLayers(&u, &rects, 30);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iLayers[1]);
 
     // Past the cap the topmost are kept; bands still count every font layer.
-    var many: [SHADER_GRID_RECTS_MAX + 4]zonvie_shader_grid_rect = undefined;
+    var many: [SHADER_LAYERS_MAX + 4]zonvie_shader_layer = undefined;
     for (&many, 0..) |*r, i| r.* = .{ .grid_id = @intCast(i + 2), .x_px = 0, .y_px = 0, .w_px = 1, .h_px = 1, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 1, .z = @intCast(i + 1) };
-    fillGridRects(&u, &many, 30);
-    try std.testing.expectEqual(@as(i32, SHADER_GRID_RECTS_MAX), u.iGridRectCount);
-    try std.testing.expectEqual(@as(f32, 30 + many.len - 1), u.iGridRects[1][2]);
+    fillLayers(&u, &many, 30);
+    try std.testing.expectEqual(@as(i32, SHADER_LAYERS_MAX), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, 30 + many.len - 1), u.iLayers[1][2]);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must
@@ -4450,3 +4464,45 @@ pub const CallbackErrorCode = enum(u32) {
     atlas_full = 3,
     shape_failed = 4,
 };
+
+test "fill_layers: grid id and flags land in the third vec4" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 7, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 2, .z = 1, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, 7.0), u.iLayers[2][2]);
+    // FONT_GRID is derived from the cell, so the caller's FLOAT is kept and it is added.
+    try std.testing.expectEqual(@as(f32, 3.0), u.iLayers[2][3]);
+}
+
+test "fill_layers: more than 16 layers keeps the 16 topmost" {
+    var u: zonvie_shader_uniforms = .{};
+    var many: [20]zonvie_shader_layer = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .grid_id = @intCast(i + 2), .x_px = 0, .y_px = 0, .w_px = 1, .h_px = 1, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 1, .z = @intCast(i + 1), .flags = 0 };
+    fillLayers(&u, &many, 30);
+    try std.testing.expectEqual(@as(i32, 16), u.iLayerCount);
+    // Entry 0 is the highest z, grid id 21.
+    try std.testing.expectEqual(@as(f32, 21.0), u.iLayers[2][2]);
+}
+
+test "fill_layers: no font-grid layer gives an empty table" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 90, .h_px = 40, .cell_w_px = 0, .cell_h_px = 0, .rows = 2, .cols = 10, .z = 1, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 0), u.iLayerCount);
+    try std.testing.expectEqual(@as(i32, 30), u.iRootRows);
+}
+
+test "fill_layers: a special grid's negative id reads back exactly" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = -100, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 2, .z = 1 },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, -100.0), u.iLayers[2][2]);
+}

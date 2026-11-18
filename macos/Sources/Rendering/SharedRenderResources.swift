@@ -129,14 +129,14 @@ final class SharedRenderResources {
         stagedGridFonts[gridId]
     }
 
-    /// Fill iRootRows and iGridRects of `u` from the layers a surface draws
-    /// this frame (zonvie_shader_fill_grid_rects). Rects are in fragCoord
+    /// Fill iRootRows and iLayers of `u` from the layers a surface draws
+    /// this frame (zonvie_shader_fill_layers). Rects are in fragCoord
     /// space: `gridOrigin` (the surface's iGridOrigin) plus each layer's
     /// origin, which is relative to the root. Layers are placed in global
     /// cells (`cellWidthPx`/`cellHeightPx`) whatever the root's font; under a
     /// root in its own font every layer has a band of its own, as the core
     /// writes it. `scratch` is the surface's own, reused frame to frame.
-    static func fillShaderGridRects(
+    static func fillShaderLayers(
         _ u: inout zonvie_shader_uniforms,
         layers: [SurfaceLayerFrame],
         rootGridId: Int64,
@@ -145,13 +145,13 @@ final class SharedRenderResources {
         gridOrigin: CGPoint,
         cellWidthPx: Float,
         cellHeightPx: Float,
-        scratch: inout [zonvie_shader_grid_rect]
+        scratch: inout [zonvie_shader_layer]
     ) {
         scratch.removeAll(keepingCapacity: true)
         for entry in layers where entry.layer.gridId != rootGridId {
             let l = entry.layer
             let fontGrid = l.cellWidthPx > 0
-            scratch.append(zonvie_shader_grid_rect(
+            scratch.append(zonvie_shader_layer(
                 grid_id: l.gridId,
                 x_px: Float(gridOrigin.x) + l.originPx.x,
                 y_px: Float(gridOrigin.y) + l.originPx.y,
@@ -162,10 +162,10 @@ final class SharedRenderResources {
                 rows: UInt32(clamping: l.rows),
                 cols: UInt32(clamping: l.cols),
                 z: UInt32(clamping: l.z),
-                _pad: 0))
+                flags: l.isFloat ? UInt32(ZONVIE_SHADER_LAYER_FLOAT) : 0))
         }
         scratch.withUnsafeBufferPointer { buf in
-            zonvie_shader_fill_grid_rects(&u, buf.baseAddress, buf.count, UInt32(clamping: rootRows))
+            zonvie_shader_fill_layers(&u, buf.baseAddress, buf.count, UInt32(clamping: rootRows))
         }
     }
 

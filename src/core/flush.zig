@@ -1890,7 +1890,7 @@ fn cellTextPlane(core: *Core, surface: i64, root: *const grid_mod.GridBuf) CellT
 }
 
 /// First plane row of a font layer's band: bands follow the root's rows in
-/// grid-id order (c_api.fillGridRects states the same rule to the shader).
+/// grid-id order (c_api.fillLayers states the same rule to the shader).
 fn cellTextBandRow0(core: *Core, surface: i64, root_rows: u32, grid_id: i64) u32 {
     var row0 = root_rows;
     var it = FontLayerIterator.init(core, surface);

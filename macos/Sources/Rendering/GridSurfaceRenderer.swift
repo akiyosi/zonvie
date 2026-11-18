@@ -2321,8 +2321,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Per-frame snapshot taken under `lock`, reused across frames. Entry 0 is
     /// this surface's root grid, which every draw loop below skips.
     private var layerSnapshot: [SurfaceLayerFrame] = []
-    /// zonvie_shader_fill_grid_rects input, reused frame to frame.
-    private var shaderGridRectScratch: [zonvie_shader_grid_rect] = []
+    /// zonvie_shader_fill_layers input, reused frame to frame.
+    private var shaderLayerScratch: [zonvie_shader_layer] = []
     /// This frame's damage bands. Draw thread only.
     private let damageBands = SurfaceDamageBands()
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
@@ -5033,12 +5033,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     gridOrigin: CGPoint(x: inset.left, y: inset.top),
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
-                SharedRenderResources.fillShaderGridRects(
+                SharedRenderResources.fillShaderLayers(
                     &u, layers: layerSnapshot, rootGridId: Self.rootGridId,
                     rootRows: layerSnapshot.first(where: { $0.layer.gridId == Self.rootGridId })?.layer.rows ?? 0,
                     rootHasFont: false,
                     gridOrigin: .zero, cellWidthPx: cellWidthPx, cellHeightPx: cellHeightPx,
-                    scratch: &shaderGridRectScratch)
+                    scratch: &shaderLayerScratch)
                 return u
             },
             prepareCopy: { copyRPD in

@@ -1041,8 +1041,17 @@ typedef enum {
     ZONVIE_SHADER_TARGET_GLSL = 2, /* GLSL 330 core (OpenGL 3.3 on Linux); resources bind by name */
 } zonvie_shader_target;
 
-/* Entries of iGridRects, three vec4 each. */
-#define ZONVIE_SHADER_GRID_RECTS_MAX 16
+/* Entries of iLayers, three vec4 each. */
+#define ZONVIE_SHADER_LAYERS_MAX 16
+
+/* iLayers entry flags: the .w word of [3i+2], as a float holding a small
+   integer. FLOAT: placed by win_float_pos. FONT_GRID: the layer has its own
+   font (the cell in [3i+1] is that font's). FOCUSABLE, BORDER: reserved; 0
+   until the frontends carry the data. */
+#define ZONVIE_SHADER_LAYER_FLOAT     (1u << 0)
+#define ZONVIE_SHADER_LAYER_FONT_GRID (1u << 1)
+#define ZONVIE_SHADER_LAYER_FOCUSABLE (1u << 2)
+#define ZONVIE_SHADER_LAYER_BORDER    (1u << 3)
 
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
@@ -1105,28 +1114,28 @@ typedef struct zonvie_shader_uniforms {
     /* Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
        the surface root's cell; iCursorCellSize is the cell of the grid the
        cursor is in, which the cursor styles are classified against.
-       iGridRects lists, topmost first, the layers down to the lowest one in
-       its own font, three vec4 each; see zonvie_shader_fill_grid_rects. */
+       iLayers lists, topmost first, the layers down to the lowest one in
+       its own font, three vec4 each; see zonvie_shader_fill_layers. */
     float    iCursorCellSize[2];      /* 192..199 */
-    int32_t  iGridRectCount;          /* 200..203 */
+    int32_t  iLayerCount;             /* 200..203 */
     int32_t  iRootRows;               /* 204..207  rows of the surface lattice */
-    float    iGridRects[ZONVIE_SHADER_GRID_RECTS_MAX * 3][4]; /* 208..975 */
+    float    iLayers[ZONVIE_SHADER_LAYERS_MAX * 3][4]; /* 208..975 */
 } zonvie_shader_uniforms;
 
-/* One layer of a surface for zonvie_shader_fill_grid_rects. The rect is in
+/* One layer of a surface for zonvie_shader_fill_layers. The rect is in
    fragCoord space: the surface's iGridOrigin plus the layer's origin. A grid
    in its own font gives its cell and its extent (margin included); any
    other layer cell 0 and rows x cols global cells, except under a root in
    its own font, where every layer gives a cell (its text has a band). z is
    the layer's back-to-front rank (zonvie_layer.z), unique per surface. */
-typedef struct zonvie_shader_grid_rect {
+typedef struct zonvie_shader_layer {
     int64_t  grid_id;
     float    x_px, y_px, w_px, h_px;
     float    cell_w_px, cell_h_px;
     uint32_t rows, cols;
     uint32_t z;
-    uint32_t _pad;
-} zonvie_shader_grid_rect;
+    uint32_t flags;      /* ZONVIE_SHADER_LAYER_*; FONT_GRID is ignored here */
+} zonvie_shader_layer;
 
 /* ---------------------------------------------------------------------------
    iCellAge stores.
@@ -1241,20 +1250,26 @@ ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
     float grid_origin_x_px, float grid_origin_y_px,
     float time_last_edit, bool cursor_visible, bool wants_edit_inputs);
 
-/* Fill iRootRows and iGridRects of `u` from a surface's `n` layers, which
+/* Fill iRootRows and iLayers of `u` from a surface's `n` layers, which
    must be every layer of the surface but its root: band rows are summed
    over them. An empty table when no layer has a cell. Otherwise, topmost
    first, every layer down to the lowest one with a cell, at most
-   ZONVIE_SHADER_GRID_RECTS_MAX. The lowest layers past that have no entry:
+   ZONVIE_SHADER_LAYERS_MAX. The lowest layers past that have no entry:
    where no listed layer covers them the shader reads the surface lattice,
    which holds what lies under a layer in its own font (under a root in its
    own font, the root's text), not that layer's. [3i] the rect; [3i+1] cell w, h and the first
    iCellText row of the grid's band, all zero for a layer on the surface
-   lattice, .w unused; [3i+2] rows, cols, .zw unused. Bands follow the
+   lattice, .w unused; [3i+2] rows, cols, grid id, flags. Bands follow the
    root's rows in grid-id order, the rule the core writes on_cell_text_row
-   by. Pure. */
-ZONVIE_API void zonvie_shader_fill_grid_rects(zonvie_shader_uniforms *u,
-    const zonvie_shader_grid_rect *rects, size_t n, uint32_t root_rows);
+   by. Pure.
+   Pre: every |grid_id| < 1 << 24 (exact in a float; negative ids of the
+   core's special grids are valid; checked by a debug assert before any write);
+   rects may be NULL only when n == 0; ids and z are unique per surface.
+   Post: iRootRows == root_rows; iLayerCount in [0, MAX]; entries past
+   iLayerCount are untouched and must not be read; flags word = the
+   caller's flags with FONT_GRID set exactly when the layer has a cell. */
+ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
+    const zonvie_shader_layer *layers, size_t n, uint32_t root_rows);
 
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */

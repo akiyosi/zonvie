@@ -145,9 +145,9 @@ const shadertoy_preamble =
     \\    int iPreviousCursorStyle;
     \\    // Per-grid cell geometry (see zonvieCellGeom).
     \\    vec2 iCursorCellSize;
-    \\    int iGridRectCount;
+    \\    int iLayerCount;
     \\    int iRootRows;
-    \\    vec4 iGridRects[48];
+    \\    vec4 iLayers[48];
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;
@@ -200,22 +200,35 @@ const shadertoy_preamble =
     \\    return off;
     \\}
     \\
+    \\// The layer table, topmost first: the layers of the surface down to the
+    \\// lowest one in its own font. Entry i is its rect (x, y, w, h in
+    \\// fragCoord px), then its cell (w, h px) and first iCellText row, then
+    \\// (rows, cols, grid id, flags); flags are the ZONVIE_SHADER_LAYER_* bits.
+    \\#define ZONVIE_SHADER_LAYER_FLOAT 1u
+    \\#define ZONVIE_SHADER_LAYER_FONT_GRID 2u
+    \\#define ZONVIE_SHADER_LAYER_FOCUSABLE 4u
+    \\#define ZONVIE_SHADER_LAYER_BORDER 8u
+    \\int zonvieLayerCount() { return iLayerCount; }
+    \\vec4 zonvieLayerRect(int i) { return iLayers[3 * i]; }
+    \\int zonvieLayerGrid(int i) { return int(iLayers[3 * i + 2].z); }
+    \\uint zonvieLayerFlags(int i) { return uint(iLayers[3 * i + 2].w); }
+    \\
     \\// The cell under a screen-space pixel: its iCellText index, and where it
     \\// is drawn (top-left and size, in fragCoord pixels; a smooth scroll in
     \\// progress included). A grid in its own font has its own cell size and
-    \\// its text in a band of iCellText below the root's rows; iGridRects
+    \\// its text in a band of iCellText below the root's rows; iLayers
     \\// lists it, with the layers over it. Everything else is the surface
     \\// lattice. False off the grid.
     \\bool zonvieCellGeom(vec2 frag_px, out ivec2 cell, out vec2 cellMin, out vec2 cellSize) {
     \\    cell = ivec2(-1);
     \\    cellMin = frag_px;
     \\    cellSize = iCellSize;
-    \\    for (int i = 0; i < iGridRectCount; ++i) {
-    \\        vec4 r = iGridRects[3 * i];
+    \\    for (int i = 0; i < iLayerCount; ++i) {
+    \\        vec4 r = iLayers[3 * i];
     \\        if (frag_px.x < r.x || frag_px.y < r.y || frag_px.x >= r.x + r.z || frag_px.y >= r.y + r.w) continue;
-    \\        vec4 g = iGridRects[3 * i + 1];
-    \\        if (g.x <= 0.0) break;
-    \\        vec4 rc = iGridRects[3 * i + 2];
+    \\        vec4 g = iLayers[3 * i + 1];
+    \\        if ((zonvieLayerFlags(i) & ZONVIE_SHADER_LAYER_FONT_GRID) == 0u) break;
+    \\        vec4 rc = iLayers[3 * i + 2];
     \\        vec2 local = floor((frag_px - r.xy) / g.xy);
     \\        // The bottom margin belongs to the last row, as it is drawn.
     \\        local.y = min(local.y, rc.x - 1.0);
@@ -590,7 +603,7 @@ const thymer_reference_glsl =
     \\}
 ;
 
-test "preamble uniform block matches zonvie_shader_uniforms offsets" {
+test "preamble iLayers offsets match zonvie_shader_uniforms" {
     // std140 alignment silently shifts every field below a misaligned one,
     // which compiles fine and then reads the wrong bytes at runtime — that is
     // exactly how the cursor style ended up reading past the end of the
@@ -600,7 +613,8 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
         \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         \\    float a = iCellSize.x + iGridOrigin.y + iTimeLastEdit;
         \\    float b = float(iCursorVisible + iCurrentCursorStyle + iPreviousCursorStyle);
-        \\    float c = iCursorCellSize.x + float(iGridRectCount + iRootRows) + iGridRects[47].w;
+        \\    float c = iCursorCellSize.x + float(iLayerCount + iRootRows) + iLayers[47].w;
+        \\    c += zonvieLayerRect(0).x + float(zonvieLayerCount() + zonvieLayerGrid(0)) + float(zonvieLayerFlags(0) & ZONVIE_SHADER_LAYER_FLOAT);
         \\    fragColor = vec4(a, b, c, 1.0);
         \\}
     ;
@@ -627,9 +641,9 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
     // Types as well as order: a vec3 there would still be in order and
     // without padding, and push every later field off its C offset.
     const i_ccs = std.mem.indexOf(u8, tail, "float2 iCursorCellSize") orelse return error.NoCursorCellSize;
-    const i_cnt = std.mem.indexOf(u8, tail, "int iGridRectCount") orelse return error.NoGridRectCount;
+    const i_cnt = std.mem.indexOf(u8, tail, "int iLayerCount") orelse return error.NoLayerCount;
     const i_rows = std.mem.indexOf(u8, tail, "int iRootRows") orelse return error.NoRootRows;
-    const i_rects = std.mem.indexOf(u8, tail, "float4 iGridRects[48]") orelse return error.NoGridRects;
+    const i_rects = std.mem.indexOf(u8, tail, "float4 iLayers[48]") orelse return error.NoLayers;
     try std.testing.expect(i_prev < i_ccs);
     try std.testing.expect(i_ccs < i_cnt);
     try std.testing.expect(i_cnt < i_rows);

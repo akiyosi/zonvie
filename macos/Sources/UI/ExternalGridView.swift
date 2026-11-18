@@ -159,8 +159,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// This surface's own grid is not a layer here; the main renderer's entry 0
     /// is its root.
     private var layerSnapshot: [SurfaceLayerFrame] = []
-    /// zonvie_shader_fill_grid_rects input, reused frame to frame.
-    private var shaderGridRectScratch: [zonvie_shader_grid_rect] = []
+    /// zonvie_shader_fill_layers input, reused frame to frame.
+    private var shaderLayerScratch: [zonvie_shader_layer] = []
     /// This frame's damage bands. Draw thread only.
     private let damageBands = SurfaceDamageBands()
     /// Rows each hosted layer's committed placement has travelled upwards
@@ -3563,12 +3563,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     cellAgeGrid: self.gridId,
                     lastLoggedCursor: &self.lastLoggedShaderCursor
                 )
-                SharedRenderResources.fillShaderGridRects(
+                SharedRenderResources.fillShaderLayers(
                     &u, layers: self.layerSnapshot, rootGridId: self.gridId,
                     rootRows: Int(f.snapGridRows), rootHasFont: f.rootFont != nil,
                     gridOrigin: gridOrigin,
                     cellWidthPx: self.shared.cellWidthPx, cellHeightPx: self.shared.cellHeightPx,
-                    scratch: &self.shaderGridRectScratch)
+                    scratch: &self.shaderLayerScratch)
                 return u
             }
         )

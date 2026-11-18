@@ -900,7 +900,7 @@ typedef struct zonvie_cell_stamp {
    own font, is the exception: its cells are not on the surface's lattice,
    so its rows go to a band of their own below the root's rows, from column
    0, and it covers nothing beneath. Bands follow in grid-id order
-   (zonvie_shader_fill_grid_rects states the same rule to the shader).
+   (zonvie_shader_fill_layers states the same rule to the shader).
    tex_rows x tex_cols is that texture's cell grid: the root's rows plus
    every band, as wide as the widest of the root and the bands; a change
    of either starts the texture blank. On that, and on any move of a band,

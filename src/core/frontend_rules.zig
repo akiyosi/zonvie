@@ -1213,7 +1213,8 @@ pub fn shaderNeedsAnimation(source: []const u8) bool {
 pub fn shaderUsesEditInputs(source: []const u8) bool {
     return containsAnyWord(source, &.{
         "iCellAge",       "zonvieCellAge",  "iCellSize",      "iGridOrigin", "iTimeLastEdit",
-        "zonvieCellAt",   "zonvieCellGeom", "iCursorCellSize", "iGridRects", "iGridRectCount",
+        "zonvieCellAt",   "zonvieCellGeom", "iCursorCellSize", "iLayers", "iLayerCount",
+        "zonvieLayerCount", "zonvieLayerRect", "zonvieLayerGrid", "zonvieLayerFlags",
         "iRootRows",
     }) or shaderUsesCellText(source);
 }
@@ -1269,6 +1270,8 @@ test "a shader animates when it reads a per-frame uniform as a whole word" {
 test "a shader uses the edit inputs only when it names one as a whole word" {
     try std.testing.expect(shaderUsesEditInputs("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(shaderUsesEditInputs("vec2 cs = iCellSize;"));
+    try std.testing.expect(shaderUsesEditInputs("vec4 r = iLayers[0];"));
+    try std.testing.expect(shaderUsesEditInputs("vec4 r = zonvieLayerRect(0);"));
     try std.testing.expect(shaderUsesEditInputs("float a = zonvieCellAge(fragCoord) + iTime;"));
     try std.testing.expect(!shaderUsesEditInputs("float myiCellAge = 1.0;"));
     try std.testing.expect(!shaderUsesEditInputs("fragColor = vec4(sin(iTime));"));
