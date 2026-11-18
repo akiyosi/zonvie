@@ -1139,6 +1139,14 @@ typedef struct zonvie_shader_uniforms {
     int32_t  iLayerCount;             /* 200..203 */
     int32_t  iRootRows;               /* 204..207  rows of the surface lattice */
     float    iLayers[ZONVIE_SHADER_LAYERS_MAX * 3][4]; /* 208..975 */
+    /* Ghostty's colour uniforms, vec3 rgb in 0..1 in a 16-byte std140
+       slot ([3] is padding, 0); see zonvie_shader_fill_colors. Their
+       names are declared by the preamble, so a user shader that declares
+       its own iCursorColor (etc.) fails to compile, as in Ghostty. */
+    float    iBackgroundColor[4];     /* 976..991   default background */
+    float    iForegroundColor[4];     /* 992..1007  default foreground */
+    float    iCursorColor[4];         /* 1008..1023 cursor fill */
+    float    iCursorText[4];          /* 1024..1039 text drawn on the cursor */
 } zonvie_shader_uniforms;
 
 /* One layer of a surface for zonvie_shader_fill_layers. The rect is in
@@ -1296,6 +1304,16 @@ ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
    caller's flags with FONT_GRID set exactly when the layer has a cell. */
 ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
     const zonvie_shader_layer *layers, size_t n, uint32_t root_rows);
+
+/* Fill iBackgroundColor, iForegroundColor, iCursorColor and iCursorText of
+   `u` from the core's latest colour snapshot: Neovim's default colours,
+   and the cursor attr's bg (fill) and fg (text), or default fg and bg
+   when the cursor has attr 0 (the Nvim swap the drawn cursor uses). The
+   snapshot is published at each cursor emission and on a default-colour
+   change, and is read whole (never a mix of two). Any thread.
+   Pre: u non-NULL; core NULL leaves u unchanged.
+   Post: only bytes 976..1039 written; each channel = byte/255, [3] = 0. */
+ZONVIE_API void zonvie_shader_fill_colors(const zonvie_core *core, zonvie_shader_uniforms *u);
 
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */

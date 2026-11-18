@@ -596,6 +596,44 @@ pub const SavedLedger = struct {
     live: bool = false,
 };
 
+/// Seqlocked snapshot of the colours behind the Ghostty colour uniforms,
+/// rgb24 each. One writer (grid_mu held), any number of lock-free readers;
+/// a read returns one whole published snapshot, never a mix of two.
+pub const ShaderColors = struct {
+    pub const Snapshot = struct { default_fg: u32, default_bg: u32, cursor: u32, cursor_text: u32 };
+
+    /// Odd while a write is in progress.
+    seq: std.atomic.Value(u32) = .init(0),
+    vals: [4]std.atomic.Value(u32) = .{ .init(0xFFFFFF), .init(0), .init(0xFFFFFF), .init(0) },
+
+    pub fn write(self: *ShaderColors, s: Snapshot) void {
+        const v = [4]u32{ s.default_fg, s.default_bg, s.cursor, s.cursor_text };
+        const seq0 = self.seq.load(.monotonic);
+        std.debug.assert(seq0 & 1 == 0);
+        self.seq.store(seq0 +% 1, .monotonic);
+        // Release on each value orders the odd seq before it, so a reader
+        // that sees any new value also sees the write in progress.
+        for (&self.vals, v) |*slot, x| slot.store(x, .release);
+        self.seq.store(seq0 +% 2, .release);
+    }
+
+    pub fn read(self: *const ShaderColors) Snapshot {
+        while (true) {
+            const s1 = self.seq.load(.acquire);
+            if (s1 & 1 != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            var v: [4]u32 = undefined;
+            for (&v, &self.vals) |*x, *slot| x.* = slot.load(.acquire);
+            const s2 = self.seq.load(.monotonic);
+            if (s1 != s2) continue;
+            std.debug.assert(s2 & 1 == 0);
+            return .{ .default_fg = v[0], .default_bg = v[1], .cursor = v[2], .cursor_text = v[3] };
+        }
+    }
+};
+
 pub const Core = struct {
     pub const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
     const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
@@ -973,6 +1011,9 @@ pub const Core = struct {
     /// Empty whenever no group is declared, so the flush skips the lookup.
     /// Rebuilt with the glow set and on set_shader_hl_groups, never per flush.
     shader_hl_masks: std.ArrayListUnmanaged(u32) = .empty,
+    /// The Ghostty colour uniforms' source, read by zonvie_shader_fill_colors
+    /// from any thread. Written only with grid_mu held.
+    shader_colors: ShaderColors = .{},
     /// One row of cell texels (4 u32 per cell) for on_cell_text_row; sized
     /// in onFlush while cell text is on, so the row loop never allocates.
     cell_texel_scratch: std.ArrayListUnmanaged(u32) = .empty,
@@ -5569,6 +5610,20 @@ pub const Core = struct {
     pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool) void {
         if (groups_changed) self.rebuildShaderHlMasks();
         if (self.hl.default_colors_changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+        if (self.hl.default_colors_changed) self.publishShaderColors();
+    }
+
+    /// Publish the shader colour snapshot from the current defaults and
+    /// cursor attr. cursor = the attr's bg, cursor_text = its fg; attr 0
+    /// swaps the defaults (Nvim spec), as the cursor quads do. grid_mu held.
+    pub fn publishShaderColors(self: *Core) void {
+        const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
+        self.shader_colors.write(.{
+            .default_fg = self.hl.default_fg & 0xFFFFFF,
+            .default_bg = self.hl.default_bg & 0xFFFFFF,
+            .cursor = (if (attr) |a| a.bg else self.hl.default_fg) & 0xFFFFFF,
+            .cursor_text = (if (attr) |a| a.fg else self.hl.default_bg) & 0xFFFFFF,
+        });
     }
 
     /// Say, once per attribute id, that a cell asked to glow and was refused.
@@ -10193,4 +10248,51 @@ test "new default colours resend every surface's text only while cell text is on
     core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
     core.refreshShaderTexelSources(false);
     try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "with cursor attr 0 the shader colours swap the defaults" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    core.grid.cursor_attr_id = 0;
+    core.refreshShaderTexelSources(false);
+    const s = core.shader_colors.read();
+    try std.testing.expectEqual(@as(u32, 0x112233), s.default_fg);
+    try std.testing.expectEqual(@as(u32, 0x445566), s.default_bg);
+    try std.testing.expectEqual(s.default_fg, s.cursor);
+    try std.testing.expectEqual(s.default_bg, s.cursor_text);
+}
+
+test "a cursor attr gives the cursor its bg and the cursor text its fg" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    try core.hl.define(7, 0xAA0000, 0x00BB00, null, false, 0, .{}, false);
+    core.grid.cursor_attr_id = 7;
+    core.publishShaderColors();
+    const s = core.shader_colors.read();
+    try std.testing.expectEqual(@as(u32, 0x00BB00), s.cursor);
+    try std.testing.expectEqual(@as(u32, 0xAA0000), s.cursor_text);
+}
+
+test "a shader colour read never returns a mix of two snapshots" {
+    var sc: ShaderColors = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    const Writer = struct {
+        fn run(c: *ShaderColors, st: *std.atomic.Value(bool)) void {
+            var i: u32 = 1;
+            while (!st.load(.acquire)) : (i = (i + 1) & 0xFFFFFF) {
+                c.write(.{ .default_fg = i, .default_bg = i, .cursor = i, .cursor_text = i });
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ &sc, &stop });
+    var n: usize = 0;
+    while (n < 200_000) : (n += 1) {
+        const s = sc.read();
+        if (s.default_fg == 0xFFFFFF and s.default_bg == 0) continue; // initial value
+        try std.testing.expect(s.default_fg == s.default_bg and s.default_bg == s.cursor and s.cursor == s.cursor_text);
+    }
+    stop.store(true, .release);
+    t.join();
 }

@@ -1223,7 +1223,12 @@ pub fn shaderUsesEditInputs(source: []const u8) bool {
 /// preamble's zonvieCellText wrappers). Gates the row deliveries and the
 /// texture, which an age-only shader never pays for.
 pub fn shaderUsesCellText(source: []const u8) bool {
-    return containsAnyWord(source, &.{ "iCellText", "zonvieCellText", "zonvieCellTextAt" });
+    return containsAnyWord(source, &.{
+        "iCellText",          "zonvieCellText",     "zonvieCellTextAt",  "zonvieCellAt4",
+        "zonvieCellFg",       "zonvieCellFgAt",     "zonvieCellBg",      "zonvieCellBgAt",
+        "zonvieCellAttr",     "zonvieCellAttrAt",   "zonvieCellGroups",  "zonvieCellGroupsAt",
+        "zonvieCellHasGroup", "zonvieCellHasGroupAt",
+    });
 }
 
 /// Whether a shader reads iPrevFrame. Gates the feedback pair and the copy
@@ -1351,6 +1356,14 @@ test "a shader uses the cell text only when it names the texture or a wrapper" {
     try std.testing.expect(shaderUsesCellText("uint c = zonvieCellTextAt(cell + ivec2(1, 0));"));
     try std.testing.expect(!shaderUsesCellText("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(!shaderUsesCellText("uint myiCellText = 1u;"));
+    try std.testing.expect(shaderUsesCellText("vec3 b = zonvieCellBg(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("vec3 f = zonvieCellFgAt(c);"));
+    try std.testing.expect(shaderUsesCellText("uint a = zonvieCellAttr(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("bool h = zonvieCellHasGroupAt(c, 0);"));
+    try std.testing.expect(shaderUsesCellText("uint g = zonvieCellGroups(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("uvec4 t = zonvieCellAt4(c);"));
+    // The colour uniforms need no cell text.
+    try std.testing.expect(!shaderUsesCellText("vec3 c = iCursorText + iBackgroundColor;"));
     // The text is an edit input: reading it alone must switch the core on.
     try std.testing.expect(shaderUsesEditInputs("if (zonvieCellText(fragCoord) == 0x5Bu) {}"));
 }

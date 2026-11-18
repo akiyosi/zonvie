@@ -3941,6 +3941,12 @@ pub const zonvie_shader_uniforms = extern struct {
     iLayerCount: i32 = 0, // 200..203
     iRootRows: i32 = 0, // 204..207
     iLayers: [SHADER_LAYERS_MAX * 3][4]f32 = @splat(@splat(0)), // 208..975
+    // Ghostty colour uniforms (vec3 in a 16-byte std140 slot; [3] is
+    // padding and stays 0). Filled by zonvie_shader_fill_colors.
+    iBackgroundColor: [4]f32 = .{ 0, 0, 0, 0 }, // 976..991
+    iForegroundColor: [4]f32 = .{ 0, 0, 0, 0 }, // 992..1007
+    iCursorColor: [4]f32 = .{ 0, 0, 0, 0 }, // 1008..1023
+    iCursorText: [4]f32 = .{ 0, 0, 0, 0 }, // 1024..1039
 };
 
 pub const SHADER_LAYERS_MAX = 16;
@@ -3955,8 +3961,51 @@ pub const SHADER_INPUT_CELL_AGE: u32 = 1 << 0;
 pub const SHADER_INPUT_CELL_TEXT: u32 = 1 << 1;
 
 comptime {
-    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 976);
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 1040);
     std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iLayers") == 208);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iBackgroundColor") == 976);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iForegroundColor") == 992);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iCursorColor") == 1008);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iCursorText") == 1024);
+}
+
+/// rgb24 (0xRRGGBB) to a std140 vec3 slot, each channel /255, pad 0.
+fn rgb24ToSlot(rgb: u32) [4]f32 {
+    std.debug.assert(rgb <= 0xFFFFFF);
+    return .{
+        @as(f32, @floatFromInt((rgb >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((rgb >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(rgb & 0xFF)) / 255.0,
+        0,
+    };
+}
+
+/// Pure packing of a colour snapshot {default_bg, default_fg, cursor,
+/// cursor_text} (rgb24 each, in uniform order) into the four slots at
+/// 976..1039. Pre: every value <= 0xFFFFFF.
+pub fn colorsToUniform(c: [4]u32) [4][4]f32 {
+    return .{ rgb24ToSlot(c[0]), rgb24ToSlot(c[1]), rgb24ToSlot(c[2]), rgb24ToSlot(c[3]) };
+}
+
+/// Write iBackgroundColor, iForegroundColor, iCursorColor and iCursorText
+/// from the core's latest published colour snapshot. Touches only bytes
+/// 976..1039 of `u`. Safe from any thread.
+pub export fn zonvie_shader_fill_colors(p: ?*const zonvie_core, u: *zonvie_shader_uniforms) callconv(.c) void {
+    const box: *const CoreBox = @ptrCast(@alignCast(p orelse return));
+    const s = box.core.shader_colors.read();
+    const slots = colorsToUniform(.{ s.default_bg, s.default_fg, s.cursor, s.cursor_text });
+    u.iBackgroundColor = slots[0];
+    u.iForegroundColor = slots[1];
+    u.iCursorColor = slots[2];
+    u.iCursorText = slots[3];
+}
+
+test "colorsToUniform unpacks rgb24 to /255 channels with a zero pad" {
+    const s = colorsToUniform(.{ 0xFF8000, 0x000000, 0xFFFFFF, 0x0080FF });
+    try std.testing.expectEqual([4]f32{ 1.0, 128.0 / 255.0, 0, 0 }, s[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, s[1]);
+    try std.testing.expectEqual([4]f32{ 1, 1, 1, 0 }, s[2]);
+    try std.testing.expectEqual([4]f32{ 0, 128.0 / 255.0, 1, 0 }, s[3]);
 }
 
 /// One layer of a surface as zonvie_shader_fill_layers reads it. The

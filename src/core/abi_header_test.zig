@@ -160,6 +160,16 @@ test "extern structs and callbacks match include/zonvie_core.h" {
     try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACKS_ABI_VERSION), c_api.CALLBACKS_ABI_VERSION);
 }
 
+test "the header's Ghostty colour uniforms sit at 976/992/1008/1024 in 1040 bytes" {
+    const U = c.zonvie_shader_uniforms;
+    try std.testing.expectEqual(@as(usize, 1040), @sizeOf(U));
+    try std.testing.expectEqual(@as(usize, 976), @offsetOf(U, "iBackgroundColor"));
+    try std.testing.expectEqual(@as(usize, 992), @offsetOf(U, "iForegroundColor"));
+    try std.testing.expectEqual(@as(usize, 1008), @offsetOf(U, "iCursorColor"));
+    try std.testing.expectEqual(@as(usize, 1024), @offsetOf(U, "iCursorText"));
+    try std.testing.expect(@hasDecl(c, "zonvie_shader_fill_colors"));
+}
+
 // Separate import: zonvie_hbft.h declares the C bridge's functions, which
 // c_api.zig does not export, so it stays out of the export check above.
 const hbft = @cImport(@cInclude("zonvie_hbft.h"));

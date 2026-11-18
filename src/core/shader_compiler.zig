@@ -148,6 +148,15 @@ const shadertoy_preamble =
     \\    int iLayerCount;
     \\    int iRootRows;
     \\    vec4 iLayers[48];
+    \\    // Ghostty's terminal colours, linear 0..1 rgb: the default background
+    \\    // and foreground, the cursor's fill and the text drawn on it. Each
+    \\    // vec3 fills a 16-byte std140 slot (976, 992, 1008, 1024). These are
+    \\    // preamble names, so a user shader that redeclares one fails to
+    \\    // compile, as it does in Ghostty.
+    \\    vec3 iBackgroundColor;
+    \\    vec3 iForegroundColor;
+    \\    vec3 iCursorColor;
+    \\    vec3 iCursorText;
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;
@@ -283,6 +292,40 @@ const shadertoy_preamble =
     \\uint zonvieCellText(vec2 frag_px) {
     \\    return zonvieCellTextAt(zonvieCellAt(frag_px));
     \\}
+    \\
+    \\// The whole texel of the cell at grid index `cell`, 0 outside the
+    \\// texture: x codepoint, y fg rgb24 | attr bits << 24, z bg rgb24,
+    \\// w hl-group mask (bit i = the i-th name in @zonvie-hl-groups).
+    \\// All-zero means no row has been delivered for that cell.
+    \\#define ZONVIE_ATTR_BOLD 1u
+    \\#define ZONVIE_ATTR_ITALIC 2u
+    \\#define ZONVIE_ATTR_STRIKETHROUGH 4u
+    \\#define ZONVIE_ATTR_UNDERLINE 8u
+    \\#define ZONVIE_ATTR_UNDERCURL 16u
+    \\#define ZONVIE_ATTR_UNDERDOUBLE 32u
+    \\#define ZONVIE_ATTR_UNDERDOTTED 64u
+    \\#define ZONVIE_ATTR_UNDERDASHED 128u
+    \\uvec4 zonvieCellAt4(ivec2 cell) {
+    \\    ivec2 dim = textureSize(iCellText, 0);
+    \\    if (cell.x < 0 || cell.y < 0 || cell.x >= dim.x || cell.y >= dim.y) return uvec4(0u);
+    \\    return texelFetch(iCellText, cell, 0);
+    \\}
+    \\vec3 zonvieRgb24(uint c) {
+    \\    return vec3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u)) / 255.0;
+    \\}
+    \\// Drawn colours: reverse applied, defaults substituted.
+    \\vec3 zonvieCellFgAt(ivec2 cell) { return zonvieRgb24(zonvieCellAt4(cell).y); }
+    \\vec3 zonvieCellBgAt(ivec2 cell) { return zonvieRgb24(zonvieCellAt4(cell).z); }
+    \\uint zonvieCellAttrAt(ivec2 cell) { return zonvieCellAt4(cell).y >> 24; }
+    \\uint zonvieCellGroupsAt(ivec2 cell) { return zonvieCellAt4(cell).w; }
+    \\bool zonvieCellHasGroupAt(ivec2 cell, int i) {
+    \\    return i >= 0 && i < 32 && (zonvieCellGroupsAt(cell) & (1u << uint(i))) != 0u;
+    \\}
+    \\vec3 zonvieCellFg(vec2 frag_px) { return zonvieCellFgAt(zonvieCellAt(frag_px)); }
+    \\vec3 zonvieCellBg(vec2 frag_px) { return zonvieCellBgAt(zonvieCellAt(frag_px)); }
+    \\uint zonvieCellAttr(vec2 frag_px) { return zonvieCellAttrAt(zonvieCellAt(frag_px)); }
+    \\uint zonvieCellGroups(vec2 frag_px) { return zonvieCellGroupsAt(zonvieCellAt(frag_px)); }
+    \\bool zonvieCellHasGroup(vec2 frag_px, int i) { return zonvieCellHasGroupAt(zonvieCellAt(frag_px), i); }
     \\
     \\// ----- user source (mainImage) follows -----
     \\
@@ -660,6 +703,95 @@ test "preamble iLayers offsets match zonvie_shader_uniforms" {
     const pad_region = tail[0..i_cell];
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 _zonvie_pad") == null);
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "_zonvie_pad_cursor2") != null);
+}
+
+const ghostty_colour_glsl =
+    \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    \\    vec3 c = iCursorText.rgb + iBackgroundColor + iForegroundColor + iCursorColor;
+    \\    fragColor = vec4(c + vec3(iLayers[47].w), 1.0);
+    \\}
+;
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in HLSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    // packoffset(cN) is byte N*16: c61 = 976 ... c64 = 1024.
+    try std.testing.expect(std.mem.indexOf(u8, out, "float4 _25_iLayers[48] : packoffset(c13);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iBackgroundColor : packoffset(c61);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iForegroundColor : packoffset(c62);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iCursorColor : packoffset(c63);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iCursorText : packoffset(c64);") != null);
+}
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in MSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .msl);
+    defer std.testing.allocator.free(out);
+    // An MSL float3 is 16-byte aligned and sized, so four float3s straight
+    // after the 768-byte table at 208 land on 976, 992, 1008, 1024. A
+    // packed_float3 or a padding member would move them.
+    try std.testing.expect(std.mem.indexOf(u8, out,
+        \\    float4 iLayers[48];
+        \\    float3 iBackgroundColor;
+        \\    float3 iForegroundColor;
+        \\    float3 iCursorColor;
+        \\    float3 iCursorText;
+        \\};
+    ) != null);
+}
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in GL 3.3 GLSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .glsl);
+    defer std.testing.allocator.free(out);
+    // std140 gives each vec3 a 16-byte slot after the vec4 array.
+    try std.testing.expect(std.mem.indexOf(u8, out, "std140") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out,
+        \\    vec4 iLayers[48];
+        \\    vec3 iBackgroundColor;
+        \\    vec3 iForegroundColor;
+        \\    vec3 iCursorColor;
+        \\    vec3 iCursorText;
+        \\}
+    ) != null);
+}
+
+test "a Phase 1 iCellText .r read and the per-cell accessors compile on all targets" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    uint cp = texelFetch(iCellText, ivec2(0), 0).r;
+        \\    vec3 c = zonvieCellFg(fragCoord) + zonvieCellBg(fragCoord) + zonvieCellFgAt(ivec2(1)) + zonvieCellBgAt(ivec2(1));
+        \\    uint a = zonvieCellAttr(fragCoord) | zonvieCellAttrAt(ivec2(1)) | zonvieCellGroups(fragCoord) | zonvieCellGroupsAt(ivec2(1)) | zonvieCellAt4(ivec2(2)).x;
+        \\    bool g = zonvieCellHasGroup(fragCoord, 0) || zonvieCellHasGroupAt(ivec2(1), 31);
+        \\    bool b = (a & (ZONVIE_ATTR_BOLD | ZONVIE_ATTR_UNDERDASHED)) != 0u;
+        \\    fragColor = vec4(c, float(cp) + (g || b ? 1.0 : 0.0));
+        \\}
+    ;
+    inline for (.{ .msl, .hlsl, .glsl }) |t| {
+        const out = try compileGlslToTarget(std.testing.allocator, glsl, t);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len > 0);
+    }
+}
+
+test "ZONVIE_ATTR_* match ZONVIE_CELL_ATTR_* bits" {
+    const hl = @import("highlight.zig");
+    const pairs = .{
+        .{ "BOLD", hl.STYLE_BOLD },               .{ "ITALIC", hl.STYLE_ITALIC },
+        .{ "STRIKETHROUGH", hl.STYLE_STRIKETHROUGH }, .{ "UNDERLINE", hl.STYLE_UNDERLINE },
+        .{ "UNDERCURL", hl.STYLE_UNDERCURL },     .{ "UNDERDOUBLE", hl.STYLE_UNDERDOUBLE },
+        .{ "UNDERDOTTED", hl.STYLE_UNDERDOTTED }, .{ "UNDERDASHED", hl.STYLE_UNDERDASHED },
+    };
+    inline for (pairs) |p| {
+        const line = std.fmt.comptimePrint("#define ZONVIE_ATTR_{s} {d}u\n", .{ p[0], p[1] });
+        try std.testing.expect(std.mem.indexOf(u8, shadertoy_preamble, line) != null);
+    }
+}
+
+test "a shader using the Ghostty colour names compiles on all targets" {
+    inline for (.{ .msl, .hlsl, .glsl }) |t| {
+        const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, t);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len > 0);
+    }
 }
 
 test "a Shadertoy shader compiles to GL 3.3 GLSL with name-bound resources" {
