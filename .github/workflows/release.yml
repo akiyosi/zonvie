@@ -18,10 +18,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # An explicit CPU model: without one Zig optimizes for the
+          # runner's own CPU, and the binary can trap with SIGILL on an
+          # older one. x86_64_v2 is SSE4.2 + POPCNT.
           - arch: arm64
             runner: macos-15
+            cpu: baseline
           - arch: x86_64
             runner: macos-15-intel
+            cpu: x86_64_v2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +51,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build Zig Core (macOS)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }}
 
       - name: Build macOS App (Release)
         run: |
@@ -125,10 +130,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # An explicit CPU model: without one Zig optimizes for the
+          # runner's own CPU (AVX-512 on x86_64), and the binary traps with
+          # SIGILL on an older one. x86_64_v2 is SSE4.2 + POPCNT.
           - arch: x86_64
             runner: ubuntu-24.04
+            cpu: x86_64_v2
           - arch: arm64
             runner: ubuntu-24.04-arm
+            cpu: baseline
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,7 +162,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build Linux App (Release)
-        run: zig build linux -Doptimize=ReleaseFast
+        run: zig build linux -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }}
 
       # The layout `zonvie --install` writes under $XDG_DATA_HOME, generated
       # by the binary itself, with Exec/Icon made relocatable.

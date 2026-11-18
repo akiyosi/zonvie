@@ -284,7 +284,12 @@ pub fn build(b: *std.Build) !void {
         },
     });
 
-    const is_cross = !target.query.isNative();
+    // A CPU model alone (-Dcpu, as the release build passes) still links
+    // against the host's system libraries, so only OS, arch and ABI count.
+    const host = @import("builtin");
+    const is_cross = target.result.os.tag != host.os.tag or
+        target.result.cpu.arch != host.cpu.arch or
+        target.result.abi != host.abi;
 
     const linux_exe = b.addExecutable(.{
         .name = "zonvie",
