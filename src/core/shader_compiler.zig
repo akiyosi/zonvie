@@ -148,7 +148,7 @@ const shadertoy_preamble =
     \\    int iLayerCount;
     \\    int iRootRows;
     \\    vec4 iLayers[48];
-    \\    // Ghostty's terminal colours, linear 0..1 rgb: the default background
+    \\    // Ghostty's terminal colours, sRGB 0..1 rgb (byte / 255): the default background
     \\    // and foreground, the cursor's fill and the text drawn on it. Each
     \\    // vec3 fills a 16-byte std140 slot (976, 992, 1008, 1024). These are
     \\    // preamble names, so a user shader that redeclares one fails to

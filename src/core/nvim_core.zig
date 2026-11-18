@@ -5551,26 +5551,28 @@ pub const Core = struct {
         \\S.names = names
         \\local function resolve(g)
         \\  while g do
-        \\    local r = vim.api.nvim_get_hl(0, { name = g, link = false })
+        \\    local r = vim.api.nvim_get_hl(0, { name = g, link = false, create = false })
         \\    r.default = nil
         \\    if next(r) ~= nil then return r end
         \\    g = g:match('^(.*)%.[^.]*$')
         \\  end
         \\end
-        \\function S.apply()
-        \\  for _, g in ipairs(S.names) do
-        \\    local cur = vim.api.nvim_get_hl(0, { name = g, link = true })
-        \\    local ours = S.wrote[g]
-        \\    if cur.link == nil and next(cur) ~= nil and not (ours and vim.deep_equal(cur, ours)) then
-        \\      S.wrote[g] = nil
-        \\    else
-        \\      local r = resolve(g)
-        \\      if r then
-        \\        vim.api.nvim_set_hl(0, g, r)
-        \\        S.wrote[g] = vim.api.nvim_get_hl(0, { name = g, link = true })
-        \\      end
+        \\local function one(g)
+        \\  local cur = vim.api.nvim_get_hl(0, { name = g, link = true, create = false })
+        \\  local ours = S.wrote[g]
+        \\  if cur.link == nil and next(cur) ~= nil and not (ours and vim.deep_equal(cur, ours)) then
+        \\    S.wrote[g] = nil
+        \\  else
+        \\    local r = resolve(g)
+        \\    if r then
+        \\      vim.api.nvim_set_hl(0, g, r)
+        \\      S.wrote[g] = vim.api.nvim_get_hl(0, { name = g, link = true, create = false })
         \\    end
         \\  end
+        \\end
+        \\function S.apply()
+        \\  -- One group's failure must not skip the rest.
+        \\  for _, g in ipairs(S.names) do pcall(one, g) end
         \\end
         \\local aug = vim.api.nvim_create_augroup('ZonvieShaderHlGroups', { clear = true })
         \\if #names > 0 then

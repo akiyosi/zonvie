@@ -888,7 +888,9 @@ ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len
    change to the old link target is not followed until the next
    ColorScheme, which re-applies. A group the user or a plugin defines
    directly is left alone. Declaring no names (after some) only removes the
-   ColorScheme autocmd; links are not restored. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
+   ColorScheme autocmd; links are not restored. Lookups never create a
+   group; the state lives in the Lua global `zonvie_shader_hl` and the
+   augroup `ZonvieShaderHlGroups`. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
    from inside a core callback. */
 ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
 
