@@ -2953,6 +2953,12 @@ pub fn runLoop(self: *Core) void {
         setupMouseScrollReporter(self);
         if (self.perGridFontsEnabled()) setupWindowFontHelper(self);
 
+        // Unlink the shader's declared groups in this session's Neovim.
+        self.grid_mu.lockUncancelable(clock.io());
+        self.markShaderHlUnlinkPendingLocked();
+        self.grid_mu.unlock(clock.io());
+        self.sendShaderHlUnlink();
+
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
             _ = cleanupSession(self, &child, have_child, true, false, false);

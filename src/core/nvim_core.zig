@@ -1011,6 +1011,11 @@ pub const Core = struct {
     /// Empty whenever no group is declared, so the flush skips the lookup.
     /// Rebuilt with the glow set and on set_shader_hl_groups, never per flush.
     shader_hl_masks: std.ArrayListUnmanaged(u32) = .empty,
+    /// grid_mu held. The declared set awaits its unlink call to Neovim
+    /// (sent once attached), and whether one was ever sent, so an emptied
+    /// declaration clears the ColorScheme augroup only where it exists.
+    shader_hl_unlink_pending: bool = false,
+    shader_hl_unlink_sent: bool = false,
     /// The Ghostty colour uniforms' source, read by zonvie_shader_fill_colors
     /// from any thread. Written only with grid_mu held.
     shader_colors: ShaderColors = .{},
@@ -5529,6 +5534,97 @@ pub const Core = struct {
         // Bit meanings changed: every texel on screen carries a stale w,
         // whatever the old table held (empty on a first declaration).
         if (self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+        self.markShaderHlUnlinkPendingLocked();
+    }
+
+    /// Run with the declared names as `...`. hl_attr_define's ext_hlstate
+    /// info names the group a `:hi link` chain ends at, so a linked group is
+    /// redefined with its resolved attributes (same look, own attr id). A
+    /// Treesitter name with no definition takes its dotted fallback's. A
+    /// group whose definition differs from what this chunk last wrote is the
+    /// user's or a plugin's and is left alone. ColorScheme re-applies; an
+    /// empty list only clears the augroup.
+    pub const shader_hl_unlink_lua =
+        \\local names = ...
+        \\local S = _G.zonvie_shader_hl or { wrote = {} }
+        \\_G.zonvie_shader_hl = S
+        \\S.names = names
+        \\local function resolve(g)
+        \\  while g do
+        \\    local r = vim.api.nvim_get_hl(0, { name = g, link = false })
+        \\    r.default = nil
+        \\    if next(r) ~= nil then return r end
+        \\    g = g:match('^(.*)%.[^.]*$')
+        \\  end
+        \\end
+        \\function S.apply()
+        \\  for _, g in ipairs(S.names) do
+        \\    local cur = vim.api.nvim_get_hl(0, { name = g, link = true })
+        \\    local ours = S.wrote[g]
+        \\    if cur.link == nil and next(cur) ~= nil and not (ours and vim.deep_equal(cur, ours)) then
+        \\      S.wrote[g] = nil
+        \\    else
+        \\      local r = resolve(g)
+        \\      if r then
+        \\        vim.api.nvim_set_hl(0, g, r)
+        \\        S.wrote[g] = vim.api.nvim_get_hl(0, { name = g, link = true })
+        \\      end
+        \\    end
+        \\  end
+        \\end
+        \\local aug = vim.api.nvim_create_augroup('ZonvieShaderHlGroups', { clear = true })
+        \\if #names > 0 then
+        \\  vim.api.nvim_create_autocmd('ColorScheme', { group = aug, callback = S.apply })
+        \\  S.apply()
+        \\end
+    ;
+
+    /// The nvim_exec_lua notification carrying `names` to shader_hl_unlink_lua.
+    pub fn packShaderHlUnlink(buf: *rpc.Buf, alloc: std.mem.Allocator, names: []const []const u8) !void {
+        try rpc.packArray(buf, alloc, 3);
+        try rpc.packInt(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, "nvim_exec_lua");
+        try rpc.packArray(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, shader_hl_unlink_lua);
+        try rpc.packArray(buf, alloc, 1);
+        try rpc.packArray(buf, alloc, names.len);
+        for (names) |n| try rpc.packStr(buf, alloc, n);
+    }
+
+    /// grid_mu held. Packs the pending unlink call into `buf` and clears the
+    /// pending mark; false (buf untouched) when nothing is pending or the
+    /// UI is not attached yet.
+    pub fn takeShaderHlUnlinkLocked(self: *Core, buf: *rpc.Buf) bool {
+        if (!self.shader_hl_unlink_pending or !self.ui_attached.load(.seq_cst)) return false;
+        packShaderHlUnlink(buf, self.alloc, self.shader_hl_groups.items) catch {
+            buf.clearRetainingCapacity();
+            return false;
+        };
+        self.shader_hl_unlink_pending = false;
+        self.shader_hl_unlink_sent = self.shader_hl_groups.items.len != 0;
+        return true;
+    }
+
+    /// Send the pending unlink call, if any. Takes grid_mu; sends after
+    /// releasing it. Called after set_shader_hl_groups and after ui_attach.
+    pub fn sendShaderHlUnlink(self: *Core) void {
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        self.grid_mu.lockUncancelable(clock.io());
+        const take = self.takeShaderHlUnlinkLocked(&buf);
+        self.grid_mu.unlock(clock.io());
+        if (!take) return;
+        self.sendRaw(buf.items) catch |e| {
+            self.log.write("shader hl unlink send failed: {any}\n", .{e});
+            return;
+        };
+        self.log.write("rpc send: shader hl unlink ({d} bytes)\n", .{buf.items.len});
+    }
+
+    /// grid_mu held. On a new declaration, and on attach (a new session's
+    /// Neovim holds none of the unlinked definitions).
+    pub fn markShaderHlUnlinkPendingLocked(self: *Core) void {
+        self.shader_hl_unlink_pending = self.shader_hl_groups.items.len != 0 or self.shader_hl_unlink_sent;
     }
 
     /// Whether group `name` is `wanted` or falls back to it by Neovim's
@@ -10194,6 +10290,55 @@ test "a Treesitter group with a language suffix matches the group it falls back 
     try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.heading.10"}));
     try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.head"}));
     try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"@markup"}, &.{"@markup.quote"}));
+}
+
+test "packShaderHlUnlink is an nvim_exec_lua notification with the names in order" {
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try Core.packShaderHlUnlink(&buf, std.testing.allocator, &.{ "markdownH1", "@markup.quote" });
+    // [2, "nvim_exec_lua", [chunk, [[names...]]]]
+    try std.testing.expectEqualSlices(u8, &.{ 0x93, 0x02, 0xad }, buf.items[0..3]);
+    try std.testing.expectEqualStrings("nvim_exec_lua", buf.items[3..16]);
+    const a = std.mem.indexOf(u8, buf.items, "\xaamarkdownH1").?;
+    const b = std.mem.indexOf(u8, buf.items, "\xad@markup.quote").?;
+    try std.testing.expect(a < b);
+    try std.testing.expectEqual(buf.items.len, b + 14);
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x92 }, buf.items[a - 2 .. a]);
+}
+
+test "the unlink call waits for attach, goes once, and an unchanged declaration sends nothing" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // Never declared: nothing, attached or not.
+    core.ui_attached.store(true, .seq_cst);
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.ui_attached.store(false, .seq_cst);
+
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: markdownH1\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    // Attach sends the queued call once.
+    core.ui_attached.store(true, .seq_cst);
+    core.markShaderHlUnlinkPendingLocked();
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "markdownH1") != null);
+    buf.clearRetainingCapacity();
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: markdownH1\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+
+    // Emptied after a send: one call with no names (clears the augroup).
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x90 }, buf.items[buf.items.len - 2 ..]);
+    buf.clearRetainingCapacity();
+    // A later attach has nothing left to clear.
+    core.markShaderHlUnlinkPendingLocked();
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
 }
 
 test "a mask rebuild that changes an existing id marks every surface dirty" {

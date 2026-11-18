@@ -880,7 +880,15 @@ ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len
    later redefinition of an attr; when a mask that cells may show changes
    while cell text is on, every surface's rows are redelivered by the next
    flush. With no name declared the core keeps no table and texels carry
-   w == 0. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
+   w == 0.
+   Neovim side effect: once attached, each declared group that is a `:hi
+   link` (or, for a dotted Treesitter name, undefined) is redefined in
+   Neovim with its resolved attributes, so cells report it by its own name.
+   It looks the same, `:hi` shows a direct definition, and a later `:hi`
+   change to the old link target is not followed until the next
+   ColorScheme, which re-applies. A group the user or a plugin defines
+   directly is left alone. Declaring no names (after some) only removes the
+   ColorScheme autocmd; links are not restored. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
    from inside a core callback. */
 ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
 

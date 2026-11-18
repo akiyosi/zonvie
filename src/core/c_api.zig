@@ -1667,6 +1667,7 @@ pub export fn zonvie_core_set_shader_hl_groups(p: ?*zonvie_core, source: ?[*]con
     box.core.grid_mu.lockUncancelable(clock.io());
     box.core.setShaderHlGroupsLocked(src);
     box.core.grid_mu.unlock(clock.io());
+    box.core.sendShaderHlUnlink();
 }
 
 /// One iCellText texel (zonvie_cell_text_row.texels): x codepoint, y fg rgb24
