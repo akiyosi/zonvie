@@ -1122,7 +1122,7 @@ typedef struct zonvie_callbacks {
        iCellAge texture a custom shader samples. Called at most once per
        flush, after all vertices are submitted and before on_flush_end, and
        ONLY after the frontend opted in with
-       zonvie_core_set_shader_inputs_enabled — a frontend without a custom
+       ZONVIE_SHADER_INPUT_CELL_AGE via zonvie_core_set_shader_inputs_enabled — a frontend without a custom
        shader never sees this callback and the core never builds the list.
 
        When `clear` is non-zero the frontend must zero EVERY cell-age
@@ -1153,8 +1153,8 @@ typedef struct zonvie_callbacks {
        covers (none when it is all covered), or one for a band row (see
        zonvie_cell_text_row). Also for rows the frontend keeps across a row
        shift, at their new place. ONLY after the frontend opted in with
-       zonvie_core_set_shader_inputs_enabled; the first flush after each
-       call that enables it delivers every row of every surface, so a
+       ZONVIE_SHADER_INPUT_CELL_TEXT via zonvie_core_set_shader_inputs_enabled;
+       the first flush after each call that sets that bit delivers every row of every surface, so a
        frontend may start its texture blank there. Rows not resent keep their
        previous codepoints, as with on_vertices_row. Runs on the core thread
        with grid_mu held. Appended at the end for ABI compat. */
@@ -1209,13 +1209,23 @@ ZONVIE_API void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
-/* Opt in to the per-flush cell-age stamp list delivered via
-   on_cell_age_stamps and the per-row codepoints delivered via
-   on_cell_text_row. Off by default: with it off the core builds no list
-   and never fires either callback, so a frontend without a custom shader
-   that reads the edit inputs pays nothing. Frontends toggle this when such
-   a shader is loaded or unloaded. */
-ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int enabled);
+/* Shader-input opt-in bits for zonvie_core_set_shader_inputs_enabled. */
+#define ZONVIE_SHADER_INPUT_CELL_AGE  (1u << 0)
+#define ZONVIE_SHADER_INPUT_CELL_TEXT (1u << 1)
+
+/* Opt in to the shader cell inputs. `flags` is a bit set; 0 (the default)
+   is off, and unknown bits are ignored. Each call replaces the whole set.
+     ZONVIE_SHADER_INPUT_CELL_AGE  - the per-flush cell-age stamp list,
+       delivered via on_cell_age_stamps (what a non-zero value meant before
+       the bits existed).
+     ZONVIE_SHADER_INPUT_CELL_TEXT - the per-row codepoints delivered via
+       on_cell_text_row. The first flush after a call that sets this bit
+       delivers every row of every surface.
+   With a bit clear the core builds nothing for it and never fires its
+   callback, so a shader that reads only iCellAge pays nothing for cell
+   text. A shader that reads iCellText passes both bits. Frontends toggle
+   this when a shader that reads the inputs is loaded or unloaded. */
+ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int32_t flags);
 
 /* Process due message timeouts (including the throttled message float scroll)
  * and render-maintenance retries. Frontends

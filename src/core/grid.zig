@@ -1512,6 +1512,9 @@ pub const Grid = struct {
     // the default path builds nothing and fires no callback. Core-thread
     // only: written while handling redraw events, drained during flush.
     shader_inputs_enabled: bool = false,
+    /// iCellText rows (on_cell_text_row) and their bookkeeping; independent of the
+    /// cell-age flag above, so a shader reading only iCellAge pays nothing for it.
+    cell_text_enabled: bool = false,
     /// Runs of cells edited during the current flush.
     cell_stamps: [cell_stamp_capacity]CellStamp = undefined,
     cell_stamp_count: usize = 0,
@@ -2405,7 +2408,7 @@ pub const Grid = struct {
     /// layer's, are owed their text again. Call before the placement or
     /// size changes. Only while a shader reads the inputs.
     pub fn noteLayerCoverageLeaving(self: *Grid, grid_id: i64) void {
-        if (!self.shader_inputs_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
+        if (!self.cell_text_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
         const pos = self.win_pos.get(grid_id) orelse return;
         const rows = (self.sub_grids.getPtr(grid_id) orelse return).rows;
         const placed = self.surfacePlacement(pos) orelse return;
@@ -2432,7 +2435,7 @@ pub const Grid = struct {
     /// new rect or stacking resends its own text there. Call after the
     /// placement changes.
     pub fn noteLayerCoverageArrived(self: *Grid, grid_id: i64) void {
-        if (!self.shader_inputs_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
+        if (!self.cell_text_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
         if (!self.win_pos.contains(grid_id)) return;
         if (self.sub_grids.getPtr(grid_id)) |sg| sg.markAllDirty();
     }

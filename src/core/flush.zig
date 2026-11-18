@@ -1933,7 +1933,7 @@ const FontLayerIterator = struct {
 /// change and a moved band holds another grid's text, so every grid of the
 /// surface is resent.
 fn noteCellTextPlaneChanges(core: *Core) void {
-    if (!core.grid.shader_inputs_enabled or core.cb.on_cell_text_row == null) return;
+    if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
     noteCellTextPlaneChange(core, 1);
     var it = core.grid.external_grids.keyIterator();
     while (it.next()) |id| noteCellTextPlaneChange(core, id.*);
@@ -1966,7 +1966,7 @@ fn noteCellTextPlaneChange(core: *Core, surface: i64) void {
 /// it stays whole for the cells around it.
 fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, cps: [*]const u32) void {
     const g = &core.grid;
-    if (!g.shader_inputs_enabled) return;
+    if (!g.cell_text_enabled) return;
     const cb = core.cb.on_cell_text_row orelse return;
     var surface = grid_id;
     var row_i: i64 = row;
@@ -3679,7 +3679,7 @@ fn dispatchGridRowScroll(
 /// it now stands, by composeRowRuns' rule: cells the buffer lacks are blank.
 /// `row_cells.scalars` is free until the row loop.
 fn sendCellTextRegion(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf, row_start: u32, row_end: u32) void {
-    if (!core.grid.shader_inputs_enabled or core.cb.on_cell_text_row == null) return;
+    if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
     const scratch = &core.row_cells.scalars;
     scratch.ensureTotalCapacity(core.alloc, buf.cols) catch return;
     scratch.items.len = buf.cols;
@@ -20636,6 +20636,60 @@ test "a font grid's cursor uses the grid's cell size" {
     try std.testing.expectEqual(@as(f32, 12), state.min_y);
 }
 
+const CellTextGateProbe = struct {
+    text_rows: usize = 0,
+    stamp_calls: usize = 0,
+
+    fn onText(ctx: ?*anyopaque, _: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.text_rows += 1;
+    }
+    fn onStamps(ctx: ?*anyopaque, _: ?[*]const grid_mod.CellStamp, _: usize, _: i32) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.stamp_calls += 1;
+    }
+    fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+
+    /// Enable `flags`, flush once to settle, then edit a cell, stamp it and
+    /// flush again; counters cover the second flush only.
+    fn run(core: *Core, probe: *@This(), flags: u32) !void {
+        try core.grid.resizeGrid(1, 2, 4);
+        core.drawable_w_px = 4;
+        core.drawable_h_px = 2;
+        core.cell_w_px = 1;
+        core.cell_h_px = 1;
+        core.ctx = probe;
+        core.cb.on_vertices_row = onRow;
+        core.cb.on_cell_text_row = onText;
+        core.cb.on_cell_age_stamps = onStamps;
+        core.setShaderInputsEnabledLocked(flags);
+        var flush_ctx = FlushCtx{ .core = core };
+        try flush_ctx.onFlush(2, 4);
+        probe.* = .{};
+        core.grid.putCell(1, 2, 'x', 0);
+        core.grid.stampEditedCells(1, 1, 2, 1);
+        try flush_ctx.onFlush(2, 4);
+    }
+};
+
+test "cell text is not delivered when only the cell-age bit is set" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var probe = CellTextGateProbe{};
+    try CellTextGateProbe.run(&core, &probe, c_api.SHADER_INPUT_CELL_AGE);
+    try std.testing.expectEqual(@as(usize, 0), probe.text_rows);
+    try std.testing.expect(probe.stamp_calls > 0);
+}
+
+test "cell text is delivered when the cell-text bit is set" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var probe = CellTextGateProbe{};
+    try CellTextGateProbe.run(&core, &probe, c_api.SHADER_INPUT_CELL_AGE | c_api.SHADER_INPUT_CELL_TEXT);
+    try std.testing.expect(probe.text_rows > 0);
+    try std.testing.expect(probe.stamp_calls > 0);
+}
+
 test "each sent row hands the frontend its composed codepoints for iCellText" {
     const State = struct {
         rows: [4]c_api.zonvie_cell_text_row = undefined,
@@ -20674,7 +20728,7 @@ test "each sent row hands the frontend its composed codepoints for iCellText" {
     try std.testing.expectEqual(@as(usize, 0), state.n);
 
     // Turned on, the first flush hands over every row: the texture is new.
-    core.setShaderInputsEnabledLocked(true);
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_AGE | c_api.SHADER_INPUT_CELL_TEXT);
     try flush_ctx.onFlush(2, 4);
     try std.testing.expectEqual(@as(usize, 2), state.n);
 
@@ -20693,10 +20747,10 @@ test "each sent row hands the frontend its composed codepoints for iCellText" {
 
     // Off and on again: an edit made while off reaches the new texture,
     // with every other row.
-    core.setShaderInputsEnabledLocked(false);
+    core.setShaderInputsEnabledLocked(0);
     core.grid.putCell(0, 1, 'z', 0);
     try flush_ctx.onFlush(2, 4);
-    core.setShaderInputsEnabledLocked(true);
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_AGE | c_api.SHADER_INPUT_CELL_TEXT);
     state.n = 0;
     try flush_ctx.onFlush(2, 4);
     try std.testing.expectEqual(@as(usize, 2), state.n);
@@ -20750,6 +20804,7 @@ test "cell text under a layer is left to the layer, and a float on an external w
     core.cb.on_vertices_row = Noop.onRow;
     core.cb.on_cell_text_row = Sent.onRow;
     core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
 
     // A float over row 0, cols 3..5 of the main surface.
     try core.grid.resizeGrid(2, 1, 2);
@@ -20866,6 +20921,7 @@ test "a layer in its own font writes its text to a band below the root's rows an
     core.cb.on_vertices_row = Noop.onRow;
     core.cb.on_cell_text_row = Sent.onRow;
     core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
 
     // Two font floats over row 0, ids 4 then 3, 1 x 3 and 2 x 2 of their own cells.
     try core.grid.resizeGrid(4, 1, 3);
@@ -20982,6 +21038,7 @@ test "a plain float moving beside a grid in its own font hands the root its text
     core.cb.on_vertices_row = Noop.onRow;
     core.cb.on_cell_text_row = Sent.onRow;
     core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
 
     try core.grid.resizeGrid(4, 1, 3);
     try core.grid.setWinFloatPos(4, 40, 0, 0, 50, 0, 1, true);
@@ -21019,6 +21076,7 @@ test "a row shift inside a grid in its own font resends its band" {
     try setUpRowShiftCore(&core, &state.sink);
     core.ctx = &state;
     core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
     core.cb.on_cell_text_row = Text.onText;
     // An exact fit (no bottom margin) keeps the row-shift fast path.
     try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 101, .font_id = 1, .mode = .resize, .cell_w_px = 1, .cell_h_px = 1, .frame_rows = 10, .frame_cols = 20, .extent_w_px = 20, .extent_h_px = 10 });
@@ -21057,6 +21115,7 @@ test "a row shift resends the surviving rows' text at their new rows" {
     try setUpRowShiftCore(&core, &state.sink);
     core.ctx = &state;
     core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
     core.cb.on_cell_text_row = Text.onText;
 
     // Scroll the window up one row: the frontend keeps rows 1..9 as 0..8

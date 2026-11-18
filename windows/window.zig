@@ -945,8 +945,14 @@ pub fn scheduleReliableWindowMessage(
 /// windows compile the same config, so the flag they derive is identical).
 fn syncShaderInputsEnabled(app: *App) void {
     const corep = app.corep orelse return;
-    const want = if (app.renderer) |*r| r.shader_wants_edit_inputs else false;
-    core.zonvie_core_set_shader_inputs_enabled(corep, if (want) 1 else 0);
+    const r = if (app.renderer) |*r| r else {
+        core.zonvie_core_set_shader_inputs_enabled(corep, 0);
+        return;
+    };
+    var flags: i32 = 0;
+    if (r.shader_wants_edit_inputs) flags |= @intCast(core.SHADER_INPUT_CELL_AGE);
+    if (r.shader_wants_cell_text) flags |= @intCast(core.SHADER_INPUT_CELL_TEXT);
+    core.zonvie_core_set_shader_inputs_enabled(corep, flags);
 }
 
 pub fn scheduleDeviceLostRetry(hwnd: c.HWND, app: *App) void {

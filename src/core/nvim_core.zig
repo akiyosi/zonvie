@@ -5928,9 +5928,12 @@ pub const Core = struct {
     /// stamps recorded for the flush in flight; either way the next flush
     /// finds every text plane new and resends it all, since a frontend that
     /// turns them on starts its texture empty.
-    pub fn setShaderInputsEnabledLocked(self: *Core, on: bool) void {
-        self.grid.shader_inputs_enabled = on;
-        if (!on) self.grid.resetCellStamps();
+    pub fn setShaderInputsEnabledLocked(self: *Core, flags: u32) void {
+        std.debug.assert(flags & ~(c_api.SHADER_INPUT_CELL_AGE | c_api.SHADER_INPUT_CELL_TEXT) == 0);
+        const age = flags & c_api.SHADER_INPUT_CELL_AGE != 0;
+        self.grid.shader_inputs_enabled = age;
+        self.grid.cell_text_enabled = flags & c_api.SHADER_INPUT_CELL_TEXT != 0;
+        if (!age) self.grid.resetCellStamps();
         self.cell_text_plane_sig.clearRetainingCapacity();
     }
 

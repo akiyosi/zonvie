@@ -3139,12 +3139,16 @@ final class ZonvieCore {
         )
     }
 
-    /// Tell the core whether to build per-flush cell-age stamp lists. Driven
-    /// by the loaded shader set: only a shader that reads the edit inputs
-    /// turns this on, so the default path costs nothing.
-    func setShaderInputsEnabled(_ enabled: Bool) {
+    /// Tell the core which shader inputs to build: per-flush cell-age stamp lists
+    /// for a shader that reads the edit inputs, and cell-text rows for one that
+    /// reads iCellText. Driven by the loaded shader set, so the default path
+    /// costs nothing and an iCellAge-only shader never pays for cell text.
+    func setShaderInputsEnabled(editInputs: Bool, cellText: Bool) {
         guard let core else { return }
-        zonvie_core_set_shader_inputs_enabled(core, enabled ? 1 : 0)
+        var flags: UInt32 = 0
+        if editInputs { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_AGE) }
+        if cellText { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_TEXT) }
+        zonvie_core_set_shader_inputs_enabled(core, Int32(flags))
     }
 
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).

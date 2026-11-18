@@ -1639,10 +1639,11 @@ pub export fn zonvie_core_set_ext_tabline(p: ?*zonvie_core, enabled: i32) callco
 /// default: with it off the core records nothing and never fires the
 /// callback, so a frontend without an edit-effect shader pays nothing.
 /// Turning it off also drops anything recorded for the in-flight flush.
-pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, flags: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    const on = (enabled != 0);
+    // Unknown bits (and a negative value's sign bit) are ignored.
+    const on: u32 = @as(u32, @bitCast(flags)) & (SHADER_INPUT_CELL_AGE | SHADER_INPUT_CELL_TEXT);
     // Called from the frontend's render/UI thread after zonvie_core_start,
     // while the core thread may be inside handleRedraw recording stamps into
     // the same fields. grid_mu serialises the two; without it the OFF path's
@@ -1653,7 +1654,7 @@ pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i
     box.core.grid_mu.lockUncancelable(clock.io());
     box.core.setShaderInputsEnabledLocked(on);
     box.core.grid_mu.unlock(clock.io());
-    box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: enabled={any}\n", .{on});
+    box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: flags={d}\n", .{on});
 }
 
 pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -3922,6 +3923,8 @@ pub const SHADER_LAYER_FLOAT: u32 = 1 << 0;
 pub const SHADER_LAYER_FONT_GRID: u32 = 1 << 1;
 pub const SHADER_LAYER_FOCUSABLE: u32 = 1 << 2;
 pub const SHADER_LAYER_BORDER: u32 = 1 << 3;
+pub const SHADER_INPUT_CELL_AGE: u32 = 1 << 0;
+pub const SHADER_INPUT_CELL_TEXT: u32 = 1 << 1;
 
 comptime {
     std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 976);

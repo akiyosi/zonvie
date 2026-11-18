@@ -448,8 +448,8 @@ final class MetalTerminalView: GridInputView {
             // Do not request redraw here; Neovim will redraw on the next "flush" after resize.
         }
 
-        renderer.shared.onShaderEditInputsChanged = { [weak self] enabled in
-            self?.core?.setShaderInputsEnabled(enabled)
+        renderer.shared.onShaderEditInputsChanged = { [weak self] editInputs, cellText in
+            self?.core?.setShaderInputsEnabled(editInputs: editInputs, cellText: cellText)
         }
 
         renderer.onCommitPublished = { [weak self] in

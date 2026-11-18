@@ -301,7 +301,7 @@ final class SharedRenderResources {
     /// Fired when the loaded chain starts or stops reading the edit inputs.
     /// The main view forwards it to the core, so stamp lists are built only
     /// while something reads them.
-    var onShaderEditInputsChanged: ((Bool) -> Void)?
+    var onShaderEditInputsChanged: ((_ editInputs: Bool, _ cellText: Bool) -> Void)?
     /// The iCellAge state of every surface, keyed the way the core stamps it.
     let cellAge = SurfaceCellAgeStores()
     /// The iCellText state of every surface, keyed the same way.
@@ -1685,7 +1685,7 @@ extension SharedRenderResources {
         defer {
             if !shaderWantsEditInputs { cellAge.removeAll() }
             if !shaderWantsCellText { cellText.removeAll() }
-            onShaderEditInputsChanged?(shaderWantsEditInputs)
+            onShaderEditInputsChanged?(shaderWantsEditInputs, shaderWantsCellText)
         }
         if !config.enabled || config.paths.isEmpty {
             return

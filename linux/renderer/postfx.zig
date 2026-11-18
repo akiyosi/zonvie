@@ -294,8 +294,10 @@ fn setup(app: *App, p: *PostFx) bool {
     }
     // The core records no stamps until a shader wants them. Every window
     // compiles the same config, so the answer is the same for all.
-    if (p.uses_edit) {
-        if (app.corep) |cp| core.zonvie_core_set_shader_inputs_enabled(cp, 1);
+    if (p.uses_edit or p.uses_cell_text) {
+        var flags: i32 = @intCast(core.SHADER_INPUT_CELL_AGE);
+        if (p.uses_cell_text) flags |= @intCast(core.SHADER_INPUT_CELL_TEXT);
+        if (app.corep) |cp| core.zonvie_core_set_shader_inputs_enabled(cp, flags);
     }
     p.ready = true;
     p.failed = false;
