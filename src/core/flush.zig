@@ -21217,6 +21217,77 @@ test "a plain float moving beside a grid in its own font hands the root its text
     try std.testing.expect(sent.find(1, 5) != null);
 }
 
+test "a child float of a moving float has its text resent at the new place" {
+    const Sent = struct {
+        rows: [32]c_api.zonvie_cell_text_row = undefined,
+        first: [32]u32 = undefined,
+        n: usize = 0,
+
+        fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.n == self.rows.len) return;
+            self.rows[self.n] = r.*;
+            self.first[self.n] = if (r.count != 0) r.texels[0] else 0;
+            self.n += 1;
+        }
+
+        fn find(self: *const @This(), row: u32, col: u32) ?usize {
+            for (self.rows[0..self.n], 0..) |r, i| {
+                if (r.grid == 1 and r.row == row and r.col == col) return i;
+            }
+            return null;
+        }
+    };
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 10);
+    core.drawable_w_px = 10;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var sent = Sent{};
+    core.ctx = &sent;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_cell_text_row = Sent.onRow;
+    core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
+
+    // Parent float at root (0,1); the child is anchored one row, one col
+    // into it. GridPos holds surface cells, resolved by the redraw handler.
+    try core.grid.resizeGrid(2, 2, 4);
+    try core.grid.setWinFloatPos(2, 20, 0, 1, 50, 0, 1, true);
+    try core.grid.resizeGrid(3, 1, 2);
+    try core.grid.setWinFloatPos(3, 30, 1, 2, 60, 0, 2, true);
+    core.grid.putCellGrid(2, 0, 0, 'p', 0);
+    core.grid.putCellGrid(3, 0, 0, 'c', 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 10);
+    try std.testing.expectEqual(@as(u32, 'c'), sent.first[sent.find(1, 2).?]);
+
+    // The parent moves and Neovim resends the child's win_float_pos, which
+    // the redraw handler resolves against the parent's new place; neither
+    // grid's rows change. The child must follow it on the plane at (2,5).
+    sent.n = 0;
+    try core.grid.setWinFloatPos(2, 20, 1, 4, 50, 0, 1, true);
+    const at = core.grid.resolveAnchoredFloat(3, 2, .{ .south = false, .east = false, .row = 1, .col = 1, .pum_pad = false }).?;
+    try core.grid.setWinFloatPos(3, 30, at.row, at.col, 60, 0, 2, true);
+    try flush_ctx.onFlush(4, 10);
+    try std.testing.expectEqual(@as(u32, 'p'), sent.first[sent.find(1, 4).?]);
+    const child = sent.find(2, 5).?;
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[child].count);
+    try std.testing.expectEqual(@as(u32, 'c'), sent.first[child]);
+    // The root cell the child left is owed its text again.
+    var root_back = false;
+    for (sent.rows[0..sent.n]) |r| {
+        if (r.grid == 1 and r.row == 1 and r.col <= 2 and r.col + r.count > 2) root_back = true;
+    }
+    try std.testing.expect(root_back);
+}
+
 test "a row shift inside a grid in its own font resends its band" {
     const Text = struct {
         sink: RowShiftSink = .{},
