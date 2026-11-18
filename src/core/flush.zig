@@ -1871,6 +1871,9 @@ fn sendCellTextRow(core: *Core, src: GridRowSource, row: u32) void {
     const base: usize = @as(usize, row) * src.cols;
     const present: usize = if (base >= cells.len) 0 else @min(@as(usize, src.cols), cells.len - base);
     const masked = core.shader_hl_masks.items.len != 0;
+    // Invariant: row_cells colours and style are still composeRowRuns'
+    // getWithStyles output; nothing writes them between composition and
+    // this send, which keeps this path equal to sendCellTextRegion's.
     for (0..src.cols) |c| {
         const mask: u32 = if (masked and c < present) core.shaderHlMask(cells[base + c].hl) else 0;
         texels[c * texel_stride ..][0..texel_stride].* = c_api.packCellTexel(
@@ -1984,6 +1987,8 @@ fn noteCellTextPlaneChanges(core: *Core) void {
 fn presizeCellTexelScratch(core: *Core) void {
     if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
     var cols: usize = core.grid.main_buf.cols;
+    // Every grid but 1, external roots included, keeps its buffer in
+    // sub_grids (Grid.bufForConst); external_grids holds only window info.
     var it = core.grid.sub_grids.valueIterator();
     while (it.next()) |sg| cols = @max(cols, sg.cols);
     core.cell_texel_scratch.ensureTotalCapacity(core.alloc, cols * texel_stride) catch {};

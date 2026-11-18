@@ -5485,6 +5485,9 @@ pub const Core = struct {
             };
         }
         self.rebuildShaderHlMasks();
+        // Bit meanings changed: every texel on screen carries a stale w,
+        // whatever the old table held (empty on a first declaration).
+        if (self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
     }
 
     /// Bit i is set when `names` (the groups an attr id was composed from)
@@ -5516,7 +5519,8 @@ pub const Core = struct {
     }
 
     /// Returns whether an id below the old table's length changed its mask.
-    /// An id past it was not defined before, so no cell shows it yet.
+    /// The table spans every defined attr id (hl.map), named or not, so an
+    /// id past it was not defined before and no cell shows it yet.
     fn rebuildShaderHlMaskTable(self: *Core) !bool {
         const wanted: []const []const u8 = self.shader_hl_groups.items;
         const old = self.shader_hl_masks.items;
@@ -5526,8 +5530,10 @@ pub const Core = struct {
             return had_bits;
         }
         var len: usize = 0;
-        var kit = self.hl.attr_names.keyIterator();
+        var kit = self.hl.map.keyIterator();
         while (kit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        var nit = self.hl.attr_names.keyIterator();
+        while (nit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
         var git = self.hl.groups.valueIterator();
         while (git.next()) |id| len = @max(len, @as(usize, id.*) + 1);
 
@@ -10139,6 +10145,40 @@ test "a mask rebuild that changes an existing id marks every surface dirty" {
     core.grid.clearDirty();
     core.setShaderHlGroupsLocked("void main() {}\n");
     try std.testing.expectEqual(@as(usize, 0), core.shader_hl_masks.items.len);
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "a first declaration of groups resends cells already on screen" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.grid.putCell(0, 0, 'c', 1);
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+    // The same declaration again is no change.
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+}
+
+test "a nameless id later given a declared group resends its cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment @markup.quote\n");
+    try core.hl.defineWithNames(7, .{}, &.{});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0), core.shaderHlMask(7));
+    core.grid.putCell(0, 0, 'q', 7);
+    core.grid.clearDirty();
+    try core.hl.defineWithNames(7, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(7));
     try std.testing.expect(core.grid.main_buf.anyDirty());
 }
 
