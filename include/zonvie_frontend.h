@@ -851,8 +851,9 @@ ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t le
 
 /* Whether a custom shader's source reads the cell-age inputs (iCellAge, the
    zonvieCellAge wrapper, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
-   allocate the cell-age texture, and opt in with
-   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does.
+   allocate the cell-age texture, and set ZONVIE_SHADER_INPUT_CELL_AGE with
+   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does
+   (ZONVIE_SHADER_INPUT_CELL_TEXT is the cell-text opt-in, below).
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
@@ -1196,7 +1197,10 @@ ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
    Each surface calls zonvie_cell_text_commit for its grid from its own
    flush commit, under the lock its draw takes to snapshot rows and sync
    this texture, so a frame never pairs one flush's rows with another's
-   text; a refused flush calls zonvie_cell_text_discard for every grid.
+   text; a refused flush calls zonvie_cell_text_discard, which drops the
+   staged rows of EVERY grid. That is correct only because a refused flush
+   is all-or-nothing across surfaces: no surface commits a flush that
+   another refused, so no grid's staged rows belong to a committed flush.
    Each shaded draw calls zonvie_cell_text_sync for its own grid:
      0  nothing to bind (no row delivered yet, or out of memory);
      1  the texture already holds the mirror;

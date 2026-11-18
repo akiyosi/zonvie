@@ -179,6 +179,8 @@ final class ZonvieCore {
     static var appLogVerbose = false
     // Core callback thread only; shared with every surface in this bracket.
     private var renderTraceFlushId: UInt64 = 0
+    /// The cell-text opt-in as of this flush's on_flush_begin. Core thread only.
+    private var flushWantsCellText = false
     /// Whether a core flush bracket is open. A destroy that arrives outside one
     /// has no on_flush_end to publish against and would be cleared by the next
     /// begin, so it is released immediately instead of staged.
@@ -1156,6 +1158,9 @@ final class ZonvieCore {
                 me.renderTraceFlushId &+= 1
                 me.terminalView?.renderer.renderTraceFlushId = me.renderTraceFlushId
                 ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=begin")
+                // Latched once per flush: a pipeline rebuild on another thread
+                // changes the opt-in only between flushes, never mid-flush.
+                me.flushWantsCellText = me.terminalView?.renderer.shared.cellTextOptIn.withLock { $0 } ?? false
                 // The shader cursor has one staged slot for the whole flush,
                 // written by whichever surface draws the cursor. A measurement
                 // left by a flush that never committed describes vertices that
@@ -1698,7 +1703,7 @@ final class ZonvieCore {
                 guard let ctx, let row else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 // Core thread, grid_mu held. Only the CPU mirror is written.
-                guard let shared = me.terminalView?.renderer.shared, shared.shaderWantsCellText else { return }
+                guard me.flushWantsCellText, let shared = me.terminalView?.renderer.shared else { return }
                 shared.cellText.apply(row)
             }
         )

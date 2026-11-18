@@ -186,6 +186,9 @@ pub const Stores = struct {
     /// Drop every staged row: the flush that wrote them was refused, and
     /// its rows will be sent again. A pending cell grid stays pending: the
     /// retry writes the same one.
+    /// Precondition: a refused flush is all-or-nothing across surfaces (no
+    /// surface commits a flush another refused), so dropping EVERY grid's
+    /// staged rows never drops rows a committed flush owns.
     pub fn discard(self: *Stores) void {
         self.lock();
         defer self.unlock();

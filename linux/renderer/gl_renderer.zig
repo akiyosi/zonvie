@@ -474,7 +474,13 @@ pub fn renderMain(app: *App, t: *Target) Frame {
     const t0 = clock.nowNs();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
+    return renderMainLocked(app, t, t0);
+}
 
+/// renderMain with App.mu held by the caller (postfx.renderFrame, which
+/// snapshots the shader inputs under the same hold).
+pub fn renderMainLocked(app: *App, t: *Target, t0: i128) Frame {
+    if (t.program == 0) return .{};
     drainAtlas(app, t);
     if (!begin(app, t)) return .{};
     if (!t.warmed) {
@@ -614,7 +620,12 @@ pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
     const t0 = clock.nowNs();
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
+    return renderExternalSceneLocked(app, t, surface_id, t0);
+}
 
+/// renderExternalScene with App.mu held by the caller.
+pub fn renderExternalSceneLocked(app: *App, t: *Target, surface_id: i64, t0: i128) Frame {
+    if (t.program == 0) return .{};
     syncAtlas(app, t);
     if (!begin(app, t)) return .{};
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));

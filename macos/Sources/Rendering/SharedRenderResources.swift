@@ -1,6 +1,7 @@
 import Metal
 import MetalKit
 import QuartzCore
+import os
 
 /// The GPU objects every surface in this app shares: one device, one set of
 /// render pipelines, one sampler. A surface borrows them; none of them belongs
@@ -293,6 +294,9 @@ final class SharedRenderResources {
     /// True when a loaded shader reads the cell text. Gates the cell-text
     /// stores, their row writes and the texture, on every surface.
     private(set) var shaderWantsCellText: Bool = false
+    /// `shaderWantsCellText` published for the core thread, which latches it
+    /// once per flush (ZonvieCore on_flush_begin).
+    let cellTextOptIn = OSAllocatedUnfairLock(initialState: false)
     /// True when a loaded shader reads iPrevFrame. Gates the feedback pair
     /// and its copy pass, on every surface.
     private(set) var shaderWantsPrevFrame: Bool = false
@@ -1028,6 +1032,7 @@ final class SurfaceCellAgeStores {
         default:
             return t.texture
         }
+        // Safe to rewrite in place: only the owning surface's draw samples it, after taking that surface's inflightSemaphore (value 1), which its last command buffer's completion signals.
         t.uploadScratch.withUnsafeBytes { raw in
             t.texture?.replace(
                 region: MTLRegionMake2D(0, 0, cols, rows),
@@ -1157,6 +1162,7 @@ final class SurfaceCellTextStores {
             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
             t.texture = tex
         }
+        // Safe to rewrite in place: only the owning surface's draw samples it, after taking that surface's inflightSemaphore (value 1), which its last command buffer's completion signals.
         t.uploadScratch.withUnsafeBytes { raw in
             t.texture?.replace(
                 region: MTLRegionMake2D(0, 0, cols, rows),
@@ -1685,6 +1691,8 @@ extension SharedRenderResources {
         defer {
             if !shaderWantsEditInputs { cellAge.removeAll() }
             if !shaderWantsCellText { cellText.removeAll() }
+            let wantsCellText = shaderWantsCellText
+            cellTextOptIn.withLock { $0 = wantsCellText }
             onShaderEditInputsChanged?(shaderWantsEditInputs, shaderWantsCellText)
         }
         if !config.enabled || config.paths.isEmpty {

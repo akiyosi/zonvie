@@ -3681,7 +3681,19 @@ fn dispatchGridRowScroll(
 fn sendCellTextRegion(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf, row_start: u32, row_end: u32) void {
     if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
     const scratch = &core.row_cells.scalars;
-    scratch.ensureTotalCapacity(core.alloc, buf.cols) catch return;
+    scratch.ensureTotalCapacity(core.alloc, buf.cols) catch {
+        // The kept rows' text cannot go out at their new place: forget the
+        // surface's plane signature, so the next flush finds it changed and
+        // resends the whole surface (noteCellTextPlaneChange).
+        var surface = grid_id;
+        if (!core.grid.isSurfaceRoot(grid_id)) {
+            if (core.grid.win_pos.get(grid_id)) |pos| {
+                if (core.grid.surfacePlacement(pos)) |placed| surface = placed.surface;
+            }
+        }
+        _ = core.cell_text_plane_sig.remove(surface);
+        return;
+    };
     scratch.items.len = buf.cols;
     var r = row_start;
     while (r < row_end) : (r += 1) {
@@ -21130,4 +21142,35 @@ test "a row shift resends the surviving rows' text at their new rows" {
     }
     try std.testing.expect(state.sent[9]);
     try std.testing.expectEqual(@as(u32, ' '), state.first[9]);
+}
+
+test "a row shift whose text scratch cannot grow marks its surface for a full text resend" {
+    const Text = struct {
+        sink: RowShiftSink = .{},
+        fn onText(_: ?*anyopaque, _: *const c_api.zonvie_cell_text_row) callconv(.c) void {}
+    };
+    var state = Text{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state.sink);
+    core.ctx = &state;
+    core.grid.shader_inputs_enabled = true;
+    core.grid.cell_text_enabled = true;
+    core.cb.on_cell_text_row = Text.onText;
+    noteCellTextPlaneChanges(&core);
+    try std.testing.expect(core.cell_text_plane_sig.contains(1));
+
+    // Drop the scratch so the region has to allocate, then fail that.
+    core.row_cells.scalars.clearAndFree(core.alloc);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    sendCellTextRegion(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 9);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expect(!core.cell_text_plane_sig.contains(1));
+
+    // The next flush's plane check finds no signature: a changed plane.
+    noteCellTextPlaneChanges(&core);
+    try std.testing.expect(core.cell_text_plane_sig.contains(1));
 }
