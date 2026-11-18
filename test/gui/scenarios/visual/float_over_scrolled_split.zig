@@ -210,7 +210,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var settled = try g.captureStable(crop, 8000);
     settled.deinit(alloc);
     var jump_buf: [64]u8 = undefined;
-    const jump_cmd = try std.fmt.bufPrint(&jump_buf, "execute('normal! {d}Gzt0')", .{topline});
+    // Restore the cursor row too: when a late resize moved the start topline,
+    // the scroll ends with the cursor below the top row.
+    const jump_cmd = try std.fmt.bufPrint(&jump_buf, "execute('normal! {d}Gzt{d}G0')", .{ topline, cursor_line });
     try g.exec(jump_cmd);
     var jumped = try g.captureStable(crop, 8000);
     defer jumped.deinit(alloc);
