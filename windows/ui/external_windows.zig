@@ -3722,6 +3722,7 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
     const content = decoratedContentOriginPx(app, classifyExternalSurface(g_sh.cell_age_grid));
     g_sh.shader_grid_origin = .{ off_x + content.x, off_y + content.y };
     g_sh.cursor_blink_on = app.cursor_blink.visible;
+    g_sh.shader_core = app.corep;
 }
 
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {

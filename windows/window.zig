@@ -949,6 +949,8 @@ fn syncShaderInputsEnabled(app: *App) void {
         core.zonvie_core_set_shader_inputs_enabled(corep, 0);
         return;
     };
+    const hl_src = r.shader_hl_groups_source.items;
+    core.zonvie_core_set_shader_hl_groups(corep, hl_src.ptr, hl_src.len);
     var flags: i32 = 0;
     if (r.shader_wants_edit_inputs) flags |= @intCast(core.SHADER_INPUT_CELL_AGE);
     if (r.shader_wants_cell_text) flags |= @intCast(core.SHADER_INPUT_CELL_TEXT);
@@ -2397,6 +2399,7 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     g.cell_w_px = app.cell_w_px;
     g.cell_h_px = app.rowHeightPx();
     g.cursor_blink_on = app.cursor_blink.visible;
+    g.shader_core = app.corep;
     g.shader_grid_origin = .{
         @floatFromInt(geom.content_x_offset orelse 0),
         @floatFromInt(geom.content_y_offset orelse 0),

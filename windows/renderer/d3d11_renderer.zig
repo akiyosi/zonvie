@@ -398,6 +398,9 @@ pub const Renderer = struct {
     // Loaded from config `[shaders].paths` after renderer init. Empty when
     // `shaders.enabled = false` or no paths configured.
     custom_shader_pipelines: std.ArrayListUnmanaged(CustomShaderPipeline) = .empty,
+    /// The loaded shaders' GLSL joined in load order, for
+    /// zonvie_core_set_shader_hl_groups. Filled by loadCustomShaderPipelines.
+    shader_hl_groups_source: std.ArrayListUnmanaged(u8) = .empty,
     // Scratch copy of back_tex used as the pixel-shader input when running
     // the custom shader pass (reading and writing the same texture is
     // undefined in D3D11). Lazily sized and recreated on resize.
@@ -450,6 +453,9 @@ pub const Renderer = struct {
     cursor_blink_on: bool = true,
     /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
     shader_grid_origin: [2]f32 = .{ 0, 0 },
+    /// Source of the Ghostty colour uniforms (zonvie_shader_fill_colors,
+    /// seqlocked: no app lock needed). Mirrored with the fields above.
+    shader_core: ?*const core.zonvie_core = null,
     /// iRootRows and iLayers (core.fillLayers), set by the paint driver
     /// from the layers it pinned (app.fillShaderLayers).
     shader_root_rows: i32 = 0,
@@ -797,6 +803,7 @@ pub const Renderer = struct {
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.deinit(self.alloc);
+        self.shader_hl_groups_source.deinit(self.alloc);
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
         for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
@@ -3180,6 +3187,7 @@ pub const Renderer = struct {
     pub fn loadCustomShaderPipelines(self: *Renderer, cfg: *const core.config.Config) void {
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.clearRetainingCapacity();
+        self.shader_hl_groups_source.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = false;
         self.shader_wants_edit_inputs = false;
         self.shader_wants_cell_text = false;
@@ -3477,6 +3485,12 @@ pub const Renderer = struct {
             }
             return CustomShaderCompileError.OutOfMemory;
         };
+        // A shader whose text cannot be kept still loads; it just declares
+        // no hl groups.
+        if (self.shader_hl_groups_source.ensureUnusedCapacity(self.alloc, glsl.len + 1)) |_| {
+            self.shader_hl_groups_source.appendSliceAssumeCapacity(glsl);
+            self.shader_hl_groups_source.appendAssumeCapacity('\n');
+        } else |_| {}
         return .{
             .alloc = self.alloc,
             .source_path = path_copy,
@@ -3628,6 +3642,7 @@ pub const Renderer = struct {
             self.cursor_blink_on,
             self.shader_wants_edit_inputs,
         );
+        if (self.shader_core) |cp| core.zonvie_shader_fill_colors(cp, &u);
         u.iRootRows = self.shader_root_rows;
         u.iLayerCount = self.shader_layer_count;
         u.iLayers = self.shader_layers;
