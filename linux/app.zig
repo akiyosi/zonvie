@@ -4,7 +4,8 @@
 const std = @import("std");
 const core = @import("zonvie_core");
 const SurfaceStore = @import("surface_store.zig").SurfaceStore;
-const Fonts = @import("renderer/font.zig").Fonts;
+const font_mod = @import("renderer/font.zig");
+const Fonts = font_mod.Fonts;
 const scroll_ease = core.scroll_ease;
 const overlay_layout = @import("overlay_layout.zig");
 const ui_state = @import("ui_state.zig");
@@ -339,6 +340,8 @@ pub const App = struct {
             }
             slot.* = null;
         }
+        // After the last face: the faces borrow the mapped bytes.
+        font_mod.releaseMappedFiles(self.alloc);
         self.clipboard_text.deinit(self.alloc);
         self.ext_ops.deinit(self.alloc);
         self.ext_ops_main.deinit(self.alloc);

@@ -442,7 +442,7 @@ fn applyAxes(f: *Font, fc_variations: []const u8, user: []const hbft.zonvie_font
     hbft.zonvie_ft_hb_font_set_variation_axes(f, merged.ptr, merged.len);
 }
 
-/// Font files by path, mapped read-only and never unmapped: a face borrows
+/// Font files by path, mapped read-only until shutdown: a face borrows
 /// its file's bytes for its whole life, the four styles of a family and every
 /// reload at another size share one mapping, and a session names few files.
 /// Guarded like the rest of this file (the core's grid lock).
@@ -470,6 +470,18 @@ fn mapFile(alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
         return null;
     };
     return bytes;
+}
+
+/// Unmaps every font file and frees the table. Pre: no face is left, so
+/// nothing borrows the bytes; the allocator is the one mapFile was given.
+pub fn releaseMappedFiles(alloc: std.mem.Allocator) void {
+    var it = mapped_files.iterator();
+    while (it.next()) |kv| {
+        _ = std.c.munmap(@ptrCast(@alignCast(kv.value_ptr.*.ptr)), kv.value_ptr.*.len);
+        alloc.free(kv.key_ptr.*);
+    }
+    mapped_files.deinit(alloc);
+    mapped_files = .empty;
 }
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8, index: c_int, pixel_size: u32) ?*Font {
