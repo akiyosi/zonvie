@@ -1132,7 +1132,7 @@ final class SurfaceCellTextStores {
         case 0:
             return false
         case 2:
-            let n = Int(t.cache.cols) * Int(t.cache.rows)
+            let n = Int(t.cache.cols) * Int(t.cache.rows) * Int(ZONVIE_CELL_TEXEL_STRIDE)
             if t.uploadScratch.count != n {
                 t.uploadScratch = [UInt32](repeating: 0, count: n)
             }
@@ -1156,7 +1156,7 @@ final class SurfaceCellTextStores {
         let cols = Int(t.cache.cols), rows = Int(t.cache.rows)
         if t.texture == nil || t.texture?.width != cols || t.texture?.height != rows {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .r32Uint, width: cols, height: rows, mipmapped: false)
+                pixelFormat: .rgba32Uint, width: cols, height: rows, mipmapped: false)
             desc.usage = [.shaderRead]
             desc.storageMode = .shared
             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
@@ -1168,7 +1168,7 @@ final class SurfaceCellTextStores {
                 region: MTLRegionMake2D(0, 0, cols, rows),
                 mipmapLevel: 0,
                 withBytes: raw.baseAddress!,
-                bytesPerRow: cols * MemoryLayout<UInt32>.size
+                bytesPerRow: cols * Int(ZONVIE_CELL_TEXEL_STRIDE) * MemoryLayout<UInt32>.size
             )
         }
         t.pendingUpload = false

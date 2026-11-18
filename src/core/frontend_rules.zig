@@ -1240,6 +1240,73 @@ pub fn shaderOwnsCursor(source: []const u8) bool {
     return std.mem.indexOf(u8, source, "@zonvie-owns-cursor") != null;
 }
 
+/// Highest number of groups a shader can declare: one bit each in a texel's w.
+pub const max_hl_groups = 32;
+
+/// The highlight-group names a shader declares with
+/// `@zonvie-hl-groups: name name ...` (a comment line; the colon must follow
+/// the token directly). Names are whitespace-separated up to the end of the
+/// line; several declarations append. Bit i of a texel's w is out[i].
+/// Duplicates keep their first index; names past max_hl_groups are dropped.
+/// Returns the count; the slices point into `source`.
+pub fn parseHlGroups(source: []const u8, out: *[max_hl_groups][]const u8) u8 {
+    const token = "@zonvie-hl-groups:";
+    var n: u8 = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search, token)) |pos| {
+        const line_end = std.mem.indexOfScalarPos(u8, source, pos, '\n') orelse source.len;
+        search = line_end;
+        var it = std.mem.tokenizeAny(u8, source[pos + token.len .. line_end], " \t\r");
+        while (it.next()) |name| {
+            if (n == max_hl_groups) return n;
+            var dup = false;
+            for (out[0..n]) |seen| {
+                if (std.mem.eql(u8, seen, name)) dup = true;
+            }
+            if (dup) continue;
+            out[n] = name;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "parseHlGroups reads names in order after the token" {
+    var out: [max_hl_groups][]const u8 = undefined;
+    const n = parseHlGroups("// @zonvie-hl-groups: @markup.heading.1 @markup.quote  @markup.raw.block  \r\nvoid main() {}\n", &out);
+    try std.testing.expectEqual(@as(u8, 3), n);
+    try std.testing.expectEqualStrings("@markup.heading.1", out[0]);
+    try std.testing.expectEqualStrings("@markup.quote", out[1]);
+    try std.testing.expectEqualStrings("@markup.raw.block", out[2]);
+}
+
+test "parseHlGroups caps at 32, keeps first of duplicates, ignores a token without colon" {
+    var out: [max_hl_groups][]const u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 0), parseHlGroups("// @zonvie-hl-groups Comment\n", &out));
+    try std.testing.expectEqual(@as(u8, 0), parseHlGroups("// @zonvie-hl-groups :Comment\n", &out));
+    const dup = parseHlGroups("// @zonvie-hl-groups: A B A\n// @zonvie-hl-groups: C B\n", &out);
+    try std.testing.expectEqual(@as(u8, 3), dup);
+    try std.testing.expectEqualStrings("A", out[0]);
+    try std.testing.expectEqualStrings("B", out[1]);
+    try std.testing.expectEqualStrings("C", out[2]);
+    var src: [40 * 4 + 32]u8 = undefined;
+    var w: usize = 0;
+    for ("// @zonvie-hl-groups:") |ch| {
+        src[w] = ch;
+        w += 1;
+    }
+    for (0..40) |i| {
+        src[w] = ' ';
+        src[w + 1] = 'g';
+        src[w + 2] = '0' + @as(u8, @intCast(i / 10));
+        src[w + 3] = '0' + @as(u8, @intCast(i % 10));
+        w += 4;
+    }
+    try std.testing.expectEqual(@as(u8, 32), parseHlGroups(src[0..w], &out));
+    try std.testing.expectEqualStrings("g00", out[0]);
+    try std.testing.expectEqualStrings("g31", out[31]);
+}
+
 fn containsAnyWord(source: []const u8, tokens: []const []const u8) bool {
     for (tokens) |tok| {
         var search: usize = 0;

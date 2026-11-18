@@ -866,6 +866,24 @@ ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t l
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len);
 
+/* Most names a shader can declare with @zonvie-hl-groups: one bit each in a
+   cell texel's w. */
+#define ZONVIE_SHADER_HL_GROUPS_MAX 32
+
+/* Declare the highlight groups the loaded shader names. `source` is the
+   shader text (NULL with len 0 declares none); every line containing
+   `@zonvie-hl-groups:` contributes the whitespace-separated names after the
+   colon, to the end of the line. Name i, in order, is bit i of the cell
+   texels' w (zonvie_cell_text_row). Duplicates keep their first index;
+   names past ZONVIE_SHADER_HL_GROUPS_MAX are ignored.
+   Post: the core's per-attr mask table follows the declaration and every
+   later redefinition of an attr; when a mask that cells may show changes
+   while cell text is on, every surface's rows are redelivered by the next
+   flush. With no name declared the core keeps no table and texels carry
+   w == 0. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
+   from inside a core callback. */
+ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
+
 /* Whether a custom shader's source reads iPrevFrame. Frontends allocate the
    feedback pair, and render the last pass into it plus a copy to the
    drawable, only when a loaded shader does.
@@ -1190,7 +1208,9 @@ ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
 /* ---------------------------------------------------------------------------
    iCellText stores.
 
-   The CPU side of every surface's iCellText texture: one r32uint mirror per
+   The CPU side of every surface's iCellText texture: one rgba32ui mirror
+   (ZONVIE_CELL_TEXEL_STRIDE uint32_t per cell, the texel of
+   zonvie_cell_text_row) per
    zonvie_cell_text_row.grid value, sized by the rows delivered to it. A
    frontend creates one store set, feeds it every on_cell_text_row with
    zonvie_cell_text_apply_row (core thread), which only STAGES the row.
@@ -1204,7 +1224,9 @@ ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
    Each shaded draw calls zonvie_cell_text_sync for its own grid:
      0  nothing to bind (no row delivered yet, or out of memory);
      1  the texture already holds the mirror;
-     2  *out_values is the cache->cols x cache->rows mirror to upload, and
+     2  *out_values is the cache->cols x cache->rows mirror to upload
+        (cols * rows * ZONVIE_CELL_TEXEL_STRIDE uint32_t, row pitch
+        cols * 16 bytes), and
         the store's lock stays held until zonvie_cell_text_end_upload.
    `cache` is the caller's, one per texture, zero-initialised and otherwise
    opaque: while that grid's store is unchanged since its last sync, the

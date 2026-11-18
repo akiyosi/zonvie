@@ -134,8 +134,8 @@ pub const RowOffsets = struct {
 test "cell text: no shader uses it -> store absent and callback is a no-op" {
     var stores = Stores.init(std.testing.allocator);
     defer stores.deinit();
-    const cps = [_]u32{ 'a', 'b' };
-    const row: core.zonvie_cell_text_row = .{ .grid = 1, .tex_rows = 1, .tex_cols = 2, .row = 0, .col = 0, .count = 2, .cps = &cps };
+    const cps = [_]u32{ 'a', 0x112233, 0x445566, 1, 'b', 0x112233, 0x445566, 0 };
+    const row: core.zonvie_cell_text_row = .{ .grid = 1, .tex_rows = 1, .tex_cols = 2, .row = 0, .col = 0, .count = 2, .texels = &cps };
     stageCellText(&stores, false, row);
     stores.commit(1);
     try std.testing.expectEqual(@as(usize, 0), stores.stores.items.len);
@@ -154,10 +154,10 @@ test "cell text: no shader uses it -> store absent and callback is a no-op" {
 test "external surface syncs its own grid's cell text" {
     var stores = Stores.init(std.testing.allocator);
     defer stores.deinit();
-    const main_cps = [_]u32{ 'm', 'm', 'm' };
-    const ext_cps = [_]u32{ 'x', 'y' };
-    stageCellText(&stores, true, .{ .grid = 1, .tex_rows = 1, .tex_cols = 3, .row = 0, .col = 0, .count = 3, .cps = &main_cps });
-    stageCellText(&stores, true, .{ .grid = 7, .tex_rows = 1, .tex_cols = 2, .row = 0, .col = 0, .count = 2, .cps = &ext_cps });
+    const main_cps = [_]u32{ 'm', 1, 2, 3, 'm', 1, 2, 3, 'm', 1, 2, 3 };
+    const ext_cps = [_]u32{ 'x', 4, 5, 6, 'y', 7, 8, 9 };
+    stageCellText(&stores, true, .{ .grid = 1, .tex_rows = 1, .tex_cols = 3, .row = 0, .col = 0, .count = 3, .texels = &main_cps });
+    stageCellText(&stores, true, .{ .grid = 7, .tex_rows = 1, .tex_cols = 2, .row = 0, .col = 0, .count = 2, .texels = &ext_cps });
     stores.commit(1);
     stores.commit(7);
     var cache: core.cell_text_store.SyncCache = .{};

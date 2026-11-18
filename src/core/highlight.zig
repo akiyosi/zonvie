@@ -196,46 +196,48 @@ pub const Highlights = struct {
     /// visible, so an OOM leaves both at their prior state (absent for a new
     /// id) and the abandoned batch replays cleanly.
     ///
-    /// Names repeat across ids and ids repeat across redraws, so a name
-    /// already recorded for `id` is not stored twice. A new name sets
-    /// `groups_changed`, which is what makes the glow set re-resolve.
+    /// A redefinition replaces the id's names: after `:colorscheme` or
+    /// `:hi link` an id belongs only to the groups its latest definition
+    /// names. Duplicates are stored once. A different name set sets
+    /// `groups_changed`, which re-resolves the glow set and the shader
+    /// group masks; the same set allocates nothing.
     pub fn defineWithNames(self: *Highlights, id: u32, a: Attr, names: []const []const u8) !void {
         try self.map.ensureUnusedCapacity(1);
-        const gop = try self.attr_names.getOrPut(id);
-        if (!gop.found_existing) gop.value_ptr.* = &.{};
-        errdefer if (!gop.found_existing) {
-            _ = self.attr_names.remove(id);
-        };
-        const old = gop.value_ptr.*;
-
-        var added: usize = 0;
-        for (names, 0..) |name, i| {
-            if (isNewName(old, names[0..i], name)) added += 1;
-        }
-        if (added != 0) {
-            const grown = try self.alloc.alloc([]u8, old.len + added);
-            var n: usize = old.len;
-            errdefer {
-                for (grown[old.len..n]) |s| self.alloc.free(s);
-                self.alloc.free(grown);
-            }
-            @memcpy(grown[0..old.len], old);
+        const old: []const []u8 = self.attr_names.get(id) orelse &.{};
+        if (!sameNameSet(old, names)) {
+            try self.attr_names.ensureUnusedCapacity(1);
+            var unique: usize = 0;
             for (names, 0..) |name, i| {
-                if (!isNewName(old, names[0..i], name)) continue;
-                grown[n] = try self.alloc.dupe(u8, name);
+                if (!hasName(names[0..i], name)) unique += 1;
+            }
+            const fresh = try self.alloc.alloc([]u8, unique);
+            var n: usize = 0;
+            errdefer {
+                for (fresh[0..n]) |s| self.alloc.free(s);
+                self.alloc.free(fresh);
+            }
+            for (names, 0..) |name, i| {
+                if (hasName(names[0..i], name)) continue;
+                fresh[n] = try self.alloc.dupe(u8, name);
                 n += 1;
             }
+            for (old) |s| self.alloc.free(s);
             self.alloc.free(old);
-            gop.value_ptr.* = grown;
+            self.attr_names.putAssumeCapacity(id, fresh);
             self.groups_changed = true;
         }
 
         self.publish(id, a);
     }
 
-    fn isNewName(old: []const []u8, earlier: []const []const u8, name: []const u8) bool {
-        for (old) |s| if (std.mem.eql(u8, s, name)) return false;
-        for (earlier) |s| if (std.mem.eql(u8, s, name)) return false;
+    fn hasName(list: anytype, name: []const u8) bool {
+        for (list) |s| if (std.mem.eql(u8, s, name)) return true;
+        return false;
+    }
+
+    fn sameNameSet(old: []const []u8, names: []const []const u8) bool {
+        for (names) |n| if (!hasName(old, n)) return false;
+        for (old) |s| if (!hasName(names, s)) return false;
         return true;
     }
 
@@ -439,6 +441,23 @@ test "colour resolution blends before it reverses, and both paths agree" {
     try std.testing.expectEqual(@as(u32, 0x111111), hl.get(999).fg);
     try std.testing.expectEqual(@as(u32, 0x222222), hl.get(999).bg);
     try std.testing.expectEqual(@as(u32, 0x111111), hl.getWithStyles(999).fg);
+}
+
+test "redefining an id with disjoint groups drops the old ones" {
+    var h = Highlights.init(std.testing.allocator);
+    defer h.deinit();
+    try h.defineWithNames(5, .{}, &.{ "Comment", "Comment", "@comment" });
+    try std.testing.expect(h.groups_changed);
+    try std.testing.expectEqual(@as(usize, 2), h.attr_names.get(5).?.len);
+    h.groups_changed = false;
+    // The same set in another order is no change.
+    try h.defineWithNames(5, .{}, &.{ "@comment", "Comment" });
+    try std.testing.expect(!h.groups_changed);
+    try h.defineWithNames(5, .{}, &.{"@markup.quote"});
+    try std.testing.expect(h.groups_changed);
+    const names = h.attr_names.get(5).?;
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("@markup.quote", names[0]);
 }
 
 test "the packed style byte keeps its wire values" {

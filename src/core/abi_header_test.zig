@@ -19,6 +19,7 @@ const scrollbar_metrics = @import("scrollbar_metrics.zig");
 const frontend_rules = @import("frontend_rules.zig");
 const glow_chain = @import("glow_chain.zig");
 const scroll_ease = @import("scroll_ease.zig");
+const highlight = @import("highlight.zig");
 
 const pairs = .{
     .{ c.zonvie_glyph_entry, c_api.GlyphEntry },
@@ -204,6 +205,16 @@ const constant_pairs = .{
     .{ c.ZONVIE_SHADER_LAYER_BORDER, c_api.SHADER_LAYER_BORDER },
     .{ c.ZONVIE_SHADER_INPUT_CELL_AGE, c_api.SHADER_INPUT_CELL_AGE },
     .{ c.ZONVIE_SHADER_INPUT_CELL_TEXT, c_api.SHADER_INPUT_CELL_TEXT },
+    .{ c.ZONVIE_CELL_ATTR_BOLD, highlight.STYLE_BOLD },
+    .{ c.ZONVIE_CELL_ATTR_ITALIC, highlight.STYLE_ITALIC },
+    .{ c.ZONVIE_CELL_ATTR_STRIKETHROUGH, highlight.STYLE_STRIKETHROUGH },
+    .{ c.ZONVIE_CELL_ATTR_UNDERLINE, highlight.STYLE_UNDERLINE },
+    .{ c.ZONVIE_CELL_ATTR_UNDERCURL, highlight.STYLE_UNDERCURL },
+    .{ c.ZONVIE_CELL_ATTR_UNDERDOUBLE, highlight.STYLE_UNDERDOUBLE },
+    .{ c.ZONVIE_CELL_ATTR_UNDERDOTTED, highlight.STYLE_UNDERDOTTED },
+    .{ c.ZONVIE_CELL_ATTR_UNDERDASHED, highlight.STYLE_UNDERDASHED },
+    .{ c.ZONVIE_CELL_TEXEL_STRIDE, c_api.cell_text_store.texel_stride },
+    .{ c.ZONVIE_SHADER_HL_GROUPS_MAX, frontend_rules.max_hl_groups },
     .{ c.ZONVIE_GRID_ID_CMDLINE, c_api.grid_mod.CMDLINE_GRID_ID },
     .{ c.ZONVIE_GRID_ID_POPUPMENU, c_api.grid_mod.POPUPMENU_GRID_ID },
     .{ c.ZONVIE_GRID_ID_MESSAGE, c_api.grid_mod.MESSAGE_GRID_ID },

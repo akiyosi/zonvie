@@ -888,7 +888,20 @@ typedef struct zonvie_cell_stamp {
     int16_t grid;
 } zonvie_cell_stamp;
 
-/* One row of codepoints for the iCellText texture a custom shader samples,
+/* Style bits in the top byte of a cell texel's y (zonvie_cell_text_row). */
+#define ZONVIE_CELL_ATTR_BOLD          (1u << 0)
+#define ZONVIE_CELL_ATTR_ITALIC        (1u << 1)
+#define ZONVIE_CELL_ATTR_STRIKETHROUGH (1u << 2)
+#define ZONVIE_CELL_ATTR_UNDERLINE     (1u << 3)
+#define ZONVIE_CELL_ATTR_UNDERCURL     (1u << 4)
+#define ZONVIE_CELL_ATTR_UNDERDOUBLE   (1u << 5)
+#define ZONVIE_CELL_ATTR_UNDERDOTTED   (1u << 6)
+#define ZONVIE_CELL_ATTR_UNDERDASHED   (1u << 7)
+
+/* uint32_t per cell in zonvie_cell_text_row.texels and the cell-text stores. */
+#define ZONVIE_CELL_TEXEL_STRIDE 4
+
+/* One row of cell texels for the iCellText texture a custom shader samples,
    delivered by on_cell_text_row right after that row's on_vertices_row.
    `grid` selects the texture: 1 is the main window's screen-space cell grid,
    any other value is an EXTERNAL window's grid id with row/col local to it.
@@ -904,9 +917,21 @@ typedef struct zonvie_cell_stamp {
    tex_rows x tex_cols is that texture's cell grid: the root's rows plus
    every band, as wide as the widest of the root and the bands; a change
    of either starts the texture blank. On that, and on any move of a band,
-   every row of the surface is redelivered. `cps` holds `count` codepoints for cells
-   (row, col..col+count): 0 for the second cell of a wide glyph, 32 for a
-   blank. The pointer is valid only for the call. */
+   every row of the surface is redelivered. `texels` holds `count` texels of
+   ZONVIE_CELL_TEXEL_STRIDE uint32_t each for cells (row, col..col+count),
+   one rgba32ui texel per cell:
+     x  codepoint: 0 for the second cell of a wide glyph, 32 for a blank;
+     y  fg rgb24 | ZONVIE_CELL_ATTR_* << 24;
+     z  bg rgb24;
+     w  highlight-group mask: bit i set when the cell's attr was composed
+        from the i-th name declared with zonvie_core_set_shader_hl_groups;
+        0 when none is declared.
+   fg and bg are Zonvie's resolved colours as drawn: defaults substituted,
+   reverse applied, blend mixed against the default bg (not the pixels
+   underneath); never 0 meaning "default". The second cell of a wide glyph
+   carries its glyph's fg, bg, attr and mask. A texel never delivered reads
+   all zero, so w == 0 && y == 0 && z == 0 means "no data". The pointer is
+   valid only for the call. */
 typedef struct zonvie_cell_text_row {
     int64_t  grid;
     uint32_t tex_rows;
@@ -915,7 +940,7 @@ typedef struct zonvie_cell_text_row {
     uint32_t col;
     uint32_t count;
     uint32_t _pad;
-    const uint32_t *cps;
+    const uint32_t *texels;
 } zonvie_cell_text_row;
 
 typedef struct zonvie_callbacks {
@@ -1148,7 +1173,7 @@ typedef struct zonvie_callbacks {
     zonvie_shape_text_run_ex_fn on_shape_text_run_ex;
     zonvie_rasterize_glyph_ex_fn on_rasterize_glyph_ex;
     zonvie_rasterize_glyph_by_id_ex_fn on_rasterize_glyph_by_id_ex;
-    /* The codepoints of a row the flush just sent, for the iCellText texture
+    /* The cell texels of a row the flush just sent, for the iCellText texture
        a custom shader samples: one call per run of the row no higher layer
        covers (none when it is all covered), or one for a band row (see
        zonvie_cell_text_row). Also for rows the frontend keeps across a row

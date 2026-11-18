@@ -635,7 +635,7 @@ pub const Callbacks = extern struct {
     on_shape_text_run_ex: ?ShapeTextRunExFn = null,
     on_rasterize_glyph_ex: ?RasterizeGlyphExFn = null,
     on_rasterize_glyph_by_id_ex: ?RasterizeGlyphExFn = null,
-    // The codepoints of a row the flush just sent, for the iCellText shader
+    // The cell texels of a row the flush just sent, for the iCellText shader
     // input. Appended at the end for ABI compat; only fired after the
     // frontend opts in via zonvie_core_set_shader_inputs_enabled.
     on_cell_text_row: ?*const fn (ctx: ?*anyopaque, row: *const zonvie_cell_text_row) callconv(.c) void = null,
@@ -1655,6 +1655,34 @@ pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, flags: i32
     box.core.setShaderInputsEnabledLocked(on);
     box.core.grid_mu.unlock(clock.io());
     box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: flags={d}\n", .{on});
+}
+
+/// Declare the highlight groups the loaded shader names with
+/// `@zonvie-hl-groups:`; see include/zonvie_frontend.h. Same thread and lock
+/// rules as zonvie_core_set_shader_inputs_enabled.
+pub export fn zonvie_core_set_shader_hl_groups(p: ?*zonvie_core, source: ?[*]const u8, len: usize) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const src: []const u8 = if (source) |s| s[0..len] else &.{};
+    box.core.grid_mu.lockUncancelable(clock.io());
+    box.core.setShaderHlGroupsLocked(src);
+    box.core.grid_mu.unlock(clock.io());
+}
+
+/// One iCellText texel (zonvie_cell_text_row.texels): x codepoint, y fg rgb24
+/// with the ZONVIE_CELL_ATTR_* byte above it, z bg rgb24, w group mask.
+/// Pre: colours are rgb24 (debug-asserted; release drops higher bits).
+pub fn packCellTexel(cp: u32, fg_rgb: u32, bg_rgb: u32, style: u8, mask: u32) [4]u32 {
+    std.debug.assert(fg_rgb <= 0xFFFFFF and bg_rgb <= 0xFFFFFF);
+    return .{ cp, (fg_rgb & 0xFFFFFF) | (@as(u32, style) << 24), bg_rgb & 0xFFFFFF, mask };
+}
+
+test "packCellTexel puts cp in x, fg|attr<<24 in y, bg in z, mask in w" {
+    const hl = @import("highlight.zig");
+    const t = packCellTexel(0x41, 0x112233, 0x445566, hl.STYLE_BOLD | hl.STYLE_UNDERCURL, 0x8000_0001);
+    try std.testing.expectEqual([4]u32{ 0x41, 0x112233 | (0x11 << 24), 0x445566, 0x8000_0001 }, t);
+    // Every style bit lands in y's top byte unchanged.
+    try std.testing.expectEqual(@as(u32, 0xFF00_0000), packCellTexel(0, 0, 0, 0xFF, 0)[1]);
 }
 
 pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callconv(.c) void {

@@ -110,8 +110,8 @@ pub const PostFx = struct {
     age_rows: u32 = 0,
     age_cache: core.cell_age_store.SyncCache = .{},
     uses_edit: bool = false,
-    /// This surface's iCellText: the store's cols x rows R32UI codepoints,
-    /// when a shader reads it; `zero_text` (1x1 R32UI) until a row arrives.
+    /// This surface's iCellText: the store's cols x rows RGBA32UI cell
+    /// texels, when a shader reads it; `zero_text` (1x1) until a row arrives.
     text_tex: u32 = 0,
     text_cols: u32 = 0,
     text_rows: u32 = 0,
@@ -294,8 +294,9 @@ fn setup(app: *App, p: *PostFx) bool {
         // An unsigned sampler must not read the RGBA8 `black`.
         gl.glGenTextures(1, &p.zero_text);
         gl.glBindTexture(gl.GL_TEXTURE_2D, p.zero_text);
-        const zero_u = [_]u32{0};
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32UI, 1, 1, 0, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_INT, &zero_u);
+        const zero_u = [_]u32{ 0, 0, 0, 0 };
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 4);
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32UI, 1, 1, 0, gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, &zero_u);
         nearest();
         app.shader_wants_cell_text.store(true, .release);
     }
@@ -731,16 +732,19 @@ fn uploadCellText(p: *PostFx) u32 {
     const values = p.text_scratch.items;
     const cols = p.text_cache.cols;
     const rows = p.text_cache.rows;
+    std.debug.assert(values.len == @as(usize, cols) * rows * core.cell_text_store.texel_stride);
+    // Rows of RGBA32UI texels are 16-byte multiples; the glyph uploads set 1.
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 4);
     if (p.text_tex == 0 or p.text_cols != cols or p.text_rows != rows) {
         if (p.text_tex == 0) gl.glGenTextures(1, &p.text_tex);
         gl.glBindTexture(gl.GL_TEXTURE_2D, p.text_tex);
         nearest();
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32UI, @intCast(cols), @intCast(rows), 0, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32UI, @intCast(cols), @intCast(rows), 0, gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
         p.text_cols = cols;
         p.text_rows = rows;
     } else {
         gl.glBindTexture(gl.GL_TEXTURE_2D, p.text_tex);
-        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, @intCast(cols), @intCast(rows), gl.GL_RED_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, @intCast(cols), @intCast(rows), gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
     }
     return p.text_tex;
 }

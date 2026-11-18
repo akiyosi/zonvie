@@ -2999,7 +2999,7 @@ pub const Renderer = struct {
             td.Height = rows;
             td.MipLevels = 1;
             td.ArraySize = 1;
-            td.Format = c.DXGI_FORMAT_R32_UINT;
+            td.Format = c.DXGI_FORMAT_R32G32B32A32_UINT;
             td.SampleDesc.Count = 1;
             td.Usage = c.D3D11_USAGE_DEFAULT;
             td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
@@ -3018,8 +3018,10 @@ pub const Renderer = struct {
             self.cell_text_tex_cols = cols;
             self.cell_text_tex_rows = rows;
         }
+        const stride = core.cell_text_store.texel_stride;
+        std.debug.assert(values.len == @as(usize, cols) * rows * stride);
         if (ctx_vtbl.*.UpdateSubresource) |update| {
-            update(ctx, @ptrCast(self.cell_text_tex.?), 0, null, @ptrCast(values.ptr), cols * @sizeOf(u32), 0);
+            update(ctx, @ptrCast(self.cell_text_tex.?), 0, null, @ptrCast(values.ptr), cols * @as(u32, stride * @sizeOf(u32)), 0);
         }
         return self.cell_text_srv;
     }

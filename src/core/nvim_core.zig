@@ -20,6 +20,7 @@ const vertexgen = @import("vertexgen.zig");
 const pointer_target = @import("pointer_target.zig");
 const font_slots = @import("font_slots.zig");
 const clock = @import("clock.zig");
+const frontend_rules = @import("frontend_rules.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
 /// reaching into `rpc_transport`.
@@ -488,7 +489,7 @@ pub const Callbacks = struct {
     on_shape_text_run_ex: ?c_api.ShapeTextRunExFn = null,
     on_rasterize_glyph_ex: ?c_api.RasterizeGlyphExFn = null,
     on_rasterize_glyph_by_id_ex: ?c_api.RasterizeGlyphExFn = null,
-    /// The codepoints of a row the flush just sent (on_vertices_row), for
+    /// The cell texels of a row the flush just sent (on_vertices_row), for
     /// the iCellText texture a custom shader samples. Only while the
     /// frontend has opted in via zonvie_core_set_shader_inputs_enabled.
     on_cell_text_row: ?*const fn (ctx: ?*anyopaque, row: *const c_api.zonvie_cell_text_row) callconv(.c) void = null,
@@ -964,6 +965,17 @@ pub const Core = struct {
     last_surface_layout: std.AutoHashMapUnmanaged(i64, flush.SurfaceLayoutSig) = .{},
     /// Last iCellText plane layout per surface (flush.noteCellTextPlaneChanges).
     cell_text_plane_sig: std.AutoHashMapUnmanaged(i64, u64) = .{},
+    /// Highlight-group names the loaded shaders declare (`@zonvie-hl-groups`),
+    /// owned copies, at most frontend_rules.max_hl_groups: name i is bit i of
+    /// a cell texel's w.
+    shader_hl_groups: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Per attr id, the shader_hl_groups bits that id was composed from.
+    /// Empty whenever no group is declared, so the flush skips the lookup.
+    /// Rebuilt with the glow set and on set_shader_hl_groups, never per flush.
+    shader_hl_masks: std.ArrayListUnmanaged(u32) = .empty,
+    /// One row of cell texels (4 u32 per cell) for on_cell_text_row; sized
+    /// in onFlush while cell text is on, so the row loop never allocates.
+    cell_texel_scratch: std.ArrayListUnmanaged(u32) = .empty,
     layout_budget: c_api.render_layout.Budget = .{},
     /// Persistent build buffer for one surface's layer list; grown on layout
     /// change only, never per flush.
@@ -1471,6 +1483,10 @@ pub const Core = struct {
         self.last_surface_layout = .{};
         self.cell_text_plane_sig.deinit(self.alloc);
         self.cell_text_plane_sig = .{};
+        self.freeShaderHlGroups();
+        self.shader_hl_groups.deinit(self.alloc);
+        self.shader_hl_masks.deinit(self.alloc);
+        self.cell_texel_scratch.deinit(self.alloc);
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.msg_line_cache.deinit(self.alloc);
@@ -1713,6 +1729,9 @@ pub const Core = struct {
         self.last_surface_layout = .{};
         self.cell_text_plane_sig.deinit(self.alloc);
         self.cell_text_plane_sig = .{};
+        // Attr ids belong to the old server; the new one's hl_attr_define
+        // rebuilds the table.
+        self.shader_hl_masks.clearRetainingCapacity();
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.grid.external_grids.deinit(self.alloc);
@@ -5431,6 +5450,119 @@ pub const Core = struct {
             map.count(),
             self.glow_group_names.items.len,
         });
+    }
+
+    // ---- Shader highlight-group masks ----
+
+    fn freeShaderHlGroups(self: *Core) void {
+        for (self.shader_hl_groups.items) |name| self.alloc.free(name);
+        self.shader_hl_groups.clearRetainingCapacity();
+    }
+
+    /// Declare the shader's groups from its source (`@zonvie-hl-groups:`).
+    /// grid_mu held. An unchanged declaration does nothing; otherwise the
+    /// mask table follows at once.
+    pub fn setShaderHlGroupsLocked(self: *Core, source: []const u8) void {
+        var parsed: [frontend_rules.max_hl_groups][]const u8 = undefined;
+        const n = frontend_rules.parseHlGroups(source, &parsed);
+        if (n == frontend_rules.max_hl_groups) {
+            self.log.write("shader hl groups: at most {d} names are used\n", .{frontend_rules.max_hl_groups});
+        }
+        same: {
+            if (n != self.shader_hl_groups.items.len) break :same;
+            for (parsed[0..n], self.shader_hl_groups.items) |a, b| {
+                if (!std.mem.eql(u8, a, b)) break :same;
+            }
+            return;
+        }
+        self.freeShaderHlGroups();
+        for (parsed[0..n]) |name| {
+            // Out of memory keeps the names declared so far: their bits stay right.
+            const owned = self.alloc.dupe(u8, name) catch break;
+            self.shader_hl_groups.append(self.alloc, owned) catch {
+                self.alloc.free(owned);
+                break;
+            };
+        }
+        self.rebuildShaderHlMasks();
+    }
+
+    /// Bit i is set when `names` (the groups an attr id was composed from)
+    /// holds wanted[i]. Pre: wanted.len <= max_hl_groups.
+    pub fn hlGroupMask(names: []const []const u8, wanted: []const []const u8) u32 {
+        std.debug.assert(wanted.len <= frontend_rules.max_hl_groups);
+        var mask: u32 = 0;
+        for (wanted, 0..) |w, i| {
+            for (names) |n| {
+                if (std.mem.eql(u8, n, w)) {
+                    mask |= @as(u32, 1) << @intCast(i);
+                    break;
+                }
+            }
+        }
+        return mask;
+    }
+
+    /// Rebuild shader_hl_masks from the attribute table. Not a flush path:
+    /// runs where the glow set re-resolves and on set_shader_hl_groups.
+    /// Texels carry the mask, so when an id that cells may already show
+    /// changes its mask, every surface is resent while cell text is on.
+    pub fn rebuildShaderHlMasks(self: *Core) void {
+        const changed = self.rebuildShaderHlMaskTable() catch blk: {
+            self.shader_hl_masks.clearRetainingCapacity();
+            break :blk true;
+        };
+        if (changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+    }
+
+    /// Returns whether an id below the old table's length changed its mask.
+    /// An id past it was not defined before, so no cell shows it yet.
+    fn rebuildShaderHlMaskTable(self: *Core) !bool {
+        const wanted: []const []const u8 = self.shader_hl_groups.items;
+        const old = self.shader_hl_masks.items;
+        if (wanted.len == 0) {
+            const had_bits = std.mem.indexOfNone(u32, old, &.{0}) != null;
+            self.shader_hl_masks.clearRetainingCapacity();
+            return had_bits;
+        }
+        var len: usize = 0;
+        var kit = self.hl.attr_names.keyIterator();
+        while (kit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        var git = self.hl.groups.valueIterator();
+        while (git.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+
+        const fresh = try self.alloc.alloc(u32, len);
+        defer self.alloc.free(fresh);
+        @memset(fresh, 0);
+        var it = self.hl.attr_names.iterator();
+        while (it.next()) |e| fresh[e.key_ptr.*] = hlGroupMask(e.value_ptr.*, wanted);
+        // hl_group_set ids, as resolveGlowGroups honours them.
+        for (wanted, 0..) |name, i| {
+            if (self.hl.groups.get(name)) |id| fresh[id] |= @as(u32, 1) << @intCast(i);
+        }
+
+        var changed = false;
+        for (old, 0..) |m, i| {
+            if (m != (if (i < len) fresh[i] else 0)) changed = true;
+        }
+        try self.shader_hl_masks.ensureTotalCapacity(self.alloc, len);
+        self.shader_hl_masks.clearRetainingCapacity();
+        self.shader_hl_masks.appendSliceAssumeCapacity(fresh);
+        return changed;
+    }
+
+    /// The group mask of a cell's attr id; 0 with no group declared.
+    pub inline fn shaderHlMask(self: *const Core, hl_id: u32) u32 {
+        const masks = self.shader_hl_masks.items;
+        return if (hl_id < masks.len) masks[hl_id] else 0;
+    }
+
+    /// Pre-flush, grid_mu held. Texels hold group masks and resolved
+    /// colours: a group change rebuilds the masks (which resend what they
+    /// change), and new default colours resend every surface's text.
+    pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool) void {
+        if (groups_changed) self.rebuildShaderHlMasks();
+        if (self.hl.default_colors_changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
     }
 
     /// Say, once per attribute id, that a cell asked to glow and was refused.
@@ -9976,4 +10108,49 @@ test "an OS request at the grid's size, or one Neovim refuses, leaves no answer 
     try core.grid.resizeGrid(4, 25, 80);
     core.settleFontGridResizesLocked();
     try std.testing.expectEqual(grid_mod.WinFrame{ .rows = 25, .cols = 80 }, core.grid.grid_fonts.get(4).?.req.?);
+}
+
+test "hlGroupMask sets bit i for the i-th wanted name present in names" {
+    try std.testing.expectEqual(@as(u32, 0b10), Core.hlGroupMask(&.{ "Normal", "@markup.quote" }, &.{ "@markup.heading.1", "@markup.quote" }));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"Normal"}, &.{"@markup.quote"}));
+    try std.testing.expectEqual(@as(u32, 0b11), Core.hlGroupMask(&.{ "B", "A" }, &.{ "A", "B" }));
+}
+
+test "a mask rebuild that changes an existing id marks every surface dirty" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment @markup.quote\n");
+    try std.testing.expectEqual(@as(u32, 0b01), core.shaderHlMask(1));
+    core.grid.clearDirty();
+    // A new id past the table is no change: no cell shows it yet.
+    try core.hl.defineWithNames(2, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(2));
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+    // `:colorscheme` relinks id 1: its cells must be resent.
+    try core.hl.defineWithNames(1, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(1));
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+    // Dropping every declared group empties the table and resends.
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expectEqual(@as(usize, 0), core.shader_hl_masks.items.len);
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "new default colours resend every surface's text only while cell text is on" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    core.grid.clearDirty();
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expect(core.grid.main_buf.anyDirty());
 }

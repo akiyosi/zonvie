@@ -1857,13 +1857,53 @@ fn sendGridRow(core: *Core, row_cb: anytype, src: GridRowSource, row: u32, verts
     sendRowUpdate(core, row_cb, src.grid_id, row, 1, verts.ptr, verts.len, .main, src.rows, src.cols);
 }
 
-/// Hand the frontend the codepoints of the row just sent, for the iCellText
-/// texture: the composed row still sits in core.row_cells.scalars, so nothing
-/// is copied. A surface has one text plane: its root's cell grid, with a band
-/// below it for each layer in its own font (cellTextPlane). A layer's row
-/// lands on the plane of the surface that places it.
+/// Hand the frontend the texels of the row just sent, for the iCellText
+/// texture: codepoint, fg, bg and style as composed into core.row_cells
+/// (what was drawn), and the group mask of the cell's attr id. A surface has
+/// one text plane: its root's cell grid, with a band below it for each layer
+/// in its own font (cellTextPlane). A layer's row lands on the plane of the
+/// surface that places it.
 fn sendCellTextRow(core: *Core, src: GridRowSource, row: u32) void {
-    sendCellTextRowAt(core, src.grid_id, src.cols, row, core.row_cells.scalars.items.ptr);
+    if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
+    const texels = cellTexelRow(core, src.grid_id, src.cols) orelse return;
+    const rc = &core.row_cells;
+    const cells = src.buf.cells;
+    const base: usize = @as(usize, row) * src.cols;
+    const present: usize = if (base >= cells.len) 0 else @min(@as(usize, src.cols), cells.len - base);
+    const masked = core.shader_hl_masks.items.len != 0;
+    for (0..src.cols) |c| {
+        const mask: u32 = if (masked and c < present) core.shaderHlMask(cells[base + c].hl) else 0;
+        texels[c * texel_stride ..][0..texel_stride].* = c_api.packCellTexel(
+            rc.scalars.items[c],
+            rc.fg_rgbs.items[c],
+            rc.bg_rgbs.items[c],
+            rc.style_flags_arr.items[c],
+            mask,
+        );
+    }
+    sendCellTextRowAt(core, src.grid_id, src.cols, row, texels.ptr);
+}
+
+const texel_stride = c_api.cell_text_store.texel_stride;
+
+/// core.cell_texel_scratch as one row of `cols` texels. onFlush sizes it, so
+/// this allocates only for a caller outside a flush. Out of memory, the row's
+/// text cannot go out: the surface's plane signature is forgotten, so the
+/// next flush finds it changed and resends the whole surface.
+fn cellTexelRow(core: *Core, grid_id: i64, cols: u32) ?[]u32 {
+    const n = @as(usize, cols) * texel_stride;
+    core.cell_texel_scratch.ensureTotalCapacity(core.alloc, n) catch {
+        var surface = grid_id;
+        if (!core.grid.isSurfaceRoot(grid_id)) {
+            if (core.grid.win_pos.get(grid_id)) |pos| {
+                if (core.grid.surfacePlacement(pos)) |placed| surface = placed.surface;
+            }
+        }
+        _ = core.cell_text_plane_sig.remove(surface);
+        return null;
+    };
+    core.cell_texel_scratch.items.len = n;
+    return core.cell_texel_scratch.items;
 }
 
 /// A layer of `surface` whose cells are not the root's: one drawn in its own
@@ -1939,6 +1979,16 @@ fn noteCellTextPlaneChanges(core: *Core) void {
     while (it.next()) |id| noteCellTextPlaneChange(core, id.*);
 }
 
+/// Size the texel row for the widest grid once per flush, while cell text is
+/// on, so the row loop never allocates. A failure is left to cellTexelRow.
+fn presizeCellTexelScratch(core: *Core) void {
+    if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
+    var cols: usize = core.grid.main_buf.cols;
+    var it = core.grid.sub_grids.valueIterator();
+    while (it.next()) |sg| cols = @max(cols, sg.cols);
+    core.cell_texel_scratch.ensureTotalCapacity(core.alloc, cols * texel_stride) catch {};
+}
+
 fn noteCellTextPlaneChange(core: *Core, surface: i64) void {
     const root = core.grid.bufForConst(surface) orelse return;
     const plane = cellTextPlane(core, surface, root);
@@ -1964,7 +2014,7 @@ fn noteCellTextPlaneChange(core: *Core, surface: i64) void {
 /// So each row goes out as the runs no layer above the sender covers. A
 /// font layer covers nothing: its text is in its band, and the lattice under
 /// it stays whole for the cells around it.
-fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, cps: [*]const u32) void {
+fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, texels: [*]const u32) void {
     const g = &core.grid;
     if (!g.cell_text_enabled) return;
     const cb = core.cb.on_cell_text_row orelse return;
@@ -1989,7 +2039,7 @@ fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, cps: [*]con
         .row = 0,
         .col = 0,
         .count = 0,
-        .cps = cps,
+        .texels = texels,
     };
     if (font_layer) {
         out.row = cellTextBandRow0(core, surface, root.rows, grid_id) + row;
@@ -2028,7 +2078,7 @@ fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, cps: [*]con
         }
         out.col = @intCast(c);
         out.count = @intCast(run_end - c);
-        out.cps = cps + @as(usize, @intCast(c - col_i));
+        out.texels = texels + @as(usize, @intCast(c - col_i)) * texel_stride;
         cb(core.ctx, &out);
         c = run_end;
     }
@@ -3676,32 +3726,36 @@ fn dispatchGridRowScroll(
 /// The iCellText texture is keyed by row, so rows the frontend keeps across a
 /// row shift are resent as text at their new place; the vacated ones follow
 /// with the flush. The buffer has already scrolled, so each row is read as
-/// it now stands, by composeRowRuns' rule: cells the buffer lacks are blank.
-/// `row_cells.scalars` is free until the row loop.
+/// it now stands, by composeRowRuns' rule: cells the buffer lacks are blank
+/// at hl 0. Colours and style come from the resolver composeRowRuns uses
+/// (getWithStyles), run-batched by hl id, so a kept row's texels equal the
+/// ones a recomposed row would carry. row_cells is not touched.
 fn sendCellTextRegion(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf, row_start: u32, row_end: u32) void {
     if (!core.grid.cell_text_enabled or core.cb.on_cell_text_row == null) return;
-    const scratch = &core.row_cells.scalars;
-    scratch.ensureTotalCapacity(core.alloc, buf.cols) catch {
-        // The kept rows' text cannot go out at their new place: forget the
-        // surface's plane signature, so the next flush finds it changed and
-        // resends the whole surface (noteCellTextPlaneChange).
-        var surface = grid_id;
-        if (!core.grid.isSurfaceRoot(grid_id)) {
-            if (core.grid.win_pos.get(grid_id)) |pos| {
-                if (core.grid.surfacePlacement(pos)) |placed| surface = placed.surface;
-            }
-        }
-        _ = core.cell_text_plane_sig.remove(surface);
-        return;
-    };
-    scratch.items.len = buf.cols;
+    const texels = cellTexelRow(core, grid_id, buf.cols) orelse return;
+    const masked = core.shader_hl_masks.items.len != 0;
+    const cols: usize = buf.cols;
     var r = row_start;
     while (r < row_end) : (r += 1) {
-        const base: usize = @as(usize, r) * buf.cols;
-        const present: usize = if (base >= buf.cells.len) 0 else @min(@as(usize, buf.cols), buf.cells.len - base);
-        if (present != 0) simdExtractCp(buf.cells.ptr + base, scratch.items.ptr, present);
-        @memset(scratch.items[present..], ' ');
-        sendCellTextRowAt(core, grid_id, buf.cols, r, scratch.items.ptr);
+        const base: usize = @as(usize, r) * cols;
+        const present: usize = if (base >= buf.cells.len) 0 else @min(cols, buf.cells.len - base);
+        var c: usize = 0;
+        while (c < cols) {
+            const run_hl: u32 = if (c < present) buf.cells[base + c].hl else 0;
+            var run_end = c + 1;
+            while (run_end < cols) : (run_end += 1) {
+                const next_hl: u32 = if (run_end < present) buf.cells[base + run_end].hl else 0;
+                if (next_hl != run_hl) break;
+            }
+            const a = core.hl.getWithStyles(run_hl);
+            const mask: u32 = if (masked) core.shaderHlMask(run_hl) else 0;
+            for (c..run_end) |i| {
+                const cp: u32 = if (i < present) buf.cells[base + i].cp else ' ';
+                texels[i * texel_stride ..][0..texel_stride].* = c_api.packCellTexel(cp, a.fg, a.bg, a.style_flags, mask);
+            }
+            c = run_end;
+        }
+        sendCellTextRowAt(core, grid_id, buf.cols, r, texels.ptr);
     }
 }
 
@@ -3723,6 +3777,7 @@ pub const FlushCtx = struct {
         ctx.core.grid.assertMainShapeMirrored();
         ctx.core.settleFontGridResizesLocked();
         noteCellTextPlaneChanges(ctx.core);
+        presizeCellTexelScratch(ctx.core);
         // Pre-size the shaping buffers so a run of up to this many glyphs
         // allocates nothing in the row loop; a longer run still grows them
         // there (ShapingBuffers.setLen).
@@ -20712,7 +20767,7 @@ test "each sent row hands the frontend its composed codepoints for iCellText" {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (self.n == self.rows.len) return;
             self.rows[self.n] = r.*;
-            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            for (0..r.count) |i| self.text[self.n][i] = r.texels[i * texel_stride];
             self.n += 1;
         }
     };
@@ -20771,6 +20826,95 @@ test "each sent row hands the frontend its composed codepoints for iCellText" {
     }
 }
 
+/// Captures the texels of each main-window row delivered whole (4 cols).
+const TexelCapture = struct {
+    texels: [2][4 * texel_stride]u32 = @splat(@splat(0xDEAD)),
+    n: usize = 0,
+
+    fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.n += 1;
+        if (r.row >= 2 or r.col != 0 or r.count != 4) return;
+        @memcpy(&self.texels[r.row], r.texels[0 .. 4 * texel_stride]);
+    }
+    fn noopRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+
+    fn setup(core: *Core, cap: *@This()) !void {
+        try core.grid.resizeGrid(1, 2, 4);
+        core.drawable_w_px = 4;
+        core.drawable_h_px = 2;
+        core.cell_w_px = 1;
+        core.cell_h_px = 1;
+        core.ctx = cap;
+        core.cb.on_vertices_row = noopRow;
+        core.cb.on_cell_text_row = onRow;
+        core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    }
+};
+
+test "with no groups declared, cell texels carry mask 0 and no mask table exists" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var cap = TexelCapture{};
+    try TexelCapture.setup(&core, &cap);
+    try core.hl.defineWithNames(3, .{ .fg = 0x112233 }, &.{"@markup.quote"});
+    core.rebuildShaderHlMasks();
+    try std.testing.expectEqual(@as(usize, 0), core.shader_hl_masks.items.len);
+    core.grid.putCell(0, 0, 'q', 3);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 4);
+    try std.testing.expectEqual(@as(u32, 'q'), cap.texels[0][0]);
+    for (0..4) |c| try std.testing.expectEqual(@as(u32, 0), cap.texels[0][c * texel_stride + 3]);
+}
+
+test "a reverse attr and an attr without fg deliver drawn colours, never 0-as-default" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var cap = TexelCapture{};
+    try TexelCapture.setup(&core, &cap);
+    core.hl.setDefaults(0xAAAAAA, 0x101010, null);
+    try core.hl.defineWithNames(1, .{ .fg = 0x00FF00, .bg = 0x0000FF, .reverse = true, .bold = true }, &.{});
+    try core.hl.defineWithNames(2, .{ .bg = 0x202020 }, &.{});
+    core.grid.putCell(0, 0, 'r', 1);
+    core.grid.putCell(0, 1, 'n', 2);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 4);
+    const t = cap.texels[0];
+    try std.testing.expectEqualSlices(u32, &.{ 'r', 0x0000FF | (@as(u32, STYLE_BOLD) << 24), 0x00FF00 }, t[0..3]);
+    try std.testing.expectEqualSlices(u32, &.{ 'n', 0xAAAAAA, 0x202020 }, t[4..7]);
+    // A blank cell at hl 0 carries the defaults.
+    try std.testing.expectEqualSlices(u32, &.{ ' ', 0xAAAAAA, 0x101010 }, t[8..11]);
+}
+
+test "a shifted row's texels equal the re-composed row's texels for the same cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var cap = TexelCapture{};
+    try TexelCapture.setup(&core, &cap);
+    core.hl.setDefaults(0xAAAAAA, 0x101010, null);
+    try core.hl.defineWithNames(1, .{ .fg = 0x00FF00, .bg = 0x0000FF, .reverse = true, .italic = true }, &.{"@markup.quote"});
+    try core.hl.defineWithNames(2, .{ .fg = 0x123456 }, &.{ "Comment", "@markup.heading.1" });
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: @markup.heading.1 @markup.quote\n");
+    try std.testing.expect(core.shader_hl_masks.items.len != 0);
+    core.grid.putCell(0, 0, 'a', 1);
+    core.grid.putCell(0, 1, 0x3042, 2);
+    // The continuation cell of a wide glyph: cp 0, same attr.
+    core.grid.putCell(0, 2, 0, 2);
+    core.grid.putCell(1, 3, 'z', 1);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 4);
+    const composed = cap.texels;
+    // The continuation cell carries its glyph's colours and mask.
+    try std.testing.expectEqualSlices(u32, composed[0][4..8], &.{ 0x3042, 0x123456, 0x101010, 0b01 });
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0x123456, 0x101010, 0b01 }, composed[0][8..12]);
+    try std.testing.expectEqual(@as(u32, 0b10), composed[0][3]);
+
+    cap.texels = @splat(@splat(0xDEAD));
+    sendCellTextRegion(&core, 1, &core.grid.main_buf, 0, 2);
+    try std.testing.expectEqualSlices(u32, &composed[0], &cap.texels[0]);
+    try std.testing.expectEqualSlices(u32, &composed[1], &cap.texels[1]);
+}
+
 test "cell text under a layer is left to the layer, and a float on an external window writes its texture" {
     const Sent = struct {
         rows: [32]c_api.zonvie_cell_text_row = undefined,
@@ -20781,7 +20925,7 @@ test "cell text under a layer is left to the layer, and a float on an external w
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (self.n == self.rows.len) return;
             self.rows[self.n] = r.*;
-            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            for (0..r.count) |i| self.text[self.n][i] = r.texels[i * texel_stride];
             self.n += 1;
         }
 
@@ -20906,7 +21050,7 @@ test "a layer in its own font writes its text to a band below the root's rows an
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (self.n == self.rows.len) return;
             self.rows[self.n] = r.*;
-            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            for (0..r.count) |i| self.text[self.n][i] = r.texels[i * texel_stride];
             self.n += 1;
         }
 
@@ -21078,7 +21222,7 @@ test "a row shift inside a grid in its own font resends its band" {
         fn onText(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (r.grid != 1 or r.row >= 20 or r.count == 0) return;
-            self.first[r.row] = r.cps[0];
+            self.first[r.row] = r.texels[0];
             self.sent[r.row] = true;
         }
     };
@@ -21117,7 +21261,7 @@ test "a row shift resends the surviving rows' text at their new rows" {
         fn onText(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (r.grid != 1 or r.row >= 10 or r.count == 0) return;
-            self.first[r.row] = r.cps[0];
+            self.first[r.row] = r.texels[0];
             self.sent[r.row] = true;
         }
     };

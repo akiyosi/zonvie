@@ -15,7 +15,11 @@
 const std = @import("std");
 const clock = @import("clock.zig");
 
-/// One row of codepoints for one texture. Layout matches
+/// u32 per cell in a row's `texels` and in every mirror: x codepoint,
+/// y fg rgb24 | attr << 24, z bg rgb24, w hl-group mask.
+pub const texel_stride: usize = 4;
+
+/// One row of cell texels for one texture. Layout matches
 /// `zonvie_cell_text_row` in `include/zonvie_core.h`.
 pub const Row = extern struct {
     /// 1 = the main window's texture, else an external window's grid id.
@@ -25,14 +29,15 @@ pub const Row = extern struct {
     /// blank grid is published with the flush that fills it.
     tex_rows: u32,
     tex_cols: u32,
-    /// Where `cps` lands on the texture: a composited float's row is offset
+    /// Where `texels` lands on the texture: a composited float's row is offset
     /// by its win_pos, a grid in its own font's row sits in its band below
     /// the root's rows.
     row: u32,
     col: u32,
     count: u32,
     _pad: u32 = 0,
-    cps: [*]const u32,
+    /// `count` * texel_stride u32.
+    texels: [*]const u32,
 };
 
 /// Textures whose clean frames skip the lock. A store past this many still
@@ -74,7 +79,7 @@ pub const SyncResult = enum(i32) {
     unavailable = 0,
     /// The texture already holds the mirror.
     clean = 1,
-    /// `values` must be uploaded at `cache.cols` x `cache.rows`; `mu` stays
+    /// `values` (texel_stride u32 per cell) must be uploaded at `cache.cols` x `cache.rows`; `mu` stays
     /// held until `endUpload`.
     dirty = 2,
 };
@@ -113,19 +118,20 @@ pub const Stores = struct {
         const st = self.sized(r.grid, r.tex_cols, r.tex_rows) orelse return;
         const cols = st.stagedCols();
         if (r.row >= st.stagedRows() or r.col >= cols) return;
-        const n: usize = @min(@as(usize, r.count), @as(usize, cols - r.col));
-        const base: usize = @as(usize, r.row) * cols + r.col;
+        const n: usize = @min(@as(usize, r.count), @as(usize, cols - r.col)) * texel_stride;
+        const base: usize = (@as(usize, r.row) * cols + r.col) * texel_stride;
         // A row's first write of a flush starts from what the texture shows,
         // so a partial row (a float's run) keeps the cells around it; on a
         // new cell grid, from blank.
         if (!st.staged_rows.isSet(r.row)) {
-            const row_base: usize = @as(usize, r.row) * cols;
-            const dst = st.staged[row_base .. row_base + cols];
-            if (st.pending_cols != 0) @memset(dst, 0) else @memcpy(dst, st.values[row_base .. row_base + cols]);
+            const w: usize = @as(usize, cols) * texel_stride;
+            const row_base: usize = @as(usize, r.row) * w;
+            const dst = st.staged[row_base .. row_base + w];
+            if (st.pending_cols != 0) @memset(dst, 0) else @memcpy(dst, st.values[row_base .. row_base + w]);
             st.staged_rows.set(r.row);
             st.any_staged = true;
         }
-        @memcpy(st.staged[base .. base + n], r.cps[0..n]);
+        @memcpy(st.staged[base .. base + n], r.texels[0..n]);
     }
 
     /// Publish `grid`'s staged rows: the flush that wrote them committed.
@@ -145,9 +151,10 @@ pub const Stores = struct {
             var changed = false;
             var it = st.staged_rows.iterator(.{});
             while (it.next()) |r| {
-                const base: usize = r * st.cols;
-                const src = st.staged[base .. base + st.cols];
-                const dst = st.values[base .. base + st.cols];
+                const w: usize = @as(usize, st.cols) * texel_stride;
+                const base: usize = r * w;
+                const src = st.staged[base .. base + w];
+                const dst = st.values[base .. base + w];
                 if (std.mem.eql(u32, dst, src)) continue;
                 @memcpy(dst, src);
                 changed = true;
@@ -165,10 +172,11 @@ pub const Stores = struct {
     /// committed one. Allocates nothing: sized() made the buffer.
     fn publishPending(self: *Stores, st: *Store) void {
         const cols = st.pending_cols;
+        const w: usize = @as(usize, cols) * texel_stride;
         var it = st.staged_rows.iterator(.{});
         while (it.next()) |r| {
-            const base: usize = r * cols;
-            @memcpy(st.pending[base .. base + cols], st.staged[base .. base + cols]);
+            const base: usize = r * w;
+            @memcpy(st.pending[base .. base + w], st.staged[base .. base + w]);
         }
         st.staged_rows.unsetAll();
         st.any_staged = false;
@@ -282,7 +290,7 @@ pub const Stores = struct {
         if (st.stagedCols() == cols and st.stagedRows() == rows) return st;
         // A new cell grid waits in `pending` for the commit: a draw before it
         // keeps the texture it has, which still pairs with the committed rows.
-        const n: usize = @as(usize, cols) * @as(usize, rows);
+        const n: usize = @as(usize, cols) * @as(usize, rows) * texel_stride;
         const buf = self.alloc.alloc(u32, n) catch return null;
         const staged = self.alloc.alloc(u32, n) catch {
             self.alloc.free(buf);
@@ -347,8 +355,25 @@ pub const Stores = struct {
 
 const testing = std.testing;
 
+var test_texels: [64 * texel_stride]u32 = undefined;
+var test_xs: [64]u32 = undefined;
+
+/// A row whose texels carry `cps` in x and a marker in the other lanes; the
+/// result is valid until the next call.
 fn row(grid: i64, tex_rows: u32, tex_cols: u32, r: u32, c: u32, cps: []const u32) Row {
-    return .{ .grid = grid, .tex_rows = tex_rows, .tex_cols = tex_cols, .row = r, .col = c, .count = @intCast(cps.len), .cps = cps.ptr };
+    for (cps, 0..) |cp, i| test_texels[i * texel_stride ..][0..texel_stride].* = .{ cp, cp +% 1, cp +% 2, cp +% 3 };
+    return .{ .grid = grid, .tex_rows = tex_rows, .tex_cols = tex_cols, .row = r, .col = c, .count = @intCast(cps.len), .texels = &test_texels };
+}
+
+/// The x lanes of a mirror, after checking every texel moved as a whole.
+fn xs(v: []const u32) []const u32 {
+    const n = v.len / texel_stride;
+    for (0..n) |i| {
+        const t = v[i * texel_stride ..][0..texel_stride];
+        if (t[0] != 0) std.debug.assert(t[1] == t[0] +% 1 and t[2] == t[0] +% 2 and t[3] == t[0] +% 3);
+        test_xs[i] = t[0];
+    }
+    return test_xs[0..n];
 }
 
 /// Stage one row and commit it, as a flush the frontend accepted does.
@@ -364,7 +389,7 @@ fn syncValues(s: *Stores, grid: i64) ?[]const u32 {
     return switch (s.sync(grid, false, &cache, &v)) {
         .dirty => blk: {
             s.endUpload();
-            break :blk v;
+            break :blk xs(v);
         },
         else => null,
     };
@@ -411,7 +436,7 @@ test "a cached sync stays clean until the text changes; a resize starts blank" {
     try testing.expectEqual(SyncResult.clean, s.sync(1, false, &cache, &v));
     put(&s, row(1, 1, 2, 0, 1, &.{'c'}));
     try testing.expectEqual(SyncResult.dirty, s.sync(1, false, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 'a', 'c' }, v);
+    try testing.expectEqualSlices(u32, &.{ 'a', 'c' }, xs(v));
     s.endUpload();
     // force re-uploads a clean mirror, for a texture just (re)created.
     try testing.expectEqual(SyncResult.dirty, s.sync(1, true, &cache, &v));
@@ -419,7 +444,7 @@ test "a cached sync stays clean until the text changes; a resize starts blank" {
     // A new cell grid is a new, blank texture; the row written with it stays.
     put(&s, row(1, 2, 2, 1, 0, &.{ 'd', 'e' }));
     try testing.expectEqual(SyncResult.dirty, s.sync(1, false, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 0, 0, 'd', 'e' }, v);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 'd', 'e' }, xs(v));
     s.endUpload();
     try testing.expectEqual(@as(u32, 2), cache.rows);
 }
@@ -502,12 +527,12 @@ test "a commit not yet uploaded still shows its own text when the next flush sta
     put(&s, row(1, 1, 2, 0, 0, &.{ 'c', 'd' }));
     s.applyRow(row(1, 2, 2, 0, 0, &.{ 'e', 'f' }));
     try testing.expectEqual(SyncResult.dirty, s.sync(1, false, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 'c', 'd' }, v);
+    try testing.expectEqualSlices(u32, &.{ 'c', 'd' }, xs(v));
     s.endUpload();
     try testing.expectEqual(@as(u32, 1), cache.rows);
     // A texture made now (force) gets the committed grid too.
     try testing.expectEqual(SyncResult.dirty, s.sync(1, true, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 'c', 'd' }, v);
+    try testing.expectEqualSlices(u32, &.{ 'c', 'd' }, xs(v));
     s.endUpload();
     // A refused flush keeps it; the retry publishes the new grid whole.
     s.discard();
@@ -515,7 +540,7 @@ test "a commit not yet uploaded still shows its own text when the next flush sta
     s.applyRow(row(1, 2, 2, 1, 0, &.{ 'g', 'h' }));
     s.commit(1);
     try testing.expectEqual(SyncResult.dirty, s.sync(1, false, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 0, 0, 'g', 'h' }, v);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 'g', 'h' }, xs(v));
     s.endUpload();
 }
 
@@ -528,6 +553,6 @@ test "no texture is offered before a flush commits the first row" {
     try testing.expectEqual(SyncResult.unavailable, s.sync(1, true, &cache, &v));
     s.commit(1);
     try testing.expectEqual(SyncResult.dirty, s.sync(1, false, &cache, &v));
-    try testing.expectEqualSlices(u32, &.{ 'a', 'b' }, v);
+    try testing.expectEqualSlices(u32, &.{ 'a', 'b' }, xs(v));
     s.endUpload();
 }
