@@ -578,6 +578,42 @@ fn setLayerFont(l: *SurfaceLayer, gf: ?GridFontPx) void {
     l.font_extent_h_px = f.extent_h_px;
 }
 
+/// Hand a surface's renderer iRootRows and iGridRects for its custom shader
+/// (core.fillGridRects). `layers` is the paint's pinned list, root first;
+/// rects are placed from `origin`, the renderer's iGridOrigin, by each
+/// layer's offset from the root. Layers are placed in global cells
+/// (`cell_w_px`/`row_h_px`) whatever the root's font; under a root in its
+/// own font every layer has a band of its own, as the core writes it. The
+/// buffer holds the topmost layers, the ones the table can list.
+pub fn fillShaderGridRects(r: anytype, layers: []const SurfaceLayer, origin: [2]f32, cell_w_px: u32, row_h_px: u32) void {
+    var in: [256]core.zonvie_shader_grid_rect = undefined;
+    const root_rows: u32 = if (layers.len != 0) layers[0].rows else 0;
+    const root_font = layers.len != 0 and layers[0].font_cell_w_px > 0;
+    const placed = if (layers.len > 1) layers[1..] else layers[0..0];
+    var n: usize = 0;
+    for (placed[placed.len - @min(placed.len, in.len) ..]) |l| {
+        const font = l.font_cell_w_px > 0;
+        in[n] = .{
+            .grid_id = l.grid_id,
+            .x_px = origin[0] + @as(f32, @floatFromInt(l.x_px)),
+            .y_px = origin[1] + @as(f32, @floatFromInt(l.y_px)),
+            .w_px = @floatFromInt(if (font) l.font_extent_w_px else l.cols * cell_w_px),
+            .h_px = @floatFromInt(if (font) l.font_extent_h_px else l.rows * row_h_px),
+            .cell_w_px = @floatFromInt(if (font) l.font_cell_w_px else if (root_font) cell_w_px else 0),
+            .cell_h_px = @floatFromInt(if (font) l.font_cell_h_px else if (root_font) row_h_px else 0),
+            .rows = l.rows,
+            .cols = l.cols,
+            .z = @intCast(@max(l.z, 0)),
+        };
+        n += 1;
+    }
+    var u: core.zonvie_shader_uniforms = .{};
+    core.fillGridRects(&u, in[0..n], root_rows);
+    r.shader_root_rows = u.iRootRows;
+    r.shader_grid_rect_count = u.iGridRectCount;
+    r.shader_grid_rects = u.iGridRects;
+}
+
 /// The row height and cell width of `grid_id`'s layer, or the surface's when
 /// it has no font or is not placed. For the cursor, whose rows are its grid's.
 pub fn layerCellPx(layers: []const SurfaceLayer, grid_id: i64, surface_cell_w_px: i32, surface_row_h_px: i32) [2]i32 {
@@ -5507,6 +5543,28 @@ pub fn drawSurfaceRowFrame(
         if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
     }
 
+    // Where this frame's eases drew each row, for the shader's iRowOffset:
+    // the root's scroll region at its offset, then every eased layer's
+    // region at the layer's rows, which wins where it covers the root.
+    if (g.shader_wants_edit_inputs and row_h_px > 0) {
+        const surface_cols: usize = @intCast(@max(1, @divFloor(@as(i64, rowModeViewportWidth(g, in.draw_params)), @as(i64, cell_w_px))));
+        g.beginRowOffsets(surface_cols, in.row_map.len);
+        if (in.draw_params.root_ease) |ease| {
+            const r = ease.region(in.row_map.len);
+            g.addRowOffset(0, @intCast(surface_cols), r[0], r[1], ease.offset_px);
+        }
+        if (in.layer_src) |src| {
+            if (in.layers.len > 1) for (in.layers[1..]) |layer| {
+                const state = src.paint.layerState(layer.grid_id) orelse continue;
+                if (!state.ease.easing) continue;
+                const r = state.ease.region(layer.rows);
+                const top: i64 = @divFloor(@as(i64, layer.y_px), @as(i64, row_h_px));
+                const left: i64 = @divFloor(@as(i64, layer.x_px), @as(i64, cell_w_px));
+                g.addRowOffset(left, left + @as(i64, layer.cols), top + r[0], top + r[1], state.ease.offset_px);
+            };
+        }
+    }
+
     // The cursor's own row in its layer. Blink-off redraws this instead of
     // the root's row, which is empty under ext_multigrid.
     var cursor_layer_row: ?LayerCursorRow = null;
@@ -6285,6 +6343,11 @@ pub const App = struct {
     /// iCellAge mirrors for the main and every external window, written by
     /// on_cell_age_stamps and read by each renderer's shaded draw.
     cell_age: core.cell_age_store.Stores,
+    /// iCellText mirrors, written by on_cell_text_row.
+    cell_text: core.cell_text_store.Stores,
+    /// Whether the loaded chain reads iCellText, as of this flush's begin.
+    /// Core thread only: written at onFlushBegin, read per row.
+    flush_wants_cell_text: bool = false,
     /// One slot per decorated grid id; see ParkedExternalWindow.
     parked_external_windows: [4]?ParkedExternalWindow = .{null} ** 4,
 
@@ -6794,6 +6857,7 @@ pub const App = struct {
         }
         // After every renderer that pointed at it.
         self.cell_age.deinit();
+        self.cell_text.deinit();
 
         // Release App's own reference on the shared D3D11 device/context (the
         // renderer, as of this fix, takes and releases its OWN reference via

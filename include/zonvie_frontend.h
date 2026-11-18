@@ -857,6 +857,14 @@ ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t le
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
 
+/* Whether a custom shader's source reads the cell-text texture (iCellText,
+   or the zonvieCellText / zonvieCellTextAt wrappers). Frontends keep the
+   cell-text stores and texture only when a loaded shader does; such a
+   shader also counts as using the edit inputs above.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len);
+
 /* Whether a custom shader's source reads iPrevFrame. Frontends allocate the
    feedback pair, and render the last pass into it plus a copy to the
    drawable, only when a loaded shader does.
@@ -1033,11 +1041,14 @@ typedef enum {
     ZONVIE_SHADER_TARGET_GLSL = 2, /* GLSL 330 core (OpenGL 3.3 on Linux); resources bind by name */
 } zonvie_shader_target;
 
+/* Entries of iGridRects, three vec4 each. */
+#define ZONVIE_SHADER_GRID_RECTS_MAX 16
+
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
    declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
-   Frontends populate this struct in place and upload 160 bytes to the
-   uniform buffer each frame.
+   Frontends populate this struct in place and upload
+   sizeof(zonvie_shader_uniforms) bytes to the uniform buffer each frame.
 
    Field order and offsets are load-bearing; do not reorder. std140 lays
    iTime into the trailing 4 bytes of iResolution's 16-byte slot.
@@ -1091,7 +1102,31 @@ typedef struct zonvie_shader_uniforms {
     int32_t  iCursorVisible;          /* 180..183  0 while blink-off */
     int32_t  iCurrentCursorStyle;     /* 184..187 */
     int32_t  iPreviousCursorStyle;    /* 188..191 */
+    /* Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
+       the surface root's cell; iCursorCellSize is the cell of the grid the
+       cursor is in, which the cursor styles are classified against.
+       iGridRects lists, topmost first, the layers down to the lowest one in
+       its own font, three vec4 each; see zonvie_shader_fill_grid_rects. */
+    float    iCursorCellSize[2];      /* 192..199 */
+    int32_t  iGridRectCount;          /* 200..203 */
+    int32_t  iRootRows;               /* 204..207  rows of the surface lattice */
+    float    iGridRects[ZONVIE_SHADER_GRID_RECTS_MAX * 3][4]; /* 208..975 */
 } zonvie_shader_uniforms;
+
+/* One layer of a surface for zonvie_shader_fill_grid_rects. The rect is in
+   fragCoord space: the surface's iGridOrigin plus the layer's origin. A grid
+   in its own font gives its cell and its extent (margin included); any
+   other layer cell 0 and rows x cols global cells, except under a root in
+   its own font, where every layer gives a cell (its text has a band). z is
+   the layer's back-to-front rank (zonvie_layer.z), unique per surface. */
+typedef struct zonvie_shader_grid_rect {
+    int64_t  grid_id;
+    float    x_px, y_px, w_px, h_px;
+    float    cell_w_px, cell_h_px;
+    uint32_t rows, cols;
+    uint32_t z;
+    uint32_t _pad;
+} zonvie_shader_grid_rect;
 
 /* ---------------------------------------------------------------------------
    iCellAge stores.
@@ -1133,6 +1168,59 @@ ZONVIE_API void zonvie_cell_age_end_upload(zonvie_cell_age_stores *stores);
 ZONVIE_API void zonvie_cell_age_drop(zonvie_cell_age_stores *stores, int64_t grid);
 ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
 
+/* A shader that reads any edit input also reads iRowOffset (binding 5): one
+   r32float texel per screen cell of the surface, holding how many pixels
+   down that cell's content is drawn from its grid rect this frame (a smooth
+   scroll in progress; 0 at rest). Per cell because side-by-side windows
+   share rows and scroll apart. The preamble's zonvieCellAt subtracts it
+   before indexing iCellAge / iCellText, and zonvieRowOffset hands it to a
+   shader that draws in cell space; a frontend that displaces rows must
+   bind it, sized like those textures and indexed the same way. */
+
+/* ---------------------------------------------------------------------------
+   iCellText stores.
+
+   The CPU side of every surface's iCellText texture: one r32uint mirror per
+   zonvie_cell_text_row.grid value, sized by the rows delivered to it. A
+   frontend creates one store set, feeds it every on_cell_text_row with
+   zonvie_cell_text_apply_row (core thread), which only STAGES the row.
+   Each surface calls zonvie_cell_text_commit for its grid from its own
+   flush commit, under the lock its draw takes to snapshot rows and sync
+   this texture, so a frame never pairs one flush's rows with another's
+   text; a refused flush calls zonvie_cell_text_discard for every grid.
+   Each shaded draw calls zonvie_cell_text_sync for its own grid:
+     0  nothing to bind (no row delivered yet, or out of memory);
+     1  the texture already holds the mirror;
+     2  *out_values is the cache->cols x cache->rows mirror to upload, and
+        the store's lock stays held until zonvie_cell_text_end_upload.
+   `cache` is the caller's, one per texture, zero-initialised and otherwise
+   opaque: while that grid's store is unchanged since its last sync, the
+   call returns 1 without taking the lock (for the first 16 live stores).
+   Its cols/rows are the texture size as of the sync; (re)create the texture
+   when they differ from the one bound. `force` marks the mirror dirty
+   first, for a texture just created. Drop a grid's store when its window
+   closes. The lock is a leaf: call nothing between sync and end_upload but
+   the copy out of *out_values. */
+typedef struct zonvie_cell_text_stores zonvie_cell_text_stores;
+typedef struct {
+    uint64_t version;
+    uint32_t slot;
+    uint32_t cols;
+    uint32_t rows;
+} zonvie_cell_text_cache;
+ZONVIE_API zonvie_cell_text_stores *zonvie_cell_text_create(void);
+ZONVIE_API void zonvie_cell_text_destroy(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_apply_row(zonvie_cell_text_stores *stores,
+    const zonvie_cell_text_row *row);
+ZONVIE_API int32_t zonvie_cell_text_sync(zonvie_cell_text_stores *stores,
+    int64_t grid, bool force, zonvie_cell_text_cache *cache,
+    const uint32_t **out_values);
+ZONVIE_API void zonvie_cell_text_commit(zonvie_cell_text_stores *stores, int64_t grid);
+ZONVIE_API void zonvie_cell_text_discard(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_end_upload(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_drop(zonvie_cell_text_stores *stores, int64_t grid);
+ZONVIE_API void zonvie_cell_text_remove_all(zonvie_cell_text_stores *stores);
+
 /* The cells a screen-space iCellAge texture needs to cover a surface:
    ceil(surface / cell) per axis, 0 x 0 while either metric is 0.
    `row_h_px` is the grid row height with 'linespace' included — the height
@@ -1143,13 +1231,30 @@ ZONVIE_API void zonvie_cell_age_surface_grid(float surface_w_px, float surface_h
 /* Fill iCellSize, iGridOrigin, iTimeLastEdit, iCursorVisible and both
    cursor styles of `u` for one surface. Call after iCurrentCursor and
    iPreviousCursor are set; the styles are classified from those rects
-   against (cell_w_px, row_h_px). iCellSize.y is `row_h_px`, the grid row
-   height with 'linespace' included, so cell lookups track the drawn rows.
+   against the cursor grid's cell (cursor_cell_w_px, cursor_row_h_px).
+   iCellSize is the surface root's (cell_w_px, row_h_px), the row height
+   with 'linespace' included, so cell lookups track the drawn rows.
    iTimeLastEdit is `time_last_edit` (the surface's
    zonvie_cell_age_cache.last_edit) when `wants_edit_inputs`, else 0. Pure. */
 ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
-    float cell_w_px, float row_h_px, float grid_origin_x_px, float grid_origin_y_px,
+    float cell_w_px, float row_h_px, float cursor_cell_w_px, float cursor_row_h_px,
+    float grid_origin_x_px, float grid_origin_y_px,
     float time_last_edit, bool cursor_visible, bool wants_edit_inputs);
+
+/* Fill iRootRows and iGridRects of `u` from a surface's `n` layers, which
+   must be every layer of the surface but its root: band rows are summed
+   over them. An empty table when no layer has a cell. Otherwise, topmost
+   first, every layer down to the lowest one with a cell, at most
+   ZONVIE_SHADER_GRID_RECTS_MAX. The lowest layers past that have no entry:
+   where no listed layer covers them the shader reads the surface lattice,
+   which holds what lies under a layer in its own font (under a root in its
+   own font, the root's text), not that layer's. [3i] the rect; [3i+1] cell w, h and the first
+   iCellText row of the grid's band, all zero for a layer on the surface
+   lattice, .w unused; [3i+2] rows, cols, .zw unused. Bands follow the
+   root's rows in grid-id order, the rule the core writes on_cell_text_row
+   by. Pure. */
+ZONVIE_API void zonvie_shader_fill_grid_rects(zonvie_shader_uniforms *u,
+    const zonvie_shader_grid_rect *rects, size_t n, uint32_t root_rows);
 
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */

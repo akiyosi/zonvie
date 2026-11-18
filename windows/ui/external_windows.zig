@@ -2216,6 +2216,7 @@ fn takeParkedExternalWindow(app: *App, grid_id: i64) ?app_mod.ParkedExternalWind
         }
         // Inputs derived from the last showing's grid, which is gone.
         parked.renderer.cell_age_cache = .{};
+        parked.renderer.cell_text_cache = .{};
         parked.renderer.feedback_primed = false;
         return parked;
     }
@@ -2257,6 +2258,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     const entry = app.external_windows.fetchRemove(grid_id);
     // A later window reusing this grid id must start unedited.
     app.cell_age.drop(grid_id);
+    app.cell_text.drop(grid_id);
     // Evict the scrollbar viewport cache entry for this grid; nothing else
     // removes it once the grid is gone (a dead grid_id is never re-queried),
     // so long sessions would otherwise accumulate one stale entry per
@@ -3510,6 +3512,7 @@ pub fn newExternalRenderer(app: *App, hwnd: c.HWND, grid_id: i64) ?d3d11.Rendere
     // The core stamps an external window under its own grid id.
     renderer.cell_age = &app.cell_age;
     renderer.cell_age_grid = grid_id;
+    renderer.cell_text = &app.cell_text;
     if (app.corep) |corep| {
         if (core.zonvie_core_get_glow_enabled(corep)) _ = renderer.prepareBloomShaders();
     }
@@ -3847,6 +3850,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             break :blk .{ @intCast(cell[0]), @intCast(cell[1]) };
         },
     });
+    app_mod.fillShaderGridRects(g, tbs_snapshot.layers.slice(), g.shader_grid_origin, app.cell_w_px, app.rowHeightPx());
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;

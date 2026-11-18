@@ -159,6 +159,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// This surface's own grid is not a layer here; the main renderer's entry 0
     /// is its root.
     private var layerSnapshot: [SurfaceLayerFrame] = []
+    /// zonvie_shader_fill_grid_rects input, reused frame to frame.
+    private var shaderGridRectScratch: [zonvie_shader_grid_rect] = []
     /// This frame's damage bands. Draw thread only.
     private let damageBands = SurfaceDamageBands()
     /// Rows each hosted layer's committed placement has travelled upwards
@@ -691,6 +693,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// iPrevFrame for this surface. Its own, because this view has its own
     /// drawable and history.
     private let customShaderFeedback = SurfaceFeedbackTextures()
+    private let customShaderRowOffset = SurfaceRowOffsetTexture()
     private let scrollScratch = SurfaceScrollScratchTexture()
 
     // Blur transparency support
@@ -1256,6 +1259,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 cursorWriteSetIndex = -1
             }
             committedExtent.commit(width: gridCols, height: gridRows)
+            // The text these rows show, under the lock the draw syncs with.
+            shared.cellText.commit(grid: gridId)
             cursorOwner.commit()
             if let forwarded = stagedForwardedCursor {
                 committedForwardedCursor = forwarded
@@ -2956,7 +2961,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         if shared.shaderCursor.evaluate(scrollOffsetPx: f.cursorShaderOffsetPx, raw: cursorShaderRawSnapshot) {
             shaderCursorMovedThisFrame = true
         }
+        // Staged under the lock with the rows, uploaded after it (see
+        // SurfaceCellTextStores.stage).
+        let cellTextStaged = shared.shaderWantsCellText && shared.cellText.stage(grid: gridId)
         lock.unlock()
+        f.cellTextTexture = cellTextStaged
+            ? shared.cellText.texture(grid: gridId, device: shared.device) : nil
         return true
     }
 
@@ -3468,6 +3478,22 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         ) {
             shared.cellAge.texture(
                 grid: gridId, cols: Int(gridCols), rows: Int(gridRows), device: shared.device)
+        } cellText: {
+            f.cellTextTexture
+        } rowOffset: {
+            // The root's offset and every hosted layer's, over this grid's
+            // rows from the viewport origin (where iGridOrigin points).
+            customShaderRowOffset.texture(
+                cols: Int(gridCols), rows: Int(gridRows),
+                cellWidthPx: Float(shared.cellWidthPx), cellHeightPx: f.ch,
+                gridOriginPx: simd_float2(Float(f.vpOriginX), Float(f.vpOriginY)),
+                viewportHeightPx: Float(f.vpHeight),
+                offsets: f.hostedScrollOffsets, rootOffset: f.scrollOffset,
+                layerRect: { gid in
+                    guard let e = layerSnapshot.first(where: { $0.layer.gridId == gid }) else { return nil }
+                    return (e.layer.originPx, e.layer.cols, e.layer.rows)
+                },
+                device: shared.device)
         }
         // Where this grid starts in this window's drawable: a decorated
         // surface insets its viewport for its icon/padding (the same mapping
@@ -3519,20 +3545,31 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // main renderer, which is what calling through it did,
                 // reported the main window's — the same number only while
                 // every window sits on one display.
-                return self.shared.makeShaderUniforms(
+                let gridOrigin = CGPoint(
+                    x: windowOffset.x + gridOriginInViewPx.x,
+                    y: windowOffset.y + gridOriginInViewPx.y
+                )
+                // A root in its own font is laid out in that font's cell.
+                let rootCell = (f.rootFont.map { Float($0.cellWidthPx) } ?? Float(self.shared.cellWidthPx), f.ch)
+                var u = self.shared.makeShaderUniforms(
                     screenResolution: screenRes,
                     windowOffset: windowOffset,
                     windowSize: view.drawableSize,
                     backingScale: self.backingScale,
                     timing: self.shaderTiming,
                     cursorVisible: cursorVisible,
-                    gridOrigin: CGPoint(
-                        x: windowOffset.x + gridOriginInViewPx.x,
-                        y: windowOffset.y + gridOriginInViewPx.y
-                    ),
+                    gridOrigin: gridOrigin,
+                    rootCellPx: rootCell,
                     cellAgeGrid: self.gridId,
                     lastLoggedCursor: &self.lastLoggedShaderCursor
                 )
+                SharedRenderResources.fillShaderGridRects(
+                    &u, layers: self.layerSnapshot, rootGridId: self.gridId,
+                    rootRows: Int(f.snapGridRows), rootHasFont: f.rootFont != nil,
+                    gridOrigin: gridOrigin,
+                    cellWidthPx: self.shared.cellWidthPx, cellHeightPx: self.shared.cellHeightPx,
+                    scratch: &self.shaderGridRectScratch)
+                return u
             }
         )
     }
@@ -4072,6 +4109,8 @@ fileprivate struct ExternalSurfaceFrame {
     /// The root's offset, nil when it is not displaced this frame.
     var scrollOffset: GridSurfaceRenderer.ScrollOffset?
     var hostedScrollOffsets: [GridSurfaceRenderer.ScrollOffset] = []
+    /// iCellText as of the snapshot, nil when no shader reads it.
+    var cellTextTexture: MTLTexture?
     var cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset?
     var cursorShaderOffsetPx: Float?
     var retained: [RetainedScrollRow] = []

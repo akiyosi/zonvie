@@ -1284,6 +1284,7 @@ final class ZonvieCore {
                     }
                     me.terminalView?.renderer.abortFlush()
                     me.sharedResources?.abortFlushTransaction()
+                    me.terminalView?.renderer.shared.cellText.discard()
                     for gridView in me.extViewsScratch {
                         gridView.cancelFlush()
                     }
@@ -1692,6 +1693,13 @@ final class ZonvieCore {
                 guard let atlas = me.sharedAtlas else { return 0 }
                 return atlas.rasterizeByGlyphID(fontId: fontId, glyphID: glyphID, styleFlags: styleFlags,
                                                 outBitmap: outBitmap) ? 1 : 0
+            },
+            on_cell_text_row: { ctx, row in
+                guard let ctx, let row else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Core thread, grid_mu held. Only the CPU mirror is written.
+                guard let shared = me.terminalView?.renderer.shared, shared.shaderWantsCellText else { return }
+                shared.cellText.apply(row)
             }
         )
 
@@ -5603,6 +5611,7 @@ final class ZonvieCore {
         externalGridViewsLock.lock()
         let removedView = externalGridViews.removeValue(forKey: gridId)
         terminalView?.renderer.shared.cellAge.drop(grid: gridId)
+        terminalView?.renderer.shared.cellText.drop(grid: gridId)
         externalGridViewsLock.unlock()
         // The view's own vertex storage goes when the view does, not on
         // on_grid_destroy: that fires while this close is still queued and

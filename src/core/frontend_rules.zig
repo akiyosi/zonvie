@@ -1211,7 +1211,18 @@ pub fn shaderNeedsAnimation(source: []const u8) bool {
 /// and the cell-age texture. `zonvieCellAge` is the preamble's wrapper around
 /// iCellAge, so a shader that only calls it still needs the texture bound.
 pub fn shaderUsesEditInputs(source: []const u8) bool {
-    return containsAnyWord(source, &.{ "iCellAge", "zonvieCellAge", "iCellSize", "iGridOrigin", "iTimeLastEdit" });
+    return containsAnyWord(source, &.{
+        "iCellAge",       "zonvieCellAge",  "iCellSize",      "iGridOrigin", "iTimeLastEdit",
+        "zonvieCellAt",   "zonvieCellGeom", "iCursorCellSize", "iGridRects", "iGridRectCount",
+        "iRootRows",
+    }) or shaderUsesCellText(source);
+}
+
+/// Whether a shader reads the cell-text texture (iCellText, or the
+/// preamble's zonvieCellText wrappers). Gates the row deliveries and the
+/// texture, which an age-only shader never pays for.
+pub fn shaderUsesCellText(source: []const u8) bool {
+    return containsAnyWord(source, &.{ "iCellText", "zonvieCellText", "zonvieCellTextAt" });
 }
 
 /// Whether a shader reads iPrevFrame. Gates the feedback pair and the copy
@@ -1262,6 +1273,16 @@ test "a shader uses the edit inputs only when it names one as a whole word" {
     try std.testing.expect(!shaderUsesEditInputs("float myiCellAge = 1.0;"));
     try std.testing.expect(!shaderUsesEditInputs("fragColor = vec4(sin(iTime));"));
     try std.testing.expect(!shaderUsesEditInputs("vec4 p = texture(iPrevFrame, uv);"));
+}
+
+test "a shader uses the cell text only when it names the texture or a wrapper" {
+    try std.testing.expect(shaderUsesCellText("uint c = texelFetch(iCellText, idx, 0).r;"));
+    try std.testing.expect(shaderUsesCellText("if (zonvieCellText(fragCoord) == 0x5Bu) {}"));
+    try std.testing.expect(shaderUsesCellText("uint c = zonvieCellTextAt(cell + ivec2(1, 0));"));
+    try std.testing.expect(!shaderUsesCellText("float a = texelFetch(iCellAge, c, 0).r;"));
+    try std.testing.expect(!shaderUsesCellText("uint myiCellText = 1u;"));
+    // The text is an edit input: reading it alone must switch the core on.
+    try std.testing.expect(shaderUsesEditInputs("if (zonvieCellText(fragCoord) == 0x5Bu) {}"));
 }
 
 test "a shader uses iPrevFrame only when it names it" {

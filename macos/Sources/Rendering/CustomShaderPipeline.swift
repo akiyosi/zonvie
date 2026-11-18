@@ -25,6 +25,9 @@ final class CustomShaderPipeline {
     /// SharedRenderResources so the cell-age texture and the core's stamp
     /// lists exist only when something reads them.
     let usesEditInputs: Bool
+    /// True when the source reads the cell-text texture. Gates the
+    /// cell-text stores and texture.
+    let usesCellText: Bool
     /// True when the source reads `iPrevFrame`. Gates the feedback pair.
     let usesPrevFrame: Bool
     /// True when the source declared `@zonvie-owns-cursor`.
@@ -35,6 +38,7 @@ final class CustomShaderPipeline {
         pipelineState: MTLRenderPipelineState,
         needsAnimation: Bool,
         usesEditInputs: Bool,
+        usesCellText: Bool,
         usesPrevFrame: Bool,
         ownsCursor: Bool
     ) {
@@ -42,6 +46,7 @@ final class CustomShaderPipeline {
         self.pipelineState = pipelineState
         self.needsAnimation = needsAnimation
         self.usesEditInputs = usesEditInputs
+        self.usesCellText = usesCellText
         self.usesPrevFrame = usesPrevFrame
         self.ownsCursor = ownsCursor
     }
@@ -58,6 +63,13 @@ final class CustomShaderPipeline {
     static func detectUsesEditInputs(in source: String) -> Bool {
         var source = source
         return source.withUTF8 { zonvie_core_shader_uses_edit_inputs($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader reads the cell text: the core's rule, shared with
+    /// Windows.
+    static func detectUsesCellText(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_cell_text($0.baseAddress, $0.count) }
     }
 
     /// Whether the shader reads iPrevFrame: the core's rule, shared with
@@ -146,14 +158,16 @@ final class CustomShaderPipeline {
 
         let needsAnimation = detectNeedsAnimation(in: glslSource)
         let usesEditInputs = detectUsesEditInputs(in: glslSource)
+        let usesCellText = detectUsesCellText(in: glslSource)
         let usesPrevFrame = detectUsesPrevFrame(in: glslSource)
         let ownsCursor = detectOwnsCursor(in: glslSource)
-        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) prevFrame=\(usesPrevFrame) ownsCursor=\(ownsCursor))")
+        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) cellText=\(usesCellText) prevFrame=\(usesPrevFrame) ownsCursor=\(ownsCursor))")
         return CustomShaderPipeline(
             sourcePath: sourcePath,
             pipelineState: pipelineState,
             needsAnimation: needsAnimation,
             usesEditInputs: usesEditInputs,
+            usesCellText: usesCellText,
             usesPrevFrame: usesPrevFrame,
             ownsCursor: ownsCursor
         )
@@ -193,10 +207,11 @@ final class CustomShaderPipeline {
     /// Shadertoy preamble's `layout(std140, binding = 1)`. Inlining
     /// avoids write races when several MTKViews animate simultaneously
     /// (each gets its own copy in the command buffer).
-    /// `prevFrame` and `cellAge` back the Zonvie edit-effect inputs
-    /// (`iPrevFrame` at texture 2, `iCellAge` at texture 3). Both are nil for
-    /// shaders that do not reference them; the fragment function then simply
-    /// never samples those slots.
+    /// `prevFrame`, `cellAge`, `cellText` and `rowOffset` back the Zonvie
+    /// edit-effect inputs (`iPrevFrame` at texture 2, `iCellAge` at 3,
+    /// `iCellText` at 4, `iRowOffset` at 5). Each is nil for shaders that do
+    /// not reference it; the fragment function then simply never samples
+    /// that slot.
     func encode(
         cmd: MTLCommandBuffer,
         input: MTLTexture,
@@ -209,7 +224,9 @@ final class CustomShaderPipeline {
         sampler: MTLSamplerState,
         uniforms: zonvie_shader_uniforms,
         prevFrame: MTLTexture? = nil,
-        cellAge: MTLTexture? = nil
+        cellAge: MTLTexture? = nil,
+        cellText: MTLTexture? = nil,
+        rowOffset: MTLTexture? = nil
     ) -> Bool {
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = output
@@ -233,6 +250,14 @@ final class CustomShaderPipeline {
         if let cellAge {
             enc.setFragmentTexture(cellAge, index: 3)
             enc.setFragmentSamplerState(sampler, index: 3)
+        }
+        if let cellText {
+            enc.setFragmentTexture(cellText, index: 4)
+            enc.setFragmentSamplerState(sampler, index: 4)
+        }
+        if let rowOffset {
+            enc.setFragmentTexture(rowOffset, index: 5)
+            enc.setFragmentSamplerState(sampler, index: 5)
         }
         var u = uniforms
         enc.setFragmentBytes(&u, length: MemoryLayout<zonvie_shader_uniforms>.size, index: 1)

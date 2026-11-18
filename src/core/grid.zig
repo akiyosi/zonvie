@@ -2308,6 +2308,7 @@ pub const Grid = struct {
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
             const old_surface_vertex_count = sg.surface_vertex_count;
+            if (shape_changed) self.noteLayerCoverageLeaving(grid_id);
             try sg.resize(self.alloc, rows, cols);
             self.subgrid_surface_vertex_count -|= old_surface_vertex_count;
             if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
@@ -2394,6 +2395,56 @@ pub const Grid = struct {
             id = pos.anchor_grid;
         }
         return null;
+    }
+
+    /// iCellText: a surface row's text is sent without the cells a higher
+    /// layer covers (flush.sendCellTextRowAt), and Neovim does not redraw
+    /// grid 1 under a float. So when `grid_id` is about to stop covering its
+    /// rect (hidden, closed, moved, resized, re-stacked, sent external), the
+    /// rows beneath it on the same surface, the root's and every other
+    /// layer's, are owed their text again. Call before the placement or
+    /// size changes. Only while a shader reads the inputs.
+    pub fn noteLayerCoverageLeaving(self: *Grid, grid_id: i64) void {
+        if (!self.shader_inputs_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
+        const pos = self.win_pos.get(grid_id) orelse return;
+        const rows = (self.sub_grids.getPtr(grid_id) orelse return).rows;
+        const placed = self.surfacePlacement(pos) orelse return;
+        const top = placed.row;
+        const bot = placed.row + rows;
+        if (self.bufFor(placed.surface)) |root| {
+            root.markDirtyRect(std.math.cast(u32, @max(top, 0)) orelse return, std.math.cast(u32, @max(bot, 0)) orelse return);
+        }
+        var it = self.win_pos.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            if (id == grid_id or self.isSurfaceRoot(id)) continue;
+            const p = self.surfacePlacement(e.value_ptr.*) orelse continue;
+            if (p.surface != placed.surface) continue;
+            const sg = self.sub_grids.getPtr(id) orelse continue;
+            const lt = @max(top - p.row, 0);
+            const lb = @min(bot - p.row, @as(i64, sg.rows));
+            if (lt >= lb) continue;
+            sg.markDirtyRect(@intCast(lt), @intCast(lb));
+        }
+    }
+
+    /// The other half of noteLayerCoverageLeaving: a layer that lands on a
+    /// new rect or stacking resends its own text there. Call after the
+    /// placement changes.
+    pub fn noteLayerCoverageArrived(self: *Grid, grid_id: i64) void {
+        if (!self.shader_inputs_enabled or self.isSurfaceRoot(grid_id) or self.hasTextBand(grid_id)) return;
+        if (!self.win_pos.contains(grid_id)) return;
+        if (self.sub_grids.getPtr(grid_id)) |sg| sg.markAllDirty();
+    }
+
+    /// A layer whose iCellText rows go to a band of their own (one in its
+    /// own font, or on a root in its own font; flush.isFontLayerOf). Its
+    /// band does not depend on where it is placed, and it covers nothing.
+    fn hasTextBand(self: *const Grid, grid_id: i64) bool {
+        if (self.grid_fonts.count() == 0) return false;
+        if (self.grid_fonts.contains(grid_id)) return true;
+        const surface = self.surfaceForGrid(grid_id) orelse return false;
+        return self.grid_fonts.contains(surface);
     }
 
     /// Where a placed grid sits on the surface that composites it, in that
@@ -2870,6 +2921,7 @@ pub const Grid = struct {
         }
         // Before anything is removed, so a failure keeps the grid whole.
         try self.destroyed_pending.ensureUnusedCapacity(self.alloc, 1);
+        self.noteLayerCoverageLeaving(grid_id);
         const was_external = self.external_grids.contains(grid_id);
         const was_visible = self.win_pos.contains(grid_id) or was_external;
 
@@ -2983,11 +3035,13 @@ pub const Grid = struct {
 
         // The pixels the move exposes and covers are the frontend's to
         // repaint, from the layout it publishes.
+        self.noteLayerCoverageLeaving(grid_id);
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
+        self.noteLayerCoverageArrived(grid_id);
         self.glyph_working_set_rev +%= 1;
 
         // Only advance cursor_rev if cursor is on this grid
@@ -3123,6 +3177,7 @@ pub const Grid = struct {
         // The old coverage and the new one are the frontend's to repaint, from
         // the layout it publishes.
         const new_pos = prospective_pos;
+        if (working_set_changed) self.noteLayerCoverageLeaving(grid_id);
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
@@ -3140,7 +3195,10 @@ pub const Grid = struct {
         } else if (self.win_layer.getPtr(grid_id)) |layer_ptr| {
             layer_ptr.* = new_layer;
         }
-        if (working_set_changed) self.glyph_working_set_rev +%= 1;
+        if (working_set_changed) {
+            self.noteLayerCoverageArrived(grid_id);
+            self.glyph_working_set_rev +%= 1;
+        }
         if (self.cursor_grid == grid_id and self.cursor_valid) {
             self.cursor_rev +%= 1;
         }
@@ -3156,6 +3214,7 @@ pub const Grid = struct {
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
         // The rows this grid covered are the frontend's to repaint, from the
         // layout it publishes.
+        self.noteLayerCoverageLeaving(grid_id);
         _ = self.win_pos.remove(grid_id);
         // The window id is unreachable once grid_win_ids drops it, so a later
         // win_close could no longer release the answer; a re-show asks again.
@@ -3226,6 +3285,7 @@ pub const Grid = struct {
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)
+        self.noteLayerCoverageLeaving(grid_id);
         _ = self.win_pos.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
 

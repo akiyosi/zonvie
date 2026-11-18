@@ -405,23 +405,121 @@ enum SurfaceDrawablePresentation {
 }
 
 /// The Zonvie edit-effect inputs one surface hands its chain: its own
-/// feedback pair (iPrevFrame, nil unless a shader reads it) and its cell-age
+/// feedback pair (iPrevFrame, nil unless a shader reads it), its cell-age
 /// texture (iCellAge, nil until its store is sized or when no shader reads
-/// it). Nil as a whole when no loaded shader reads either.
+/// it), its cell-text texture (iCellText, likewise) and its row-offset
+/// texture (iRowOffset, with the cell-age one). Nil as a whole when no
+/// loaded shader reads any of them.
 struct SurfaceEditInputs {
     let feedback: SurfaceFeedbackTextures?
     let cellAge: MTLTexture?
+    let cellText: MTLTexture?
+    let rowOffset: MTLTexture?
 
-    /// Nil when the loaded chain reads neither input.
+    /// Nil when the loaded chain reads none of the inputs.
     static func make(
         shared: SharedRenderResources,
         feedback: SurfaceFeedbackTextures,
-        cellAge: () -> MTLTexture?
+        cellAge: () -> MTLTexture?,
+        cellText: () -> MTLTexture?,
+        rowOffset: () -> MTLTexture?
     ) -> SurfaceEditInputs? {
         guard shared.shaderWantsEditInputs || shared.shaderWantsPrevFrame else { return nil }
         return SurfaceEditInputs(
             feedback: shared.shaderWantsPrevFrame ? feedback : nil,
-            cellAge: shared.shaderWantsEditInputs ? cellAge() : nil)
+            cellAge: shared.shaderWantsEditInputs ? cellAge() : nil,
+            cellText: shared.shaderWantsCellText ? cellText() : nil,
+            rowOffset: shared.shaderWantsEditInputs ? rowOffset() : nil)
+    }
+}
+
+/// A surface's iRowOffset texture: per screen cell, how many pixels down
+/// that cell's content is drawn from its grid rect this frame. Rebuilt from
+/// the frame's scroll offsets on every shaded draw; the texture is remade
+/// only when the cell grid changes, and a frame at rest after another at
+/// rest uploads nothing.
+final class SurfaceRowOffsetTexture {
+    private var texture: MTLTexture?
+    private var scratch: [Float] = []
+    private var uploadedAtRest = false
+
+    /// `cols` x `rows` cells of `cellWidthPx` x `cellHeightPx` from
+    /// `gridOriginPx` down the drawable. A grid's offset covers its layer's
+    /// rect when `layerRect` knows the grid (a layer's origin is already
+    /// relative to the grid origin), else its content rows across every
+    /// column. The content rows (NDC bounds over `viewportHeightPx`) also
+    /// clip a scrolling layer's rect: the vertex pass leaves its margin rows
+    /// (winbar, border) in place. Bodily-moved floats are written after the
+    /// others so they win where they overlap.
+    func texture(
+        cols: Int, rows: Int, cellWidthPx: Float, cellHeightPx: Float,
+        gridOriginPx: simd_float2, viewportHeightPx: Float,
+        offsets: [GridSurfaceRenderer.ScrollOffset],
+        rootOffset: GridSurfaceRenderer.ScrollOffset? = nil,
+        layerRect: (Int64) -> (originPx: simd_float2, cols: Int, rows: Int)?,
+        device: MTLDevice
+    ) -> MTLTexture? {
+        guard cols > 0, rows > 0, cellWidthPx > 0, cellHeightPx > 0, viewportHeightPx > 0 else { return nil }
+        let n = cols * rows
+        if scratch.count != n {
+            scratch = [Float](repeating: 0, count: n)
+            uploadedAtRest = false
+        } else {
+            for i in scratch.indices { scratch[i] = 0 }
+        }
+        var moving = false
+        // `rootOffset` is a surface that keeps its root's offset apart from
+        // its hosted ones; folded in here so the caller allocates no list.
+        for pass in 0..<2 {
+            for k in 0...offsets.count {
+                guard let o = k < offsets.count ? offsets[k] : rootOffset else { continue }
+                guard (o.move_all != 0) == (pass == 1) else { continue }
+                guard o.offset_y.isFinite, o.offset_y != 0 else { continue }
+                let px = -o.offset_y * viewportHeightPx / 2
+                var r0 = 0, r1 = rows, c0 = 0, c1 = cols
+                let layer = layerRect(Int64(o.grid_id))
+                if let layer {
+                    r0 = Int((layer.originPx.y / cellHeightPx).rounded())
+                    r1 = r0 + layer.rows
+                    c0 = Int((layer.originPx.x / cellWidthPx).rounded())
+                    c1 = c0 + layer.cols
+                } else if o.move_all != 0 {
+                    continue
+                }
+                if o.move_all == 0 {
+                    // NDC y runs +1 (top) to -1: px from the top is (1 - y) * h / 2.
+                    r0 = max(r0, Int((((1 - o.content_top_y) * viewportHeightPx / 2 - gridOriginPx.y) / cellHeightPx).rounded()))
+                    r1 = min(r1, Int((((1 - o.content_bottom_y) * viewportHeightPx / 2 - gridOriginPx.y) / cellHeightPx).rounded()))
+                }
+                r0 = max(0, r0)
+                r1 = min(rows, r1)
+                c0 = max(0, c0)
+                c1 = min(cols, c1)
+                guard r0 < r1, c0 < c1 else { continue }
+                for r in r0..<r1 {
+                    let base = r * cols
+                    for c in c0..<c1 { scratch[base + c] = px }
+                }
+                moving = true
+            }
+        }
+        if texture == nil || texture!.width != cols || texture!.height != rows {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r32Float, width: cols, height: rows, mipmapped: false)
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            texture = tex
+            uploadedAtRest = false
+        }
+        if !moving && uploadedAtRest { return texture }
+        scratch.withUnsafeBytes { raw in
+            texture?.replace(
+                region: MTLRegionMake2D(0, 0, cols, rows), mipmapLevel: 0,
+                withBytes: raw.baseAddress!, bytesPerRow: cols * MemoryLayout<Float>.size)
+        }
+        uploadedAtRest = !moving
+        return texture
     }
 }
 
@@ -472,7 +570,9 @@ func encodeSurfaceBackBufferToDrawable(
             sampler: bilinSamp,
             uniforms: scaledWindowSize(makeUniforms(), by: uvScale),
             prevFrame: prevFrame,
-            cellAge: editInputs?.cellAge
+            cellAge: editInputs?.cellAge,
+            cellText: editInputs?.cellText,
+            rowOffset: editInputs?.rowOffset
         ) {
             guard let feedbackWrite else { return .customShaderChain }
             // Rotate only once the slot reached the drawable: a failed copy
@@ -847,7 +947,9 @@ func encodeSurfaceCustomShaderChain(
     sampler: MTLSamplerState,
     uniforms: zonvie_shader_uniforms,
     prevFrame: MTLTexture? = nil,
-    cellAge: MTLTexture? = nil
+    cellAge: MTLTexture? = nil,
+    cellText: MTLTexture? = nil,
+    rowOffset: MTLTexture? = nil
 ) -> Bool {
     guard !pipelines.isEmpty else { return false }
     if pipelines.count > 1 {
@@ -868,7 +970,9 @@ func encodeSurfaceCustomShaderChain(
             sampler: sampler,
             uniforms: uniforms,
             prevFrame: prevFrame,
-            cellAge: cellAge
+            cellAge: cellAge,
+            cellText: cellText,
+            rowOffset: rowOffset
         ) {
             return false
         }
@@ -2217,6 +2321,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Per-frame snapshot taken under `lock`, reused across frames. Entry 0 is
     /// this surface's root grid, which every draw loop below skips.
     private var layerSnapshot: [SurfaceLayerFrame] = []
+    /// zonvie_shader_fill_grid_rects input, reused frame to frame.
+    private var shaderGridRectScratch: [zonvie_shader_grid_rect] = []
     /// This frame's damage bands. Draw thread only.
     private let damageBands = SurfaceDamageBands()
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
@@ -2505,6 +2611,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// iPrevFrame for this surface; allocated only while a loaded shader
     /// reads the edit inputs.
     private let customShaderFeedback = SurfaceFeedbackTextures()
+    private let customShaderRowOffset = SurfaceRowOffsetTexture()
     /// Last cursor rect handed to a shader, so the log fires on change only.
     /// Per-surface, because each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
@@ -2877,6 +2984,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
         lock.lock()
+        // The text the published rows show, under the lock a draw snapshots
+        // rows and syncs the text texture with, so no frame pairs this
+        // flush's rows with the previous flush's text or the reverse.
+        shared.cellText.commit(grid: 1)
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
         // The background the viewport edges and scroll gaps clear to lands
@@ -4076,7 +4187,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         f.cursorLayerOrigin = committedCursorPlacement.originPx
         f.bgRGB = surfaceBgRGB
         f.committedExtent = committedExtent
+        // Staged under the same hold as the rows it describes (see
+        // commitFlush): a memcpy only when the text changed. The GPU upload
+        // waits for the lock to drop, as the cell-age one does.
+        let cellTextStaged = shared.shaderWantsCellText && shared.cellText.stage(grid: 1)
         lock.unlock()
+        f.cellTextTexture = cellTextStaged
+            ? shared.cellText.texture(grid: 1, device: shared.device) : nil
 
         // The union scrolled content must not bleed over, from the same
         // layer snapshot this frame draws, so placement and mask cannot
@@ -4865,6 +4982,23 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 cellWidthPx, cellHeightPx, &cols, &rows)
             return shared.cellAge.texture(
                 grid: 1, cols: Int(cols), rows: Int(rows), device: shared.device)
+        } cellText: {
+            f.cellTextTexture
+        } rowOffset: {
+            // Rows the way the shader indexes them: from the drawable's top,
+            // the same mapping iCellAge is sized with.
+            customShaderRowOffset.texture(
+                cols: Int((Float(view.drawableSize.width) / cellWidthPx).rounded(.up)),
+                rows: Int((Float(view.drawableSize.height) / cellHeightPx).rounded(.up)),
+                cellWidthPx: cellWidthPx, cellHeightPx: cellHeightPx,
+                gridOriginPx: simd_float2(0, 0),
+                viewportHeightPx: f.viewportMetrics.fragmentHeight,
+                offsets: f.scrollOffsets,
+                layerRect: { gid in
+                    guard let e = layerSnapshot.first(where: { $0.layer.gridId == gid }) else { return nil }
+                    return (e.layer.originPx, e.layer.cols, e.layer.rows)
+                },
+                device: shared.device)
         }
         let cursorVisible = f.cursorBlink && f.cursorCount > 0
         var source = backTex
@@ -4889,7 +5023,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             bilinearSampler: shared.bilinearSampler,
             editInputs: editInputs,
             makeUniforms: {
-                shared.makeShaderUniforms(
+                var u = shared.makeShaderUniforms(
                     screenResolution: view.drawableSize,
                     windowOffset: .zero,
                     windowSize: view.drawableSize,
@@ -4899,6 +5033,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     gridOrigin: CGPoint(x: inset.left, y: inset.top),
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
+                SharedRenderResources.fillShaderGridRects(
+                    &u, layers: layerSnapshot, rootGridId: Self.rootGridId,
+                    rootRows: layerSnapshot.first(where: { $0.layer.gridId == Self.rootGridId })?.layer.rows ?? 0,
+                    rootHasFont: false,
+                    gridOrigin: .zero, cellWidthPx: cellWidthPx, cellHeightPx: cellHeightPx,
+                    scratch: &shaderGridRectScratch)
+                return u
             },
             prepareCopy: { copyRPD in
                 // Full 4-stage sampling (vertex + fragment) on the copy
@@ -5611,6 +5752,8 @@ fileprivate struct MainSurfaceFrame {
     var hadActiveScrollOffset = false
     /// For setVertexBytes (no GPU/CPU race).
     var scrollOffsets: [GridSurfaceRenderer.ScrollOffset] = []
+    /// iCellText as of the snapshot, nil when no shader reads it.
+    var cellTextTexture: MTLTexture?
     /// Rows kept alive across a smooth-scroll step.
     var retained: [RetainedScrollRow] = []
     var fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand] = []

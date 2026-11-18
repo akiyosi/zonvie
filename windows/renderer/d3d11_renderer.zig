@@ -436,6 +436,7 @@ pub const Renderer = struct {
     // Allocated only when a loaded shader references them, so a shader-less
     // or plain-shader configuration costs exactly what it did before.
     shader_wants_edit_inputs: bool = false,
+    shader_wants_cell_text: bool = false,
     shader_wants_prev_frame: bool = false,
     /// Cell metrics, blink state and grid origin mirrored from the app by the
     /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
@@ -449,6 +450,11 @@ pub const Renderer = struct {
     cursor_blink_on: bool = true,
     /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
     shader_grid_origin: [2]f32 = .{ 0, 0 },
+    /// iRootRows and iGridRects (core.fillGridRects), set by the paint driver
+    /// from the layers it pinned (app.fillShaderGridRects).
+    shader_root_rows: i32 = 0,
+    shader_grid_rect_count: i32 = 0,
+    shader_grid_rects: [core.SHADER_GRID_RECTS_MAX * 3][4]f32 = @splat(@splat(0)),
     shader_owns_cursor: bool = false,
     /// Feedback pair: the LAST pass writes here instead of the backbuffer so
     /// the NEXT frame can sample it as iPrevFrame; a copy then moves it to
@@ -470,6 +476,26 @@ pub const Renderer = struct {
     cell_age_srv: ?*c.ID3D11ShaderResourceView = null,
     cell_age_tex_cols: u32 = 0,
     cell_age_tex_rows: u32 = 0,
+    /// The app's shared cell-text stores, keyed like the cell-age ones. The
+    /// texture's size follows the rows delivered, not the surface.
+    cell_text: ?*core.cell_text_store.Stores = null,
+    cell_text_cache: core.cell_text_store.SyncCache = .{},
+    cell_text_tex: ?*c.ID3D11Texture2D = null,
+    cell_text_srv: ?*c.ID3D11ShaderResourceView = null,
+    cell_text_tex_cols: u32 = 0,
+    cell_text_tex_rows: u32 = 0,
+    /// iRowOffset: per surface cell, how many pixels down that cell's
+    /// content is drawn this frame (a smooth scroll in progress). The app
+    /// fills it with each frame's eases; the shader pass uploads it when it
+    /// changed.
+    row_offsets_px: std.ArrayListUnmanaged(f32) = .empty,
+    row_offset_cols: u32 = 0,
+    row_offset_rows: u32 = 0,
+    row_offsets_dirty: bool = false,
+    row_offset_tex: ?*c.ID3D11Texture2D = null,
+    row_offset_srv: ?*c.ID3D11ShaderResourceView = null,
+    row_offset_tex_cols: u32 = 0,
+    row_offset_tex_rows: u32 = 0,
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. The main loop reads this to decide whether to
     /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
@@ -780,6 +806,11 @@ pub const Renderer = struct {
         self.releaseFeedbackTextures();
         safeRelease(&self.cell_age_srv);
         safeRelease(&self.cell_age_tex);
+        safeRelease(&self.cell_text_srv);
+        safeRelease(&self.cell_text_tex);
+        safeRelease(&self.row_offset_srv);
+        safeRelease(&self.row_offset_tex);
+        self.row_offsets_px.deinit(self.alloc);
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -2864,6 +2895,135 @@ pub const Renderer = struct {
         return self.cell_age_srv;
     }
 
+    /// Start this frame's cell offsets at rest for cols x rows cells. UI
+    /// thread, before the frame's eases are added with addRowOffset.
+    pub fn beginRowOffsets(self: *Renderer, cols: usize, rows: usize) void {
+        const n = cols * rows;
+        if (self.row_offsets_px.items.len != n or self.row_offset_cols != cols) {
+            self.row_offsets_px.resize(self.alloc, n) catch return;
+            self.row_offset_cols = @intCast(cols);
+            self.row_offset_rows = @intCast(rows);
+            self.row_offsets_dirty = true;
+        }
+        for (self.row_offsets_px.items) |*v| {
+            if (v.* != 0) self.row_offsets_dirty = true;
+            v.* = 0;
+        }
+    }
+
+    /// The cells of rows [row_start, row_end) and columns [col_start,
+    /// col_end) are drawn `offset_px` down this frame.
+    pub fn addRowOffset(self: *Renderer, col_start: i64, col_end: i64, row_start: i64, row_end: i64, offset_px: f32) void {
+        if (offset_px == 0) return;
+        const cols: i64 = self.row_offset_cols;
+        const rows: i64 = self.row_offset_rows;
+        const c0: usize = @intCast(@max(0, @min(col_start, cols)));
+        const c1: usize = @intCast(@max(0, @min(col_end, cols)));
+        const r0: usize = @intCast(@max(0, @min(row_start, rows)));
+        const r1: usize = @intCast(@max(0, @min(row_end, rows)));
+        if (c0 >= c1 or r0 >= r1) return;
+        for (r0..r1) |r| {
+            const base = r * @as(usize, @intCast(cols));
+            for (self.row_offsets_px.items[base + c0 .. base + c1]) |*v| v.* = offset_px;
+        }
+        self.row_offsets_dirty = true;
+    }
+
+    /// Upload the row offsets when they changed; nil with no rows yet.
+    fn ensureRowOffsetTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
+        const dev = self.device orelse return null;
+        const cols = self.row_offset_cols;
+        const rows = self.row_offset_rows;
+        if (cols == 0 or rows == 0) return null;
+        if (self.row_offset_tex == null or self.row_offset_tex_cols != cols or self.row_offset_tex_rows != rows) {
+            safeRelease(&self.row_offset_srv);
+            safeRelease(&self.row_offset_tex);
+            self.row_offset_tex_cols = 0;
+            self.row_offset_tex_rows = 0;
+            var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            td.Width = cols;
+            td.Height = rows;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = c.DXGI_FORMAT_R32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = c.D3D11_USAGE_DEFAULT;
+            td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return null;
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return null;
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) return null;
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv)) or srv == null) {
+                safeRelease(&tex);
+                return null;
+            }
+            self.row_offset_tex = tex;
+            self.row_offset_srv = srv;
+            self.row_offset_tex_cols = cols;
+            self.row_offset_tex_rows = rows;
+            self.row_offsets_dirty = true;
+        }
+        if (self.row_offsets_dirty) {
+            if (ctx_vtbl.*.UpdateSubresource) |update| {
+                update(ctx, @ptrCast(self.row_offset_tex.?), 0, null, @ptrCast(self.row_offsets_px.items.ptr), cols * @sizeOf(f32), 0);
+            }
+            self.row_offsets_dirty = false;
+        }
+        return self.row_offset_srv;
+    }
+
+    /// Upload this grid's cell text, (re)creating the texture when the
+    /// store's cell grid changed; nil until a row has arrived. The store's
+    /// lock is held only across the UpdateSubresource copy.
+    fn ensureCellTextTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
+        const stores = self.cell_text orelse return null;
+        const dev = self.device orelse return null;
+        var values: []const u32 = &.{};
+        switch (stores.sync(self.cell_age_grid, self.cell_text_tex == null, &self.cell_text_cache, &values)) {
+            .unavailable => return null,
+            .clean => return self.cell_text_srv,
+            .dirty => {},
+        }
+        defer stores.endUpload();
+        const cols = self.cell_text_cache.cols;
+        const rows = self.cell_text_cache.rows;
+        if (self.cell_text_tex == null or self.cell_text_tex_cols != cols or self.cell_text_tex_rows != rows) {
+            safeRelease(&self.cell_text_srv);
+            safeRelease(&self.cell_text_tex);
+            self.cell_text_tex_cols = 0;
+            self.cell_text_tex_rows = 0;
+            var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            td.Width = cols;
+            td.Height = rows;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = c.DXGI_FORMAT_R32_UINT;
+            td.SampleDesc.Count = 1;
+            td.Usage = c.D3D11_USAGE_DEFAULT;
+            td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return null;
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return null;
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) return null;
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv)) or srv == null) {
+                safeRelease(&tex);
+                return null;
+            }
+            self.cell_text_tex = tex;
+            self.cell_text_srv = srv;
+            self.cell_text_tex_cols = cols;
+            self.cell_text_tex_rows = rows;
+        }
+        if (ctx_vtbl.*.UpdateSubresource) |update| {
+            update(ctx, @ptrCast(self.cell_text_tex.?), 0, null, @ptrCast(values.ptr), cols * @sizeOf(u32), 0);
+        }
+        return self.cell_text_srv;
+    }
+
     fn bloomShadersReady(self: *const Renderer) bool {
         return self.vs_fullscreen != null and
             self.ps_glow_extract != null and
@@ -3020,6 +3180,7 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = false;
         self.shader_wants_edit_inputs = false;
+        self.shader_wants_cell_text = false;
         self.shader_wants_prev_frame = false;
         self.shader_owns_cursor = false;
 
@@ -3043,6 +3204,7 @@ pub const Renderer = struct {
             };
             if (pipeline.needs_animation) self.any_custom_shader_needs_animation = true;
             if (pipeline.uses_edit_inputs) self.shader_wants_edit_inputs = true;
+            if (pipeline.uses_cell_text) self.shader_wants_cell_text = true;
             if (pipeline.uses_prev_frame) self.shader_wants_prev_frame = true;
             if (pipeline.owns_cursor) self.shader_owns_cursor = true;
         }
@@ -3064,6 +3226,7 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = src.any_custom_shader_needs_animation;
         self.shader_wants_edit_inputs = src.shader_wants_edit_inputs;
+        self.shader_wants_cell_text = src.shader_wants_cell_text;
         self.shader_wants_prev_frame = src.shader_wants_prev_frame;
         self.shader_owns_cursor = src.shader_owns_cursor;
         for (src.custom_shader_pipelines.items) |sp| {
@@ -3074,6 +3237,7 @@ pub const Renderer = struct {
                 .pixel_shader = sp.pixel_shader,
                 .needs_animation = sp.needs_animation,
                 .uses_edit_inputs = sp.uses_edit_inputs,
+                .uses_cell_text = sp.uses_cell_text,
                 .uses_prev_frame = sp.uses_prev_frame,
                 .owns_cursor = sp.owns_cursor,
             }) catch {
@@ -3317,6 +3481,7 @@ pub const Renderer = struct {
             .pixel_shader = ps_out,
             .needs_animation = core.frontend_rules.shaderNeedsAnimation(glsl),
             .uses_edit_inputs = core.frontend_rules.shaderUsesEditInputs(glsl),
+            .uses_cell_text = core.frontend_rules.shaderUsesCellText(glsl),
             .uses_prev_frame = core.frontend_rules.shaderUsesPrevFrame(glsl),
             .owns_cursor = core.frontend_rules.shaderOwnsCursor(glsl),
         };
@@ -3450,13 +3615,20 @@ pub const Renderer = struct {
         u.iTimeCursorChange = self.shader_cursor_change_time;
         core.fillEditUniforms(
             &u,
-            @floatFromInt(if (self.shader_cursor_cell_px[0] > 0) self.shader_cursor_cell_px[0] else self.cell_w_px),
-            @floatFromInt(if (self.shader_cursor_cell_px[1] > 0) self.shader_cursor_cell_px[1] else self.cell_h_px),
+            @floatFromInt(self.cell_w_px),
+            @floatFromInt(self.cell_h_px),
+            .{
+                @floatFromInt(if (self.shader_cursor_cell_px[0] > 0) self.shader_cursor_cell_px[0] else self.cell_w_px),
+                @floatFromInt(if (self.shader_cursor_cell_px[1] > 0) self.shader_cursor_cell_px[1] else self.cell_h_px),
+            },
             self.shader_grid_origin,
             self.cell_age_cache.last_edit,
             self.cursor_blink_on,
             self.shader_wants_edit_inputs,
         );
+        u.iRootRows = self.shader_root_rows;
+        u.iGridRectCount = self.shader_grid_rect_count;
+        u.iGridRects = self.shader_grid_rects;
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto just lists the fields as "Year, month, day,
         // time in seconds" without spelling out indexing. Forward
@@ -3539,6 +3711,8 @@ pub const Renderer = struct {
         // Edit-effect inputs, allocated only when a shader reads them.
         var prev_frame_srv: ?*c.ID3D11ShaderResourceView = null;
         var cell_age_srv_bind: ?*c.ID3D11ShaderResourceView = null;
+        var cell_text_srv_bind: ?*c.ID3D11ShaderResourceView = null;
+        var row_offset_srv_bind: ?*c.ID3D11ShaderResourceView = null;
         var feedback_rtv_target: ?*c.ID3D11RenderTargetView = null;
         var feedback_src_tex: ?*c.ID3D11Texture2D = null;
         if (self.shader_wants_edit_inputs) {
@@ -3549,7 +3723,9 @@ pub const Renderer = struct {
                 @floatFromInt(self.cell_h_px),
             );
             if (g.cols > 0) cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl, g.cols, g.rows);
+            row_offset_srv_bind = self.ensureRowOffsetTexture(ctx, ctx_vtbl);
         }
+        if (self.shader_wants_cell_text) cell_text_srv_bind = self.ensureCellTextTexture(ctx, ctx_vtbl);
         if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
             if (self.feedback_rtv[self.feedback_index]) |w| {
@@ -3672,10 +3848,11 @@ pub const Renderer = struct {
                 var pf_srvs: [1]?*c.ID3D11ShaderResourceView = .{pf};
                 set_srvs_fn(ctx, 2, 1, &pf_srvs[0]);
             }
-            if (cell_age_srv_bind) |ca| {
-                var ca_srvs: [1]?*c.ID3D11ShaderResourceView = .{ca};
-                set_srvs_fn(ctx, 3, 1, &ca_srvs[0]);
-            }
+            // Bound even when null: the immediate context is shared by every
+            // window's renderer, so a slot left alone would still hold the
+            // texture of whichever window drew last.
+            var edit_srvs: [3]?*c.ID3D11ShaderResourceView = .{ cell_age_srv_bind, cell_text_srv_bind, row_offset_srv_bind };
+            set_srvs_fn(ctx, 3, 3, &edit_srvs[0]);
 
             set_ps_fn(ctx, ps_i, null, 0);
             draw_fn(ctx, 3, 0);

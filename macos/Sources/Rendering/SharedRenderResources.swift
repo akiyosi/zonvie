@@ -129,6 +129,46 @@ final class SharedRenderResources {
         stagedGridFonts[gridId]
     }
 
+    /// Fill iRootRows and iGridRects of `u` from the layers a surface draws
+    /// this frame (zonvie_shader_fill_grid_rects). Rects are in fragCoord
+    /// space: `gridOrigin` (the surface's iGridOrigin) plus each layer's
+    /// origin, which is relative to the root. Layers are placed in global
+    /// cells (`cellWidthPx`/`cellHeightPx`) whatever the root's font; under a
+    /// root in its own font every layer has a band of its own, as the core
+    /// writes it. `scratch` is the surface's own, reused frame to frame.
+    static func fillShaderGridRects(
+        _ u: inout zonvie_shader_uniforms,
+        layers: [SurfaceLayerFrame],
+        rootGridId: Int64,
+        rootRows: Int,
+        rootHasFont: Bool,
+        gridOrigin: CGPoint,
+        cellWidthPx: Float,
+        cellHeightPx: Float,
+        scratch: inout [zonvie_shader_grid_rect]
+    ) {
+        scratch.removeAll(keepingCapacity: true)
+        for entry in layers where entry.layer.gridId != rootGridId {
+            let l = entry.layer
+            let fontGrid = l.cellWidthPx > 0
+            scratch.append(zonvie_shader_grid_rect(
+                grid_id: l.gridId,
+                x_px: Float(gridOrigin.x) + l.originPx.x,
+                y_px: Float(gridOrigin.y) + l.originPx.y,
+                w_px: fontGrid ? Float(l.extentWidthPx) : Float(l.cols) * cellWidthPx,
+                h_px: fontGrid ? Float(l.extentHeightPx) : Float(l.rows) * cellHeightPx,
+                cell_w_px: fontGrid ? Float(l.cellWidthPx) : (rootHasFont ? cellWidthPx : 0),
+                cell_h_px: fontGrid ? Float(l.cellHeightPx) : (rootHasFont ? cellHeightPx : 0),
+                rows: UInt32(clamping: l.rows),
+                cols: UInt32(clamping: l.cols),
+                z: UInt32(clamping: l.z),
+                _pad: 0))
+        }
+        scratch.withUnsafeBufferPointer { buf in
+            zonvie_shader_fill_grid_rects(&u, buf.baseAddress, buf.count, UInt32(clamping: rootRows))
+        }
+    }
+
     func gridFont(_ gridId: Int64) -> GridFontPx? {
         os_unfair_lock_lock(&gridFontsLock)
         defer { os_unfair_lock_unlock(&gridFontsLock) }
@@ -250,6 +290,9 @@ final class SharedRenderResources {
     /// True when a loaded shader reads the cell-age inputs. Gates every
     /// cell-age allocation and upload, on every surface.
     private(set) var shaderWantsEditInputs: Bool = false
+    /// True when a loaded shader reads the cell text. Gates the cell-text
+    /// stores, their row writes and the texture, on every surface.
+    private(set) var shaderWantsCellText: Bool = false
     /// True when a loaded shader reads iPrevFrame. Gates the feedback pair
     /// and its copy pass, on every surface.
     private(set) var shaderWantsPrevFrame: Bool = false
@@ -261,6 +304,8 @@ final class SharedRenderResources {
     var onShaderEditInputsChanged: ((Bool) -> Void)?
     /// The iCellAge state of every surface, keyed the way the core stamps it.
     let cellAge = SurfaceCellAgeStores()
+    /// The iCellText state of every surface, keyed the same way.
+    let cellText = SurfaceCellTextStores()
 
     /// True when a shader declared @zonvie-owns-cursor and can draw it now.
     /// Every surface that draws a native cursor or its glow consults this, or
@@ -476,6 +521,7 @@ final class SharedRenderResources {
         cursorVisible: Bool,
         cmdlineCursorVisible: Bool = false,
         gridOrigin: CGPoint = .zero,
+        rootCellPx: (Float, Float)? = nil,
         cellAgeGrid: Int64 = 1,
         lastLoggedCursor: inout (Float, Float, Float, Float)
     ) -> zonvie_shader_uniforms {
@@ -545,12 +591,16 @@ final class SharedRenderResources {
         // the two cannot disagree for a frame.
         let visible = cursorVisible ||
             (cmdlineCursorVisible && cursor.gridId == ZonvieCore.cmdlineGridId)
-        // The cursor grid's own cell when it has a font, so bar/block is
-        // classified against the cell the cursor is drawn in.
+        // iCellSize is the surface root's cell (`rootCellPx` for a root in
+        // its own font); the cursor grid's own cell classifies bar/block
+        // against the cell the cursor is drawn in.
+        let rootCell = rootCellPx ?? (cellWidthPx, cellHeightPx)
         let cursorFont = gridFont(cursor.gridId)
         zonvie_shader_fill_edit_uniforms(
-            &uniforms, cursorFont.map { Float($0.cellWidthPx) } ?? cellWidthPx,
-            cursorFont.map { Float($0.cellHeightPx) } ?? cellHeightPx, Float(gridOrigin.x), Float(gridOrigin.y),
+            &uniforms, rootCell.0, rootCell.1,
+            cursorFont.map { Float($0.cellWidthPx) } ?? rootCell.0,
+            cursorFont.map { Float($0.cellHeightPx) } ?? rootCell.1,
+            Float(gridOrigin.x), Float(gridOrigin.y),
             cellAge.lastEdit(grid: cellAgeGrid), visible, shaderWantsEditInputs)
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,
@@ -1009,6 +1059,127 @@ final class SurfaceCellAgeStores {
 
     func removeAll() {
         zonvie_cell_age_remove_all(stores)
+        textureLock.lock()
+        textures.removeAll()
+        textureLock.unlock()
+    }
+}
+
+/// The iCellText textures of every surface, over the core's shared store set
+/// (zonvie_cell_text_*). Keyed like SurfaceCellAgeStores. The core thread
+/// writes rows; each surface's draw syncs its store and uploads it. A
+/// texture's size follows the rows delivered to its store, not the surface.
+final class SurfaceCellTextStores {
+    private final class Texture {
+        var texture: MTLTexture?
+        var uploadScratch: [UInt32] = []
+        var cache = zonvie_cell_text_cache()
+        /// `uploadScratch` holds a copy the texture has not seen.
+        var pendingUpload = false
+    }
+
+    private let stores: OpaquePointer
+    private let textureLock = NSLock()
+    private var textures: [Int64: Texture] = [:]  // Protected by textureLock
+
+    init() {
+        stores = zonvie_cell_text_create()!
+    }
+
+    deinit {
+        zonvie_cell_text_destroy(stores)
+    }
+
+    /// Stage one row. Core thread.
+    func apply(_ row: UnsafePointer<zonvie_cell_text_row>) {
+        zonvie_cell_text_apply_row(stores, row)
+    }
+
+    /// Publish `grid`'s staged rows. Core thread, from the surface's commit
+    /// under the lock its draw snapshots with.
+    func commit(grid: Int64) {
+        zonvie_cell_text_commit(stores, grid)
+    }
+
+    /// Drop the rows staged by a refused flush. Core thread.
+    func discard() {
+        zonvie_cell_text_discard(stores)
+    }
+
+    private func entry(grid: Int64) -> Texture {
+        textureLock.lock()
+        defer { textureLock.unlock() }
+        if let t = textures[grid] { return t }
+        let t = Texture()
+        textures[grid] = t
+        return t
+    }
+
+    /// Copy `grid`'s mirror out of the store when it changed. Drawing
+    /// thread, under the surface's renderer lock so the copy pairs with the
+    /// rows that lock snapshots; only a memcpy happens there, the GPU work
+    /// is `texture`'s after the lock is released. False when no row has
+    /// arrived yet.
+    func stage(grid: Int64) -> Bool {
+        let t = entry(grid: grid)
+        var values: UnsafePointer<UInt32>?
+        switch zonvie_cell_text_sync(stores, grid, t.texture == nil, &t.cache, &values) {
+        case 0:
+            return false
+        case 2:
+            let n = Int(t.cache.cols) * Int(t.cache.rows)
+            if t.uploadScratch.count != n {
+                t.uploadScratch = [UInt32](repeating: 0, count: n)
+            }
+            t.uploadScratch.withUnsafeMutableBufferPointer { dst in
+                _ = memcpy(dst.baseAddress!, values!, n * MemoryLayout<UInt32>.size)
+            }
+            zonvie_cell_text_end_upload(stores)
+            t.pendingUpload = true
+        default:
+            break
+        }
+        return true
+    }
+
+    /// Return `grid`'s texture with the staged copy uploaded. Drawing
+    /// thread, after `stage`, outside every lock. The texture is (re)made
+    /// only when the store's cell grid changes.
+    func texture(grid: Int64, device: MTLDevice) -> MTLTexture? {
+        let t = entry(grid: grid)
+        guard t.pendingUpload else { return t.texture }
+        let cols = Int(t.cache.cols), rows = Int(t.cache.rows)
+        if t.texture == nil || t.texture?.width != cols || t.texture?.height != rows {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r32Uint, width: cols, height: rows, mipmapped: false)
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            t.texture = tex
+        }
+        t.uploadScratch.withUnsafeBytes { raw in
+            t.texture?.replace(
+                region: MTLRegionMake2D(0, 0, cols, rows),
+                mipmapLevel: 0,
+                withBytes: raw.baseAddress!,
+                bytesPerRow: cols * MemoryLayout<UInt32>.size
+            )
+        }
+        t.pendingUpload = false
+        return t.texture
+    }
+
+    /// Forget an external window's store when that window goes away; see
+    /// SurfaceCellAgeStores.drop for the threading.
+    func drop(grid: Int64) {
+        zonvie_cell_text_drop(stores, grid)
+        textureLock.lock()
+        textures.removeValue(forKey: grid)
+        textureLock.unlock()
+    }
+
+    func removeAll() {
+        zonvie_cell_text_remove_all(stores)
         textureLock.lock()
         textures.removeAll()
         textureLock.unlock()
@@ -1505,6 +1676,7 @@ extension SharedRenderResources {
         customShaderPipelinesDecorated.removeAll()
         anyCustomShaderNeedsAnimation = false
         shaderWantsEditInputs = false
+        shaderWantsCellText = false
         shaderWantsPrevFrame = false
         shaderOwnsCursor = false
         // Only ask the core to build stamp lists when a shader reads them,
@@ -1512,6 +1684,7 @@ extension SharedRenderResources {
         // memory.
         defer {
             if !shaderWantsEditInputs { cellAge.removeAll() }
+            if !shaderWantsCellText { cellText.removeAll() }
             onShaderEditInputsChanged?(shaderWantsEditInputs)
         }
         if !config.enabled || config.paths.isEmpty {
@@ -1529,6 +1702,7 @@ extension SharedRenderResources {
             customShaderPipelines.append(loaded)
             if loaded.needsAnimation { anyCustomShaderNeedsAnimation = true }
             if loaded.usesEditInputs { shaderWantsEditInputs = true }
+            if loaded.usesCellText { shaderWantsCellText = true }
             if loaded.usesPrevFrame { shaderWantsPrevFrame = true }
             if loaded.ownsCursor { shaderOwnsCursor = true }
         }

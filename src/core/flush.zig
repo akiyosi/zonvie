@@ -1857,6 +1857,202 @@ fn sendGridRow(core: *Core, row_cb: anytype, src: GridRowSource, row: u32, verts
     sendRowUpdate(core, row_cb, src.grid_id, row, 1, verts.ptr, verts.len, .main, src.rows, src.cols);
 }
 
+/// Hand the frontend the codepoints of the row just sent, for the iCellText
+/// texture: the composed row still sits in core.row_cells.scalars, so nothing
+/// is copied. A surface has one text plane: its root's cell grid, with a band
+/// below it for each layer in its own font (cellTextPlane). A layer's row
+/// lands on the plane of the surface that places it.
+fn sendCellTextRow(core: *Core, src: GridRowSource, row: u32) void {
+    sendCellTextRowAt(core, src.grid_id, src.cols, row, core.row_cells.scalars.items.ptr);
+}
+
+/// A layer of `surface` whose cells are not the root's: one drawn in its own
+/// font, or any layer of a root in its own font (layers are placed in global
+/// cells). Its text gets a band of its own instead of the root lattice.
+fn isFontLayerOf(core: *Core, grid_id: i64, surface: i64) bool {
+    const g = &core.grid;
+    if (!g.grid_fonts.contains(grid_id) and !g.grid_fonts.contains(surface)) return false;
+    return isLayerOfSurface(core, grid_id, surface);
+}
+
+const CellTextPlane = struct { rows: u32, cols: u32 };
+
+/// The size of a surface's iCellText plane: the root's rows, then one band
+/// per font layer, as wide as the widest of them.
+fn cellTextPlane(core: *Core, surface: i64, root: *const grid_mod.GridBuf) CellTextPlane {
+    var plane = CellTextPlane{ .rows = root.rows, .cols = root.cols };
+    var it = FontLayerIterator.init(core, surface);
+    while (it.next()) |l| {
+        plane.rows += l.sg.rows;
+        plane.cols = @max(plane.cols, l.sg.cols);
+    }
+    return plane;
+}
+
+/// First plane row of a font layer's band: bands follow the root's rows in
+/// grid-id order (c_api.fillGridRects states the same rule to the shader).
+fn cellTextBandRow0(core: *Core, surface: i64, root_rows: u32, grid_id: i64) u32 {
+    var row0 = root_rows;
+    var it = FontLayerIterator.init(core, surface);
+    while (it.next()) |l| {
+        if (l.id < grid_id) row0 += l.sg.rows;
+    }
+    return row0;
+}
+
+/// The font layers of a surface (isFontLayerOf). With no font anywhere this
+/// walks an empty map; under a root in its own font, every placed grid.
+const FontLayerIterator = struct {
+    core: *Core,
+    surface: i64,
+    fonts: ?@FieldType(grid_mod.Grid, "grid_fonts").KeyIterator,
+    layers: ?@FieldType(grid_mod.Grid, "win_pos").KeyIterator,
+
+    const Item = struct { id: i64, sg: *const grid_mod.GridBuf };
+
+    fn init(core: *Core, surface: i64) FontLayerIterator {
+        const g = &core.grid;
+        if (g.grid_fonts.count() != 0 and g.grid_fonts.contains(surface)) {
+            return .{ .core = core, .surface = surface, .fonts = null, .layers = g.win_pos.keyIterator() };
+        }
+        return .{ .core = core, .surface = surface, .fonts = g.grid_fonts.keyIterator(), .layers = null };
+    }
+
+    fn next(self: *FontLayerIterator) ?Item {
+        while (true) {
+            const id = if (self.layers) |*it| (it.next() orelse return null).* else (self.fonts.?.next() orelse return null).*;
+            if (!isFontLayerOf(self.core, id, self.surface)) continue;
+            const sg = self.core.grid.sub_grids.getPtr(id) orelse continue;
+            return .{ .id = id, .sg = sg };
+        }
+    }
+};
+
+/// A surface's plane changes size, or its bands move, when a font layer
+/// comes, goes or resizes. The frontend's store starts blank on a size
+/// change and a moved band holds another grid's text, so every grid of the
+/// surface is resent.
+fn noteCellTextPlaneChanges(core: *Core) void {
+    if (!core.grid.shader_inputs_enabled or core.cb.on_cell_text_row == null) return;
+    noteCellTextPlaneChange(core, 1);
+    var it = core.grid.external_grids.keyIterator();
+    while (it.next()) |id| noteCellTextPlaneChange(core, id.*);
+}
+
+fn noteCellTextPlaneChange(core: *Core, surface: i64) void {
+    const root = core.grid.bufForConst(surface) orelse return;
+    const plane = cellTextPlane(core, surface, root);
+    // The bands follow from the set of (id, rows); a sum is order-free.
+    var sig: u64 = std.hash.Wyhash.hash(0, std.mem.asBytes(&[3]u64{ plane.rows, plane.cols, root.rows }));
+    var it = FontLayerIterator.init(core, surface);
+    while (it.next()) |l| {
+        sig +%= std.hash.Wyhash.hash(1, std.mem.asBytes(&[3]i64{ l.id, l.sg.rows, l.sg.cols }));
+    }
+    const gop = core.cell_text_plane_sig.getOrPut(core.alloc, surface) catch {
+        core.grid.markSurfaceDirty(surface);
+        return;
+    };
+    if (gop.found_existing and gop.value_ptr.* == sig) return;
+    gop.value_ptr.* = sig;
+    core.grid.markSurfaceDirty(surface);
+}
+
+/// Cells of a surface row that a layer hides are left to that layer: a root
+/// row resent under an open float (every keystroke with a completion menu
+/// up) must not wipe the float's text, and of two overlapping floats the
+/// upper one's text has to survive whichever order their rows are sent in.
+/// So each row goes out as the runs no layer above the sender covers. A
+/// font layer covers nothing: its text is in its band, and the lattice under
+/// it stays whole for the cells around it.
+fn sendCellTextRowAt(core: *Core, grid_id: i64, cols: u32, row: u32, cps: [*]const u32) void {
+    const g = &core.grid;
+    if (!g.shader_inputs_enabled) return;
+    const cb = core.cb.on_cell_text_row orelse return;
+    var surface = grid_id;
+    var row_i: i64 = row;
+    var col_i: i64 = 0;
+    var font_layer = false;
+    if (!g.isSurfaceRoot(grid_id)) {
+        const pos = g.win_pos.get(grid_id) orelse return;
+        const placed = g.surfacePlacement(pos) orelse return;
+        surface = placed.surface;
+        row_i += placed.row;
+        col_i = placed.col;
+        font_layer = isFontLayerOf(core, grid_id, surface);
+    }
+    const root = g.bufForConst(surface) orelse return;
+    const plane = cellTextPlane(core, surface, root);
+    var out = c_api.zonvie_cell_text_row{
+        .grid = surface,
+        .tex_rows = plane.rows,
+        .tex_cols = plane.cols,
+        .row = 0,
+        .col = 0,
+        .count = 0,
+        .cps = cps,
+    };
+    if (font_layer) {
+        out.row = cellTextBandRow0(core, surface, root.rows, grid_id) + row;
+        out.count = cols;
+        // The plane is sized from this grid's rows and cols in this flush.
+        std.debug.assert(cols <= plane.cols and out.row < plane.rows);
+        cb(core.ctx, &out);
+        return;
+    }
+    if (row_i < 0 or row_i >= root.rows or col_i >= root.cols) return;
+    out.row = @intCast(row_i);
+    const col_end: i64 = @min(col_i + cols, root.cols);
+    var c: i64 = @max(col_i, 0);
+    while (c < col_end) {
+        var covered_until: i64 = c;
+        var run_end: i64 = col_end;
+        var it = g.win_pos.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            if (id == grid_id or !isLayerOfSurface(core, id, surface) or isFontLayerOf(core, id, surface)) continue;
+            if (!g.isSurfaceRoot(grid_id) and !layerAbove(g, id, grid_id)) continue;
+            const sg = g.sub_grids.get(id) orelse continue;
+            const p = g.surfacePlacement(e.value_ptr.*) orelse continue;
+            if (row_i < p.row or row_i >= p.row + sg.rows) continue;
+            const l = p.col;
+            const r = p.col + sg.cols;
+            if (l <= c and c < r) {
+                covered_until = @max(covered_until, r);
+            } else if (l > c and l < run_end) {
+                run_end = l;
+            }
+        }
+        if (covered_until > c) {
+            c = covered_until;
+            continue;
+        }
+        out.col = @intCast(c);
+        out.count = @intCast(run_end - c);
+        out.cps = cps + @as(usize, @intCast(c - col_i));
+        cb(core.ctx, &out);
+        c = run_end;
+    }
+}
+
+/// Whether layer `a` paints over layer `b` of the same surface: the order
+/// collectSurfaceLayerEntries sorts by.
+fn layerAbove(g: *const grid_mod.Grid, a: i64, b: i64) bool {
+    const none = grid_mod.WinLayer{ .zindex = 0, .compindex = 0, .order = 0 };
+    const la = g.win_layer.get(a) orelse none;
+    const lb = g.win_layer.get(b) orelse none;
+    return gridEntryLessThan({}, .{
+        .grid_id = b,
+        .zindex = lb.zindex,
+        .compindex = lb.compindex,
+        .order = lb.order,
+    }, .{
+        .grid_id = a,
+        .zindex = la.zindex,
+        .compindex = la.compindex,
+        .order = la.order,
+    });
+}
+
 const RowUpdateKind = enum { main, cursor };
 
 /// The one on_vertices_row emission point. A send carries exactly one of
@@ -2063,6 +2259,7 @@ fn emitGridRows(
         };
         const t_cb_start: i128 = if (timed) clock.nowNs() else 0;
         sendGridRow(core, row_cb, src, r, out.items);
+        sendCellTextRow(core, src, r);
 
         if (timed) {
             const p = perf.?;
@@ -3472,7 +3669,28 @@ fn dispatchGridRowScroll(
     traceRender(core, "event=row_shift_send grid={d} start={d} end={d} delta={d}\n", .{ grid_id, region.row_start, region.row_end, op.rows });
     scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, sg.rows, sg.cols);
     sg.row_shift_sent = true;
+    sendCellTextRegion(core, grid_id, sg, region.row_start, region.row_end);
     return true;
+}
+
+/// The iCellText texture is keyed by row, so rows the frontend keeps across a
+/// row shift are resent as text at their new place; the vacated ones follow
+/// with the flush. The buffer has already scrolled, so each row is read as
+/// it now stands, by composeRowRuns' rule: cells the buffer lacks are blank.
+/// `row_cells.scalars` is free until the row loop.
+fn sendCellTextRegion(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf, row_start: u32, row_end: u32) void {
+    if (!core.grid.shader_inputs_enabled or core.cb.on_cell_text_row == null) return;
+    const scratch = &core.row_cells.scalars;
+    scratch.ensureTotalCapacity(core.alloc, buf.cols) catch return;
+    scratch.items.len = buf.cols;
+    var r = row_start;
+    while (r < row_end) : (r += 1) {
+        const base: usize = @as(usize, r) * buf.cols;
+        const present: usize = if (base >= buf.cells.len) 0 else @min(@as(usize, buf.cols), buf.cells.len - base);
+        if (present != 0) simdExtractCp(buf.cells.ptr + base, scratch.items.ptr, present);
+        @memset(scratch.items[present..], ' ');
+        sendCellTextRowAt(core, grid_id, buf.cols, r, scratch.items.ptr);
+    }
 }
 
 pub const FlushCtx = struct {
@@ -3492,6 +3710,7 @@ pub const FlushCtx = struct {
         assertTransactionInactive(ctx.core);
         ctx.core.grid.assertMainShapeMirrored();
         ctx.core.settleFontGridResizesLocked();
+        noteCellTextPlaneChanges(ctx.core);
         // Pre-size the shaping buffers so a run of up to this many glyphs
         // allocates nothing in the row loop; a longer run still grows them
         // there (ShapingBuffers.setLen).
@@ -4322,16 +4541,16 @@ fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
     }
 
     // Back-to-front: smaller first. Same z order the composited overlay used.
-    std.sort.block(GridEntry, self.grid_entries.items, {}, struct {
-        fn lessThan(_: void, a: GridEntry, b: GridEntry) bool {
-            if (a.zindex != b.zindex) return a.zindex < b.zindex;
-            if (a.compindex != b.compindex) return a.compindex < b.compindex;
-            if (a.order != b.order) return a.order < b.order;
-            return a.grid_id < b.grid_id;
-        }
-    }.lessThan);
+    std.sort.block(GridEntry, self.grid_entries.items, {}, gridEntryLessThan);
 
     return self.grid_entries.items;
+}
+
+fn gridEntryLessThan(_: void, a: GridEntry, b: GridEntry) bool {
+    if (a.zindex != b.zindex) return a.zindex < b.zindex;
+    if (a.compindex != b.compindex) return a.compindex < b.compindex;
+    if (a.order != b.order) return a.order < b.order;
+    return a.grid_id < b.grid_id;
 }
 
 /// Collect one surface's layers, back-to-front, into `core.layout_scratch`.
@@ -4590,6 +4809,10 @@ fn publishSurfaceLayouts(self: *Core) void {
             if (self.grid.isSurfaceRoot(id)) continue;
             entry.value_ptr.deinit();
             self.last_surface_layout.removeByPtr(entry.key_ptr);
+        }
+        var plane_it = self.cell_text_plane_sig.keyIterator();
+        while (plane_it.next()) |id| {
+            if (!self.grid.isSurfaceRoot(id.*)) self.cell_text_plane_sig.removeByPtr(id);
         }
     }
 }
@@ -20411,4 +20634,441 @@ test "a font grid's cursor uses the grid's cell size" {
     try std.testing.expect(sendGridCursor(&core, State.onRow, 2, buf, true, false, &retry, &reset));
     try std.testing.expectEqual(@as(f32, 14), state.min_x);
     try std.testing.expectEqual(@as(f32, 12), state.min_y);
+}
+
+test "each sent row hands the frontend its composed codepoints for iCellText" {
+    const State = struct {
+        rows: [4]c_api.zonvie_cell_text_row = undefined,
+        text: [4][4]u32 = undefined,
+        n: usize = 0,
+
+        fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.n == self.rows.len) return;
+            self.rows[self.n] = r.*;
+            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            self.n += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_cell_text_row = State.onRow;
+
+    // Off by default: a frontend without a shader sees nothing.
+    core.grid.putCell(0, 0, 'a', 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 4);
+    try std.testing.expectEqual(@as(usize, 0), state.n);
+
+    // Turned on, the first flush hands over every row: the texture is new.
+    core.setShaderInputsEnabledLocked(true);
+    try flush_ctx.onFlush(2, 4);
+    try std.testing.expectEqual(@as(usize, 2), state.n);
+
+    state.n = 0;
+    core.grid.putCell(1, 2, 'x', 0);
+    try flush_ctx.onFlush(2, 4);
+    // Then only the dirty row is resent, as the main window's texture row 1.
+    try std.testing.expectEqual(@as(usize, 1), state.n);
+    try std.testing.expectEqual(@as(i64, 1), state.rows[0].grid);
+    try std.testing.expectEqual(@as(u32, 2), state.rows[0].tex_rows);
+    try std.testing.expectEqual(@as(u32, 4), state.rows[0].tex_cols);
+    try std.testing.expectEqual(@as(u32, 1), state.rows[0].row);
+    try std.testing.expectEqual(@as(u32, 0), state.rows[0].col);
+    try std.testing.expectEqual(@as(u32, 4), state.rows[0].count);
+    try std.testing.expectEqualSlices(u32, &.{ ' ', ' ', 'x', ' ' }, state.text[0][0..4]);
+
+    // Off and on again: an edit made while off reaches the new texture,
+    // with every other row.
+    core.setShaderInputsEnabledLocked(false);
+    core.grid.putCell(0, 1, 'z', 0);
+    try flush_ctx.onFlush(2, 4);
+    core.setShaderInputsEnabledLocked(true);
+    state.n = 0;
+    try flush_ctx.onFlush(2, 4);
+    try std.testing.expectEqual(@as(usize, 2), state.n);
+    for (state.rows[0..2], 0..) |r, i| {
+        if (r.row == 0) try std.testing.expectEqualSlices(u32, &.{ 'a', 'z', ' ', ' ' }, state.text[i][0..4]);
+    }
+}
+
+test "cell text under a layer is left to the layer, and a float on an external window writes its texture" {
+    const Sent = struct {
+        rows: [32]c_api.zonvie_cell_text_row = undefined,
+        text: [32][8]u32 = undefined,
+        n: usize = 0,
+
+        fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.n == self.rows.len) return;
+            self.rows[self.n] = r.*;
+            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            self.n += 1;
+        }
+
+        fn find(self: *const @This(), grid: i64, row: u32, col: u32) ?usize {
+            for (self.rows[0..self.n], 0..) |r, i| {
+                if (r.grid == grid and r.row == row and r.col == col) return i;
+            }
+            return null;
+        }
+
+        fn countFor(self: *const @This(), grid: i64, row: u32) usize {
+            var n: usize = 0;
+            for (self.rows[0..self.n]) |r| {
+                if (r.grid == grid and r.row == row) n += 1;
+            }
+            return n;
+        }
+    };
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 8);
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var sent = Sent{};
+    core.ctx = &sent;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_cell_text_row = Sent.onRow;
+    core.grid.shader_inputs_enabled = true;
+
+    // A float over row 0, cols 3..5 of the main surface.
+    try core.grid.resizeGrid(2, 1, 2);
+    try core.grid.setWinFloatPos(2, 20, 0, 3, 50, 0, 1, true);
+    core.grid.putCell(0, 0, 'a', 0);
+    core.grid.putCell(0, 6, 'z', 0);
+    core.grid.putCellGrid(2, 0, 0, 'q', 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 8);
+
+    // The root row arrives as the two runs beside the float; the float's own
+    // run fills the gap. Each run's codepoints start at its own column.
+    try std.testing.expectEqual(@as(usize, 3), sent.countFor(1, 0));
+    const left = sent.find(1, 0, 0).?;
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[left].count);
+    try std.testing.expectEqual(@as(u32, 'a'), sent.text[left][0]);
+    const right = sent.find(1, 0, 5).?;
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[right].count);
+    try std.testing.expectEqualSlices(u32, &.{ ' ', 'z', ' ' }, sent.text[right][0..3]);
+    const float = sent.find(1, 0, 3).?;
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[float].count);
+    try std.testing.expectEqualSlices(u32, &.{ 'q', ' ' }, sent.text[float][0..2]);
+    // Row 1 has no layer over it: one full run.
+    try std.testing.expectEqual(@as(usize, 1), sent.countFor(1, 1));
+    try std.testing.expectEqual(@as(u32, 8), sent.rows[sent.find(1, 1, 0).?].count);
+
+    // A second float above the first (higher zindex), cols 4..6: the lower
+    // float keeps only col 3, the root only cols 0..3 and 6..8.
+    sent.n = 0;
+    try core.grid.resizeGrid(3, 1, 2);
+    try core.grid.setWinFloatPos(3, 30, 0, 4, 60, 0, 1, true);
+    core.grid.markAllDirty();
+    core.grid.sub_grids.getPtr(2).?.markAllDirty();
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(usize, 4), sent.countFor(1, 0));
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[sent.find(1, 0, 0).?].count);
+    try std.testing.expectEqual(@as(u32, 1), sent.rows[sent.find(1, 0, 3).?].count);
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[sent.find(1, 0, 4).?].count);
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[sent.find(1, 0, 6).?].count);
+
+    // A float placed on an external window lands on that window's texture,
+    // at its placement in the window's cells.
+    sent.n = 0;
+    try core.grid.resizeGrid(5, 2, 6);
+    try std.testing.expect(try core.grid.setWinExternalPos(5, 55));
+    try core.grid.resizeGrid(6, 1, 2);
+    try core.grid.setWinFloatPos(6, 66, 1, 2, 50, 0, 5, true);
+    core.grid.putCellGrid(6, 0, 0, 'e', 0);
+    try flush_ctx.onFlush(2, 8);
+    const ext_float = sent.find(5, 1, 2).?;
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[ext_float].tex_rows);
+    try std.testing.expectEqual(@as(u32, 6), sent.rows[ext_float].tex_cols);
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[ext_float].count);
+    try std.testing.expectEqual(@as(u32, 'e'), sent.text[ext_float][0]);
+    // The external root's row 1 is sent around it (two runs plus the
+    // float's); its row 0 whole.
+    try std.testing.expectEqual(@as(usize, 3), sent.countFor(5, 1));
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[sent.find(5, 1, 0).?].count);
+    try std.testing.expectEqual(@as(u32, 2), sent.rows[sent.find(5, 1, 4).?].count);
+    try std.testing.expectEqual(@as(u32, 6), sent.rows[sent.find(5, 0, 0).?].count);
+
+    // Moving the lower float down a row: the root row it left is owed its
+    // text again (Neovim redraws nothing there), and the float's own text
+    // lands at its new place though its rows did not change.
+    sent.n = 0;
+    try core.grid.setWinFloatPos(2, 20, 1, 3, 50, 0, 1, true);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expect(sent.find(1, 0, 0) != null);
+    const moved = sent.find(1, 1, 3).?;
+    try std.testing.expectEqual(@as(u32, 'q'), sent.text[moved][0]);
+
+    // Hiding it: the root row beneath gets its whole text back.
+    sent.n = 0;
+    try core.grid.hideWin(2);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(usize, 1), sent.countFor(1, 1));
+    try std.testing.expectEqual(@as(u32, 8), sent.rows[sent.find(1, 1, 0).?].count);
+}
+
+test "a layer in its own font writes its text to a band below the root's rows and covers nothing" {
+    const Sent = struct {
+        rows: [32]c_api.zonvie_cell_text_row = undefined,
+        text: [32][16]u32 = undefined,
+        n: usize = 0,
+
+        fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.n == self.rows.len) return;
+            self.rows[self.n] = r.*;
+            @memcpy(self.text[self.n][0..r.count], r.cps[0..r.count]);
+            self.n += 1;
+        }
+
+        fn find(self: *const @This(), row: u32, col: u32) ?usize {
+            for (self.rows[0..self.n], 0..) |r, i| {
+                if (r.grid == 1 and r.row == row and r.col == col) return i;
+            }
+            return null;
+        }
+    };
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 8);
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var sent = Sent{};
+    core.ctx = &sent;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_cell_text_row = Sent.onRow;
+    core.grid.shader_inputs_enabled = true;
+
+    // Two font floats over row 0, ids 4 then 3, 1 x 3 and 2 x 2 of their own cells.
+    try core.grid.resizeGrid(4, 1, 3);
+    try core.grid.setWinFloatPos(4, 40, 0, 2, 50, 0, 1, true);
+    try core.grid.grid_fonts.put(core.alloc, 4, .{ .win_id = 40, .font_id = 1, .mode = .font_view, .cell_w_px = 2, .cell_h_px = 2, .frame_rows = 2, .frame_cols = 6, .extent_w_px = 6, .extent_h_px = 2 });
+    try core.grid.resizeGrid(3, 2, 2);
+    try core.grid.setWinFloatPos(3, 30, 0, 5, 50, 0, 1, true);
+    try core.grid.grid_fonts.put(core.alloc, 3, .{ .win_id = 30, .font_id = 1, .mode = .font_view, .cell_w_px = 1, .cell_h_px = 1, .frame_rows = 2, .frame_cols = 2, .extent_w_px = 2, .extent_h_px = 2 });
+    core.grid.putCell(0, 3, 'r', 0);
+    core.grid.putCellGrid(4, 0, 0, 'f', 0);
+    core.grid.putCellGrid(3, 1, 1, 'g', 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 8);
+
+    // The plane is the root's 2 x 8 plus a band of 2 for grid 3 then 1 for grid 4.
+    for (sent.rows[0..sent.n]) |r| {
+        try std.testing.expectEqual(@as(u32, 5), r.tex_rows);
+        try std.testing.expectEqual(@as(u32, 8), r.tex_cols);
+    }
+    // The root row is one whole run: font layers cover nothing.
+    const root0 = sent.find(0, 0).?;
+    try std.testing.expectEqual(@as(u32, 8), sent.rows[root0].count);
+    try std.testing.expectEqual(@as(u32, 'r'), sent.text[root0][3]);
+    try std.testing.expectEqual(@as(u32, 'g'), sent.text[sent.find(3, 0).?][1]);
+    const band4 = sent.find(4, 0).?;
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[band4].count);
+    try std.testing.expectEqual(@as(u32, 'f'), sent.text[band4][0]);
+
+    // A band wider than the root widens the plane; the root's rows stay as
+    // wide as the root.
+    sent.n = 0;
+    try core.grid.resizeGrid(4, 1, 10);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(u32, 10), sent.rows[0].tex_cols);
+    try std.testing.expectEqual(@as(u32, 8), sent.rows[sent.find(0, 0).?].count);
+    try std.testing.expectEqual(@as(u32, 10), sent.rows[sent.find(4, 0).?].count);
+
+    // An unrelated row edit keeps the plane: only that row is resent.
+    sent.n = 0;
+    core.grid.putCell(1, 0, 'x', 0);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(usize, 1), sent.n);
+
+    // Grid 3 losing its font moves grid 4's band up and shrinks the plane:
+    // every row of the surface is resent, grid 3 back on the root lattice.
+    sent.n = 0;
+    _ = core.grid.grid_fonts.remove(3);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[0].tex_rows);
+    const moved = sent.find(2, 0).?;
+    try std.testing.expectEqual(@as(u32, 'f'), sent.text[moved][0]);
+    try std.testing.expectEqual(@as(u32, 'g'), sent.text[sent.find(1, 5).?][1]);
+    // The root's rows come again, split around grid 3 now that it covers.
+    try std.testing.expectEqual(@as(u32, 5), sent.rows[sent.find(0, 0).?].count);
+    try std.testing.expect(sent.find(0, 7) != null);
+    try std.testing.expectEqual(@as(u32, 'x'), sent.text[sent.find(1, 0).?][0]);
+
+    // An external window whose root has its own font: a plain float on it is
+    // placed in global cells, not the root's, so its text takes a band too
+    // and the root's row goes out whole.
+    sent.n = 0;
+    try core.grid.resizeGrid(5, 2, 6);
+    try std.testing.expect(try core.grid.setWinExternalPos(5, 55));
+    try core.grid.grid_fonts.put(core.alloc, 5, .{ .win_id = 55, .font_id = 1, .mode = .resize, .cell_w_px = 2, .cell_h_px = 2, .frame_rows = 4, .frame_cols = 12, .extent_w_px = 12, .extent_h_px = 4 });
+    try core.grid.resizeGrid(6, 1, 2);
+    try core.grid.setWinFloatPos(6, 66, 1, 2, 50, 0, 5, true);
+    core.grid.putCellGrid(6, 0, 0, 'e', 0);
+    try flush_ctx.onFlush(2, 8);
+    var ext_root1: ?usize = null;
+    var ext_band: ?usize = null;
+    for (sent.rows[0..sent.n], 0..) |r, i| {
+        if (r.grid != 5) continue;
+        try std.testing.expectEqual(@as(u32, 3), r.tex_rows);
+        if (r.row == 1) ext_root1 = i;
+        if (r.row == 2) ext_band = i;
+    }
+    try std.testing.expectEqual(@as(u32, 6), sent.rows[ext_root1.?].count);
+    try std.testing.expectEqual(@as(u32, 0), sent.rows[ext_band.?].col);
+    try std.testing.expectEqual(@as(u32, 'e'), sent.text[ext_band.?][0]);
+}
+
+test "a plain float moving beside a grid in its own font hands the root its text back" {
+    const Sent = struct {
+        rows: [32]c_api.zonvie_cell_text_row = undefined,
+        n: usize = 0,
+
+        fn onRow(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.n == self.rows.len) return;
+            self.rows[self.n] = r.*;
+            self.n += 1;
+        }
+
+        fn find(self: *const @This(), row: u32, col: u32) ?usize {
+            for (self.rows[0..self.n], 0..) |r, i| {
+                if (r.grid == 1 and r.row == row and r.col == col) return i;
+            }
+            return null;
+        }
+    };
+    const Noop = struct {
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 8);
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var sent = Sent{};
+    core.ctx = &sent;
+    core.cb.on_vertices_row = Noop.onRow;
+    core.cb.on_cell_text_row = Sent.onRow;
+    core.grid.shader_inputs_enabled = true;
+
+    try core.grid.resizeGrid(4, 1, 3);
+    try core.grid.setWinFloatPos(4, 40, 0, 0, 50, 0, 1, true);
+    try core.grid.grid_fonts.put(core.alloc, 4, .{ .win_id = 40, .font_id = 1, .mode = .font_view, .cell_w_px = 2, .cell_h_px = 2, .frame_rows = 2, .frame_cols = 6, .extent_w_px = 6, .extent_h_px = 2 });
+    try core.grid.resizeGrid(7, 1, 2);
+    try core.grid.setWinFloatPos(7, 70, 1, 0, 50, 0, 1, true);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 8);
+
+    // Grid 7 is a plain float on a plain root: the root cells it leaves are
+    // owed their text, whatever other grid has a font.
+    sent.n = 0;
+    try core.grid.setWinFloatPos(7, 70, 1, 3, 50, 0, 1, true);
+    try flush_ctx.onFlush(2, 8);
+    try std.testing.expectEqual(@as(u32, 3), sent.rows[sent.find(1, 0).?].count);
+    try std.testing.expect(sent.find(1, 5) != null);
+}
+
+test "a row shift inside a grid in its own font resends its band" {
+    const Text = struct {
+        sink: RowShiftSink = .{},
+        first: [20]u32 = @splat(0),
+        sent: [20]bool = @splat(false),
+
+        fn onText(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (r.grid != 1 or r.row >= 20 or r.count == 0) return;
+            self.first[r.row] = r.cps[0];
+            self.sent[r.row] = true;
+        }
+    };
+    var state = Text{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state.sink);
+    core.ctx = &state;
+    core.grid.shader_inputs_enabled = true;
+    core.cb.on_cell_text_row = Text.onText;
+    // An exact fit (no bottom margin) keeps the row-shift fast path.
+    try core.grid.grid_fonts.put(core.alloc, 2, .{ .win_id = 101, .font_id = 1, .mode = .resize, .cell_w_px = 1, .cell_h_px = 1, .frame_rows = 10, .frame_cols = 20, .extent_w_px = 20, .extent_h_px = 10 });
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    state = .{};
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 1), state.sink.scroll_calls);
+    // The band is root rows 10..19: the surviving rows move up within it.
+    for (0..9) |r| {
+        try std.testing.expect(state.sent[10 + r]);
+        try std.testing.expectEqual('A' + @as(u32, @intCast(r)) + 1, state.first[10 + r]);
+    }
+    try std.testing.expect(state.sent[19]);
+    try std.testing.expectEqual(@as(u32, ' '), state.first[19]);
+}
+
+test "a row shift resends the surviving rows' text at their new rows" {
+    const Text = struct {
+        sink: RowShiftSink = .{},
+        first: [10]u32 = @splat(0),
+        sent: [10]bool = @splat(false),
+
+        fn onText(ctx: ?*anyopaque, r: *const c_api.zonvie_cell_text_row) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (r.grid != 1 or r.row >= 10 or r.count == 0) return;
+            self.first[r.row] = r.cps[0];
+            self.sent[r.row] = true;
+        }
+    };
+    var state = Text{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state.sink);
+    core.ctx = &state;
+    core.grid.shader_inputs_enabled = true;
+    core.cb.on_cell_text_row = Text.onText;
+
+    // Scroll the window up one row: the frontend keeps rows 1..9 as 0..8
+    // and is sent only row 9, but the text texture must see all ten.
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 1), state.sink.scroll_calls);
+    for (0..9) |r| {
+        try std.testing.expect(state.sent[r]);
+        try std.testing.expectEqual('A' + @as(u32, @intCast(r)) + 1, state.first[r]);
+    }
+    try std.testing.expect(state.sent[9]);
+    try std.testing.expectEqual(@as(u32, ' '), state.first[9]);
 }

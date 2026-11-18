@@ -26,6 +26,8 @@ pub const CustomShaderPipeline = struct {
     /// True when the source reads the cell-age inputs. Gates the core opt-in
     /// and the cell-age texture.
     uses_edit_inputs: bool = false,
+    /// True when the source reads the cell text. Gates the cell-text texture.
+    uses_cell_text: bool = false,
     /// True when the source reads iPrevFrame. Gates the feedback pair.
     uses_prev_frame: bool = false,
     /// True when the source declared `@zonvie-owns-cursor`.

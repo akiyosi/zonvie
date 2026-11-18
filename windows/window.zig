@@ -1527,6 +1527,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
         .on_cell_age_stamps = callbacks.onCellAgeStamps,
+        .on_cell_text_row = callbacks.onCellTextRow,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,
@@ -2386,6 +2387,7 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     // The chain renders over the full backbuffer, so iGridOrigin is where
     // the grid sits inside it: past the in-client tab bar or sidebar.
     g.cell_age = &app.cell_age;
+    g.cell_text = &app.cell_text;
     g.cell_w_px = app.cell_w_px;
     g.cell_h_px = app.rowHeightPx();
     g.cursor_blink_on = app.cursor_blink.visible;
@@ -2393,6 +2395,7 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
         @floatFromInt(geom.content_x_offset orelse 0),
         @floatFromInt(geom.content_y_offset orelse 0),
     };
+    app_mod.fillShaderGridRects(g, in.tbs_snapshot.layers.slice(), g.shader_grid_origin, g.cell_w_px, g.cell_h_px);
 
     if (!in.snap.row_mode) return drawMainFlatFrame(hwnd, app, g, in, geom);
     return drawMainRowFrame(hwnd, app, g, in, geom, resized_before_draw);

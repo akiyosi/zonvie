@@ -488,6 +488,10 @@ pub const Callbacks = struct {
     on_shape_text_run_ex: ?c_api.ShapeTextRunExFn = null,
     on_rasterize_glyph_ex: ?c_api.RasterizeGlyphExFn = null,
     on_rasterize_glyph_by_id_ex: ?c_api.RasterizeGlyphExFn = null,
+    /// The codepoints of a row the flush just sent (on_vertices_row), for
+    /// the iCellText texture a custom shader samples. Only while the
+    /// frontend has opted in via zonvie_core_set_shader_inputs_enabled.
+    on_cell_text_row: ?*const fn (ctx: ?*anyopaque, row: *const c_api.zonvie_cell_text_row) callconv(.c) void = null,
 };
 
 const GridEntry = flush.GridEntry;
@@ -958,6 +962,8 @@ pub const Core = struct {
     /// Last layer list published per surface, so on_surface_layout only fires
     /// when the list actually changed.
     last_surface_layout: std.AutoHashMapUnmanaged(i64, flush.SurfaceLayoutSig) = .{},
+    /// Last iCellText plane layout per surface (flush.noteCellTextPlaneChanges).
+    cell_text_plane_sig: std.AutoHashMapUnmanaged(i64, u64) = .{},
     layout_budget: c_api.render_layout.Budget = .{},
     /// Persistent build buffer for one surface's layer list; grown on layout
     /// change only, never per flush.
@@ -1463,6 +1469,8 @@ pub const Core = struct {
         flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
+        self.cell_text_plane_sig.deinit(self.alloc);
+        self.cell_text_plane_sig = .{};
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.msg_line_cache.deinit(self.alloc);
@@ -1703,6 +1711,8 @@ pub const Core = struct {
         flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
+        self.cell_text_plane_sig.deinit(self.alloc);
+        self.cell_text_plane_sig = .{};
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.grid.external_grids.deinit(self.alloc);
@@ -5914,6 +5924,16 @@ pub const Core = struct {
     /// here; the frontends apply it at that flush's commit), and again after
     /// the batch for one with no flush.
     /// Caller holds grid_mu.
+    /// Turn the shader cell inputs on or off. grid_mu held. Off drops the
+    /// stamps recorded for the flush in flight; either way the next flush
+    /// finds every text plane new and resends it all, since a frontend that
+    /// turns them on starts its texture empty.
+    pub fn setShaderInputsEnabledLocked(self: *Core, on: bool) void {
+        self.grid.shader_inputs_enabled = on;
+        if (!on) self.grid.resetCellStamps();
+        self.cell_text_plane_sig.clearRetainingCapacity();
+    }
+
     pub fn settleFontGridResizesLocked(self: *Core) void {
         defer self.grid.font_grids_resized.clearRetainingCapacity();
         for (self.grid.font_grids_resized.items) |grid_id| {

@@ -481,8 +481,9 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     const cell: [2]f32 = if (cursor) |c| c.cell else .{ @floatFromInt(app.cell_w_px), @floatFromInt(app.cell_h_px) };
     core.fillEditUniforms(
         u,
-        cell[0],
-        cell[1],
+        @floatFromInt(app.cell_w_px),
+        @floatFromInt(app.cell_h_px),
+        cell,
         .{ 0, 0 },
         p.age_cache.last_edit,
         // Blinked off as macOS and Windows pass it: a shader that draws the

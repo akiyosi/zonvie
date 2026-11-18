@@ -888,6 +888,36 @@ typedef struct zonvie_cell_stamp {
     int16_t grid;
 } zonvie_cell_stamp;
 
+/* One row of codepoints for the iCellText texture a custom shader samples,
+   delivered by on_cell_text_row right after that row's on_vertices_row.
+   `grid` selects the texture: 1 is the main window's screen-space cell grid,
+   any other value is an EXTERNAL window's grid id with row/col local to it.
+   A layer's rows land on the texture of the surface that places it, at its
+   placement, so a float on an external window writes that window's texture.
+   Cells a higher layer covers are not delivered for the row beneath; a row
+   may therefore arrive as several runs. A layer drawn in its own font
+   (on_grid_font), and every layer of a surface whose root is drawn in its
+   own font, is the exception: its cells are not on the surface's lattice,
+   so its rows go to a band of their own below the root's rows, from column
+   0, and it covers nothing beneath. Bands follow in grid-id order
+   (zonvie_shader_fill_grid_rects states the same rule to the shader).
+   tex_rows x tex_cols is that texture's cell grid: the root's rows plus
+   every band, as wide as the widest of the root and the bands; a change
+   of either starts the texture blank. On that, and on any move of a band,
+   every row of the surface is redelivered. `cps` holds `count` codepoints for cells
+   (row, col..col+count): 0 for the second cell of a wide glyph, 32 for a
+   blank. The pointer is valid only for the call. */
+typedef struct zonvie_cell_text_row {
+    int64_t  grid;
+    uint32_t tex_rows;
+    uint32_t tex_cols;
+    uint32_t row;
+    uint32_t col;
+    uint32_t count;
+    uint32_t _pad;
+    const uint32_t *cps;
+} zonvie_cell_text_row;
+
 typedef struct zonvie_callbacks {
     /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
        NULL otherwise. callbacks_size only sees the struct's length, not a
@@ -1118,6 +1148,17 @@ typedef struct zonvie_callbacks {
     zonvie_shape_text_run_ex_fn on_shape_text_run_ex;
     zonvie_rasterize_glyph_ex_fn on_rasterize_glyph_ex;
     zonvie_rasterize_glyph_by_id_ex_fn on_rasterize_glyph_by_id_ex;
+    /* The codepoints of a row the flush just sent, for the iCellText texture
+       a custom shader samples: one call per run of the row no higher layer
+       covers (none when it is all covered), or one for a band row (see
+       zonvie_cell_text_row). Also for rows the frontend keeps across a row
+       shift, at their new place. ONLY after the frontend opted in with
+       zonvie_core_set_shader_inputs_enabled; the first flush after each
+       call that enables it delivers every row of every surface, so a
+       frontend may start its texture blank there. Rows not resent keep their
+       previous codepoints, as with on_vertices_row. Runs on the core thread
+       with grid_mu held. Appended at the end for ABI compat. */
+    void (*on_cell_text_row)(void* ctx, const zonvie_cell_text_row* row);
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1169,10 +1210,11 @@ ZONVIE_API void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
 /* Opt in to the per-flush cell-age stamp list delivered via
-   on_cell_age_stamps. Off by default: with it off the core builds no list
-   and never fires the callback, so a frontend without a custom shader that
-   reads the edit inputs pays nothing. Frontends toggle this when such a
-   shader is loaded or unloaded. */
+   on_cell_age_stamps and the per-row codepoints delivered via
+   on_cell_text_row. Off by default: with it off the core builds no list
+   and never fires either callback, so a frontend without a custom shader
+   that reads the edit inputs pays nothing. Frontends toggle this when such
+   a shader is loaded or unloaded. */
 ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int enabled);
 
 /* Process due message timeouts (including the throttled message float scroll)
