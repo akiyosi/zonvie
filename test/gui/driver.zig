@@ -1,5 +1,5 @@
 // driver.zig — GUI test driver: runs the REAL zonvie app against a shared
-// nvim server and observes OS-level effects. macOS and Windows hosts.
+// nvim server and observes OS-level effects. macOS, Windows and Linux hosts.
 //
 // Topology (three processes):
 //
@@ -13,6 +13,7 @@
 // are observed read-only via the platform window module:
 //   macOS:   CGWindowList   (test/gui/macos_window.zig)
 //   Windows: EnumWindows    (test/gui/windows_window.zig)
+//   Linux:   Hyprland IPC   (test/gui/linux_window.zig)
 //
 // Platform notes:
 //   - listen address: absolute unix socket path on macOS (the core's
@@ -35,11 +36,13 @@ const builtin = @import("builtin");
 
 pub const platform = switch (builtin.os.tag) {
     .windows => @import("windows_window.zig"),
+    .linux => @import("linux_window.zig"),
     else => @import("macos_window.zig"),
 };
 
 pub const capture = switch (builtin.os.tag) {
     .windows => @import("windows_capture.zig"),
+    .linux => @import("linux_capture.zig"),
     else => @import("macos_capture.zig"),
 };
 
@@ -47,6 +50,7 @@ pub const default_app_rel_path = switch (builtin.os.tag) {
     // build.zig installs the Windows exe directly into windows/zig-out, with
     // no bin/ subdirectory.
     .windows => "windows/zig-out/zonvie.exe",
+    .linux => "linux/zig-out/zonvie",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
 };
 
@@ -239,6 +243,13 @@ pub const Gui = struct {
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
             try g.app_env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", home_abs);
+            if (builtin.os.tag == .linux) {
+                // Persisted window state (linux/window_size.zig) goes to
+                // $XDG_STATE_HOME before $HOME: a session that sets it would
+                // hand every scenario the size the last one closed with.
+                var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+                try g.app_env.put("XDG_STATE_HOME", try std.fmt.bufPrint(&state_buf, "{s}/.local/state", .{home_abs}));
+            }
             if (builtin.os.tag == .macos) {
                 var name_buf: [160]u8 = undefined;
                 // Per run too: the key outlives the home dir the scenario

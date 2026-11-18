@@ -4104,6 +4104,24 @@ pub const FlushCtx = struct {
             return;
         }
 
+        // Kept for the flush: only the last value a frontend would draw with
+        // is worth loading. At attach Neovim sends its default guifont and
+        // then the user's, with no flush between; applying each loaded a font
+        // and re-laid the grid out for a value no frame ever showed.
+        ctx.core.pending_guifont.clearRetainingCapacity();
+        try ctx.core.pending_guifont.appendSlice(ctx.core.alloc, font);
+        ctx.core.pending_guifont_set = true;
+    }
+
+    /// Applies the guifont the batches since the last flush left, before the
+    /// flush generates vertices. From the redraw's own flush only, not a
+    /// retried one: a frontend takes on_guifont on the redraw thread. Caller
+    /// holds grid_mu as the redraw owner.
+    pub fn applyPendingGuifont(ctx: *FlushCtx) void {
+        if (!ctx.core.pending_guifont_set) return;
+        ctx.core.pending_guifont_set = false;
+        const font = ctx.core.pending_guifont.items;
+
         // Invalidate caches BEFORE emitting the callback: a frontend may answer
         // it with a layout update that generates vertices, which must use
         // fresh cache lookups.
@@ -5811,8 +5829,10 @@ pub fn sendCmdlineHide(self: *Core) void {
     }
 
     // Neovim does NOT send msg_clear after confirm dialog is answered via cmdline.
-    // Dismiss confirm when cmdline hides (noice.nvim pattern: confirm lifecycle = cmdline lifecycle).
-    if (self.grid.message_state.confirm_msg.active) {
+    // Dismiss confirm when cmdline hides (noice.nvim pattern: confirm lifecycle = cmdline lifecycle),
+    // but only one that was showing when the hide arrived: `:call confirm(...)<CR>`
+    // sends its own cmdline_hide and then the confirm in one batch.
+    if (self.grid.message_state.confirm_msg.active and self.grid.message_state.confirm_msg.hide_seen) {
         self.log.write("[cmdline] hide: dismissing confirm (cmdline lifecycle)\n", .{});
         self.grid.message_state.confirm_msg.clear();
         self.grid.message_state.confirm_dirty = true;
@@ -8400,6 +8420,24 @@ test "cmdline hide does not restore a cursor outside a grid that shrank meanwhil
     try core.grid.resize(2, 5);
     sendCmdlineHide(&core);
     try std.testing.expect(!core.grid.cursor_valid);
+}
+
+test "a cmdline hide dismisses the confirm it answered, not one shown after it" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+    const confirm = [_]grid_mod.MsgChunk{.{ .hl_id = 0, .text = "Save changes?" }};
+
+    // `:call confirm(...)<CR>`: the typed cmdline hides, then the confirm.
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "call" }}, 4, ':', "", 0, 1, 0);
+    core.grid.setCmdlineHide(1);
+    try core.grid.setMsgShow("confirm", &confirm, false, false, false, 1);
+    sendCmdlineHide(&core);
+    try std.testing.expect(core.grid.message_state.confirm_msg.active);
+
+    // Answering it in the prompt's cmdline hides that cmdline.
+    core.grid.setCmdlineHide(1);
+    sendCmdlineHide(&core);
+    try std.testing.expect(!core.grid.message_state.confirm_msg.active);
 }
 
 test "cmdline block output: block lines and the current line" {

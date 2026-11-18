@@ -18,7 +18,11 @@ const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_float_survives_closed_float_anchor.log";
-const trace_side = if (builtin.os.tag == .windows) "side=windows" else "side=macos";
+const trace_side = switch (builtin.os.tag) {
+    .windows => "side=windows",
+    .linux => "side=linux",
+    else => "side=macos",
+};
 
 /// The last layer count `side` published for surface 1 since `since_ms`.
 fn lastMainLayerCount(alloc: std.mem.Allocator, since_ms: f64) !?f64 {

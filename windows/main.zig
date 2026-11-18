@@ -505,6 +505,8 @@ pub fn main() u8 {
     var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var nvim_file_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
+    // After zonvie's `--`: nvim's own command line, flags and all.
+    var nvim_scan: frontend_rules.NvimArgScan = .{};
     const shell_cwd: ?[]const u8 = getCwdUtf8(alloc);
     defer if (shell_cwd) |cwd| alloc.free(cwd);
 
@@ -519,7 +521,17 @@ pub fn main() u8 {
         }
 
         if (pass_all_to_nvim) {
-            appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, null, arg, true);
+            // appendNvimArg asks the same question isFile answers, so it gets
+            // the scan's state from before this token.
+            const prev = nvim_scan.prev;
+            const dash_dash = nvim_scan.after_dash_dash;
+            _ = nvim_scan.isFile(arg);
+            if (!dash_dash and std.mem.eql(u8, arg, "--")) {
+                // nvim's own `--`, passed on as is.
+                nvim_extra_args.append(alloc, arg) catch {};
+            } else {
+                appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, prev, arg, dash_dash);
+            }
             continue;
         }
 

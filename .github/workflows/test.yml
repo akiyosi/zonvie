@@ -42,6 +42,35 @@ jobs:
           path: .zig-cache/
           retention-days: 7
 
+  # The same suite on Linux, against the Linux release of the same Neovim.
+  e2e-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --version
+          echo "$RUNNER_TEMP/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "ZONVIE_TEST_NVIM=$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" >> "$GITHUB_ENV"
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: E2E Tests
+        run: zig build e2e --summary all
+        env:
+          ZONVIE_REQUIRE_NVIM: "1"
+        timeout-minutes: 30
+      - name: Upload E2E Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-linux
+          path: .zig-cache/
+          retention-days: 7
+
   compile:
     runs-on: ubuntu-latest
     steps:
@@ -56,16 +85,25 @@ jobs:
         run: zig build windows -Dtarget=x86_64-windows-gnu
         timeout-minutes: 30
 
-  unit-tests:
-    runs-on: ubuntu-latest
+  # Installs what build.zig's linux step links, as the macOS and Windows jobs
+  # install their platform's prerequisites.
+  unit-tests-linux:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: actions/checkout@v4
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libopengl-dev libegl-dev libglib2.0-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Unit Tests
-        run: zig build test
-        timeout-minutes: 20
+        run: zig build test --summary all
+        timeout-minutes: 30
 
   # Releases ship ReleaseFast, where a failed assert is undefined behaviour
   # rather than a panic. ReleaseSafe keeps the asserts and runs the optimized
@@ -195,6 +233,34 @@ jobs:
             windows/zig-out/zonvie.pdb
           if-no-files-found: ignore
           retention-days: 7
+
+  # The Linux driver observes windows through Hyprland's IPC and drives the
+  # pointer through wlroots' virtual-pointer protocol (test/gui/linux_window.zig,
+  # linux_pointer.zig). A hosted runner has no such session, so every scenario
+  # skips here: this job builds the app and the scenarios, so a change that
+  # breaks either fails here, and runs the driver's own tests (the capture
+  # codec). The scenarios themselves run locally under Hyprland, with
+  # ZONVIE_GUI_REQUIRE to make a missing prerequisite fail.
+  gui-tests-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libopengl-dev libegl-dev libglib2.0-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build Linux app
+        run: zig build linux --summary all
+        timeout-minutes: 30
+      - name: GUI Tests (scenarios skip without Hyprland)
+        run: zig build gui-test --summary all
+        timeout-minutes: 20
 
   # The same driver on macOS: CGWindowList, CGEvent input, window capture.
   # As on Windows, golden-only visual checks SKIP on CI (no committed

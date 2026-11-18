@@ -1,0 +1,7 @@
+# config_native_sidebar with the sidebar on the right, for the
+# native_titlebar_fallback scenario: the revealed buttons go top left.
+[tabline]
+external = true
+style = "sidebar"
+sidebar_width = 200
+sidebar_position = "right"

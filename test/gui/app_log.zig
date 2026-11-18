@@ -171,6 +171,26 @@ pub fn field(line: []const u8, name: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, rest[0..end]) catch null;
 }
 
+/// Where the editor view sits in the main window, logical px: the latest
+/// `[grid_insets]` line (Linux) divided by its scale. Chrome (a titlebar,
+/// tabs, a sidebar, an editor card) is whatever lies outside the view.
+pub const ViewInsets = struct { left: f64, top: f64, right: f64, bottom: f64, scale: f64 };
+
+pub fn viewInsets(alloc: std.mem.Allocator, path: []const u8) !ViewInsets {
+    const lines = try linesAfter(alloc, path, "[grid_insets]", 0);
+    defer alloc.free(lines);
+    var it = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, lines, "\n"), '\n');
+    const line = it.next() orelse return error.NoGridInsets;
+    const scale = field(line, "scale") orelse return error.NoGridInsets;
+    return .{
+        .left = (field(line, "left") orelse return error.NoGridInsets) / scale,
+        .top = (field(line, "top") orelse return error.NoGridInsets) / scale,
+        .right = (field(line, "right") orelse return error.NoGridInsets) / scale,
+        .bottom = (field(line, "bottom") orelse return error.NoGridInsets) / scale,
+        .scale = scale,
+    };
+}
+
 /// Every line containing `marker` stamped at or after `since_ms`, joined
 /// with newlines. Caller owns the slice. Used by scenarios that check an
 /// invariant across a whole gesture rather than a single sample.

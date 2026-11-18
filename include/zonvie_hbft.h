@@ -25,6 +25,12 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
 zonvie_ft_hb_font* zonvie_ft_hb_font_create_borrowed(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index);
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f);
 
+// The fixed strike (px) a bitmap-only face such as a CBDT colour emoji font
+// was opened at, when it has no size near the requested pixel_size; 0 for a
+// scalable face. Its bitmaps, advances and positions are then in strike px,
+// and the caller scales them to pixel_size.
+uint32_t zonvie_ft_hb_font_strike_px(const zonvie_ft_hb_font* f);
+
 // Set OpenType features for HarfBuzz shaping.
 // Stored on the font handle and applied to all subsequent hb_shape() calls.
 // count must be <= ZONVIE_MAX_FONT_FEATURES; excess features are silently ignored.
@@ -50,6 +56,21 @@ typedef struct zonvie_font_axis {
 
 // zonvie_ft_hb_font_set_variations with fractional values.
 void zonvie_ft_hb_font_set_variation_axes(zonvie_ft_hb_font* f, const zonvie_font_axis* axes, size_t count);
+
+// The face's current design coordinates, one per fvar axis (at most `cap`):
+// a named instance opened through face_index's high 16 bits reports that
+// instance's coordinates. Returns the count written; 0 for a static face.
+size_t zonvie_ft_hb_font_get_variation_axes(zonvie_ft_hb_font* f, zonvie_font_axis* out, size_t cap);
+
+// Synthesize a style the face lacks: `bold` emboldens every outline,
+// `oblique` slants it, as a platform rasterizer simulates a missing style.
+// Glyph advances are left as the face reports them, so the cell grid holds.
+void zonvie_ft_hb_font_set_synthetic(zonvie_ft_hb_font* f, int bold, int oblique);
+
+// Render outline glyphs as horizontal LCD coverage, three samples per pixel
+// (zonvie_ft_render_glyph_color then reports bytes_per_pixel 3 and the pixel
+// width), as Windows rasterizes ClearType 3x1. Off by default.
+void zonvie_ft_hb_font_set_lcd(zonvie_ft_hb_font* f, int on);
 
 // Shape UTF-32 scalars.
 // Outputs are HarfBuzz position values in 26.6 fixed-point pixels (1px = 64).

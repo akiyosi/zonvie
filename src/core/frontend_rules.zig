@@ -714,6 +714,189 @@ test "panelBg moves brightness toward the middle and keeps hue and saturation" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), black[1], tol);
 }
 
+// ---------------------------------------------------------------------------
+// Editor card (Config.TitlebarLayout.island)
+
+/// Ground between the editor card and the window edges or the sidebar.
+pub const island_margin_pt: i32 = 6;
+/// Background between the card's edge and the grid; at least (1 - 1/sqrt 2)
+/// of the corner radius, so no cell reaches into a corner.
+pub const island_padding_pt: i32 = 6;
+pub const island_radius_pt: i32 = 10;
+/// How far the card's border moves from the bg toward white (dark bg) or
+/// black (light bg). The renderers that draw the card in a shader hold the
+/// same value and rule: ISLAND_BORDER_MIX in windows/shaders/main.hlsl and
+/// macos/Sources/Rendering/Shaders.metal.
+pub const island_border_mix: f32 = 0.12;
+
+fn srgbToLinear(v: f32) f32 {
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(v_in: f32) f32 {
+    const v = std.math.clamp(v_in, 0.0, 1.0);
+    return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
+
+pub const LightnessShift = enum { sidebar_darker, sidebar_lighter, island_ground };
+
+/// `rgb` (sRGB 0-1) with its OKLab L moved, hue and chroma kept. The island
+/// ground goes darker, or lighter when darker would clip to black.
+pub fn oklabLightnessShifted(rgb: [3]f32, shift: LightnessShift) [3]f32 {
+    const lr = srgbToLinear(rgb[0]);
+    const lg = srgbToLinear(rgb[1]);
+    const lb = srgbToLinear(rgb[2]);
+    const l_ = std.math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+    const m_ = std.math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+    const s_ = std.math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+    var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    const A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+    const delta: f32 = switch (shift) {
+        .sidebar_darker => -0.07,
+        .sidebar_lighter => 0.04,
+        .island_ground => if (L >= 0.2) -0.06 else 0.06,
+    };
+    L = std.math.clamp(L + delta, 0.0, 1.0);
+    const l2 = std.math.pow(f32, L + 0.3963377774 * A + 0.2158037573 * B, 3);
+    const m2 = std.math.pow(f32, L - 0.1055613458 * A - 0.0638541728 * B, 3);
+    const s2 = std.math.pow(f32, L - 0.0894841775 * A - 1.2914855480 * B, 3);
+    return .{
+        linearToSrgb(4.0767416621 * l2 - 3.3077115913 * m2 + 0.2309699292 * s2),
+        linearToSrgb(-1.2684380046 * l2 + 2.6097574011 * m2 - 0.3413193965 * s2),
+        linearToSrgb(-0.0041960863 * l2 - 0.7034186147 * m2 + 1.7076147010 * s2),
+    };
+}
+
+/// The editor card's border from the default bg (sRGB 0-1).
+pub fn islandBorder(bg: [3]f32) [3]f32 {
+    const toward: f32 = if (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5) 1.0 else 0.0;
+    return .{
+        bg[0] + (toward - bg[0]) * island_border_mix,
+        bg[1] + (toward - bg[1]) * island_border_mix,
+        bg[2] + (toward - bg[2]) * island_border_mix,
+    };
+}
+
+test "island ground: a step darker, lighter for a near-black bg, grey stays grey" {
+    const mid = oklabLightnessShifted(.{ 0.5, 0.5, 0.5 }, .island_ground);
+    try std.testing.expect(mid[0] < 0.5);
+    try std.testing.expectApproxEqAbs(mid[0], mid[1], 1e-3);
+    try std.testing.expectApproxEqAbs(mid[1], mid[2], 1e-3);
+    const black = oklabLightnessShifted(.{ 0, 0, 0 }, .island_ground);
+    try std.testing.expect(black[0] > 0);
+}
+
+test "island border: toward white on a dark bg, black on a light one" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.12), islandBorder(.{ 0, 0, 0 })[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.88), islandBorder(.{ 1, 1, 1 })[0], 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// Ext UI panel chrome and tabline geometry, unscaled
+
+/// Padding around the cmdline panel's content.
+pub const cmdline_padding_pt: u32 = 12;
+/// The cmdline icon's box. Its margins are measured from the content
+/// padding, so the icon sits at x = 12 and the text at x = 44.
+pub const cmdline_icon_size_pt: u32 = 18;
+pub const cmdline_icon_margin_left_pt: u32 = 0;
+pub const cmdline_icon_margin_right_pt: u32 = 14;
+/// The cmdline panel's margin from the screen edges.
+pub const cmdline_screen_margin_pt: u32 = 40;
+/// Padding around a message panel's content.
+pub const msg_padding_pt: u32 = 8;
+/// The copy-content button: its box (also the hit area), the gap from the
+/// grid content and the gap from the trailing edge.
+pub const copy_button_size_pt: u32 = 18;
+pub const copy_button_margin_left_pt: u32 = 4;
+pub const copy_button_margin_right_pt: u32 = 8;
+
+/// The bounds a titlebar tab's width is held to.
+pub const tab_min_width_pt: i32 = 100;
+pub const tab_max_width_pt: i32 = 200;
+
+/// One titlebar tab's width: the strip's `available_px` shared out among
+/// `tab_count` tabs, held to [min_px, max_px] (the tab_*_width_pt bounds in
+/// the caller's pixels). 0 with no tabs.
+pub fn titlebarTabWidth(available_px: i32, tab_count: i32, min_px: i32, max_px: i32) i32 {
+    if (tab_count <= 0) return 0;
+    return @min(max_px, @max(min_px, @divTrunc(available_px, tab_count)));
+}
+
+test "a titlebar tab shares the strip within its bounds" {
+    try std.testing.expectEqual(@as(i32, 0), titlebarTabWidth(900, 0, 100, 200));
+    try std.testing.expectEqual(@as(i32, 200), titlebarTabWidth(900, 2, 100, 200));
+    try std.testing.expectEqual(@as(i32, 150), titlebarTabWidth(900, 6, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(900, 20, 100, 200));
+    try std.testing.expectEqual(@as(i32, 100), titlebarTabWidth(-40, 3, 100, 200));
+}
+
+/// The sidebar tabline's colours (sRGB 0..1; a channel may leave the range
+/// and the caller clamps).
+pub const SidebarPalette = struct {
+    is_dark: bool,
+    bg: [3]f32,
+    selected: [3]f32,
+    hover: [3]f32,
+    text: [3]f32,
+    text_selected: [3]f32,
+    separator: [3]f32,
+    close: [3]f32,
+    close_hi: [3]f32,
+    indicator: [3]f32,
+};
+
+/// The sidebar's colours from the colorscheme's fg and bg: the strip a
+/// little darker than a dark bg or lighter than a light one, the selected
+/// and hovered rows stepped the other way, the text dimmed fg, and the
+/// separator 10% white (dark) or black (light) over the strip. `strip_bg`
+/// replaces the derived strip colour where a frontend tints it itself.
+pub fn sidebarPalette(fg: [3]f32, bg: [3]f32, strip_bg: ?[3]f32) SidebarPalette {
+    const is_dark = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 0.5;
+    const dim: f32 = if (is_dark) 0.6 else 0.5;
+    var p: SidebarPalette = undefined;
+    p.is_dark = is_dark;
+    p.text_selected = fg;
+    for (0..3) |i| {
+        const b = bg[i];
+        const strip = if (strip_bg) |s| s[i] else if (is_dark) b * 0.85 else @min(@as(f32, 1.0), b + 0.03);
+        p.bg[i] = strip;
+        p.selected[i] = if (is_dark) b + 0.06 else @max(@as(f32, 0.0), b - 0.06);
+        p.hover[i] = if (is_dark) b + 0.03 else @max(@as(f32, 0.0), b - 0.03);
+        p.text[i] = fg[i] * dim;
+        p.separator[i] = if (is_dark) strip * 0.9 + 0.1 else strip * 0.9;
+        p.close[i] = fg[i] * 0.5;
+        p.close_hi[i] = fg[i] * 0.8;
+        p.indicator[i] = fg[i] * 0.7;
+    }
+    return p;
+}
+
+test "the sidebar strip is darker on a dark theme and lighter on a light one" {
+    const tol = 1e-6;
+    const dark = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, null);
+    try std.testing.expect(dark.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.17), dark.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), dark.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.23), dark.hover[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), dark.text[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.253), dark.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), dark.indicator[0], tol);
+
+    const light = sidebarPalette(.{ 0, 0, 0 }, .{ 0.99, 0.9, 0.9 }, null);
+    try std.testing.expect(!light.is_dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), light.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.84), light.selected[1], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), light.separator[0], tol);
+
+    // A frontend's own strip colour also carries the separator.
+    const tinted = sidebarPalette(.{ 1, 1, 1 }, .{ 0.2, 0.2, 0.2 }, .{ 0.5, 0.5, 0.5 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), tinted.bg[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), tinted.separator[0], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.26), tinted.selected[0], tol);
+}
+
 /// How one argument goes into a spawn command so the core's tokenizer
 /// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
 /// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote
@@ -769,6 +952,31 @@ test "nvimArgIsFile keeps flags, commands and option values out of the file list
     try std.testing.expect(nvimArgIsFile(null, "-u", true));
     try std.testing.expect(nvimArgIsFile(null, "+10", true));
     try std.testing.expect(!nvimArgIsFile(null, "-", true));
+}
+
+/// Walks nvim's own command line — what follows zonvie's `--` — token by
+/// token, saying which are files. Its `after_dash_dash` is nvim's `--`, not
+/// zonvie's: treating zonvie's as nvim's made `zonvie -- -u init.lua` hand
+/// nvim `<cwd>/-u <cwd>/init.lua`. nvim's `--` itself is no file.
+pub const NvimArgScan = struct {
+    prev: ?[]const u8 = null,
+    after_dash_dash: bool = false,
+
+    pub fn isFile(self: *NvimArgScan, arg: []const u8) bool {
+        defer self.prev = arg;
+        if (!self.after_dash_dash and std.mem.eql(u8, arg, "--")) {
+            self.after_dash_dash = true;
+            return false;
+        }
+        return nvimArgIsFile(self.prev, arg, self.after_dash_dash);
+    }
+};
+
+test "nvim's command line keeps its flags until its own --" {
+    var scan: NvimArgScan = .{};
+    const args = [_][]const u8{ "-u", "init.lua", "+10", "a.txt", "--", "-b.txt", "-" };
+    const want = [_]bool{ false, false, false, true, false, true, false };
+    for (args, want) |a, w| try std.testing.expectEqual(w, scan.isFile(a));
 }
 
 /// A devcontainer workspace or config path as the devcontainer commands can
@@ -900,6 +1108,21 @@ pub fn dropInsertsPath(mode: []const u8, has_external_cmdline: bool, force: bool
     return std.mem.startsWith(u8, mode, "cmdline");
 }
 
+/// What a file drag shows over a surface: the "link" badge when the drop
+/// will insert its paths (`dropInsertsPath`), "copy" when it will open them
+/// (windows/ui/drop_target.zig effectFor). An action the source does not
+/// offer must not be answered, so the other one stands in rather than the
+/// drop being refused.
+pub const DropFeedback = enum { none, copy, link };
+
+pub fn dropFeedback(inserts_path: bool, offers_copy: bool, offers_link: bool) DropFeedback {
+    if (inserts_path and offers_link) return .link;
+    if (!inserts_path and offers_copy) return .copy;
+    if (offers_copy) return .copy;
+    if (offers_link) return .link;
+    return .none;
+}
+
 /// `path` as Neovim's fnameescape() writes it for a `:e`-style argument: its
 /// PATH_ESC_CHARS backslashed, plus a leading `>`, `+` or lone `-`, which are
 /// special at the start of :edit/:write/:cd. With `backslash_is_separator`
@@ -933,6 +1156,14 @@ test "a drop inserts the path only onto a command line" {
     try std.testing.expect(dropInsertsPath("normal", true, true));
     try std.testing.expect(!dropInsertsPath("normal", false, false));
     try std.testing.expect(!dropInsertsPath("", false, false));
+}
+
+test "a drag shows link over a command line and copy elsewhere, within what the source offers" {
+    try std.testing.expectEqual(DropFeedback.link, dropFeedback(true, true, true));
+    try std.testing.expectEqual(DropFeedback.copy, dropFeedback(false, true, true));
+    try std.testing.expectEqual(DropFeedback.copy, dropFeedback(true, true, false));
+    try std.testing.expectEqual(DropFeedback.link, dropFeedback(false, false, true));
+    try std.testing.expectEqual(DropFeedback.none, dropFeedback(true, false, false));
 }
 
 test "a cmdline path is escaped as fnameescape escapes it" {
@@ -1641,4 +1872,222 @@ test "snapping a stable desired size is idempotent across an intermediate cell c
     const direct = snapTerminalPx(desired, 9);
     const via_other_cell = snapTerminalPx(snapTerminalPx(desired, 11), 9);
     try std.testing.expect(via_other_cell <= direct);
+}
+
+/// `[log] perf_only` / `scroll_only` for one frontend line, by its leading
+/// tag: the tiers src/core/log.zig applies to the core's own lines.
+/// `scroll_only` passes [perf] and [scroll_debug]; `perf_only` only [perf].
+pub fn logLineEmitted(line: []const u8, perf_only: bool, scroll_only: bool) bool {
+    const is_perf = std.mem.startsWith(u8, line, "[perf]") or std.mem.startsWith(u8, line, "[perf_");
+    const is_scroll = std.mem.startsWith(u8, line, "[scroll_debug]");
+    if (scroll_only) return is_perf or is_scroll;
+    if (perf_only) return is_perf;
+    return true;
+}
+
+test "log tiers pass only their tags" {
+    try std.testing.expect(logLineEmitted("[perf] flush", true, false));
+    try std.testing.expect(logLineEmitted("[perf_input] seq=1", true, false));
+    try std.testing.expect(!logLineEmitted("[performance] x", true, false));
+    try std.testing.expect(!logLineEmitted("[scroll_debug] r", true, false));
+    try std.testing.expect(logLineEmitted("[scroll_debug] r", false, true));
+    try std.testing.expect(logLineEmitted("[perf] flush", true, true));
+    try std.testing.expect(!logLineEmitted("[linux] x", false, true));
+    try std.testing.expect(logLineEmitted("[linux] x", false, false));
+}
+
+/// Whether the window buttons are drawn: always without hover reveal; with
+/// it while revealed, or while one is held pressed so its release lands on
+/// what the user sees.
+pub fn captionButtonsShown(reveal_on: bool, revealed: bool, pressed: bool) bool {
+    return !reveal_on or revealed or pressed;
+}
+
+/// Client point (x, y) in the top `band_px` of a `client_w` wide client.
+pub fn inCaptionBand(band_px: c_int, client_w: c_int, x: c_int, y: c_int) bool {
+    return x >= 0 and x < client_w and y >= 0 and y < band_px;
+}
+
+/// The bar that drags a captionless window (`titlebar_style = "hidden"`),
+/// revealed after the pointer rests in the band off the buttons. One state
+/// machine for every window of every frontend; the transitions are pure and
+/// the caller runs the timer.
+pub const DragBar = struct {
+    revealed: bool = false,
+    timer_armed: bool = false,
+    /// When the pending rest began; meaningful only while `timer_armed`.
+    armed_at_ms: u64 = 0,
+
+    /// How long the pointer rests in the band before the bar shows.
+    pub const reveal_ms: u32 = 2000;
+
+    pub const Timer = enum { keep, set, kill };
+    pub const Step = struct { next: DragBar, timer: Timer = .keep };
+
+    /// The pointer moved or left at `now_ms`. `in_band`: it is inside the
+    /// window and in the top band; `on_button`: over a caption button;
+    /// `allowed`: the window may show the bar now.
+    pub fn onPointer(self: DragBar, in_band: bool, on_button: bool, allowed: bool, now_ms: u64) Step {
+        if (on_button) return .{ .next = self };
+        if (in_band and allowed) {
+            if (self.revealed or self.timer_armed) return .{ .next = self };
+            return .{ .next = .{ .timer_armed = true, .armed_at_ms = now_ms }, .timer = .set };
+        }
+        return .{ .next = .{}, .timer = if (self.timer_armed) .kill else .keep };
+    }
+
+    /// The reveal timer fired at `now_ms`. A timer API may deliver a fire
+    /// already queued when it was killed or re-armed (Win32's WM_TIMER), so a fire is
+    /// stale unless armed and a rest has nearly elapsed: a stale fire keeps
+    /// the live timer. Half the delay separates the two, since a stale fire
+    /// lands right after a re-arm while timer and tick resolution jitter by
+    /// one clock tick.
+    pub fn onTimer(self: DragBar, in_band: bool, allowed: bool, now_ms: u64) Step {
+        if (!self.timer_armed) return .{ .next = self };
+        if (now_ms -| self.armed_at_ms < reveal_ms / 2) return .{ .next = self };
+        return .{ .next = .{ .revealed = in_band and allowed }, .timer = .kill };
+    }
+};
+
+test "buttonsShown: hidden only with reveal on, not revealed and nothing pressed" {
+    try std.testing.expect(captionButtonsShown(false, false, false));
+    try std.testing.expect(!captionButtonsShown(true, false, false));
+    try std.testing.expect(captionButtonsShown(true, true, false));
+    try std.testing.expect(captionButtonsShown(true, false, true));
+}
+
+test "DragBar: arms in the band, reveals after a full rest, conceals outside" {
+    const t0: u64 = 10_000;
+    const due = t0 + DragBar.reveal_ms;
+    const idle: DragBar = .{};
+    // Off the band or not allowed: nothing to arm.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(false, false, true, t0));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(true, false, false, t0));
+    // Over a button: the bar keeps whatever it had.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onPointer(true, true, true, t0));
+    // In the band: arm once, stamped with the rest's start.
+    const armed = idle.onPointer(true, false, true, t0);
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .timer_armed = true, .armed_at_ms = t0 }, .timer = .set }, armed);
+    try std.testing.expectEqual(DragBar.Step{ .next = armed.next }, armed.next.onPointer(true, false, true, t0 + 500));
+    // Resting on a button edge keeps the timer running.
+    try std.testing.expectEqual(DragBar.Step{ .next = armed.next }, armed.next.onPointer(true, true, true, t0 + 500));
+    // Leaving while armed kills the timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onPointer(false, false, true, t0 + 500));
+    // An editor drag starting while armed kills the pending reveal.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onPointer(true, false, false, t0 + 500));
+    // A full rest reveals only while the pointer is still in the band and
+    // allowed; every due fire kills the timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, armed.next.onTimer(true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onTimer(false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle, .timer = .kill }, armed.next.onTimer(true, false, due));
+    // Tick jitter: a fire one clock tick early still counts.
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, armed.next.onTimer(true, true, due - 16));
+    // Stale fires: none armed, or queued before a re-arm, keep the live timer.
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, idle.onTimer(true, true, due));
+    const rearmed = idle.onPointer(true, false, true, due).next;
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, true, due + 1));
+    // A stale fire keeps the timer even out of the band: concealing is the
+    // pointer's job, not a stale message's.
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(false, true, due + 1));
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, false, due + 1));
+    // The rest threshold is half the delay: one ms short is stale, at it is due.
+    const half = DragBar.reveal_ms / 2;
+    try std.testing.expectEqual(DragBar.Step{ .next = rearmed }, rearmed.onTimer(true, true, due + half - 1));
+    try std.testing.expectEqual(DragBar.Step{ .next = .{ .revealed = true }, .timer = .kill }, rearmed.onTimer(true, true, due + half));
+    // Revealed: stays in the band and over buttons, conceals outside or on a drag.
+    const shown: DragBar = .{ .revealed = true };
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onPointer(true, false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onPointer(true, true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, shown.onPointer(false, false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = idle }, shown.onPointer(true, false, false, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(true, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(false, true, due));
+    try std.testing.expectEqual(DragBar.Step{ .next = shown }, shown.onTimer(true, false, due));
+}
+
+test "inBand: the top band_px rows across the client width" {
+    try std.testing.expect(inCaptionBand(32, 400, 0, 0));
+    try std.testing.expect(inCaptionBand(32, 400, 399, 31));
+    try std.testing.expect(!inCaptionBand(32, 400, 399, 32));
+    try std.testing.expect(!inCaptionBand(32, 400, 400, 0));
+    try std.testing.expect(!inCaptionBand(32, 400, -1, 0));
+    try std.testing.expect(!inCaptionBand(32, 400, 0, -1));
+}
+
+/// Narrowest a sidebar width drag goes, logical px.
+pub const sidebar_min_width_pt: c_int = 120;
+
+/// The sidebar width a width drag asks for, both in logical px: at most half
+/// the client, but never below sidebar_min_width_pt even in a narrow client.
+pub fn clampSidebarWidth(want_px: c_int, client_w_px: c_int) u32 {
+    const max_px = @max(sidebar_min_width_pt, @divTrunc(client_w_px, 2));
+    return @intCast(std.math.clamp(want_px, sidebar_min_width_pt, max_px));
+}
+
+test "clampSidebarWidth: min 120, max half the client, min wins in a narrow client" {
+    try std.testing.expectEqual(@as(u32, 200), clampSidebarWidth(200, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(50, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(-30, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(900, 1000));
+    try std.testing.expectEqual(@as(u32, 500), clampSidebarWidth(500, 1000));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(300, 200));
+    try std.testing.expectEqual(@as(u32, 120), clampSidebarWidth(10, 200));
+}
+
+pub const MainWindowSnap = struct {
+    outer_w: i32,
+    outer_h: i32,
+    snapped_content_w: u32,
+    snapped_content_h: u32,
+};
+
+/// The main window's new outer size for WM_APP_SNAP_MAIN_WINDOW: snap the
+/// *desired* content size (0 falls back to the live `content_w`/`content_h`,
+/// i.e. before the first WM_SIZE) to a cell multiple, then apply the chrome
+/// delta already present between `outer_w`/`outer_h` and the live content.
+/// Snapping the desired size rather than the live content is what lets the
+/// window grow back after it shrank on a font-size change (windows/window.zig,
+/// linux/main.zig onSnap). Returns null when there is nothing to do: a
+/// degenerate cell size, a content area smaller than one cell, or the window
+/// already holding the snapped size.
+pub fn snapMainWindowOuterSize(
+    outer_w: i32,
+    outer_h: i32,
+    content_w: u32,
+    content_h: u32,
+    desired_content_w: u32,
+    desired_content_h: u32,
+    cell_w: u32,
+    cell_h: u32,
+) ?MainWindowSnap {
+    if (cell_w == 0 or cell_h == 0) return null;
+    if (content_w < cell_w or content_h < cell_h) return null;
+
+    const base_w: u32 = if (desired_content_w != 0) desired_content_w else content_w;
+    const base_h: u32 = if (desired_content_h != 0) desired_content_h else content_h;
+
+    const snapped_w = snapTerminalPx(base_w, cell_w);
+    const snapped_h = snapTerminalPx(base_h, cell_h);
+    if (snapped_w == 0 or snapped_h == 0) return null;
+    if (snapped_w == content_w and snapped_h == content_h) return null;
+
+    const delta_w: i32 = @as(i32, @intCast(content_w)) - @as(i32, @intCast(snapped_w));
+    const delta_h: i32 = @as(i32, @intCast(content_h)) - @as(i32, @intCast(snapped_h));
+    return .{
+        .outer_w = outer_w - delta_w,
+        .outer_h = outer_h - delta_h,
+        .snapped_content_w = snapped_w,
+        .snapped_content_h = snapped_h,
+    };
+}
+
+test "the window snaps its desired content, and holds still once snapped" {
+    // 1000 desired, 11 px cells: 990, so the outer shrinks by 10.
+    const s = snapMainWindowOuterSize(1020, 1040, 1000, 1000, 0, 0, 11, 11).?;
+    try std.testing.expectEqual(@as(i32, 1010), s.outer_w);
+    try std.testing.expectEqual(@as(u32, 990), s.snapped_content_h);
+    // Back to 9 px cells: the desired 1000 regrows to 999.
+    const g = snapMainWindowOuterSize(1010, 1030, 990, 990, 1000, 1000, 9, 9).?;
+    try std.testing.expectEqual(@as(u32, 999), g.snapped_content_w);
+    try std.testing.expect(snapMainWindowOuterSize(1000, 1000, 990, 990, 990, 990, 11, 11) == null);
 }

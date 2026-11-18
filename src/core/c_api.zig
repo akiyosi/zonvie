@@ -1,5 +1,5 @@
 const std = @import("std");
-const pointer_target = @import("pointer_target.zig");
+pub const pointer_target = @import("pointer_target.zig");
 const scrollbar_metrics = @import("scrollbar_metrics.zig");
 const popup_placement = @import("popup_placement.zig");
 const build_options = @import("build_options");
@@ -25,9 +25,10 @@ pub const font_slots = @import("font_slots.zig");
 pub const scroll_ease = @import("scroll_ease.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
-const msg_stack = @import("msg_stack.zig");
+pub const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const frontend_rules = @import("frontend_rules.zig");
+pub const tab_label = @import("tab_label.zig");
 pub const cell_age_store = @import("cell_age_store.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
@@ -36,6 +37,7 @@ pub const highlight = @import("highlight.zig");
 pub const log_mod = @import("log.zig");
 
 test {
+    _ = @import("tab_label.zig");
     _ = @import("abi_header_test.zig");
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");
@@ -2483,6 +2485,27 @@ pub export fn zonvie_core_try_get_viewport(
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
 }
 
+/// zonvie_core_try_scrollbar_grid and zonvie_core_get_viewport for a callback
+/// the core runs inside a flush, where grid_mu is held: they read without
+/// locking, so they always answer, and with the state that flush commits.
+pub export fn zonvie_core_scrollbar_grid_locked(p: ?*zonvie_core, surface_id: i64) callconv(.c) i64 {
+    if (p == null) return surface_id;
+    const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
+    return box.core.scrollbarGridForSurfaceLocked(surface_id);
+}
+
+pub export fn zonvie_core_get_viewport_locked(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    out_viewport: ?*ViewportInfo,
+) callconv(.c) i32 {
+    if (p == null or out_viewport == null) return 0;
+    const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
+    return box.core.getViewportInfoLocked(grid_id, out_viewport.?);
+}
+
 /// Whether the view of `grid_id` moved in the batch being flushed (a
 /// win_viewport with a nonzero scroll_delta). Reads grid state without
 /// locking: call only from a callback the core runs inside a flush.
@@ -3808,6 +3831,7 @@ pub export fn zonvie_core_update_layout_px_locked(
 pub const zonvie_shader_target = enum(c_int) {
     msl = 0, // Metal Shading Language
     hlsl = 1, // HLSL (shader model 5.0)
+    glsl = 2, // GLSL 330 core (OpenGL 3.3)
     _,
 };
 
@@ -4095,6 +4119,7 @@ pub export fn zonvie_shader_compile_glsl(
     const t: shader_compiler.Target = switch (target) {
         .msl => .msl,
         .hlsl => .hlsl,
+        .glsl => .glsl,
         _ => return buildShaderError("unknown shader target"),
     };
     const compiled = shader_compiler.compileGlslToTarget(gpa, src, t) catch |err| {

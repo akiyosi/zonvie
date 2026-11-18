@@ -2,11 +2,11 @@
 
 <img src="zonvie.png" width="100" height="100" alt="Zonvie">
 
-Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Windows.
+Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS, Windows and Linux.
 
 ## Features
 
-- **Native Performance**: Zig core with Metal (macOS) and D3D11 (Windows) rendering
+- **Native Performance**: Zig core with Metal (macOS), D3D11 (Windows) and OpenGL (Linux) rendering
 - **Zero-allocation Hot Paths**: Optimized for minimal latency during redraw/flush
 - **Full Neovim UI API Compliance**: Supports ext_cmdline, ext_popupmenu, ext_messages, ext_tabline
 - **Remote Development**:
@@ -32,6 +32,58 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Wi
 
 - **macOS**: AppKit + Swift + Metal
 - **Windows**: Win32 + D3D11/DXGI + DirectWrite
+- **Linux**: Wayland (no toolkit) + OpenGL (EGL) + FreeType/HarfBuzz/Fontconfig
+
+### Linux notes
+
+The Linux frontend is a Wayland client that uses no toolkit: it draws on a
+bare `xdg_toplevel` through EGL. It does not run under an X11 session.
+
+- **External UI**: the external cmdline, popup menu and messages are popup
+  surfaces of the window they belong to (`xdg_popup`), so they may reach
+  past its edge as far as the compositor allows. Message views follow
+  `[messages] msg_pos`.
+- **Input method**: through `text-input-unstable-v3` (Fcitx5, IBus). The
+  composition is drawn at the cursor (`[input] ime_preedit_mode =
+  "overlay"`, the default) or in the buffer (`"inline"`).
+- **Closing the window** sends Neovim `:confirm qa`, so an unsaved buffer is
+  asked about in Neovim's own command line. With `[server] close_to_tray`
+  and a tray host running (StatusNotifierItem), it hides to the tray
+  instead.
+- **Translucency**: `[window] opacity` and `blur` make the window
+  translucent. With `blur`, zonvie asks the compositor to blur what lies
+  behind it through the `ext-background-effect-v1` protocol; the compositor
+  picks the strength, so `blur_radius` has no effect.
+- **Titlebar**: `[window] titlebar_style = "native"` asks the compositor
+  for one (`xdg-decoration-unstable-v1`); where it has none to give (GNOME,
+  tiling compositors) the style acts as `"hidden"`. With `"hidden"`,
+  `"unified"` or titlebar tabs zonvie draws the caption itself: the window
+  buttons, a menu (New Session, About, Quit), and edges that resize where
+  the compositor does not report the window as tiled or maximized
+  (Hyprland reports both for every window, so its own resize binding is
+  the way there).
+- **Tab line** (`--exttabline`): along the header, down a sidebar or in a
+  Tabs menu by `[tabline] style`. A tab is reordered by dragging it and
+  becomes a window of its own when let go away from the strip.
+- **External windows** (`--extwindows`): each in a toplevel of its own.
+  Wayland lets no client read or set where its windows are, so the
+  window-layout commands (`<C-w>H`, `<C-w>x`, ...) leave them where they
+  are, and the cursor cannot be moved to the window in a direction.
+  Untested as an option on Linux: it needs a Neovim that accepts the
+  `ext_windows` UI option, which stock Neovim rejects. Windows opened with
+  `nvim_open_win(..., {external = true})` work.
+- **Dialogs** are zonvie windows that ask through Neovim's own prompts: the
+  connection dialog (`--dialog`), SSH passwords and passphrases, crash and
+  connection-failure reports. `:set guifont=*` lists the installed
+  monospace families through `vim.ui.select`.
+- **Window size**: remembered between runs when the window was free to
+  choose it (not tiled, maximized or fullscreen). Wayland lets no client
+  place its windows.
+- **Devcontainer**: Docker must already be running; zonvie does not start
+  it. The window shows the progress while `devcontainer up` runs.
+- **`--renderer=`** is accepted and ignored, so that a command line written
+  for an earlier version still starts: there is one renderer, which
+  presents the window's own surface.
 
 ## Installation
 
@@ -49,6 +101,17 @@ Build from source (requires Zig 0.16.x):
 
 ```bash
 zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+```
+
+### Linux
+
+Build from source (requires Zig 0.16.x and the development packages of
+Wayland (client, egl, cursor), xkbcommon, EGL/OpenGL (libglvnd), GLib,
+FreeType, HarfBuzz and Fontconfig):
+
+```bash
+zig build linux -Doptimize=ReleaseFast
+linux/zig-out/zonvie --install   # default config, desktop entry and icon
 ```
 
 ## Usage
@@ -76,7 +139,9 @@ zonvie [OPTIONS] [--] [NVIM_ARGS...]
 | `--devcontainer-rebuild` | Rebuild devcontainer before starting |
 | `--connect-nvim=<addr>` | Attach to a running Neovim server. Address: POSIX (macOS/Linux) — TCP `host:port` or Unix socket path; Windows — named pipe path (e.g. `\\.\pipe\nvim.31920.0`). Mutually exclusive with `--ssh` / `--devcontainer` / `--wsl`. |
 | `--remote-ui=<addr>` | Alias of `--connect-nvim`, mirrors `nvim --remote-ui` |
-| `--install` | Create default config file and exit |
+| `--dialog` | Choose the connection (Local / SSH / Devcontainer) in a dialog at startup. `--ssh` / `--devcontainer` pre-select their tab. Mutually exclusive with `--connect-nvim` |
+| `--install` | Create default config file and exit (Linux: also the desktop entry and icon) |
+| `--version` | Show version information and exit |
 | `--` | Pass all remaining arguments to nvim |
 | `--help`, `-h` | Show help message |
 
@@ -122,7 +187,8 @@ one. On macOS it writes to the same single path the app reads. On Windows it
 always writes to `%APPDATA%`, so running it while a config lives at the
 `%USERPROFILE%\.config` fallback will shadow that config. Windows also creates
 the default config automatically on first launch when neither candidate
-exists.
+exists. On Linux it also writes the desktop entry and its icon under
+`$XDG_DATA_HOME` (`~/.local/share`), pointing at the binary it was run from.
 
 ### Example Configuration
 
@@ -145,7 +211,7 @@ linespace = 2
 blur = true
 opacity = 0.85
 blur_radius = 20
-titlebar_style = "native"  # "native", "hidden" or "unified" (macOS, Windows)
+titlebar_style = "native"  # "native", "hidden" or "unified"
 
 [scrollbar]
 enabled = true
@@ -218,7 +284,7 @@ ime_disable_on_modechange = false
 ime_preedit_mode = "overlay"  # "overlay" (floating overlay) or "inline" (inline virt_text)
 
 [server]
-single_instance = false  # route `zonvie <file>` to a running instance (Windows only)
+single_instance = false  # route `zonvie <file>` to a running instance (Windows and Linux)
 open_mode = "tab"        # "tab" (new tab) or "current" (replace current window)
 close_to_tray = false    # close button hides to the notification area instead of quitting (Windows only)
 
@@ -262,8 +328,8 @@ paths = [
 |-----|-------------|
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
-| `blur_radius` | Blur radius (1-100, when blur=true) |
-| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge (default: `"native"`) |
+| `blur_radius` | Blur radius (1-100, when blur=true). Not applicable on Linux, where the compositor blurs |
+| `titlebar_style` | macOS and Windows, main and external windows: `"hidden"` hides the native titlebar and extends the content to the window top; the window buttons (traffic lights) show only while the pointer is over the top band, and resting there reveals a bar that drags the window. With `[tabline] style = "sidebar"` the sidebar reaches the top and a toggle button sits next to the traffic lights; with `style = "titlebar"` the tabs float over the editor surface. On Windows the window buttons and the sidebar toggle sit at the top-right. Window separators fade in across that band. `"unified"` replaces the native titlebar with a self-drawn band showing the window title; the editor starts below it. With `"native"` and `"unified"` the main window draws the editor in a rounded card on a ground colour derived from the colorscheme background, which the sidebar, the band and titlebar tabs (under `"unified"`) share; `"hidden"` keeps the editor edge to edge. Linux follows the same table with a header bar, the hover-revealed buttons and the title band it draws itself (default: `"native"`) |
 
 #### [scrollbar]
 | Key | Description |
@@ -349,7 +415,7 @@ as a single live dialog rather than as messages — so the override exists for
 | `agent_indicator` | Show AI-agent status icon on terminal tabs (true/false, default true) |
 | `agent_notification` | OS notification when an AI agent finishes (true/false, default true) |
 | `cards` | Sidebar draws each tab as a multi-line card from `'guitablabel'` (true/false, default true) |
-| `card_provider` | Fill `'guitablabel'` with Zonvie's default card (title, cwd · branch, status) when you have not set it. Applies to the macOS sidebar with `cards` and to the titlebar tab bar when the external tabline is on (true/false, default false) |
+| `card_provider` | Fill `'guitablabel'` with Zonvie's default card (title, cwd · branch, status) when you have not set it. Applies to the macOS and Linux sidebar with `cards` and to the titlebar tab bar when the external tabline is on (true/false, default false) |
 
 To design your own card, set `'guitablabel'` yourself (this needs a Neovim with multi-line `'guitablabel'` support). Each `\n` starts a new card line, and `%#Group#` colours the text that follows:
 
@@ -391,7 +457,7 @@ The `"titlebar"` style draws the same multi-line label in each tab, up to 4 line
 #### [server]
 | Key | Description |
 |-----|-------------|
-| `single_instance` | **Windows only.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS. |
+| `single_instance` | **Windows and Linux.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS; Linux routes through the session bus (D-Bus). |
 | `open_mode` | How a routed file is shown: `"tab"` opens a new tab (`:tab drop`), `"current"` replaces the current window (`:drop`). Multiple files always open as tabs. Default `"tab"`. |
 | `close_to_tray` | **Windows only.** When true, the close button hides the window to the notification area (system tray) instead of quitting; Neovim keeps running, so the instance stays resident (and reusable via `single_instance`). Left-click the tray icon to restore, right-click for Open/Quit. Default false. |
 

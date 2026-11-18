@@ -120,7 +120,10 @@ pub const Config = struct {
             .linux => "Source Code Pro,DejaVu Sans Mono,Courier New,monospace",
             else => "DejaVu Sans Mono,Courier New,monospace",
         },
-        size: f32 = if (builtin.os.tag == .macos) 14.0 else 18.0,
+        // What a guifont entry without `:hN` gets, on every platform: with
+        // the family above, the font a config-less start loads is the one
+        // Neovim's default guifont names at attach, and nothing reloads.
+        size: f32 = redraw_handler.guifont_default_pt,
         linespace: i32 = 0,
         // Whether the user explicitly set the value in config.toml. When true,
         // the frontend should prefer config over nvim's default `guifont`
@@ -161,8 +164,9 @@ pub const Config = struct {
     pub const TablinePlacement = enum { titlebar, sidebar, other };
 
     /// The window chrome one `TitlebarStyle` yields with one tabline
-    /// placement. Both frontends follow this table; macOS mirrors it as
-    /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift.
+    /// placement. Every frontend follows this table; macOS mirrors it as
+    /// `TitlebarLayout` in macos/Sources/UI/TabBarView.swift, Linux maps it
+    /// to the chrome it draws in linux/chrome.zig `plan`.
     ///
     ///                 native          hidden              unified
     ///   titlebar      tabs, card      tabs, editor bg     tabs on ground, card
@@ -368,8 +372,8 @@ pub const Config = struct {
 
     pub const ServerConfig = struct {
         /// Single-instance mode: route files opened via a second `zonvie <file>`
-        /// invocation to the already-running instance. Windows-only (macOS gets
-        /// single-instance behavior from the OS launch services).
+        /// invocation to the already-running instance. Windows and Linux (macOS
+        /// gets single-instance behavior from the OS launch services).
         single_instance: bool = false,
         /// How a routed file is shown in the running instance: "tab" opens a
         /// new tab (`:tab drop`), "current" replaces the current window
@@ -380,8 +384,8 @@ pub const Config = struct {
         open_mode: []const u8 = "tab",
         /// Close button hides the window to the notification area (system
         /// tray) instead of quitting; Neovim keeps running, so the instance
-        /// stays resident (and reusable via single_instance). Windows-only
-        /// (read directly by the Windows frontend; macOS does not consume it).
+        /// stays resident (and reusable via single_instance). Windows and Linux
+        /// (a StatusNotifierItem there); macOS does not consume it.
         close_to_tray: bool = false,
     };
 
@@ -1106,10 +1110,9 @@ else "") ++
     \\    [window]
     \\        blur            Enable blur effect (default: {})
     \\        opacity         Background opacity (0.0-1.0, default: {d:.1})
-    ++ (if (is_windows) "" else std.fmt.comptimePrint(
+    ++ (if (builtin.os.tag != .macos) "" else std.fmt.comptimePrint(
     "\n        blur_radius     Blur radius (0-100, default: {d})", .{defaults.window.blur_radius})) ++
-    (if (builtin.os.tag == .macos or is_windows)
-    "\n        titlebar_style  \"native\", \"hidden\" or \"unified\" (default: \"native\")" else "") ++
+    "\n        titlebar_style  \"native\", \"hidden\" or \"unified\" (default: \"native\")" ++
     \\
     \\
     \\    [scrollbar]
@@ -1168,7 +1171,7 @@ else
     \\        ime_preedit_mode            "overlay" or "inline"
     \\
     \\    [server]
-    ++ (if (is_windows)
+    ++ (if (is_windows or builtin.os.tag == .linux)
     \\
     \\        single_instance Route `zonvie <file>` to a running instance
     \\        close_to_tray   Close button hides to the notification area
@@ -1218,13 +1221,13 @@ pub const default_config_toml: [:0]const u8 = std.fmt.comptimePrint(
     \\[window]
     \\# opacity = {d:.1}
     \\# blur = {}
-    ++ (if (is_windows) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
-    (if (builtin.os.tag == .macos or is_windows) "\n# titlebar_style = \"native\"   # \"native\", \"hidden\" or \"unified\"" else "") ++
+    ++ (if (builtin.os.tag != .macos) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
+    "\n# titlebar_style = \"native\"   # \"native\", \"hidden\" or \"unified\"" ++
     \\
     \\
     \\[server]
     \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
-    ++ (if (is_windows)
+    ++ (if (is_windows or builtin.os.tag == .linux)
     \\
     \\# single_instance = false   # route `zonvie <file>` to a running instance
     \\# close_to_tray = false     # close button hides to the notification area instead of quitting

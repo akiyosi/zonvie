@@ -1060,52 +1060,8 @@ pub fn rootRowShift(row_dy_px: f32, eased: bool) RootRowShift {
         .{ .viewport_dy_px = row_dy_px, .transform_dy_px = 0 };
 }
 
-pub const MainWindowSnap = struct {
-    outer_w: i32,
-    outer_h: i32,
-    snapped_content_w: u32,
-    snapped_content_h: u32,
-};
-
-/// The main window's new outer size for WM_APP_SNAP_MAIN_WINDOW: snap the
-/// *desired* content size (0 falls back to the live `content_w`/`content_h`,
-/// i.e. before the first WM_SIZE) to a cell multiple, then apply the chrome
-/// delta already present between `outer_w`/`outer_h` and the live content.
-/// Snapping the desired size rather than the live content is what lets the
-/// window grow back after it shrank on a font-size change (see the caller in
-/// windows/window.zig). Returns null when there is nothing to do: a
-/// degenerate cell size, a content area smaller than one cell, or the window
-/// already holding the snapped size.
-pub fn snapMainWindowOuterSize(
-    outer_w: i32,
-    outer_h: i32,
-    content_w: u32,
-    content_h: u32,
-    desired_content_w: u32,
-    desired_content_h: u32,
-    cell_w: u32,
-    cell_h: u32,
-) ?MainWindowSnap {
-    if (cell_w == 0 or cell_h == 0) return null;
-    if (content_w < cell_w or content_h < cell_h) return null;
-
-    const base_w: u32 = if (desired_content_w != 0) desired_content_w else content_w;
-    const base_h: u32 = if (desired_content_h != 0) desired_content_h else content_h;
-
-    const snapped_w = core.zonvie_core_snap_terminal_px(base_w, cell_w);
-    const snapped_h = core.zonvie_core_snap_terminal_px(base_h, cell_h);
-    if (snapped_w == 0 or snapped_h == 0) return null;
-    if (snapped_w == content_w and snapped_h == content_h) return null;
-
-    const delta_w: i32 = @as(i32, @intCast(content_w)) - @as(i32, @intCast(snapped_w));
-    const delta_h: i32 = @as(i32, @intCast(content_h)) - @as(i32, @intCast(snapped_h));
-    return .{
-        .outer_w = outer_w - delta_w,
-        .outer_h = outer_h - delta_h,
-        .snapped_content_w = snapped_w,
-        .snapped_content_h = snapped_h,
-    };
-}
+pub const MainWindowSnap = core.frontend_rules.MainWindowSnap;
+pub const snapMainWindowOuterSize = core.frontend_rules.snapMainWindowOuterSize;
 
 pub const PaintPolicyInputs = struct {
     /// The surface's own "repaint everything" request.
@@ -1493,17 +1449,10 @@ pub fn cursorDamageRects(
 
 /// The grid whose Neovim window a move INTO the main window lands on: the
 /// top-left split the main window still shows. Grid 2 is only that window
-/// until it is externalized. Same rule as macOS `mainWindowTargetWinId`.
+/// until it is externalized. The core's rule, shared with macOS
+/// `mainWindowTargetWinId` and Linux.
 pub fn mainMoveTargetGrid(comptime Grid: type, grids: []const Grid) i64 {
-    var best: ?Grid = null;
-    for (grids) |g| {
-        if (g.grid_id <= 1 or g.zindex > 0 or g.placed_by_surface != 1) continue;
-        if (best) |b| {
-            if (g.start_row > b.start_row or (g.start_row == b.start_row and g.start_col >= b.start_col)) continue;
-        }
-        best = g;
-    }
-    return if (best) |b| b.grid_id else 2;
+    return core.win_layout.mainTargetGrid(Grid, grids);
 }
 
 /// One full-width rect per run of adjacent dirty rows, written into `out` and

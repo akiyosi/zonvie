@@ -657,6 +657,10 @@ pub const Core = struct {
     row_cells: RenderCells = .{},
     grid_entries: c_api.render_layout.List(GridEntry) = .{},
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// The last guifont a redraw batch set, applied by the flush that follows
+    /// (flush.FlushCtx.applyPendingGuifont). Redraw thread only.
+    pending_guifont: std.ArrayListUnmanaged(u8) = .empty,
+    pending_guifont_set: bool = false,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
     // well as the normal per-keystroke caller, so the shared scratch buffer
@@ -1414,6 +1418,7 @@ pub const Core = struct {
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
         self.key_buf.deinit(self.alloc);
+        self.pending_guifont.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
 
@@ -2320,10 +2325,9 @@ pub const Core = struct {
     /// Reset shaping result cache. Called on guifont/font feature change.
     /// NOT called on atlas reset (shaping results are atlas-independent).
     pub fn resetShapeCache(self: *Core) void {
+        // A hit requires the entry's font_gen to equal font_generation, so
+        // the bump alone retires every entry.
         self.font_generation +%= 1;
-        if (self.shape_cache) |buf| {
-            @memset(buf, .{});
-        }
         self.ascii_tables_valid = false;
     }
 
@@ -3655,6 +3659,11 @@ pub const Core = struct {
     pub fn tryScrollbarGridForSurface(self: *Core, surface_id: i64) ?i64 {
         if (!self.grid_mu.tryLock()) return null;
         defer self.grid_mu.unlock(clock.io());
+        return self.scrollbarGridForSurfaceLocked(surface_id);
+    }
+
+    /// tryScrollbarGridForSurface with grid_mu already held.
+    pub fn scrollbarGridForSurfaceLocked(self: *Core, surface_id: i64) i64 {
         const cursor_grid = self.grid.cursor_grid;
         if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
             // Only a window's grid (one Neovim sent a viewport for): the cursor
@@ -3765,6 +3774,15 @@ pub const Core = struct {
     /// moment served a stale one: a float the cursor had just entered was
     /// missing, and the box landed on the main window. Caller holds grid_mu.
     pub fn publishMsgAnchorLocked(self: *Core) void {
+        // The cursor sits in a synthetic ext UI grid (the cmdline; negative
+        // ids) only while that UI is up. Messages keep hanging from the
+        // window the user is working in, not from the one-row cmdline grid.
+        if (self.grid.cursor_grid < 0) {
+            self.msg_anchor_mu.lockUncancelable(clock.io());
+            const have = self.msg_anchor != null;
+            self.msg_anchor_mu.unlock(clock.io());
+            if (have) return;
+        }
         const surfaceOf = struct {
             fn f(info: ?c_api.GridInfo) i64 {
                 const i = info orelse return 1;
@@ -3936,8 +3954,8 @@ pub const Core = struct {
         return self.getViewportInfoLocked(grid_id, out);
     }
 
-    /// Internal: get viewport info assuming grid_mu is already held.
-    fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
+    /// Get viewport info assuming grid_mu is already held.
+    pub fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
         const vp = self.grid.getViewport(grid_id) orelse {
             // self.log.write("[getViewportInfo] grid_id={d} not found\n", .{grid_id});
             return 0;
@@ -8578,6 +8596,13 @@ test "the message anchor walks the cursor's float to the window it hangs off" {
     try std.testing.expectEqual(@as(i64, 1), u.cursor_surface);
     try std.testing.expectEqual(@as(i64, 1), u.anchor_grid);
     try std.testing.expectEqual(@as(i32, 20), u.rows);
+
+    // The cmdline holding the cursor keeps the window's anchor.
+    core.grid.cursor_grid = 4;
+    core.publishMsgAnchorLocked();
+    core.grid.cursor_grid = grid_mod.CMDLINE_GRID_ID;
+    core.publishMsgAnchorLocked();
+    try std.testing.expectEqual(@as(i64, 3), core.msgAnchor().?.anchor_grid);
 }
 
 test "a float an external window hosts is reported in that window's cells" {

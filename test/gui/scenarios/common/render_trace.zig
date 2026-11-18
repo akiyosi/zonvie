@@ -34,10 +34,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (timer.read() < 5 * std.time.ns_per_s) {
         const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(64 * 1024 * 1024));
         defer alloc.free(data);
-        const frontend = if (builtin.os.tag == .windows) "side=windows" else "side=macos";
+        const frontend = switch (builtin.os.tag) {
+            .windows => "side=windows",
+            .linux => "side=linux",
+            else => "side=macos",
+        };
         // Windows frees a destroyed grid's rows with the commit whose layout
-        // drops it, so it traces the destroy alone; macOS stages it and
-        // releases after on_flush_end.
+        // drops it, so it traces the destroy alone; macOS and Linux stage it
+        // and release it with the commit.
         const stage_event = if (builtin.os.tag == .windows) "event=destroy " else "event=destroy_stage";
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {

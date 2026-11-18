@@ -98,6 +98,41 @@ jobs:
           name: zonvie-windows-${{ matrix.arch }}-debug
           path: windows/zig-out/zonvie.exe
 
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # What build.zig's linux step links; release.yml installs the same.
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libopengl-dev libegl-dev libglib2.0-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build Linux App
+        run: zig build linux
+
+      - name: Upload Linux Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: zonvie-linux-${{ matrix.arch }}-debug
+          path: linux/zig-out/zonvie
+
   # windows/shaders/compiled_shaders.zig is generated output that has to live
   # in the repo: every Windows build here cross-compiles from Linux, where fxc
   # cannot run, so the bytecode cannot be produced at build time. That makes it

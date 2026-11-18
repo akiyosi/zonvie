@@ -11,8 +11,8 @@
 // float double-cursor) are pixel/z-order regressions that need the
 // not-yet-built screenshot layer.
 //
-// Windows-only; gated by the runner. Compile-verified from macOS but needs
-// a real Windows run to confirm the wheel routing / coordinate handling.
+// Windows and Linux (a virtual pointer's notch, linux_window.sendWheel);
+// gated by the runner.
 
 const std = @import("std");
 const gui_io = @import("../../gui_io.zig");

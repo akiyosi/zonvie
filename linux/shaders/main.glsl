@@ -1,0 +1,167 @@
+// GLSL 330 port of windows/shaders/main.hlsl VSMain and the grid subset of
+// PSMain. Compiled twice by gl_renderer.zig with `#version 330 core` and
+// VERTEX or FRAGMENT prepended, so this file carries no #version line.
+
+#define DECO_UNDERCURL     (1u << 0)
+#define DECO_UNDERDOUBLE   (1u << 2)
+#define DECO_UNDERDOTTED   (1u << 3)
+#define DECO_UNDERDASHED   (1u << 4)
+#define DECO_CURSOR        (1u << 6)
+// Transport-only: the vertex is in the scrollable content area, not a margin.
+#define DECO_SCROLLABLE    (1u << 7)
+#define DECO_GLOW          (1u << 9)
+#define DECO_COLOR_EMOJI   (1u << 10)
+// Window separators on the root grid: faded under a captionless window's
+// top band (separatorEdge).
+#define DECO_SEPARATOR     (1u << 12)
+
+#ifdef VERTEX
+layout(location = 0) in vec2 a_pos; // grid-local px
+layout(location = 1) in vec2 a_uv;
+layout(location = 2) in vec4 a_col;
+layout(location = 3) in uint a_deco;
+layout(location = 4) in float a_phase;
+
+uniform vec2 u_scale;
+uniform vec2 u_offset;
+// How far a smooth scroll still draws this layer's content below where its
+// rows put it, in px. Moves only DECO_SCROLLABLE vertices, so margins
+// (winbar, float borders) stay put. Zero when nothing eases.
+uniform float u_scroll_offset_px;
+// DECO_SEPARATOR glyphs within this many px of the layer top fade in. 0 px
+// leaves them alone.
+uniform float u_separator_fade_px;
+
+out vec2 v_uv;
+out vec4 v_col;
+flat out uint v_deco;
+out float v_phase;
+out float v_layer_y;
+flat out float v_separator_fade;
+
+void main() {
+    vec2 p = a_pos;
+    if ((a_deco & DECO_SCROLLABLE) != 0u) p.y += u_scroll_offset_px;
+    gl_Position = vec4(p * u_scale + u_offset, 0.0, 1.0);
+    v_uv = a_uv;
+    v_col = a_col;
+    v_deco = a_deco;
+    v_phase = a_phase;
+    v_layer_y = p.y;
+    v_separator_fade = u_separator_fade_px;
+}
+#endif
+
+#ifdef FRAGMENT
+uniform sampler2D u_atlas;
+// Layer left edge in surface px, so pattern decorations phase from the
+// layer's own edge instead of the window's.
+uniform float u_layer_origin_x_px;
+// 0 draws the grid; 1 extracts the glyphs the core marked DECO_GLOW, in their
+// own colour, for the bloom (windows/shaders/main.hlsl PSGlowExtract); 2
+// draws the UI layer's rounded corners (ui_layer.zig Builder.corner).
+uniform int u_mode;
+// A panel's own bg (alpha >= 0): solid cells of that colour are left out so
+// the panel fill shows through, as windows/ui/external_windows.zig
+// appendDecoratedContent makes them transparent. Alpha < 0 draws them all.
+uniform vec4 u_clear_bg;
+
+in vec2 v_uv;
+in vec4 v_col;
+flat in uint v_deco;
+in float v_phase;
+in float v_layer_y;
+flat in float v_separator_fade;
+
+out vec4 o_color;
+
+// Alpha factor for a DECO_SEPARATOR glyph: 0 at the layer top, 1 below the
+// band, so a separator reaching under the window buttons does not start
+// abruptly (windows/shaders/main.hlsl separatorEdge).
+float separatorEdge() {
+    if ((v_deco & DECO_SEPARATOR) == 0u || v_separator_fade <= 0.0) return 1.0;
+    return smoothstep(0.0, v_separator_fade, v_layer_y);
+}
+
+// DirectWrite's coverage correction, as windows/shaders/main.hlsl applies it
+// (from Windows Terminal): gamma 1.8 ratios.
+const vec4 dwrite_gamma_ratios = vec4(0.148054421, -0.894594550, 1.47590804, -0.324668258);
+
+float dwriteEnhanceContrast(float a, float k) {
+    return a * (k + 1.0) / (a * k + 1.0);
+}
+
+float dwriteAlphaCorrection(float a, float intensity) {
+    vec4 g = dwrite_gamma_ratios;
+    return a + a * (1.0 - a) * ((g.x * intensity + g.y) * a + (g.z * intensity + g.w));
+}
+
+float dwriteLightOnDarkContrast(float k, vec3 c) {
+    return k * clamp(dot(c, vec3(0.30, 0.59, 0.11) * -4.0) + 3.0, 0.0, 1.0);
+}
+
+vec4 premultiply(vec4 c) {
+    return vec4(c.rgb * c.a, c.a);
+}
+
+void main() {
+    if (u_mode == 1) {
+        if ((v_deco & DECO_GLOW) == 0u || v_uv.x < 0.0) discard;
+        vec4 tex = texture(u_atlas, v_uv);
+        if ((v_deco & DECO_COLOR_EMOJI) != 0u) {
+            o_color = tex;
+            return;
+        }
+        float cov = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
+        o_color = vec4(v_col.rgb * cov, cov);
+        return;
+    }
+    if (u_mode == 2) {
+        // v_uv is the fragment's offset from the arc's centre in px, v_phase
+        // the radius. The colour fills what lies outside the arc, or with a
+        // stroke width in v_deco draws that many px just inside it.
+        float d = length(v_uv) - v_phase;
+        float w = float(v_deco);
+        float cov = w == 0.0 ? clamp(d + 0.5, 0.0, 1.0) : clamp(d + w + 0.5, 0.0, 1.0) * clamp(0.5 - d, 0.0, 1.0);
+        o_color = premultiply(v_col) * cov;
+        return;
+    }
+    // Solid quads (backgrounds, decorations, cursor) carry uv.x < 0; for
+    // decorations uv.y is the local y within the quad (0 top, 1 bottom).
+    if (v_uv.x < 0.0) {
+        if (u_clear_bg.a >= 0.0 && (v_deco & DECO_CURSOR) == 0u &&
+            all(lessThan(abs(v_col.rgb - u_clear_bg.rgb), vec3(0.005)))) discard;
+        float x_px = gl_FragCoord.x - u_layer_origin_x_px;
+        if ((v_deco & DECO_UNDERCURL) != 0u) {
+            float cell_width = 8.0;
+            float wave_y = sin((x_px / cell_width + v_phase) * 6.28318530) * 0.35;
+            float dist = abs(v_uv.y - (0.5 + wave_y));
+            if (dist > 0.25) discard;
+            float alpha = v_col.a * (1.0 - smoothstep(0.0, 0.25, dist));
+            o_color = vec4(v_col.rgb * alpha, alpha);
+            return;
+        }
+        if ((v_deco & DECO_UNDERDOTTED) != 0u) {
+            if (mod(x_px, 4.0) >= 2.0) discard;
+        } else if ((v_deco & DECO_UNDERDASHED) != 0u) {
+            if (mod(x_px, 8.0) >= 5.0) discard;
+        } else if ((v_deco & DECO_UNDERDOUBLE) != 0u) {
+            if (abs(v_uv.y - 0.2) > 0.15 && abs(v_uv.y - 0.8) > 0.15) discard;
+        }
+        o_color = premultiply(v_col);
+        return;
+    }
+    // The atlas holds color glyphs already premultiplied (FreeType BGRA).
+    if ((v_deco & DECO_COLOR_EMOJI) != 0u) {
+        o_color = texture(u_atlas, v_uv);
+        return;
+    }
+    // Coverage (FreeType gray, or LCD coverage collapsed to its luminance)
+    // replicated into every channel, corrected as Windows' shader corrects
+    // DirectWrite coverage: contrast enhanced, light-on-dark adjusted, then
+    // the gamma 1.8 alpha correction.
+    float k = dwriteLightOnDarkContrast(1.0, v_col.rgb);
+    float a = dwriteEnhanceContrast(texture(u_atlas, v_uv).r, k);
+    o_color = premultiply(v_col) * dwriteAlphaCorrection(a, dot(v_col.rgb, vec3(0.30, 0.59, 0.11))) * separatorEdge();
+}
+#endif

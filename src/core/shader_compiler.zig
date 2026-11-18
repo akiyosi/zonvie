@@ -36,6 +36,11 @@ const spvc = @cImport({
 pub const Target = enum(u8) {
     msl = 0, // Metal Shading Language (macOS)
     hlsl = 1, // High-Level Shading Language (D3D11 on Windows)
+    /// GLSL 330 core (OpenGL 3.3 on Linux). GL 3.3 has no binding
+    /// qualifiers, so the frontend binds the samplers and the uniform block
+    /// by name: zonvie_iChannel0Tex, zonvie_iPrevFrameTex, iCellAge and
+    /// ZonvieShaderUniforms.
+    glsl = 2,
 };
 
 pub const CompileError = error{
@@ -355,6 +360,7 @@ fn crossCompileSpirv(
     const backend: spvc.spvc_backend = switch (target) {
         .msl => spvc.SPVC_BACKEND_MSL,
         .hlsl => spvc.SPVC_BACKEND_HLSL,
+        .glsl => spvc.SPVC_BACKEND_GLSL,
     };
 
     var compiler: spvc.spvc_compiler = undefined;
@@ -378,6 +384,20 @@ fn crossCompileSpirv(
                 spvc.SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL,
                 50,
             );
+            _ = spvc.spvc_compiler_install_compiler_options(compiler, options);
+        }
+    }
+
+    // Desktop GLSL 330 without the 420pack extension: no layout(binding)
+    // and no layout(location) on the varying, so a GL 3.3 driver takes it and
+    // the frontend's vertex stage matches `vUV` by name.
+    if (target == .glsl) {
+        var options: spvc.spvc_compiler_options = undefined;
+        if (spvc.spvc_compiler_create_compiler_options(compiler, &options) == spvc.SPVC_SUCCESS) {
+            _ = spvc.spvc_compiler_options_set_uint(options, spvc.SPVC_COMPILER_OPTION_GLSL_VERSION, 330);
+            _ = spvc.spvc_compiler_options_set_bool(options, spvc.SPVC_COMPILER_OPTION_GLSL_ES, spvc.SPVC_FALSE);
+            _ = spvc.spvc_compiler_options_set_bool(options, spvc.SPVC_COMPILER_OPTION_GLSL_ENABLE_420PACK_EXTENSION, spvc.SPVC_FALSE);
+            _ = spvc.spvc_compiler_options_set_bool(options, spvc.SPVC_COMPILER_OPTION_GLSL_SEPARATE_SHADER_OBJECTS, spvc.SPVC_FALSE);
             _ = spvc.spvc_compiler_install_compiler_options(compiler, options);
         }
     }
@@ -515,6 +535,22 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
     const pad_region = tail[0..i_cell];
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 _zonvie_pad") == null);
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "_zonvie_pad_cursor2") != null);
+}
+
+test "a Shadertoy shader compiles to GL 3.3 GLSL with name-bound resources" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec2 uv = fragCoord / iResolution.xy;
+        \\    fragColor = texture(iChannel0, uv) * (0.5 + 0.5 * sin(iTime));
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .glsl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "#version 330"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "binding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zonvie_iChannel0Tex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ZonvieShaderUniforms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "in vec2 vUV;") != null);
 }
 
 test "Thymer reference shader compiles to MSL with the Zonvie edit inputs" {
