@@ -78,6 +78,8 @@ const Custom = struct {
     uses_cell_text: bool = false,
     /// Declares `@zonvie-owns-cursor` (frontend_rules.shaderOwnsCursor).
     owns_cursor: bool = false,
+    /// Reads iBelowFloats (frontend_rules.shaderUsesBelowFloats).
+    uses_below: bool = false,
 };
 
 const max_custom = 8;
@@ -132,6 +134,11 @@ pub const PostFx = struct {
     row_rows: u32 = 0,
     /// Some loaded shader draws the cursor itself.
     owns_cursor: bool = false,
+    /// iBelowFloats: the surface drawn again without its float layers and
+    /// cursor, when a loaded shader reads it; created at first need or a
+    /// size change and kept.
+    below: Rt = .{},
+    uses_below: bool = false,
     /// iDate's date fields and the wall-clock second they were taken at:
     /// localtime runs at most once a second.
     date_second: i64 = -1,
@@ -292,6 +299,7 @@ fn setup(app: *App, p: *PostFx) bool {
             if (c.uses_edit) p.uses_edit = true;
             if (c.uses_cell_text) p.uses_cell_text = true;
             if (c.owns_cursor) p.owns_cursor = true;
+            if (c.uses_below) p.uses_below = true;
         }
     }
     if (p.uses_cell_text) {
@@ -359,6 +367,8 @@ fn loadCustom(app: *App, path: []const u8, hl_src: *std.ArrayListUnmanaged(u8)) 
     if (u_age >= 0) gl.glUniform1i(u_age, 3);
     if (u_text >= 0) gl.glUniform1i(u_text, 4);
     if (u_row >= 0) gl.glUniform1i(u_row, 5);
+    const u_below = gl.glGetUniformLocation(pass.prog, "zonvie_iBelowFloatsTex");
+    if (u_below >= 0) gl.glUniform1i(u_below, 6);
     applog.appLog("[postfx] loaded shader {s}\n", .{path});
     // A shader whose text cannot be kept still loads; it declares no groups.
     if (hl_src.ensureUnusedCapacity(app.alloc, src.len + 1)) |_| {
@@ -374,6 +384,7 @@ fn loadCustom(app: *App, path: []const u8, hl_src: *std.ArrayListUnmanaged(u8)) 
         .uses_edit = core.frontend_rules.shaderUsesEditInputs(src),
         .uses_cell_text = core.frontend_rules.shaderUsesCellText(src),
         .owns_cursor = core.frontend_rules.shaderOwnsCursor(src),
+        .uses_below = core.frontend_rules.shaderUsesBelowFloats(src),
     };
 }
 
@@ -614,6 +625,18 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     app.mu.lockUncancelable(clock.io());
     const f = if (surface_id == 1) gl_renderer.renderMainLocked(app, t, t0) else gl_renderer.renderExternalSceneLocked(app, t, surface_id, t0);
     const snap: Snapshot = if (p.custom_len != 0) snapshotLocked(app, p, surface_id) else .{};
+    // Same hold, after the scene pass planned the eases it reuses. Bound
+    // below only when this frame's render completed.
+    var below_ok = false;
+    if (p.uses_below and p.custom_len != 0) {
+        p.below.ensure(t.w_px, t.h_px);
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.below.fbo);
+        t.skip_floats = true;
+        t.skip_cursor = true;
+        below_ok = gl_renderer.renderBelowFloatsLocked(app, t, surface_id);
+        t.skip_floats = false;
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.scene.fbo);
+    }
     app.mu.unlock(clock.io());
     t.skip_cursor = false;
     if (app.corep) |cp| {
@@ -655,6 +678,10 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     if (p.uses_edit) {
         gl.glActiveTexture(gl.GL_TEXTURE5);
         gl.glBindTexture(gl.GL_TEXTURE_2D, if (rows != 0) rows else p.black);
+    }
+    if (p.uses_below) {
+        gl.glActiveTexture(gl.GL_TEXTURE6);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, if (below_ok) p.below.tex else p.black);
     }
     var src = p.scene.tex;
     for (p.custom[0..p.custom_len], 0..) |c, i| {
@@ -790,6 +817,7 @@ pub fn unrealize(p: *PostFx) void {
     for (&p.ping) |*r| r.deinit();
     p.prev.deinit();
     p.out.deinit();
+    p.below.deinit();
     if (p.age_tex != 0) gl.glDeleteTextures(1, &p.age_tex);
     if (p.text_tex != 0) gl.glDeleteTextures(1, &p.text_tex);
     if (p.zero_text != 0) gl.glDeleteTextures(1, &p.zero_text);

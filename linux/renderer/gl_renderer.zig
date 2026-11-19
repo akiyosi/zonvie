@@ -70,6 +70,10 @@ pub const Target = struct {
     /// A `@zonvie-owns-cursor` shader draws the cursor over this frame
     /// (postfx.renderFrame): the native cursor pass is skipped.
     skip_cursor: bool = false,
+    /// The iBelowFloats pass (postfx.renderFrame): win_float_pos layers
+    /// (FLOAT without MSG) are not drawn, and the eases this frame's scene
+    /// pass planned are reused rather than planned again.
+    skip_floats: bool = false,
     /// One layer's rows concatenated for a single upload; capacity reused
     /// across frames.
     scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
@@ -433,9 +437,10 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
     }
     // The core sends layers back-to-front; draw in order (windows/app.zig:4432).
     for (layers) |layer| {
+        if (t.skip_floats and layer.flags & core.LAYER_FLOAT != 0 and layer.flags & core.LAYER_MSG == 0) continue;
         const grid = app.surface.committedGrid(layer.grid_id) orelse continue;
         const ease = app.surface.gridEase(layer.grid_id).?;
-        ease.plan(now_ns, layerGeom(app, layer).row_h_px, grid.committedRows().len);
+        if (!t.skip_floats) ease.plan(now_ns, layerGeom(app, layer).row_h_px, grid.committedRows().len);
         if (ease.moving()) out.moving = true;
         out.verts += drawLayer(app, t, followed(app, layer, layers), grid, ease.region(), ease.offset_px);
     }
@@ -632,6 +637,20 @@ pub fn renderExternalSceneLocked(app: *App, t: *Target, surface_id: i64, t0: i12
     if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar, surface_id);
     _ = drawOverlays(app, t, surface_id);
     return .{ .moving = d.moving };
+}
+
+/// iBelowFloats into the bound framebuffer: the surface as this frame's
+/// scene pass drew it, without win_float_pos layers, the cursor or the ext
+/// UI overlays. Runs after that pass in the same App.mu hold, with
+/// `t.skip_floats` and `t.skip_cursor` set by the caller. False when nothing
+/// could be drawn.
+pub fn renderBelowFloatsLocked(app: *App, t: *Target, surface_id: i64) bool {
+    if (t.program == 0 or !begin(app, t)) return false;
+    const layers = if (surface_id == 1) app.surface.committedLayers() else app.surface.committedSurfaceLayers(surface_id);
+    _ = drawSurface(app, t, layers, 0);
+    const st = if (surface_id == 1) &app.scrollbar else if (app.ext_windows.get(surface_id)) |w| &w.scrollbar else return true;
+    drawScrollbar(app, t, st, surface_id);
+    return true;
 }
 
 /// The surface's scrollbar over its grids, under the ext UI overlays.

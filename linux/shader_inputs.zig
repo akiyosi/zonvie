@@ -58,7 +58,7 @@ pub fn fillLayers(u: *core.zonvie_shader_uniforms, layers: []const core.Layer, f
             .rows = l.rows,
             .cols = l.cols,
             .z = @intCast(@max(l.z, 0)),
-            .flags = if (l.flags & core.LAYER_FLOAT != 0) core.SHADER_LAYER_FLOAT else 0,
+            .flags = core.shaderLayerFlags(l.flags),
         };
         n += 1;
     }
