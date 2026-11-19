@@ -2930,7 +2930,22 @@ pub export fn zonvie_core_get_emoji_cluster(p: ?*zonvie_core, out_len: ?*u8) cal
         return null;
     }
     const box = asBox(p.?);
-    const len = box.core.emoji_cluster_len;
+    const len: u8 = if (box.core.cluster_is_text) 0 else box.core.emoji_cluster_len;
+    if (out_len) |ol| ol.* = len;
+    if (len == 0) return null;
+    return &box.core.emoji_cluster_buf;
+}
+
+/// The text cluster context of the current on_rasterize_glyph callback: the
+/// scalar argument (a base the primary font lacks) followed by its combining
+/// marks. Null with *out_len=0 otherwise, including for emoji clusters.
+pub export fn zonvie_core_get_text_cluster(p: ?*zonvie_core, out_len: ?*u8) callconv(.c) ?[*]const u32 {
+    if (p == null) {
+        if (out_len) |ol| ol.* = 0;
+        return null;
+    }
+    const box = asBox(p.?);
+    const len: u8 = if (box.core.cluster_is_text) box.core.emoji_cluster_len else 0;
     if (out_len) |ol| ol.* = len;
     if (len == 0) return null;
     return &box.core.emoji_cluster_buf;

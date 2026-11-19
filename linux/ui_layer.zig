@@ -244,7 +244,7 @@ pub const Builder = struct {
             a.pixel_size = app.fonts.pixel_size;
         }
         var bm: core.GlyphBitmap = undefined;
-        if (!app.fonts.rasterizeScalar(app.alloc, scalar, flags, &.{}, &bm)) return null;
+        if (!app.fonts.rasterizeScalar(app.alloc, scalar, flags, &.{}, &.{}, &bm)) return null;
         const w = bm.width;
         const h = bm.height;
         if (w + 2 > atlas_size or h + 2 > atlas_size) return null;

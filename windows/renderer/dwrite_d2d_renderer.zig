@@ -863,7 +863,8 @@ pub const Renderer = struct {
         // If flush set a multi-scalar cluster context, use the full cluster;
         // otherwise fall back to the single scalar argument.
         var gdi_cl_len: u8 = 0;
-        const gdi_cl_ptr = core.zonvie_core_get_emoji_cluster(corep, &gdi_cl_len);
+        const gdi_cl_ptr = core.zonvie_core_get_emoji_cluster(corep, &gdi_cl_len) orelse
+            core.zonvie_core_get_text_cluster(corep, &gdi_cl_len);
         var text_buf: [32]c.WCHAR = undefined; // max 16 scalars * 2 UTF-16 units
         var text_len: u32 = 0;
         const text_scalars: []const u32 = if (gdi_cl_len > 1 and gdi_cl_ptr != null) gdi_cl_ptr.?[0..gdi_cl_len] else (&scalar)[0..1];
@@ -1174,9 +1175,13 @@ pub const Renderer = struct {
         // U+2600 + FE0F) and for non-ASCII the font lacks (.notdef).
         var emoji_cl_len: u8 = 0;
         _ = core.zonvie_core_get_emoji_cluster(corep, &emoji_cl_len);
+        // A text cluster (base + combining marks) is laid out whole by
+        // DrawText, whose font fallback picks one face for the cluster.
+        var text_cl_len: u8 = 0;
+        _ = core.zonvie_core_get_text_cluster(corep, &text_cl_len);
         const non_ascii = scalar > 0x7F;
         const is_emoji = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0;
-        const gdi_first = is_emoji or (glyph_index == 0 and non_ascii);
+        const gdi_first = is_emoji or (glyph_index == 0 and non_ascii) or text_cl_len > 1;
         const fallback_style: u32 = if (is_emoji) 0 else style_flags;
         if (gdi_first and self.rasterizeColorEmojiGDI(scalar, fallback_style, corep, out_bitmap)) return;
 
