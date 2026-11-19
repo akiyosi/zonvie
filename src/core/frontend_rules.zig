@@ -1238,6 +1238,12 @@ pub fn shaderUsesPrevFrame(source: []const u8) bool {
     return containsAnyWord(source, &.{"iPrevFrame"});
 }
 
+/// Whether a shader reads iBelowFloats. Gates the below-floats texture and
+/// the extra non-float pass that fills it.
+pub fn shaderUsesBelowFloats(source: []const u8) bool {
+    return containsAnyWord(source, &.{"iBelowFloats"});
+}
+
 /// Whether a shader opts into drawing the cursor itself with the
 /// `@zonvie-owns-cursor` comment token. The frontend then skips its native
 /// cursor pass and glow for every shape, block included.
@@ -1372,6 +1378,12 @@ test "a shader uses iPrevFrame only when it names it" {
     try std.testing.expect(shaderUsesPrevFrame("vec4 p = texture(iPrevFrame, uv);"));
     try std.testing.expect(!shaderUsesPrevFrame("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(!shaderUsesPrevFrame("vec4 myiPrevFrame;"));
+}
+
+test "a shader uses iBelowFloats only when it names it" {
+    try std.testing.expect(shaderUsesBelowFloats("vec4 b = texture(iBelowFloats, uv);"));
+    try std.testing.expect(!shaderUsesBelowFloats("vec4 iBelowFloatsX;"));
+    try std.testing.expect(!shaderUsesBelowFloats("void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel0, p); }"));
 }
 
 test "a shader owns the cursor only with the opt-in token" {

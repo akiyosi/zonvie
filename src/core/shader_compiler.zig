@@ -112,6 +112,9 @@ const shadertoy_preamble =
     \\// scroll in progress; 0 at rest). Per cell, not per row: side-by-side
     \\// windows share rows and scroll apart.
     \\layout(binding = 5) uniform sampler2D iRowOffset;
+    \\// iBelowFloats is this frame of the surface without its float layers
+    \\// and without the native cursor: root rows, splits and the msg grid.
+    \\layout(binding = 6) uniform sampler2D zonvie_iBelowFloatsTex;
     \\
     \\layout(std140, binding = 1) uniform ZonvieShaderUniforms {
     \\    vec3 iResolution;
@@ -189,6 +192,14 @@ const shadertoy_preamble =
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
     \\    vec2 local_uv = local_px / iWindowSize;
     \\    return textureLod(zonvie_iPrevFrameTex, local_uv, 0.0);
+    \\}
+    \\
+    \\struct zonvie_iBelowFloats_t { int _d; };
+    \\const zonvie_iBelowFloats_t iBelowFloats = zonvie_iBelowFloats_t(0);
+    \\vec4 texture(zonvie_iBelowFloats_t _ch, vec2 screen_uv) {
+    \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
+    \\    vec2 local_uv = local_px / iWindowSize;
+    \\    return textureLod(zonvie_iBelowFloatsTex, local_uv, 0.0);
     \\}
     \\
     \\// How many pixels below its grid rect the content under a screen-space
@@ -561,6 +572,7 @@ fn crossCompileSpirv(
     //   iCellAge   → texture(3) + sampler(3)
     //   iCellText  → texture(4) + sampler(4)
     //   iRowOffset → texture(5) + sampler(5)
+    //   iBelowFloats → texture(6) + sampler(6)
     if (target == .msl) {
         var bind_ubo: spvc.spvc_msl_resource_binding = undefined;
         spvc.spvc_msl_resource_binding_init(&bind_ubo);
@@ -582,7 +594,7 @@ fn crossCompileSpirv(
         // Zonvie edit-effect samplers. Registered unconditionally: a shader
         // that never references them produces no binding at all, and an
         // unused mapping is ignored.
-        for ([_]u32{ 2, 3, 4, 5 }) |slot| {
+        for ([_]u32{ 2, 3, 4, 5, 6 }) |slot| {
             var bind_edit: spvc.spvc_msl_resource_binding = undefined;
             spvc.spvc_msl_resource_binding_init(&bind_edit);
             bind_edit.stage = spvc.SpvExecutionModelFragment;
@@ -844,6 +856,25 @@ test "Thymer reference shader compiles to HLSL with the Zonvie edit inputs" {
     try expectDeclaredAt(out, "iCellAge", "register(t3)");
     try expectDeclaredAt(out, "iCellText", "register(t4)");
     try expectDeclaredAt(out, "iRowOffset", "register(t5)");
+}
+
+test "iBelowFloats sits at slot 6 on every target" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec2 uv = fragCoord / iResolution.xy;
+        \\    fragColor = texture(iBelowFloats, uv) + texture(iChannel0, uv);
+        \\}
+    ;
+    const msl = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
+    defer std.testing.allocator.free(msl);
+    try expectDeclaredAt(msl, "iBelowFloats", "[[texture(6)]]");
+    const hlsl = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
+    defer std.testing.allocator.free(hlsl);
+    try expectDeclaredAt(hlsl, "iBelowFloats", "register(t6)");
+    const gl = try compileGlslToTarget(std.testing.allocator, glsl, .glsl);
+    defer std.testing.allocator.free(gl);
+    // postfx.zig binds this name to unit 6.
+    try std.testing.expect(std.mem.indexOf(u8, gl, "uniform sampler2D zonvie_iBelowFloatsTex;") != null);
 }
 
 /// Fails unless some line of `out` declares `name` with `binding`.

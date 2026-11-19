@@ -901,6 +901,19 @@ ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_prev_frame(const char *source, size_t len);
 
+/* Whether a custom shader's source names iBelowFloats (whole word).
+   Frontends create the below-floats texture and fill it only when a loaded
+   shader does, and release it once none does.
+   iBelowFloats (sampler slot 6: Metal texture/sampler 6, HLSL t6/s6, GL
+   uniform `zonvie_iBelowFloatsTex` on unit 6), sampled through the same
+   screen-space wrapper as iChannel0:
+   Pre: the frontend has drawn, this frame, the surface's root rows and every
+   layer without ZONVIE_SHADER_LAYER_FLOAT, and no native cursor.
+   Post: same size and pixel space as iChannel0.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_below_floats(const char *source, size_t len);
+
 /* Whether a custom shader's source carries the `@zonvie-owns-cursor` token:
    once iCurrentCursor holds a non-empty rect, the frontend skips its native
    cursor pass and cursor glow for every shape, block included, and leaves
@@ -1075,8 +1088,10 @@ typedef enum {
 
 /* iLayers entry flags: the .w word of [3i+2], as a float holding a small
    integer. FLOAT: placed by win_float_pos. FONT_GRID: the layer has its own
-   font (the cell in [3i+1] is that font's). FOCUSABLE, BORDER: reserved; 0
-   until the frontends carry the data. */
+   font (the cell in [3i+1] is that font's). FOCUSABLE: the layer takes
+   mouse input (its zonvie_layer MOUSE_ENABLED flag); the frontend passes it.
+   BORDER: reserved and never set, because Neovim's UI protocol does not
+   report a float's border; zonvie_shader_fill_layers clears it. */
 #define ZONVIE_SHADER_LAYER_FLOAT     (1u << 0)
 #define ZONVIE_SHADER_LAYER_FONT_GRID (1u << 1)
 #define ZONVIE_SHADER_LAYER_FOCUSABLE (1u << 2)
@@ -1143,8 +1158,9 @@ typedef struct zonvie_shader_uniforms {
     /* Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
        the surface root's cell; iCursorCellSize is the cell of the grid the
        cursor is in, which the cursor styles are classified against.
-       iLayers lists, topmost first, the layers down to the lowest one in
-       its own font, three vec4 each; see zonvie_shader_fill_layers. */
+       iLayers lists, topmost first, every non-root layer (at most
+       ZONVIE_SHADER_LAYERS_MAX), three vec4 each; see
+       zonvie_shader_fill_layers. */
     float    iCursorCellSize[2];      /* 192..199 */
     int32_t  iLayerCount;             /* 200..203 */
     int32_t  iRootRows;               /* 204..207  rows of the surface lattice */
@@ -1296,8 +1312,7 @@ ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
 
 /* Fill iRootRows and iLayers of `u` from a surface's `n` layers, which
    must be every layer of the surface but its root: band rows are summed
-   over them. An empty table when no layer has a cell. Otherwise, topmost
-   first, every layer down to the lowest one with a cell, at most
+   over them. Topmost first, every layer, cell or not, at most
    ZONVIE_SHADER_LAYERS_MAX. The lowest layers past that have no entry:
    where no listed layer covers them the shader reads the surface lattice,
    which holds what lies under a layer in its own font (under a root in its
@@ -1310,8 +1325,9 @@ ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
    core's special grids are valid; checked by a debug assert before any write);
    rects may be NULL only when n == 0; ids and z are unique per surface.
    Post: iRootRows == root_rows; iLayerCount in [0, MAX]; entries past
-   iLayerCount are untouched and must not be read; flags word = the
-   caller's flags with FONT_GRID set exactly when the layer has a cell. */
+   iLayerCount are untouched and must not be read; iLayerCount ==
+   min(n, MAX); flags word = the caller's flags with FONT_GRID set exactly
+   when the layer has a cell and BORDER always cleared. */
 ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
     const zonvie_shader_layer *layers, size_t n, uint32_t root_rows);
 
