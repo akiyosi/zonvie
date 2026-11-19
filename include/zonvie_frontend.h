@@ -907,9 +907,14 @@ ZONVIE_API bool zonvie_core_shader_uses_prev_frame(const char *source, size_t le
    iBelowFloats (sampler slot 6: Metal texture/sampler 6, HLSL t6/s6, GL
    uniform `zonvie_iBelowFloatsTex` on unit 6), sampled through the same
    screen-space wrapper as iChannel0:
-   Pre: the frontend has drawn, this frame, the surface's root rows and every
-   layer without ZONVIE_SHADER_LAYER_FLOAT, and no native cursor.
-   Post: same size and pixel space as iChannel0.
+   Pre: the frontend has drawn, this frame, the surface's root rows, its
+   splits and its msg grid (every layer without ZONVIE_SHADER_LAYER_FLOAT,
+   plus those with ZONVIE_SHADER_LAYER_MSG), and none of: win_float_pos
+   floats, the cursor, the scrollbar, ext UI overlays (popupmenu, cmdline,
+   messages windows).
+   Post: same size and pixel space as iChannel0. Reads black (0) when the
+   frontend has no below-floats content for the frame: a failed pass, or on
+   Windows a frame drawn before the first row commit (background only).
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_below_floats(const char *source, size_t len);

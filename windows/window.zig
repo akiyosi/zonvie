@@ -2404,7 +2404,9 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
         @floatFromInt(geom.content_x_offset orelse 0),
         @floatFromInt(geom.content_y_offset orelse 0),
     };
-    app_mod.fillShaderLayers(g, in.tbs_snapshot.layers.slice(), g.shader_grid_origin, g.cell_w_px, g.cell_h_px);
+    // Only the chain reads iLayers; a shader-less frame does no selection.
+    if (g.custom_shader_pipelines.items.len != 0)
+        app_mod.fillShaderLayers(g, in.tbs_snapshot.layers.slice(), g.shader_grid_origin, g.cell_w_px, g.cell_h_px);
 
     if (!in.snap.row_mode) return drawMainFlatFrame(hwnd, app, g, in, geom);
     return drawMainRowFrame(hwnd, app, g, in, geom, resized_before_draw);

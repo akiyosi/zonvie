@@ -640,16 +640,14 @@ pub fn renderExternalSceneLocked(app: *App, t: *Target, surface_id: i64, t0: i12
 }
 
 /// iBelowFloats into the bound framebuffer: the surface as this frame's
-/// scene pass drew it, without win_float_pos layers, the cursor or the ext
-/// UI overlays. Runs after that pass in the same App.mu hold, with
-/// `t.skip_floats` and `t.skip_cursor` set by the caller. False when nothing
-/// could be drawn.
+/// scene pass drew it, without win_float_pos layers, the cursor, the
+/// scrollbar or the ext UI overlays. Runs after that pass in the same App.mu
+/// hold, with `t.skip_floats` and `t.skip_cursor` set by the caller. False
+/// when nothing could be drawn.
 pub fn renderBelowFloatsLocked(app: *App, t: *Target, surface_id: i64) bool {
     if (t.program == 0 or !begin(app, t)) return false;
     const layers = if (surface_id == 1) app.surface.committedLayers() else app.surface.committedSurfaceLayers(surface_id);
     _ = drawSurface(app, t, layers, 0);
-    const st = if (surface_id == 1) &app.scrollbar else if (app.ext_windows.get(surface_id)) |w| &w.scrollbar else return true;
-    drawScrollbar(app, t, st, surface_id);
     return true;
 }
 

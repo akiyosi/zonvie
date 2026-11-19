@@ -279,8 +279,8 @@ final class CustomShaderPipeline {
             enc.setFragmentTexture(rowOffset, index: 5)
             enc.setFragmentSamplerState(sampler, index: 5)
         }
-        if let belowFloats {
-            enc.setFragmentTexture(belowFloats, index: 6)
+        if let below = belowFloats ?? (usesBelowFloats ? blackFallback(device: cmd.device) : nil) {
+            enc.setFragmentTexture(below, index: 6)
             enc.setFragmentSamplerState(sampler, index: 6)
         }
         var u = uniforms
@@ -288,5 +288,22 @@ final class CustomShaderPipeline {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         enc.endEncoding()
         return true
+    }
+
+    /// Bound at slot 6 when the below pass produced nothing, so a shader
+    /// reading iBelowFloats never samples an unbound slot (black, matching
+    /// Linux and Windows). Created once per pipeline and reused.
+    private var blackTexture: MTLTexture?
+
+    private func blackFallback(device: MTLDevice) -> MTLTexture? {
+        if let blackTexture { return blackTexture }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        var px: UInt32 = 0
+        tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &px, bytesPerRow: 4)
+        blackTexture = tex
+        return tex
     }
 }

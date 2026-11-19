@@ -3851,7 +3851,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             break :blk .{ @intCast(cell[0]), @intCast(cell[1]) };
         },
     });
-    app_mod.fillShaderLayers(g, tbs_snapshot.layers.slice(), g.shader_grid_origin, app.cell_w_px, app.rowHeightPx());
+    // Only the chain reads iLayers; a shader-less frame does no selection.
+    if (g.custom_shader_pipelines.items.len != 0)
+        app_mod.fillShaderLayers(g, tbs_snapshot.layers.slice(), g.shader_grid_origin, app.cell_w_px, app.rowHeightPx());
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;
