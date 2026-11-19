@@ -74,6 +74,7 @@ pub const DECO_SEPARATOR: u32 = 1 << 12;
 pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
 pub const LAYER_MOUSE_ENABLED: u32 = 1 << 1;
 pub const LAYER_FLOAT: u32 = 1 << 2;
+pub const LAYER_MSG: u32 = 1 << 3;
 
 pub const Layer = extern struct {
     grid_id: i64,
@@ -4255,6 +4256,27 @@ pub fn fillLayers(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_layer
         n += 1;
     }
     u.iLayerCount = @intCast(n);
+}
+
+/// The SHADER_LAYER_* a frontend passes for a zonvie_layer: FLOAT for a
+/// win_float_pos float only (the msg grid is placed with a zindex but is not
+/// one), FOCUSABLE from MOUSE_ENABLED.
+pub fn shaderLayerFlags(layer_flags: u32) u32 {
+    const float = layer_flags & LAYER_FLOAT != 0 and layer_flags & LAYER_MSG == 0;
+    return (if (float) SHADER_LAYER_FLOAT else 0) |
+        (if (layer_flags & LAYER_MOUSE_ENABLED != 0) SHADER_LAYER_FOCUSABLE else 0);
+}
+
+pub export fn zonvie_shader_layer_flags(layer_flags: u32) callconv(.c) u32 {
+    return shaderLayerFlags(layer_flags);
+}
+
+test "shaderLayerFlags: the msg grid is not a float, mouse makes focusable" {
+    try std.testing.expectEqual(SHADER_LAYER_FLOAT, shaderLayerFlags(LAYER_FLOAT));
+    try std.testing.expectEqual(@as(u32, 0), shaderLayerFlags(LAYER_FLOAT | LAYER_MSG));
+    try std.testing.expectEqual(SHADER_LAYER_FOCUSABLE, shaderLayerFlags(LAYER_FLOAT | LAYER_MSG | LAYER_MOUSE_ENABLED));
+    try std.testing.expectEqual(SHADER_LAYER_FLOAT | SHADER_LAYER_FOCUSABLE, shaderLayerFlags(LAYER_FLOAT | LAYER_MOUSE_ENABLED | LAYER_FOLLOWS_SCROLL));
+    try std.testing.expectEqual(@as(u32, 0), shaderLayerFlags(LAYER_FOLLOWS_SCROLL));
 }
 
 pub export fn zonvie_shader_fill_layers(

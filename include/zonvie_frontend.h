@@ -1331,6 +1331,13 @@ ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
 ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
     const zonvie_shader_layer *layers, size_t n, uint32_t root_rows);
 
+/* The ZONVIE_SHADER_LAYER_* flags a frontend passes in zonvie_shader_layer
+   for a zonvie_layer with `layer_flags`. Pure.
+   Post: FLOAT exactly when ZONVIE_LAYER_FLOAT is set and ZONVIE_LAYER_MSG is
+   not; FOCUSABLE exactly when ZONVIE_LAYER_MOUSE_ENABLED is set; no other
+   bit. */
+ZONVIE_API uint32_t zonvie_shader_layer_flags(uint32_t layer_flags);
+
 /* Fill iBackgroundColor, iForegroundColor, iCursorColor and iCursorText of
    `u` from the core's latest colour snapshot: Neovim's default colours,
    and the cursor attr's bg (fill) and fg (text), or default fg and bg

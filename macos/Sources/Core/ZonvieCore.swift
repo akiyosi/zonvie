@@ -1604,7 +1604,8 @@ final class ZonvieCore {
                         z: Int(l.z),
                         followsScroll: (l.flags & UInt32(ZONVIE_LAYER_FOLLOWS_SCROLL)) != 0,
                         mouseEnabled: (l.flags & UInt32(ZONVIE_LAYER_MOUSE_ENABLED)) != 0,
-                        isFloat: (l.flags & UInt32(ZONVIE_LAYER_FLOAT)) != 0
+                        isFloat: (l.flags & UInt32(ZONVIE_LAYER_FLOAT)) != 0,
+                        isMsg: (l.flags & UInt32(ZONVIE_LAYER_MSG)) != 0
                     ))
                 }
                 me.onSurfaceLayout(

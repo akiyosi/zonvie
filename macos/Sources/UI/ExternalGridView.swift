@@ -3273,7 +3273,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
         for entry in layerSnapshot {
             let layer = entry.layer
-            if belowFloats && layer.isFloat { continue }
+            if belowFloats && layer.isFloat && !layer.isMsg { continue }
             let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rows = min(layer.rows, set.rowLogicalToSlot.count)

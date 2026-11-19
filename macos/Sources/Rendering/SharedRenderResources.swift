@@ -163,8 +163,10 @@ final class SharedRenderResources {
                 rows: UInt32(clamping: l.rows),
                 cols: UInt32(clamping: l.cols),
                 z: UInt32(clamping: l.z),
-                flags: (l.isFloat ? UInt32(ZONVIE_SHADER_LAYER_FLOAT) : 0)
-                    | (l.mouseEnabled ? UInt32(ZONVIE_SHADER_LAYER_FOCUSABLE) : 0)))
+                flags: zonvie_shader_layer_flags(
+                    (l.isFloat ? UInt32(ZONVIE_LAYER_FLOAT) : 0)
+                    | (l.isMsg ? UInt32(ZONVIE_LAYER_MSG) : 0)
+                    | (l.mouseEnabled ? UInt32(ZONVIE_LAYER_MOUSE_ENABLED) : 0))))
         }
         scratch.withUnsafeBufferPointer { buf in
             zonvie_shader_fill_layers(&u, buf.baseAddress, buf.count, UInt32(clamping: rootRows))

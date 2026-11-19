@@ -438,6 +438,11 @@ typedef void (*zonvie_on_external_window_close_fn)(
    the paint rank and is >= 1 for every hosted layer, so it cannot tell them
    apart; a fixed-float mask over scrolled content wants only these. */
 #define ZONVIE_LAYER_FLOAT (1u << 2)
+/* This layer is Neovim's message grid (msg_set_pos). It carries FLOAT as
+   well, since Neovim places it with a zindex, but it is not a win_float_pos
+   float: iBelowFloats keeps it and the shader layer table does not mark it
+   ZONVIE_SHADER_LAYER_FLOAT (zonvie_shader_layer_flags). */
+#define ZONVIE_LAYER_MSG (1u << 3)
 
 typedef struct zonvie_layer {
     int64_t  grid_id;

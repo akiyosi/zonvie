@@ -4673,7 +4673,9 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
             .z = @intCast(self.layout_scratch.items.len),
             .flags = (if (pos.follows_scroll) c_api.LAYER_FOLLOWS_SCROLL else 0) |
                 (if (pos.mouse_enabled) c_api.LAYER_MOUSE_ENABLED else 0) |
-                (if (ent.zindex > 0) c_api.LAYER_FLOAT else 0),
+                (if (ent.zindex > 0) c_api.LAYER_FLOAT else 0) |
+                // msg_set_pos is the only placement without a window id.
+                (if (ent.zindex > 0 and !self.grid.grid_win_ids.contains(ent.grid_id)) c_api.LAYER_MSG else 0),
         }) catch |err| {
             failSurfaceLayout(self, err);
             return &.{};
@@ -17077,6 +17079,45 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
 }
 
+test "surface layout marks the msg_set_pos grid MSG as well as FLOAT" {
+    const State = struct {
+        count: usize = 0,
+        layers: [8]c_api.Layer = undefined,
+
+        fn onLayout(ctx: ?*anyopaque, _: i64, layers: [*]const c_api.Layer, count: usize, _: u32, _: u32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count = @min(count, self.layers.len);
+            for (0..self.count) |i| self.layers[i] = layers[i];
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(10, 40);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_surface_layout = State.onLayout;
+
+    // A win_float_pos float, then the msg grid the way msg_set_pos places it
+    // (no window id, zindex 200).
+    try core.grid.resizeGrid(3, 2, 6);
+    try core.grid.setWinFloatPos(3, 101, 1, 3, 50, 0, 1, true);
+    try core.grid.resizeGrid(4, 2, 40);
+    try core.grid.setWinFloatPos(4, 0, 8, 0, 200, 0, 1, true);
+
+    notifySurfaceLayouts(&core);
+    try std.testing.expectEqual(@as(usize, 3), state.count);
+    try std.testing.expectEqual(@as(i64, 3), state.layers[1].grid_id);
+    try std.testing.expect(state.layers[1].flags & c_api.LAYER_FLOAT != 0);
+    try std.testing.expect(state.layers[1].flags & c_api.LAYER_MSG == 0);
+    try std.testing.expectEqual(@as(i64, 4), state.layers[2].grid_id);
+    try std.testing.expect(state.layers[2].flags & c_api.LAYER_FLOAT != 0);
+    try std.testing.expect(state.layers[2].flags & c_api.LAYER_MSG != 0);
+}
+
 test "surface layout places splits and floats as ordered layers" {
     const State = struct {
         surface: i64 = 0,
@@ -17141,6 +17182,8 @@ test "surface layout places splits and floats as ordered layers" {
     try std.testing.expect(state.layers[2].flags & c_api.LAYER_FLOAT != 0);
     try std.testing.expect(state.layers[1].flags & c_api.LAYER_FLOAT == 0);
     try std.testing.expect(state.layers[0].flags & c_api.LAYER_FLOAT == 0);
+    // Neither is the msg grid.
+    for (state.layers[0..3]) |l| try std.testing.expect(l.flags & c_api.LAYER_MSG == 0);
 
     // Hiding the float drops its layer.
     try core.grid.hideWin(3);

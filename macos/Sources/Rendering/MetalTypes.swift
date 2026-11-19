@@ -1169,6 +1169,9 @@ struct SurfaceLayer {
     /// A floating window (Neovim zindex > 0), not a split; `z` is the paint
     /// rank and is > 0 for both.
     var isFloat: Bool = false
+    /// Neovim's msg grid (ZONVIE_LAYER_MSG). Also `isFloat`, but not a
+    /// win_float_pos float: iBelowFloats keeps it.
+    var isMsg: Bool = false
     /// A grid drawn in its own font (on_grid_font): its cell and the pixel
     /// box the core clips it to, margin included. 0 = the surface's cell.
     var cellWidthPx: Int = 0

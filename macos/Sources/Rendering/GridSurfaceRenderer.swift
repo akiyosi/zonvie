@@ -4681,7 +4681,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(shared.pipeline!)
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
-            if belowFloats && layer.isFloat { continue }
+            if belowFloats && layer.isFloat && !layer.isMsg { continue }
             let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rowCount = f.layerResolvableRowCount(entry)
