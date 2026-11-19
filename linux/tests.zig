@@ -26,4 +26,5 @@ test {
     _ = @import("panel_popup.zig");
     _ = @import("tray.zig");
     _ = @import("shell.zig");
+    _ = @import("shader_inputs.zig");
 }

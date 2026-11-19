@@ -945,8 +945,16 @@ pub fn scheduleReliableWindowMessage(
 /// windows compile the same config, so the flag they derive is identical).
 fn syncShaderInputsEnabled(app: *App) void {
     const corep = app.corep orelse return;
-    const want = if (app.renderer) |*r| r.shader_wants_edit_inputs else false;
-    core.zonvie_core_set_shader_inputs_enabled(corep, if (want) 1 else 0);
+    const r = if (app.renderer) |*r| r else {
+        core.zonvie_core_set_shader_inputs_enabled(corep, 0);
+        return;
+    };
+    const hl_src = r.shader_hl_groups_source.items;
+    core.zonvie_core_set_shader_hl_groups(corep, hl_src.ptr, hl_src.len);
+    var flags: i32 = 0;
+    if (r.shader_wants_edit_inputs) flags |= @intCast(core.SHADER_INPUT_CELL_AGE);
+    if (r.shader_wants_cell_text) flags |= @intCast(core.SHADER_INPUT_CELL_TEXT);
+    core.zonvie_core_set_shader_inputs_enabled(corep, flags);
 }
 
 pub fn scheduleDeviceLostRetry(hwnd: c.HWND, app: *App) void {
@@ -1527,6 +1535,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
         .on_cell_age_stamps = callbacks.onCellAgeStamps,
+        .on_cell_text_row = callbacks.onCellTextRow,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,
@@ -2386,13 +2395,18 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     // The chain renders over the full backbuffer, so iGridOrigin is where
     // the grid sits inside it: past the in-client tab bar or sidebar.
     g.cell_age = &app.cell_age;
+    g.cell_text = &app.cell_text;
     g.cell_w_px = app.cell_w_px;
     g.cell_h_px = app.rowHeightPx();
     g.cursor_blink_on = app.cursor_blink.visible;
+    g.shader_core = app.corep;
     g.shader_grid_origin = .{
         @floatFromInt(geom.content_x_offset orelse 0),
         @floatFromInt(geom.content_y_offset orelse 0),
     };
+    // Only the chain reads iLayers; a shader-less frame does no selection.
+    if (g.custom_shader_pipelines.items.len != 0)
+        app_mod.fillShaderLayers(g, in.tbs_snapshot.layers.slice(), g.shader_grid_origin, g.cell_w_px, g.cell_h_px);
 
     if (!in.snap.row_mode) return drawMainFlatFrame(hwnd, app, g, in, geom);
     return drawMainRowFrame(hwnd, app, g, in, geom, resized_before_draw);

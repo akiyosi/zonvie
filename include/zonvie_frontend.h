@@ -851,11 +851,48 @@ ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t le
 
 /* Whether a custom shader's source reads the cell-age inputs (iCellAge, the
    zonvieCellAge wrapper, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
-   allocate the cell-age texture, and opt in with
-   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does.
+   allocate the cell-age texture, and set ZONVIE_SHADER_INPUT_CELL_AGE with
+   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does
+   (ZONVIE_SHADER_INPUT_CELL_TEXT is the cell-text opt-in, below).
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
+
+/* Whether a custom shader's source reads the cell-text texture (iCellText,
+   or the zonvieCellText / zonvieCellTextAt wrappers). Frontends keep the
+   cell-text stores and texture only when a loaded shader does; such a
+   shader also counts as using the edit inputs above.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len);
+
+/* Most names a shader can declare with @zonvie-hl-groups: one bit each in a
+   cell texel's w. */
+#define ZONVIE_SHADER_HL_GROUPS_MAX 32
+
+/* Declare the highlight groups the loaded shader names. `source` is the
+   shader text (NULL with len 0 declares none); every line containing
+   `@zonvie-hl-groups:` contributes the whitespace-separated names after the
+   colon, to the end of the line. Name i, in order, is bit i of the cell
+   texels' w (zonvie_cell_text_row). Duplicates keep their first index;
+   names past ZONVIE_SHADER_HL_GROUPS_MAX are ignored.
+   Post: the core's per-attr mask table follows the declaration and every
+   later redefinition of an attr; when a mask that cells may show changes
+   while cell text is on, every surface's rows are redelivered by the next
+   flush. With no name declared the core keeps no table and texels carry
+   w == 0.
+   Neovim side effect: once attached, each declared group that is a `:hi
+   link` (or, for a dotted Treesitter name, undefined) is redefined in
+   Neovim with its resolved attributes, so cells report it by its own name.
+   It looks the same, `:hi` shows a direct definition, and a later `:hi`
+   change to the old link target is not followed until the next
+   ColorScheme, which re-applies. A group the user or a plugin defines
+   directly is left alone. Declaring no names (after some) only removes the
+   ColorScheme autocmd; links are not restored. Lookups never create a
+   group; the state lives in the Lua global `zonvie_shader_hl` and the
+   augroup `ZonvieShaderHlGroups`. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
+   from inside a core callback. */
+ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
 
 /* Whether a custom shader's source reads iPrevFrame. Frontends allocate the
    feedback pair, and render the last pass into it plus a copy to the
@@ -863,6 +900,24 @@ ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t l
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_prev_frame(const char *source, size_t len);
+
+/* Whether a custom shader's source names iBelowFloats (whole word).
+   Frontends create the below-floats texture and fill it only when a loaded
+   shader does, and release it once none does.
+   iBelowFloats (sampler slot 6: Metal texture/sampler 6, HLSL t6/s6, GL
+   uniform `zonvie_iBelowFloatsTex` on unit 6), sampled through the same
+   screen-space wrapper as iChannel0:
+   Pre: the frontend has drawn, this frame, the surface's root rows, its
+   splits and its msg grid (every layer without ZONVIE_SHADER_LAYER_FLOAT,
+   plus those with ZONVIE_SHADER_LAYER_MSG), and none of: win_float_pos
+   floats, the cursor, the scrollbar, ext UI overlays (popupmenu, cmdline,
+   messages windows).
+   Post: same size and pixel space as iChannel0. Reads black (0) when the
+   frontend has no below-floats content for the frame: a failed pass, or on
+   Windows a frame drawn before the first row commit (background only).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_below_floats(const char *source, size_t len);
 
 /* Whether a custom shader's source carries the `@zonvie-owns-cursor` token:
    once iCurrentCursor holds a non-empty rect, the frontend skips its native
@@ -1033,11 +1088,25 @@ typedef enum {
     ZONVIE_SHADER_TARGET_GLSL = 2, /* GLSL 330 core (OpenGL 3.3 on Linux); resources bind by name */
 } zonvie_shader_target;
 
+/* Entries of iLayers, three vec4 each. */
+#define ZONVIE_SHADER_LAYERS_MAX 16
+
+/* iLayers entry flags: the .w word of [3i+2], as a float holding a small
+   integer. FLOAT: placed by win_float_pos. FONT_GRID: the layer has its own
+   font (the cell in [3i+1] is that font's). FOCUSABLE: the layer takes
+   mouse input (its zonvie_layer MOUSE_ENABLED flag); the frontend passes it.
+   BORDER: reserved and never set, because Neovim's UI protocol does not
+   report a float's border; zonvie_shader_fill_layers clears it. */
+#define ZONVIE_SHADER_LAYER_FLOAT     (1u << 0)
+#define ZONVIE_SHADER_LAYER_FONT_GRID (1u << 1)
+#define ZONVIE_SHADER_LAYER_FOCUSABLE (1u << 2)
+#define ZONVIE_SHADER_LAYER_BORDER    (1u << 3)
+
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
    declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
-   Frontends populate this struct in place and upload 160 bytes to the
-   uniform buffer each frame.
+   Frontends populate this struct in place and upload
+   sizeof(zonvie_shader_uniforms) bytes to the uniform buffer each frame.
 
    Field order and offsets are load-bearing; do not reorder. std140 lays
    iTime into the trailing 4 bytes of iResolution's 16-byte slot.
@@ -1091,7 +1160,40 @@ typedef struct zonvie_shader_uniforms {
     int32_t  iCursorVisible;          /* 180..183  0 while blink-off */
     int32_t  iCurrentCursorStyle;     /* 184..187 */
     int32_t  iPreviousCursorStyle;    /* 188..191 */
+    /* Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
+       the surface root's cell; iCursorCellSize is the cell of the grid the
+       cursor is in, which the cursor styles are classified against.
+       iLayers lists, topmost first, every non-root layer (at most
+       ZONVIE_SHADER_LAYERS_MAX), three vec4 each; see
+       zonvie_shader_fill_layers. */
+    float    iCursorCellSize[2];      /* 192..199 */
+    int32_t  iLayerCount;             /* 200..203 */
+    int32_t  iRootRows;               /* 204..207  rows of the surface lattice */
+    float    iLayers[ZONVIE_SHADER_LAYERS_MAX * 3][4]; /* 208..975 */
+    /* Ghostty's colour uniforms, vec3 rgb in 0..1 in a 16-byte std140
+       slot ([3] is padding, 0); see zonvie_shader_fill_colors. Their
+       names are declared by the preamble, so a user shader that declares
+       its own iCursorColor (etc.) fails to compile, as in Ghostty. */
+    float    iBackgroundColor[4];     /* 976..991   default background */
+    float    iForegroundColor[4];     /* 992..1007  default foreground */
+    float    iCursorColor[4];         /* 1008..1023 cursor fill */
+    float    iCursorText[4];          /* 1024..1039 text drawn on the cursor */
 } zonvie_shader_uniforms;
+
+/* One layer of a surface for zonvie_shader_fill_layers. The rect is in
+   fragCoord space: the surface's iGridOrigin plus the layer's origin. A grid
+   in its own font gives its cell and its extent (margin included); any
+   other layer cell 0 and rows x cols global cells, except under a root in
+   its own font, where every layer gives a cell (its text has a band). z is
+   the layer's back-to-front rank (zonvie_layer.z), unique per surface. */
+typedef struct zonvie_shader_layer {
+    int64_t  grid_id;
+    float    x_px, y_px, w_px, h_px;
+    float    cell_w_px, cell_h_px;
+    uint32_t rows, cols;
+    uint32_t z;
+    uint32_t flags;      /* ZONVIE_SHADER_LAYER_*; FONT_GRID is ignored here */
+} zonvie_shader_layer;
 
 /* ---------------------------------------------------------------------------
    iCellAge stores.
@@ -1133,6 +1235,66 @@ ZONVIE_API void zonvie_cell_age_end_upload(zonvie_cell_age_stores *stores);
 ZONVIE_API void zonvie_cell_age_drop(zonvie_cell_age_stores *stores, int64_t grid);
 ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
 
+/* A shader that reads any edit input also reads iRowOffset (binding 5): one
+   r32float texel per screen cell of the surface, holding how many pixels
+   down that cell's content is drawn from its grid rect this frame (a smooth
+   scroll in progress; 0 at rest). Per cell because side-by-side windows
+   share rows and scroll apart. The preamble's zonvieCellAt subtracts it
+   before indexing iCellAge / iCellText, and zonvieRowOffset hands it to a
+   shader that draws in cell space; a frontend that displaces rows must
+   bind it, sized like those textures and indexed the same way. */
+
+/* ---------------------------------------------------------------------------
+   iCellText stores.
+
+   The CPU side of every surface's iCellText texture: one rgba32ui mirror
+   (ZONVIE_CELL_TEXEL_STRIDE uint32_t per cell, the texel of
+   zonvie_cell_text_row) per
+   zonvie_cell_text_row.grid value, sized by the rows delivered to it. A
+   frontend creates one store set, feeds it every on_cell_text_row with
+   zonvie_cell_text_apply_row (core thread), which only STAGES the row.
+   Each surface calls zonvie_cell_text_commit for its grid from its own
+   flush commit, under the lock its draw takes to snapshot rows and sync
+   this texture, so a frame never pairs one flush's rows with another's
+   text; a refused flush calls zonvie_cell_text_discard, which drops the
+   staged rows of EVERY grid. That is correct only because a refused flush
+   is all-or-nothing across surfaces: no surface commits a flush that
+   another refused, so no grid's staged rows belong to a committed flush.
+   Each shaded draw calls zonvie_cell_text_sync for its own grid:
+     0  nothing to bind (no row delivered yet, or out of memory);
+     1  the texture already holds the mirror;
+     2  *out_values is the cache->cols x cache->rows mirror to upload
+        (cols * rows * ZONVIE_CELL_TEXEL_STRIDE uint32_t, row pitch
+        cols * 16 bytes), and
+        the store's lock stays held until zonvie_cell_text_end_upload.
+   `cache` is the caller's, one per texture, zero-initialised and otherwise
+   opaque: while that grid's store is unchanged since its last sync, the
+   call returns 1 without taking the lock (for the first 16 live stores).
+   Its cols/rows are the texture size as of the sync; (re)create the texture
+   when they differ from the one bound. `force` marks the mirror dirty
+   first, for a texture just created. Drop a grid's store when its window
+   closes. The lock is a leaf: call nothing between sync and end_upload but
+   the copy out of *out_values. */
+typedef struct zonvie_cell_text_stores zonvie_cell_text_stores;
+typedef struct {
+    uint64_t version;
+    uint32_t slot;
+    uint32_t cols;
+    uint32_t rows;
+} zonvie_cell_text_cache;
+ZONVIE_API zonvie_cell_text_stores *zonvie_cell_text_create(void);
+ZONVIE_API void zonvie_cell_text_destroy(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_apply_row(zonvie_cell_text_stores *stores,
+    const zonvie_cell_text_row *row);
+ZONVIE_API int32_t zonvie_cell_text_sync(zonvie_cell_text_stores *stores,
+    int64_t grid, bool force, zonvie_cell_text_cache *cache,
+    const uint32_t **out_values);
+ZONVIE_API void zonvie_cell_text_commit(zonvie_cell_text_stores *stores, int64_t grid);
+ZONVIE_API void zonvie_cell_text_discard(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_end_upload(zonvie_cell_text_stores *stores);
+ZONVIE_API void zonvie_cell_text_drop(zonvie_cell_text_stores *stores, int64_t grid);
+ZONVIE_API void zonvie_cell_text_remove_all(zonvie_cell_text_stores *stores);
+
 /* The cells a screen-space iCellAge texture needs to cover a surface:
    ceil(surface / cell) per axis, 0 x 0 while either metric is 0.
    `row_h_px` is the grid row height with 'linespace' included — the height
@@ -1143,13 +1305,52 @@ ZONVIE_API void zonvie_cell_age_surface_grid(float surface_w_px, float surface_h
 /* Fill iCellSize, iGridOrigin, iTimeLastEdit, iCursorVisible and both
    cursor styles of `u` for one surface. Call after iCurrentCursor and
    iPreviousCursor are set; the styles are classified from those rects
-   against (cell_w_px, row_h_px). iCellSize.y is `row_h_px`, the grid row
-   height with 'linespace' included, so cell lookups track the drawn rows.
+   against the cursor grid's cell (cursor_cell_w_px, cursor_row_h_px).
+   iCellSize is the surface root's (cell_w_px, row_h_px), the row height
+   with 'linespace' included, so cell lookups track the drawn rows.
    iTimeLastEdit is `time_last_edit` (the surface's
    zonvie_cell_age_cache.last_edit) when `wants_edit_inputs`, else 0. Pure. */
 ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
-    float cell_w_px, float row_h_px, float grid_origin_x_px, float grid_origin_y_px,
+    float cell_w_px, float row_h_px, float cursor_cell_w_px, float cursor_row_h_px,
+    float grid_origin_x_px, float grid_origin_y_px,
     float time_last_edit, bool cursor_visible, bool wants_edit_inputs);
+
+/* Fill iRootRows and iLayers of `u` from a surface's `n` layers, which
+   must be every layer of the surface but its root: band rows are summed
+   over them. Topmost first, every layer, cell or not, at most
+   ZONVIE_SHADER_LAYERS_MAX. The lowest layers past that have no entry:
+   where no listed layer covers them the shader reads the surface lattice,
+   which holds what lies under a layer in its own font (under a root in its
+   own font, the root's text), not that layer's. [3i] the rect; [3i+1] cell w, h and the first
+   iCellText row of the grid's band, all zero for a layer on the surface
+   lattice, .w unused; [3i+2] rows, cols, grid id, flags. Bands follow the
+   root's rows in grid-id order, the rule the core writes on_cell_text_row
+   by. Pure.
+   Pre: every |grid_id| < 1 << 24 (exact in a float; negative ids of the
+   core's special grids are valid; checked by a debug assert before any write);
+   rects may be NULL only when n == 0; ids and z are unique per surface.
+   Post: iRootRows == root_rows; iLayerCount in [0, MAX]; entries past
+   iLayerCount are untouched and must not be read; iLayerCount ==
+   min(n, MAX); flags word = the caller's flags with FONT_GRID set exactly
+   when the layer has a cell and BORDER always cleared. */
+ZONVIE_API void zonvie_shader_fill_layers(zonvie_shader_uniforms *u,
+    const zonvie_shader_layer *layers, size_t n, uint32_t root_rows);
+
+/* The ZONVIE_SHADER_LAYER_* flags a frontend passes in zonvie_shader_layer
+   for a zonvie_layer with `layer_flags`. Pure.
+   Post: FLOAT exactly when ZONVIE_LAYER_FLOAT is set and ZONVIE_LAYER_MSG is
+   not; FOCUSABLE exactly when ZONVIE_LAYER_MOUSE_ENABLED is set; no other
+   bit. */
+ZONVIE_API uint32_t zonvie_shader_layer_flags(uint32_t layer_flags);
+
+/* Fill iBackgroundColor, iForegroundColor, iCursorColor and iCursorText of
+   `u` from the core's latest colour snapshot: Neovim's default colours,
+   and the cursor attr's bg (fill) and fg (text), or default fg and bg
+   when the cursor has attr 0 (the Nvim swap the drawn cursor uses). The
+   snapshot is republished once per flush, and is read whole (never a mix of two). Any thread.
+   Pre: u non-NULL; core NULL leaves u unchanged.
+   Post: only bytes 976..1039 written; each channel = byte/255, [3] = 0. */
+ZONVIE_API void zonvie_shader_fill_colors(const zonvie_core *core, zonvie_shader_uniforms *u);
 
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */

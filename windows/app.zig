@@ -475,6 +475,11 @@ pub const SurfaceLayer = struct {
     /// it -- Neovim refuses an event addressed to such a window rather than
     /// passing it to what is behind.
     mouse_enabled: bool = true,
+    /// A floating window (Neovim zindex > 0), not a split.
+    is_float: bool = false,
+    /// Neovim's message grid (ZONVIE_LAYER_MSG). It is also is_float, but
+    /// iBelowFloats keeps it.
+    is_msg: bool = false,
     /// A grid drawn in its own font (on_grid_font), stamped at commit
     /// (App.commitGridFonts): its cell and the pixel box the core clips it
     /// to, margin included. 0 = the surface's cell.
@@ -576,6 +581,45 @@ fn setLayerFont(l: *SurfaceLayer, gf: ?GridFontPx) void {
     l.font_cell_h_px = f.cell_h_px;
     l.font_extent_w_px = f.extent_w_px;
     l.font_extent_h_px = f.extent_h_px;
+}
+
+/// Hand a surface's renderer iRootRows and iLayers for its custom shader
+/// (core.fillLayers). `layers` is the paint's pinned list, root first;
+/// rects are placed from `origin`, the renderer's iGridOrigin, by each
+/// layer's offset from the root. Layers are placed in global cells
+/// (`cell_w_px`/`row_h_px`) whatever the root's font; under a root in its
+/// own font every layer has a band of its own, as the core writes it. The
+/// buffer holds the topmost layers, the ones the table can list.
+pub fn fillShaderLayers(r: anytype, layers: []const SurfaceLayer, origin: [2]f32, cell_w_px: u32, row_h_px: u32) void {
+    var in: [256]core.zonvie_shader_layer = undefined;
+    const root_rows: u32 = if (layers.len != 0) layers[0].rows else 0;
+    const root_font = layers.len != 0 and layers[0].font_cell_w_px > 0;
+    const placed = if (layers.len > 1) layers[1..] else layers[0..0];
+    var n: usize = 0;
+    for (placed[placed.len - @min(placed.len, in.len) ..]) |l| {
+        const font = l.font_cell_w_px > 0;
+        in[n] = .{
+            .grid_id = l.grid_id,
+            .x_px = origin[0] + @as(f32, @floatFromInt(l.x_px)),
+            .y_px = origin[1] + @as(f32, @floatFromInt(l.y_px)),
+            .w_px = @floatFromInt(if (font) l.font_extent_w_px else l.cols * cell_w_px),
+            .h_px = @floatFromInt(if (font) l.font_extent_h_px else l.rows * row_h_px),
+            .cell_w_px = @floatFromInt(if (font) l.font_cell_w_px else if (root_font) cell_w_px else 0),
+            .cell_h_px = @floatFromInt(if (font) l.font_cell_h_px else if (root_font) row_h_px else 0),
+            .rows = l.rows,
+            .cols = l.cols,
+            .z = @intCast(@max(l.z, 0)),
+            .flags = core.shaderLayerFlags((if (l.is_float) core.LAYER_FLOAT else 0) |
+                (if (l.is_msg) core.LAYER_MSG else 0) |
+                (if (l.mouse_enabled) core.LAYER_MOUSE_ENABLED else 0)),
+        };
+        n += 1;
+    }
+    var u: core.zonvie_shader_uniforms = .{};
+    core.fillLayers(&u, in[0..n], root_rows);
+    r.shader_root_rows = u.iRootRows;
+    r.shader_layer_count = u.iLayerCount;
+    r.shader_layers = u.iLayers;
 }
 
 /// The row height and cell width of `grid_id`'s layer, or the surface's when
@@ -5408,6 +5452,154 @@ pub const RowFrameOutcome = struct {
     }
 };
 
+/// iBelowFloats (Renderer.beginBelowFloats): every root row and every row of
+/// each layer that is not a win_float_pos float, without the cursor, at the
+/// same scroll-ease offsets the normal pass drew. Reads the pinned set only:
+/// the frame's plan, bands, draw counts, row buffers and their budget stay
+/// the normal pass's (a row whose own buffer is not current is drawn from
+/// the renderer's scratch buffer). Any failure leaves the target unbound.
+fn drawBelowFloats(
+    g: *d3d11.Renderer,
+    surface: RowFrameSurface,
+    in: RowFrameInput,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+    layer_row_h_px: i32,
+    cell_w_px: i32,
+) void {
+    const p = in.draw_params;
+    const sc_fn = rs_set_sc_fn orelse return;
+    const ctx = ctx_ptr orelse return;
+    if (p.row_h_px <= 0) return;
+    const content: c.D3D11_RECT = .{
+        .left = p.x_offset,
+        .top = p.y_offset,
+        .right = p.content_right,
+        .bottom = p.y_offset + @as(i32, @intCast(p.content_height)),
+    };
+    if (!g.beginBelowFloats(content)) return;
+    var ok = true;
+    defer g.endBelowFloats(ok);
+    const vp_w: f32 = @floatFromInt(rowModeViewportWidth(g, p));
+    const vp_h: f32 = @floatFromInt(p.content_height);
+
+    // Root rows; an eased region under one scissor at the ease offset, with
+    // the rows it retained, as drawRowModeSetupAndRowsFromSlots does.
+    const root_region: [2]u32 = if (p.root_ease) |e| e.region(in.row_map.len) else .{ 0, 0 };
+    const root_n = @min(in.row_map.len, surface.row_vbs.len);
+    for (0..root_n) |ri| {
+        if (ri >= root_region[0] and ri < root_region[1]) continue;
+        const band = rootRowBandPx(@intCast(ri), in.row_map.len, p.row_h_px, p.root_extent_h_px);
+        var sc: c.D3D11_RECT = .{ .left = p.x_offset, .top = p.y_offset + band[0], .right = p.content_right, .bottom = p.y_offset + band[1] };
+        if (sc.bottom <= sc.top) continue;
+        sc_fn(ctx, 1, &sc);
+        drawBelowRow(g, &surface.row_vbs[ri], in.row_map[ri], surface.pool, ri, p.layer_origin_x_px, p.layer_origin_y_px, p.row_h_px, vp_w, vp_h, null) catch {
+            ok = false;
+        };
+    }
+    if (root_region[1] > root_region[0]) {
+        const e = p.root_ease.?;
+        var sc: c.D3D11_RECT = .{
+            .left = p.x_offset,
+            .top = p.y_offset + @as(i32, @intCast(root_region[0])) * p.row_h_px,
+            .right = p.content_right,
+            .bottom = p.y_offset + @as(i32, @intCast(root_region[1])) * p.row_h_px,
+        };
+        sc_fn(ctx, 1, &sc);
+        for (root_region[0]..@min(root_region[1], root_n)) |ri| {
+            drawBelowRow(g, &surface.row_vbs[ri], in.row_map[ri], surface.pool, ri, p.layer_origin_x_px, p.layer_origin_y_px, p.row_h_px, vp_w, vp_h, e.offset_px) catch {
+                ok = false;
+            };
+        }
+        if (e.drawRetained(g, p.layer_origin_x_px, p.layer_origin_y_px, vp_w, vp_h, p.row_h_px) != 0) ok = false;
+    }
+
+    if (in.layer_src) |src| if (in.layers.len > 1 and layer_row_h_px > 0) for (in.layers[1..]) |layer| {
+        if (layer.is_float and !layer.is_msg) continue;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const rows = src.rows(layer);
+        const row_limit = @min(rows.len, state.row_vbs.items.len);
+        const d = LayerRowDrawCtx{
+            .layer = layer,
+            .layer_w_px = layer.widthPx(cell_w_px),
+            .origin_x = @floatFromInt(layer.x_px),
+            .origin_y = @floatFromInt(layer.y_px),
+            .base_vp = .{ .x = 0, .y = 0, .w = vp_w, .h = vp_h },
+            .x_offset = p.x_offset,
+            .y_offset = p.y_offset,
+            .content_right = p.content_right,
+            .row_h_px = layer.rowHeightPx(layer_row_h_px),
+            .ctx_ptr = ctx,
+            .rs_set_sc_fn = sc_fn,
+        };
+        const region = state.ease.region(row_limit);
+        // A layer row overwrites its band with the bg first, as
+        // drawLayerRowUnder does, so a translucent row does not blend over
+        // the root beneath it.
+        const overwrite = g.opacity < 1.0 or g.blur_enabled;
+        for (0..row_limit) |ri| {
+            if (ri >= region[0] and ri < region[1]) continue;
+            var sc = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse continue;
+            sc_fn(ctx, 1, &sc);
+            const empty = rows[ri].slot == SLOT_NONE or src.pool.slotPtrConst(rows[ri].slot).verts.items.len == 0;
+            if (overwrite or empty) g.drawClearRowOverwrite() catch {
+                ok = false;
+            };
+            drawBelowRow(g, &state.row_vbs.items[ri], rows[ri], src.pool, ri, d.origin_x, d.origin_y, d.row_h_px, vp_w, vp_h, null) catch {
+                ok = false;
+            };
+        }
+        if (region[1] > region[0]) {
+            if (layerRowsScissor(d, region[0], region[1])) |sc0| {
+                var sc = sc0;
+                sc_fn(ctx, 1, &sc);
+                g.drawClearRowOverwrite() catch {
+                    ok = false;
+                };
+                for (region[0]..region[1]) |ri| {
+                    drawBelowRow(g, &state.row_vbs.items[ri], rows[ri], src.pool, ri, d.origin_x, d.origin_y, d.row_h_px, vp_w, vp_h, state.ease.offset_px) catch {
+                        ok = false;
+                    };
+                }
+                if (state.ease.drawRetained(g, d.origin_x, d.origin_y, vp_w, vp_h, d.row_h_px) != 0) ok = false;
+            }
+        }
+    };
+    g.setLayerTransform(0, 0, vp_w, vp_h) catch {
+        ok = false;
+    };
+}
+
+/// One row of drawBelowFloats under the scissor the caller set: from the
+/// row's own buffer when it holds this slot's current vertices, otherwise
+/// from the renderer's scratch buffer. Never uploads into `rvb`.
+fn drawBelowRow(
+    g: *d3d11.Renderer,
+    rvb: *const RowVB,
+    mapping: RowMapping,
+    pool: *const SlotPool,
+    ri: usize,
+    origin_x: f32,
+    origin_y: f32,
+    row_h_px: i32,
+    vp_w: f32,
+    vp_h: f32,
+    ease_offset_px: ?f32,
+) !void {
+    if (mapping.slot == SLOT_NONE) return;
+    const slot = pool.slotPtrConst(mapping.slot);
+    const verts = slot.verts.items;
+    if (verts.len == 0) return;
+    const row_dy = slotRowShiftPx(slot, ri, row_h_px);
+    try g.setLayerTransformScrolled(origin_x, origin_y + row_dy, vp_w, vp_h, ease_offset_px orelse 0);
+    // Under a translucent surface the target holds the bg overwrite already;
+    // the row's own bg quads blend over it as they do over back_tex's.
+    if (rvb.vb) |vb| if (rvb.uploaded_slot == mapping.slot and rvb.uploaded_ver == slot.ver and rvb.vb_bytes >= verts.len * @sizeOf(Vertex)) {
+        return g.drawVB(vb, verts.len);
+    };
+    try g.drawBelowFloatsVerts(verts);
+}
+
 /// One surface's row frame, root rows to bloom, in the order both paint
 /// drivers used to run it separately: root rows, hosted layers, cursor
 /// overlay, bloom. Snapshot, present rectangles, Present, and the chrome
@@ -5505,6 +5697,30 @@ pub fn drawSurfaceRowFrame(
             log_enabled,
         );
         if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
+    }
+
+    if (!out.layers.incomplete()) drawBelowFloats(g, surface, in, out.rows.ctx_ptr, out.rows.rs_set_sc_fn, layer_row_h_px, cell_w_px);
+
+    // Where this frame's eases drew each row, for the shader's iRowOffset:
+    // the root's scroll region at its offset, then every eased layer's
+    // region at the layer's rows, which wins where it covers the root.
+    if (g.shader_wants_edit_inputs and row_h_px > 0) {
+        const surface_cols: usize = @intCast(@max(1, @divFloor(@as(i64, rowModeViewportWidth(g, in.draw_params)), @as(i64, cell_w_px))));
+        g.beginRowOffsets(surface_cols, in.row_map.len);
+        if (in.draw_params.root_ease) |ease| {
+            const r = ease.region(in.row_map.len);
+            g.addRowOffset(0, @intCast(surface_cols), r[0], r[1], ease.offset_px);
+        }
+        if (in.layer_src) |src| {
+            if (in.layers.len > 1) for (in.layers[1..]) |layer| {
+                const state = src.paint.layerState(layer.grid_id) orelse continue;
+                if (!state.ease.easing) continue;
+                const r = state.ease.region(layer.rows);
+                const top: i64 = @divFloor(@as(i64, layer.y_px), @as(i64, row_h_px));
+                const left: i64 = @divFloor(@as(i64, layer.x_px), @as(i64, cell_w_px));
+                g.addRowOffset(left, left + @as(i64, layer.cols), top + r[0], top + r[1], state.ease.offset_px);
+            };
+        }
     }
 
     // The cursor's own row in its layer. Blink-off redraws this instead of
@@ -6285,6 +6501,11 @@ pub const App = struct {
     /// iCellAge mirrors for the main and every external window, written by
     /// on_cell_age_stamps and read by each renderer's shaded draw.
     cell_age: core.cell_age_store.Stores,
+    /// iCellText mirrors, written by on_cell_text_row.
+    cell_text: core.cell_text_store.Stores,
+    /// Whether the loaded chain reads iCellText, as of this flush's begin.
+    /// Core thread only: written at onFlushBegin, read per row.
+    flush_wants_cell_text: bool = false,
     /// One slot per decorated grid id; see ParkedExternalWindow.
     parked_external_windows: [4]?ParkedExternalWindow = .{null} ** 4,
 
@@ -6794,6 +7015,7 @@ pub const App = struct {
         }
         // After every renderer that pointed at it.
         self.cell_age.deinit();
+        self.cell_text.deinit();
 
         // Release App's own reference on the shared D3D11 device/context (the
         // renderer, as of this fix, takes and releases its OWN reference via

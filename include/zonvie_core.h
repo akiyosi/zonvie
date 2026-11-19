@@ -438,6 +438,11 @@ typedef void (*zonvie_on_external_window_close_fn)(
    the paint rank and is >= 1 for every hosted layer, so it cannot tell them
    apart; a fixed-float mask over scrolled content wants only these. */
 #define ZONVIE_LAYER_FLOAT (1u << 2)
+/* This layer is Neovim's message grid (msg_set_pos). It carries FLOAT as
+   well, since Neovim places it with a zindex, but it is not a win_float_pos
+   float: iBelowFloats keeps it and the shader layer table does not mark it
+   ZONVIE_SHADER_LAYER_FLOAT (zonvie_shader_layer_flags). */
+#define ZONVIE_LAYER_MSG (1u << 3)
 
 typedef struct zonvie_layer {
     int64_t  grid_id;
@@ -888,6 +893,61 @@ typedef struct zonvie_cell_stamp {
     int16_t grid;
 } zonvie_cell_stamp;
 
+/* Style bits in the top byte of a cell texel's y (zonvie_cell_text_row). */
+#define ZONVIE_CELL_ATTR_BOLD          (1u << 0)
+#define ZONVIE_CELL_ATTR_ITALIC        (1u << 1)
+#define ZONVIE_CELL_ATTR_STRIKETHROUGH (1u << 2)
+#define ZONVIE_CELL_ATTR_UNDERLINE     (1u << 3)
+#define ZONVIE_CELL_ATTR_UNDERCURL     (1u << 4)
+#define ZONVIE_CELL_ATTR_UNDERDOUBLE   (1u << 5)
+#define ZONVIE_CELL_ATTR_UNDERDOTTED   (1u << 6)
+#define ZONVIE_CELL_ATTR_UNDERDASHED   (1u << 7)
+
+/* uint32_t per cell in zonvie_cell_text_row.texels and the cell-text stores. */
+#define ZONVIE_CELL_TEXEL_STRIDE 4
+
+/* One row of cell texels for the iCellText texture a custom shader samples,
+   delivered by on_cell_text_row right after that row's on_vertices_row.
+   `grid` selects the texture: 1 is the main window's screen-space cell grid,
+   any other value is an EXTERNAL window's grid id with row/col local to it.
+   A layer's rows land on the texture of the surface that places it, at its
+   placement, so a float on an external window writes that window's texture.
+   Cells a higher layer covers are not delivered for the row beneath; a row
+   may therefore arrive as several runs. A layer drawn in its own font
+   (on_grid_font), and every layer of a surface whose root is drawn in its
+   own font, is the exception: its cells are not on the surface's lattice,
+   so its rows go to a band of their own below the root's rows, from column
+   0, and it covers nothing beneath. Bands follow in grid-id order
+   (zonvie_shader_fill_layers states the same rule to the shader).
+   tex_rows x tex_cols is that texture's cell grid: the root's rows plus
+   every band, as wide as the widest of the root and the bands; a change
+   of either starts the texture blank. On that, and on any move of a band,
+   every row of the surface is redelivered. `texels` holds `count` texels of
+   ZONVIE_CELL_TEXEL_STRIDE uint32_t each for cells (row, col..col+count),
+   one rgba32ui texel per cell:
+     x  codepoint: 0 for the second cell of a wide glyph, 32 for a blank;
+     y  fg rgb24 | ZONVIE_CELL_ATTR_* << 24;
+     z  bg rgb24;
+     w  highlight-group mask: bit i set when the cell's attr was composed
+        from the i-th name declared with zonvie_core_set_shader_hl_groups;
+        0 when none is declared.
+   fg and bg are Zonvie's resolved colours as drawn: defaults substituted,
+   reverse applied, blend mixed against the default bg (not the pixels
+   underneath); never 0 meaning "default". The second cell of a wide glyph
+   carries its glyph's fg, bg, attr and mask. A texel never delivered reads
+   all zero, so w == 0 && y == 0 && z == 0 means "no data". The pointer is
+   valid only for the call. */
+typedef struct zonvie_cell_text_row {
+    int64_t  grid;
+    uint32_t tex_rows;
+    uint32_t tex_cols;
+    uint32_t row;
+    uint32_t col;
+    uint32_t count;
+    uint32_t _pad;
+    const uint32_t *texels;
+} zonvie_cell_text_row;
+
 typedef struct zonvie_callbacks {
     /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
        NULL otherwise. callbacks_size only sees the struct's length, not a
@@ -1092,7 +1152,7 @@ typedef struct zonvie_callbacks {
        iCellAge texture a custom shader samples. Called at most once per
        flush, after all vertices are submitted and before on_flush_end, and
        ONLY after the frontend opted in with
-       zonvie_core_set_shader_inputs_enabled — a frontend without a custom
+       ZONVIE_SHADER_INPUT_CELL_AGE via zonvie_core_set_shader_inputs_enabled — a frontend without a custom
        shader never sees this callback and the core never builds the list.
 
        When `clear` is non-zero the frontend must zero EVERY cell-age
@@ -1118,6 +1178,17 @@ typedef struct zonvie_callbacks {
     zonvie_shape_text_run_ex_fn on_shape_text_run_ex;
     zonvie_rasterize_glyph_ex_fn on_rasterize_glyph_ex;
     zonvie_rasterize_glyph_by_id_ex_fn on_rasterize_glyph_by_id_ex;
+    /* The cell texels of a row the flush just sent, for the iCellText texture
+       a custom shader samples: one call per run of the row no higher layer
+       covers (none when it is all covered), or one for a band row (see
+       zonvie_cell_text_row). Also for rows the frontend keeps across a row
+       shift, at their new place. ONLY after the frontend opted in with
+       ZONVIE_SHADER_INPUT_CELL_TEXT via zonvie_core_set_shader_inputs_enabled;
+       the first flush after each call that sets that bit delivers every row of every surface, so a
+       frontend may start its texture blank there. Rows not resent keep their
+       previous codepoints, as with on_vertices_row. Runs on the core thread
+       with grid_mu held. Appended at the end for ABI compat. */
+    void (*on_cell_text_row)(void* ctx, const zonvie_cell_text_row* row);
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1168,12 +1239,23 @@ ZONVIE_API void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
-/* Opt in to the per-flush cell-age stamp list delivered via
-   on_cell_age_stamps. Off by default: with it off the core builds no list
-   and never fires the callback, so a frontend without a custom shader that
-   reads the edit inputs pays nothing. Frontends toggle this when such a
-   shader is loaded or unloaded. */
-ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int enabled);
+/* Shader-input opt-in bits for zonvie_core_set_shader_inputs_enabled. */
+#define ZONVIE_SHADER_INPUT_CELL_AGE  (1u << 0)
+#define ZONVIE_SHADER_INPUT_CELL_TEXT (1u << 1)
+
+/* Opt in to the shader cell inputs. `flags` is a bit set; 0 (the default)
+   is off, and unknown bits are ignored. Each call replaces the whole set.
+     ZONVIE_SHADER_INPUT_CELL_AGE  - the per-flush cell-age stamp list,
+       delivered via on_cell_age_stamps (what a non-zero value meant before
+       the bits existed).
+     ZONVIE_SHADER_INPUT_CELL_TEXT - the per-row codepoints delivered via
+       on_cell_text_row. The first flush after a call that sets this bit
+       delivers every row of every surface.
+   With a bit clear the core builds nothing for it and never fires its
+   callback, so a shader that reads only iCellAge pays nothing for cell
+   text. A shader that reads iCellText passes both bits. Frontends toggle
+   this when a shader that reads the inputs is loaded or unloaded. */
+ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int32_t flags);
 
 /* Process due message timeouts (including the throttled message float scroll)
  * and render-maintenance retries. Frontends

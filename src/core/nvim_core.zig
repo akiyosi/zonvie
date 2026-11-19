@@ -20,6 +20,7 @@ const vertexgen = @import("vertexgen.zig");
 const pointer_target = @import("pointer_target.zig");
 const font_slots = @import("font_slots.zig");
 const clock = @import("clock.zig");
+const frontend_rules = @import("frontend_rules.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
 /// reaching into `rpc_transport`.
@@ -488,6 +489,10 @@ pub const Callbacks = struct {
     on_shape_text_run_ex: ?c_api.ShapeTextRunExFn = null,
     on_rasterize_glyph_ex: ?c_api.RasterizeGlyphExFn = null,
     on_rasterize_glyph_by_id_ex: ?c_api.RasterizeGlyphExFn = null,
+    /// The cell texels of a row the flush just sent (on_vertices_row), for
+    /// the iCellText texture a custom shader samples. Only while the
+    /// frontend has opted in via zonvie_core_set_shader_inputs_enabled.
+    on_cell_text_row: ?*const fn (ctx: ?*anyopaque, row: *const c_api.zonvie_cell_text_row) callconv(.c) void = null,
 };
 
 const GridEntry = flush.GridEntry;
@@ -589,6 +594,44 @@ pub const SavedLedger = struct {
     /// invalid; `counts` is not recorded for it.
     ledger_valid: bool = true,
     live: bool = false,
+};
+
+/// Seqlocked snapshot of the colours behind the Ghostty colour uniforms,
+/// rgb24 each. One writer (grid_mu held), any number of lock-free readers;
+/// a read returns one whole published snapshot, never a mix of two.
+pub const ShaderColors = struct {
+    pub const Snapshot = struct { default_fg: u32, default_bg: u32, cursor: u32, cursor_text: u32 };
+
+    /// Odd while a write is in progress.
+    seq: std.atomic.Value(u32) = .init(0),
+    vals: [4]std.atomic.Value(u32) = .{ .init(0xFFFFFF), .init(0), .init(0xFFFFFF), .init(0) },
+
+    pub fn write(self: *ShaderColors, s: Snapshot) void {
+        const v = [4]u32{ s.default_fg, s.default_bg, s.cursor, s.cursor_text };
+        const seq0 = self.seq.load(.monotonic);
+        std.debug.assert(seq0 & 1 == 0);
+        self.seq.store(seq0 +% 1, .monotonic);
+        // Release on each value orders the odd seq before it, so a reader
+        // that sees any new value also sees the write in progress.
+        for (&self.vals, v) |*slot, x| slot.store(x, .release);
+        self.seq.store(seq0 +% 2, .release);
+    }
+
+    pub fn read(self: *const ShaderColors) Snapshot {
+        while (true) {
+            const s1 = self.seq.load(.acquire);
+            if (s1 & 1 != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            var v: [4]u32 = undefined;
+            for (&v, &self.vals) |*x, *slot| x.* = slot.load(.acquire);
+            const s2 = self.seq.load(.monotonic);
+            if (s1 != s2) continue;
+            std.debug.assert(s2 & 1 == 0);
+            return .{ .default_fg = v[0], .default_bg = v[1], .cursor = v[2], .cursor_text = v[3] };
+        }
+    }
 };
 
 pub const Core = struct {
@@ -958,6 +1001,27 @@ pub const Core = struct {
     /// Last layer list published per surface, so on_surface_layout only fires
     /// when the list actually changed.
     last_surface_layout: std.AutoHashMapUnmanaged(i64, flush.SurfaceLayoutSig) = .{},
+    /// Last iCellText plane layout per surface (flush.noteCellTextPlaneChanges).
+    cell_text_plane_sig: std.AutoHashMapUnmanaged(i64, u64) = .{},
+    /// Highlight-group names the loaded shaders declare (`@zonvie-hl-groups`),
+    /// owned copies, at most frontend_rules.max_hl_groups: name i is bit i of
+    /// a cell texel's w.
+    shader_hl_groups: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Per attr id, the shader_hl_groups bits that id was composed from.
+    /// Empty whenever no group is declared, so the flush skips the lookup.
+    /// Rebuilt with the glow set and on set_shader_hl_groups, never per flush.
+    shader_hl_masks: std.ArrayListUnmanaged(u32) = .empty,
+    /// grid_mu held. The declared set awaits its unlink call to Neovim
+    /// (sent once attached), and whether one was ever sent, so an emptied
+    /// declaration clears the ColorScheme augroup only where it exists.
+    shader_hl_unlink_pending: bool = false,
+    shader_hl_unlink_sent: bool = false,
+    /// The Ghostty colour uniforms' source, read by zonvie_shader_fill_colors
+    /// from any thread. Written only with grid_mu held.
+    shader_colors: ShaderColors = .{},
+    /// One row of cell texels (4 u32 per cell) for on_cell_text_row; sized
+    /// in onFlush while cell text is on, so the row loop never allocates.
+    cell_texel_scratch: std.ArrayListUnmanaged(u32) = .empty,
     layout_budget: c_api.render_layout.Budget = .{},
     /// Persistent build buffer for one surface's layer list; grown on layout
     /// change only, never per flush.
@@ -1463,6 +1527,12 @@ pub const Core = struct {
         flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
+        self.cell_text_plane_sig.deinit(self.alloc);
+        self.cell_text_plane_sig = .{};
+        self.freeShaderHlGroups();
+        self.shader_hl_groups.deinit(self.alloc);
+        self.shader_hl_masks.deinit(self.alloc);
+        self.cell_texel_scratch.deinit(self.alloc);
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.msg_line_cache.deinit(self.alloc);
@@ -1703,6 +1773,11 @@ pub const Core = struct {
         flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
+        self.cell_text_plane_sig.deinit(self.alloc);
+        self.cell_text_plane_sig = .{};
+        // Attr ids belong to the old server; the new one's hl_attr_define
+        // rebuilds the table.
+        self.shader_hl_masks.clearRetainingCapacity();
         self.layout_scratch.deinit();
         self.emit_grid_ids.deinit();
         self.grid.external_grids.deinit(self.alloc);
@@ -5423,6 +5498,242 @@ pub const Core = struct {
         });
     }
 
+    // ---- Shader highlight-group masks ----
+
+    fn freeShaderHlGroups(self: *Core) void {
+        for (self.shader_hl_groups.items) |name| self.alloc.free(name);
+        self.shader_hl_groups.clearRetainingCapacity();
+    }
+
+    /// Declare the shader's groups from its source (`@zonvie-hl-groups:`).
+    /// grid_mu held. An unchanged declaration does nothing; otherwise the
+    /// mask table follows at once.
+    pub fn setShaderHlGroupsLocked(self: *Core, source: []const u8) void {
+        var parsed: [frontend_rules.max_hl_groups][]const u8 = undefined;
+        const n = frontend_rules.parseHlGroups(source, &parsed);
+        if (n == frontend_rules.max_hl_groups) {
+            self.log.write("shader hl groups: at most {d} names are used\n", .{frontend_rules.max_hl_groups});
+        }
+        same: {
+            if (n != self.shader_hl_groups.items.len) break :same;
+            for (parsed[0..n], self.shader_hl_groups.items) |a, b| {
+                if (!std.mem.eql(u8, a, b)) break :same;
+            }
+            return;
+        }
+        self.freeShaderHlGroups();
+        for (parsed[0..n]) |name| {
+            // Out of memory keeps the names declared so far: their bits stay right.
+            const owned = self.alloc.dupe(u8, name) catch break;
+            self.shader_hl_groups.append(self.alloc, owned) catch {
+                self.alloc.free(owned);
+                break;
+            };
+        }
+        self.rebuildShaderHlMasks();
+        // Bit meanings changed: every texel on screen carries a stale w,
+        // whatever the old table held (empty on a first declaration).
+        if (self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+        self.markShaderHlUnlinkPendingLocked();
+    }
+
+    /// Run with the declared names as `...`. hl_attr_define's ext_hlstate
+    /// info names the group a `:hi link` chain ends at, so a linked group is
+    /// redefined with its resolved attributes (same look, own attr id). A
+    /// Treesitter name with no definition takes its dotted fallback's. A
+    /// group whose definition differs from what this chunk last wrote is the
+    /// user's or a plugin's and is left alone. ColorScheme re-applies; an
+    /// empty list only clears the augroup.
+    pub const shader_hl_unlink_lua =
+        \\local names = ...
+        \\local S = _G.zonvie_shader_hl or { wrote = {} }
+        \\_G.zonvie_shader_hl = S
+        \\S.names = names
+        \\local function resolve(g)
+        \\  while g do
+        \\    local r = vim.api.nvim_get_hl(0, { name = g, link = false, create = false })
+        \\    r.default = nil
+        \\    if next(r) ~= nil then return r end
+        \\    g = g:match('^(.*)%.[^.]*$')
+        \\  end
+        \\end
+        \\local function one(g)
+        \\  local cur = vim.api.nvim_get_hl(0, { name = g, link = true, create = false })
+        \\  local ours = S.wrote[g]
+        \\  if cur.link == nil and next(cur) ~= nil and not (ours and vim.deep_equal(cur, ours)) then
+        \\    S.wrote[g] = nil
+        \\  else
+        \\    local r = resolve(g)
+        \\    if r then
+        \\      vim.api.nvim_set_hl(0, g, r)
+        \\      S.wrote[g] = vim.api.nvim_get_hl(0, { name = g, link = true, create = false })
+        \\    end
+        \\  end
+        \\end
+        \\function S.apply()
+        \\  -- One group's failure must not skip the rest.
+        \\  for _, g in ipairs(S.names) do pcall(one, g) end
+        \\end
+        \\local aug = vim.api.nvim_create_augroup('ZonvieShaderHlGroups', { clear = true })
+        \\if #names > 0 then
+        \\  vim.api.nvim_create_autocmd('ColorScheme', { group = aug, callback = S.apply })
+        \\  S.apply()
+        \\end
+    ;
+
+    /// The nvim_exec_lua notification carrying `names` to shader_hl_unlink_lua.
+    pub fn packShaderHlUnlink(buf: *rpc.Buf, alloc: std.mem.Allocator, names: []const []const u8) !void {
+        try rpc.packArray(buf, alloc, 3);
+        try rpc.packInt(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, "nvim_exec_lua");
+        try rpc.packArray(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, shader_hl_unlink_lua);
+        try rpc.packArray(buf, alloc, 1);
+        try rpc.packArray(buf, alloc, names.len);
+        for (names) |n| try rpc.packStr(buf, alloc, n);
+    }
+
+    /// grid_mu held. Packs the pending unlink call into `buf` and clears the
+    /// pending mark; false (buf untouched) when nothing is pending or the
+    /// UI is not attached yet.
+    pub fn takeShaderHlUnlinkLocked(self: *Core, buf: *rpc.Buf) bool {
+        if (!self.shader_hl_unlink_pending or !self.ui_attached.load(.seq_cst)) return false;
+        packShaderHlUnlink(buf, self.alloc, self.shader_hl_groups.items) catch {
+            buf.clearRetainingCapacity();
+            return false;
+        };
+        self.shader_hl_unlink_pending = false;
+        self.shader_hl_unlink_sent = self.shader_hl_groups.items.len != 0;
+        return true;
+    }
+
+    /// Send the pending unlink call, if any. Takes grid_mu; sends after
+    /// releasing it. Called after set_shader_hl_groups and after ui_attach.
+    pub fn sendShaderHlUnlink(self: *Core) void {
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        self.grid_mu.lockUncancelable(clock.io());
+        const take = self.takeShaderHlUnlinkLocked(&buf);
+        self.grid_mu.unlock(clock.io());
+        if (!take) return;
+        self.sendRaw(buf.items) catch |e| {
+            self.log.write("shader hl unlink send failed: {any}\n", .{e});
+            return;
+        };
+        self.log.write("rpc send: shader hl unlink ({d} bytes)\n", .{buf.items.len});
+    }
+
+    /// grid_mu held. On a new declaration, and on attach (a new session's
+    /// Neovim holds none of the unlinked definitions).
+    pub fn markShaderHlUnlinkPendingLocked(self: *Core) void {
+        self.shader_hl_unlink_pending = self.shader_hl_groups.items.len != 0 or self.shader_hl_unlink_sent;
+    }
+
+    /// Whether group `name` is `wanted` or falls back to it by Neovim's
+    /// dotted-name rule: Treesitter applies `@markup.heading.1.markdown`,
+    /// which resolves through `@markup.heading.1` and `@markup.heading`.
+    pub fn hlNameFallsBackTo(name: []const u8, wanted: []const u8) bool {
+        if (!std.mem.startsWith(u8, name, wanted)) return false;
+        return name.len == wanted.len or name[wanted.len] == '.';
+    }
+
+    /// Bit i is set when `names` (the groups an attr id was composed from)
+    /// holds wanted[i] or a name falling back to it. Pre: wanted.len <= max_hl_groups.
+    pub fn hlGroupMask(names: []const []const u8, wanted: []const []const u8) u32 {
+        std.debug.assert(wanted.len <= frontend_rules.max_hl_groups);
+        var mask: u32 = 0;
+        for (wanted, 0..) |w, i| {
+            for (names) |n| {
+                if (hlNameFallsBackTo(n, w)) {
+                    mask |= @as(u32, 1) << @intCast(i);
+                    break;
+                }
+            }
+        }
+        return mask;
+    }
+
+    /// Rebuild shader_hl_masks from the attribute table. Not a flush path:
+    /// runs where the glow set re-resolves and on set_shader_hl_groups.
+    /// Texels carry the mask, so when an id that cells may already show
+    /// changes its mask, every surface is resent while cell text is on.
+    pub fn rebuildShaderHlMasks(self: *Core) void {
+        const changed = self.rebuildShaderHlMaskTable() catch blk: {
+            self.shader_hl_masks.clearRetainingCapacity();
+            break :blk true;
+        };
+        if (changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+    }
+
+    /// Returns whether an id below the old table's length changed its mask.
+    /// The table spans every defined attr id (hl.map), named or not, so an
+    /// id past it was not defined before and no cell shows it yet.
+    fn rebuildShaderHlMaskTable(self: *Core) !bool {
+        const wanted: []const []const u8 = self.shader_hl_groups.items;
+        const old = self.shader_hl_masks.items;
+        if (wanted.len == 0) {
+            const had_bits = std.mem.indexOfNone(u32, old, &.{0}) != null;
+            self.shader_hl_masks.clearRetainingCapacity();
+            return had_bits;
+        }
+        var len: usize = 0;
+        var kit = self.hl.map.keyIterator();
+        while (kit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        var nit = self.hl.attr_names.keyIterator();
+        while (nit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        var git = self.hl.groups.valueIterator();
+        while (git.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+
+        const fresh = try self.alloc.alloc(u32, len);
+        defer self.alloc.free(fresh);
+        @memset(fresh, 0);
+        var it = self.hl.attr_names.iterator();
+        while (it.next()) |e| fresh[e.key_ptr.*] = hlGroupMask(e.value_ptr.*, wanted);
+        // hl_group_set ids, as resolveGlowGroups honours them.
+        for (wanted, 0..) |name, i| {
+            if (self.hl.groups.get(name)) |id| fresh[id] |= @as(u32, 1) << @intCast(i);
+        }
+
+        var changed = false;
+        for (old, 0..) |m, i| {
+            if (m != (if (i < len) fresh[i] else 0)) changed = true;
+        }
+        try self.shader_hl_masks.ensureTotalCapacity(self.alloc, len);
+        self.shader_hl_masks.clearRetainingCapacity();
+        self.shader_hl_masks.appendSliceAssumeCapacity(fresh);
+        return changed;
+    }
+
+    /// The group mask of a cell's attr id; 0 with no group declared.
+    pub inline fn shaderHlMask(self: *const Core, hl_id: u32) u32 {
+        const masks = self.shader_hl_masks.items;
+        return if (hl_id < masks.len) masks[hl_id] else 0;
+    }
+
+    /// Pre-flush, grid_mu held. Texels hold group masks and resolved
+    /// colours: a group change rebuilds the masks (which resend what they
+    /// change), and new default colours resend every surface's text.
+    pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool) void {
+        if (groups_changed) self.rebuildShaderHlMasks();
+        if (self.hl.default_colors_changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+        // Every flush: an attr redefinition or a mode change can recolour
+        // the cursor without a cursor emission.
+        self.publishShaderColors();
+    }
+
+    /// Publish the shader colour snapshot from the current defaults and
+    /// cursor attr. cursor = the attr's bg, cursor_text = its fg; attr 0
+    /// swaps the defaults (Nvim spec), as the cursor quads do. grid_mu held.
+    pub fn publishShaderColors(self: *Core) void {
+        const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
+        self.shader_colors.write(.{
+            .default_fg = self.hl.default_fg & 0xFFFFFF,
+            .default_bg = self.hl.default_bg & 0xFFFFFF,
+            .cursor = (if (attr) |a| a.bg else self.hl.default_fg) & 0xFFFFFF,
+            .cursor_text = (if (attr) |a| a.fg else self.hl.default_bg) & 0xFFFFFF,
+        });
+    }
+
     /// Say, once per attribute id, that a cell asked to glow and was refused.
     /// The id is what `cellGlow` actually matches on, and it is not what
     /// `:Inspect` shows -- a group can reach the screen under several composed
@@ -5914,6 +6225,19 @@ pub const Core = struct {
     /// here; the frontends apply it at that flush's commit), and again after
     /// the batch for one with no flush.
     /// Caller holds grid_mu.
+    /// Turn the shader cell inputs on or off. grid_mu held. Off drops the
+    /// stamps recorded for the flush in flight; either way the next flush
+    /// finds every text plane new and resends it all, since a frontend that
+    /// turns them on starts its texture empty.
+    pub fn setShaderInputsEnabledLocked(self: *Core, flags: u32) void {
+        std.debug.assert(flags & ~(c_api.SHADER_INPUT_CELL_AGE | c_api.SHADER_INPUT_CELL_TEXT) == 0);
+        const age = flags & c_api.SHADER_INPUT_CELL_AGE != 0;
+        self.grid.shader_inputs_enabled = age;
+        self.grid.cell_text_enabled = flags & c_api.SHADER_INPUT_CELL_TEXT != 0;
+        if (!age) self.grid.resetCellStamps();
+        self.cell_text_plane_sig.clearRetainingCapacity();
+    }
+
     pub fn settleFontGridResizesLocked(self: *Core) void {
         defer self.grid.font_grids_resized.clearRetainingCapacity();
         for (self.grid.font_grids_resized.items) |grid_id| {
@@ -9953,4 +10277,214 @@ test "an OS request at the grid's size, or one Neovim refuses, leaves no answer 
     try core.grid.resizeGrid(4, 25, 80);
     core.settleFontGridResizesLocked();
     try std.testing.expectEqual(grid_mod.WinFrame{ .rows = 25, .cols = 80 }, core.grid.grid_fonts.get(4).?.req.?);
+}
+
+test "hlGroupMask sets bit i for the i-th wanted name present in names" {
+    try std.testing.expectEqual(@as(u32, 0b10), Core.hlGroupMask(&.{ "Normal", "@markup.quote" }, &.{ "@markup.heading.1", "@markup.quote" }));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"Normal"}, &.{"@markup.quote"}));
+    try std.testing.expectEqual(@as(u32, 0b11), Core.hlGroupMask(&.{ "B", "A" }, &.{ "A", "B" }));
+}
+
+test "a Treesitter group with a language suffix matches the group it falls back to" {
+    const names: []const []const u8 = &.{"@markup.heading.1.markdown"};
+    try std.testing.expectEqual(@as(u32, 0b11), Core.hlGroupMask(names, &.{ "@markup.heading.1", "@markup.heading" }));
+    // Only at a dot boundary, and never the other way round.
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.heading.10"}));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(names, &.{"@markup.head"}));
+    try std.testing.expectEqual(@as(u32, 0), Core.hlGroupMask(&.{"@markup"}, &.{"@markup.quote"}));
+}
+
+test "packShaderHlUnlink is an nvim_exec_lua notification with the names in order" {
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try Core.packShaderHlUnlink(&buf, std.testing.allocator, &.{ "markdownH1", "@markup.quote" });
+    // [2, "nvim_exec_lua", [chunk, [[names...]]]]
+    try std.testing.expectEqualSlices(u8, &.{ 0x93, 0x02, 0xad }, buf.items[0..3]);
+    try std.testing.expectEqualStrings("nvim_exec_lua", buf.items[3..16]);
+    const a = std.mem.indexOf(u8, buf.items, "\xaamarkdownH1").?;
+    const b = std.mem.indexOf(u8, buf.items, "\xad@markup.quote").?;
+    try std.testing.expect(a < b);
+    try std.testing.expectEqual(buf.items.len, b + 14);
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x92 }, buf.items[a - 2 .. a]);
+}
+
+test "the unlink call waits for attach, goes once, and an unchanged declaration sends nothing" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // Never declared: nothing, attached or not.
+    core.ui_attached.store(true, .seq_cst);
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.ui_attached.store(false, .seq_cst);
+
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: markdownH1\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    // Attach sends the queued call once.
+    core.ui_attached.store(true, .seq_cst);
+    core.markShaderHlUnlinkPendingLocked();
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "markdownH1") != null);
+    buf.clearRetainingCapacity();
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: markdownH1\n");
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+
+    // Emptied after a send: one call with no names (clears the augroup).
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x90 }, buf.items[buf.items.len - 2 ..]);
+    buf.clearRetainingCapacity();
+    // A later attach has nothing left to clear.
+    core.markShaderHlUnlinkPendingLocked();
+    try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+}
+
+test "a mask rebuild that changes an existing id marks every surface dirty" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment @markup.quote\n");
+    try std.testing.expectEqual(@as(u32, 0b01), core.shaderHlMask(1));
+    core.grid.clearDirty();
+    // A new id past the table is no change: no cell shows it yet.
+    try core.hl.defineWithNames(2, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(2));
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+    // `:colorscheme` relinks id 1: its cells must be resent.
+    try core.hl.defineWithNames(1, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(1));
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+    // Dropping every declared group empties the table and resends.
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("void main() {}\n");
+    try std.testing.expectEqual(@as(usize, 0), core.shader_hl_masks.items.len);
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "a first declaration of groups resends cells already on screen" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.grid.putCell(0, 0, 'c', 1);
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+    // The same declaration again is no change.
+    core.grid.clearDirty();
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+}
+
+test "a nameless id later given a declared group resends its cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment @markup.quote\n");
+    try core.hl.defineWithNames(7, .{}, &.{});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0), core.shaderHlMask(7));
+    core.grid.putCell(0, 0, 'q', 7);
+    core.grid.clearDirty();
+    try core.hl.defineWithNames(7, .{}, &.{"@markup.quote"});
+    core.refreshShaderTexelSources(true);
+    try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(7));
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "new default colours resend every surface's text only while cell text is on" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    core.grid.clearDirty();
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "with cursor attr 0 the shader colours swap the defaults" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    core.hl.default_colors_changed = false; // published regardless
+    core.grid.cursor_attr_id = 0;
+    core.refreshShaderTexelSources(false);
+    const s = core.shader_colors.read();
+    try std.testing.expectEqual(@as(u32, 0x112233), s.default_fg);
+    try std.testing.expectEqual(@as(u32, 0x445566), s.default_bg);
+    try std.testing.expectEqual(s.default_fg, s.cursor);
+    try std.testing.expectEqual(s.default_bg, s.cursor_text);
+}
+
+test "a cursor attr gives the cursor its bg and the cursor text its fg" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    try core.hl.define(7, 0xAA0000, 0x00BB00, null, false, 0, .{}, false);
+    core.grid.cursor_attr_id = 7;
+    core.publishShaderColors();
+    const s = core.shader_colors.read();
+    try std.testing.expectEqual(@as(u32, 0x00BB00), s.cursor);
+    try std.testing.expectEqual(@as(u32, 0xAA0000), s.cursor_text);
+}
+
+test "a redefined cursor attr is republished by the next flush without a cursor emission" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.hl.define(7, 0xAA0000, 0x00BB00, null, false, 0, .{}, false);
+    core.grid.cursor_attr_id = 7;
+    core.publishShaderColors();
+    try core.hl.define(7, 0xAA0000, 0x0000CC, null, false, 0, .{}, false);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x0000CC), core.shader_colors.read().cursor);
+}
+
+test "a mode change of the cursor attr is republished by the next flush" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x112233, 0x445566, null);
+    try core.hl.define(9, 0x010101, 0x020202, null, false, 0, .{}, false);
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x112233), core.shader_colors.read().cursor);
+    // What applyModeInfo does on mode_change / mode_info_set.
+    core.grid.cursor_attr_id = 9;
+    core.refreshShaderTexelSources(false);
+    try std.testing.expectEqual(@as(u32, 0x020202), core.shader_colors.read().cursor);
+    try std.testing.expectEqual(@as(u32, 0x010101), core.shader_colors.read().cursor_text);
+}
+
+test "a shader colour read never returns a mix of two snapshots" {
+    var sc: ShaderColors = .{};
+    var stop = std.atomic.Value(bool).init(false);
+    const Writer = struct {
+        fn run(c: *ShaderColors, st: *std.atomic.Value(bool)) void {
+            var i: u32 = 1;
+            while (!st.load(.acquire)) : (i = (i + 1) & 0xFFFFFF) {
+                c.write(.{ .default_fg = i, .default_bg = i, .cursor = i, .cursor_text = i });
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ &sc, &stop });
+    var n: usize = 0;
+    while (n < 200_000) : (n += 1) {
+        const s = sc.read();
+        if (s.default_fg == 0xFFFFFF and s.default_bg == 0) continue; // initial value
+        try std.testing.expect(s.default_fg == s.default_bg and s.default_bg == s.cursor and s.cursor == s.cursor_text);
+    }
+    stop.store(true, .release);
+    t.join();
 }

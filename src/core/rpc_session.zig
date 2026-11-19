@@ -1982,6 +1982,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     // hl_group_set changes can alter decoration geometry. Resolve them before
     // vertex generation so the flush that terminates this redraw batch carries
     // the new glow state.
+    const groups_changed = self.hl.groups_changed;
     if (self.hl.groups_changed) {
         self.hl.groups_changed = false;
         self.resolveGlowGroups();
@@ -1990,6 +1991,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
             self.cursor_owner.force_recheck = true;
         }
     }
+    self.refreshShaderTexelSources(groups_changed);
 
     // Promote an external editor grid before the frontend transaction. A
     // successful flush must represent the final composition state of the
@@ -2950,6 +2952,12 @@ pub fn runLoop(self: *Core) void {
         // wheel know how many rows one wheel event is worth.
         setupMouseScrollReporter(self);
         if (self.perGridFontsEnabled()) setupWindowFontHelper(self);
+
+        // Unlink the shader's declared groups in this session's Neovim.
+        self.grid_mu.lockUncancelable(clock.io());
+        self.markShaderHlUnlinkPendingLocked();
+        self.grid_mu.unlock(clock.io());
+        self.sendShaderHlUnlink();
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});

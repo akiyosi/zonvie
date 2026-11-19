@@ -93,6 +93,11 @@ pub const GL_INVALID_INDEX: GLuint = 0xFFFFFFFF;
 pub const GL_TEXTURE1: GLenum = 0x84C1;
 pub const GL_TEXTURE2: GLenum = 0x84C2;
 pub const GL_TEXTURE3: GLenum = 0x84C3;
+pub const GL_TEXTURE4: GLenum = 0x84C4;
+pub const GL_TEXTURE5: GLenum = 0x84C5;
+pub const GL_TEXTURE6: GLenum = 0x84C6;
+pub const GL_RGBA32UI: GLint = 0x8D70;
+pub const GL_RGBA_INTEGER: GLenum = 0x8D99;
 
 // Pixel store
 pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;

@@ -398,6 +398,9 @@ pub const Renderer = struct {
     // Loaded from config `[shaders].paths` after renderer init. Empty when
     // `shaders.enabled = false` or no paths configured.
     custom_shader_pipelines: std.ArrayListUnmanaged(CustomShaderPipeline) = .empty,
+    /// The loaded shaders' GLSL joined in load order, for
+    /// zonvie_core_set_shader_hl_groups. Filled by loadCustomShaderPipelines.
+    shader_hl_groups_source: std.ArrayListUnmanaged(u8) = .empty,
     // Scratch copy of back_tex used as the pixel-shader input when running
     // the custom shader pass (reading and writing the same texture is
     // undefined in D3D11). Lazily sized and recreated on resize.
@@ -436,7 +439,26 @@ pub const Renderer = struct {
     // Allocated only when a loaded shader references them, so a shader-less
     // or plain-shader configuration costs exactly what it did before.
     shader_wants_edit_inputs: bool = false,
+    shader_wants_cell_text: bool = false,
     shader_wants_prev_frame: bool = false,
+    /// A loaded shader reads iBelowFloats: the row frame also draws the
+    /// surface without its win_float_pos floats into `below_floats`
+    /// (beginBelowFloats), bound at t6. Logical size, like the scratch copy
+    /// iChannel0 reads; created on first need or resize and kept.
+    shader_wants_below_floats: bool = false,
+    below_floats: Tex2D = .{},
+    below_floats_w: u32 = 0,
+    below_floats_h: u32 = 0,
+    /// The last row frame finished `below_floats` at the current size; the
+    /// chain binds it only then (an animation-only frame reuses it).
+    below_floats_valid: bool = false,
+    /// Rows whose own buffer is not current are uploaded here, so the pass
+    /// never touches the row buffers or their budget. Grow-only.
+    below_floats_vb: ?*c.ID3D11Buffer = null,
+    below_floats_vb_bytes: usize = 0,
+    /// The scissor beginBelowFloats found, restored by endBelowFloats.
+    below_floats_saved_sc: c.D3D11_RECT = std.mem.zeroes(c.D3D11_RECT),
+    below_floats_saved_sc_n: c.UINT = 0,
     /// Cell metrics, blink state and grid origin mirrored from the app by the
     /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
     /// iGridOrigin and the cell-age grid. `cell_h_px` is the grid row
@@ -449,6 +471,14 @@ pub const Renderer = struct {
     cursor_blink_on: bool = true,
     /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
     shader_grid_origin: [2]f32 = .{ 0, 0 },
+    /// Source of the Ghostty colour uniforms (zonvie_shader_fill_colors,
+    /// seqlocked: no app lock needed). Mirrored with the fields above.
+    shader_core: ?*const core.zonvie_core = null,
+    /// iRootRows and iLayers (core.fillLayers), set by the paint driver
+    /// from the layers it pinned (app.fillShaderLayers).
+    shader_root_rows: i32 = 0,
+    shader_layer_count: i32 = 0,
+    shader_layers: [core.SHADER_LAYERS_MAX * 3][4]f32 = @splat(@splat(0)),
     shader_owns_cursor: bool = false,
     /// Feedback pair: the LAST pass writes here instead of the backbuffer so
     /// the NEXT frame can sample it as iPrevFrame; a copy then moves it to
@@ -470,6 +500,26 @@ pub const Renderer = struct {
     cell_age_srv: ?*c.ID3D11ShaderResourceView = null,
     cell_age_tex_cols: u32 = 0,
     cell_age_tex_rows: u32 = 0,
+    /// The app's shared cell-text stores, keyed like the cell-age ones. The
+    /// texture's size follows the rows delivered, not the surface.
+    cell_text: ?*core.cell_text_store.Stores = null,
+    cell_text_cache: core.cell_text_store.SyncCache = .{},
+    cell_text_tex: ?*c.ID3D11Texture2D = null,
+    cell_text_srv: ?*c.ID3D11ShaderResourceView = null,
+    cell_text_tex_cols: u32 = 0,
+    cell_text_tex_rows: u32 = 0,
+    /// iRowOffset: per surface cell, how many pixels down that cell's
+    /// content is drawn this frame (a smooth scroll in progress). The app
+    /// fills it with each frame's eases; the shader pass uploads it when it
+    /// changed.
+    row_offsets_px: std.ArrayListUnmanaged(f32) = .empty,
+    row_offset_cols: u32 = 0,
+    row_offset_rows: u32 = 0,
+    row_offsets_dirty: bool = false,
+    row_offset_tex: ?*c.ID3D11Texture2D = null,
+    row_offset_srv: ?*c.ID3D11ShaderResourceView = null,
+    row_offset_tex_cols: u32 = 0,
+    row_offset_tex_rows: u32 = 0,
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. The main loop reads this to decide whether to
     /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
@@ -771,6 +821,7 @@ pub const Renderer = struct {
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.deinit(self.alloc);
+        self.shader_hl_groups_source.deinit(self.alloc);
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
         for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
@@ -778,8 +829,14 @@ pub const Renderer = struct {
         for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         safeRelease(&self.custom_shader_uniforms_cb);
         self.releaseFeedbackTextures();
+        self.releaseBelowFloats();
         safeRelease(&self.cell_age_srv);
         safeRelease(&self.cell_age_tex);
+        safeRelease(&self.cell_text_srv);
+        safeRelease(&self.cell_text_tex);
+        safeRelease(&self.row_offset_srv);
+        safeRelease(&self.row_offset_tex);
+        self.row_offsets_px.deinit(self.alloc);
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -1007,6 +1064,7 @@ pub const Renderer = struct {
         for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         self.custom_shader_pong_w = 0;
         self.custom_shader_pong_h = 0;
+        self.releaseBelowFloats();
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -1169,6 +1227,9 @@ pub const Renderer = struct {
 
         const ctx = self.ctx.?;
         const back_rtv = self.back_rtv.?; // persistent back buffer RTV
+        // back_tex is about to change; only a row frame's below pass
+        // (beginBelowFloats/endBelowFloats) makes the target match it again.
+        self.below_floats_valid = false;
 
         const ctx_vtbl = ctx.*.lpVtbl;
 
@@ -2802,6 +2863,83 @@ pub const Renderer = struct {
         self.feedback_primed = false;
     }
 
+    fn releaseBelowFloats(self: *Renderer) void {
+        self.below_floats.release();
+        self.below_floats_w = 0;
+        self.below_floats_h = 0;
+        self.below_floats_valid = false;
+        safeRelease(&self.below_floats_vb);
+        self.below_floats_vb_bytes = 0;
+    }
+
+    /// Draw `verts` from the below-floats scratch buffer (see
+    /// below_floats_vb) under the transform and scissor already set.
+    pub fn drawBelowFloatsVerts(self: *Renderer, verts: []const core.Vertex) !void {
+        if (verts.len == 0) return;
+        try self.ensureExternalVertexBuffer(&self.below_floats_vb, &self.below_floats_vb_bytes, verts.len * @sizeOf(core.Vertex));
+        const vb = self.below_floats_vb orelse return error.NoBelowFloatsVB;
+        try self.uploadVertsToVB(vb, verts);
+        try self.drawVB(vb, verts.len);
+    }
+
+    /// Point the row pipeline at `below_floats` for the caller's redraw of
+    /// the surface without its floats. Seeds it with back_tex (so the chrome
+    /// matches iChannel0) and overwrites `content` with the default bg, which
+    /// the caller then repaints. False, with back_rtv still bound, when no
+    /// running shader reads iBelowFloats or the target is unavailable; after
+    /// true the caller must call endBelowFloats.
+    pub fn beginBelowFloats(self: *Renderer, content: c.D3D11_RECT) bool {
+        // custom_shader_pipelines is exactly the chain drawCustomShaderPass
+        // runs for this surface (each window's renderer holds its own).
+        if (!self.shader_wants_below_floats or self.custom_shader_pipelines.items.len == 0) return false;
+        self.below_floats_valid = false;
+        const ctx = self.ctx orelse return false;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const back = self.back_tex orelse return false;
+        if (self.below_floats.tex == null or self.below_floats_w != self.width or self.below_floats_h != self.height) {
+            self.releaseBelowFloats();
+            const dev = self.device orelse return false;
+            var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+            const get_desc = back.*.lpVtbl.*.GetDesc orelse return false;
+            get_desc(back, &back_desc);
+            self.below_floats = createTex2D(dev, self.width, self.height, back_desc.Format, c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE) orelse return false;
+            self.below_floats_w = self.width;
+            self.below_floats_h = self.height;
+        }
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
+        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return false;
+        const set_sc = ctx_vtbl.*.RSSetScissorRects orelse return false;
+        const get_sc = ctx_vtbl.*.RSGetScissorRects orelse return false;
+        self.below_floats_saved_sc_n = 1;
+        get_sc(ctx, &self.below_floats_saved_sc_n, &self.below_floats_saved_sc);
+        // Unbound before the copy, as drawCustomShaderPass does.
+        set_rtvs(ctx, 0, null, null);
+        const box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = self.width, .bottom = self.height, .back = 1 };
+        copy_sub(ctx, @ptrCast(self.below_floats.tex.?), 0, 0, 0, 0, @ptrCast(back), 0, &box);
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.below_floats.rtv};
+        set_rtvs(ctx, 1, &rtvs[0], null);
+        var sc = content;
+        set_sc(ctx, 1, &sc);
+        self.drawClearRowOverwrite() catch {
+            self.endBelowFloats(false);
+            return false;
+        };
+        return true;
+    }
+
+    /// Rebind back_rtv and restore the scissor after beginBelowFloats
+    /// returned true. `complete`: every row landed, so the chain may sample
+    /// the target; otherwise it binds null at t6.
+    pub fn endBelowFloats(self: *Renderer, complete: bool) void {
+        self.below_floats_valid = complete;
+        const ctx = self.ctx orelse return;
+        const vt = ctx.*.lpVtbl;
+        const set_rtvs = vt.*.OMSetRenderTargets orelse return;
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.back_rtv};
+        set_rtvs(ctx, 1, &rtvs[0], null);
+        if (vt.*.RSSetScissorRects) |set_sc| set_sc(ctx, self.below_floats_saved_sc_n, &self.below_floats_saved_sc);
+    }
+
     fn releaseFeedbackTextures(self: *Renderer) void {
         for (&self.feedback_srv) |*x| safeRelease(x);
         for (&self.feedback_rtv) |*x| safeRelease(x);
@@ -2862,6 +3000,137 @@ pub const Renderer = struct {
             },
         }
         return self.cell_age_srv;
+    }
+
+    /// Start this frame's cell offsets at rest for cols x rows cells. UI
+    /// thread, before the frame's eases are added with addRowOffset.
+    pub fn beginRowOffsets(self: *Renderer, cols: usize, rows: usize) void {
+        const n = cols * rows;
+        if (self.row_offsets_px.items.len != n or self.row_offset_cols != cols) {
+            self.row_offsets_px.resize(self.alloc, n) catch return;
+            self.row_offset_cols = @intCast(cols);
+            self.row_offset_rows = @intCast(rows);
+            self.row_offsets_dirty = true;
+        }
+        for (self.row_offsets_px.items) |*v| {
+            if (v.* != 0) self.row_offsets_dirty = true;
+            v.* = 0;
+        }
+    }
+
+    /// The cells of rows [row_start, row_end) and columns [col_start,
+    /// col_end) are drawn `offset_px` down this frame.
+    pub fn addRowOffset(self: *Renderer, col_start: i64, col_end: i64, row_start: i64, row_end: i64, offset_px: f32) void {
+        if (offset_px == 0) return;
+        const cols: i64 = self.row_offset_cols;
+        const rows: i64 = self.row_offset_rows;
+        const c0: usize = @intCast(@max(0, @min(col_start, cols)));
+        const c1: usize = @intCast(@max(0, @min(col_end, cols)));
+        const r0: usize = @intCast(@max(0, @min(row_start, rows)));
+        const r1: usize = @intCast(@max(0, @min(row_end, rows)));
+        if (c0 >= c1 or r0 >= r1) return;
+        for (r0..r1) |r| {
+            const base = r * @as(usize, @intCast(cols));
+            for (self.row_offsets_px.items[base + c0 .. base + c1]) |*v| v.* = offset_px;
+        }
+        self.row_offsets_dirty = true;
+    }
+
+    /// Upload the row offsets when they changed; nil with no rows yet.
+    fn ensureRowOffsetTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
+        const dev = self.device orelse return null;
+        const cols = self.row_offset_cols;
+        const rows = self.row_offset_rows;
+        if (cols == 0 or rows == 0) return null;
+        if (self.row_offset_tex == null or self.row_offset_tex_cols != cols or self.row_offset_tex_rows != rows) {
+            safeRelease(&self.row_offset_srv);
+            safeRelease(&self.row_offset_tex);
+            self.row_offset_tex_cols = 0;
+            self.row_offset_tex_rows = 0;
+            var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            td.Width = cols;
+            td.Height = rows;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = c.DXGI_FORMAT_R32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = c.D3D11_USAGE_DEFAULT;
+            td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return null;
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return null;
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) return null;
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv)) or srv == null) {
+                safeRelease(&tex);
+                return null;
+            }
+            self.row_offset_tex = tex;
+            self.row_offset_srv = srv;
+            self.row_offset_tex_cols = cols;
+            self.row_offset_tex_rows = rows;
+            self.row_offsets_dirty = true;
+        }
+        if (self.row_offsets_dirty) {
+            if (ctx_vtbl.*.UpdateSubresource) |update| {
+                update(ctx, @ptrCast(self.row_offset_tex.?), 0, null, @ptrCast(self.row_offsets_px.items.ptr), cols * @sizeOf(f32), 0);
+            }
+            self.row_offsets_dirty = false;
+        }
+        return self.row_offset_srv;
+    }
+
+    /// Upload this grid's cell text, (re)creating the texture when the
+    /// store's cell grid changed; nil until a row has arrived. The store's
+    /// lock is held only across the UpdateSubresource copy.
+    fn ensureCellTextTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
+        const stores = self.cell_text orelse return null;
+        const dev = self.device orelse return null;
+        var values: []const u32 = &.{};
+        switch (stores.sync(self.cell_age_grid, self.cell_text_tex == null, &self.cell_text_cache, &values)) {
+            .unavailable => return null,
+            .clean => return self.cell_text_srv,
+            .dirty => {},
+        }
+        defer stores.endUpload();
+        const cols = self.cell_text_cache.cols;
+        const rows = self.cell_text_cache.rows;
+        if (self.cell_text_tex == null or self.cell_text_tex_cols != cols or self.cell_text_tex_rows != rows) {
+            safeRelease(&self.cell_text_srv);
+            safeRelease(&self.cell_text_tex);
+            self.cell_text_tex_cols = 0;
+            self.cell_text_tex_rows = 0;
+            var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            td.Width = cols;
+            td.Height = rows;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = c.DXGI_FORMAT_R32G32B32A32_UINT;
+            td.SampleDesc.Count = 1;
+            td.Usage = c.D3D11_USAGE_DEFAULT;
+            td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return null;
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return null;
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) return null;
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv)) or srv == null) {
+                safeRelease(&tex);
+                return null;
+            }
+            self.cell_text_tex = tex;
+            self.cell_text_srv = srv;
+            self.cell_text_tex_cols = cols;
+            self.cell_text_tex_rows = rows;
+        }
+        const stride = core.cell_text_store.texel_stride;
+        std.debug.assert(values.len == @as(usize, cols) * rows * stride);
+        if (ctx_vtbl.*.UpdateSubresource) |update| {
+            update(ctx, @ptrCast(self.cell_text_tex.?), 0, null, @ptrCast(values.ptr), cols * @as(u32, stride * @sizeOf(u32)), 0);
+        }
+        return self.cell_text_srv;
     }
 
     fn bloomShadersReady(self: *const Renderer) bool {
@@ -3018,10 +3287,14 @@ pub const Renderer = struct {
     pub fn loadCustomShaderPipelines(self: *Renderer, cfg: *const core.config.Config) void {
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.clearRetainingCapacity();
+        self.shader_hl_groups_source.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = false;
         self.shader_wants_edit_inputs = false;
+        self.shader_wants_cell_text = false;
         self.shader_wants_prev_frame = false;
+        self.shader_wants_below_floats = false;
         self.shader_owns_cursor = false;
+        defer if (!self.shader_wants_below_floats) self.releaseBelowFloats();
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
         const dev = self.device orelse return;
@@ -3043,7 +3316,9 @@ pub const Renderer = struct {
             };
             if (pipeline.needs_animation) self.any_custom_shader_needs_animation = true;
             if (pipeline.uses_edit_inputs) self.shader_wants_edit_inputs = true;
+            if (pipeline.uses_cell_text) self.shader_wants_cell_text = true;
             if (pipeline.uses_prev_frame) self.shader_wants_prev_frame = true;
+            if (pipeline.uses_below_floats) self.shader_wants_below_floats = true;
             if (pipeline.owns_cursor) self.shader_owns_cursor = true;
         }
         applog.appLog(
@@ -3064,7 +3339,10 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = src.any_custom_shader_needs_animation;
         self.shader_wants_edit_inputs = src.shader_wants_edit_inputs;
+        self.shader_wants_cell_text = src.shader_wants_cell_text;
         self.shader_wants_prev_frame = src.shader_wants_prev_frame;
+        self.shader_wants_below_floats = src.shader_wants_below_floats;
+        if (!self.shader_wants_below_floats) self.releaseBelowFloats();
         self.shader_owns_cursor = src.shader_owns_cursor;
         for (src.custom_shader_pipelines.items) |sp| {
             const path = self.alloc.dupe(u8, sp.source_path) catch return false;
@@ -3074,7 +3352,9 @@ pub const Renderer = struct {
                 .pixel_shader = sp.pixel_shader,
                 .needs_animation = sp.needs_animation,
                 .uses_edit_inputs = sp.uses_edit_inputs,
+                .uses_cell_text = sp.uses_cell_text,
                 .uses_prev_frame = sp.uses_prev_frame,
+                .uses_below_floats = sp.uses_below_floats,
                 .owns_cursor = sp.owns_cursor,
             }) catch {
                 self.alloc.free(path);
@@ -3311,13 +3591,21 @@ pub const Renderer = struct {
             }
             return CustomShaderCompileError.OutOfMemory;
         };
+        // A shader whose text cannot be kept still loads; it just declares
+        // no hl groups.
+        if (self.shader_hl_groups_source.ensureUnusedCapacity(self.alloc, glsl.len + 1)) |_| {
+            self.shader_hl_groups_source.appendSliceAssumeCapacity(glsl);
+            self.shader_hl_groups_source.appendAssumeCapacity('\n');
+        } else |_| {}
         return .{
             .alloc = self.alloc,
             .source_path = path_copy,
             .pixel_shader = ps_out,
             .needs_animation = core.frontend_rules.shaderNeedsAnimation(glsl),
             .uses_edit_inputs = core.frontend_rules.shaderUsesEditInputs(glsl),
+            .uses_cell_text = core.frontend_rules.shaderUsesCellText(glsl),
             .uses_prev_frame = core.frontend_rules.shaderUsesPrevFrame(glsl),
+            .uses_below_floats = core.frontend_rules.shaderUsesBelowFloats(glsl),
             .owns_cursor = core.frontend_rules.shaderOwnsCursor(glsl),
         };
     }
@@ -3450,13 +3738,21 @@ pub const Renderer = struct {
         u.iTimeCursorChange = self.shader_cursor_change_time;
         core.fillEditUniforms(
             &u,
-            @floatFromInt(if (self.shader_cursor_cell_px[0] > 0) self.shader_cursor_cell_px[0] else self.cell_w_px),
-            @floatFromInt(if (self.shader_cursor_cell_px[1] > 0) self.shader_cursor_cell_px[1] else self.cell_h_px),
+            @floatFromInt(self.cell_w_px),
+            @floatFromInt(self.cell_h_px),
+            .{
+                @floatFromInt(if (self.shader_cursor_cell_px[0] > 0) self.shader_cursor_cell_px[0] else self.cell_w_px),
+                @floatFromInt(if (self.shader_cursor_cell_px[1] > 0) self.shader_cursor_cell_px[1] else self.cell_h_px),
+            },
             self.shader_grid_origin,
             self.cell_age_cache.last_edit,
             self.cursor_blink_on,
             self.shader_wants_edit_inputs,
         );
+        if (self.shader_core) |cp| core.zonvie_shader_fill_colors(cp, &u);
+        u.iRootRows = self.shader_root_rows;
+        u.iLayerCount = self.shader_layer_count;
+        u.iLayers = self.shader_layers;
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto just lists the fields as "Year, month, day,
         // time in seconds" without spelling out indexing. Forward
@@ -3539,6 +3835,8 @@ pub const Renderer = struct {
         // Edit-effect inputs, allocated only when a shader reads them.
         var prev_frame_srv: ?*c.ID3D11ShaderResourceView = null;
         var cell_age_srv_bind: ?*c.ID3D11ShaderResourceView = null;
+        var cell_text_srv_bind: ?*c.ID3D11ShaderResourceView = null;
+        var row_offset_srv_bind: ?*c.ID3D11ShaderResourceView = null;
         var feedback_rtv_target: ?*c.ID3D11RenderTargetView = null;
         var feedback_src_tex: ?*c.ID3D11Texture2D = null;
         if (self.shader_wants_edit_inputs) {
@@ -3549,7 +3847,12 @@ pub const Renderer = struct {
                 @floatFromInt(self.cell_h_px),
             );
             if (g.cols > 0) cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl, g.cols, g.rows);
+            row_offset_srv_bind = self.ensureRowOffsetTexture(ctx, ctx_vtbl);
         }
+        if (self.shader_wants_cell_text) cell_text_srv_bind = self.ensureCellTextTexture(ctx, ctx_vtbl);
+        // Drawn by the row frame (beginBelowFloats); never created here.
+        const below_floats_srv_bind: ?*c.ID3D11ShaderResourceView =
+            if (self.shader_wants_below_floats and self.below_floats_valid and self.below_floats_w == self.width and self.below_floats_h == self.height) self.below_floats.srv else null;
         if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
             if (self.feedback_rtv[self.feedback_index]) |w| {
@@ -3672,10 +3975,11 @@ pub const Renderer = struct {
                 var pf_srvs: [1]?*c.ID3D11ShaderResourceView = .{pf};
                 set_srvs_fn(ctx, 2, 1, &pf_srvs[0]);
             }
-            if (cell_age_srv_bind) |ca| {
-                var ca_srvs: [1]?*c.ID3D11ShaderResourceView = .{ca};
-                set_srvs_fn(ctx, 3, 1, &ca_srvs[0]);
-            }
+            // Bound even when null: the immediate context is shared by every
+            // window's renderer, so a slot left alone would still hold the
+            // texture of whichever window drew last.
+            var edit_srvs: [4]?*c.ID3D11ShaderResourceView = .{ cell_age_srv_bind, cell_text_srv_bind, row_offset_srv_bind, below_floats_srv_bind };
+            set_srvs_fn(ctx, 3, 4, &edit_srvs[0]);
 
             set_ps_fn(ctx, ps_i, null, 0);
             draw_fn(ctx, 3, 0);
@@ -3703,6 +4007,9 @@ pub const Renderer = struct {
         // next-frame prologue don't inherit the custom shader's bindings.
         var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{self.atlas_srv};
         set_srvs_fn(ctx, 0, 1, &atlas_srvs[0]);
+        // below_floats is a render target in the next row frame.
+        var null_below: [1]?*c.ID3D11ShaderResourceView = .{null};
+        set_srvs_fn(ctx, 6, 1, &null_below[0]);
         if (ctx_vtbl.*.VSSetShader) |set_vs| {
             if (self.vs) |vs_main| set_vs(ctx, vs_main, null, 0);
         }

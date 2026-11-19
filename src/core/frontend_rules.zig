@@ -1211,7 +1211,24 @@ pub fn shaderNeedsAnimation(source: []const u8) bool {
 /// and the cell-age texture. `zonvieCellAge` is the preamble's wrapper around
 /// iCellAge, so a shader that only calls it still needs the texture bound.
 pub fn shaderUsesEditInputs(source: []const u8) bool {
-    return containsAnyWord(source, &.{ "iCellAge", "zonvieCellAge", "iCellSize", "iGridOrigin", "iTimeLastEdit" });
+    return containsAnyWord(source, &.{
+        "iCellAge",       "zonvieCellAge",  "iCellSize",      "iGridOrigin", "iTimeLastEdit",
+        "zonvieCellAt",   "zonvieCellGeom", "iCursorCellSize", "iLayers", "iLayerCount",
+        "zonvieLayerCount", "zonvieLayerRect", "zonvieLayerGrid", "zonvieLayerFlags",
+        "iRootRows",
+    }) or shaderUsesCellText(source);
+}
+
+/// Whether a shader reads the cell-text texture (iCellText, or the
+/// preamble's zonvieCellText wrappers). Gates the row deliveries and the
+/// texture, which an age-only shader never pays for.
+pub fn shaderUsesCellText(source: []const u8) bool {
+    return containsAnyWord(source, &.{
+        "iCellText",          "zonvieCellText",     "zonvieCellTextAt",  "zonvieCellAt4",
+        "zonvieCellFg",       "zonvieCellFgAt",     "zonvieCellBg",      "zonvieCellBgAt",
+        "zonvieCellAttr",     "zonvieCellAttrAt",   "zonvieCellGroups",  "zonvieCellGroupsAt",
+        "zonvieCellHasGroup", "zonvieCellHasGroupAt",
+    });
 }
 
 /// Whether a shader reads iPrevFrame. Gates the feedback pair and the copy
@@ -1221,11 +1238,84 @@ pub fn shaderUsesPrevFrame(source: []const u8) bool {
     return containsAnyWord(source, &.{"iPrevFrame"});
 }
 
+/// Whether a shader reads iBelowFloats. Gates the below-floats texture and
+/// the extra non-float pass that fills it.
+pub fn shaderUsesBelowFloats(source: []const u8) bool {
+    return containsAnyWord(source, &.{"iBelowFloats"});
+}
+
 /// Whether a shader opts into drawing the cursor itself with the
 /// `@zonvie-owns-cursor` comment token. The frontend then skips its native
 /// cursor pass and glow for every shape, block included.
 pub fn shaderOwnsCursor(source: []const u8) bool {
     return std.mem.indexOf(u8, source, "@zonvie-owns-cursor") != null;
+}
+
+/// Highest number of groups a shader can declare: one bit each in a texel's w.
+pub const max_hl_groups = 32;
+
+/// The highlight-group names a shader declares with
+/// `@zonvie-hl-groups: name name ...` (a comment line; the colon must follow
+/// the token directly). Names are whitespace-separated up to the end of the
+/// line; several declarations append. Bit i of a texel's w is out[i].
+/// Duplicates keep their first index; names past max_hl_groups are dropped.
+/// Returns the count; the slices point into `source`.
+pub fn parseHlGroups(source: []const u8, out: *[max_hl_groups][]const u8) u8 {
+    const token = "@zonvie-hl-groups:";
+    var n: u8 = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search, token)) |pos| {
+        const line_end = std.mem.indexOfScalarPos(u8, source, pos, '\n') orelse source.len;
+        search = line_end;
+        var it = std.mem.tokenizeAny(u8, source[pos + token.len .. line_end], " \t\r");
+        while (it.next()) |name| {
+            if (n == max_hl_groups) return n;
+            var dup = false;
+            for (out[0..n]) |seen| {
+                if (std.mem.eql(u8, seen, name)) dup = true;
+            }
+            if (dup) continue;
+            out[n] = name;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "parseHlGroups reads names in order after the token" {
+    var out: [max_hl_groups][]const u8 = undefined;
+    const n = parseHlGroups("// @zonvie-hl-groups: @markup.heading.1 @markup.quote  @markup.raw.block  \r\nvoid main() {}\n", &out);
+    try std.testing.expectEqual(@as(u8, 3), n);
+    try std.testing.expectEqualStrings("@markup.heading.1", out[0]);
+    try std.testing.expectEqualStrings("@markup.quote", out[1]);
+    try std.testing.expectEqualStrings("@markup.raw.block", out[2]);
+}
+
+test "parseHlGroups caps at 32, keeps first of duplicates, ignores a token without colon" {
+    var out: [max_hl_groups][]const u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 0), parseHlGroups("// @zonvie-hl-groups Comment\n", &out));
+    try std.testing.expectEqual(@as(u8, 0), parseHlGroups("// @zonvie-hl-groups :Comment\n", &out));
+    const dup = parseHlGroups("// @zonvie-hl-groups: A B A\n// @zonvie-hl-groups: C B\n", &out);
+    try std.testing.expectEqual(@as(u8, 3), dup);
+    try std.testing.expectEqualStrings("A", out[0]);
+    try std.testing.expectEqualStrings("B", out[1]);
+    try std.testing.expectEqualStrings("C", out[2]);
+    var src: [40 * 4 + 32]u8 = undefined;
+    var w: usize = 0;
+    for ("// @zonvie-hl-groups:") |ch| {
+        src[w] = ch;
+        w += 1;
+    }
+    for (0..40) |i| {
+        src[w] = ' ';
+        src[w + 1] = 'g';
+        src[w + 2] = '0' + @as(u8, @intCast(i / 10));
+        src[w + 3] = '0' + @as(u8, @intCast(i % 10));
+        w += 4;
+    }
+    try std.testing.expectEqual(@as(u8, 32), parseHlGroups(src[0..w], &out));
+    try std.testing.expectEqualStrings("g00", out[0]);
+    try std.testing.expectEqualStrings("g31", out[31]);
 }
 
 fn containsAnyWord(source: []const u8, tokens: []const []const u8) bool {
@@ -1258,16 +1348,42 @@ test "a shader animates when it reads a per-frame uniform as a whole word" {
 test "a shader uses the edit inputs only when it names one as a whole word" {
     try std.testing.expect(shaderUsesEditInputs("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(shaderUsesEditInputs("vec2 cs = iCellSize;"));
+    try std.testing.expect(shaderUsesEditInputs("vec4 r = iLayers[0];"));
+    try std.testing.expect(shaderUsesEditInputs("vec4 r = zonvieLayerRect(0);"));
     try std.testing.expect(shaderUsesEditInputs("float a = zonvieCellAge(fragCoord) + iTime;"));
     try std.testing.expect(!shaderUsesEditInputs("float myiCellAge = 1.0;"));
     try std.testing.expect(!shaderUsesEditInputs("fragColor = vec4(sin(iTime));"));
     try std.testing.expect(!shaderUsesEditInputs("vec4 p = texture(iPrevFrame, uv);"));
 }
 
+test "a shader uses the cell text only when it names the texture or a wrapper" {
+    try std.testing.expect(shaderUsesCellText("uint c = texelFetch(iCellText, idx, 0).r;"));
+    try std.testing.expect(shaderUsesCellText("if (zonvieCellText(fragCoord) == 0x5Bu) {}"));
+    try std.testing.expect(shaderUsesCellText("uint c = zonvieCellTextAt(cell + ivec2(1, 0));"));
+    try std.testing.expect(!shaderUsesCellText("float a = texelFetch(iCellAge, c, 0).r;"));
+    try std.testing.expect(!shaderUsesCellText("uint myiCellText = 1u;"));
+    try std.testing.expect(shaderUsesCellText("vec3 b = zonvieCellBg(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("vec3 f = zonvieCellFgAt(c);"));
+    try std.testing.expect(shaderUsesCellText("uint a = zonvieCellAttr(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("bool h = zonvieCellHasGroupAt(c, 0);"));
+    try std.testing.expect(shaderUsesCellText("uint g = zonvieCellGroups(fragCoord);"));
+    try std.testing.expect(shaderUsesCellText("uvec4 t = zonvieCellAt4(c);"));
+    // The colour uniforms need no cell text.
+    try std.testing.expect(!shaderUsesCellText("vec3 c = iCursorText + iBackgroundColor;"));
+    // The text is an edit input: reading it alone must switch the core on.
+    try std.testing.expect(shaderUsesEditInputs("if (zonvieCellText(fragCoord) == 0x5Bu) {}"));
+}
+
 test "a shader uses iPrevFrame only when it names it" {
     try std.testing.expect(shaderUsesPrevFrame("vec4 p = texture(iPrevFrame, uv);"));
     try std.testing.expect(!shaderUsesPrevFrame("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(!shaderUsesPrevFrame("vec4 myiPrevFrame;"));
+}
+
+test "a shader uses iBelowFloats only when it names it" {
+    try std.testing.expect(shaderUsesBelowFloats("vec4 b = texture(iBelowFloats, uv);"));
+    try std.testing.expect(!shaderUsesBelowFloats("vec4 iBelowFloatsX;"));
+    try std.testing.expect(!shaderUsesBelowFloats("void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel0, p); }"));
 }
 
 test "a shader owns the cursor only with the opt-in token" {

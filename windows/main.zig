@@ -904,6 +904,7 @@ pub fn main() u8 {
     app.* = .{
         .alloc = alloc,
         .cell_age = .init(alloc),
+        .cell_text = .init(alloc),
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .config = config,
         .ext_cmdline_enabled = ext_cmdline_enabled,

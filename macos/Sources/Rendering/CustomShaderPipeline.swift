@@ -25,24 +25,38 @@ final class CustomShaderPipeline {
     /// SharedRenderResources so the cell-age texture and the core's stamp
     /// lists exist only when something reads them.
     let usesEditInputs: Bool
+    /// True when the source reads the cell-text texture. Gates the
+    /// cell-text stores and texture.
+    let usesCellText: Bool
     /// True when the source reads `iPrevFrame`. Gates the feedback pair.
     let usesPrevFrame: Bool
+    /// True when the source reads `iBelowFloats`. Gates the below-floats
+    /// texture and its pass.
+    let usesBelowFloats: Bool
     /// True when the source declared `@zonvie-owns-cursor`.
     let ownsCursor: Bool
+    /// The GLSL text, for the core's `@zonvie-hl-groups:` declaration.
+    let glslSource: String
 
     private init(
         sourcePath: String,
         pipelineState: MTLRenderPipelineState,
         needsAnimation: Bool,
         usesEditInputs: Bool,
+        usesCellText: Bool,
         usesPrevFrame: Bool,
-        ownsCursor: Bool
+        usesBelowFloats: Bool,
+        ownsCursor: Bool,
+        glslSource: String
     ) {
+        self.glslSource = glslSource
         self.sourcePath = sourcePath
         self.pipelineState = pipelineState
         self.needsAnimation = needsAnimation
         self.usesEditInputs = usesEditInputs
+        self.usesCellText = usesCellText
         self.usesPrevFrame = usesPrevFrame
+        self.usesBelowFloats = usesBelowFloats
         self.ownsCursor = ownsCursor
     }
 
@@ -60,11 +74,25 @@ final class CustomShaderPipeline {
         return source.withUTF8 { zonvie_core_shader_uses_edit_inputs($0.baseAddress, $0.count) }
     }
 
+    /// Whether the shader reads the cell text: the core's rule, shared with
+    /// Windows.
+    static func detectUsesCellText(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_cell_text($0.baseAddress, $0.count) }
+    }
+
     /// Whether the shader reads iPrevFrame: the core's rule, shared with
     /// Windows.
     static func detectUsesPrevFrame(in source: String) -> Bool {
         var source = source
         return source.withUTF8 { zonvie_core_shader_uses_prev_frame($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader reads iBelowFloats: the core's rule, shared with
+    /// Windows.
+    static func detectUsesBelowFloats(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_below_floats($0.baseAddress, $0.count) }
     }
 
     /// Whether the shader opts into drawing the cursor: the core's rule,
@@ -146,16 +174,21 @@ final class CustomShaderPipeline {
 
         let needsAnimation = detectNeedsAnimation(in: glslSource)
         let usesEditInputs = detectUsesEditInputs(in: glslSource)
+        let usesCellText = detectUsesCellText(in: glslSource)
         let usesPrevFrame = detectUsesPrevFrame(in: glslSource)
+        let usesBelowFloats = detectUsesBelowFloats(in: glslSource)
         let ownsCursor = detectOwnsCursor(in: glslSource)
-        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) prevFrame=\(usesPrevFrame) ownsCursor=\(ownsCursor))")
+        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) cellText=\(usesCellText) prevFrame=\(usesPrevFrame) belowFloats=\(usesBelowFloats) ownsCursor=\(ownsCursor))")
         return CustomShaderPipeline(
             sourcePath: sourcePath,
             pipelineState: pipelineState,
             needsAnimation: needsAnimation,
             usesEditInputs: usesEditInputs,
+            usesCellText: usesCellText,
             usesPrevFrame: usesPrevFrame,
-            ownsCursor: ownsCursor
+            usesBelowFloats: usesBelowFloats,
+            ownsCursor: ownsCursor,
+            glslSource: glslSource
         )
     }
 
@@ -193,10 +226,11 @@ final class CustomShaderPipeline {
     /// Shadertoy preamble's `layout(std140, binding = 1)`. Inlining
     /// avoids write races when several MTKViews animate simultaneously
     /// (each gets its own copy in the command buffer).
-    /// `prevFrame` and `cellAge` back the Zonvie edit-effect inputs
-    /// (`iPrevFrame` at texture 2, `iCellAge` at texture 3). Both are nil for
-    /// shaders that do not reference them; the fragment function then simply
-    /// never samples those slots.
+    /// `prevFrame`, `cellAge`, `cellText` and `rowOffset` back the Zonvie
+    /// edit-effect inputs (`iPrevFrame` at texture 2, `iCellAge` at 3,
+    /// `iCellText` at 4, `iRowOffset` at 5, `iBelowFloats` at 6). Each is nil for shaders that do
+    /// not reference it; the fragment function then simply never samples
+    /// that slot.
     func encode(
         cmd: MTLCommandBuffer,
         input: MTLTexture,
@@ -209,7 +243,10 @@ final class CustomShaderPipeline {
         sampler: MTLSamplerState,
         uniforms: zonvie_shader_uniforms,
         prevFrame: MTLTexture? = nil,
-        cellAge: MTLTexture? = nil
+        cellAge: MTLTexture? = nil,
+        cellText: MTLTexture? = nil,
+        rowOffset: MTLTexture? = nil,
+        belowFloats: MTLTexture? = nil
     ) -> Bool {
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = output
@@ -234,10 +271,39 @@ final class CustomShaderPipeline {
             enc.setFragmentTexture(cellAge, index: 3)
             enc.setFragmentSamplerState(sampler, index: 3)
         }
+        if let cellText {
+            enc.setFragmentTexture(cellText, index: 4)
+            enc.setFragmentSamplerState(sampler, index: 4)
+        }
+        if let rowOffset {
+            enc.setFragmentTexture(rowOffset, index: 5)
+            enc.setFragmentSamplerState(sampler, index: 5)
+        }
+        if let below = belowFloats ?? (usesBelowFloats ? blackFallback(device: cmd.device) : nil) {
+            enc.setFragmentTexture(below, index: 6)
+            enc.setFragmentSamplerState(sampler, index: 6)
+        }
         var u = uniforms
         enc.setFragmentBytes(&u, length: MemoryLayout<zonvie_shader_uniforms>.size, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         enc.endEncoding()
         return true
+    }
+
+    /// Bound at slot 6 when the below pass produced nothing, so a shader
+    /// reading iBelowFloats never samples an unbound slot (black, matching
+    /// Linux and Windows). Created once per pipeline and reused.
+    private var blackTexture: MTLTexture?
+
+    private func blackFallback(device: MTLDevice) -> MTLTexture? {
+        if let blackTexture { return blackTexture }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        var px: UInt32 = 0
+        tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &px, bytesPerRow: 4)
+        blackTexture = tex
+        return tex
     }
 }

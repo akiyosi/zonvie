@@ -179,6 +179,8 @@ final class ZonvieCore {
     static var appLogVerbose = false
     // Core callback thread only; shared with every surface in this bracket.
     private var renderTraceFlushId: UInt64 = 0
+    /// The cell-text opt-in as of this flush's on_flush_begin. Core thread only.
+    private var flushWantsCellText = false
     /// Whether a core flush bracket is open. A destroy that arrives outside one
     /// has no on_flush_end to publish against and would be cleared by the next
     /// begin, so it is released immediately instead of staged.
@@ -1156,6 +1158,9 @@ final class ZonvieCore {
                 me.renderTraceFlushId &+= 1
                 me.terminalView?.renderer.renderTraceFlushId = me.renderTraceFlushId
                 ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=begin")
+                // Latched once per flush: a pipeline rebuild on another thread
+                // changes the opt-in only between flushes, never mid-flush.
+                me.flushWantsCellText = me.terminalView?.renderer.shared.cellTextOptIn.withLock { $0 } ?? false
                 // The shader cursor has one staged slot for the whole flush,
                 // written by whichever surface draws the cursor. A measurement
                 // left by a flush that never committed describes vertices that
@@ -1284,6 +1289,7 @@ final class ZonvieCore {
                     }
                     me.terminalView?.renderer.abortFlush()
                     me.sharedResources?.abortFlushTransaction()
+                    me.terminalView?.renderer.shared.cellText.discard()
                     for gridView in me.extViewsScratch {
                         gridView.cancelFlush()
                     }
@@ -1598,7 +1604,8 @@ final class ZonvieCore {
                         z: Int(l.z),
                         followsScroll: (l.flags & UInt32(ZONVIE_LAYER_FOLLOWS_SCROLL)) != 0,
                         mouseEnabled: (l.flags & UInt32(ZONVIE_LAYER_MOUSE_ENABLED)) != 0,
-                        isFloat: (l.flags & UInt32(ZONVIE_LAYER_FLOAT)) != 0
+                        isFloat: (l.flags & UInt32(ZONVIE_LAYER_FLOAT)) != 0,
+                        isMsg: (l.flags & UInt32(ZONVIE_LAYER_MSG)) != 0
                     ))
                 }
                 me.onSurfaceLayout(
@@ -1692,6 +1699,13 @@ final class ZonvieCore {
                 guard let atlas = me.sharedAtlas else { return 0 }
                 return atlas.rasterizeByGlyphID(fontId: fontId, glyphID: glyphID, styleFlags: styleFlags,
                                                 outBitmap: outBitmap) ? 1 : 0
+            },
+            on_cell_text_row: { ctx, row in
+                guard let ctx, let row else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Core thread, grid_mu held. Only the CPU mirror is written.
+                guard me.flushWantsCellText, let shared = me.terminalView?.renderer.shared else { return }
+                shared.cellText.apply(row)
             }
         )
 
@@ -3131,12 +3145,26 @@ final class ZonvieCore {
         )
     }
 
-    /// Tell the core whether to build per-flush cell-age stamp lists. Driven
-    /// by the loaded shader set: only a shader that reads the edit inputs
-    /// turns this on, so the default path costs nothing.
-    func setShaderInputsEnabled(_ enabled: Bool) {
+    /// Tell the core which shader inputs to build: per-flush cell-age stamp lists
+    /// for a shader that reads the edit inputs, and cell-text rows for one that
+    /// reads iCellText. Driven by the loaded shader set, so the default path
+    /// costs nothing and an iCellAge-only shader never pays for cell text.
+    /// Ghostty colour uniforms from the core's seqlocked snapshot; any thread.
+    func fillShaderColors(_ u: inout zonvie_shader_uniforms) {
         guard let core else { return }
-        zonvie_core_set_shader_inputs_enabled(core, enabled ? 1 : 0)
+        zonvie_shader_fill_colors(core, &u)
+    }
+
+    /// `hlGroupsSource` is the loaded chain's sources joined in load order;
+    /// its `@zonvie-hl-groups:` lines are declared before cell text turns on.
+    func setShaderInputsEnabled(editInputs: Bool, cellText: Bool, hlGroupsSource: String) {
+        guard let core else { return }
+        var source = hlGroupsSource
+        source.withUTF8 { zonvie_core_set_shader_hl_groups(core, $0.baseAddress, $0.count) }
+        var flags: UInt32 = 0
+        if editInputs { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_AGE) }
+        if cellText { flags |= UInt32(ZONVIE_SHADER_INPUT_CELL_TEXT) }
+        zonvie_core_set_shader_inputs_enabled(core, Int32(flags))
     }
 
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
@@ -5603,6 +5631,7 @@ final class ZonvieCore {
         externalGridViewsLock.lock()
         let removedView = externalGridViews.removeValue(forKey: gridId)
         terminalView?.renderer.shared.cellAge.drop(grid: gridId)
+        terminalView?.renderer.shared.cellText.drop(grid: gridId)
         externalGridViewsLock.unlock()
         // The view's own vertex storage goes when the view does, not on
         // on_grid_destroy: that fires while this close is still queued and

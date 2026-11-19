@@ -30,6 +30,7 @@ pub const glow_chain = @import("glow_chain.zig");
 pub const frontend_rules = @import("frontend_rules.zig");
 pub const tab_label = @import("tab_label.zig");
 pub const cell_age_store = @import("cell_age_store.zig");
+pub const cell_text_store = @import("cell_text_store.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -46,6 +47,7 @@ test {
     _ = damage_bands;
     _ = scroll_ease;
     _ = cell_age_store;
+    _ = cell_text_store;
 }
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -72,6 +74,7 @@ pub const DECO_SEPARATOR: u32 = 1 << 12;
 pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
 pub const LAYER_MOUSE_ENABLED: u32 = 1 << 1;
 pub const LAYER_FLOAT: u32 = 1 << 2;
+pub const LAYER_MSG: u32 = 1 << 3;
 
 pub const Layer = extern struct {
     grid_id: i64,
@@ -633,6 +636,10 @@ pub const Callbacks = extern struct {
     on_shape_text_run_ex: ?ShapeTextRunExFn = null,
     on_rasterize_glyph_ex: ?RasterizeGlyphExFn = null,
     on_rasterize_glyph_by_id_ex: ?RasterizeGlyphExFn = null,
+    // The cell texels of a row the flush just sent, for the iCellText shader
+    // input. Appended at the end for ABI compat; only fired after the
+    // frontend opts in via zonvie_core_set_shader_inputs_enabled.
+    on_cell_text_row: ?*const fn (ctx: ?*anyopaque, row: *const zonvie_cell_text_row) callconv(.c) void = null,
 
     // Field layout is checked against include/zonvie_core.h in
     // abi_header_test.zig; the version must stay readable at offset 0.
@@ -776,6 +783,7 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         // Cell-age stamps for the iCellAge shader input
         .on_cell_age_stamps = box.cb.on_cell_age_stamps,
+        .on_cell_text_row = box.cb.on_cell_text_row,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
@@ -1632,10 +1640,11 @@ pub export fn zonvie_core_set_ext_tabline(p: ?*zonvie_core, enabled: i32) callco
 /// default: with it off the core records nothing and never fires the
 /// callback, so a frontend without an edit-effect shader pays nothing.
 /// Turning it off also drops anything recorded for the in-flight flush.
-pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, flags: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    const on = (enabled != 0);
+    // Unknown bits (and a negative value's sign bit) are ignored.
+    const on: u32 = @as(u32, @bitCast(flags)) & (SHADER_INPUT_CELL_AGE | SHADER_INPUT_CELL_TEXT);
     // Called from the frontend's render/UI thread after zonvie_core_start,
     // while the core thread may be inside handleRedraw recording stamps into
     // the same fields. grid_mu serialises the two; without it the OFF path's
@@ -1644,10 +1653,38 @@ pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i
     // held there and this mutex is not recursive) — both frontends call it
     // from their shader-pipeline build, which runs on their own thread.
     box.core.grid_mu.lockUncancelable(clock.io());
-    box.core.grid.shader_inputs_enabled = on;
-    if (!on) box.core.grid.resetCellStamps();
+    box.core.setShaderInputsEnabledLocked(on);
     box.core.grid_mu.unlock(clock.io());
-    box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: enabled={any}\n", .{on});
+    box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: flags={d}\n", .{on});
+}
+
+/// Declare the highlight groups the loaded shader names with
+/// `@zonvie-hl-groups:`; see include/zonvie_frontend.h. Same thread and lock
+/// rules as zonvie_core_set_shader_inputs_enabled.
+pub export fn zonvie_core_set_shader_hl_groups(p: ?*zonvie_core, source: ?[*]const u8, len: usize) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const src: []const u8 = if (source) |s| s[0..len] else &.{};
+    box.core.grid_mu.lockUncancelable(clock.io());
+    box.core.setShaderHlGroupsLocked(src);
+    box.core.grid_mu.unlock(clock.io());
+    box.core.sendShaderHlUnlink();
+}
+
+/// One iCellText texel (zonvie_cell_text_row.texels): x codepoint, y fg rgb24
+/// with the ZONVIE_CELL_ATTR_* byte above it, z bg rgb24, w group mask.
+/// Pre: colours are rgb24 (debug-asserted; release drops higher bits).
+pub fn packCellTexel(cp: u32, fg_rgb: u32, bg_rgb: u32, style: u8, mask: u32) [4]u32 {
+    std.debug.assert(fg_rgb <= 0xFFFFFF and bg_rgb <= 0xFFFFFF);
+    return .{ cp, (fg_rgb & 0xFFFFFF) | (@as(u32, style) << 24), bg_rgb & 0xFFFFFF, mask };
+}
+
+test "packCellTexel puts cp in x, fg|attr<<24 in y, bg in z, mask in w" {
+    const hl = @import("highlight.zig");
+    const t = packCellTexel(0x41, 0x112233, 0x445566, hl.STYLE_BOLD | hl.STYLE_UNDERCURL, 0x8000_0001);
+    try std.testing.expectEqual([4]u32{ 0x41, 0x112233 | (0x11 << 24), 0x445566, 0x8000_0001 }, t);
+    // Every style bit lands in y's top byte unchanged.
+    try std.testing.expectEqual(@as(u32, 0xFF00_0000), packCellTexel(0, 0, 0, 0xFF, 0)[1]);
 }
 
 pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -2272,9 +2309,19 @@ pub export fn zonvie_core_shader_uses_edit_inputs(source: ?[*]const u8, len: usi
     return frontend_rules.shaderUsesEditInputs(s[0..len]);
 }
 
+pub export fn zonvie_core_shader_uses_cell_text(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderUsesCellText(s[0..len]);
+}
+
 pub export fn zonvie_core_shader_uses_prev_frame(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderUsesPrevFrame(s[0..len]);
+}
+
+pub export fn zonvie_core_shader_uses_below_floats(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderUsesBelowFloats(s[0..len]);
 }
 
 pub export fn zonvie_core_shader_owns_cursor(source: ?[*]const u8, len: usize) callconv(.c) bool {
@@ -3847,7 +3894,7 @@ comptime {
 /// `ZonvieShaderUniforms` block emitted by `shader_compiler.zig`'s
 /// Shadertoy preamble; keep this struct and the C header version
 /// (`zonvie_shader_uniforms` in `include/zonvie_core.h`) in lock-step.
-/// Total size is 160 bytes; field ordering is load-bearing.
+/// Field order and offsets are load-bearing (std140).
 ///
 /// iResolution is the main window's drawable size for every view, so the
 /// shader sees a single coordinate space across windows. iWindowOffset
@@ -3893,11 +3940,104 @@ pub const zonvie_shader_uniforms = extern struct {
     iCursorVisible: i32 = 1, // 180..183
     iCurrentCursorStyle: i32 = 0, // 184..187
     iPreviousCursorStyle: i32 = 0, // 188..191
+    // Cell geometry per grid (the preamble's zonvieCellGeom). iCellSize is
+    // the surface root's cell; iCursorCellSize the cell of the grid the
+    // cursor is in. iLayers lists, topmost first, the layers down to the
+    // lowest one in its own font, three vec4 each (fillLayers).
+    iCursorCellSize: [2]f32 = .{ 0, 0 }, // 192..199
+    iLayerCount: i32 = 0, // 200..203
+    iRootRows: i32 = 0, // 204..207
+    iLayers: [SHADER_LAYERS_MAX * 3][4]f32 = @splat(@splat(0)), // 208..975
+    // Ghostty colour uniforms (vec3 in a 16-byte std140 slot; [3] is
+    // padding and stays 0). Filled by zonvie_shader_fill_colors.
+    iBackgroundColor: [4]f32 = .{ 0, 0, 0, 0 }, // 976..991
+    iForegroundColor: [4]f32 = .{ 0, 0, 0, 0 }, // 992..1007
+    iCursorColor: [4]f32 = .{ 0, 0, 0, 0 }, // 1008..1023
+    iCursorText: [4]f32 = .{ 0, 0, 0, 0 }, // 1024..1039
 };
 
+pub const SHADER_LAYERS_MAX = 16;
+
+/// iLayers entry flags, the [3i+2].w word. fillLayers derives FONT_GRID from
+/// the layer's cell; a caller supplies the others.
+pub const SHADER_LAYER_FLOAT: u32 = 1 << 0;
+pub const SHADER_LAYER_FONT_GRID: u32 = 1 << 1;
+pub const SHADER_LAYER_FOCUSABLE: u32 = 1 << 2;
+pub const SHADER_LAYER_BORDER: u32 = 1 << 3;
+pub const SHADER_INPUT_CELL_AGE: u32 = 1 << 0;
+pub const SHADER_INPUT_CELL_TEXT: u32 = 1 << 1;
+
 comptime {
-    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 192);
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 1040);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iLayers") == 208);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iBackgroundColor") == 976);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iForegroundColor") == 992);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iCursorColor") == 1008);
+    std.debug.assert(@offsetOf(zonvie_shader_uniforms, "iCursorText") == 1024);
 }
+
+/// rgb24 (0xRRGGBB) to a std140 vec3 slot, each channel /255, pad 0.
+fn rgb24ToSlot(rgb: u32) [4]f32 {
+    std.debug.assert(rgb <= 0xFFFFFF);
+    return .{
+        @as(f32, @floatFromInt((rgb >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((rgb >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(rgb & 0xFF)) / 255.0,
+        0,
+    };
+}
+
+/// Pure packing of a colour snapshot {default_bg, default_fg, cursor,
+/// cursor_text} (rgb24 each, in uniform order) into the four slots at
+/// 976..1039. Pre: every value <= 0xFFFFFF.
+pub fn colorsToUniform(c: [4]u32) [4][4]f32 {
+    return .{ rgb24ToSlot(c[0]), rgb24ToSlot(c[1]), rgb24ToSlot(c[2]), rgb24ToSlot(c[3]) };
+}
+
+/// Write iBackgroundColor, iForegroundColor, iCursorColor and iCursorText
+/// from the core's latest published colour snapshot. Touches only bytes
+/// 976..1039 of `u`. Safe from any thread.
+pub export fn zonvie_shader_fill_colors(p: ?*const zonvie_core, u: *zonvie_shader_uniforms) callconv(.c) void {
+    const box: *const CoreBox = @ptrCast(@alignCast(p orelse return));
+    const s = box.core.shader_colors.read();
+    const slots = colorsToUniform(.{ s.default_bg, s.default_fg, s.cursor, s.cursor_text });
+    u.iBackgroundColor = slots[0];
+    u.iForegroundColor = slots[1];
+    u.iCursorColor = slots[2];
+    u.iCursorText = slots[3];
+}
+
+test "colorsToUniform unpacks rgb24 to /255 channels with a zero pad" {
+    const s = colorsToUniform(.{ 0xFF8000, 0x000000, 0xFFFFFF, 0x0080FF });
+    try std.testing.expectEqual([4]f32{ 1.0, 128.0 / 255.0, 0, 0 }, s[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, s[1]);
+    try std.testing.expectEqual([4]f32{ 1, 1, 1, 0 }, s[2]);
+    try std.testing.expectEqual([4]f32{ 0, 128.0 / 255.0, 1, 0 }, s[3]);
+}
+
+/// One layer of a surface as zonvie_shader_fill_layers reads it. The
+/// rect is in fragCoord space (the surface's iGridOrigin plus the layer's
+/// origin); a grid in its own font gives its cell and its extent (margin
+/// included), any other
+/// layer cell 0 and rows x cols global cells, except under a root in its own
+/// font, where every layer gives a cell (its text has a band).
+pub const zonvie_shader_layer = extern struct {
+    grid_id: i64,
+    x_px: f32,
+    y_px: f32,
+    w_px: f32,
+    h_px: f32,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    rows: u32,
+    cols: u32,
+    /// Back-to-front rank, as zonvie_layer.z; unique per surface.
+    z: u32,
+    /// SHADER_LAYER_* the caller knows (FLOAT; FOCUSABLE from the layer's
+    /// MOUSE_ENABLED); fillLayers derives FONT_GRID and clears the reserved
+    /// BORDER whatever is passed here.
+    flags: u32 = 0,
+};
 
 /// One contiguous run of cells stamped as "just edited". The core-side type
 /// is `grid.CellStamp`; this alias is the name the C header uses. Keeping it
@@ -3959,6 +4099,57 @@ pub export fn zonvie_cell_age_remove_all(s: *cell_age_store.Stores) callconv(.c)
     s.removeAll();
 }
 
+pub const zonvie_cell_text_row = cell_text_store.Row;
+
+pub export fn zonvie_cell_text_create() callconv(.c) ?*cell_text_store.Stores {
+    const s = std.heap.c_allocator.create(cell_text_store.Stores) catch return null;
+    s.* = .init(std.heap.c_allocator);
+    return s;
+}
+
+pub export fn zonvie_cell_text_destroy(s: ?*cell_text_store.Stores) callconv(.c) void {
+    const p = s orelse return;
+    p.deinit();
+    std.heap.c_allocator.destroy(p);
+}
+
+pub export fn zonvie_cell_text_apply_row(s: *cell_text_store.Stores, row: *const zonvie_cell_text_row) callconv(.c) void {
+    s.applyRow(row.*);
+}
+
+pub export fn zonvie_cell_text_sync(
+    s: *cell_text_store.Stores,
+    grid: i64,
+    force: bool,
+    cache: *cell_text_store.SyncCache,
+    out_values: *?[*]const u32,
+) callconv(.c) i32 {
+    var v: []const u32 = &.{};
+    const r = s.sync(grid, force, cache, &v);
+    out_values.* = if (r == .dirty) v.ptr else null;
+    return @intFromEnum(r);
+}
+
+pub export fn zonvie_cell_text_commit(s: *cell_text_store.Stores, grid: i64) callconv(.c) void {
+    s.commit(grid);
+}
+
+pub export fn zonvie_cell_text_discard(s: *cell_text_store.Stores) callconv(.c) void {
+    s.discard();
+}
+
+pub export fn zonvie_cell_text_end_upload(s: *cell_text_store.Stores) callconv(.c) void {
+    s.endUpload();
+}
+
+pub export fn zonvie_cell_text_drop(s: *cell_text_store.Stores, grid: i64) callconv(.c) void {
+    s.drop(grid);
+}
+
+pub export fn zonvie_cell_text_remove_all(s: *cell_text_store.Stores) callconv(.c) void {
+    s.removeAll();
+}
+
 pub export fn zonvie_cell_age_surface_grid(
     surface_w_px: f32,
     surface_h_px: f32,
@@ -3992,37 +4183,116 @@ pub fn fillEditUniforms(
     u: *zonvie_shader_uniforms,
     cell_w_px: f32,
     row_h_px: f32,
+    cursor_cell_px: [2]f32,
     grid_origin_px: [2]f32,
     time_last_edit: f32,
     cursor_visible: bool,
     wants_edit_inputs: bool,
 ) void {
     u.iCellSize = .{ cell_w_px, row_h_px };
+    u.iCursorCellSize = cursor_cell_px;
     u.iGridOrigin = grid_origin_px;
     u.iTimeLastEdit = if (wants_edit_inputs) time_last_edit else 0;
     u.iCursorVisible = @intFromBool(cursor_visible);
-    u.iCurrentCursorStyle = cursorStyleForRect(u.iCurrentCursor, cell_w_px, row_h_px);
-    u.iPreviousCursorStyle = cursorStyleForRect(u.iPreviousCursor, cell_w_px, row_h_px);
+    u.iCurrentCursorStyle = cursorStyleForRect(u.iCurrentCursor, cursor_cell_px[0], cursor_cell_px[1]);
+    u.iPreviousCursorStyle = cursorStyleForRect(u.iPreviousCursor, cursor_cell_px[0], cursor_cell_px[1]);
 }
 
 pub export fn zonvie_shader_fill_edit_uniforms(
     u: *zonvie_shader_uniforms,
     cell_w_px: f32,
     row_h_px: f32,
+    cursor_cell_w_px: f32,
+    cursor_row_h_px: f32,
     grid_origin_x_px: f32,
     grid_origin_y_px: f32,
     time_last_edit: f32,
     cursor_visible: bool,
     wants_edit_inputs: bool,
 ) callconv(.c) void {
-    fillEditUniforms(u, cell_w_px, row_h_px, .{ grid_origin_x_px, grid_origin_y_px }, time_last_edit, cursor_visible, wants_edit_inputs);
+    fillEditUniforms(u, cell_w_px, row_h_px, .{ cursor_cell_w_px, cursor_row_h_px }, .{ grid_origin_x_px, grid_origin_y_px }, time_last_edit, cursor_visible, wants_edit_inputs);
+}
+
+/// Fill iRootRows and iLayers from a surface's non-root layers. The table
+/// holds every layer, topmost first, capped at the SHADER_LAYERS_MAX topmost,
+/// so a shader sees every float whether or not any grid has its own font.
+/// FLOAT and FOCUSABLE pass through from the caller (FOCUSABLE is the layer's
+/// MOUSE_ENABLED); BORDER is reserved and always cleared. Per entry:
+/// [0] the rect; [1] cell w, h and the first iCellText row of the grid's
+/// band, or all zero for a layer on the surface lattice; [2] rows, cols, grid
+/// id, flags (FONT_GRID derived from the cell). Pure; |grid id| is below 1 << 24.
+/// Bands follow the root's rows in grid-id order, the rule the core writes
+/// them by (flush.cellTextBandRow0).
+pub fn fillLayers(u: *zonvie_shader_uniforms, rects: []const zonvie_shader_layer, root_rows: u32) void {
+    // |grid_id| < 1 << 24 keeps the id exact in f32; the core's special
+    // grids are negative (CMDLINE -100 ...).
+    for (rects) |r| std.debug.assert(r.grid_id > -(1 << 24) and r.grid_id < (1 << 24));
+    u.iRootRows = @intCast(root_rows);
+    u.iLayerCount = 0;
+    var n: usize = 0;
+    var below: u32 = std.math.maxInt(u32);
+    while (n < SHADER_LAYERS_MAX) {
+        // The next layer down: the highest z under the last one taken.
+        var pick: ?usize = null;
+        for (rects, 0..) |r, i| {
+            if (r.z >= below) continue;
+            if (pick == null or r.z > rects[pick.?].z) pick = i;
+        }
+        const i = pick orelse break;
+        const r = rects[i];
+        below = r.z;
+        u.iLayers[n * 3] = .{ r.x_px, r.y_px, r.w_px, r.h_px };
+        u.iLayers[n * 3 + 1] = .{ 0, 0, 0, 0 };
+        if (r.cell_w_px > 0) {
+            var row0: u32 = root_rows;
+            for (rects) |o| {
+                if (o.cell_w_px > 0 and o.grid_id < r.grid_id) row0 += o.rows;
+            }
+            u.iLayers[n * 3 + 1] = .{ r.cell_w_px, r.cell_h_px, @floatFromInt(row0), 0 };
+        }
+        const passed = r.flags & ~(SHADER_LAYER_FONT_GRID | SHADER_LAYER_BORDER);
+        const flags = if (r.cell_w_px > 0) passed | SHADER_LAYER_FONT_GRID else passed;
+        u.iLayers[n * 3 + 2] = .{ @floatFromInt(r.rows), @floatFromInt(r.cols), @floatFromInt(r.grid_id), @floatFromInt(flags) };
+        n += 1;
+    }
+    u.iLayerCount = @intCast(n);
+}
+
+/// The SHADER_LAYER_* a frontend passes for a zonvie_layer: FLOAT for a
+/// win_float_pos float only (the msg grid is placed with a zindex but is not
+/// one), FOCUSABLE from MOUSE_ENABLED.
+pub fn shaderLayerFlags(layer_flags: u32) u32 {
+    const float = layer_flags & LAYER_FLOAT != 0 and layer_flags & LAYER_MSG == 0;
+    return (if (float) SHADER_LAYER_FLOAT else 0) |
+        (if (layer_flags & LAYER_MOUSE_ENABLED != 0) SHADER_LAYER_FOCUSABLE else 0);
+}
+
+pub export fn zonvie_shader_layer_flags(layer_flags: u32) callconv(.c) u32 {
+    return shaderLayerFlags(layer_flags);
+}
+
+test "shaderLayerFlags: the msg grid is not a float, mouse makes focusable" {
+    try std.testing.expectEqual(SHADER_LAYER_FLOAT, shaderLayerFlags(LAYER_FLOAT));
+    try std.testing.expectEqual(@as(u32, 0), shaderLayerFlags(LAYER_FLOAT | LAYER_MSG));
+    try std.testing.expectEqual(SHADER_LAYER_FOCUSABLE, shaderLayerFlags(LAYER_FLOAT | LAYER_MSG | LAYER_MOUSE_ENABLED));
+    try std.testing.expectEqual(SHADER_LAYER_FLOAT | SHADER_LAYER_FOCUSABLE, shaderLayerFlags(LAYER_FLOAT | LAYER_MOUSE_ENABLED | LAYER_FOLLOWS_SCROLL));
+    try std.testing.expectEqual(@as(u32, 0), shaderLayerFlags(LAYER_FOLLOWS_SCROLL));
+}
+
+pub export fn zonvie_shader_fill_layers(
+    u: *zonvie_shader_uniforms,
+    rects: ?[*]const zonvie_shader_layer,
+    n: usize,
+    root_rows: u32,
+) callconv(.c) void {
+    fillLayers(u, if (rects) |p| p[0..n] else &.{}, root_rows);
 }
 
 test "fillEditUniforms: row height sizes the cell, styles follow the rects, last edit is gated" {
     var u: zonvie_shader_uniforms = .{};
     u.iCurrentCursor = .{ 0, 0, 2, 20 }; // bar on a 9 x 20 cell
     u.iPreviousCursor = .{ 0, 0, 9, 4 }; // underline
-    fillEditUniforms(&u, 9, 20, .{ 4, 30 }, 6, false, true);
+    fillEditUniforms(&u, 9, 20, .{ 9, 20 }, .{ 4, 30 }, 6, false, true);
     try std.testing.expectEqual([2]f32{ 9, 20 }, u.iCellSize);
     try std.testing.expectEqual([2]f32{ 4, 30 }, u.iGridOrigin);
     try std.testing.expectEqual(@as(f32, 6), u.iTimeLastEdit);
@@ -4032,12 +4302,71 @@ test "fillEditUniforms: row height sizes the cell, styles follow the rects, last
     // A 9 px tall cursor is a block on a 17 px cell but an underline once
     // 'linespace' makes the row 20 px; the rule must see the row height.
     u.iCurrentCursor = .{ 0, 0, 9, 9 };
-    fillEditUniforms(&u, 9, 17, .{ 0, 0 }, 6, true, false);
+    fillEditUniforms(&u, 9, 17, .{ 9, 17 }, .{ 0, 0 }, 6, true, false);
     try std.testing.expectEqual(@as(i32, 0), u.iCurrentCursorStyle);
     try std.testing.expectEqual(@as(f32, 0), u.iTimeLastEdit);
     try std.testing.expectEqual(@as(i32, 1), u.iCursorVisible);
-    fillEditUniforms(&u, 9, 20, .{ 0, 0 }, 6, true, false);
+    fillEditUniforms(&u, 9, 20, .{ 9, 20 }, .{ 0, 0 }, 6, true, false);
     try std.testing.expectEqual(@as(i32, 3), u.iCurrentCursorStyle);
+    // In a grid with its own font the style is the cursor cell's, while
+    // iCellSize stays the surface's: a 2 px cursor is a bar in a 20 px cell.
+    u.iCurrentCursor = .{ 0, 0, 2, 40 };
+    fillEditUniforms(&u, 3, 20, .{ 20, 40 }, .{ 0, 0 }, 6, true, false);
+    try std.testing.expectEqual([2]f32{ 3, 20 }, u.iCellSize);
+    try std.testing.expectEqual([2]f32{ 20, 40 }, u.iCursorCellSize);
+    try std.testing.expectEqual(@as(i32, 2), u.iCurrentCursorStyle);
+    // The previous cursor too: 9 x 4 is a bar in a 20 x 40 cell (an
+    // underline in the surface's 3 x 20).
+    try std.testing.expectEqual(@as(i32, 2), u.iPreviousCursorStyle);
+}
+
+test "fillLayers: font layers get bands in grid-id order, the table runs topmost first over every layer" {
+    var u: zonvie_shader_uniforms = .{};
+    // No layer in its own font: still listed, on the surface lattice.
+    const plain = [_]zonvie_shader_layer{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 90, .h_px = 40, .cell_w_px = 0, .cell_h_px = 0, .rows = 2, .cols = 10, .z = 1 },
+    };
+    fillLayers(&u, &plain, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    try std.testing.expectEqual(@as(i32, 30), u.iRootRows);
+    u.iLayerCount = 0;
+
+    const rects = [_]zonvie_shader_layer{
+        // A split under everything, a font split, a float over it, a font float.
+        .{ .grid_id = 2, .x_px = 0, .y_px = 0, .w_px = 100, .h_px = 100, .cell_w_px = 0, .cell_h_px = 0, .rows = 5, .cols = 10, .z = 1 },
+        .{ .grid_id = 7, .x_px = 100, .y_px = 0, .w_px = 100, .h_px = 100, .cell_w_px = 15, .cell_h_px = 30, .rows = 3, .cols = 6, .z = 2 },
+        .{ .grid_id = 9, .x_px = 120, .y_px = 20, .w_px = 40, .h_px = 20, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 4, .z = 4 },
+        .{ .grid_id = 5, .x_px = 10, .y_px = 10, .w_px = 30, .h_px = 30, .cell_w_px = 5, .cell_h_px = 10, .rows = 3, .cols = 6, .z = 3 },
+    };
+    fillLayers(&u, &rects, 30);
+    try std.testing.expectEqual(@as(i32, 4), u.iLayerCount);
+    // Topmost first; grid 2, below every font layer, is listed last.
+    try std.testing.expectEqual([4]f32{ 5, 10, 2, 0 }, u.iLayers[11]);
+    try std.testing.expectEqual([4]f32{ 120, 20, 40, 20 }, u.iLayers[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iLayers[1]);
+    try std.testing.expectEqual([4]f32{ 1, 4, 9, 0 }, u.iLayers[2]);
+    // Grid 5 sorts first by id: its band starts right after the root's rows.
+    try std.testing.expectEqual([4]f32{ 10, 10, 30, 30 }, u.iLayers[3]);
+    try std.testing.expectEqual([4]f32{ 5, 10, 30, 0 }, u.iLayers[4]);
+    try std.testing.expectEqual([4]f32{ 3, 6, 5, 2 }, u.iLayers[5]);
+    try std.testing.expectEqual([4]f32{ 100, 0, 100, 100 }, u.iLayers[6]);
+    try std.testing.expectEqual([4]f32{ 15, 30, 33, 0 }, u.iLayers[7]);
+    try std.testing.expectEqual([4]f32{ 3, 6, 7, 2 }, u.iLayers[8]);
+
+    // A table filled before is cleared, not merged: the count drops to 1
+    // and a plain entry's cell is zeroed over whatever it held.
+    u.iLayers[1] = .{ 9, 9, 9, 9 };
+    fillLayers(&u, &plain, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    fillLayers(&u, &rects, 30);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.iLayers[1]);
+
+    // Past the cap the topmost are kept; bands still count every font layer.
+    var many: [SHADER_LAYERS_MAX + 4]zonvie_shader_layer = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .grid_id = @intCast(i + 2), .x_px = 0, .y_px = 0, .w_px = 1, .h_px = 1, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 1, .z = @intCast(i + 1) };
+    fillLayers(&u, &many, 30);
+    try std.testing.expectEqual(@as(i32, SHADER_LAYERS_MAX), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, 30 + many.len - 1), u.iLayers[1][2]);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must
@@ -4243,3 +4572,89 @@ pub const CallbackErrorCode = enum(u32) {
     atlas_full = 3,
     shape_failed = 4,
 };
+
+test "fill_layers: grid id and flags land in the third vec4" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 7, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 2, .z = 1, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, 7.0), u.iLayers[2][2]);
+    // FONT_GRID is derived from the cell, so the caller's FLOAT is kept and it is added.
+    try std.testing.expectEqual(@as(f32, 3.0), u.iLayers[2][3]);
+}
+
+test "fill_layers: more than 16 layers keeps the 16 topmost" {
+    var u: zonvie_shader_uniforms = .{};
+    var many: [20]zonvie_shader_layer = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .grid_id = @intCast(i + 2), .x_px = 0, .y_px = 0, .w_px = 1, .h_px = 1, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 1, .z = @intCast(i + 1), .flags = 0 };
+    fillLayers(&u, &many, 30);
+    try std.testing.expectEqual(@as(i32, 16), u.iLayerCount);
+    // Entry 0 is the highest z, grid id 21.
+    try std.testing.expectEqual(@as(f32, 21.0), u.iLayers[2][2]);
+}
+
+test "fillLayers lists floats with no font grid" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 90, .h_px = 40, .cell_w_px = 0, .cell_h_px = 0, .rows = 2, .cols = 10, .z = 50, .flags = SHADER_LAYER_FLOAT },
+        .{ .grid_id = 6, .x_px = 10, .y_px = 10, .w_px = 30, .h_px = 20, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 3, .z = 60, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 2), u.iLayerCount);
+    try std.testing.expectEqual(@as(i32, 30), u.iRootRows);
+    try std.testing.expectEqual([4]f32{ 1, 3, 6, 1 }, u.iLayers[2]);
+    try std.testing.expectEqual([4]f32{ 2, 10, 4, 1 }, u.iLayers[5]);
+}
+
+test "fillLayers caps at 16 topmost" {
+    var u: zonvie_shader_uniforms = .{};
+    var many: [20]zonvie_shader_layer = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .grid_id = @intCast(i + 2), .x_px = 0, .y_px = 0, .w_px = 1, .h_px = 1, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 1, .z = @intCast(i + 1), .flags = SHADER_LAYER_FLOAT };
+    fillLayers(&u, &many, 30);
+    try std.testing.expectEqual(@as(i32, 16), u.iLayerCount);
+    // Entry 0 is grid 21 (topmost), entry 15 the 16th from the top, grid 6.
+    try std.testing.expectEqual(@as(f32, 21.0), u.iLayers[2][2]);
+    try std.testing.expectEqual(@as(f32, 6.0), u.iLayers[15 * 3 + 2][2]);
+}
+
+test "fillLayers mixes font grids and floats" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 3, .x_px = 0, .y_px = 0, .w_px = 100, .h_px = 100, .cell_w_px = 10, .cell_h_px = 20, .rows = 5, .cols = 10, .z = 1 },
+        .{ .grid_id = 8, .x_px = 20, .y_px = 20, .w_px = 40, .h_px = 20, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 4, .z = 2, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 2), u.iLayerCount);
+    try std.testing.expectEqual([4]f32{ 1, 4, 8, 1 }, u.iLayers[2]);
+    try std.testing.expectEqual([4]f32{ 10, 20, 30, 0 }, u.iLayers[4]);
+    try std.testing.expectEqual([4]f32{ 5, 10, 3, 2 }, u.iLayers[5]);
+}
+
+test "fillLayers FOCUSABLE follows mouse_enabled" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 1, .z = 1, .flags = SHADER_LAYER_FLOAT | SHADER_LAYER_FOCUSABLE },
+        .{ .grid_id = 5, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 1, .z = 2, .flags = SHADER_LAYER_FLOAT },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(f32, 1.0), u.iLayers[2][3]);
+    try std.testing.expectEqual(@as(f32, 5.0), u.iLayers[5][3]);
+    // BORDER is reserved: never set even if a caller passes it.
+    const bordered = [_]zonvie_shader_layer{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 0, .cell_h_px = 0, .rows = 1, .cols = 1, .z = 1, .flags = SHADER_LAYER_BORDER },
+    };
+    fillLayers(&u, &bordered, 30);
+    try std.testing.expectEqual(@as(f32, 0.0), u.iLayers[2][3]);
+}
+
+test "fill_layers: a special grid's negative id reads back exactly" {
+    var u: zonvie_shader_uniforms = .{};
+    const layers = [_]zonvie_shader_layer{
+        .{ .grid_id = -100, .x_px = 0, .y_px = 0, .w_px = 10, .h_px = 10, .cell_w_px = 5, .cell_h_px = 10, .rows = 1, .cols = 2, .z = 1 },
+    };
+    fillLayers(&u, &layers, 30);
+    try std.testing.expectEqual(@as(i32, 1), u.iLayerCount);
+    try std.testing.expectEqual(@as(f32, -100.0), u.iLayers[2][2]);
+}

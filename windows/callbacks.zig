@@ -1505,6 +1505,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     app.log_flush_row_callbacks = 0;
     app.log_flush_vertex_count = 0;
     app.core_flush_active.store(true, .release);
+    app.flush_wants_cell_text = if (app.renderer) |*r| r.shader_wants_cell_text else false;
     app.mu.unlock(core.clock.io());
 }
 
@@ -1559,6 +1560,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // retry reconstruct every surface even when that external grid was
         // otherwise clean.
         if (retryable) core.zonvie_core_force_resend_locked(app.corep);
+        app.cell_text.discard();
     } else {
         // Each surface publishes its root rows, layer rows, placement and
         // cursor in one commit; per-grid fonts go out with the rows this
@@ -1569,9 +1571,13 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
             entry.value_ptr.*.surf.tbs.commitFlush(app.alloc);
+            // The text the committed rows show, published with them; paint
+            // reads both under app.mu.
+            app.cell_text.commit(entry.key_ptr.*);
             traceRender(app, "event=surface_commit surface={d} layers={d}\n", .{ entry.key_ptr.*, entry.value_ptr.*.surf.tbs.committed_layers.len });
         }
         app.surf.tbs.commitFlush(app.alloc);
+        app.cell_text.commit(1);
         if (app.pending_colorscheme_bg != 0xFFFFFFFF or app.pending_colorscheme_fg != 0xFFFFFFFF) {
             if (app.pending_colorscheme_bg != 0xFFFFFFFF and app.pending_colorscheme_bg != app.colorscheme_bg) {
                 app.colorscheme_bg = app.pending_colorscheme_bg;
@@ -2286,6 +2292,17 @@ pub fn onCellAgeStamps(
     app.cell_age.apply(slice, clear != 0, now);
 }
 
+/// One row's codepoints for the iCellText shader input. Core thread,
+/// grid_mu held; writes only the CPU mirror, whose own lock suffices.
+/// `flush_wants_cell_text` is latched at onFlushBegin and holds for the
+/// whole flush, so no row takes app.mu, which would stall the UI thread for
+/// the length of a flush.
+pub fn onCellTextRow(ctx: ?*anyopaque, row: *const core.zonvie_cell_text_row) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (!app.flush_wants_cell_text) return;
+    app.cell_text.applyRow(row.*);
+}
+
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
@@ -2796,6 +2813,8 @@ pub fn onSurfaceLayout(
             .z = l.z,
             .follows_scroll = (l.flags & core.LAYER_FOLLOWS_SCROLL) != 0,
             .mouse_enabled = (l.flags & core.LAYER_MOUSE_ENABLED) != 0,
+            .is_float = (l.flags & core.LAYER_FLOAT) != 0,
+            .is_msg = (l.flags & core.LAYER_MSG) != 0,
         };
     }
     tbs.stageLayers(staged);

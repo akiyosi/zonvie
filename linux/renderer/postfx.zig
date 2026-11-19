@@ -15,6 +15,7 @@ const gl = @import("../gl.zig");
 const App = @import("../app.zig").App;
 const gl_renderer = @import("gl_renderer.zig");
 const applog = @import("../app_log.zig");
+const shader_inputs = @import("../shader_inputs.zig");
 
 const glow_chain = core.glow_chain;
 const Uniforms = core.zonvie_shader_uniforms;
@@ -73,8 +74,12 @@ const Custom = struct {
     uses_prev: bool = false,
     /// Reads iCellAge or its companions (frontend_rules.shaderUsesEditInputs).
     uses_edit: bool = false,
+    /// Reads iCellText (frontend_rules.shaderUsesCellText).
+    uses_cell_text: bool = false,
     /// Declares `@zonvie-owns-cursor` (frontend_rules.shaderOwnsCursor).
     owns_cursor: bool = false,
+    /// Reads iBelowFloats (frontend_rules.shaderUsesBelowFloats).
+    uses_below: bool = false,
 };
 
 const max_custom = 8;
@@ -107,8 +112,33 @@ pub const PostFx = struct {
     age_rows: u32 = 0,
     age_cache: core.cell_age_store.SyncCache = .{},
     uses_edit: bool = false,
+    /// This surface's iCellText: the store's cols x rows RGBA32UI cell
+    /// texels, when a shader reads it; `zero_text` (1x1) until a row arrives.
+    text_tex: u32 = 0,
+    text_cols: u32 = 0,
+    text_rows: u32 = 0,
+    text_cache: core.cell_text_store.SyncCache = .{},
+    zero_text: u32 = 0,
+    uses_cell_text: bool = false,
+    /// The store's mirror, copied under the App.mu hold that drew the scene
+    /// and uploaded after it; grows only with the cell grid.
+    text_scratch: std.ArrayListUnmanaged(u32) = .empty,
+    /// The scratch holds a copy not yet uploaded.
+    text_staged: bool = false,
+    /// A copy could not be taken: the next frame forces a full sync.
+    text_lost: bool = false,
+    /// iRowOffset, sized like iCellAge, when a shader reads edit inputs.
+    row_offsets: shader_inputs.RowOffsets = .{},
+    row_tex: u32 = 0,
+    row_cols: u32 = 0,
+    row_rows: u32 = 0,
     /// Some loaded shader draws the cursor itself.
     owns_cursor: bool = false,
+    /// iBelowFloats: the surface drawn again without its float layers and
+    /// cursor, when a loaded shader reads it; created at first need or a
+    /// size change and kept.
+    below: Rt = .{},
+    uses_below: bool = false,
     /// iDate's date fields and the wall-clock second they were taken at:
     /// localtime runs at most once a second.
     date_second: i64 = -1,
@@ -255,21 +285,40 @@ fn setup(app: *App, p: *PostFx) bool {
     gl.glBindTexture(gl.GL_TEXTURE_2D, p.black);
     const zero = [_]u8{ 0, 0, 0, 0 };
     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, 1, 1, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, &zero);
+    // The loaded shaders' sources joined in load order, for the core's
+    // `@zonvie-hl-groups:` declaration.
+    var hl_src: std.ArrayListUnmanaged(u8) = .empty;
+    defer hl_src.deinit(app.alloc);
     for (app.shader_paths) |path| {
         if (p.custom_len == max_custom) break;
-        if (loadCustom(app, path)) |c| {
+        if (loadCustom(app, path, &hl_src)) |c| {
             p.custom[p.custom_len] = c;
             p.custom_len += 1;
             if (c.needs_animation) p.animating = true;
             if (c.uses_prev) p.uses_prev = true;
             if (c.uses_edit) p.uses_edit = true;
+            if (c.uses_cell_text) p.uses_cell_text = true;
             if (c.owns_cursor) p.owns_cursor = true;
+            if (c.uses_below) p.uses_below = true;
         }
     }
+    if (p.uses_cell_text) {
+        // An unsigned sampler must not read the RGBA8 `black`.
+        gl.glGenTextures(1, &p.zero_text);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, p.zero_text);
+        const zero_u = [_]u32{ 0, 0, 0, 0 };
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 4);
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32UI, 1, 1, 0, gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, &zero_u);
+        nearest();
+        app.shader_wants_cell_text.store(true, .release);
+    }
+    if (app.corep) |cp| core.zonvie_core_set_shader_hl_groups(cp, hl_src.items.ptr, hl_src.items.len);
     // The core records no stamps until a shader wants them. Every window
     // compiles the same config, so the answer is the same for all.
-    if (p.uses_edit) {
-        if (app.corep) |cp| core.zonvie_core_set_shader_inputs_enabled(cp, 1);
+    if (p.uses_edit or p.uses_cell_text) {
+        var flags: i32 = @intCast(core.SHADER_INPUT_CELL_AGE);
+        if (p.uses_cell_text) flags |= @intCast(core.SHADER_INPUT_CELL_TEXT);
+        if (app.corep) |cp| core.zonvie_core_set_shader_inputs_enabled(cp, flags);
     }
     p.ready = true;
     p.failed = false;
@@ -279,7 +328,7 @@ fn setup(app: *App, p: *PostFx) bool {
 /// One configured shader file: GLSL cross-compiled by the core to GLSL 330
 /// (zonvie_shader_compile_glsl), linked against our vertex stage, its
 /// samplers and uniform block bound by name.
-fn loadCustom(app: *App, path: []const u8) ?Custom {
+fn loadCustom(app: *App, path: []const u8, hl_src: *std.ArrayListUnmanaged(u8)) ?Custom {
     const src = std.Io.Dir.cwd().readFileAlloc(clock.io(), path, app.alloc, .limited(4 * 1024 * 1024)) catch {
         applog.appLog("[postfx] cannot read shader {s}\n", .{path});
         return null;
@@ -312,9 +361,20 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
     gl.glUniform1i(gl.glGetUniformLocation(pass.prog, "zonvie_iChannel0Tex"), 0);
     const u_prev = gl.glGetUniformLocation(pass.prog, "zonvie_iPrevFrameTex");
     const u_age = gl.glGetUniformLocation(pass.prog, "iCellAge");
+    const u_text = gl.glGetUniformLocation(pass.prog, "iCellText");
+    const u_row = gl.glGetUniformLocation(pass.prog, "iRowOffset");
     if (u_prev >= 0) gl.glUniform1i(u_prev, 2);
     if (u_age >= 0) gl.glUniform1i(u_age, 3);
+    if (u_text >= 0) gl.glUniform1i(u_text, 4);
+    if (u_row >= 0) gl.glUniform1i(u_row, 5);
+    const u_below = gl.glGetUniformLocation(pass.prog, "zonvie_iBelowFloatsTex");
+    if (u_below >= 0) gl.glUniform1i(u_below, 6);
     applog.appLog("[postfx] loaded shader {s}\n", .{path});
+    // A shader whose text cannot be kept still loads; it declares no groups.
+    if (hl_src.ensureUnusedCapacity(app.alloc, src.len + 1)) |_| {
+        hl_src.appendSliceAssumeCapacity(src);
+        hl_src.appendAssumeCapacity('\n');
+    } else |_| {}
     return .{
         .pass = pass,
         .u_prev = u_prev,
@@ -322,7 +382,9 @@ fn loadCustom(app: *App, path: []const u8) ?Custom {
         .needs_animation = core.zonvie_core_shader_needs_animation(src.ptr, src.len),
         .uses_prev = core.frontend_rules.shaderUsesPrevFrame(src),
         .uses_edit = core.frontend_rules.shaderUsesEditInputs(src),
+        .uses_cell_text = core.frontend_rules.shaderUsesCellText(src),
         .owns_cursor = core.frontend_rules.shaderOwnsCursor(src),
+        .uses_below = core.frontend_rules.shaderUsesBelowFloats(src),
     };
 }
 
@@ -423,11 +485,10 @@ fn bloom(app: *App, t: *gl_renderer.Target, p: *PostFx, cp: *core.zonvie_core, s
 
 /// The cursor as Ghostty's uniforms carry it: (left, bottom, w, h) in
 /// drawable px, y down, and its colour; null when it is not on this surface.
-/// Takes App.mu.
+/// Caller holds App.mu.
 /// `shown`: the cursor is lit, not in the off phase of a `guicursor` blink.
-fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32, cell: [2]f32, shown: bool } {
-    app.mu.lockUncancelable(clock.io());
-    defer app.mu.unlock(clock.io());
+const CursorState = struct { rect: [4]f32, color: [4]f32, cell: [2]f32, shown: bool };
+fn cursorState(app: *App, surface_id: i64) ?CursorState {
     const cur = app.surface.committedCursor();
     if (cur.verts.len == 0) return null;
     const layer = for (app.surface.committedSurfaceLayers(surface_id)) |l| {
@@ -443,7 +504,35 @@ fn cursorState(app: *App, surface_id: i64) ?struct { rect: [4]f32, color: [4]f32
     return .{ .rect = .{ b.left, b.bottom, b.width(), b.height() }, .color = cur.verts[0].color, .cell = cell, .shown = app.cursor_blink.visible };
 }
 
-fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id: i64) void {
+/// What a shaded frame reads of App state, taken under the App.mu hold that
+/// drew the scene, so a frame never pairs one flush's rows with another's
+/// inputs. iLayers is written into `uniforms` and iRowOffset into
+/// `row_offsets` in that hold too.
+const Snapshot = struct {
+    cursor: ?CursorState = null,
+    lattice: [2]u32 = .{ 0, 0 },
+    age_root: ?core.Layer = null,
+};
+
+/// Caller holds App.mu.
+fn snapshotLocked(app: *App, p: *PostFx, surface_id: i64) Snapshot {
+    var s: Snapshot = .{ .cursor = cursorState(app, surface_id) };
+    // iCellSize is the surface lattice's cell: an external window whose
+    // root grid has its own font is laid out in that font.
+    s.lattice = shader_inputs.latticeCell(app.surface.gridFont(surface_id), app.cell_w_px, app.cell_h_px);
+    const layers = app.surface.committedSurfaceLayers(surface_id);
+    if (p.uses_edit) {
+        shader_inputs.fillLayers(&p.uniforms, layers, &app.surface, app.cell_w_px, app.cell_h_px);
+        p.row_offsets.fill(app.alloc, layers, &app.surface, s.lattice);
+        s.age_root = for (layers) |l| {
+            if (l.grid_id == surface_id) break l;
+        } else null;
+    }
+    if (p.uses_cell_text) stageCellText(app, p, surface_id);
+    return s;
+}
+
+fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, s: *const Snapshot) void {
     const now = clock.nowNs();
     if (p.start_ns == 0) {
         p.start_ns = now;
@@ -465,7 +554,7 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
     // every window is its own origin.
     u.iWindowOffset = .{ 0, 0 };
     u.iWindowSize = .{ w, h };
-    const cursor = cursorState(app, surface_id);
+    const cursor = s.cursor;
     if (cursor) |c| {
         if (!std.mem.eql(f32, &c.rect, &p.cursor_cur)) {
             u.iPreviousCursor = u.iCurrentCursor;
@@ -476,13 +565,15 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
         u.iCurrentCursor = c.rect;
         u.iCurrentCursorColor = c.color;
     }
+    const lattice = s.lattice;
     // The rest by the core's rule, cursor styles included. The root grid
     // starts at the surface's corner.
     const cell: [2]f32 = if (cursor) |c| c.cell else .{ @floatFromInt(app.cell_w_px), @floatFromInt(app.cell_h_px) };
     core.fillEditUniforms(
         u,
-        cell[0],
-        cell[1],
+        @floatFromInt(lattice[0]),
+        @floatFromInt(lattice[1]),
+        cell,
         .{ 0, 0 },
         p.age_cache.last_edit,
         // Blinked off as macOS and Windows pass it: a shader that draws the
@@ -490,6 +581,8 @@ fn fillUniforms(app: *App, t: *const gl_renderer.Target, p: *PostFx, surface_id:
         if (cursor) |c| c.shown else false,
         p.uses_edit,
     );
+    // Seqlocked in the core: no App.mu.
+    if (app.corep) |cp| core.zonvie_shader_fill_colors(cp, u);
 }
 
 /// The main surface (with its overlays), or an external window's.
@@ -526,7 +619,25 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.scene.fbo);
     t.flip_y = true;
     t.skip_cursor = shaderDrawsCursor(p);
-    const f = scene(app, t, surface_id);
+    // One App.mu hold draws the scene's rows and snapshots the shader
+    // inputs; the GL uploads run from the snapshot after it.
+    const t0 = clock.nowNs();
+    app.mu.lockUncancelable(clock.io());
+    const f = if (surface_id == 1) gl_renderer.renderMainLocked(app, t, t0) else gl_renderer.renderExternalSceneLocked(app, t, surface_id, t0);
+    const snap: Snapshot = if (p.custom_len != 0) snapshotLocked(app, p, surface_id) else .{};
+    // Same hold, after the scene pass planned the eases it reuses. Bound
+    // below only when this frame's render completed.
+    var below_ok = false;
+    if (p.uses_below and p.custom_len != 0) {
+        p.below.ensure(t.w_px, t.h_px);
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.below.fbo);
+        t.skip_floats = true;
+        t.skip_cursor = true;
+        below_ok = gl_renderer.renderBelowFloatsLocked(app, t, surface_id);
+        t.skip_floats = false;
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, p.scene.fbo);
+    }
+    app.mu.unlock(clock.io());
     t.skip_cursor = false;
     if (app.corep) |cp| {
         if (core.zonvie_core_get_glow_enabled(cp)) bloom(app, t, p, cp, surface_id);
@@ -549,8 +660,10 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
         p.prev.ensure(t.w_px, t.h_px);
         p.out.ensure(t.w_px, t.h_px);
     }
-    const age = if (p.uses_edit) syncCellAge(app, p, surface_id) else 0;
-    fillUniforms(app, t, p, surface_id);
+    const age = if (p.uses_edit) syncCellAge(app, p, surface_id, snap.age_root) else 0;
+    const rows = if (p.uses_edit) uploadRowOffsets(p) else 0;
+    const text = if (p.uses_cell_text) uploadCellText(p) else 0;
+    fillUniforms(app, t, p, &snap);
     gl.glBindBuffer(gl.GL_UNIFORM_BUFFER, p.ubo);
     gl.glBufferSubData(gl.GL_UNIFORM_BUFFER, 0, @sizeOf(Uniforms), &p.uniforms);
     gl.glBindBufferBase(gl.GL_UNIFORM_BUFFER, 1, p.ubo);
@@ -558,6 +671,18 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
     gl.glBindTexture(gl.GL_TEXTURE_2D, if (p.uses_prev) p.prev.tex else p.black);
     gl.glActiveTexture(gl.GL_TEXTURE3);
     gl.glBindTexture(gl.GL_TEXTURE_2D, if (age != 0) age else p.black);
+    if (p.uses_cell_text) {
+        gl.glActiveTexture(gl.GL_TEXTURE4);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, if (text != 0) text else p.zero_text);
+    }
+    if (p.uses_edit) {
+        gl.glActiveTexture(gl.GL_TEXTURE5);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, if (rows != 0) rows else p.black);
+    }
+    if (p.uses_below) {
+        gl.glActiveTexture(gl.GL_TEXTURE6);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, if (below_ok) p.below.tex else p.black);
+    }
     var src = p.scene.tex;
     for (p.custom[0..p.custom_len], 0..) |c, i| {
         const last = i + 1 == p.custom_len;
@@ -589,13 +714,7 @@ pub fn renderFrame(app: *App, t: *gl_renderer.Target, p: *PostFx, surface_id: i6
 /// the last frame; 0 when it cannot be bound. Its size is the surface's
 /// root grid: the main window's screen-space cells (texture 1), or the
 /// external window's own grid.
-fn syncCellAge(app: *App, p: *PostFx, surface_id: i64) u32 {
-    app.mu.lockUncancelable(clock.io());
-    const layers = app.surface.committedSurfaceLayers(surface_id);
-    const root: ?core.Layer = for (layers) |l| {
-        if (l.grid_id == surface_id) break l;
-    } else null;
-    app.mu.unlock(clock.io());
+fn syncCellAge(app: *App, p: *PostFx, surface_id: i64, root: ?core.Layer) u32 {
     const r = root orelse return 0;
     const fresh = p.age_tex == 0 or p.age_cols != r.cols or p.age_rows != r.rows;
     var values: []const f32 = &.{};
@@ -616,6 +735,80 @@ fn syncCellAge(app: *App, p: *PostFx, surface_id: i64) u32 {
     return p.age_tex;
 }
 
+fn nearest() void {
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
+}
+
+/// Copy this surface's iCellText mirror into `text_scratch` when its store
+/// changed since the last frame. Caller holds App.mu, the lock the flush
+/// commits the text under, and the same hold drew the scene's rows: the copy
+/// pairs with that commit. The store's leaf lock is held only for the copy.
+fn stageCellText(app: *App, p: *PostFx, surface_id: i64) void {
+    var values: []const u32 = &.{};
+    const force = p.text_tex == 0 or p.text_lost;
+    switch (app.cell_text.sync(shader_inputs.cellTextGrid(surface_id), force, &p.text_cache, &values)) {
+        .unavailable, .clean => return,
+        .dirty => {},
+    }
+    defer app.cell_text.endUpload();
+    // Grows only when the cell grid does; a frame at a known size allocates nothing.
+    p.text_scratch.ensureTotalCapacity(app.alloc, values.len) catch {
+        p.text_lost = true;
+        return;
+    };
+    p.text_scratch.clearRetainingCapacity();
+    p.text_scratch.appendSliceAssumeCapacity(values);
+    p.text_staged = true;
+    p.text_lost = false;
+}
+
+/// This surface's iCellText texture, uploaded from the staged copy; 0 until
+/// a row has arrived. Created only when the store's cell grid changes.
+fn uploadCellText(p: *PostFx) u32 {
+    if (!p.text_staged) return p.text_tex;
+    p.text_staged = false;
+    const values = p.text_scratch.items;
+    const cols = p.text_cache.cols;
+    const rows = p.text_cache.rows;
+    std.debug.assert(values.len == @as(usize, cols) * rows * core.cell_text_store.texel_stride);
+    // Rows of RGBA32UI texels are 16-byte multiples; the glyph uploads set 1.
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 4);
+    if (p.text_tex == 0 or p.text_cols != cols or p.text_rows != rows) {
+        if (p.text_tex == 0) gl.glGenTextures(1, &p.text_tex);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, p.text_tex);
+        nearest();
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32UI, @intCast(cols), @intCast(rows), 0, gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
+        p.text_cols = cols;
+        p.text_rows = rows;
+    } else {
+        gl.glBindTexture(gl.GL_TEXTURE_2D, p.text_tex);
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, @intCast(cols), @intCast(rows), gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, values.ptr);
+    }
+    return p.text_tex;
+}
+
+/// This surface's iRowOffset texture from the offsets snapshotted with the
+/// scene (Snapshot); uploaded only when an offset changed. 0 with no root.
+fn uploadRowOffsets(p: *PostFx) u32 {
+    const ro = &p.row_offsets;
+    if (ro.cols == 0 or ro.rows == 0) return 0;
+    if (p.row_tex == 0 or p.row_cols != ro.cols or p.row_rows != ro.rows) {
+        if (p.row_tex == 0) gl.glGenTextures(1, &p.row_tex);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, p.row_tex);
+        nearest();
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32F, @intCast(ro.cols), @intCast(ro.rows), 0, gl.GL_RED, gl.GL_FLOAT, ro.values.items.ptr);
+        p.row_cols = ro.cols;
+        p.row_rows = ro.rows;
+        ro.dirty = false;
+    } else if (ro.dirty) {
+        gl.glBindTexture(gl.GL_TEXTURE_2D, p.row_tex);
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, @intCast(ro.cols), @intCast(ro.rows), gl.GL_RED, gl.GL_FLOAT, ro.values.items.ptr);
+        ro.dirty = false;
+    }
+    return p.row_tex;
+}
+
 /// Frees the context's objects; the next realize builds them again.
 pub fn unrealize(p: *PostFx) void {
     p.scene.deinit();
@@ -624,11 +817,25 @@ pub fn unrealize(p: *PostFx) void {
     for (&p.ping) |*r| r.deinit();
     p.prev.deinit();
     p.out.deinit();
+    p.below.deinit();
     if (p.age_tex != 0) gl.glDeleteTextures(1, &p.age_tex);
+    if (p.text_tex != 0) gl.glDeleteTextures(1, &p.text_tex);
+    if (p.zero_text != 0) gl.glDeleteTextures(1, &p.zero_text);
+    if (p.row_tex != 0) gl.glDeleteTextures(1, &p.row_tex);
     for (p.custom[0..p.custom_len]) |c| gl.glDeleteProgram(c.pass.prog);
     for ([_]Pass{ p.copy, p.down, p.up }) |pass| if (pass.prog != 0) gl.glDeleteProgram(pass.prog);
     if (p.ubo != 0) gl.glDeleteBuffers(1, &p.ubo);
     if (p.black != 0) gl.glDeleteTextures(1, &p.black);
     if (p.vao != 0) gl.glDeleteVertexArrays(1, &p.vao);
-    p.* = .{};
+    // CPU memory, not the context's: freed by the owner (deinit).
+    const row_offsets = p.row_offsets;
+    var text_scratch = p.text_scratch;
+    text_scratch.clearRetainingCapacity();
+    p.* = .{ .row_offsets = row_offsets, .text_scratch = text_scratch };
+}
+
+/// Frees what outlives the context: the row offsets' and cell text's buffers.
+pub fn deinit(p: *PostFx, alloc: std.mem.Allocator) void {
+    p.row_offsets.deinit(alloc);
+    p.text_scratch.deinit(alloc);
 }

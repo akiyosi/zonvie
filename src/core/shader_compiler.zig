@@ -102,6 +102,19 @@ const shadertoy_preamble =
     \\// the iTime at which that cell was last edited (0 = never).
     \\layout(binding = 2) uniform sampler2D zonvie_iPrevFrameTex;
     \\layout(binding = 3) uniform sampler2D iCellAge;
+    \\// iCellText holds, per grid cell, the Unicode codepoint drawn there (0
+    \\// for a cell with no row delivered yet, or the second cell of a wide
+    \\// glyph; 32 for a blank). The root's rows first, then a band per grid
+    \\// in its own font; zonvieCellGeom gives the index. iCellAge has no bands.
+    \\layout(binding = 4) uniform usampler2D iCellText;
+    \\// iRowOffset holds, per screen cell of the surface, how many pixels down
+    \\// that cell's content is drawn from its grid rect this frame (a smooth
+    \\// scroll in progress; 0 at rest). Per cell, not per row: side-by-side
+    \\// windows share rows and scroll apart.
+    \\layout(binding = 5) uniform sampler2D iRowOffset;
+    \\// iBelowFloats is this frame of the surface without its float layers
+    \\// and without the native cursor: root rows, splits and the msg grid.
+    \\layout(binding = 6) uniform sampler2D zonvie_iBelowFloatsTex;
     \\
     \\layout(std140, binding = 1) uniform ZonvieShaderUniforms {
     \\    vec3 iResolution;
@@ -133,6 +146,20 @@ const shadertoy_preamble =
     \\    int iCursorVisible;
     \\    int iCurrentCursorStyle;
     \\    int iPreviousCursorStyle;
+    \\    // Per-grid cell geometry (see zonvieCellGeom).
+    \\    vec2 iCursorCellSize;
+    \\    int iLayerCount;
+    \\    int iRootRows;
+    \\    vec4 iLayers[48];
+    \\    // Ghostty's terminal colours, sRGB 0..1 rgb (byte / 255): the default background
+    \\    // and foreground, the cursor's fill and the text drawn on it. Each
+    \\    // vec3 fills a 16-byte std140 slot (976, 992, 1008, 1024). These are
+    \\    // preamble names, so a user shader that redeclares one fails to
+    \\    // compile, as it does in Ghostty.
+    \\    vec3 iBackgroundColor;
+    \\    vec3 iForegroundColor;
+    \\    vec3 iCursorColor;
+    \\    vec3 iCursorText;
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;
@@ -167,19 +194,149 @@ const shadertoy_preamble =
     \\    return textureLod(zonvie_iPrevFrameTex, local_uv, 0.0);
     \\}
     \\
+    \\struct zonvie_iBelowFloats_t { int _d; };
+    \\const zonvie_iBelowFloats_t iBelowFloats = zonvie_iBelowFloats_t(0);
+    \\vec4 texture(zonvie_iBelowFloats_t _ch, vec2 screen_uv) {
+    \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
+    \\    vec2 local_uv = local_px / iWindowSize;
+    \\    return textureLod(zonvie_iBelowFloatsTex, local_uv, 0.0);
+    \\}
+    \\
+    \\// How many pixels below its grid rect the content under a screen-space
+    \\// pixel is drawn (a smooth scroll in progress; 0 at rest). The row is
+    \\// found under the offset of the row the pixel lands in and re-checked
+    \\// once against that row's own offset (the two differ only across a
+    \\// window boundary). Subtract it from frag_px to work in the space the
+    \\// cell grid is drawn in.
+    \\float zonvieRowOffset(vec2 frag_px) {
+    \\    vec2 rel = frag_px - iGridOrigin;
+    \\    ivec2 dim = textureSize(iRowOffset, 0);
+    \\    int c = int(floor(rel.x / iCellSize.x));
+    \\    if (c < 0 || c >= dim.x) return 0.0;
+    \\    int r = int(floor(rel.y / iCellSize.y));
+    \\    float off = (r >= 0 && r < dim.y) ? texelFetch(iRowOffset, ivec2(c, r), 0).r : 0.0;
+    \\    int r2 = int(floor((rel.y - off) / iCellSize.y));
+    \\    if (r2 != r && r2 >= 0 && r2 < dim.y) off = texelFetch(iRowOffset, ivec2(c, r2), 0).r;
+    \\    return off;
+    \\}
+    \\
+    \\// The layer table, topmost first: the layers of the surface down to the
+    \\// lowest one in its own font. Entry i is its rect (x, y, w, h in
+    \\// fragCoord px), then its cell (w, h px) and first iCellText row, then
+    \\// (rows, cols, grid id, flags); flags are the ZONVIE_SHADER_LAYER_* bits.
+    \\#define ZONVIE_SHADER_LAYER_FLOAT 1u
+    \\#define ZONVIE_SHADER_LAYER_FONT_GRID 2u
+    \\#define ZONVIE_SHADER_LAYER_FOCUSABLE 4u
+    \\#define ZONVIE_SHADER_LAYER_BORDER 8u
+    \\int zonvieLayerCount() { return iLayerCount; }
+    \\vec4 zonvieLayerRect(int i) { return iLayers[3 * i]; }
+    \\int zonvieLayerGrid(int i) { return int(iLayers[3 * i + 2].z); }
+    \\uint zonvieLayerFlags(int i) { return uint(iLayers[3 * i + 2].w); }
+    \\
+    \\// The cell under a screen-space pixel: its iCellText index, and where it
+    \\// is drawn (top-left and size, in fragCoord pixels; a smooth scroll in
+    \\// progress included). A grid in its own font has its own cell size and
+    \\// its text in a band of iCellText below the root's rows; iLayers
+    \\// lists it, with the layers over it. Everything else is the surface
+    \\// lattice. False off the grid.
+    \\bool zonvieCellGeom(vec2 frag_px, out ivec2 cell, out vec2 cellMin, out vec2 cellSize) {
+    \\    cell = ivec2(-1);
+    \\    cellMin = frag_px;
+    \\    cellSize = iCellSize;
+    \\    for (int i = 0; i < iLayerCount; ++i) {
+    \\        vec4 r = iLayers[3 * i];
+    \\        if (frag_px.x < r.x || frag_px.y < r.y || frag_px.x >= r.x + r.z || frag_px.y >= r.y + r.w) continue;
+    \\        vec4 g = iLayers[3 * i + 1];
+    \\        if ((zonvieLayerFlags(i) & ZONVIE_SHADER_LAYER_FONT_GRID) == 0u) break;
+    \\        vec4 rc = iLayers[3 * i + 2];
+    \\        vec2 local = floor((frag_px - r.xy) / g.xy);
+    \\        // The bottom margin belongs to the last row, as it is drawn.
+    \\        local.y = min(local.y, rc.x - 1.0);
+    \\        if (local.x >= rc.y) return false;
+    \\        cell = ivec2(int(local.x), int(g.z + local.y));
+    \\        cellMin = r.xy + local * g.xy;
+    \\        cellSize = g.xy;
+    \\        return true;
+    \\    }
+    \\    if (iCellSize.x <= 0.0 || iCellSize.y <= 0.0) return false;
+    \\    vec2 org = iGridOrigin + vec2(0.0, zonvieRowOffset(frag_px));
+    \\    vec2 local = floor((frag_px - org) / iCellSize);
+    \\    if (local.x < 0.0 || local.y < 0.0) return false;
+    \\    if (iRootRows > 0 && local.y >= float(iRootRows)) return false;
+    \\    cell = ivec2(local);
+    \\    cellMin = org + local * iCellSize;
+    \\    return true;
+    \\}
+    \\
+    \\// The iCellText index of the cell under a screen-space pixel, (-1, -1)
+    \\// off the grid.
+    \\ivec2 zonvieCellAt(vec2 frag_px) {
+    \\    ivec2 cell;
+    \\    vec2 cellMin, cellSize;
+    \\    zonvieCellGeom(frag_px, cell, cellMin, cellSize);
+    \\    return cell;
+    \\}
+    \\
     \\// Age of the cell under a screen-space pixel, in seconds, or a large
     \\// value when that cell has never been edited. Wraps the texel fetch so
-    \\// shaders never have to know the cell-grid dimensions.
+    \\// shaders never have to know the cell-grid dimensions. iCellAge is on
+    \\// the surface lattice even inside a grid in its own font.
     \\float zonvieCellAge(vec2 frag_px) {
     \\    if (iCellSize.x <= 0.0 || iCellSize.y <= 0.0) return 1e9;
-    \\    vec2 cell = floor((frag_px - iGridOrigin) / iCellSize);
-    \\    ivec2 idx = ivec2(cell);
+    \\    vec2 rel = frag_px - iGridOrigin - vec2(0.0, zonvieRowOffset(frag_px));
+    \\    ivec2 idx = ivec2(floor(rel / iCellSize));
     \\    ivec2 dim = textureSize(iCellAge, 0);
     \\    if (idx.x < 0 || idx.y < 0 || idx.x >= dim.x || idx.y >= dim.y) return 1e9;
     \\    float stamp = texelFetch(iCellAge, idx, 0).r;
     \\    if (stamp <= 0.0) return 1e9;
     \\    return max(0.0, iTime - stamp);
     \\}
+    \\
+    \\// Codepoint of the cell at grid index `cell`, 0 outside the texture.
+    \\uint zonvieCellTextAt(ivec2 cell) {
+    \\    ivec2 dim = textureSize(iCellText, 0);
+    \\    if (cell.x < 0 || cell.y < 0 || cell.x >= dim.x || cell.y >= dim.y) return 0u;
+    \\    return texelFetch(iCellText, cell, 0).r;
+    \\}
+    \\
+    \\// Codepoint of the cell under a screen-space pixel, 0 off the grid.
+    \\uint zonvieCellText(vec2 frag_px) {
+    \\    return zonvieCellTextAt(zonvieCellAt(frag_px));
+    \\}
+    \\
+    \\// The whole texel of the cell at grid index `cell`, 0 outside the
+    \\// texture: x codepoint, y fg rgb24 | attr bits << 24, z bg rgb24,
+    \\// w hl-group mask (bit i = the i-th name in @zonvie-hl-groups).
+    \\// All-zero means no row has been delivered for that cell.
+    \\#define ZONVIE_ATTR_BOLD 1u
+    \\#define ZONVIE_ATTR_ITALIC 2u
+    \\#define ZONVIE_ATTR_STRIKETHROUGH 4u
+    \\#define ZONVIE_ATTR_UNDERLINE 8u
+    \\#define ZONVIE_ATTR_UNDERCURL 16u
+    \\#define ZONVIE_ATTR_UNDERDOUBLE 32u
+    \\#define ZONVIE_ATTR_UNDERDOTTED 64u
+    \\#define ZONVIE_ATTR_UNDERDASHED 128u
+    \\uvec4 zonvieCellAt4(ivec2 cell) {
+    \\    ivec2 dim = textureSize(iCellText, 0);
+    \\    if (cell.x < 0 || cell.y < 0 || cell.x >= dim.x || cell.y >= dim.y) return uvec4(0u);
+    \\    return texelFetch(iCellText, cell, 0);
+    \\}
+    \\vec3 zonvieRgb24(uint c) {
+    \\    return vec3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u)) / 255.0;
+    \\}
+    \\// Drawn colours: reverse applied, defaults substituted.
+    \\vec3 zonvieCellFgAt(ivec2 cell) { return zonvieRgb24(zonvieCellAt4(cell).y); }
+    \\vec3 zonvieCellBgAt(ivec2 cell) { return zonvieRgb24(zonvieCellAt4(cell).z); }
+    \\uint zonvieCellAttrAt(ivec2 cell) { return zonvieCellAt4(cell).y >> 24; }
+    \\uint zonvieCellGroupsAt(ivec2 cell) { return zonvieCellAt4(cell).w; }
+    \\bool zonvieCellHasGroupAt(ivec2 cell, int i) {
+    \\    return i >= 0 && i < 32 && (zonvieCellGroupsAt(cell) & (1u << uint(i))) != 0u;
+    \\}
+    \\vec3 zonvieCellFg(vec2 frag_px) { return zonvieCellFgAt(zonvieCellAt(frag_px)); }
+    \\vec3 zonvieCellBg(vec2 frag_px) { return zonvieCellBgAt(zonvieCellAt(frag_px)); }
+    \\uint zonvieCellAttr(vec2 frag_px) { return zonvieCellAttrAt(zonvieCellAt(frag_px)); }
+    \\uint zonvieCellGroups(vec2 frag_px) { return zonvieCellGroupsAt(zonvieCellAt(frag_px)); }
+    \\bool zonvieCellHasGroup(vec2 frag_px, int i) { return zonvieCellHasGroupAt(zonvieCellAt(frag_px), i); }
     \\
     \\// ----- user source (mainImage) follows -----
     \\
@@ -413,6 +570,9 @@ fn crossCompileSpirv(
     //   UBO        → buffer(1)
     //   iPrevFrame → texture(2) + sampler(2)
     //   iCellAge   → texture(3) + sampler(3)
+    //   iCellText  → texture(4) + sampler(4)
+    //   iRowOffset → texture(5) + sampler(5)
+    //   iBelowFloats → texture(6) + sampler(6)
     if (target == .msl) {
         var bind_ubo: spvc.spvc_msl_resource_binding = undefined;
         spvc.spvc_msl_resource_binding_init(&bind_ubo);
@@ -434,7 +594,7 @@ fn crossCompileSpirv(
         // Zonvie edit-effect samplers. Registered unconditionally: a shader
         // that never references them produces no binding at all, and an
         // unused mapping is ignored.
-        for ([_]u32{ 2, 3 }) |slot| {
+        for ([_]u32{ 2, 3, 4, 5, 6 }) |slot| {
             var bind_edit: spvc.spvc_msl_resource_binding = undefined;
             spvc.spvc_msl_resource_binding_init(&bind_edit);
             bind_edit.stage = spvc.SpvExecutionModelFragment;
@@ -474,6 +634,7 @@ const thymer_reference_glsl =
     \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     \\    vec2 uv = fragCoord / iResolution.xy;
     \\    vec4 base = texture(iChannel0, uv);
+    \\    if (zonvieCellText(fragCoord) == 0x5Bu) base.g += 0.1;
     \\    if ((iTime - iTimeLastEdit) <= EDIT_DURATION_S) {
     \\        float t = clamp(zonvieCellAge(fragCoord) / EDIT_DURATION_S, 0.0, 1.0);
     \\        if (t < 1.0) {
@@ -497,7 +658,7 @@ const thymer_reference_glsl =
     \\}
 ;
 
-test "preamble uniform block matches zonvie_shader_uniforms offsets" {
+test "preamble iLayers offsets match zonvie_shader_uniforms" {
     // std140 alignment silently shifts every field below a misaligned one,
     // which compiles fine and then reads the wrong bytes at runtime — that is
     // exactly how the cursor style ended up reading past the end of the
@@ -507,7 +668,9 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
         \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         \\    float a = iCellSize.x + iGridOrigin.y + iTimeLastEdit;
         \\    float b = float(iCursorVisible + iCurrentCursorStyle + iPreviousCursorStyle);
-        \\    fragColor = vec4(a, b, 0.0, 1.0);
+        \\    float c = iCursorCellSize.x + float(iLayerCount + iRootRows) + iLayers[47].w;
+        \\    c += zonvieLayerRect(0).x + float(zonvieLayerCount() + zonvieLayerGrid(0)) + float(zonvieLayerFlags(0) & ZONVIE_SHADER_LAYER_FLOAT);
+        \\    fragColor = vec4(a, b, c, 1.0);
         \\}
     ;
     const out = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
@@ -528,6 +691,23 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
     try std.testing.expect(i_last < i_vis);
     try std.testing.expect(i_vis < i_cur);
     try std.testing.expect(i_cur < i_prev);
+    // The per-grid tail follows in order, and the table is one flat vec4
+    // array, as zonvie_shader_uniforms lays it out.
+    // Types as well as order: a vec3 there would still be in order and
+    // without padding, and push every later field off its C offset.
+    const i_ccs = std.mem.indexOf(u8, tail, "float2 iCursorCellSize") orelse return error.NoCursorCellSize;
+    const i_cnt = std.mem.indexOf(u8, tail, "int iLayerCount") orelse return error.NoLayerCount;
+    const i_rows = std.mem.indexOf(u8, tail, "int iRootRows") orelse return error.NoRootRows;
+    const i_rects = std.mem.indexOf(u8, tail, "float4 iLayers[48]") orelse return error.NoLayers;
+    try std.testing.expect(i_prev < i_ccs);
+    try std.testing.expect(i_ccs < i_cnt);
+    try std.testing.expect(i_cnt < i_rows);
+    try std.testing.expect(i_rows < i_rects);
+    // Nothing in between: a padding member there would move the table off
+    // offset 208, where zonvie_shader_uniforms has it.
+    const tail_region = tail[i_prev..i_rects];
+    try std.testing.expect(std.mem.indexOf(u8, tail_region, "_zonvie_pad") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_region, "_m") == null);
 
     // The padding between iTimeCursorChange and iCellSize must be three
     // scalars. A vec2 there is the bug this test exists for: it aligns to 8
@@ -535,6 +715,95 @@ test "preamble uniform block matches zonvie_shader_uniforms offsets" {
     const pad_region = tail[0..i_cell];
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 _zonvie_pad") == null);
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "_zonvie_pad_cursor2") != null);
+}
+
+const ghostty_colour_glsl =
+    \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    \\    vec3 c = iCursorText.rgb + iBackgroundColor + iForegroundColor + iCursorColor;
+    \\    fragColor = vec4(c + vec3(iLayers[47].w), 1.0);
+    \\}
+;
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in HLSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    // packoffset(cN) is byte N*16: c61 = 976 ... c64 = 1024.
+    try std.testing.expect(std.mem.indexOf(u8, out, "float4 _25_iLayers[48] : packoffset(c13);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iBackgroundColor : packoffset(c61);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iForegroundColor : packoffset(c62);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iCursorColor : packoffset(c63);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "float3 _25_iCursorText : packoffset(c64);") != null);
+}
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in MSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .msl);
+    defer std.testing.allocator.free(out);
+    // An MSL float3 is 16-byte aligned and sized, so four float3s straight
+    // after the 768-byte table at 208 land on 976, 992, 1008, 1024. A
+    // packed_float3 or a padding member would move them.
+    try std.testing.expect(std.mem.indexOf(u8, out,
+        \\    float4 iLayers[48];
+        \\    float3 iBackgroundColor;
+        \\    float3 iForegroundColor;
+        \\    float3 iCursorColor;
+        \\    float3 iCursorText;
+        \\};
+    ) != null);
+}
+
+test "Ghostty colour uniforms sit at 976/992/1008/1024 in GL 3.3 GLSL" {
+    const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, .glsl);
+    defer std.testing.allocator.free(out);
+    // std140 gives each vec3 a 16-byte slot after the vec4 array.
+    try std.testing.expect(std.mem.indexOf(u8, out, "std140") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out,
+        \\    vec4 iLayers[48];
+        \\    vec3 iBackgroundColor;
+        \\    vec3 iForegroundColor;
+        \\    vec3 iCursorColor;
+        \\    vec3 iCursorText;
+        \\}
+    ) != null);
+}
+
+test "a Phase 1 iCellText .r read and the per-cell accessors compile on all targets" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    uint cp = texelFetch(iCellText, ivec2(0), 0).r;
+        \\    vec3 c = zonvieCellFg(fragCoord) + zonvieCellBg(fragCoord) + zonvieCellFgAt(ivec2(1)) + zonvieCellBgAt(ivec2(1));
+        \\    uint a = zonvieCellAttr(fragCoord) | zonvieCellAttrAt(ivec2(1)) | zonvieCellGroups(fragCoord) | zonvieCellGroupsAt(ivec2(1)) | zonvieCellAt4(ivec2(2)).x;
+        \\    bool g = zonvieCellHasGroup(fragCoord, 0) || zonvieCellHasGroupAt(ivec2(1), 31);
+        \\    bool b = (a & (ZONVIE_ATTR_BOLD | ZONVIE_ATTR_UNDERDASHED)) != 0u;
+        \\    fragColor = vec4(c, float(cp) + (g || b ? 1.0 : 0.0));
+        \\}
+    ;
+    inline for (.{ .msl, .hlsl, .glsl }) |t| {
+        const out = try compileGlslToTarget(std.testing.allocator, glsl, t);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len > 0);
+    }
+}
+
+test "ZONVIE_ATTR_* match ZONVIE_CELL_ATTR_* bits" {
+    const hl = @import("highlight.zig");
+    const pairs = .{
+        .{ "BOLD", hl.STYLE_BOLD },               .{ "ITALIC", hl.STYLE_ITALIC },
+        .{ "STRIKETHROUGH", hl.STYLE_STRIKETHROUGH }, .{ "UNDERLINE", hl.STYLE_UNDERLINE },
+        .{ "UNDERCURL", hl.STYLE_UNDERCURL },     .{ "UNDERDOUBLE", hl.STYLE_UNDERDOUBLE },
+        .{ "UNDERDOTTED", hl.STYLE_UNDERDOTTED }, .{ "UNDERDASHED", hl.STYLE_UNDERDASHED },
+    };
+    inline for (pairs) |p| {
+        const line = std.fmt.comptimePrint("#define ZONVIE_ATTR_{s} {d}u\n", .{ p[0], p[1] });
+        try std.testing.expect(std.mem.indexOf(u8, shadertoy_preamble, line) != null);
+    }
+}
+
+test "a shader using the Ghostty colour names compiles on all targets" {
+    inline for (.{ .msl, .hlsl, .glsl }) |t| {
+        const out = try compileGlslToTarget(std.testing.allocator, ghostty_colour_glsl, t);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len > 0);
+    }
 }
 
 test "a Shadertoy shader compiles to GL 3.3 GLSL with name-bound resources" {
@@ -553,23 +822,59 @@ test "a Shadertoy shader compiles to GL 3.3 GLSL with name-bound resources" {
     try std.testing.expect(std.mem.indexOf(u8, out, "in vec2 vUV;") != null);
 }
 
+test "a GL 3.3 shader reading cell text declares iCellText and iRowOffset by name" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = vec4(float(zonvieCellText(ivec2(0))));
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .glsl);
+    defer std.testing.allocator.free(out);
+    // postfx.zig binds these names to units 4 and 5.
+    try std.testing.expect(std.mem.indexOf(u8, out, "uniform usampler2D iCellText;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "uniform sampler2D iRowOffset;") != null);
+}
+
 test "Thymer reference shader compiles to MSL with the Zonvie edit inputs" {
     const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .msl);
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, out, "metal_stdlib") != null);
-    // The slots CustomShaderPipeline.swift binds: iPrevFrame at 2, iCellAge at 3.
+    // The slots CustomShaderPipeline.swift binds: iPrevFrame at 2, iCellAge at 3, iCellText at 4, iRowOffset at 5.
     try expectDeclaredAt(out, "iPrevFrame", "[[texture(2)]]");
     try expectDeclaredAt(out, "iCellAge", "[[texture(3)]]");
+    try expectDeclaredAt(out, "iCellText", "[[texture(4)]]");
+    try expectDeclaredAt(out, "iRowOffset", "[[texture(5)]]");
 }
 
 test "Thymer reference shader compiles to HLSL with the Zonvie edit inputs" {
     const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .hlsl);
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
-    // The slots d3d11_renderer.zig binds with PSSetShaderResources(2|3).
+    // The slots d3d11_renderer.zig binds with PSSetShaderResources(2|3|4|5).
     try expectDeclaredAt(out, "iPrevFrame", "register(t2)");
     try expectDeclaredAt(out, "iCellAge", "register(t3)");
+    try expectDeclaredAt(out, "iCellText", "register(t4)");
+    try expectDeclaredAt(out, "iRowOffset", "register(t5)");
+}
+
+test "iBelowFloats sits at slot 6 on every target" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec2 uv = fragCoord / iResolution.xy;
+        \\    fragColor = texture(iBelowFloats, uv) + texture(iChannel0, uv);
+        \\}
+    ;
+    const msl = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
+    defer std.testing.allocator.free(msl);
+    try expectDeclaredAt(msl, "iBelowFloats", "[[texture(6)]]");
+    const hlsl = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
+    defer std.testing.allocator.free(hlsl);
+    try expectDeclaredAt(hlsl, "iBelowFloats", "register(t6)");
+    const gl = try compileGlslToTarget(std.testing.allocator, glsl, .glsl);
+    defer std.testing.allocator.free(gl);
+    // postfx.zig binds this name to unit 6.
+    try std.testing.expect(std.mem.indexOf(u8, gl, "uniform sampler2D zonvie_iBelowFloatsTex;") != null);
 }
 
 /// Fails unless some line of `out` declares `name` with `binding`.
