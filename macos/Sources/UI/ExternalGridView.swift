@@ -3175,7 +3175,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // grid of this surface like they are.
                 return resolveSurfaceGridRow(committed, row: logicalRow, cellHeightPx: cellHi)
             }
-            if ZonvieCore.appLogEnabled {
+            if ZonvieCore.appLogEnabled && !belowFloats {
                 // Debug: log translationY for all rows to detect slot remap drift
                 var nonZeroTranslations: [(Int, Float, Int, Int)] = []
                 for row in 0..<f.safeRowCount {
@@ -3465,7 +3465,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     ) -> MTLTexture? {
         guard shared.customShaderPostProcess == .afterBloom,
               mainTerminalView?.renderer != nil,
-              shared.shaderWantsBelowFloats else {
+              // The chain this surface runs (decorated or not), which is
+              // compiled separately and can differ from the other.
+              shared.customShaderChain(decorated: isDecoratedSurface).contains(where: \.usesBelowFloats) else {
             belowFloatsTexture = nil
             return nil
         }

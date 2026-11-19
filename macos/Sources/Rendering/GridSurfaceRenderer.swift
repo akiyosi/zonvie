@@ -5078,7 +5078,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private func encodeBelowFloats(
         _ f: inout MainSurfaceFrame, wanted: Bool, cmd: MTLCommandBuffer, backTex: MTLTexture, view: MTKView
     ) -> MTLTexture? {
-        guard wanted, shared.shaderWantsBelowFloats else {
+        // The chain this surface runs, not the aggregate: the decorated
+        // chain is compiled separately and can differ.
+        guard wanted, shared.customShaderChain(decorated: false).contains(where: \.usesBelowFloats) else {
             belowFloatsTexture = nil
             belowFloatsPadTexture = nil
             return nil
@@ -5128,10 +5130,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     ) -> MTLTexture? {
         guard let copyPipe = shared.copyPipeline, let copyVB = shared.copyVertexBuffer,
               let samp = shared.sampler else { return nil }
-        let capacity = surfaceTextureCapacity(current: belowFloatsPadTexture, logicalSize: view.drawableSize, inLiveResize: view.inLiveResize)
-        if belowFloatsPadTexture?.width != capacity.widthPx || belowFloatsPadTexture?.height != capacity.heightPx {
+        // Exactly iChannel0's pad extent: the chain maps every input with
+        // one uvScale, taken from that pad.
+        guard let channel0Pad = insetPadTexture else { return nil }
+        if belowFloatsPadTexture?.width != channel0Pad.width || belowFloatsPadTexture?.height != channel0Pad.height {
             belowFloatsPadTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
-                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                size: CGSize(width: channel0Pad.width, height: channel0Pad.height),
                 pixelFormat: view.colorPixelFormat,
                 usage: [.renderTarget, .shaderRead]))
         }
