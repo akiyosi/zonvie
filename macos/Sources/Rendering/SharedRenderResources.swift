@@ -163,7 +163,8 @@ final class SharedRenderResources {
                 rows: UInt32(clamping: l.rows),
                 cols: UInt32(clamping: l.cols),
                 z: UInt32(clamping: l.z),
-                flags: l.isFloat ? UInt32(ZONVIE_SHADER_LAYER_FLOAT) : 0))
+                flags: (l.isFloat ? UInt32(ZONVIE_SHADER_LAYER_FLOAT) : 0)
+                    | (l.mouseEnabled ? UInt32(ZONVIE_SHADER_LAYER_FOCUSABLE) : 0)))
         }
         scratch.withUnsafeBufferPointer { buf in
             zonvie_shader_fill_layers(&u, buf.baseAddress, buf.count, UInt32(clamping: rootRows))
@@ -300,6 +301,9 @@ final class SharedRenderResources {
     /// True when a loaded shader reads iPrevFrame. Gates the feedback pair
     /// and its copy pass, on every surface.
     private(set) var shaderWantsPrevFrame: Bool = false
+    /// True when a loaded shader reads iBelowFloats. Gates the below-floats
+    /// texture and its pass, on every surface.
+    private(set) var shaderWantsBelowFloats: Bool = false
     /// True when a loaded shader declared `@zonvie-owns-cursor`.
     private(set) var shaderOwnsCursor: Bool = false
     /// Fired when the loaded chain starts or stops reading the edit inputs.
@@ -1685,6 +1689,7 @@ extension SharedRenderResources {
         shaderWantsEditInputs = false
         shaderWantsCellText = false
         shaderWantsPrevFrame = false
+        shaderWantsBelowFloats = false
         shaderOwnsCursor = false
         // Only ask the core to build stamp lists when a shader reads them,
         // and drop the stores when none does, so an unused input costs no
@@ -1714,6 +1719,7 @@ extension SharedRenderResources {
             if loaded.usesEditInputs { shaderWantsEditInputs = true }
             if loaded.usesCellText { shaderWantsCellText = true }
             if loaded.usesPrevFrame { shaderWantsPrevFrame = true }
+            if loaded.usesBelowFloats { shaderWantsBelowFloats = true }
             if loaded.ownsCursor { shaderOwnsCursor = true }
         }
         // Decorated variant: always opaque (preserve_alpha OFF). Only a

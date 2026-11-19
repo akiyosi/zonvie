@@ -537,6 +537,7 @@ func encodeSurfaceBackBufferToDrawable(
     sampler: MTLSamplerState?,
     bilinearSampler: MTLSamplerState?,
     editInputs: SurfaceEditInputs? = nil,
+    belowFloats: MTLTexture? = nil,
     makeUniforms: () -> zonvie_shader_uniforms,
     prepareCopy: (MTLRenderPassDescriptor) -> Void = { _ in }
 ) -> SurfaceDrawablePresentation {
@@ -572,7 +573,8 @@ func encodeSurfaceBackBufferToDrawable(
             prevFrame: prevFrame,
             cellAge: editInputs?.cellAge,
             cellText: editInputs?.cellText,
-            rowOffset: editInputs?.rowOffset
+            rowOffset: editInputs?.rowOffset,
+            belowFloats: belowFloats
         ) {
             guard let feedbackWrite else { return .customShaderChain }
             // Rotate only once the slot reached the drawable: a failed copy
@@ -949,7 +951,8 @@ func encodeSurfaceCustomShaderChain(
     prevFrame: MTLTexture? = nil,
     cellAge: MTLTexture? = nil,
     cellText: MTLTexture? = nil,
-    rowOffset: MTLTexture? = nil
+    rowOffset: MTLTexture? = nil,
+    belowFloats: MTLTexture? = nil
 ) -> Bool {
     guard !pipelines.isEmpty else { return false }
     if pipelines.count > 1 {
@@ -972,7 +975,8 @@ func encodeSurfaceCustomShaderChain(
             prevFrame: prevFrame,
             cellAge: cellAge,
             cellText: cellText,
-            rowOffset: rowOffset
+            rowOffset: rowOffset,
+            belowFloats: belowFloats
         ) {
             return false
         }
@@ -2612,6 +2616,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// reads the edit inputs.
     private let customShaderFeedback = SurfaceFeedbackTextures()
     private let customShaderRowOffset = SurfaceRowOffsetTexture()
+    /// iBelowFloats for this surface, at the back buffer's extent, and its
+    /// copy at the grid inset when the drawable is padded. Nil while no
+    /// loaded shader reads it; remade only when the extent changes.
+    private var belowFloatsTexture: MTLTexture?
+    private var belowFloatsPadTexture: MTLTexture?
     /// Last cursor rect handed to a shader, so the log fires on change only.
     /// Per-surface, because each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
@@ -4662,13 +4671,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         _ f: inout MainSurfaceFrame,
         enc: MTLRenderCommandEncoder,
         backTex: MTLTexture,
-        loadActionIsClear: Bool
+        loadActionIsClear: Bool,
+        /// iBelowFloats: leave out FLOAT layers and draw the rest whole,
+        /// without touching the layers' draw state.
+        belowFloats: Bool = false
     ) {
         let surfaceCellHi = Int(f.cellHi)
         let use2Pass = f.use2Pass
         enc.setRenderPipelineState(shared.pipeline!)
         for entry in layerSnapshot.dropFirst() {
             let layer = entry.layer
+            if belowFloats && layer.isFloat { continue }
             let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rowCount = f.layerResolvableRowCount(entry)
@@ -4746,7 +4759,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // full-width background band does erase this layer's pixels,
             // but the band marks the layer rows it crosses where the
             // damage is produced, so they are already in drawRows.
-            let drawAll = f.layerNeedsAllRows(
+            let drawAll = belowFloats || f.layerNeedsAllRows(
                 state: st,
                 rowCount: rowCount,
                 retainedRowCount: retainedForLayerCount,
@@ -4819,6 +4832,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     )
                 }
             }
+            if belowFloats { continue }
             st?.lastDrawnRowCount = rowCount
             // rows= counts the row draws encoded (drawn rows plus
             // overwritten empty ones); a quiet layer encodes none.
@@ -5001,6 +5015,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 device: shared.device)
         }
         let cursorVisible = f.cursorBlink && f.cursorCount > 0
+        var belowFloats = encodeBelowFloats(&f, wanted: runsChain, cmd: cmd, backTex: backTex, view: view)
         var source = backTex
         let inset = gridInsetsPx
         if gridDrawableSize(view) != view.drawableSize {
@@ -5008,6 +5023,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return .notEncoded
             }
             source = padded
+            if let below = belowFloats {
+                belowFloats = padBelowFloats(f, cmd: cmd, below: below, view: view, inset: inset)
+            }
         }
         return encodeSurfaceBackBufferToDrawable(
             cmd: cmd,
@@ -5022,6 +5040,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             sampler: shared.sampler,
             bilinearSampler: shared.bilinearSampler,
             editInputs: editInputs,
+            belowFloats: belowFloats,
             makeUniforms: {
                 var u = shared.makeShaderUniforms(
                     screenResolution: view.drawableSize,
@@ -5050,6 +5069,91 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 gpuSampler.attachStats(to: copyRPD, label: "copy")
             }
         )
+    }
+
+    /// iBelowFloats: the root's rows and every non-FLOAT layer, redrawn whole
+    /// over the default background, without the cursor. The back buffer
+    /// cannot serve: its retained rows have the floats baked in. Encodes
+    /// nothing and drops the textures unless a loaded shader reads it.
+    private func encodeBelowFloats(
+        _ f: inout MainSurfaceFrame, wanted: Bool, cmd: MTLCommandBuffer, backTex: MTLTexture, view: MTKView
+    ) -> MTLTexture? {
+        guard wanted, shared.shaderWantsBelowFloats else {
+            belowFloatsTexture = nil
+            belowFloatsPadTexture = nil
+            return nil
+        }
+        // The back buffer's extent, so the chain's uvScale maps both.
+        if belowFloatsTexture?.width != backTex.width || belowFloatsTexture?.height != backTex.height {
+            belowFloatsTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
+                size: CGSize(width: backTex.width, height: backTex.height),
+                pixelFormat: backTex.pixelFormat,
+                usage: [.renderTarget, .shaderRead]))
+        }
+        guard let below = belowFloatsTexture else { return nil }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = below
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(bgRGB: f.bgRGB, blurEnabled: blurEnabled)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return nil }
+        enc.label = "BelowFloats"
+        beginSurfaceRowPass(
+            encoder: enc,
+            viewportMetrics: f.viewportMetrics,
+            pipeline: shared.pipeline!,
+            atlasTexture: f.atlasTex,
+            sampler: shared.sampler!,
+            backgroundAlpha: f.backgroundAlpha,
+            fixedFloatBands: f.fixedFloatBands,
+            fixedFloatIntervals: f.fixedFloatIntervals,
+            separatorFadePx: separatorFadePx,
+            bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: f.scrollOffsets) }
+        )
+        if f.rowMode {
+            encodeRootRows(&f, enc: enc, rowPassPlan: .allRowsWithRetained, backTex: below, view: view)
+        }
+        if layerSnapshot.count > 1 {
+            encodeLayerPass(&f, enc: enc, backTex: below, loadActionIsClear: true, belowFloats: true)
+        }
+        enc.endEncoding()
+        return below
+    }
+
+    /// `below` placed at the grid inset like encodeGridInsetPad places the
+    /// back buffer, so iBelowFloats shares iChannel0's space.
+    private func padBelowFloats(
+        _ f: MainSurfaceFrame, cmd: MTLCommandBuffer, below: MTLTexture, view: MTKView,
+        inset: (left: CGFloat, right: CGFloat, top: CGFloat)
+    ) -> MTLTexture? {
+        guard let copyPipe = shared.copyPipeline, let copyVB = shared.copyVertexBuffer,
+              let samp = shared.sampler else { return nil }
+        let capacity = surfaceTextureCapacity(current: belowFloatsPadTexture, logicalSize: view.drawableSize, inLiveResize: view.inLiveResize)
+        if belowFloatsPadTexture?.width != capacity.widthPx || belowFloatsPadTexture?.height != capacity.heightPx {
+            belowFloatsPadTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
+                size: CGSize(width: capacity.widthPx, height: capacity.heightPx),
+                pixelFormat: view.colorPixelFormat,
+                usage: [.renderTarget, .shaderRead]))
+        }
+        guard let padded = belowFloatsPadTexture else { return nil }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = padded
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(bgRGB: f.bgRGB, blurEnabled: blurEnabled)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return nil }
+        let grid = gridDrawableSize(view)
+        enc.setViewport(MTLViewport(originX: Double(inset.left), originY: Double(inset.top),
+                                    width: Double(grid.width), height: Double(grid.height), znear: 0, zfar: 1))
+        enc.setRenderPipelineState(copyPipe)
+        enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+        var scale = surfaceUVScale(logicalSize: grid, capacity: below)
+        enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
+        enc.setFragmentTexture(below, index: 0)
+        enc.setFragmentSamplerState(samp, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        enc.endEncoding()
+        return padded
     }
 
     /// The back buffer placed at the left/top insets of a full-drawable
