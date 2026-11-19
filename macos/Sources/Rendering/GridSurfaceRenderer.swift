@@ -5120,8 +5120,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return below
     }
 
-    /// `below` placed at the grid inset like encodeGridInsetPad places the
-    /// back buffer, so iBelowFloats shares iChannel0's space.
+    /// `below` placed at the grid inset the way encodeGridInsetPad places the
+    /// back buffer, so iBelowFloats shares iChannel0's space and surround.
     private func padBelowFloats(
         _ f: MainSurfaceFrame, cmd: MTLCommandBuffer, below: MTLTexture, view: MTKView,
         inset: (left: CGFloat, right: CGFloat, top: CGFloat)
@@ -5136,6 +5136,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 usage: [.renderTarget, .shaderRead]))
         }
         guard let padded = belowFloatsPadTexture else { return nil }
+        // The island's ground outside the card, as iChannel0 has it.
+        if let island, shared.islandPipeline != nil {
+            return encodeIsland(island, f, cmd: cmd, backTex: below, padded: padded, view: view, inset: inset)
+        }
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = padded
         rpd.colorAttachments[0].loadAction = .clear

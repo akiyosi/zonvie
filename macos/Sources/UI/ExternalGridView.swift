@@ -694,6 +694,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// drawable and history.
     private let customShaderFeedback = SurfaceFeedbackTextures()
     private let customShaderRowOffset = SurfaceRowOffsetTexture()
+    /// iBelowFloats for this window, at the back buffer's extent. Nil while
+    /// no loaded shader reads it; remade only when the extent changes.
+    private var belowFloatsTexture: MTLTexture?
     private let scrollScratch = SurfaceScrollScratchTexture()
 
     // Blur transparency support
@@ -2646,6 +2649,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // encoded at all.
                 ZonvieCore.renderTrace("side=macos event=retained_content_reuse surface=\(gridId) root_row_draws=0 hosted_row_draws=0")
             }
+            let belowFloats = encodeBelowFloats(
+                &f, cmd: cmd, committed: committed, pipeline: pipeline, sampler: sampler,
+                atlasTex: atlasTex, backTex: backTex, view: view)
 
             // --- Post-process bloom (neon glow) ---
             // Shared with GridSurfaceRenderer; only where the intensity and
@@ -2711,7 +2717,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             let presentation = encodeBackBufferToDrawable(
                 &f, cmd: cmd, backTex: backTex, drawable: drawable, view: view,
-                cursorVisible: f.fontIsCurrent && f.cursorBlink && committedCursor.vertexCount > 0
+                cursorVisible: f.fontIsCurrent && f.cursorBlink && committedCursor.vertexCount > 0,
+                belowFloats: belowFloats
             )
 
             guard presentation.encoded else {
@@ -3142,7 +3149,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         sampler: MTLSamplerState,
         atlasTex: MTLTexture,
         backTex: MTLTexture,
-        view: MTKView
+        view: MTKView,
+        belowFloats: Bool = false
     ) {
         // The atlas texture is also captured for the bloom extract
         // pass and the cursor pass below.
@@ -3232,7 +3240,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // Hosted grids use the same row-slot resolution and pipelines as
         // the root. The shared back texture is recomposed before effects.
         if plan.encodesHostedLayers {
-            encodeHostedLayers(&f, encoder: enc, pipeline: pipeline, backTex: backTex)
+            encodeHostedLayers(&f, encoder: enc, pipeline: pipeline, backTex: backTex, belowFloats: belowFloats)
         }
 
         // Cursor is NOT drawn into backbuffer — it is composited onto the
@@ -3252,7 +3260,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         encoder: MTLRenderCommandEncoder,
         glowPipeline: MTLRenderPipelineState? = nil,
         pipeline: MTLRenderPipelineState,
-        backTex: MTLTexture
+        backTex: MTLTexture,
+        /// iBelowFloats: leave out FLOAT layers and draw the rest whole.
+        belowFloats: Bool = false
     ) {
         let glow = glowPipeline != nil
         guard f.fontIsCurrent else { return }
@@ -3263,6 +3273,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
         for entry in layerSnapshot {
             let layer = entry.layer
+            if belowFloats && layer.isFloat { continue }
             let cellHi = layer.rowHeightPx(surfaceCellHeightPx: surfaceCellHi)
             guard let set = entry.set else { continue }
             let rows = min(layer.rows, set.rowLogicalToSlot.count)
@@ -3315,7 +3326,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     cellHeightPx: Float(cellHi)
                 )
             }
-            if f.partialHostedContents && !glow {
+            if f.partialHostedContents && !glow && !belowFloats {
                 // Recompose each damage band back-to-front. Every
                 // layer is clipped to the band the root erased, so
                 // unchanged pixels are neither cleared nor blended.
@@ -3360,6 +3371,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 useTwoPass: f.use2Pass,
                 unifiedBlurPipeline: shared.unifiedBlurPipeline
             )
+            if belowFloats { continue }
             logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
         }
         bindLayerTransform(encoder: encoder, f.viewportMetrics.layerTransform)
@@ -3437,6 +3449,52 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         }
     }
 
+    /// iBelowFloats: this window's root rows and its non-FLOAT hosted layers,
+    /// redrawn whole over the default background, without the cursor.
+    /// Encodes nothing and drops the texture unless the chain runs and a
+    /// loaded shader reads it.
+    private func encodeBelowFloats(
+        _ f: inout ExternalSurfaceFrame,
+        cmd: MTLCommandBuffer,
+        committed: SurfaceBufferSet,
+        pipeline: MTLRenderPipelineState,
+        sampler: MTLSamplerState,
+        atlasTex: MTLTexture,
+        backTex: MTLTexture,
+        view: MTKView
+    ) -> MTLTexture? {
+        guard shared.customShaderPostProcess == .afterBloom,
+              mainTerminalView?.renderer != nil,
+              shared.shaderWantsBelowFloats else {
+            belowFloatsTexture = nil
+            return nil
+        }
+        // The back buffer's extent, so the chain's uvScale maps both.
+        if belowFloatsTexture?.width != backTex.width || belowFloatsTexture?.height != backTex.height {
+            belowFloatsTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
+                size: CGSize(width: backTex.width, height: backTex.height),
+                pixelFormat: backTex.pixelFormat,
+                usage: [.renderTarget, .shaderRead]))
+        }
+        guard let below = belowFloatsTexture else { return nil }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = below
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(bgRGB: surfaceBgRGB, clearAlpha: surfaceClearAlpha)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return nil }
+        enc.label = "BelowFloats"
+        encodeBackBufferPass(
+            &f, enc: enc,
+            plan: SurfaceFramePlan(
+                encodesSurfacePass: true, loadsPreviousContents: false,
+                encodesRootRows: f.rowMode, encodesHostedLayers: true,
+                rowPassPlan: .allRowsWithRetained),
+            committed: committed, rpd: rpd, pipeline: pipeline, sampler: sampler,
+            atlasTex: atlasTex, backTex: below, view: view, belowFloats: true)
+        return below
+    }
+
     /// The back texture onto the drawable, through the custom shader chain
     /// or the plain copy.
     ///
@@ -3463,7 +3521,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         backTex: MTLTexture,
         drawable: CAMetalDrawable,
         view: MTKView,
-        cursorVisible: Bool
+        cursorVisible: Bool,
+        belowFloats: MTLTexture?
     ) -> SurfaceDrawablePresentation {
         // Cleared here, past every bail, as on the main surface.
         shaderCursorMovedThisFrame = false
@@ -3512,6 +3571,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             sampler: shared.sampler,
             bilinearSampler: shared.bilinearSampler,
             editInputs: editInputs,
+            belowFloats: belowFloats,
             makeUniforms: { [weak self] in
                 guard let self, let renderer = self.mainTerminalView?.renderer else {
                     return zonvie_shader_uniforms()
