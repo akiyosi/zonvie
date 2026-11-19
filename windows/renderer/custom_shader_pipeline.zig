@@ -30,6 +30,8 @@ pub const CustomShaderPipeline = struct {
     uses_cell_text: bool = false,
     /// True when the source reads iPrevFrame. Gates the feedback pair.
     uses_prev_frame: bool = false,
+    /// True when the source reads iBelowFloats. Gates the below-floats target.
+    uses_below_floats: bool = false,
     /// True when the source declared `@zonvie-owns-cursor`.
     owns_cursor: bool = false,
 

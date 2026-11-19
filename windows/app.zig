@@ -477,6 +477,9 @@ pub const SurfaceLayer = struct {
     mouse_enabled: bool = true,
     /// A floating window (Neovim zindex > 0), not a split.
     is_float: bool = false,
+    /// Neovim's message grid (ZONVIE_LAYER_MSG). It is also is_float, but
+    /// iBelowFloats keeps it.
+    is_msg: bool = false,
     /// A grid drawn in its own font (on_grid_font), stamped at commit
     /// (App.commitGridFonts): its cell and the pixel box the core clips it
     /// to, margin included. 0 = the surface's cell.
@@ -606,7 +609,9 @@ pub fn fillShaderLayers(r: anytype, layers: []const SurfaceLayer, origin: [2]f32
             .rows = l.rows,
             .cols = l.cols,
             .z = @intCast(@max(l.z, 0)),
-            .flags = if (l.is_float) core.SHADER_LAYER_FLOAT else 0,
+            .flags = core.shaderLayerFlags((if (l.is_float) core.LAYER_FLOAT else 0) |
+                (if (l.is_msg) core.LAYER_MSG else 0) |
+                (if (l.mouse_enabled) core.LAYER_MOUSE_ENABLED else 0)),
         };
         n += 1;
     }
@@ -5447,6 +5452,94 @@ pub const RowFrameOutcome = struct {
     }
 };
 
+/// iBelowFloats (Renderer.beginBelowFloats): every root row and every row of
+/// each layer that is not a win_float_pos float, without the cursor, at rest.
+/// Reads the pinned set only; the frame's plan, bands and draw counts are the
+/// normal pass's and stay untouched. A row that fails to draw is left as the
+/// bg the target was cleared to rather than refusing the present.
+fn drawBelowFloats(
+    g: *d3d11.Renderer,
+    app: *App,
+    surface: RowFrameSurface,
+    in: RowFrameInput,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+    layer_row_h_px: i32,
+    cell_w_px: i32,
+) void {
+    const p = in.draw_params;
+    const sc_fn = rs_set_sc_fn orelse return;
+    const ctx = ctx_ptr orelse return;
+    const content: c.D3D11_RECT = .{
+        .left = p.x_offset,
+        .top = p.y_offset,
+        .right = p.content_right,
+        .bottom = p.y_offset + @as(i32, @intCast(p.content_height)),
+    };
+    if (!g.beginBelowFloats(content)) return;
+    defer g.endBelowFloats();
+
+    const base_vp = BaseViewport{
+        .x = @floatFromInt(p.content_x_offset orelse 0),
+        .y = @floatFromInt(p.content_y_offset orelse 0),
+        .w = @floatFromInt(rowModeViewportWidth(g, p)),
+        .h = @floatFromInt(p.content_height),
+    };
+    var metrics: SurfaceRowDrawMetrics = .{};
+    drawSurfaceRowsVBFromSlots(
+        g,
+        &app.row_vb_budget,
+        surface.row_vb_retained_bytes,
+        in.row_map,
+        surface.pool,
+        surface.row_vbs,
+        null,
+        ctx,
+        sc_fn,
+        ctx.*.lpVtbl.*.RSSetViewports,
+        base_vp,
+        p.x_offset,
+        p.y_offset,
+        p.content_right,
+        p.row_h_px,
+        p.layer_origin_x_px,
+        p.layer_origin_y_px,
+        p.root_rows_may_be_empty,
+        p.root_extent_h_px,
+        &.{},
+        0,
+        null,
+        false,
+        &metrics,
+    ) catch return;
+
+    const src = in.layer_src orelse return;
+    if (in.layers.len > 1 and layer_row_h_px > 0) for (in.layers[1..]) |layer| {
+        if (layer.is_float and !layer.is_msg) continue;
+        const state = src.paint.layerState(layer.grid_id) orelse continue;
+        const rows = src.rows(layer);
+        const d = LayerRowDrawCtx{
+            .layer = layer,
+            .layer_w_px = layer.widthPx(cell_w_px),
+            .origin_x = @floatFromInt(layer.x_px),
+            .origin_y = @floatFromInt(layer.y_px),
+            .base_vp = base_vp,
+            .x_offset = p.x_offset,
+            .y_offset = p.y_offset,
+            .content_right = p.content_right,
+            .row_h_px = layer.rowHeightPx(layer_row_h_px),
+            .ctx_ptr = ctx,
+            .rs_set_sc_fn = sc_fn,
+        };
+        for (0..@min(rows.len, state.row_vbs.items.len)) |ri| {
+            var sc = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse continue;
+            sc_fn(ctx, 1, &sc);
+            _ = drawLayerRowUnder(g, src, state, rows, ri, d);
+        }
+    };
+    g.setLayerTransform(0, 0, base_vp.w, base_vp.h) catch {};
+}
+
 /// One surface's row frame, root rows to bloom, in the order both paint
 /// drivers used to run it separately: root rows, hosted layers, cursor
 /// overlay, bloom. Snapshot, present rectangles, Present, and the chrome
@@ -5545,6 +5638,8 @@ pub fn drawSurfaceRowFrame(
         );
         if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
     }
+
+    if (!out.layers.incomplete()) drawBelowFloats(g, app, surface, in, out.rows.ctx_ptr, out.rows.rs_set_sc_fn, layer_row_h_px, cell_w_px);
 
     // Where this frame's eases drew each row, for the shader's iRowOffset:
     // the root's scroll region at its offset, then every eased layer's

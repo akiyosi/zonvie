@@ -441,6 +441,14 @@ pub const Renderer = struct {
     shader_wants_edit_inputs: bool = false,
     shader_wants_cell_text: bool = false,
     shader_wants_prev_frame: bool = false,
+    /// A loaded shader reads iBelowFloats: the row frame also draws the
+    /// surface without its win_float_pos floats into `below_floats`
+    /// (beginBelowFloats), bound at t6. Logical size, like the scratch copy
+    /// iChannel0 reads; created on first need or resize and kept.
+    shader_wants_below_floats: bool = false,
+    below_floats: Tex2D = .{},
+    below_floats_w: u32 = 0,
+    below_floats_h: u32 = 0,
     /// Cell metrics, blink state and grid origin mirrored from the app by the
     /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
     /// iGridOrigin and the cell-age grid. `cell_h_px` is the grid row
@@ -811,6 +819,7 @@ pub const Renderer = struct {
         for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         safeRelease(&self.custom_shader_uniforms_cb);
         self.releaseFeedbackTextures();
+        self.releaseBelowFloats();
         safeRelease(&self.cell_age_srv);
         safeRelease(&self.cell_age_tex);
         safeRelease(&self.cell_text_srv);
@@ -1045,6 +1054,7 @@ pub const Renderer = struct {
         for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         self.custom_shader_pong_w = 0;
         self.custom_shader_pong_h = 0;
+        self.releaseBelowFloats();
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -2840,6 +2850,59 @@ pub const Renderer = struct {
         self.feedback_primed = false;
     }
 
+    fn releaseBelowFloats(self: *Renderer) void {
+        self.below_floats.release();
+        self.below_floats_w = 0;
+        self.below_floats_h = 0;
+    }
+
+    /// Point the row pipeline at `below_floats` for the caller's redraw of
+    /// the surface without its floats. Seeds it with back_tex (so the chrome
+    /// matches iChannel0) and overwrites `content` with the default bg, which
+    /// the caller then repaints. False, with back_rtv still bound, when no
+    /// running shader reads iBelowFloats or the target is unavailable; after
+    /// true the caller must call endBelowFloats.
+    pub fn beginBelowFloats(self: *Renderer, content: c.D3D11_RECT) bool {
+        if (!self.shader_wants_below_floats or self.custom_shader_pipelines.items.len == 0) return false;
+        const ctx = self.ctx orelse return false;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const back = self.back_tex orelse return false;
+        if (self.below_floats.tex == null or self.below_floats_w != self.width or self.below_floats_h != self.height) {
+            self.releaseBelowFloats();
+            const dev = self.device orelse return false;
+            var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+            const get_desc = back.*.lpVtbl.*.GetDesc orelse return false;
+            get_desc(back, &back_desc);
+            self.below_floats = createTex2D(dev, self.width, self.height, back_desc.Format, c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE) orelse return false;
+            self.below_floats_w = self.width;
+            self.below_floats_h = self.height;
+        }
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
+        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return false;
+        const set_sc = ctx_vtbl.*.RSSetScissorRects orelse return false;
+        // Unbound before the copy, as drawCustomShaderPass does.
+        set_rtvs(ctx, 0, null, null);
+        const box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = self.width, .bottom = self.height, .back = 1 };
+        copy_sub(ctx, @ptrCast(self.below_floats.tex.?), 0, 0, 0, 0, @ptrCast(back), 0, &box);
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.below_floats.rtv};
+        set_rtvs(ctx, 1, &rtvs[0], null);
+        var sc = content;
+        set_sc(ctx, 1, &sc);
+        self.drawClearRowOverwrite() catch {
+            self.endBelowFloats();
+            return false;
+        };
+        return true;
+    }
+
+    /// Rebind back_rtv after beginBelowFloats returned true.
+    pub fn endBelowFloats(self: *Renderer) void {
+        const ctx = self.ctx orelse return;
+        const set_rtvs = ctx.*.lpVtbl.*.OMSetRenderTargets orelse return;
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.back_rtv};
+        set_rtvs(ctx, 1, &rtvs[0], null);
+    }
+
     fn releaseFeedbackTextures(self: *Renderer) void {
         for (&self.feedback_srv) |*x| safeRelease(x);
         for (&self.feedback_rtv) |*x| safeRelease(x);
@@ -3192,7 +3255,9 @@ pub const Renderer = struct {
         self.shader_wants_edit_inputs = false;
         self.shader_wants_cell_text = false;
         self.shader_wants_prev_frame = false;
+        self.shader_wants_below_floats = false;
         self.shader_owns_cursor = false;
+        defer if (!self.shader_wants_below_floats) self.releaseBelowFloats();
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
         const dev = self.device orelse return;
@@ -3216,6 +3281,7 @@ pub const Renderer = struct {
             if (pipeline.uses_edit_inputs) self.shader_wants_edit_inputs = true;
             if (pipeline.uses_cell_text) self.shader_wants_cell_text = true;
             if (pipeline.uses_prev_frame) self.shader_wants_prev_frame = true;
+            if (pipeline.uses_below_floats) self.shader_wants_below_floats = true;
             if (pipeline.owns_cursor) self.shader_owns_cursor = true;
         }
         applog.appLog(
@@ -3238,6 +3304,8 @@ pub const Renderer = struct {
         self.shader_wants_edit_inputs = src.shader_wants_edit_inputs;
         self.shader_wants_cell_text = src.shader_wants_cell_text;
         self.shader_wants_prev_frame = src.shader_wants_prev_frame;
+        self.shader_wants_below_floats = src.shader_wants_below_floats;
+        if (!self.shader_wants_below_floats) self.releaseBelowFloats();
         self.shader_owns_cursor = src.shader_owns_cursor;
         for (src.custom_shader_pipelines.items) |sp| {
             const path = self.alloc.dupe(u8, sp.source_path) catch return false;
@@ -3249,6 +3317,7 @@ pub const Renderer = struct {
                 .uses_edit_inputs = sp.uses_edit_inputs,
                 .uses_cell_text = sp.uses_cell_text,
                 .uses_prev_frame = sp.uses_prev_frame,
+                .uses_below_floats = sp.uses_below_floats,
                 .owns_cursor = sp.owns_cursor,
             }) catch {
                 self.alloc.free(path);
@@ -3499,6 +3568,7 @@ pub const Renderer = struct {
             .uses_edit_inputs = core.frontend_rules.shaderUsesEditInputs(glsl),
             .uses_cell_text = core.frontend_rules.shaderUsesCellText(glsl),
             .uses_prev_frame = core.frontend_rules.shaderUsesPrevFrame(glsl),
+            .uses_below_floats = core.frontend_rules.shaderUsesBelowFloats(glsl),
             .owns_cursor = core.frontend_rules.shaderOwnsCursor(glsl),
         };
     }
@@ -3743,6 +3813,9 @@ pub const Renderer = struct {
             row_offset_srv_bind = self.ensureRowOffsetTexture(ctx, ctx_vtbl);
         }
         if (self.shader_wants_cell_text) cell_text_srv_bind = self.ensureCellTextTexture(ctx, ctx_vtbl);
+        // Drawn by the row frame (beginBelowFloats); never created here.
+        const below_floats_srv_bind: ?*c.ID3D11ShaderResourceView =
+            if (self.shader_wants_below_floats and self.below_floats_w == self.width and self.below_floats_h == self.height) self.below_floats.srv else null;
         if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
             if (self.feedback_rtv[self.feedback_index]) |w| {
@@ -3868,8 +3941,8 @@ pub const Renderer = struct {
             // Bound even when null: the immediate context is shared by every
             // window's renderer, so a slot left alone would still hold the
             // texture of whichever window drew last.
-            var edit_srvs: [3]?*c.ID3D11ShaderResourceView = .{ cell_age_srv_bind, cell_text_srv_bind, row_offset_srv_bind };
-            set_srvs_fn(ctx, 3, 3, &edit_srvs[0]);
+            var edit_srvs: [4]?*c.ID3D11ShaderResourceView = .{ cell_age_srv_bind, cell_text_srv_bind, row_offset_srv_bind, below_floats_srv_bind };
+            set_srvs_fn(ctx, 3, 4, &edit_srvs[0]);
 
             set_ps_fn(ctx, ps_i, null, 0);
             draw_fn(ctx, 3, 0);
@@ -3897,6 +3970,9 @@ pub const Renderer = struct {
         // next-frame prologue don't inherit the custom shader's bindings.
         var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{self.atlas_srv};
         set_srvs_fn(ctx, 0, 1, &atlas_srvs[0]);
+        // below_floats is a render target in the next row frame.
+        var null_below: [1]?*c.ID3D11ShaderResourceView = .{null};
+        set_srvs_fn(ctx, 6, 1, &null_below[0]);
         if (ctx_vtbl.*.VSSetShader) |set_vs| {
             if (self.vs) |vs_main| set_vs(ctx, vs_main, null, 0);
         }
