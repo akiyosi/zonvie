@@ -449,6 +449,16 @@ pub const Renderer = struct {
     below_floats: Tex2D = .{},
     below_floats_w: u32 = 0,
     below_floats_h: u32 = 0,
+    /// The last row frame finished `below_floats` at the current size; the
+    /// chain binds it only then (an animation-only frame reuses it).
+    below_floats_valid: bool = false,
+    /// Rows whose own buffer is not current are uploaded here, so the pass
+    /// never touches the row buffers or their budget. Grow-only.
+    below_floats_vb: ?*c.ID3D11Buffer = null,
+    below_floats_vb_bytes: usize = 0,
+    /// The scissor beginBelowFloats found, restored by endBelowFloats.
+    below_floats_saved_sc: c.D3D11_RECT = std.mem.zeroes(c.D3D11_RECT),
+    below_floats_saved_sc_n: c.UINT = 0,
     /// Cell metrics, blink state and grid origin mirrored from the app by the
     /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
     /// iGridOrigin and the cell-age grid. `cell_h_px` is the grid row
@@ -1217,6 +1227,9 @@ pub const Renderer = struct {
 
         const ctx = self.ctx.?;
         const back_rtv = self.back_rtv.?; // persistent back buffer RTV
+        // back_tex is about to change; only a row frame's below pass
+        // (beginBelowFloats/endBelowFloats) makes the target match it again.
+        self.below_floats_valid = false;
 
         const ctx_vtbl = ctx.*.lpVtbl;
 
@@ -2854,6 +2867,19 @@ pub const Renderer = struct {
         self.below_floats.release();
         self.below_floats_w = 0;
         self.below_floats_h = 0;
+        self.below_floats_valid = false;
+        safeRelease(&self.below_floats_vb);
+        self.below_floats_vb_bytes = 0;
+    }
+
+    /// Draw `verts` from the below-floats scratch buffer (see
+    /// below_floats_vb) under the transform and scissor already set.
+    pub fn drawBelowFloatsVerts(self: *Renderer, verts: []const core.Vertex) !void {
+        if (verts.len == 0) return;
+        try self.ensureExternalVertexBuffer(&self.below_floats_vb, &self.below_floats_vb_bytes, verts.len * @sizeOf(core.Vertex));
+        const vb = self.below_floats_vb orelse return error.NoBelowFloatsVB;
+        try self.uploadVertsToVB(vb, verts);
+        try self.drawVB(vb, verts.len);
     }
 
     /// Point the row pipeline at `below_floats` for the caller's redraw of
@@ -2863,7 +2889,10 @@ pub const Renderer = struct {
     /// running shader reads iBelowFloats or the target is unavailable; after
     /// true the caller must call endBelowFloats.
     pub fn beginBelowFloats(self: *Renderer, content: c.D3D11_RECT) bool {
+        // custom_shader_pipelines is exactly the chain drawCustomShaderPass
+        // runs for this surface (each window's renderer holds its own).
         if (!self.shader_wants_below_floats or self.custom_shader_pipelines.items.len == 0) return false;
+        self.below_floats_valid = false;
         const ctx = self.ctx orelse return false;
         const ctx_vtbl = ctx.*.lpVtbl;
         const back = self.back_tex orelse return false;
@@ -2880,6 +2909,9 @@ pub const Renderer = struct {
         const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
         const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return false;
         const set_sc = ctx_vtbl.*.RSSetScissorRects orelse return false;
+        const get_sc = ctx_vtbl.*.RSGetScissorRects orelse return false;
+        self.below_floats_saved_sc_n = 1;
+        get_sc(ctx, &self.below_floats_saved_sc_n, &self.below_floats_saved_sc);
         // Unbound before the copy, as drawCustomShaderPass does.
         set_rtvs(ctx, 0, null, null);
         const box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = self.width, .bottom = self.height, .back = 1 };
@@ -2889,18 +2921,23 @@ pub const Renderer = struct {
         var sc = content;
         set_sc(ctx, 1, &sc);
         self.drawClearRowOverwrite() catch {
-            self.endBelowFloats();
+            self.endBelowFloats(false);
             return false;
         };
         return true;
     }
 
-    /// Rebind back_rtv after beginBelowFloats returned true.
-    pub fn endBelowFloats(self: *Renderer) void {
+    /// Rebind back_rtv and restore the scissor after beginBelowFloats
+    /// returned true. `complete`: every row landed, so the chain may sample
+    /// the target; otherwise it binds null at t6.
+    pub fn endBelowFloats(self: *Renderer, complete: bool) void {
+        self.below_floats_valid = complete;
         const ctx = self.ctx orelse return;
-        const set_rtvs = ctx.*.lpVtbl.*.OMSetRenderTargets orelse return;
+        const vt = ctx.*.lpVtbl;
+        const set_rtvs = vt.*.OMSetRenderTargets orelse return;
         var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.back_rtv};
         set_rtvs(ctx, 1, &rtvs[0], null);
+        if (vt.*.RSSetScissorRects) |set_sc| set_sc(ctx, self.below_floats_saved_sc_n, &self.below_floats_saved_sc);
     }
 
     fn releaseFeedbackTextures(self: *Renderer) void {
@@ -3815,7 +3852,7 @@ pub const Renderer = struct {
         if (self.shader_wants_cell_text) cell_text_srv_bind = self.ensureCellTextTexture(ctx, ctx_vtbl);
         // Drawn by the row frame (beginBelowFloats); never created here.
         const below_floats_srv_bind: ?*c.ID3D11ShaderResourceView =
-            if (self.shader_wants_below_floats and self.below_floats_w == self.width and self.below_floats_h == self.height) self.below_floats.srv else null;
+            if (self.shader_wants_below_floats and self.below_floats_valid and self.below_floats_w == self.width and self.below_floats_h == self.height) self.below_floats.srv else null;
         if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
             if (self.feedback_rtv[self.feedback_index]) |w| {

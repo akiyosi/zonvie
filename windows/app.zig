@@ -5453,13 +5453,13 @@ pub const RowFrameOutcome = struct {
 };
 
 /// iBelowFloats (Renderer.beginBelowFloats): every root row and every row of
-/// each layer that is not a win_float_pos float, without the cursor, at rest.
-/// Reads the pinned set only; the frame's plan, bands and draw counts are the
-/// normal pass's and stay untouched. A row that fails to draw is left as the
-/// bg the target was cleared to rather than refusing the present.
+/// each layer that is not a win_float_pos float, without the cursor, at the
+/// same scroll-ease offsets the normal pass drew. Reads the pinned set only:
+/// the frame's plan, bands, draw counts, row buffers and their budget stay
+/// the normal pass's (a row whose own buffer is not current is drawn from
+/// the renderer's scratch buffer). Any failure leaves the target unbound.
 fn drawBelowFloats(
     g: *d3d11.Renderer,
-    app: *App,
     surface: RowFrameSurface,
     in: RowFrameInput,
     ctx_ptr: ?*c.ID3D11DeviceContext,
@@ -5470,6 +5470,7 @@ fn drawBelowFloats(
     const p = in.draw_params;
     const sc_fn = rs_set_sc_fn orelse return;
     const ctx = ctx_ptr orelse return;
+    if (p.row_h_px <= 0) return;
     const content: c.D3D11_RECT = .{
         .left = p.x_offset,
         .top = p.y_offset,
@@ -5477,53 +5478,53 @@ fn drawBelowFloats(
         .bottom = p.y_offset + @as(i32, @intCast(p.content_height)),
     };
     if (!g.beginBelowFloats(content)) return;
-    defer g.endBelowFloats();
+    var ok = true;
+    defer g.endBelowFloats(ok);
+    const vp_w: f32 = @floatFromInt(rowModeViewportWidth(g, p));
+    const vp_h: f32 = @floatFromInt(p.content_height);
 
-    const base_vp = BaseViewport{
-        .x = @floatFromInt(p.content_x_offset orelse 0),
-        .y = @floatFromInt(p.content_y_offset orelse 0),
-        .w = @floatFromInt(rowModeViewportWidth(g, p)),
-        .h = @floatFromInt(p.content_height),
-    };
-    var metrics: SurfaceRowDrawMetrics = .{};
-    drawSurfaceRowsVBFromSlots(
-        g,
-        &app.row_vb_budget,
-        surface.row_vb_retained_bytes,
-        in.row_map,
-        surface.pool,
-        surface.row_vbs,
-        null,
-        ctx,
-        sc_fn,
-        ctx.*.lpVtbl.*.RSSetViewports,
-        base_vp,
-        p.x_offset,
-        p.y_offset,
-        p.content_right,
-        p.row_h_px,
-        p.layer_origin_x_px,
-        p.layer_origin_y_px,
-        p.root_rows_may_be_empty,
-        p.root_extent_h_px,
-        &.{},
-        0,
-        null,
-        false,
-        &metrics,
-    ) catch return;
+    // Root rows; an eased region under one scissor at the ease offset, with
+    // the rows it retained, as drawRowModeSetupAndRowsFromSlots does.
+    const root_region: [2]u32 = if (p.root_ease) |e| e.region(in.row_map.len) else .{ 0, 0 };
+    const root_n = @min(in.row_map.len, surface.row_vbs.len);
+    for (0..root_n) |ri| {
+        if (ri >= root_region[0] and ri < root_region[1]) continue;
+        const band = rootRowBandPx(@intCast(ri), in.row_map.len, p.row_h_px, p.root_extent_h_px);
+        var sc: c.D3D11_RECT = .{ .left = p.x_offset, .top = p.y_offset + band[0], .right = p.content_right, .bottom = p.y_offset + band[1] };
+        if (sc.bottom <= sc.top) continue;
+        sc_fn(ctx, 1, &sc);
+        drawBelowRow(g, &surface.row_vbs[ri], in.row_map[ri], surface.pool, ri, p.layer_origin_x_px, p.layer_origin_y_px, p.row_h_px, vp_w, vp_h, null) catch {
+            ok = false;
+        };
+    }
+    if (root_region[1] > root_region[0]) {
+        const e = p.root_ease.?;
+        var sc: c.D3D11_RECT = .{
+            .left = p.x_offset,
+            .top = p.y_offset + @as(i32, @intCast(root_region[0])) * p.row_h_px,
+            .right = p.content_right,
+            .bottom = p.y_offset + @as(i32, @intCast(root_region[1])) * p.row_h_px,
+        };
+        sc_fn(ctx, 1, &sc);
+        for (root_region[0]..@min(root_region[1], root_n)) |ri| {
+            drawBelowRow(g, &surface.row_vbs[ri], in.row_map[ri], surface.pool, ri, p.layer_origin_x_px, p.layer_origin_y_px, p.row_h_px, vp_w, vp_h, e.offset_px) catch {
+                ok = false;
+            };
+        }
+        if (e.drawRetained(g, p.layer_origin_x_px, p.layer_origin_y_px, vp_w, vp_h, p.row_h_px) != 0) ok = false;
+    }
 
-    const src = in.layer_src orelse return;
-    if (in.layers.len > 1 and layer_row_h_px > 0) for (in.layers[1..]) |layer| {
+    if (in.layer_src) |src| if (in.layers.len > 1 and layer_row_h_px > 0) for (in.layers[1..]) |layer| {
         if (layer.is_float and !layer.is_msg) continue;
         const state = src.paint.layerState(layer.grid_id) orelse continue;
         const rows = src.rows(layer);
+        const row_limit = @min(rows.len, state.row_vbs.items.len);
         const d = LayerRowDrawCtx{
             .layer = layer,
             .layer_w_px = layer.widthPx(cell_w_px),
             .origin_x = @floatFromInt(layer.x_px),
             .origin_y = @floatFromInt(layer.y_px),
-            .base_vp = base_vp,
+            .base_vp = .{ .x = 0, .y = 0, .w = vp_w, .h = vp_h },
             .x_offset = p.x_offset,
             .y_offset = p.y_offset,
             .content_right = p.content_right,
@@ -5531,13 +5532,72 @@ fn drawBelowFloats(
             .ctx_ptr = ctx,
             .rs_set_sc_fn = sc_fn,
         };
-        for (0..@min(rows.len, state.row_vbs.items.len)) |ri| {
+        const region = state.ease.region(row_limit);
+        // A layer row overwrites its band with the bg first, as
+        // drawLayerRowUnder does, so a translucent row does not blend over
+        // the root beneath it.
+        const overwrite = g.opacity < 1.0 or g.blur_enabled;
+        for (0..row_limit) |ri| {
+            if (ri >= region[0] and ri < region[1]) continue;
             var sc = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse continue;
             sc_fn(ctx, 1, &sc);
-            _ = drawLayerRowUnder(g, src, state, rows, ri, d);
+            const empty = rows[ri].slot == SLOT_NONE or src.pool.slotPtrConst(rows[ri].slot).verts.items.len == 0;
+            if (overwrite or empty) g.drawClearRowOverwrite() catch {
+                ok = false;
+            };
+            drawBelowRow(g, &state.row_vbs.items[ri], rows[ri], src.pool, ri, d.origin_x, d.origin_y, d.row_h_px, vp_w, vp_h, null) catch {
+                ok = false;
+            };
+        }
+        if (region[1] > region[0]) {
+            if (layerRowsScissor(d, region[0], region[1])) |sc0| {
+                var sc = sc0;
+                sc_fn(ctx, 1, &sc);
+                g.drawClearRowOverwrite() catch {
+                    ok = false;
+                };
+                for (region[0]..region[1]) |ri| {
+                    drawBelowRow(g, &state.row_vbs.items[ri], rows[ri], src.pool, ri, d.origin_x, d.origin_y, d.row_h_px, vp_w, vp_h, state.ease.offset_px) catch {
+                        ok = false;
+                    };
+                }
+                if (state.ease.drawRetained(g, d.origin_x, d.origin_y, vp_w, vp_h, d.row_h_px) != 0) ok = false;
+            }
         }
     };
-    g.setLayerTransform(0, 0, base_vp.w, base_vp.h) catch {};
+    g.setLayerTransform(0, 0, vp_w, vp_h) catch {
+        ok = false;
+    };
+}
+
+/// One row of drawBelowFloats under the scissor the caller set: from the
+/// row's own buffer when it holds this slot's current vertices, otherwise
+/// from the renderer's scratch buffer. Never uploads into `rvb`.
+fn drawBelowRow(
+    g: *d3d11.Renderer,
+    rvb: *const RowVB,
+    mapping: RowMapping,
+    pool: *const SlotPool,
+    ri: usize,
+    origin_x: f32,
+    origin_y: f32,
+    row_h_px: i32,
+    vp_w: f32,
+    vp_h: f32,
+    ease_offset_px: ?f32,
+) !void {
+    if (mapping.slot == SLOT_NONE) return;
+    const slot = pool.slotPtrConst(mapping.slot);
+    const verts = slot.verts.items;
+    if (verts.len == 0) return;
+    const row_dy = slotRowShiftPx(slot, ri, row_h_px);
+    try g.setLayerTransformScrolled(origin_x, origin_y + row_dy, vp_w, vp_h, ease_offset_px orelse 0);
+    // Under a translucent surface the target holds the bg overwrite already;
+    // the row's own bg quads blend over it as they do over back_tex's.
+    if (rvb.vb) |vb| if (rvb.uploaded_slot == mapping.slot and rvb.uploaded_ver == slot.ver and rvb.vb_bytes >= verts.len * @sizeOf(Vertex)) {
+        return g.drawVB(vb, verts.len);
+    };
+    try g.drawBelowFloatsVerts(verts);
 }
 
 /// One surface's row frame, root rows to bloom, in the order both paint
@@ -5639,7 +5699,7 @@ pub fn drawSurfaceRowFrame(
         if (out.layers.budget_exceeded) out.row_vb_budget_exceeded = true;
     }
 
-    if (!out.layers.incomplete()) drawBelowFloats(g, app, surface, in, out.rows.ctx_ptr, out.rows.rs_set_sc_fn, layer_row_h_px, cell_w_px);
+    if (!out.layers.incomplete()) drawBelowFloats(g, surface, in, out.rows.ctx_ptr, out.rows.rs_set_sc_fn, layer_row_h_px, cell_w_px);
 
     // Where this frame's eases drew each row, for the shader's iRowOffset:
     // the root's scroll region at its offset, then every eased layer's
