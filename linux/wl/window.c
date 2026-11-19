@@ -177,7 +177,6 @@ static struct {
     char* ime_preedit;
     int32_t ime_preedit_begin, ime_preedit_end;
     char* ime_commit;
-    int ime_changed;
     // [0] the clipboard, [1] the primary selection.
     struct wl_data_device_manager* data_manager;
     struct wl_data_device* data_device;
@@ -965,23 +964,21 @@ static void ti_preedit(void* d, struct wl_proxy* ti, const char* text, int32_t b
     w.ime_preedit = text ? strdup(text) : NULL;
     w.ime_preedit_begin = begin;
     w.ime_preedit_end = end;
-    w.ime_changed = 1;
 }
 static void ti_commit(void* d, struct wl_proxy* ti, const char* text) {
     (void)d; (void)ti;
     free(w.ime_commit);
     w.ime_commit = text ? strdup(text) : NULL;
-    w.ime_changed = 1;
 }
 static void ti_delete(void* d, struct wl_proxy* ti, uint32_t before, uint32_t after) {
     (void)d; (void)ti; (void)before; (void)after;
 }
 // `done` applies what came since the last one: the commit first, then the
-// preedit that replaces the one before it (none sent: none left).
+// preedit that replaces the one before it (none sent: none left). A bare
+// `done` is how an input method cancels its composition, so it must clear
+// the preedit too.
 static void ti_done(void* d, struct wl_proxy* ti, uint32_t serial) {
     (void)d; (void)ti; (void)serial;
-    if (!w.ime_changed) return;
-    w.ime_changed = 0;
     char* commit = w.ime_commit;
     char* preedit = w.ime_preedit;
     w.ime_commit = NULL;
