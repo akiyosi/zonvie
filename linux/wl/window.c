@@ -170,6 +170,9 @@ static struct {
     int cursor_shape;
     // The serial of the last key or button press: what a selection is set with.
     uint32_t input_serial;
+    // The surface that has the keyboard; NULL while none of ours has it.
+    struct wl_surface* kb_surface;
+    struct wl_proxy* activation;
     struct wl_proxy* text_input_manager;
     struct wl_proxy* text_input;
     int ime_entered;
@@ -337,12 +340,15 @@ static void kb_keymap(void* d, struct wl_keyboard* k, uint32_t format, int32_t f
     if (w.l->keys_reset) w.l->keys_reset(w.data);
 }
 static void kb_enter(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s, struct wl_array* keys) {
-    (void)d; (void)k; (void)serial; (void)s; (void)keys;
-    if (w.l->focus) w.l->focus(w.data, 1);
+    (void)d; (void)k; (void)serial; (void)keys;
+    w.kb_surface = s;
+    struct zwl_ext* e = s == w.surface ? NULL : ext_of_surface(s);
+    if (w.l->focus) w.l->focus(w.data, 1, s == w.surface ? 1 : e ? e->id : 0);
 }
 static void kb_leave(void* d, struct wl_keyboard* k, uint32_t serial, struct wl_surface* s) {
     (void)d; (void)k; (void)serial; (void)s;
-    if (w.l->focus) w.l->focus(w.data, 0);
+    w.kb_surface = NULL;
+    if (w.l->focus) w.l->focus(w.data, 0, 0);
 }
 static void kb_key(void* d, struct wl_keyboard* k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
     (void)d; (void)k; (void)time;
@@ -407,6 +413,47 @@ static const struct wl_interface cursor_shape_device_interface = {
     "wp_cursor_shape_device_v1", 1, 2, cursor_shape_device_requests, 0, NULL,
 };
 enum { CURSOR_SHAPE_MANAGER_GET_POINTER = 1, CURSOR_SHAPE_DEVICE_SET_SHAPE = 1 };
+
+// xdg-activation-v1, version 1, as the scanner would emit it: a window of
+// this client asks for the keyboard, with a token naming the input that
+// asked for it.
+static const struct wl_interface activation_token_interface;
+static const struct wl_interface* activation_types[] = {
+    NULL,
+    &activation_token_interface,
+    NULL, &wl_surface_interface,
+    NULL, &wl_seat_interface,
+    &wl_surface_interface,
+};
+static const struct wl_message activation_requests[] = {
+    { "destroy", "", activation_types + 0 },
+    { "get_activation_token", "n", activation_types + 1 },
+    { "activate", "so", activation_types + 2 },
+};
+static const struct wl_interface activation_interface = {
+    "xdg_activation_v1", 1, 3, activation_requests, 0, NULL,
+};
+static const struct wl_message activation_token_requests[] = {
+    { "set_serial", "uo", activation_types + 4 },
+    { "set_app_id", "s", activation_types + 0 },
+    { "set_surface", "o", activation_types + 6 },
+    { "commit", "", activation_types + 0 },
+    { "destroy", "", activation_types + 0 },
+};
+static const struct wl_message activation_token_events[] = {
+    { "done", "s", activation_types + 0 },
+};
+static const struct wl_interface activation_token_interface = {
+    "xdg_activation_token_v1", 1, 5, activation_token_requests, 1, activation_token_events,
+};
+enum {
+    ACTIVATION_GET_TOKEN = 1,
+    ACTIVATION_ACTIVATE = 2,
+    ACTIVATION_TOKEN_SET_SERIAL = 0,
+    ACTIVATION_TOKEN_SET_SURFACE = 2,
+    ACTIVATION_TOKEN_COMMIT = 3,
+    ACTIVATION_TOKEN_DESTROY = 4,
+};
 // The cursor theme's name for a wp_cursor_shape_device_v1.shape, with an
 // older name some themes still carry.
 static void cursor_names(int shape, const char** name, const char** old) {
@@ -1080,6 +1127,8 @@ static void on_global(void* d, struct wl_registry* reg, uint32_t name, const cha
         w.shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
     } else if (strcmp(iface, cursor_shape_manager_interface.name) == 0) {
         w.cursor_shape_manager = wl_registry_bind(reg, name, &cursor_shape_manager_interface, 1);
+    } else if (strcmp(iface, activation_interface.name) == 0) {
+        w.activation = wl_registry_bind(reg, name, &activation_interface, 1);
     } else if (strcmp(iface, wl_output_interface.name) == 0 && w.n_outputs < MAX_OUTPUTS && version >= 2) {
         const int i = w.n_outputs++;
         w.outputs[i] = wl_registry_bind(reg, name, &wl_output_interface, 2);
@@ -1502,6 +1551,7 @@ int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t 
 void zwl_ext_close(int64_t id) {
     struct zwl_ext* e = ext_of_id(id);
     if (!e) return;
+    if (w.kb_surface == e->surface) w.kb_surface = NULL;
     // The surface GL draws to goes with the window: back to the main one.
     eglMakeCurrent(w.egl_display, w.egl_surface, w.egl_surface, w.egl_context);
     if (e->frame) wl_callback_destroy(e->frame);
@@ -1524,6 +1574,36 @@ void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px) {
 int zwl_ext_placed(int64_t id) {
     struct zwl_ext* e = ext_of_id(id);
     return e ? e->placed : 0;
+}
+
+// The token for zwl_activate: window `d` (1, or an external window's id)
+// asks for the keyboard with it, if it is still there.
+static void activation_token_done(void* d, struct wl_proxy* tok, const char* token) {
+    const int64_t id = (int64_t)(intptr_t)d;
+    struct zwl_ext* e = id == 1 ? NULL : ext_of_id(id);
+    struct wl_surface* s = id == 1 ? w.surface : e ? e->surface : NULL;
+    if (s) wl_proxy_marshal_flags(w.activation, ACTIVATION_ACTIVATE, NULL, 1, 0, token, s);
+    wl_proxy_marshal_flags(tok, ACTIVATION_TOKEN_DESTROY, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    wl_display_flush(w.display);
+}
+static const struct { void (*done)(void*, struct wl_proxy*, const char*); } activation_token_listener = {
+    activation_token_done,
+};
+
+int zwl_activate(int64_t id) {
+    if (!w.activation || (id != 1 && !ext_of_id(id))) return -1;
+    struct wl_proxy* tok = wl_proxy_marshal_flags(w.activation, ACTIVATION_GET_TOKEN, &activation_token_interface, 1, 0,
+                                                  NULL);
+    if (!tok) return -1;
+    wl_proxy_add_listener(tok, (void (**)(void))&activation_token_listener, (void*)(intptr_t)id);
+    // The input that moved the cursor, on the surface that had the keyboard:
+    // what a compositor checks before it hands the keyboard over.
+    if (w.input_serial && w.seat)
+        wl_proxy_marshal_flags(tok, ACTIVATION_TOKEN_SET_SERIAL, NULL, 1, 0, w.input_serial, w.seat);
+    if (w.kb_surface) wl_proxy_marshal_flags(tok, ACTIVATION_TOKEN_SET_SURFACE, NULL, 1, 0, w.kb_surface);
+    wl_proxy_marshal_flags(tok, ACTIVATION_TOKEN_COMMIT, NULL, 1, 0);
+    wl_display_flush(w.display);
+    return 0;
 }
 
 int zwl_ext_make_current(int64_t id) {

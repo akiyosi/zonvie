@@ -531,6 +531,11 @@ test "gui:cmdline_popup_pointer" {
     try gated(is_linux, @import("scenarios/linux/cmdline_popup_pointer.zig"));
 }
 
+test "gui:extwin_cmdline_popup_visible" {
+    // Linux only: linux/panel_popup.zig.
+    try gated(is_linux and can_capture, @import("scenarios/linux/extwin_cmdline_popup_visible.zig"));
+}
+
 test "gui:font_picker" {
     // Linux only: linux/font_picker.zig, answered by keys.
     try gated(is_linux, @import("scenarios/linux/font_picker.zig"));

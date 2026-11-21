@@ -28,6 +28,7 @@ extern "c" fn zwl_ext_request_frame(id: i64) void;
 extern "c" fn zwl_ext_frame_pending(id: i64) c_int;
 extern "c" fn zwl_dispatch_pending() c_int;
 extern "c" fn zwl_flush() c_int;
+extern "c" fn zwl_activate(id: i64) c_int;
 
 const app_id = "io.github.akiyosi.zonvie";
 
@@ -70,6 +71,20 @@ pub const ExtWindow = struct {
 pub var pointer_target: ?*ExtWindow = null;
 
 /// Callable from any thread; at most one idle is outstanding.
+/// The window the cursor moved into asks for the keyboard
+/// (App.activate_surface), unless it has it. Main thread.
+pub fn activateCursorSurface(app: *App) void {
+    app.mu.lockUncancelable(clock.io());
+    const want = app.activate_surface;
+    app.activate_surface = null;
+    const has = app.focus_surface;
+    app.mu.unlock(clock.io());
+    const id = want orelse return;
+    if (id == has) return;
+    const rc = zwl_activate(id);
+    applog.appLog("[ext_window] activate surface={d} rc={d}\n", .{ id, rc });
+}
+
 pub fn queueApply(app: *App) void {
     if (app.ext_idle_queued.swap(true, .acq_rel)) return;
     _ = glib.g_idle_add(&idleApply, app);

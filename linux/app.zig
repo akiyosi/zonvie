@@ -152,6 +152,17 @@ pub const App = struct {
     /// session (overlay_layout.Inputs.cmdline_user). main thread writes, the
     /// paint reads; under `mu`.
     cmdline_user: ?overlay_layout.Rect = null,
+    /// The surface `cmdline_user` was dropped on; it holds there only.
+    cmdline_user_surface: i64 = 1,
+    /// The surface that has the keyboard, or had it last: 1, or an external
+    /// window's id. The cmdline is placed there. main thread writes, the
+    /// paint reads; under `mu`.
+    focus_surface: i64 = 1,
+    /// The grid the cursor moved onto (on_cursor_grid_changed), until a
+    /// commit resolves it to `activate_surface`: the window that asks for
+    /// the keyboard on the main thread. Under `mu`.
+    cursor_grid_pending: ?i64 = null,
+    activate_surface: ?i64 = null,
     /// msg_show's pointer and pin (frontend_rules.MsgShowChrome) and the
     /// corner it is pinned at; reset when it closes. Under `mu`.
     msg_chrome: core.frontend_rules.MsgShowChrome = .{},

@@ -126,23 +126,24 @@ test "a popup's pointer hits only its panel, the main view none while they are p
 
 
 /// The surface whose view panel `kind`'s popup hangs from: the cmdline the
-/// main view's always, the popupmenu the surface its completion is in
+/// one the keyboard is on (a compositor may not show a popup of a window
+/// without the keyboard), the popupmenu the surface its completion is in
 /// (overlay_layout.popupSurface), the message panels msg_pos's
 /// (overlay_layout.msgSurface).
-pub fn hostSurface(kind: Kind, pum_surface: i64, msg_surface: i64) i64 {
+pub fn hostSurface(kind: Kind, cmdline_surface: i64, pum_surface: i64, msg_surface: i64) i64 {
     return switch (kind) {
-        .cmdline => 1,
+        .cmdline => cmdline_surface,
         .popupmenu => pum_surface,
         .msg_show, .msg_history => msg_surface,
     };
 }
 
 test "each panel's popup hangs from the surface that panel is placed on" {
-    try std.testing.expectEqual(@as(i64, 1), hostSurface(.cmdline, 1005, 1007));
-    try std.testing.expectEqual(@as(i64, 1005), hostSurface(.popupmenu, 1005, 1007));
-    try std.testing.expectEqual(@as(i64, 1007), hostSurface(.msg_show, 1005, 1007));
-    try std.testing.expectEqual(@as(i64, 1007), hostSurface(.msg_history, 1005, 1007));
-    try std.testing.expectEqual(@as(i64, 1), hostSurface(.popupmenu, 1, 1));
+    try std.testing.expectEqual(@as(i64, 1003), hostSurface(.cmdline, 1003, 1005, 1007));
+    try std.testing.expectEqual(@as(i64, 1005), hostSurface(.popupmenu, 1003, 1005, 1007));
+    try std.testing.expectEqual(@as(i64, 1007), hostSurface(.msg_show, 1003, 1005, 1007));
+    try std.testing.expectEqual(@as(i64, 1007), hostSurface(.msg_history, 1003, 1005, 1007));
+    try std.testing.expectEqual(@as(i64, 1), hostSurface(.popupmenu, 1, 1, 1));
 }
 
 /// Whether panel `kind`'s popup stays shown while the app is inactive. The

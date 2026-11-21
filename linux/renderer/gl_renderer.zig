@@ -1004,6 +1004,8 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
     const ch: i32 = @intCast(app.cell_h_px);
     const main = surface_id == 1;
     const msg_surface = msgSurface(app, app.msg_pos.ext_float);
+    // The cmdline goes where the keyboard is, as typing there opened it.
+    const cmdline_surface = if (app.focus_surface != 1 and surfaceOpen(app, app.focus_surface)) app.focus_surface else 1;
     return .{
         .surface_id = surface_id,
         .main_w_px = w,
@@ -1012,6 +1014,7 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
         .cell_h_px = ch,
         .scale = @intFromFloat(app.scale),
         .msg_target = overlay_layout.msgTargetOn(surface_id, app.msg_pos.ext_float, app.msg_anchor, w, h, cw, ch),
+        .cmdline_surface = cmdline_surface,
         .pum_surface = overlay_layout.popupSurface(app.overlays[@intFromEnum(overlay_layout.Kind.popupmenu)], app, surfaceOpen),
         .msg_surface = msg_surface,
         // A copy button sits over the surface its panel is on: the
@@ -1019,7 +1022,7 @@ pub fn overlayInputs(app: *const App, surface_id: i64, w_px: u32, h_px: u32) ove
         .copy_cmdline = app.copy_cmdline and main,
         .copy_messages = app.copy_messages and surface_id == msg_surface,
         .confirm = if (main) app.confirm_rect else null,
-        .cmdline_user = app.cmdline_user,
+        .cmdline_user = if (app.cmdline_user_surface == cmdline_surface) app.cmdline_user else null,
         .msg_show_user = app.msg_show_user,
         .free = app.panel_popups,
     };

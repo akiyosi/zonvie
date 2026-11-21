@@ -230,8 +230,10 @@ pub const Inputs = struct {
     /// What msg_show and msg_history hang from (msgTargetOn); the whole view
     /// when null.
     msg_target: ?rules.Rect = null,
-    /// The surfaces the popupmenu and the message panels draw on
-    /// (popupSurface, msgSurface); a panel shows only on its own.
+    /// The surfaces the cmdline, the popupmenu and the message panels draw
+    /// on (the keyboard's surface, popupSurface, msgSurface); a panel shows
+    /// only on its own.
+    cmdline_surface: i64 = 1,
     pum_surface: i64 = 1,
     msg_surface: i64 = 1,
     /// [cmdline] / [messages] copy_button: those panels reserve room for it.
@@ -366,8 +368,7 @@ pub fn place(surfaces: *const [4]Surface, in: Inputs) [4]?Rect {
     // Where a moved or growing panel is kept.
     const reach = if (in.free) free_reach else area;
 
-    // The cmdline is always the main view's.
-    if (in.surface_id == 1 and surfaces[@intFromEnum(Kind.cmdline)].open) {
+    if (in.surface_id == in.cmdline_surface and surfaces[@intFromEnum(Kind.cmdline)].open) {
         const wh = size(.cmdline, surfaces[@intFromEnum(Kind.cmdline)], in);
         // Centred, a third of the free height down, as a new cmdline opens on
         // Windows (centredOnWorkArea with a divisor of 3).
@@ -653,6 +654,22 @@ test "a popupmenu or message panel anchored in an open external window draws the
     try testing.expectEqual(@as(i32, 40), on_ext[@intFromEnum(Kind.popupmenu)].?.x);
     // The cmdline stays in the main view.
     try testing.expect(on_ext[@intFromEnum(Kind.cmdline)] == null);
+}
+
+test "the cmdline is placed on the surface the keyboard is on, and only there" {
+    var s: [4]Surface = @splat(.{});
+    s[@intFromEnum(Kind.cmdline)] = open(1, 20, -1, -1);
+    var main = in1;
+    main.cmdline_surface = 7;
+    try testing.expect(place(&s, main)[@intFromEnum(Kind.cmdline)] == null);
+    var ext = main;
+    ext.surface_id = 7;
+    ext.main_w_px = 400;
+    ext.main_h_px = 300;
+    const r = place(&s, ext)[@intFromEnum(Kind.cmdline)].?;
+    // Centred in the external window's own view.
+    try testing.expectEqual(@divTrunc(400 - r.w, 2), r.x);
+    try testing.expectEqual(@divTrunc(300 - r.h, 3), r.y);
 }
 
 test "the confirm dialog clears the built-in cmdline row" {
