@@ -16,6 +16,7 @@
 // (ZONVIE_TEST_FULL_REDRAW) and the two captures must match.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
 const app_log = @import("../../app_log.zig");
@@ -24,6 +25,18 @@ const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_partial_matches_full.log";
 const full_frame_marker = "[trace] event=full_frame_done";
+/// Linux logs each frame drawn as bands (linux/renderer/gl_renderer.zig).
+const partial_frame_marker = "[trace] event=partial_frame";
+
+/// On Linux, a frame drawn whole for some other reason would match the full
+/// redraw trivially: at least one frame since `since_ms` must have been drawn
+/// as bands.
+fn requirePartialFrame(alloc: std.mem.Allocator, since_ms: f64, step: []const u8) !void {
+    if (builtin.os.tag != .linux) return;
+    if (try app_log.containsSince(alloc, log_path, partial_frame_marker, since_ms)) return;
+    std.debug.print("[gui] partial_matches_full: {s} drew no partial frame; nothing partial was measured\n", .{step});
+    return error.NoPartialFrame;
+}
 const crop: driver.capture.Crop = .{ .w_pt = 700, .h_pt = 420 };
 
 /// Accented capitals on every column, so the ink above the row is wide.
@@ -73,6 +86,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.debug.print("[gui] partial_matches_full: a full frame drew the edits; nothing partial was measured\n", .{});
         return error.EditsDrawnWhole;
     }
+    try requirePartialFrame(alloc, edits_start, "the edits");
 
     const forced = try app_log.nowMs(alloc, log_path);
     driver.platform.forceFullRedraw(g.app_pid);
@@ -131,6 +145,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.debug.print("[gui] partial_matches_full: step 3 drew a full frame before forced redraw\n", .{});
         return error.Step3EditsDrawnWhole;
     }
+    try requirePartialFrame(alloc, step3_start, "step 3");
 
     const step3_forced = try app_log.nowMs(alloc, log_path);
     driver.platform.forceFullRedraw(g.app_pid);
