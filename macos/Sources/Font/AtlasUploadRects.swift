@@ -31,8 +31,19 @@ struct AtlasUploadRects {
 
     var isEmpty: Bool { rects.isEmpty }
 
+    /// Contract: `width` and `height` are positive (uploadRegion admits no
+    /// empty region). Afterwards at most `capacity` bands exist, and the
+    /// inserted rect lies inside one of them, so uploading every band
+    /// uploads every rect inserted since the last `removeAll`.
     mutating func insert(x: Int, y: Int, width: Int, height: Int) {
+        assert(width > 0 && height > 0, "empty atlas upload rect")
         let new = Rect(x: x, y: y, width: width, height: height)
+        insertUnchecked(new)
+        assert(rects.count <= Self.capacity, "atlas upload bands over capacity")
+        assert(rects.contains { Self.contains($0, new) }, "inserted rect not covered by a band")
+    }
+
+    private mutating func insertUnchecked(_ new: Rect) {
         for i in rects.indices where Self.rowsOverlap(rects[i], new) {
             rects[i] = Self.union(rects[i], new)
             return
@@ -55,6 +66,11 @@ struct AtlasUploadRects {
 
     mutating func removeAll() {
         rects.removeAll(keepingCapacity: true)
+    }
+
+    private static func contains(_ outer: Rect, _ inner: Rect) -> Bool {
+        outer.x <= inner.x && inner.x + inner.width <= outer.x + outer.width
+            && outer.y <= inner.y && inner.y + inner.height <= outer.y + outer.height
     }
 
     private static func rowsOverlap(_ a: Rect, _ b: Rect) -> Bool {
