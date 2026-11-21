@@ -98,6 +98,12 @@ void zwl_ime_reset(void);
 int zwl_egl_init(int32_t w_px, int32_t h_px);
 void zwl_egl_resize(int32_t w_px, int32_t h_px);
 int zwl_swap(void);
+// The main surface's back buffer: how many frames old its contents are, 0
+// when unknown (a new buffer, or no EGL_EXT_buffer_age).
+int zwl_buffer_age(void);
+// A swap that tells the compositor only `n` rects changed: x, y, w, h each,
+// buffer px from the bottom-left. Falls back to a plain swap.
+int zwl_swap_damage(const int32_t* rects, int32_t n);
 
 int zwl_dispatch(void);
 int zwl_dispatch_pending(void);

@@ -89,6 +89,14 @@ pub const Layer = struct {
         self.hits.clearRetainingCapacity();
     }
 
+    /// Draws the same pixels as `other` (the hits draw nothing).
+    pub fn eql(self: *const Layer, other: *const Layer) bool {
+        const b = std.mem.sliceAsBytes;
+        return std.mem.eql(u8, b(self.solid.items), b(other.solid.items)) and
+            std.mem.eql(u8, b(self.round.items), b(other.round.items)) and
+            std.mem.eql(u8, b(self.text.items), b(other.text.items));
+    }
+
     /// The topmost hit under (x, y) window px: the last one added.
     pub fn hitAt(self: *const Layer, x: i32, y: i32) ?Hit {
         var i = self.hits.items.len;

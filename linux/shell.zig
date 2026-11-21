@@ -478,6 +478,7 @@ pub fn rebuild(app: *App, request_frame: bool) void {
 
     app.mu.lockUncancelable(clock.io());
     const was_empty = app.chrome_layer.solid.items.len == 0 and app.chrome_layer.text.items.len == 0;
+    if (!app.chrome_layer.eql(&app.chrome_back)) app.chrome_gen +%= 1;
     std.mem.swap(ui_layer.Layer, &app.chrome_layer, &app.chrome_back);
     const is_empty = app.chrome_layer.solid.items.len == 0 and app.chrome_layer.text.items.len == 0;
     app.mu.unlock(clock.io());

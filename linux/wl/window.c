@@ -22,6 +22,7 @@
 #include <wayland-egl.h>
 #include <wayland-cursor.h>
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "window.h"
@@ -227,6 +228,10 @@ static struct {
     EGLContext egl_context;
     EGLSurface egl_surface;
     EGLConfig egl_config;
+    // EGL_EXT_buffer_age, and the swap that names the damage (KHR or EXT);
+    // without them every frame is drawn whole.
+    int has_buffer_age;
+    PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC swap_with_damage;
 
     // External windows (zwl_ext_open).
     struct zwl_ext {
@@ -1316,6 +1321,14 @@ int zwl_egl_init(int32_t w_px, int32_t h_px) {
     // Frames are paced by the surface's frame callback, never by a swap that
     // blocks the loop.
     eglSwapInterval(w.egl_display, 0);
+    const char* exts = eglQueryString(w.egl_display, EGL_EXTENSIONS);
+    if (exts && strstr(exts, "EGL_EXT_buffer_age")) {
+        if (strstr(exts, "EGL_KHR_swap_buffers_with_damage"))
+            w.swap_with_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)eglGetProcAddress("eglSwapBuffersWithDamageKHR");
+        else if (strstr(exts, "EGL_EXT_swap_buffers_with_damage"))
+            w.swap_with_damage = (PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)eglGetProcAddress("eglSwapBuffersWithDamageEXT");
+        w.has_buffer_age = w.swap_with_damage != NULL;
+    }
     return 0;
 }
 
@@ -1325,6 +1338,18 @@ void zwl_egl_resize(int32_t w_px, int32_t h_px) {
 
 int zwl_swap(void) {
     return eglSwapBuffers(w.egl_display, w.egl_surface) ? 0 : -1;
+}
+
+int zwl_buffer_age(void) {
+    if (!w.has_buffer_age) return 0;
+    EGLint age = 0;
+    if (!eglQuerySurface(w.egl_display, w.egl_surface, EGL_BUFFER_AGE_EXT, &age)) return 0;
+    return age;
+}
+
+int zwl_swap_damage(const int32_t* rects, int32_t n) {
+    if (!w.swap_with_damage || n <= 0) return zwl_swap();
+    return w.swap_with_damage(w.egl_display, w.egl_surface, (EGLint*)rects, n) ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------
