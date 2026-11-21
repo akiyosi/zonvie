@@ -431,6 +431,10 @@ test "gui:visual_extwin_split_with_float_background" {
     try gated(can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
 }
 
+test "gui:visual_extwin_glyphs_added_while_open" {
+    try gated(can_capture, @import("scenarios/visual/extwin_glyphs_added_while_open.zig"));
+}
+
 test "gui:visual_per_grid_font_margin" {
     try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }

@@ -46,8 +46,8 @@ pub const AtlasOps = struct {
     mirror: []u8 = &.{},
     /// `mirror` is zero from this row down.
     dirty_rows: u32 = 0,
-    /// Bumped by every create and upload; external windows resync from
-    /// `mirror` when theirs differs.
+    /// Bumped by every create and upload: a frame that samples the atlas
+    /// draws whole when it changed (gl_renderer.frameKey).
     gen: u64 = 0,
 
     pub fn clearQueued(self: *AtlasOps) void {
@@ -189,6 +189,9 @@ pub const App = struct {
 
     /// The main window's GL objects; main thread only.
     gl: gl_renderer.Target = .{},
+    /// The glyph atlas texture every window samples; main thread only,
+    /// under App.mu.
+    glyph_tex: gl_renderer.GlyphTexture = .{},
     /// The main window's bloom and custom shader chain; main thread only.
     postfx: postfx.PostFx = .{},
     /// config.toml [shaders] paths when enabled; borrowed from the config,

@@ -43,17 +43,8 @@ pub const Target = struct {
     vao: u32 = 0,
     vbo: u32 = 0,
     vbo_cap_bytes: usize = 0,
-    atlas_tex: u32 = 0,
-    /// Size the atlas texture was allocated at; 0 until it holds the atlas.
-    atlas_w: u32 = 0,
-    atlas_h: u32 = 0,
-    /// Rows of the atlas texture, from the top, that hold the mirror's
-    /// pixels; the rest has storage only (drainAtlas).
-    atlas_rows: u32 = 0,
     /// The pipeline has drawn once (renderMain).
     warmed: bool = false,
-    /// AtlasOps.gen this texture matches; external windows sync by it.
-    atlas_gen: u64 = 0,
     u_scale: i32 = -1,
     u_offset: i32 = -1,
     u_scroll_offset: i32 = -1,
@@ -101,6 +92,20 @@ pub const Target = struct {
     pub fn deinit(self: *Target, alloc: std.mem.Allocator) void {
         self.scratch.deinit(alloc);
     }
+};
+
+/// The glyph atlas texture (App.glyph_tex). Every window draws with the one
+/// EGL context (wl/window.c), so all targets sample this texture and
+/// AtlasOps.uploads has a single consumer, syncAtlas. It lives as long as
+/// that context.
+pub const GlyphTexture = struct {
+    tex: u32 = 0,
+    /// Size the texture was allocated at; 0 until it holds the atlas.
+    w: u32 = 0,
+    h: u32 = 0,
+    /// Rows of the texture, from the top, that hold the mirror's pixels;
+    /// the rest has storage only.
+    rows: u32 = 0,
 };
 
 fn compile(kind: gl.GLenum, prefix: [:0]const u8) ?gl.GLuint {
@@ -171,26 +176,14 @@ pub fn realize(t: *Target) bool {
     gl.glEnableVertexAttribArray(4);
     gl.glVertexAttribPointer(4, 1, gl.GL_FLOAT, gl.GL_FALSE, stride, @ptrFromInt(@offsetOf(core.Vertex, "deco_phase")));
 
-    gl.glGenTextures(1, &t.atlas_tex);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
-    // Point sampling and clamp, as the D3D11 atlas sampler.
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
     gl.glGenTextures(1, &t.ui_tex);
     gl.glBindTexture(gl.GL_TEXTURE_2D, t.ui_tex);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
-    // A fresh texture has no storage; the first render allocates it.
-    t.atlas_w = 0;
-    t.atlas_h = 0;
     return true;
 }
 
 pub fn unrealize(t: *Target) void {
-    if (t.atlas_tex != 0) gl.glDeleteTextures(1, &t.atlas_tex);
     if (t.ui_tex != 0) gl.glDeleteTextures(1, &t.ui_tex);
     if (t.vbo != 0) gl.glDeleteBuffers(1, &t.vbo);
     if (t.vao != 0) gl.glDeleteVertexArrays(1, &t.vao);
@@ -202,39 +195,49 @@ pub fn unrealize(t: *Target) void {
     t.* = .{ .w_px = w, .h_px = h, .flip_y = flip, .scratch = scratch };
 }
 
-/// The main window's atlas: queued uploads applied as they come. Caller
-/// holds App.mu.
-fn drainAtlas(app: *App, t: *Target) void {
+/// Binds the glyph atlas texture to unit 0 with the queued uploads applied,
+/// for whichever window draws first. Caller holds App.mu.
+fn syncAtlas(app: *App) void {
     const ops = &app.atlas_pending;
+    const g = &app.glyph_tex;
     gl.glActiveTexture(gl.GL_TEXTURE0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    if (g.tex == 0) {
+        gl.glGenTextures(1, &g.tex);
+        gl.glBindTexture(gl.GL_TEXTURE_2D, g.tex);
+        // Point sampling and clamp, as the D3D11 atlas sampler.
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
+    }
+    gl.glBindTexture(gl.GL_TEXTURE_2D, g.tex);
     // The committed rows still sample the atlas being replaced
     // (AtlasOps.held). A texture without storage has nothing to keep.
-    if (ops.held and t.atlas_w != 0) return;
+    if (ops.held and g.w != 0) return;
     gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-    // On atlas create, or a context realized again (atlas_w reset to 0),
-    // the texture gets new storage and no pixels: the rows the mirror has
-    // glyphs in follow below, and no glyph samples a row past them.
-    if (ops.recreate or (ops.w != 0 and (t.atlas_w != ops.w or t.atlas_h != ops.h))) {
+    // On atlas create, or a texture without storage yet, the texture gets
+    // new storage and no pixels: the rows the mirror has glyphs in follow
+    // below, and no glyph samples a row past them.
+    if (ops.recreate or (ops.w != 0 and (g.w != ops.w or g.h != ops.h))) {
         if (ops.w != 0 and ops.h != 0) {
             gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, null);
-            t.atlas_w = ops.w;
-            t.atlas_h = ops.h;
-            t.atlas_rows = 0;
+            g.w = ops.w;
+            g.h = ops.h;
+            g.rows = 0;
             ops.clearQueued();
         }
         ops.recreate = false;
     }
-    if (t.atlas_w != 0) {
+    if (g.w != 0) {
         // Rows the uploads reached for the first time come whole from the
         // mirror, which already holds those uploads and is zero around them;
         // one row more is the last glyph row's padding.
-        const first_new_row = t.atlas_rows;
+        const first_new_row = g.rows;
         const rows = if (ops.dirty_rows == 0) 0 else @min(ops.h, ops.dirty_rows + 1);
         if (rows > first_new_row) {
             const stride = @as(usize, ops.w) * 4;
             gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, @intCast(first_new_row), @intCast(ops.w), @intCast(rows - first_new_row), gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror[stride * first_new_row ..].ptr);
-            t.atlas_rows = rows;
+            g.rows = rows;
         }
         for (ops.uploads.items) |u| {
             if (u.y >= first_new_row) continue;
@@ -242,25 +245,6 @@ fn drainAtlas(app: *App, t: *Target) void {
         }
         ops.clearQueued();
     }
-    t.atlas_gen = ops.gen;
-}
-
-/// An external window's atlas: the whole CPU mirror, whenever the atlas
-/// changed since this texture last took it. Glyphs are added rarely once a
-/// session warms up, and the main window's queue is not replayed per window.
-/// Caller holds App.mu.
-fn syncAtlas(app: *App, t: *Target) void {
-    const ops = &app.atlas_pending;
-    gl.glActiveTexture(gl.GL_TEXTURE0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
-    if (ops.w == 0 or ops.h == 0) return;
-    if (ops.held and t.atlas_w != 0) return;
-    if (t.atlas_w != 0 and t.atlas_gen == ops.gen) return;
-    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(ops.w), @intCast(ops.h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ops.mirror.ptr);
-    t.atlas_w = ops.w;
-    t.atlas_h = ops.h;
-    t.atlas_gen = ops.gen;
 }
 
 /// Uploads `verts` into the target's persistent VBO and draws them as
@@ -410,7 +394,7 @@ fn begin(app: *App, t: *Target) bool {
     scissor(t, 0, 0, @intCast(t.w_px), @intCast(t.h_px));
     defer endScissor(t);
     clearToBg(app);
-    return bind(t);
+    return bind(app, t);
 }
 
 /// Clears what the scissor leaves to the editor's background. Caller holds
@@ -444,8 +428,8 @@ fn clearCardPadding(app: *App, t: *const Target) void {
 
 /// Binds the target's pipeline over what the caller cleared. False when
 /// there is nothing to draw with yet.
-fn bind(t: *Target) bool {
-    if (t.atlas_w == 0 or t.w_px == 0 or t.h_px == 0) return false;
+fn bind(app: *const App, t: *Target) bool {
+    if (app.glyph_tex.w == 0 or t.w_px == 0 or t.h_px == 0) return false;
     gl.glUseProgram(t.program);
     gl.glUniform1i(t.u_mode, 0);
     gl.glBindVertexArray(t.vao);
@@ -538,7 +522,7 @@ pub fn renderMain(app: *App, t: *Target) Frame {
 /// snapshots the shader inputs under the same hold).
 pub fn renderMainLocked(app: *App, t: *Target, t0: i128) Frame {
     if (t.program == 0) return .{};
-    drainAtlas(app, t);
+    syncAtlas(app);
     if (!begin(app, t)) return .{};
     if (!t.warmed) {
         // A driver may finish compiling the program only at its first draw.
@@ -579,7 +563,7 @@ pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void 
     gl.glBindVertexArray(t.vao);
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
     gl.glActiveTexture(gl.GL_TEXTURE0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, app.glyph_tex.tex);
     gl.glEnable(gl.GL_BLEND);
     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
     t.px_scale = scale;
@@ -693,7 +677,7 @@ fn planFrame(app: *App, t: *Target, fx: bool, buffer_age: u32) Plan {
     const key = frameKey(app, t, fx);
     const key_changed = key != t.last_key;
     t.last_key = key;
-    if (owed.full or key_changed or fx or app.test_full_redraw or t.program == 0 or t.atlas_w == 0) return .{ .whole = null };
+    if (owed.full or key_changed or fx or app.test_full_redraw or t.program == 0 or app.glyph_tex.w == 0) return .{ .whole = null };
     // A scroll moves rows no commit sends, and so does the frame that ends it.
     for (app.surface.committedLayers()) |l| {
         const e = app.surface.gridEase(l.grid_id) orelse continue;
@@ -810,7 +794,7 @@ fn drawUiAt(app: *App, t: *Target, win_w: u32, win_h: u32, ox: i32, oy: i32) voi
         t.ui_gen = a.gen;
     }
     drawVerts(app, t, layer.text.items, surface_layer, 0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D, t.atlas_tex);
+    gl.glBindTexture(gl.GL_TEXTURE_2D, app.glyph_tex.tex);
 }
 
 /// An external window: the surface rooted at `surface_id`.
@@ -827,7 +811,7 @@ pub fn renderExternalScene(app: *App, t: *Target, surface_id: i64) Frame {
 /// renderExternalScene with App.mu held by the caller.
 pub fn renderExternalSceneLocked(app: *App, t: *Target, surface_id: i64, t0: i128) Frame {
     if (t.program == 0) return .{};
-    syncAtlas(app, t);
+    syncAtlas(app);
     if (!begin(app, t)) return .{};
     const d = drawSurface(app, t, app.surface.committedSurfaceLayers(surface_id), @intCast(t0));
     if (app.ext_windows.get(surface_id)) |w| drawScrollbar(app, t, &w.scrollbar, surface_id);
@@ -877,17 +861,16 @@ pub fn renderExternal(app: *App, t: *Target, p: *postfx.PostFx, surface_id: i64)
 /// A panel popup's render signal (panel_popup.zig): panel `kind` at
 /// `inner` (target px) over a transparent clear, so its shadow falls on
 /// whatever is under the popup; `view` is where the panel is on the main
-/// view. The atlas is synced from the mirror as an external window's is.
-/// Takes App.mu.
+/// view. Takes App.mu.
 pub fn renderPanel(app: *App, t: *Target, kind: overlay_layout.Kind, inner: overlay_layout.Rect, view: overlay_layout.Rect) void {
     if (t.program == 0) return;
     app.mu.lockUncancelable(clock.io());
     defer app.mu.unlock(clock.io());
-    syncAtlas(app, t);
+    syncAtlas(app);
     gl.glViewport(0, 0, @intCast(t.w_px), @intCast(t.h_px));
     gl.glClearColor(0, 0, 0, 0);
     gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-    if (!bind(t)) return;
+    if (!bind(app, t)) return;
     _ = drawPanel(app, t, kind, inner, view);
 }
 
