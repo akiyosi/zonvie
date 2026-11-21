@@ -1371,6 +1371,24 @@ final class GlyphAtlas {
         return nil
     }
 
+    /// The one glyph a base + combining marks cluster shapes to in `hbft`
+    /// (HarfBuzz composes か + U+3099 into が when the face has it), or nil
+    /// when the face draws the cluster as several glyphs.
+    private func singleGlyphViaShaping(hbft: OpaquePointer, cluster: UnsafePointer<UInt32>, count: Int) -> UInt32? {
+        var glyphIds = [UInt32](repeating: 0, count: 4)
+        var xAdv = [Int32](repeating: 0, count: 4), yAdv = [Int32](repeating: 0, count: 4)
+        var xOff = [Int32](repeating: 0, count: 4), yOff = [Int32](repeating: 0, count: 4)
+        let n = zonvie_hb_shape_utf32(
+            hbft, cluster, count,
+            &glyphIds, nil,
+            &xAdv, &yAdv, &xOff, &yOff,
+            glyphIds.count,
+            nil, nil, nil
+        )
+        if n == 1 && glyphIds[0] != 0 { return glyphIds[0] }
+        return nil
+    }
+
     private func resolveHbftAndGlyph_locked(fontId: UInt32 = 0, scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer?, glyphID: UInt32, ctFont: CTFont)? {
         // fontId in bits 24-31, above the 21 scalar bits and below the style
         // flags (font_id < 64 = font_slots.max_slots); font_id 0 keys as before.
@@ -1562,12 +1580,15 @@ final class GlyphAtlas {
     }
 
     /// Render a multi-codepoint emoji cluster using CoreText line layout.
-    /// Handles VS16 emoji, ZWJ sequences, flag sequences, etc.
+    /// Handles VS16 emoji, ZWJ sequences, flag sequences, etc. With
+    /// `baseFont`, lays a text cluster out in that face instead of Apple
+    /// Color Emoji.
     /// Must be called with mu locked. Stores pixel data in rasterizeScratch.
     private func renderEmojiClusterWithCoreGraphics_locked(
         scalars: UnsafePointer<UInt32>, count: Int,
         outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>,
-        sizePx: CGFloat? = nil
+        sizePx: CGFloat? = nil,
+        baseFont: CTFont? = nil
     ) -> Bool {
         // Build a String from the cluster scalars using UnicodeScalarView
         // to preserve the exact sequence (Character append may break ZWJ joining).
@@ -1579,7 +1600,7 @@ final class GlyphAtlas {
         if str.isEmpty { return false }
 
         // Use Apple Color Emoji as the primary font
-        guard let ef = emojiFont(size: sizePx ?? CTFontGetSize(font)) else { return false }
+        guard let ef = baseFont ?? emojiFont(size: sizePx ?? CTFontGetSize(font)) else { return false }
 
         // Create an attributed string with the emoji font
         let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
@@ -1708,8 +1729,29 @@ final class GlyphAtlas {
             // Fall through to normal path if cluster rendering failed
         }
 
-        guard let resolved = resolveHbftAndGlyph_locked(fontId: fontId, scalar: scalar, styleFlags: styleFlags) else {
+        guard var resolved = resolveHbftAndGlyph_locked(fontId: fontId, scalar: scalar, styleFlags: styleFlags) else {
             return false
+        }
+
+        // A text cluster (a base the primary font lacks, with combining
+        // marks) is shaped whole in the face chosen for the base, so the marks
+        // land where that face puts them rather than at the cell origin.
+        var textLen: UInt8 = 0
+        if let textPtr = zonvie_core_get_text_cluster(corePtr, &textLen), textLen > 1, let hbft = resolved.hbft {
+            if let gid = singleGlyphViaShaping(hbft: hbft, cluster: textPtr, count: Int(textLen)) {
+                resolved.glyphID = gid
+            } else {
+                outBitmap.pointee.ascent_px = ascentPx
+                outBitmap.pointee.descent_px = descentPx
+                if renderEmojiClusterWithCoreGraphics_locked(
+                    scalars: textPtr, count: Int(textLen), outBitmap: outBitmap,
+                    baseFont: resolved.ctFont
+                ) {
+                    outBitmap.pointee.ascent_px = ascentPx
+                    outBitmap.pointee.descent_px = descentPx
+                    return true
+                }
+            }
         }
 
         // No hbft handle (bitmap-only font like Apple Color Emoji) — go straight to CoreGraphics

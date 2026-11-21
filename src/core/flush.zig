@@ -3141,12 +3141,12 @@ pub fn generateRowVertices(
                             // .notdef glyph — per-scalar fallback
                             var ci: u32 = this_cluster;
                             var fallback_base_x = penX;
-                            // src_col of the emoji cluster whose base scalar has
-                            // already been composed in this cluster, or null.
-                            // Set once the base is processed, whether or not it
-                            // produced a quad — a tail must not re-compose either
-                            // way.
-                            var composed_emoji_src_col: ?u32 = null;
+                            // src_col of the emoji or text cluster whose base
+                            // scalar has already been composed in this cluster,
+                            // or null. Set once the base is processed, whether
+                            // or not it produced a quad — a tail must not
+                            // re-compose either way.
+                            var composed_src_col: ?u32 = null;
                             while (ci < next_cluster) : (ci += 1) {
                                 const fb_scalar = core.shaping_scalars.items[@intCast(ci)];
                                 const fb_col_w = core.shaping_col_widths.items[@intCast(ci)];
@@ -3171,25 +3171,37 @@ pub fn generateRowVertices(
                                 // Set emoji cluster context for .notdef emoji scalars
                                 // so the frontend rasterizer can use color emoji path.
                                 const fb_src_col = core.shaping_src_cols.items[@intCast(ci)];
+                                // Continuation scalars of a cluster (combining
+                                // marks, ZWJ, VS16, the trailing symbols of a ZWJ
+                                // sequence) are appended with col_width 0 and the
+                                // base cell's src_col. The base scalar already
+                                // composed and drew the whole cluster, and
+                                // fallback_base_x does not advance for zero-width
+                                // scalars, so drawing a tail again would put it
+                                // over the base at the cell origin.
+                                if (fb_col_w == 0) {
+                                    if (composed_src_col) |base_col| {
+                                        if (base_col == fb_src_col) continue;
+                                    }
+                                }
                                 const fb_is_emoji = isEmojiPresentation(fb_scalar) or cellIsEmojiCluster(core, rc, r, fb_src_col);
                                 if (fb_is_emoji) {
-                                    // Continuation scalars of an emoji cluster (ZWJ,
-                                    // VS16, the trailing symbols of a ZWJ sequence)
-                                    // are appended with col_width 0 and the base
-                                    // cell's src_col. The base scalar already composed
-                                    // and drew the whole cluster, and fallback_base_x
-                                    // does not advance for zero-width scalars, so
-                                    // re-composing from a tail would rebuild a bogus
-                                    // cluster and draw it over the real one.
-                                    if (fb_col_w == 0) {
-                                        if (composed_emoji_src_col) |base_col| {
-                                            if (base_col == fb_src_col) continue;
-                                        }
-                                    }
                                     setEmojiClusterFromOverflow(core, rc, r, fb_src_col, fb_scalar);
-                                    composed_emoji_src_col = fb_src_col;
+                                    composed_src_col = fb_src_col;
+                                } else if (fb_col_w != 0 and getOverflowForCell(core, rc, r, fb_src_col) != null) {
+                                    // A base the primary font lacks, with
+                                    // combining marks: the frontend shapes the
+                                    // whole cluster with the font it picks for
+                                    // the base, so the marks land where that
+                                    // font puts them.
+                                    setEmojiClusterFromOverflow(core, rc, r, fb_src_col, fb_scalar);
+                                    core.cluster_is_text = true;
+                                    composed_src_col = fb_src_col;
                                 }
-                                defer core.emoji_cluster_len = 0;
+                                defer {
+                                    core.emoji_cluster_len = 0;
+                                    core.cluster_is_text = false;
+                                }
 
                                 // Cache this scalar like the single-cluster
                                 // fallback below does. A script the primary
@@ -8270,6 +8282,20 @@ fn ensureCachedPhase2Glyph(
     }
 
     if (resolved == null) {
+        // A cluster the text font does not draw as one glyph goes to the
+        // rasterizer whole, as the row's .notdef fallback sends it: both
+        // store under this cluster key, and the base alone would drop the
+        // marks.
+        if (!use_scalar_cluster and extras.len != 0) {
+            core.emoji_cluster_buf[0] = scalar;
+            for (extras, 0..) |extra, i| core.emoji_cluster_buf[i + 1] = extra;
+            core.emoji_cluster_len = @intCast(1 + extras.len);
+            core.cluster_is_text = true;
+        }
+        defer {
+            core.emoji_cluster_len = 0;
+            core.cluster_is_text = false;
+        }
         resolved = core.ensureGlyphPhase2(font_id, scalar, style_flags);
         if (core.flush_aborted) return null;
     }
@@ -11706,13 +11732,15 @@ test "shaping includes overflow tails in input and cache key" {
     try std.testing.expectEqual(@as(u32, 2), state.shape_calls);
     try std.testing.expectEqual(@as(u32, 0x0300), state.seen[1]);
 
-    // Malformed clusters are not cached and use the safe per-scalar path.
+    // Malformed clusters are not cached and use the safe per-scalar path,
+    // where a base with its combining mark goes to the scalar rasterizer
+    // once, as a text cluster.
     core.resetShapeCache();
     state.mode = .invalid_cluster;
     const scalar_calls_before = state.scalar_raster_calls;
     out.clearRetainingCapacity();
     _ = try generateRowVertices(&core, params, &out);
-    try std.testing.expect(state.scalar_raster_calls >= scalar_calls_before + 2);
+    try std.testing.expectEqual(scalar_calls_before + 1, state.scalar_raster_calls);
     out.clearRetainingCapacity();
     _ = try generateRowVertices(&core, params, &out);
     try std.testing.expectEqual(@as(u32, 4), state.shape_calls);
@@ -11925,6 +11953,166 @@ test "partial-only Phase 2 preserves overflow clusters with and without shaping"
     // One vertex callback per row per flush, across the three flushes above.
     try std.testing.expectEqual(@as(u32, 7), state.partial_calls);
     try std.testing.expect(!state.background_after_glyph);
+}
+
+/// A primary font without kana: every scalar of a run shapes to .notdef in
+/// cluster 0, as HarfBuzz reports for JetBrains Mono with U+30AB U+309A. The
+/// scalar rasterizer records each call with the cluster context it saw.
+const NotdefKanaFont = struct {
+    scalar_calls: u32 = 0,
+    scalars: [4]u32 = .{ 0, 0, 0, 0 },
+    text_cluster: [4][2]u32 = .{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } },
+    emoji_cluster_lens: [4]u8 = .{ 0, 0, 0, 0 },
+    core: *Core,
+
+    fn bitmap() c_api.GlyphBitmap {
+        return .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+    }
+
+    fn shape(
+        ctx: ?*anyopaque,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) callconv(.c) usize {
+        _ = ctx;
+        _ = scalars;
+        _ = style_flags;
+        if (out_cap < scalar_count) return scalar_count;
+        for (0..scalar_count) |i| {
+            out_glyph_ids[i] = 0;
+            out_clusters[i] = 0;
+            out_x_advance[i] = 64;
+            out_x_offset[i] = 0;
+            out_y_offset[i] = 0;
+        }
+        return scalar_count;
+    }
+
+    fn rasterScalar(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const i = self.scalar_calls;
+        if (i < self.scalars.len) {
+            self.scalars[i] = scalar;
+            if (self.core.cluster_is_text and self.core.emoji_cluster_len == 2) {
+                self.text_cluster[i] = .{ self.core.emoji_cluster_buf[0], self.core.emoji_cluster_buf[1] };
+            }
+            self.emoji_cluster_lens[i] = if (self.core.cluster_is_text) 0 else self.core.emoji_cluster_len;
+        }
+        self.scalar_calls += 1;
+        out_bitmap.* = bitmap();
+        return 1;
+    }
+
+    fn rasterById(ctx: ?*anyopaque, glyph_id: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+        _ = ctx;
+        _ = glyph_id;
+        _ = style_flags;
+        out_bitmap.* = bitmap();
+        return 1;
+    }
+
+    fn upload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, glyph_bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+        _ = ctx;
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = glyph_bitmap;
+    }
+
+    fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+        _ = ctx;
+        _ = width;
+        _ = height;
+    }
+
+    fn install(self: *@This(), core: *Core) void {
+        core.ctx = self;
+        core.cb.on_shape_text_run = shape;
+        core.cb.on_rasterize_glyph = rasterScalar;
+        core.cb.on_rasterize_glyph_by_id = rasterById;
+        core.cb.on_atlas_upload = upload;
+        core.cb.on_atlas_create = create;
+    }
+};
+
+// A kana from a fallback font with a combining sound mark: the mark must not
+// be rasterized alone at the base cell's origin (where it lands left of the
+// kana). The whole cluster goes to the rasterizer once, as text, so the
+// frontend shapes it with the font it picks for the base.
+test "a .notdef base with a combining mark is rasterized once, as a text cluster" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+    var font = NotdefKanaFont{ .core = &core };
+    font.install(&core);
+    core.cb.on_vertices_row = struct {
+        fn f(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, main_verts: ?[*]const c_api.Vertex, main_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = ctx;
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = main_verts;
+            _ = main_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+        }
+    }.f;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    // カ゚: no precomposed form exists, so only a cluster-wide shape fixes it.
+    try core.grid.putCellGridCluster(1, 0, 0, 0x30AB, 0, &.{0x309A});
+    try flush_ctx.onFlush(2, 2);
+
+    try std.testing.expectEqual(@as(u32, 1), font.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 0x30AB), font.scalars[0]);
+    try std.testing.expectEqual([2]u32{ 0x30AB, 0x309A }, font.text_cluster[0]);
+    // Not handed to the emoji rasterizer.
+    try std.testing.expectEqual(@as(u8, 0), font.emoji_cluster_lens[0]);
+    // The context does not outlive the callback.
+    try std.testing.expect(!core.cluster_is_text);
+    try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
+}
+
+// The cursor shares the row's cluster cache key, so it must hand the
+// rasterizer the same text cluster; drawing the base alone would cache a
+// picture without the mark under that key (and hide the mark under the cursor).
+test "a cursor on a .notdef base with a combining mark rasterizes the text cluster" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var font = NotdefKanaFont{ .core = &core };
+    font.install(&core);
+
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0, 0x304B, 0, &.{0x3099}) != null);
+    try std.testing.expectEqual(@as(u32, 1), font.scalar_calls);
+    try std.testing.expectEqual([2]u32{ 0x304B, 0x3099 }, font.text_cluster[0]);
+    try std.testing.expectEqual(@as(u8, 0), font.emoji_cluster_lens[0]);
+    try std.testing.expect(!core.cluster_is_text);
 }
 
 test "an atlas reset during rows resends an unchanged cursor in the same flush" {

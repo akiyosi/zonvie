@@ -725,3 +725,58 @@ test "every stylistic set and character variant changes shaping and keeps the fa
     }
     if (ran == 0) return error.SkipZigTest;
 }
+
+// ---------------------------------------------------------------------------
+// Combining sound marks
+// ---------------------------------------------------------------------------
+
+// The frontends draw a text cluster (zonvie_core_get_text_cluster) by shaping
+// it whole in the face chosen for the base kana and drawing the one glyph that
+// results. That relies on a kana face composing base + U+3099/U+309A: into the
+// precomposed glyph where Unicode has one (か゛ = が), and into its own glyph
+// where it does not (カ゚). A Latin face lacks both and gives .notdef per scalar.
+test "a kana face shapes a kana and its sound mark to one glyph" {
+    const alloc = std.testing.allocator;
+    // Hiragino ships with macOS; the others are checked when installed.
+    const kana_faces = [_][]const []const u8{
+        &.{"ヒラギノ角ゴシック W3.ttc"},
+        &.{"NotoSansJP-VariableFont_wght.ttf"},
+        &.{"msgothic.ttc"},
+    };
+    const clusters = [_][2]u32{
+        .{ 0x304B, 0x3099 }, // か゛ -> が
+        .{ 0x306F, 0x309A }, // は゜ -> ぱ
+        .{ 0x309D, 0x3099 }, // ゝ゛ -> ゞ
+        .{ 0x30FD, 0x3099 }, // ヽ゛ -> ヾ
+        .{ 0x30AB, 0x309A }, // カ゚, no precomposed codepoint
+    };
+    var ran: usize = 0;
+    for (kana_faces, 0..) |files, i| {
+        // Only Hiragino is guaranteed: probe the optional faces first so
+        // ZONVIE_REQUIRE_TEST_FONTS does not fail on their absence.
+        if (i > 0) {
+            const found = (try findFontFile(alloc, zonvie_core.clock.io(), files)) orelse continue;
+            alloc.free(found);
+        }
+        var tf = (try TestFont.open(alloc, files, 0)) orelse continue;
+        defer tf.deinit(alloc);
+        for (clusters) |c| {
+            var out: [16]u32 = undefined;
+            const shaped = shapeScalars(tf.font, &c, &out);
+            if (shaped.len != 1 or shaped[0] == 0) {
+                std.debug.print("{s}: U+{X:0>4} U+{X:0>4} shapes to {any}\n", .{ tf.path, c[0], c[1], shaped });
+                return error.TestUnexpectedResult;
+            }
+            // Composed, not the bare base.
+            var base_out: [16]u32 = undefined;
+            try std.testing.expect(shaped[0] != shapeScalars(tf.font, c[0..1], &base_out)[0]);
+        }
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+
+    var latin = (try TestFont.open(alloc, &.{ "JetBrainsMono-Regular.ttf", "SFNSMono.ttf" }, 0)) orelse return;
+    defer latin.deinit(alloc);
+    var out: [16]u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, shapeScalars(latin.font, &.{ 0x304B, 0x3099 }, &out));
+}

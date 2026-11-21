@@ -242,9 +242,20 @@ pub const Fonts = struct {
     /// (zonvie_core_get_emoji_cluster). The core asks here for every scalar
     /// the primary face shaped to .notdef, so this is where faces other than
     /// the primary one come in: the colour emoji face for emoji, else the
-    /// first installed face fontconfig finds covering the scalar.
-    pub fn rasterizeScalar(self: *Fonts, alloc: std.mem.Allocator, scalar: u32, style_flags: u32, cluster: []const u32, out: *core.GlyphBitmap) bool {
+    /// first installed face fontconfig finds covering the scalar. With
+    /// `text_cluster` (zonvie_core_get_text_cluster: `scalar` and its
+    /// combining marks), the cluster is shaped whole in the face chosen for
+    /// `scalar`, so the marks land where that face puts them.
+    pub fn rasterizeScalar(self: *Fonts, alloc: std.mem.Allocator, scalar: u32, style_flags: u32, cluster: []const u32, text_cluster: []const u32, out: *core.GlyphBitmap) bool {
         const font = self.forStyle(style_flags) orelse return false;
+        if (text_cluster.len > 1) {
+            const face = if (firstGlyph(font, (&scalar)[0..1]) != 0) font else self.fallbackFace(alloc, scalar);
+            if (face) |f| {
+                const cgid = onlyGlyph(f, text_cluster);
+                if (cgid != 0) return self.render(alloc, f, cgid, out);
+            }
+            // A face that draws the marks as separate glyphs: draw the base.
+        }
         if (cluster.len != 0 or core.flush_mod.isEmojiPresentation(scalar)) {
             if (self.emojiFace(alloc)) |e| {
                 const scalars: []const u32 = if (cluster.len != 0) cluster else (&scalar)[0..1];
@@ -402,6 +413,23 @@ fn firstGlyph(font: *Font, scalars: []const u32) u32 {
     var height: i32 = 0;
     const n = hbft.zonvie_hb_shape_utf32(font, scalars.ptr, scalars.len, &gids, &clusters, &x_adv, &y_adv, &x_off, &y_off, gids.len, &asc, &desc, &height);
     if (n == 0 or n > gids.len) return 0;
+    return gids[0];
+}
+
+/// The one glyph `scalars` shape to in `font`; 0 when `font` draws them as
+/// several glyphs or lacks them.
+fn onlyGlyph(font: *Font, scalars: []const u32) u32 {
+    var gids: [8]u32 = undefined;
+    var clusters: [8]u32 = undefined;
+    var x_adv: [8]i32 = undefined;
+    var y_adv: [8]i32 = undefined;
+    var x_off: [8]i32 = undefined;
+    var y_off: [8]i32 = undefined;
+    var asc: i32 = 0;
+    var desc: i32 = 0;
+    var height: i32 = 0;
+    const n = hbft.zonvie_hb_shape_utf32(font, scalars.ptr, scalars.len, &gids, &clusters, &x_adv, &y_adv, &x_off, &y_off, gids.len, &asc, &desc, &height);
+    if (n != 1) return 0;
     return gids[0];
 }
 

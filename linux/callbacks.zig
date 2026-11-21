@@ -668,7 +668,10 @@ fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap:
     var cluster_len: u8 = 0;
     const cluster_ptr = core.zonvie_core_get_emoji_cluster(app.corep, &cluster_len);
     const cluster: []const u32 = if (cluster_ptr) |p| p[0..cluster_len] else &.{};
-    return @intFromBool(app.fonts.rasterizeScalar(app.alloc, scalar, style_flags, cluster, out_bitmap));
+    var text_len: u8 = 0;
+    const text_ptr = core.zonvie_core_get_text_cluster(app.corep, &text_len);
+    const text: []const u32 = if (text_ptr) |p| p[0..text_len] else &.{};
+    return @intFromBool(app.fonts.rasterizeScalar(app.alloc, scalar, style_flags, cluster, text, out_bitmap));
 }
 
 fn onRasterizeGlyphById(ctx: ?*anyopaque, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {
@@ -801,7 +804,10 @@ fn onRasterizeGlyphEx(ctx: ?*anyopaque, font_id: u32, scalar: u32, style_flags: 
     var cluster_len: u8 = 0;
     const cluster_ptr = core.zonvie_core_get_emoji_cluster(app.corep, &cluster_len);
     const cluster: []const u32 = if (cluster_ptr) |p| p[0..cluster_len] else &.{};
-    return @intFromBool(f.rasterizeScalar(app.alloc, scalar, style_flags, cluster, out_bitmap));
+    var text_len: u8 = 0;
+    const text_ptr = core.zonvie_core_get_text_cluster(app.corep, &text_len);
+    const text: []const u32 = if (text_ptr) |p| p[0..text_len] else &.{};
+    return @intFromBool(f.rasterizeScalar(app.alloc, scalar, style_flags, cluster, text, out_bitmap));
 }
 
 fn onRasterizeGlyphByIdEx(ctx: ?*anyopaque, font_id: u32, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) callconv(.c) c_int {

@@ -1974,8 +1974,17 @@ ZONVIE_API int zonvie_core_is_float_external(zonvie_core *core, int64_t grid_id)
 // Get the current emoji cluster context during flush.
 // Returns a pointer to the cluster scalars (uint32_t codepoints) and writes the
 // count to *out_len.  Valid only during on_rasterize_glyph callbacks.
-// Returns NULL with *out_len=0 when no cluster context is active.
+// Returns NULL with *out_len=0 when no cluster context is active, and while a
+// text cluster (below) is active.
 ZONVIE_API const uint32_t *zonvie_core_get_emoji_cluster(zonvie_core *core, uint8_t *out_len);
+
+// Get the current text cluster context during flush: the scalar passed to
+// on_rasterize_glyph (a base the primary font lacks) followed by its combining
+// marks. Rasterize the whole cluster as one glyph image, shaped with the font
+// chosen for the base scalar, so the marks land where that font places them.
+// Valid only during on_rasterize_glyph callbacks. Returns NULL with *out_len=0
+// when no text cluster context is active.
+ZONVIE_API const uint32_t *zonvie_core_get_text_cluster(zonvie_core *core, uint8_t *out_len);
 
 // Query whether post-process bloom glow is currently enabled (lock-free atomic read).
 // Safe to call from any thread (including the draw thread) without locking grid_mu.

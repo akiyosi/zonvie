@@ -1179,6 +1179,10 @@ pub const Core = struct {
     /// Set during flush vertex generation, read by on_rasterize_glyph callbacks.
     emoji_cluster_buf: [16]u32 = undefined,
     emoji_cluster_len: u8 = 0,
+    /// The cluster in emoji_cluster_buf is text (a base the primary font
+    /// lacks, with combining marks), not emoji: the frontend shapes it with
+    /// the font it picks for the base scalar.
+    cluster_is_text: bool = false,
 
     // Phase B: Shaping result cache (4-way set associative, keyed by text content + style)
     shape_cache_size: u32 = 4096, // total entries (configurable via [performance] in config.toml)
