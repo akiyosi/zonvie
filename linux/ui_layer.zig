@@ -13,6 +13,7 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const App = @import("app.zig").App;
 const atlas_pixels = @import("atlas_pixels.zig");
+const shell = @import("shell.zig");
 
 pub const atlas_size = 1024;
 
@@ -44,6 +45,8 @@ pub const Atlas = struct {
     /// The faces' pixel size the glyphs were made at; another size starts over.
     pixel_size: u32 = 0,
     gen: u64 = 0,
+    /// A glyph found no room: the next build starts the atlas over.
+    full: bool = false,
 
     pub fn deinit(self: *Atlas, alloc: std.mem.Allocator) void {
         alloc.free(self.pixels);
@@ -57,6 +60,7 @@ pub const Atlas = struct {
         self.pen_y = 1;
         self.row_h = 0;
         self.pixel_size = pixel_size;
+        self.full = false;
         self.gen +%= 1;
     }
 };
@@ -108,6 +112,9 @@ pub const Builder = struct {
     cell_w: i32,
     cell_h: i32,
     ascent: i32,
+    /// The atlas held no glyph when this build started: an overflow now
+    /// would recur on a rebuild, so it does not ask for one.
+    started_empty: bool,
 
     pub fn begin(app: *App, layer: *Layer) Builder {
         layer.clear();
@@ -116,7 +123,10 @@ pub const Builder = struct {
         if (app.corep) |cp| core.zonvie_core_lock_grid(cp);
         const locked = true;
         const f = &app.fonts;
-        if (app.ui_atlas.pixels.len != 0 and app.ui_atlas.pixel_size != f.pixel_size) app.ui_atlas.reset(f.pixel_size);
+        const a = &app.ui_atlas;
+        // Safe while the layer on screen still samples the old glyphs: the
+        // renderer runs on this thread and draws only after the swap.
+        if (a.pixels.len != 0 and (a.pixel_size != f.pixel_size or a.full)) a.reset(f.pixel_size);
         return .{
             .app = app,
             .layer = layer,
@@ -124,6 +134,7 @@ pub const Builder = struct {
             .cell_w = @intCast(f.cell_w_px),
             .cell_h = @intCast(f.cell_h_px),
             .ascent = @divTrunc(f.ascent_26_6 + 32, 64),
+            .started_empty = a.glyphs.count() == 0,
         };
     }
 
@@ -230,7 +241,9 @@ pub const Builder = struct {
     }
 
     /// The glyph for `scalar`, rasterized on first use. Null without a core
-    /// (nothing guards the faces then), a face, or room in the atlas.
+    /// (nothing guards the faces then) or a face. Without room in the atlas
+    /// it is an empty glyph of its width, and the atlas starts over with the
+    /// next build.
     fn glyph(self: *Builder, scalar: u21, style: Style) ?Glyph {
         const app = self.app;
         const a = &app.ui_atlas;
@@ -247,13 +260,30 @@ pub const Builder = struct {
         if (!app.fonts.rasterizeScalar(app.alloc, scalar, flags, &.{}, &.{}, &bm)) return null;
         const w = bm.width;
         const h = bm.height;
-        if (w + 2 > atlas_size or h + 2 > atlas_size) return null;
-        if (a.pen_x + w + 1 > atlas_size) {
-            a.pen_x = 1;
-            a.pen_y += a.row_h + 1;
-            a.row_h = 0;
+        const adv = @divTrunc(bm.advance_26_6 + 32, 64);
+        const cells: u8 = if (self.cell_w > 0 and adv * 2 > self.cell_w * 3) 2 else 1;
+        const empty: Glyph = .{ .x = 0, .y = 0, .w = 0, .h = 0, .bearing_x = 0, .bearing_y = 0, .cells = cells, .color = false };
+        // Never fits: kept as empty so it is not rasterized again.
+        if (w + 2 > atlas_size or h + 2 > atlas_size) {
+            a.glyphs.put(app.alloc, key, empty) catch {};
+            return empty;
         }
-        if (a.pen_y + h + 1 > atlas_size) return null;
+        var pen_x = a.pen_x;
+        var pen_y = a.pen_y;
+        var row_h = a.row_h;
+        if (pen_x + w + 1 > atlas_size) {
+            pen_x = 1;
+            pen_y += row_h + 1;
+            row_h = 0;
+        }
+        if (pen_y + h + 1 > atlas_size) {
+            if (!a.full and !self.started_empty) shell.queueRefresh(app);
+            a.full = true;
+            return empty;
+        }
+        a.pen_x = pen_x;
+        a.pen_y = pen_y;
+        a.row_h = row_h;
         if (w != 0 and h != 0) {
             const tmp = app.alloc.alloc(u8, @as(usize, w) * h * 4) catch return null;
             defer app.alloc.free(tmp);
@@ -264,7 +294,6 @@ pub const Builder = struct {
                 @memcpy(a.pixels[dst..][0 .. @as(usize, w) * 4], tmp[row * w * 4 ..][0 .. @as(usize, w) * 4]);
             }
         }
-        const adv = @divTrunc(bm.advance_26_6 + 32, 64);
         const g: Glyph = .{
             .x = @intCast(a.pen_x),
             .y = @intCast(a.pen_y),
@@ -272,7 +301,7 @@ pub const Builder = struct {
             .h = @intCast(h),
             .bearing_x = @intCast(std.math.clamp(bm.bearing_x, -32768, 32767)),
             .bearing_y = @intCast(std.math.clamp(bm.bearing_y, -32768, 32767)),
-            .cells = if (self.cell_w > 0 and adv * 2 > self.cell_w * 3) 2 else 1,
+            .cells = cells,
             .color = bm.bytes_per_pixel == 4,
         };
         a.pen_x += w + 1;

@@ -727,7 +727,13 @@ fn syncCellAge(app: *App, p: *PostFx, surface_id: i64, root: ?core.Layer) u32 {
             gl.glBindTexture(gl.GL_TEXTURE_2D, p.age_tex);
             gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
             gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32F, @intCast(r.cols), @intCast(r.rows), 0, gl.GL_RED, gl.GL_FLOAT, values.ptr);
+            // Storage is specified only when the grid size changes; a same-size
+            // update rewrites the existing storage.
+            if (fresh) {
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32F, @intCast(r.cols), @intCast(r.rows), 0, gl.GL_RED, gl.GL_FLOAT, values.ptr);
+            } else {
+                gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, @intCast(r.cols), @intCast(r.rows), gl.GL_RED, gl.GL_FLOAT, values.ptr);
+            }
             p.age_cols = r.cols;
             p.age_rows = r.rows;
         },
