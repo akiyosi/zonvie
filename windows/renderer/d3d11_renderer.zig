@@ -174,6 +174,18 @@ fn dumpBlobAsText(prefix: []const u8, b: ?*ID3DBlob) void {
 /// Which GDI-rendered chrome strip a texture holds.
 pub const Strip = enum { tabline, sidebar };
 
+pub const StripComposite = enum {
+    /// Premultiplied over the target.
+    blend,
+    /// Final premultiplied pixels written with blending off, as the editor
+    /// card is.
+    replace,
+    /// Binary alpha: an opaque pixel is written as (colour * opacity,
+    /// opacity) and a transparent one leaves the target, so a strip drawn
+    /// over already translucent chrome neither compounds nor punches holes.
+    keyed,
+};
+
 /// A B8G8R8A8 texture the tabline or sidebar strip is uploaded into. The two
 /// had a copy each of this create/update code.
 const StripTexture = struct {
@@ -184,6 +196,8 @@ const StripTexture = struct {
     /// The caller's signature of the content last uploaded; 0 = none. A new
     /// renderer starts at 0, so recovery re-renders the strip unasked.
     content_sig: u64 = 0,
+    /// How the strip's pixels reach the target (tabbar.renderOffscreenToD3D).
+    composite: StripComposite = .blend,
 
     fn release(self: *StripTexture) void {
         safeRelease(&self.srv);
@@ -339,9 +353,6 @@ pub const Renderer = struct {
     // Tabline and sidebar strips, rendered from GDI bitmaps.
     tabline_strip: StripTexture = .{},
     sidebar_strip: StripTexture = .{},
-    /// The strips hold final premultiplied pixels and are written with
-    /// blending off, as the editor card is (tabbar.renderOffscreenToD3D).
-    strips_replace: bool = false,
 
     // Post-process bloom (neon glow, Dual Kawase)
     glow_extract_tex: ?*c.ID3D11Texture2D = null,
@@ -373,6 +384,8 @@ pub const Renderer = struct {
     /// behind an opaque layer does not bloom through it.
     ps_glow_occlude: ?*c.ID3D11PixelShader = null,
     occlude_blend: ?*c.ID3D11BlendState = null,
+    /// (BLEND_FACTOR, INV_SRC_ALPHA) for StripComposite.keyed.
+    keyed_blend: ?*c.ID3D11BlendState = null,
     ps_kawase_down: ?*c.ID3D11PixelShader = null,
     ps_kawase_up: ?*c.ID3D11PixelShader = null,
     ps_glow_composite: ?*c.ID3D11PixelShader = null,
@@ -810,6 +823,7 @@ pub const Renderer = struct {
         safeRelease(&self.ps_glow_extract);
         safeRelease(&self.ps_glow_occlude);
         safeRelease(&self.occlude_blend);
+        safeRelease(&self.keyed_blend);
         safeRelease(&self.ps_kawase_down);
         safeRelease(&self.ps_kawase_up);
         safeRelease(&self.ps_glow_composite);
@@ -1588,6 +1602,13 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn stripComposite(self: *Renderer, strip: Strip) *StripComposite {
+        return switch (strip) {
+            .tabline => &self.tabline_strip.composite,
+            .sidebar => &self.sidebar_strip.composite,
+        };
+    }
+
     /// Draw one strip's texture over the NDC rect [left, right] x [bottom, top],
     /// then rebind the atlas.
     fn drawStripTexture(self: *Renderer, st: *const StripTexture, ndc_left: f32, ndc_right: f32, ndc_top: f32, ndc_bottom: f32) !void {
@@ -1612,14 +1633,17 @@ pub const Renderer = struct {
         const ps_set_srv = ctx.*.lpVtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
         var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-        if (self.strips_replace) {
-            const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
-            var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
-            set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
-            defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
-            try self.drawVertices(&verts);
-        } else {
-            try self.drawVertices(&verts);
+        switch (st.composite) {
+            .blend => try self.drawVertices(&verts),
+            .replace, .keyed => {
+                const set_blend = ctx.*.lpVtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+                const o = self.opacity;
+                var blend_factor: [4]f32 = .{ o, o, o, o };
+                const state = if (st.composite == .keyed) (self.keyed_blend orelse return error.D3DBlendMissing) else null;
+                set_blend(ctx, state, &blend_factor, 0xFFFFFFFF);
+                defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+                try self.drawVertices(&verts);
+            },
         }
         srvs[0] = self.atlas_srv;
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
@@ -4664,6 +4688,26 @@ pub const Renderer = struct {
             const hr_ob = create_blend(dev, &obd, &ob);
             if (c.FAILED(hr_ob) or ob == null) return error.D3DCreateBlendFailed;
             self.occlude_blend = ob;
+        }
+
+        // --- Keyed strip blend (BLEND_FACTOR, INV_SRC_ALPHA) ---
+        {
+            const create_blend = dev_vtbl.*.CreateBlendState orelse return error.D3DCreateBlendFailed;
+
+            var kbd: c.D3D11_BLEND_DESC = std.mem.zeroes(c.D3D11_BLEND_DESC);
+            kbd.RenderTarget[0].BlendEnable = c.TRUE;
+            kbd.RenderTarget[0].SrcBlend = c.D3D11_BLEND_BLEND_FACTOR;
+            kbd.RenderTarget[0].DestBlend = c.D3D11_BLEND_INV_SRC_ALPHA;
+            kbd.RenderTarget[0].BlendOp = c.D3D11_BLEND_OP_ADD;
+            kbd.RenderTarget[0].SrcBlendAlpha = c.D3D11_BLEND_BLEND_FACTOR;
+            kbd.RenderTarget[0].DestBlendAlpha = c.D3D11_BLEND_INV_SRC_ALPHA;
+            kbd.RenderTarget[0].BlendOpAlpha = c.D3D11_BLEND_OP_ADD;
+            kbd.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+
+            var kb: ?*c.ID3D11BlendState = null;
+            const hr_kb = create_blend(dev, &kbd, &kb);
+            if (c.FAILED(hr_kb) or kb == null) return error.D3DCreateBlendFailed;
+            self.keyed_blend = kb;
         }
 
         // --- Bilinear sampler for bloom blur ---

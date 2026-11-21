@@ -1287,10 +1287,15 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
     // at that opacity (the strip shader premultiplies), so its ground is the
     // clear's and a selected tab running into the card is the card's own
     // colour. Keyed pixels stay (0,0,0,0): the sidebar, drawn after, covers
-    // them.
+    // them. The band overlay is drawn after the sidebar and the card
+    // instead, so it keeps binary alpha and is keyed: its drawn pixels are
+    // written at the opacity like the rest, its keyed ones leave what is
+    // under them.
     const g = &(app.renderer.?);
-    g.strips_replace = g.opacity < 1.0 and sidebar_caption.island(app) != null;
-    if (g.strips_replace) {
+    const translucent_card = g.opacity < 1.0 and sidebar_caption.island(app) != null;
+    const overlay = surface == .tabline and sidebar_caption.drawsBand(app);
+    g.stripComposite(surface).* = if (!translucent_card) .blend else if (overlay) .keyed else .replace;
+    if (translucent_card and !overlay) {
         const a: u8 = @intFromFloat(@round(g.opacity * 255.0));
         i = 0;
         while (i < pixel_count) : (i += 1) {
