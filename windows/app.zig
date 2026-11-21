@@ -2744,6 +2744,11 @@ pub const LayerPaintState = struct {
     last_drawn_rows: usize = 0,
     /// The layer's smooth scroll; its buffers count toward the layer's.
     ease: GridEase = .{},
+    /// How far below its placed y_px this frame draws the layer
+    /// (followScrollDyPx), and how far the previous plan drew it: when the
+    /// two differ the layer's pixels moved.
+    follow_dy_px: i32 = 0,
+    prev_follow_dy_px: i32 = 0,
 
     /// Release this state's buffers and free the entry for another grid.
     fn release(self: *LayerPaintState, budget: *RowVBPhysicalBudget, retained_bytes: *usize) void {
@@ -2757,6 +2762,8 @@ pub const LayerPaintState = struct {
         self.draw_blit_rect = null;
         self.blit_clear_band = null;
         self.last_drawn_rows = 0;
+        self.follow_dy_px = 0;
+        self.prev_follow_dy_px = 0;
     }
 
     /// Something of this layer is redrawn this frame.
@@ -2825,6 +2832,9 @@ pub const SurfacePaintState = struct {
     /// (planLayerFrame), reused so a paint does not allocate.
     damage_spans: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
     bands: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
+    /// The layers where the paint being drawn places them (planLayerFrame),
+    /// reused so a paint does not allocate.
+    drawn_layers: std.ArrayListUnmanaged(SurfaceLayer) = .empty,
     /// The root grid's smooth scroll; its buffers count toward the root's.
     /// Only an external window's root ever eases (GridEase.plan).
     root_ease: GridEase = .{},
@@ -2884,6 +2894,7 @@ pub const SurfacePaintState = struct {
         self.layers.deinit(alloc);
         self.damage_spans.deinit(alloc);
         self.bands.deinit(alloc);
+        self.drawn_layers.deinit(alloc);
         self.root_ease.release(row_vb_budget, &self.row_vb_retained_bytes);
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
@@ -4318,6 +4329,28 @@ pub fn layerRowDrawn(paint: *SurfacePaintState, grid_id: i64, row: u32) bool {
     return row < state.draw_rows.bit_length and state.draw_rows.isSet(row);
 }
 
+/// How far below its placed y_px this frame draws `layer`, in whole pixels.
+/// A buffer-tracking float (follows_scroll) not easing in its own right
+/// moves bodily with the smooth scroll of the window it is anchored to: Neovim
+/// re-places it with the scroll that seeded the ease, so its layout is already
+/// where the text lands. A float anchored to a float does not follow, as on
+/// Linux (layer_geom.scrollAnchor). Every ease of `layers` must already be
+/// planned this frame.
+pub fn followScrollDyPx(paint: *SurfacePaintState, layer: SurfaceLayer, layers: []const SurfaceLayer) i32 {
+    if (!layer.follows_scroll or layer.anchor_grid == layer.grid_id) return 0;
+    if (paint.layerState(layer.grid_id)) |own| {
+        if (own.ease.easing) return 0;
+    }
+    for (layers, 0..) |anchor, i| {
+        if (anchor.grid_id != layer.anchor_grid) continue;
+        if (anchor.is_float) return 0;
+        const ease: *const GridEase = if (i == 0) &paint.root_ease else &(paint.layerState(anchor.grid_id) orelse return 0).ease;
+        if (!ease.easing) return 0;
+        return @intFromFloat(@round(ease.offset_px));
+    }
+    return 0;
+}
+
 /// Decide which rows of every layer this paint draws, and shift on the GPU
 /// the ones whose scroll a copy of their own rectangle can serve. Runs before
 /// the root rows for the same reason applyScrollShift does: the copy has to
@@ -4338,6 +4371,9 @@ pub fn planLayerFrame(
 ) error{OutOfMemory}!void {
     const paint = src.paint;
     paint.bands.clearRetainingCapacity();
+    // Filled before any early return: the draw places the layers from it.
+    paint.drawn_layers.clearRetainingCapacity();
+    try paint.drawn_layers.appendSlice(src.alloc, layers);
     if (layers.len <= 1 or p.row_h_px <= 0) return;
     const n = layers.len;
     // `h` is the row height a layer without its own font has; the root's
@@ -4387,16 +4423,29 @@ pub fn planLayerFrame(
         if (state.draw_scroll) |s| shiftRowVBs(state.row_vbs.items, s.rows_delta, s.row_start, s.row_end);
     }
 
+    // 1b. Where each layer is drawn, now that every ease is planned: a float
+    //     riding its anchor's ease is drawn, damaged and copied where it is
+    //     drawn. A layer whose offset changed moved every pixel, so it is
+    //     drawn whole, and step 3 damages the place it left.
+    const drawn = paint.drawn_layers.items;
+    for (drawn[1..n]) |*layer| {
+        const state = paint.layerState(layer.grid_id) orelse continue;
+        state.prev_follow_dy_px = state.follow_dy_px;
+        state.follow_dy_px = followScrollDyPx(paint, layer.*, layers);
+        layer.y_px += state.follow_dy_px;
+        if (state.follow_dy_px != state.prev_follow_dy_px) state.draw_all = true;
+    }
+
     // 2. The refusal ladder, back-to-front. Order matters twice: a rung only
     //    runs once the cheaper ones passed, and an accepted copy is always the
     //    lowest in the stack, so the marking below it stays one-directional.
     const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
     // A grid in its own font is off the row lattice the copy and its
     // over-blit rules assume, as a layer above a copy or as the one scrolled.
-    const any_font_layer = for (layers[1..n]) |l| {
+    const any_font_layer = for (drawn[1..n]) |l| {
         if (l.font_cell_h_px > 0) break true;
     } else false;
-    for (layers[1..n], 1..) |layer, li| {
+    for (drawn[1..n], 1..) |layer, li| {
         const state = paint.layerState(layer.grid_id) orelse continue;
         const scroll = state.draw_scroll orelse continue;
         const origin_x: i32 = p.x_offset + layer.x_px;
@@ -4433,7 +4482,7 @@ pub fn planLayerFrame(
                 .right = origin_x + @as(i32, @intCast(layer.cols)) * p.cell_w_px,
                 .bottom = origin_y + @as(i32, @intCast(layer.rows)) * h,
             };
-            for (layers[1..li]) |below| {
+            for (drawn[1..li]) |below| {
                 const below_state = paint.layerState(below.grid_id) orelse continue;
                 const r = below_state.draw_blit_rect orelse continue;
                 if (render_pipeline_helpers.blitRectsIntersect(layer_rect, r))
@@ -4474,7 +4523,7 @@ pub fn planLayerFrame(
 
         // The copy rewrote every pixel of its rectangle, so a layer drawn over
         // it moved with it, and so did what it covered.
-        for (layers[li + 1 .. n]) |above| {
+        for (drawn[li + 1 .. n]) |above| {
             const over = core.row_scroll.overBlitRows(
                 pl,
                 scroll.rows_delta,
@@ -4516,17 +4565,24 @@ pub fn planLayerFrame(
     // 3. Everything owed, as surface pixel spans.
     const spans = &paint.damage_spans;
     spans.clearRetainingCapacity();
-    const root = layers[0];
+    const root = drawn[0];
     try spans.ensureUnusedCapacity(src.alloc, p.rows_to_draw.items.len + 3);
     for (p.rows_to_draw.items) |row| {
         const top = root.y_px + @as(i32, @intCast(row)) * root_h;
         spans.appendAssumeCapacity(.{ .top_px = top, .bottom_px = top + root_h });
     }
     if (p.root_scroll_rect) |sr| spans.appendAssumeCapacity(.{ .top_px = sr.top - p.y_offset, .bottom_px = sr.bottom - p.y_offset });
-    for (layers[1..n]) |layer| {
+    for (drawn[1..n]) |layer| {
         const state = paint.layerState(layer.grid_id) orelse continue;
         const row_limit = src.rows(layer).len;
         if (row_limit == 0) continue;
+        // A layer that moved (step 1b) leaves pixels where the previous
+        // frame drew it, which may lie outside its anchor.
+        if (state.follow_dy_px != state.prev_follow_dy_px) {
+            const b = layer.rowsBandPx(0, @intCast(row_limit), h);
+            const prev_y_px = layer.y_px - state.follow_dy_px + state.prev_follow_dy_px;
+            try spans.append(src.alloc, .{ .top_px = prev_y_px + b[0], .bottom_px = prev_y_px + b[1] });
+        }
         if (state.draw_all) {
             const b = layer.rowsBandPx(0, @intCast(row_limit), h);
             try spans.append(src.alloc, .{ .top_px = layer.y_px + b[0], .bottom_px = layer.y_px + b[1] });
@@ -4552,7 +4608,7 @@ pub fn planLayerFrame(
     try paint.bands.ensureTotalCapacity(src.alloc, @max(1, spans.items.len));
     paint.bands.items.len = core.damage_bands.bands(spans.items, root_h, p.content_height, paint.bands.allocatedSlice());
     for (paint.bands.items) |band| {
-        for (layers[1..n]) |layer| {
+        for (drawn[1..n]) |layer| {
             const state = paint.layerState(layer.grid_id) orelse continue;
             if (state.draw_all) continue;
             const rows = layer.rowsForBand(band, layer.y_px, @intCast(src.rows(layer).len), h) orelse continue;
@@ -5985,6 +6041,7 @@ pub fn drawSurfaceRowPass(
     // The copy has to land before the rows below paint over the band it
     // moves, and the plan before the draw.
     var layer_src: ?LayerFrameSource = null;
+    var drawn_layers = layers;
     if (has_layers) {
         const src: LayerFrameSource = .{
             .set = &surface.tbs.sets[in.snapshot.committed_index],
@@ -6013,6 +6070,11 @@ pub fn drawSurfaceRowPass(
             .ease = in.ease,
             .log_enabled = in.frame.log_enabled,
         });
+        // Everything below draws each layer where the plan placed it, and
+        // the cursor rides the float it sits in.
+        drawn_layers = paint.drawn_layers.items;
+        if (paint.layerState(in.snapshot.cursor_layer_grid_id)) |st|
+            in.frame.cursor_layer_origin[1] += @floatFromInt(st.follow_dy_px);
         if (in.layer_present) |lp| appendBandPresentRects(
             paint.bands.items,
             p.x_offset,
@@ -6036,7 +6098,7 @@ pub fn drawSurfaceRowPass(
         if (state.ease.moving()) ease_moving = true;
     };
 
-    in.frame.layers = layers;
+    in.frame.layers = drawn_layers;
     in.frame.layer_src = layer_src;
     in.frame.rows_to_draw = rows_to_draw.items;
     const frame = drawSurfaceRowFrame(g, app, .{
@@ -7998,6 +8060,105 @@ fn planForTest(
         .root_rows = layers[0].rows,
         .log_enabled = false,
     });
+}
+
+test "a buffer-tracking float rides its anchor window's ease" {
+    const alloc = std.testing.allocator;
+    var layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 20, .cols = 20, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 20, .cols = 20, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 2, .x_px = 0, .y_px = 60, .rows = 2, .cols = 5, .z = 2, .follows_scroll = true, .is_float = true },
+    };
+    var paint: SurfacePaintState = .{};
+    var budget: RowVBPhysicalBudget = .{};
+    defer paint.deinit(alloc, &budget);
+    try paint.syncLayers(alloc, &budget, &layers);
+    const anchor = &paint.layerState(2).?.ease;
+
+    // Control: the anchor at rest moves nothing.
+    try std.testing.expectEqual(@as(i32, 0), followScrollDyPx(&paint, layers[2], &layers));
+
+    // Easing, the float moves by the anchor's offset, rounded to a pixel.
+    anchor.easing = true;
+    anchor.offset_px = 33.6;
+    try std.testing.expectEqual(@as(i32, 34), followScrollDyPx(&paint, layers[2], &layers));
+    anchor.offset_px = -12.4;
+    try std.testing.expectEqual(@as(i32, -12), followScrollDyPx(&paint, layers[2], &layers));
+
+    // Easing in its own right, the float keeps its own offset.
+    paint.layerState(3).?.ease.easing = true;
+    try std.testing.expectEqual(@as(i32, 0), followScrollDyPx(&paint, layers[2], &layers));
+    paint.layerState(3).?.ease.easing = false;
+
+    // A float fixed to its window stays put.
+    layers[2].follows_scroll = false;
+    try std.testing.expectEqual(@as(i32, 0), followScrollDyPx(&paint, layers[2], &layers));
+    layers[2].follows_scroll = true;
+
+    // Anchored to a float, it does not follow.
+    layers[1].is_float = true;
+    try std.testing.expectEqual(@as(i32, 0), followScrollDyPx(&paint, layers[2], &layers));
+    layers[1].is_float = false;
+
+    // Anchored to the root, it rides the root's ease.
+    layers[2].anchor_grid = 1;
+    anchor.easing = false;
+    try std.testing.expectEqual(@as(i32, 0), followScrollDyPx(&paint, layers[2], &layers));
+    paint.root_ease.easing = true;
+    paint.root_ease.offset_px = 20;
+    try std.testing.expectEqual(@as(i32, 20), followScrollDyPx(&paint, layers[2], &layers));
+}
+
+test "a float moved by its anchor's ease is drawn whole and damages the place it left" {
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 20, .cols = 20, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 0, .y_px = 6 * row_h_px, .rows = 2, .cols = 5, .z = 1, .follows_scroll = true, .is_float = true },
+    };
+    var fx = LayerPlanFixture{};
+    defer fx.deinit(alloc);
+    try fx.init(alloc, &.{3}, &.{2}, &layers);
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows_to_draw.deinit(alloc);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(alloc);
+    const contains = struct {
+        fn f(rows: []const u32, row: u32) bool {
+            return std.mem.indexOfScalar(u32, rows, row) != null;
+        }
+    }.f;
+
+    // Control: no ease, the float is drawn where it is placed and owes nothing.
+    try planForTest(&fx, alloc, &layers, row_h_px, 8, 1, .{ null, null }, &rows_to_draw, &scratch);
+    try std.testing.expectEqual(@as(i32, 60), fx.paint.drawn_layers.items[1].y_px);
+    try std.testing.expect(!fx.paint.layerState(3).?.draw_all);
+
+    // The anchor eases 2 rows down: the float is drawn there, whole, and the
+    // rows it left (6..7) are redrawn with the rows it covers now (8..9).
+    fx.paint.root_ease.easing = true;
+    fx.paint.root_ease.offset_px = 2 * row_h_px;
+    rows_to_draw.clearRetainingCapacity();
+    try planForTest(&fx, alloc, &layers, row_h_px, 8, 1, .{ null, null }, &rows_to_draw, &scratch);
+    try std.testing.expectEqual(@as(i32, 80), fx.paint.drawn_layers.items[1].y_px);
+    try std.testing.expect(fx.paint.layerState(3).?.draw_all);
+    try std.testing.expect(contains(rows_to_draw.items, 6));
+    try std.testing.expect(contains(rows_to_draw.items, 9));
+
+    // The frame that brings the ease to rest puts it back and damages 8..9.
+    fx.paint.root_ease.offset_px = 0;
+    rows_to_draw.clearRetainingCapacity();
+    try planForTest(&fx, alloc, &layers, row_h_px, 8, 1, .{ null, null }, &rows_to_draw, &scratch);
+    try std.testing.expectEqual(@as(i32, 60), fx.paint.drawn_layers.items[1].y_px);
+    try std.testing.expect(fx.paint.layerState(3).?.draw_all);
+    try std.testing.expect(contains(rows_to_draw.items, 9));
+
+    // At rest it owes nothing again.
+    fx.paint.root_ease.easing = false;
+    rows_to_draw.clearRetainingCapacity();
+    try planForTest(&fx, alloc, &layers, row_h_px, 8, 1, .{ null, null }, &rows_to_draw, &scratch);
+    try std.testing.expect(!fx.paint.layerState(3).?.draw_all);
+    try std.testing.expectEqual(@as(usize, 0), rows_to_draw.items.len);
 }
 
 test "a layer's cursor row is repainted over the layers above it" {
