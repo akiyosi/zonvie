@@ -66,9 +66,9 @@ final class GlyphAtlas {
     /// Full logical atlas image used to batch cold-glyph uploads. Allocated
     /// only at initialization or an atlas resize; uploadRegion writes glyph
     /// pixels into this persistent storage and the flush boundary performs one
-    /// texture replace for the staged union.
+    /// texture replace per staged row band.
     private var atlasShadow: [UInt8] = [] // mu protected
-    private var stagedUploadRect: AtlasDirtyRect? = nil // mu protected
+    private var stagedUploadRects = AtlasUploadRects() // mu protected
     // mu protected: set when recreateTexture()'s makeTexture() call fails (e.g. an
     // MTLTexture allocation failure under memory pressure). prepareBackTexture()
     // retries the allocation for this slot on every subsequent beginFlush() until
@@ -1300,7 +1300,7 @@ final class GlyphAtlas {
         needsAtlasRebuild = true
         flushHadRecreate = true
         flushDirtyRect = nil
-        stagedUploadRect = nil
+        stagedUploadRects.removeAll()
         flushUploadTransactionOpen = false
         // NOTE: does NOT set atlasModified.
         // Callers that need swap must set it explicitly:
@@ -2236,12 +2236,7 @@ final class GlyphAtlas {
         }
 
         atlasModified = true
-        if var rect = stagedUploadRect {
-            rect.union(x: destX, y: destY, width: width, height: height)
-            stagedUploadRect = rect
-        } else {
-            stagedUploadRect = AtlasDirtyRect(x: destX, y: destY, width: width, height: height)
-        }
+        stagedUploadRects.insert(x: destX, y: destY, width: width, height: height)
         if var rect = flushDirtyRect {
             rect.union(x: destX, y: destY, width: width, height: height)
             flushDirtyRect = rect
@@ -2252,8 +2247,8 @@ final class GlyphAtlas {
         return .uploaded
     }
 
-    /// Flush all staged glyph pixels with one driver call. Reader admission is
-    /// closed only for the actual texture replace, never for rasterization,
+    /// Flush all staged glyph pixels, one driver call per staged row band.
+    /// Reader admission is closed only for the texture replaces, never for rasterization,
     /// fallback font resolution, bitmap copies, or vertex generation.
     ///
     /// Returns false without discarding staged CPU pixels when a prior blit or
@@ -2269,7 +2264,7 @@ final class GlyphAtlas {
             return false
         case .failed:
             os_unfair_lock_lock(&mu)
-            stagedUploadRect = nil
+            stagedUploadRects.removeAll()
             flushUploadTransactionOpen = false
             os_unfair_lock_unlock(&mu)
             return false
@@ -2283,22 +2278,24 @@ final class GlyphAtlas {
 
         os_unfair_lock_lock(&mu)
         var committed = true
-        if let rect = stagedUploadRect,
+        if !stagedUploadRects.isEmpty,
            let tex = textures[1 - frontIndex] {
             atlasShadow.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return }
-                let byteOffset = (rect.y * atlasW + rect.x) * 4
-                tex.replace(
-                    region: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height),
-                    mipmapLevel: 0,
-                    withBytes: base.advanced(by: byteOffset),
-                    bytesPerRow: atlasW * 4
-                )
+                for rect in stagedUploadRects.rects {
+                    let byteOffset = (rect.y * atlasW + rect.x) * 4
+                    tex.replace(
+                        region: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height),
+                        mipmapLevel: 0,
+                        withBytes: base.advanced(by: byteOffset),
+                        bytesPerRow: atlasW * 4
+                    )
+                }
             }
-            stagedUploadRect = nil
-        } else if stagedUploadRect != nil {
+            stagedUploadRects.removeAll()
+        } else if !stagedUploadRects.isEmpty {
             needsAtlasRebuild = true
-            stagedUploadRect = nil
+            stagedUploadRects.removeAll()
             committed = false
         }
         if committed { flushUploadTransactionOpen = false }
@@ -2345,7 +2342,7 @@ final class GlyphAtlas {
         atlasModified = true
         flushHadRecreate = true
         flushDirtyRect = nil
-        stagedUploadRect = nil
+        stagedUploadRects.removeAll()
         flushUploadTransactionOpen = false
         // The successfully allocated slot completes the rebuild requested by
         // setBackingScale, setFont, or a prior allocation/command failure.

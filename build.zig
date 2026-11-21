@@ -404,6 +404,16 @@ pub fn build(b: *std.Build) !void {
                     "macos/Tests/FontCellFitTests.swift",
                 },
             },
+            // The flush's staged atlas upload: glyphs in one shelf share a row
+            // band and distant shelves stay apart, so the texture replace
+            // copies only the rows glyphs were written to.
+            .{
+                .exe_name = "atlas-upload-rects-tests",
+                .sources = &.{
+                    "macos/Sources/Font/AtlasUploadRects.swift",
+                    "macos/Tests/AtlasUploadRectsTests.swift",
+                },
+            },
             // A variable font's Bold/Italic faces are instances of one file:
             // FreeType must be handed their coordinates, merged with the user's.
             .{
