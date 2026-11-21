@@ -20,6 +20,8 @@ const postfx = @import("postfx.zig");
 const scrollbar = @import("../scrollbar.zig");
 const layer_geom = @import("../layer_geom.zig");
 const chrome = @import("../ui.zig").chrome;
+const frame_damage = @import("../frame_damage.zig");
+const Band = frame_damage.Band;
 
 const shader_src = @embedFile("../shaders/main.glsl");
 const initial_vbo_bytes: usize = 64 * 1024;
@@ -77,6 +79,24 @@ pub const Target = struct {
     /// One layer's rows concatenated for a single upload; capacity reused
     /// across frames.
     scratch: std.ArrayListUnmanaged(core.Vertex) = .empty,
+    /// Set while a partial frame repaints one band: every scissor is cut to
+    /// `clip` (framebuffer px, top-down: x0, y0, x1, y1), and each layer
+    /// draws only its rows that meet `band` (view px).
+    clip: ?[4]i32 = null,
+    band: ?Band = null,
+    /// The main view's frames so far, for its back buffer's age.
+    history: frame_damage.History = .{},
+    /// What the last main frame drew besides committed rows (frameKey);
+    /// another value draws the frame whole.
+    last_key: u64 = 0,
+    /// Where the last main frame drew the cursor, view px; null for nowhere.
+    last_cursor: ?Band = null,
+    /// A partial frame's bands: those it changed, and those it repaints
+    /// (those, and what the back buffer missed).
+    own_bands: [frame_damage.max_bands]Band = undefined,
+    draw_bands: [frame_damage.max_bands]Band = undefined,
+    /// The swap's damage, x, y, w, h in buffer px from the bottom-left.
+    swap_rects: [frame_damage.max_bands][4]i32 = undefined,
 
     pub fn deinit(self: *Target, alloc: std.mem.Allocator) void {
         self.scratch.deinit(alloc);
@@ -267,18 +287,37 @@ fn drawVerts(app: *App, t: *Target, verts: []const core.Vertex, layer: core.Laye
     gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(verts.len));
 }
 
-/// Clips to a rect given top-down in surface px.
+/// Clips to a rect given top-down in surface px, within the band a partial
+/// frame repaints.
 fn scissor(t: *const Target, x: i32, top: i32, w: i32, h: i32) void {
+    var x0 = x + t.ox_px;
+    var y0 = top + t.oy_px;
+    var x1 = x0 + w;
+    var y1 = y0 + @max(0, h);
+    if (t.clip) |c| {
+        x0 = @max(x0, c[0]);
+        y0 = @max(y0, c[1]);
+        x1 = @max(x0, @min(x1, c[2]));
+        y1 = @max(y0, @min(y1, c[3]));
+    }
     // Bottom-up in the framebuffer, which the view may be a part of.
     const fb_h: i32 = @intCast(if (t.fb_h_px != 0) t.fb_h_px else t.h_px);
-    const y = if (t.flip_y) top else fb_h - t.oy_px - top - h;
+    const y = if (t.flip_y) y0 else fb_h - y1;
     const s = t.px_scale;
     const f = struct {
         fn px(v: i32, k: f32) i32 {
             return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * k));
         }
     }.px;
-    gl.glScissor(f(x + t.ox_px, s), f(y, s), f(w, s), f(@max(0, h), s));
+    gl.glScissor(f(x0, s), f(y, s), f(x1 - x0, s), f(y1 - y0, s));
+}
+
+/// Ends a clip `scissor` set: back to the band a partial frame repaints, or
+/// none.
+fn endScissor(t: *const Target) void {
+    const c = t.clip orelse return gl.glDisable(gl.GL_SCISSOR_TEST);
+    gl.glEnable(gl.GL_SCISSOR_TEST);
+    scissor(t, c[0] - t.ox_px, c[1] - t.oy_px, c[2] - c[0], c[3] - c[1]);
 }
 
 /// `layer`'s cell and box: its grid's own font when it has one. Caller
@@ -294,8 +333,20 @@ fn scissorRows(app: *const App, t: *const Target, layer: core.Layer, row_start: 
     scissor(t, layer.x_px, layer.y_px + @as(i32, @intCast(band[0])), @intCast(g.widthPx()), @intCast(band[1] - band[0]));
 }
 
-/// Appends rows [start, end) to the target's scratch buffer.
+/// Rows [start, end) of `layer`'s `len` that the band being repainted
+/// reaches (damage_bands.layerRowsForBand); all of them outside a partial
+/// frame.
+fn bandRows(app: *const App, t: *const Target, layer: core.Layer, len: usize) [2]usize {
+    const b = t.band orelse return .{ 0, len };
+    const g = layerGeom(app, layer);
+    const r = core.damage_bands.layerRowsForBand(b, layer.y_px, @intCast(len), @intCast(g.row_h_px)) orelse return .{ 0, 0 };
+    return .{ r[0], r[1] + 1 };
+}
+
+/// Appends rows [start, end) to the target's scratch buffer; none when the
+/// range is empty.
 fn gatherRows(app: *App, t: *Target, rows: []const Row, start: usize, end: usize) void {
+    if (start >= end) return;
     for (rows[start..end]) |row| {
         t.scratch.appendSlice(app.alloc, row.verts.items) catch break;
     }
@@ -313,23 +364,24 @@ fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, re
     const rows = grid.committedRows();
     const r0: usize = @min(region[0], rows.len);
     const r1: usize = @min(region[1], rows.len);
+    const span = bandRows(app, t, layer, rows.len);
     var total: usize = 0;
     const boxed = layerGeom(app, layer).extent != null;
     if (boxed) {
         gl.glEnable(gl.GL_SCISSOR_TEST);
         scissorRows(app, t, layer, 0, layer.rows);
     }
-    defer if (boxed) gl.glDisable(gl.GL_SCISSOR_TEST);
+    defer if (boxed) endScissor(t);
 
     t.scratch.clearRetainingCapacity();
-    gatherRows(app, t, rows, 0, r0);
-    gatherRows(app, t, rows, r1, rows.len);
+    gatherRows(app, t, rows, span[0], @min(r0, span[1]));
+    gatherRows(app, t, rows, @max(r1, span[0]), span[1]);
     total += t.scratch.items.len;
     drawVerts(app, t, t.scratch.items, layer, 0);
     if (r0 == r1) return total;
 
     t.scratch.clearRetainingCapacity();
-    gatherRows(app, t, rows, r0, r1);
+    gatherRows(app, t, rows, @max(r0, span[0]), @min(r1, span[1]));
     for (grid.retainedRows()) |r| {
         if (!r.live) continue;
         t.scratch.appendSlice(app.alloc, r.verts.items) catch break;
@@ -338,7 +390,7 @@ fn drawLayer(app: *App, t: *Target, layer: core.Layer, grid: *const GridRows, re
     gl.glEnable(gl.GL_SCISSOR_TEST);
     scissorRows(app, t, layer, @intCast(r0), @intCast(r1));
     drawVerts(app, t, t.scratch.items, layer, offset_px);
-    gl.glDisable(gl.GL_SCISSOR_TEST);
+    endScissor(t);
     return total;
 }
 
@@ -356,7 +408,7 @@ fn begin(app: *App, t: *Target) bool {
     // layer's (drawUi).
     gl.glEnable(gl.GL_SCISSOR_TEST);
     scissor(t, 0, 0, @intCast(t.w_px), @intCast(t.h_px));
-    defer gl.glDisable(gl.GL_SCISSOR_TEST);
+    defer endScissor(t);
     clearToBg(app);
     return bind(t);
 }
@@ -433,7 +485,7 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
         scissorRows(app, t, layers[0], 0, layers[0].rows);
         gl.glClearColor(0, 0, 0, 0);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-        gl.glDisable(gl.GL_SCISSOR_TEST);
+        endScissor(t);
     }
     // The core sends layers back-to-front; draw in order (windows/app.zig:4432).
     for (layers) |layer| {
@@ -461,7 +513,7 @@ fn drawSurface(app: *App, t: *Target, layers: []const core.Layer, now_ns: i64) S
             scissorRows(app, t, layer, 0, layer.rows);
         }
         drawVerts(app, t, cur.verts, layer, if (ease) |e| e.offset_px else 0);
-        gl.glDisable(gl.GL_SCISSOR_TEST);
+        endScissor(t);
         break;
     }
     return out;
@@ -541,8 +593,17 @@ pub fn drawGlowExtract(app: *App, t: *Target, scale: f32, surface_id: i64) void 
     gl.glUniform1i(t.u_mode, 0);
 }
 
-/// One frame of the main window (main.zig draw).
-pub fn render(app: *App) void {
+/// What a main frame hands the swap.
+pub const Swap = struct {
+    /// Nothing on the window changed: there is no buffer to present.
+    skip: bool = false,
+    /// The rects the frame changed (Target.swap_rects); empty for all.
+    rects: []const [4]i32 = &.{},
+};
+
+/// One frame of the main window (main.zig draw), into a back buffer that
+/// holds the frame drawn `buffer_age` frames ago (0: unknown contents).
+pub fn render(app: *App, buffer_age: u32) Swap {
     const t = &app.gl;
     t.w_px = app.drawable_w_px;
     t.h_px = app.drawable_h_px;
@@ -550,11 +611,146 @@ pub fn render(app: *App) void {
     t.oy_px = app.view_y_px;
     t.fb_w_px = if (app.win_w_px != 0) app.win_w_px else t.w_px;
     t.fb_h_px = if (app.win_h_px != 0) app.win_h_px else t.h_px;
-    if (app.island()) clearCardPadding(app, t);
-    const f = if (postfx.active(app, &app.postfx)) postfx.renderFrame(app, t, &app.postfx, 1) else renderMain(app, t);
-    drawUi(app, t);
+    const fx = postfx.active(app, &app.postfx);
+    var out: Swap = .{};
+    switch (planFrame(app, t, fx, buffer_age)) {
+        .whole => |own| {
+            if (app.island()) clearCardPadding(app, t);
+            const f = if (fx) postfx.renderFrame(app, t, &app.postfx, 1) else renderMain(app, t);
+            drawUi(app, t);
+            // Drawn whole for a buffer that missed more, it still changed
+            // only its own bands.
+            if (own) |n| {
+                t.history.pushBands(t.own_bands[0..n]);
+                out.rects = swapRects(t, n);
+            } else t.history.pushFull();
+            if (app.test_full_redraw) {
+                app.test_full_redraw = false;
+                applog.appLog("[trace] event=full_frame_done surface=1\n", .{});
+            }
+            if (f.moving or app.postfx.animating) startEaseTick(app);
+        },
+        .none => out.skip = true,
+        .bands => |n| {
+            // Each band is the whole frame clipped to it: the view's rows
+            // across its width, the panels and the UI layer over them.
+            var moving = false;
+            for (t.draw_bands[0..n.draw]) |b| {
+                t.band = b;
+                t.clip = .{ t.ox_px, t.oy_px + b.top_px, t.ox_px + @as(i32, @intCast(t.w_px)), t.oy_px + b.bottom_px };
+                endScissor(t);
+                if (renderMain(app, t).moving) moving = true;
+                drawUi(app, t);
+            }
+            t.band = null;
+            t.clip = null;
+            gl.glDisable(gl.GL_SCISSOR_TEST);
+            t.history.pushBands(t.own_bands[0..n.own]);
+            out.rects = swapRects(t, n.own);
+            if (applog.isEnabled()) applog.appLog("[trace] event=partial_frame own={d} drawn={d} age={d}\n", .{ n.own, n.draw, buffer_age });
+            // A commit between the plan and the draw may start a scroll.
+            if (moving) startEaseTick(app);
+        },
+    }
     if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface=1\n", .{});
-    if (f.moving or app.postfx.animating) startEaseTick(app);
+    return out;
+}
+
+/// The first `n` own bands as the swap's damage.
+fn swapRects(t: *Target, n: usize) []const [4]i32 {
+    const fb_h: i32 = @intCast(t.fb_h_px);
+    for (t.own_bands[0..n], 0..) |b, i| {
+        t.swap_rects[i] = .{ t.ox_px, fb_h - (t.oy_px + b.bottom_px), @intCast(t.w_px), b.bottom_px - b.top_px };
+    }
+    return t.swap_rects[0..n];
+}
+
+const Plan = union(enum) {
+    /// The count of Target.own_bands when the frame changed only those,
+    /// and is drawn whole for a back buffer that missed more.
+    whole: ?usize,
+    /// Nothing changed since the last frame.
+    none,
+    /// Counts of Target.own_bands and Target.draw_bands.
+    bands: struct { own: usize, draw: usize },
+};
+
+/// Whether this main frame repaints the whole window or bands of the view:
+/// the rows the commits since the last frame sent and the cursor's moves,
+/// joined with what the back buffer missed. Anything else that changed what
+/// the frame draws draws it whole. Takes App.mu.
+fn planFrame(app: *App, t: *Target, fx: bool, buffer_age: u32) Plan {
+    app.mu.lockUncancelable(clock.io());
+    defer app.mu.unlock(clock.io());
+    var owed = app.surface.damage.take();
+    const cur = cursorBand(app, t);
+    if (app.surface.cursor_changed or !std.meta.eql(cur, t.last_cursor)) {
+        if (t.last_cursor) |b| owed.add(b.top_px, b.bottom_px);
+        if (cur) |b| owed.add(b.top_px, b.bottom_px);
+    }
+    app.surface.cursor_changed = false;
+    t.last_cursor = cur;
+    const key = frameKey(app, t, fx);
+    const key_changed = key != t.last_key;
+    t.last_key = key;
+    if (owed.full or key_changed or fx or app.test_full_redraw or t.program == 0 or t.atlas_w == 0) return .{ .whole = null };
+    // A scroll moves rows no commit sends, and so does the frame that ends it.
+    for (app.surface.committedLayers()) |l| {
+        const e = app.surface.gridEase(l.grid_id) orelse continue;
+        if (e.easing or e.moving() or e.offset_px != 0) return .{ .whole = null };
+    }
+    // A panel over the view changes with no row of the view.
+    if (!app.panel_popups) for (app.overlays) |o| if (o.open) return .{ .whole = null };
+    if (owed.isEmpty()) return .none;
+    const row_h: i32 = @intCast(app.cell_h_px);
+    const h: i32 = @intCast(t.h_px);
+    const own = core.damage_bands.bands(owed.spans[0..owed.n], row_h, h, &t.own_bands);
+    if (own == 0) return .none;
+    if (!t.history.catchUp(buffer_age, &owed)) return .{ .whole = own };
+    const draw = core.damage_bands.bands(owed.spans[0..owed.n], row_h, h, &t.draw_bands);
+    return .{ .bands = .{ .own = own, .draw = draw } };
+}
+
+/// Where the main view draws the cursor this frame, view px; null for
+/// nowhere. Caller holds App.mu.
+fn cursorBand(app: *App, t: *const Target) ?Band {
+    const cur = app.surface.committedCursor();
+    if (cur.verts.len == 0 or !app.cursor_blink.visible or t.skip_cursor) return null;
+    const layers = app.surface.committedLayers();
+    for (layers) |placed| {
+        if (placed.grid_id != cur.grid_id) continue;
+        const layer = followed(app, placed, layers);
+        var lo: f32 = std.math.inf(f32);
+        var hi: f32 = -std.math.inf(f32);
+        for (cur.verts) |v| {
+            lo = @min(lo, v.position[1]);
+            hi = @max(hi, v.position[1]);
+        }
+        return .{ .top_px = layer.y_px + @as(i32, @intFromFloat(@floor(lo))), .bottom_px = layer.y_px + @as(i32, @intFromFloat(@ceil(hi))) };
+    }
+    return null;
+}
+
+/// What the main frame draws besides the committed rows, the cursor and the
+/// panels: the frame is drawn whole when it differs from the last frame's.
+/// Caller holds App.mu.
+fn frameKey(app: *App, t: *const Target, fx: bool) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const sb = scrollbar.drawn(app, &app.scrollbar, 1);
+    const view = sb orelse surface_store.ScrollView{ .topline = 0, .botline = 0, .line_count = 0 };
+    const parts = .{
+        t.w_px,                     t.h_px,                  t.ox_px,              t.oy_px,        t.fb_w_px,        t.fb_h_px,
+        app.cell_w_px,              app.cell_h_px,           app.scale,            app.island(),   app.captionless(), app.default_bg,
+        app.window_cfg.opacity,     app.window_cfg.blur,     fx,                   app.panel_popups,
+        // The UI layer and the textures the frame samples.
+        app.chrome_gen,             app.ui_atlas.gen,        app.atlas_pending.gen,
+        sb != null,                 view.grid,               view.topline,         view.botline,   view.line_count,  app.scrollbar.alpha,
+    };
+    inline for (parts) |v| {
+        const x = v;
+        h.update(std.mem.asBytes(&x));
+    }
+    return h.final();
 }
 
 /// The UI layer over the whole window: its solid quads, then its text from
@@ -596,7 +792,7 @@ fn drawUiAt(app: *App, t: *Target, win_w: u32, win_h: u32, ox: i32, oy: i32) voi
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, t.vbo);
     gl.glEnable(gl.GL_BLEND);
     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
-    gl.glDisable(gl.GL_SCISSOR_TEST);
+    endScissor(t);
     drawVerts(app, t, layer.solid.items, surface_layer, 0);
     if (layer.round.items.len != 0) {
         gl.glUniform1i(t.u_mode, 2);
@@ -929,7 +1125,7 @@ fn drawPanel(app: *App, t: *Target, kind: overlay_layout.Kind, r: overlay_layout
                 drawVerts(app, t, cur.verts, placed, 0);
             }
         }
-        gl.glDisable(gl.GL_SCISSOR_TEST);
+        endScissor(t);
         if (overlay_layout.closeBadgeRect(kind, r, scale)) |box| {
             t.scratch.clearRetainingCapacity();
             pushCloseBadge(app, t, box, app.msg_chrome.look(), rgba(app.cmdline_icon_rgb, 1));

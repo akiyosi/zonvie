@@ -94,6 +94,8 @@ extern "c" fn zwl_selection_get(primary: c_int, out_len: *usize) ?[*]u8;
 extern "c" fn zwl_egl_init(w_px: i32, h_px: i32) c_int;
 extern "c" fn zwl_egl_resize(w_px: i32, h_px: i32) void;
 extern "c" fn zwl_swap() c_int;
+extern "c" fn zwl_buffer_age() c_int;
+extern "c" fn zwl_swap_damage(rects: [*]const [4]i32, n: i32) c_int;
 extern "c" fn zwl_dispatch() c_int;
 extern "c" fn zwl_dispatch_pending() c_int;
 extern "c" fn zwl_flush() c_int;
@@ -107,6 +109,7 @@ extern "c" fn g_unix_fd_add(fd: c_int, condition: c_uint, func: *const fn (c_int
 extern "c" fn g_timeout_add(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
 extern "c" fn g_source_remove(tag: c_uint) c_int;
 extern "c" fn g_idle_add(func: GSourceFunc, data: ?*anyopaque) c_uint;
+extern "c" fn g_unix_signal_add(signum: c_int, handler: GSourceFunc, data: ?*anyopaque) c_uint;
 const G_IO_IN: c_uint = 1;
 
 /// The window's side of the App: main thread only.
@@ -209,10 +212,21 @@ fn draw() void {
     window.dirty = false;
     window.shown = true;
     if (applog.isEnabled()) applog.appLog("[wl] draw\n", .{});
-    gl_renderer.render(window.app);
+    const swap = gl_renderer.render(window.app, @intCast(@max(0, zwl_buffer_age())));
+    // Nothing changed: the frame on screen stays, and no buffer is spent.
+    if (swap.skip) return pump();
     zwl_request_frame();
-    _ = zwl_swap();
+    _ = zwl_swap_damage(swap.rects.ptr, @intCast(swap.rects.len));
     pump();
+}
+
+/// Test only: SIGUSR2 to an app run with ZONVIE_TEST_FULL_REDRAW=1 draws the
+/// next main frame whole (test/gui/linux_window.zig forceFullRedraw).
+fn onTestFullRedraw(data: ?*anyopaque) callconv(.c) c_int {
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.test_full_redraw = true;
+    queueRender(app);
+    return 1;
 }
 
 /// EGL reads the socket too (its own roundtrips, a swap), and what it reads
@@ -1688,6 +1702,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     _ = g_unix_fd_add(zwl_fd(), G_IO_IN, &onWayland, null);
+    if (std.c.getenv("ZONVIE_TEST_FULL_REDRAW")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "1")) _ = g_unix_signal_add(@intFromEnum(std.posix.SIG.USR2), &onTestFullRedraw, app);
+    }
     pump();
     g_main_loop_run(loop);
     stopCore(app);

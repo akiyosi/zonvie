@@ -62,9 +62,9 @@ const is_windows = builtin.os.tag == .windows;
 const can_capture = driver.capture.supported;
 const is_linux = builtin.os.tag == .linux;
 
-/// The Linux renderer draws every committed row of every layer each frame:
-/// no row reuse, blit, scroll fast path or per-row gating, so the scenarios
-/// that assert those paths ran have nothing to observe there.
+/// The Linux renderer repaints the bands a frame changed, but scrolls by
+/// drawing whole: no row-scroll blit, scroll fast path or per-row gating, so
+/// the scenarios that assert those paths ran have nothing to observe there.
 const redraws_partially = !is_linux;
 /// The cmdline is an overlay in the main window on Linux, not a window of its
 /// own, and a tiling compositor sizes the window, not :set columns/lines.
@@ -249,11 +249,11 @@ test "gui:visual_split" {
 }
 
 test "gui:visual_partial_matches_full" {
-    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full.zig"));
+    try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
 test "gui:visual_partial_matches_full_float_move" {
-    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full_float_move.zig"));
+    try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
 }
 
 test "gui:visual_split_divider_survives_layer_redraw" {

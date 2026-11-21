@@ -8,7 +8,9 @@ const core = @import("zonvie_core");
 const Vertex = core.Vertex;
 const grid_ease = @import("grid_ease.zig");
 pub const ScrollInput = grid_ease.ScrollInput;
-pub const GridFont = @import("layer_geom.zig").GridFont;
+const layer_geom = @import("layer_geom.zig");
+pub const GridFont = layer_geom.GridFont;
+const frame_damage = @import("frame_damage.zig");
 
 pub const Row = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
@@ -196,6 +198,11 @@ pub const SurfaceStore = struct {
     fonts_staged: std.AutoHashMapUnmanaged(i64, GridFont) = .empty,
     fonts: std.AutoHashMapUnmanaged(i64, GridFont) = .empty,
     fonts_dirty: bool = false,
+    /// What the commits since the main view last drew changed on it, in view
+    /// px (gl_renderer.render takes it). Caller holds App.mu.
+    damage: frame_damage.Pending = .{},
+    /// The committed cursor changed since the main view last drew.
+    cursor_changed: bool = false,
 
     pub fn deinit(self: *SurfaceStore, alloc: std.mem.Allocator) void {
         var it = self.grids.valueIterator();
@@ -340,7 +347,12 @@ pub const SurfaceStore = struct {
             var fit = self.fonts_staged.iterator();
             while (fit.next()) |e| self.fonts.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
             self.fonts_dirty = false;
+            self.damage.markFull();
         }
+        // Before the rows: their damage is placed by the layers they commit with.
+        if (self.main.staged and !std.mem.eql(u8, std.mem.sliceAsBytes(self.main.front.items), std.mem.sliceAsBytes(self.main.back.items))) self.damage.markFull();
+        self.main.commit();
+        if (self.destroyed.items.len != 0) self.damage.markFull();
         var it = self.grids.iterator();
         // Grid 1 is the root, holding chrome and messages, and negative ids
         // are UI the core owns: neither eases. A shift is in the grid's own
@@ -348,18 +360,22 @@ pub const SurfaceStore = struct {
         while (it.next()) |kv| {
             var grid_in = in;
             grid_in.row_h_px = self.rowHeightPx(kv.key_ptr.*, in.row_h_px);
+            self.noteDamage(kv.key_ptr.*, kv.value_ptr.*, in.row_h_px);
             kv.value_ptr.*.commit(alloc, kv.key_ptr.* >= 2, grid_in);
         }
-        self.main.commit();
         var oit = self.others.valueIterator();
         while (oit.next()) |l| l.*.commit();
         if (self.cursor_staged) {
+            self.cursor_changed = true;
             std.mem.swap(std.ArrayListUnmanaged(Vertex), &self.cursor_front, &self.cursor_back);
             self.cursor_front_grid = self.cursor_back_grid;
             self.cursor_staged = false;
         }
         // A cursor whose grid left the layout must stop displaying (zonvie_core.h).
-        if (!self.hasLayer(self.cursor_front_grid)) self.cursor_front.clearRetainingCapacity();
+        if (!self.hasLayer(self.cursor_front_grid) and self.cursor_front.items.len != 0) {
+            self.cursor_front.clearRetainingCapacity();
+            self.cursor_changed = true;
+        }
         for (self.destroyed.items) |id| {
             if (self.grids.fetchRemove(id)) |kv| {
                 kv.value.deinit(alloc);
@@ -367,6 +383,41 @@ pub const SurfaceStore = struct {
             }
         }
         self.destroyed.clearRetainingCapacity();
+    }
+
+    /// The main view's rows `g` is about to commit: what it stages, at the
+    /// place its main-surface layer gives it. A grid on no main layer is not
+    /// drawn there. Before `g.commit`, which clears what it staged.
+    fn noteDamage(self: *SurfaceStore, grid_id: i64, g: *const GridRows, surface_row_h_px: u32) void {
+        if (self.damage.full) return;
+        const placed = for (self.main.front.items) |l| {
+            if (l.grid_id == grid_id) break l;
+        } else return;
+        if (g.staged_clear or (g.staged_len != null and g.staged_len.? != g.front.items.len)) return self.damage.markFull();
+        const geom = layer_geom.Geom.of(placed, self.gridFont(grid_id), 0, surface_row_h_px);
+        if (g.staged_shift) |s| {
+            const b = geom.rowsBandPx(s.row_start, s.row_end);
+            self.damage.add(placed.y_px + @as(i32, @intCast(b[0])), placed.y_px + @as(i32, @intCast(b[1])));
+        }
+        const len = @min(g.front.items.len, g.dirty.bit_length);
+        var it = g.dirty.iterator(.{});
+        var run: ?[2]u32 = null;
+        while (it.next()) |i| {
+            if (i >= len) break;
+            const row: u32 = @intCast(i);
+            if (run) |r| if (r[1] == row) {
+                run.?[1] = row + 1;
+                continue;
+            };
+            if (run) |r| self.addRows(placed, geom, r);
+            run = .{ row, row + 1 };
+        }
+        if (run) |r| self.addRows(placed, geom, r);
+    }
+
+    fn addRows(self: *SurfaceStore, placed: core.Layer, geom: layer_geom.Geom, rows: [2]u32) void {
+        const b = geom.rowsBandPx(rows[0], rows[1]);
+        self.damage.add(placed.y_px + @as(i32, @intCast(b[0])), placed.y_px + @as(i32, @intCast(b[1])));
     }
 
     fn hasLayer(self: *const SurfaceStore, grid_id: i64) bool {
@@ -556,6 +607,85 @@ test "layers publish at commit only" {
     try s.prepareCommit(testing.allocator);
     s.commit(testing.allocator, no_scroll);
     try testing.expectEqual(@as(usize, 2), s.committedLayers().len);
+}
+
+fn placedLayer(grid: i64, y_px: i32, rows: u32) core.Layer {
+    return .{ .grid_id = grid, .anchor_grid = 1, .x_px = 0, .y_px = y_px, .rows = rows, .cols = 2, .z = 0, .flags = 0 };
+}
+
+/// A store whose main view shows grid 2 at y 100, with its damage taken.
+fn settledStore(s: *SurfaceStore) !void {
+    try s.stageLayers(testing.allocator, 1, &.{ placedLayer(1, 0, 10), placedLayer(2, 100, 4) });
+    const g = try s.rowsFor(testing.allocator, 2);
+    for (0..4) |i| try g.stageRow(testing.allocator, @intCast(i), &.{v(0)}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    _ = s.damage.take();
+}
+
+const no_scroll_rows: ScrollInput = .{ .now_ns = 1, .row_h_px = 10, .mousescroll_ver = 3, .large_jump = .partial };
+
+test "rows sent owe their band of the view, joined into runs" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try settledStore(&s);
+    const g = s.grids.get(2).?;
+    try g.stageRow(testing.allocator, 1, &.{v(0)}, 4);
+    try g.stageRow(testing.allocator, 2, &.{v(0)}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    const d = s.damage.take();
+    try testing.expect(!d.full);
+    try testing.expectEqual(@as(usize, 1), d.n);
+    try testing.expectEqual(frame_damage.Band{ .top_px = 110, .bottom_px = 130 }, d.spans[0]);
+}
+
+test "a commit that sends nothing owes nothing" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try settledStore(&s);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    try testing.expect(s.damage.take().isEmpty());
+}
+
+test "a moved layer or a new row count owes the whole view" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try settledStore(&s);
+    try s.stageLayers(testing.allocator, 1, &.{ placedLayer(1, 0, 10), placedLayer(2, 120, 4) });
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    try testing.expect(s.damage.take().full);
+
+    try s.grids.get(2).?.stageRow(testing.allocator, 0, &.{v(0)}, 5);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    try testing.expect(s.damage.take().full);
+}
+
+test "a grid on no main layer owes the main view nothing" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try settledStore(&s);
+    try (try s.rowsFor(testing.allocator, 7)).stageRow(testing.allocator, 0, &.{v(0)}, 1);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    try testing.expect(s.damage.take().isEmpty());
+}
+
+test "a shift owes its whole region" {
+    var s: SurfaceStore = .{};
+    defer s.deinit(testing.allocator);
+    try settledStore(&s);
+    const g = s.grids.get(2).?;
+    g.stageShift(0, 4, 1, 4, true);
+    try g.stageRow(testing.allocator, 3, &.{v(0)}, 4);
+    try s.prepareCommit(testing.allocator);
+    s.commit(testing.allocator, no_scroll_rows);
+    const d = s.damage.take();
+    try testing.expect(!d.full);
+    try testing.expectEqual(frame_damage.Band{ .top_px = 100, .bottom_px = 140 }, d.spans[0]);
 }
 
 test "cursor-only update never touches rows" {

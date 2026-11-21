@@ -140,10 +140,10 @@ pub fn pinWindow(pid: i32, x: i32, y: i32) void {
     _ = y;
 }
 
-/// The Linux renderer draws every committed row each frame, so there is no
-/// partial-redraw state to reset.
+/// Ask an app launched with ZONVIE_TEST_FULL_REDRAW=1 to draw its main
+/// window whole on the next frame (linux/main.zig onTestFullRedraw).
 pub fn forceFullRedraw(pid: i32) void {
-    _ = pid;
+    std.posix.kill(pid, std.posix.SIG.USR2) catch {};
 }
 
 pub fn dumpWindowsForPid(pid: i32) void {

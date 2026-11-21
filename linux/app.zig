@@ -326,6 +326,12 @@ pub const App = struct {
     chrome_layer: ui_layer.Layer = .{},
     chrome_back: ui_layer.Layer = .{},
     ui_atlas: ui_layer.Atlas = .{},
+    /// Moves when a swap changes what `chrome_layer` draws: a main frame
+    /// after one is drawn whole (gl_renderer.frameKey). Under `mu`.
+    chrome_gen: u64 = 0,
+    /// Test only (ZONVIE_TEST_FULL_REDRAW=1): SIGUSR2 asked for the next main
+    /// frame to be drawn whole, which logs full_frame_done. Main thread.
+    test_full_redraw: bool = false,
     /// The cursor blink's one-shot timer (0: none) and its lock retry
     /// (blink.zig); main thread only.
     blink_timer: c_uint = 0,

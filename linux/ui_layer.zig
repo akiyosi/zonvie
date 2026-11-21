@@ -13,6 +13,7 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const App = @import("app.zig").App;
 const atlas_pixels = @import("atlas_pixels.zig");
+const shell = @import("shell.zig");
 
 pub const atlas_size = 1024;
 
@@ -44,10 +45,83 @@ pub const Atlas = struct {
     /// The faces' pixel size the glyphs were made at; another size starts over.
     pixel_size: u32 = 0,
     gen: u64 = 0,
+    /// A glyph found no room: the next build starts the atlas over.
+    full: bool = false,
 
     pub fn deinit(self: *Atlas, alloc: std.mem.Allocator) void {
         alloc.free(self.pixels);
         self.glyphs.deinit(alloc);
+    }
+
+    /// A rasterized glyph for `insert`: its pixels as RGBA8, w * h * 4 bytes.
+    pub const Raster = struct {
+        w: u32,
+        h: u32,
+        rgba: []const u8,
+        bearing_x: i32,
+        bearing_y: i32,
+        cells: u8,
+        color: bool,
+    };
+
+    /// The texture's pixels, zeroed, on first use.
+    fn ensurePixels(self: *Atlas, alloc: std.mem.Allocator, pixel_size: u32) !void {
+        if (self.pixels.len != 0) return;
+        self.pixels = try alloc.alloc(u8, atlas_size * atlas_size * 4);
+        @memset(self.pixels, 0);
+        self.pixel_size = pixel_size;
+    }
+
+    /// Whether a build at `pixel_size` starts the atlas over: its glyphs are
+    /// another size's, or one found no room.
+    fn startsOver(self: *const Atlas, pixel_size: u32) bool {
+        return self.pixels.len != 0 and (self.pixel_size != pixel_size or self.full);
+    }
+
+    /// `r` packed under `key`. A glyph that never fits is kept empty, so it
+    /// is not rasterized again; one that finds no room left is returned
+    /// empty, uncached, still `r.cells` wide, and marks the atlas full. Null
+    /// only when the cache cannot grow. Pre: ensurePixels succeeded.
+    fn insert(self: *Atlas, alloc: std.mem.Allocator, key: u64, r: Raster) ?Glyph {
+        const empty: Glyph = .{ .x = 0, .y = 0, .w = 0, .h = 0, .bearing_x = 0, .bearing_y = 0, .cells = r.cells, .color = false };
+        if (r.w + 2 > atlas_size or r.h + 2 > atlas_size) {
+            self.glyphs.put(alloc, key, empty) catch return null;
+            return empty;
+        }
+        var pen_x = self.pen_x;
+        var pen_y = self.pen_y;
+        var row_h = self.row_h;
+        if (pen_x + r.w + 1 > atlas_size) {
+            pen_x = 1;
+            pen_y += row_h + 1;
+            row_h = 0;
+        }
+        if (pen_y + r.h + 1 > atlas_size) {
+            self.full = true;
+            return empty;
+        }
+        const g: Glyph = .{
+            .x = @intCast(pen_x),
+            .y = @intCast(pen_y),
+            .w = @intCast(r.w),
+            .h = @intCast(r.h),
+            .bearing_x = @intCast(std.math.clamp(r.bearing_x, -32768, 32767)),
+            .bearing_y = @intCast(std.math.clamp(r.bearing_y, -32768, 32767)),
+            .cells = r.cells,
+            .color = r.color,
+        };
+        self.glyphs.put(alloc, key, g) catch return null;
+        var row: usize = 0;
+        const row_bytes = @as(usize, r.w) * 4;
+        while (row < r.h) : (row += 1) {
+            const dst = (@as(usize, pen_y) + row) * atlas_size * 4 + @as(usize, pen_x) * 4;
+            @memcpy(self.pixels[dst..][0..row_bytes], r.rgba[row * row_bytes ..][0..row_bytes]);
+        }
+        self.pen_x = pen_x + r.w + 1;
+        self.pen_y = pen_y;
+        self.row_h = @max(row_h, r.h);
+        self.gen +%= 1;
+        return g;
     }
 
     fn reset(self: *Atlas, pixel_size: u32) void {
@@ -57,6 +131,7 @@ pub const Atlas = struct {
         self.pen_y = 1;
         self.row_h = 0;
         self.pixel_size = pixel_size;
+        self.full = false;
         self.gen +%= 1;
     }
 };
@@ -85,6 +160,14 @@ pub const Layer = struct {
         self.hits.clearRetainingCapacity();
     }
 
+    /// Draws the same pixels as `other` (the hits draw nothing).
+    pub fn eql(self: *const Layer, other: *const Layer) bool {
+        const b = std.mem.sliceAsBytes;
+        return std.mem.eql(u8, b(self.solid.items), b(other.solid.items)) and
+            std.mem.eql(u8, b(self.round.items), b(other.round.items)) and
+            std.mem.eql(u8, b(self.text.items), b(other.text.items));
+    }
+
     /// The topmost hit under (x, y) window px: the last one added.
     pub fn hitAt(self: *const Layer, x: i32, y: i32) ?Hit {
         var i = self.hits.items.len;
@@ -108,6 +191,9 @@ pub const Builder = struct {
     cell_w: i32,
     cell_h: i32,
     ascent: i32,
+    /// The atlas held no glyph when this build started: an overflow now
+    /// would recur on a rebuild, so it does not ask for one.
+    started_empty: bool,
 
     pub fn begin(app: *App, layer: *Layer) Builder {
         layer.clear();
@@ -116,7 +202,10 @@ pub const Builder = struct {
         if (app.corep) |cp| core.zonvie_core_lock_grid(cp);
         const locked = true;
         const f = &app.fonts;
-        if (app.ui_atlas.pixels.len != 0 and app.ui_atlas.pixel_size != f.pixel_size) app.ui_atlas.reset(f.pixel_size);
+        const a = &app.ui_atlas;
+        // Safe while the layer on screen still samples the old glyphs: the
+        // renderer runs on this thread and draws only after the swap.
+        if (a.startsOver(f.pixel_size)) a.reset(f.pixel_size);
         return .{
             .app = app,
             .layer = layer,
@@ -124,6 +213,7 @@ pub const Builder = struct {
             .cell_w = @intCast(f.cell_w_px),
             .cell_h = @intCast(f.cell_h_px),
             .ascent = @divTrunc(f.ascent_26_6 + 32, 64),
+            .started_empty = a.glyphs.count() == 0,
         };
     }
 
@@ -230,7 +320,9 @@ pub const Builder = struct {
     }
 
     /// The glyph for `scalar`, rasterized on first use. Null without a core
-    /// (nothing guards the faces then), a face, or room in the atlas.
+    /// (nothing guards the faces then) or a face. Without room in the atlas
+    /// it is an empty glyph of its width, and the atlas starts over with the
+    /// next build.
     fn glyph(self: *Builder, scalar: u21, style: Style) ?Glyph {
         const app = self.app;
         const a = &app.ui_atlas;
@@ -238,47 +330,83 @@ pub const Builder = struct {
         const key = @as(u64, scalar) | (@as(u64, flags) << 32);
         if (a.glyphs.get(key)) |g| return g;
         if (!self.locked or app.fonts.regular == null) return null;
-        if (a.pixels.len == 0) {
-            a.pixels = app.alloc.alloc(u8, atlas_size * atlas_size * 4) catch return null;
-            @memset(a.pixels, 0);
-            a.pixel_size = app.fonts.pixel_size;
-        }
+        a.ensurePixels(app.alloc, app.fonts.pixel_size) catch return null;
         var bm: core.GlyphBitmap = undefined;
         if (!app.fonts.rasterizeScalar(app.alloc, scalar, flags, &.{}, &.{}, &bm)) return null;
         const w = bm.width;
         const h = bm.height;
-        if (w + 2 > atlas_size or h + 2 > atlas_size) return null;
-        if (a.pen_x + w + 1 > atlas_size) {
-            a.pen_x = 1;
-            a.pen_y += a.row_h + 1;
-            a.row_h = 0;
-        }
-        if (a.pen_y + h + 1 > atlas_size) return null;
-        if (w != 0 and h != 0) {
-            const tmp = app.alloc.alloc(u8, @as(usize, w) * h * 4) catch return null;
-            defer app.alloc.free(tmp);
-            atlas_pixels.toRgba8(&bm, tmp);
-            var row: usize = 0;
-            while (row < h) : (row += 1) {
-                const dst = (@as(usize, a.pen_y) + row) * atlas_size * 4 + @as(usize, a.pen_x) * 4;
-                @memcpy(a.pixels[dst..][0 .. @as(usize, w) * 4], tmp[row * w * 4 ..][0 .. @as(usize, w) * 4]);
-            }
-        }
         const adv = @divTrunc(bm.advance_26_6 + 32, 64);
-        const g: Glyph = .{
-            .x = @intCast(a.pen_x),
-            .y = @intCast(a.pen_y),
-            .w = @intCast(w),
-            .h = @intCast(h),
-            .bearing_x = @intCast(std.math.clamp(bm.bearing_x, -32768, 32767)),
-            .bearing_y = @intCast(std.math.clamp(bm.bearing_y, -32768, 32767)),
+        const len = @as(usize, w) * h * 4;
+        const tmp = app.alloc.alloc(u8, len) catch return null;
+        defer app.alloc.free(tmp);
+        if (len != 0) atlas_pixels.toRgba8(&bm, tmp);
+        const was_full = a.full;
+        const g = a.insert(app.alloc, key, .{
+            .w = w,
+            .h = h,
+            .rgba = tmp,
+            .bearing_x = bm.bearing_x,
+            .bearing_y = bm.bearing_y,
             .cells = if (self.cell_w > 0 and adv * 2 > self.cell_w * 3) 2 else 1,
             .color = bm.bytes_per_pixel == 4,
-        };
-        a.pen_x += w + 1;
-        a.row_h = @max(a.row_h, h);
-        a.gen +%= 1;
-        a.glyphs.put(app.alloc, key, g) catch return null;
+        }) orelse return null;
+        // A rebuild starts the atlas over, unless this build already did.
+        if (a.full and !was_full and !self.started_empty) shell.queueRefresh(app);
         return g;
     }
 };
+
+const testing = std.testing;
+
+/// A w x h glyph of zeros, `cells` wide.
+fn raster(buf: []u8, w: u32, h: u32, cells: u8) Atlas.Raster {
+    return .{ .w = w, .h = h, .rgba = buf[0 .. @as(usize, w) * h * 4], .bearing_x = 0, .bearing_y = 0, .cells = cells, .color = false };
+}
+
+test "a glyph that finds no room keeps its width and marks the atlas full" {
+    var a: Atlas = .{};
+    defer a.deinit(testing.allocator);
+    try a.ensurePixels(testing.allocator, 16);
+    const buf = try testing.allocator.alloc(u8, 500 * 500 * 4);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    // Two 500 px glyphs to a row, two rows.
+    for (0..4) |i| try testing.expect(a.insert(testing.allocator, i, raster(buf, 500, 500, 1)).?.w == 500);
+    try testing.expect(!a.full);
+    const g = a.insert(testing.allocator, 9, raster(buf, 500, 500, 2)).?;
+    try testing.expectEqual(@as(u8, 2), g.cells);
+    try testing.expectEqual(@as(u16, 0), g.w);
+    try testing.expect(a.full);
+    // Not cached: it is tried again once the atlas starts over.
+    try testing.expect(a.glyphs.get(9) == null);
+}
+
+test "a full atlas starts over at the next build" {
+    var a: Atlas = .{};
+    defer a.deinit(testing.allocator);
+    try a.ensurePixels(testing.allocator, 16);
+    const buf = try testing.allocator.alloc(u8, 600 * 600 * 4);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    try testing.expect(!a.startsOver(16));
+    _ = a.insert(testing.allocator, 1, raster(buf, 600, 600, 1));
+    _ = a.insert(testing.allocator, 2, raster(buf, 600, 600, 1));
+    try testing.expect(a.startsOver(16));
+    a.reset(16);
+    try testing.expect(!a.startsOver(16));
+    const g = a.insert(testing.allocator, 2, raster(buf, 600, 600, 1)).?;
+    try testing.expectEqual(@as(u16, 1), g.x);
+    try testing.expectEqual(@as(u16, 1), g.y);
+}
+
+test "a glyph larger than the atlas is kept empty, of its width" {
+    var a: Atlas = .{};
+    defer a.deinit(testing.allocator);
+    try a.ensurePixels(testing.allocator, 16);
+    const g = a.insert(testing.allocator, 5, .{ .w = atlas_size, .h = 10, .rgba = &.{}, .bearing_x = 0, .bearing_y = 0, .cells = 2, .color = false }).?;
+    try testing.expectEqual(@as(u8, 2), g.cells);
+    try testing.expectEqual(@as(u16, 0), g.w);
+    try testing.expect(a.glyphs.get(5) != null);
+    try testing.expect(!a.full);
+}
+
