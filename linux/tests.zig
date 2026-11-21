@@ -28,4 +28,5 @@ test {
     _ = @import("shell.zig");
     _ = @import("shader_inputs.zig");
     _ = @import("frame_damage.zig");
+    _ = @import("ui_layer.zig");
 }
