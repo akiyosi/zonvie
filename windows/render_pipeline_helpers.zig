@@ -281,7 +281,7 @@ pub const PaintRetryState = struct {
     }
 };
 
-pub const atlas_full_upload_rect_threshold: usize = 64;
+pub const atlas_upload_band_capacity: usize = 64;
 pub const atlas_full_upload_area_divisor: u64 = 4;
 
 /// Drop the queued atlas upload rects before `consumed_seq`, the cursor of a
@@ -471,10 +471,79 @@ pub fn BackDamageQueue(comptime Rect: type, comptime buffers: usize, comptime ma
     };
 }
 
-/// Decide when a per-consumer dirty-rect replay should collapse to one full
-/// atlas upload. Rect may be any type with left/top/right/bottom integer fields.
+/// Coalesce queued glyph rects into row bands for one consumer's upload.
+/// Glyphs packed into one shelf share its rows, so rects whose rows overlap
+/// merge and the result stays near one band per shelf touched, while shelves
+/// far apart stay separate instead of costing the rows between them. The
+/// band count is bounded by `out`; past it a rect merges into the band
+/// nearest in y. Bands may come to overlap after a merge; uploading shared
+/// rows twice copies the same CPU-atlas pixels and is safe. Empty rects are
+/// dropped. R is any type with left/top/right/bottom u32 fields.
+///
+/// Contract: pure; reads `rects`, writes only `out`, and returns a prefix of
+/// it. Postconditions (checked in safe builds): at most
+/// atlas_upload_band_capacity bands, none empty, and every non-empty input
+/// rect lies inside some band, so uploading the bands uploads every rect.
+pub fn coalesceAtlasUploadBands(comptime R: type, rects: []const R, out: *[atlas_upload_band_capacity]R) []R {
+    const bands = coalesceAtlasUploadBandsUnchecked(R, rects, out);
+    if (std.debug.runtime_safety) {
+        std.debug.assert(bands.len <= atlas_upload_band_capacity);
+        for (bands) |b| std.debug.assert(b.left < b.right and b.top < b.bottom);
+        for (rects) |r| {
+            if (r.right <= r.left or r.bottom <= r.top) continue;
+            const covered = for (bands) |b| {
+                if (b.left <= r.left and r.right <= b.right and b.top <= r.top and r.bottom <= b.bottom) break true;
+            } else false;
+            std.debug.assert(covered);
+        }
+    }
+    return bands;
+}
+
+fn coalesceAtlasUploadBandsUnchecked(comptime R: type, rects: []const R, out: *[atlas_upload_band_capacity]R) []R {
+    var n: usize = 0;
+    next: for (rects) |r| {
+        if (r.right <= r.left or r.bottom <= r.top) continue;
+        for (out[0..n]) |*band| {
+            if (r.top < band.bottom and band.top < r.bottom) {
+                band.* = unionAtlasRect(R, band.*, r);
+                continue :next;
+            }
+        }
+        if (n < out.len) {
+            out[n] = r;
+            n += 1;
+            continue;
+        }
+        var nearest: usize = 0;
+        var nearest_gap: u32 = std.math.maxInt(u32);
+        for (out[0..n], 0..) |band, i| {
+            const gap = @max(band.top, r.top) -| @min(band.bottom, r.bottom);
+            if (gap < nearest_gap) {
+                nearest = i;
+                nearest_gap = gap;
+            }
+        }
+        out[nearest] = unionAtlasRect(R, out[nearest], r);
+    }
+    return out[0..n];
+}
+
+fn unionAtlasRect(comptime R: type, a: R, b: R) R {
+    var u = a;
+    u.left = @min(a.left, b.left);
+    u.top = @min(a.top, b.top);
+    u.right = @max(a.right, b.right);
+    u.bottom = @max(a.bottom, b.bottom);
+    return u;
+}
+
+/// Decide when coalesced upload bands should collapse to one full atlas
+/// upload: once they cover a quarter of the atlas, one copy of the whole CPU
+/// atlas is cheaper than the band copies. The band count is already bounded
+/// by coalesceAtlasUploadBands. Rect may be any type with left/top/right/bottom
+/// integer fields.
 pub fn shouldUseFullAtlasUpload(rects: anytype, atlas_w: u32, atlas_h: u32) bool {
-    if (rects.len >= atlas_full_upload_rect_threshold) return true;
     const atlas_area = @as(u64, atlas_w) * @as(u64, atlas_h);
     if (atlas_area == 0) return false;
 

@@ -1358,26 +1358,30 @@ pub const Renderer = struct {
 
         // Bound per-consumer GPU calls and atlas-mutex hold time. A lagging or
         // newly-created window otherwise replays every historical glyph rect.
-        // Once rect count or covered area is substantial, one full upload is
-        // cheaper and has deterministic call count.
-        if (render_pipeline_helpers.shouldUseFullAtlasUpload(pending, self.atlas_w, self.atlas_h)) {
+        // Row bands bound the call count and copy only the rows glyphs were
+        // written to; a full upload is kept for bands covering much of the atlas.
+        var band_buf: [render_pipeline_helpers.atlas_upload_band_capacity]c.D2D1_RECT_U = undefined;
+        const bands = render_pipeline_helpers.coalesceAtlasUploadBands(c.D2D1_RECT_U, pending, &band_buf);
+        if (render_pipeline_helpers.shouldUseFullAtlasUpload(bands, self.atlas_w, self.atlas_h)) {
             if (applog.isEnabled()) applog.appLog(
-                "[atlas] flushSince: coalescing {d} rects into full upload\n",
-                .{pending.len},
+                "[atlas] flushSince: coalescing {d} rects ({d} bands) into full upload\n",
+                .{ pending.len, bands.len },
             );
             return self.uploadFullAtlasToD3DLocked(d3d);
         }
 
         if (applog.isEnabled()) applog.appLog(
-            "[atlas] flushSince: since={d} base={d} head={d} uploading={d}\n",
-            .{ since_seq, self.pending_upload_base_seq, head_seq, self.pending_uploads.items.len - start_idx },
+            "[atlas] flushSince: since={d} base={d} head={d} uploading={d} rects as {d} bands\n",
+            .{ since_seq, self.pending_upload_base_seq, head_seq, self.pending_uploads.items.len - start_idx, bands.len },
         );
 
         var log_idx: usize = 0;
-        for (pending) |r| {
+        for (bands) |r| {
+            // Bands are unions of queued rects, which uploadAtlasRegion
+            // admitted only inside the atlas.
+            std.debug.assert(r.right <= self.atlas_w and r.bottom <= self.atlas_h);
             const w: u32 = r.right - r.left;
             const h: u32 = r.bottom - r.top;
-            if (w == 0 or h == 0) continue;
 
             if (log_idx < 8 and applog.isEnabled()) {
                 applog.appLog(

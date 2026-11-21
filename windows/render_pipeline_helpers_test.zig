@@ -338,7 +338,7 @@ test "natural paint releases an armed retry after message delivery failure" {
     try std.testing.expect(retry.timerFired(current.generation));
 }
 
-test "atlas upload policy bounds calls by rect count or dirty area" {
+test "atlas upload policy collapses to a full upload by dirty area" {
     const AtlasRect = struct { left: u32, top: u32, right: u32, bottom: u32 };
     const small = [_]AtlasRect{
         .{ .left = 0, .top = 0, .right = 8, .bottom = 8 },
@@ -348,9 +348,47 @@ test "atlas upload policy bounds calls by rect count or dirty area" {
 
     const large = [_]AtlasRect{.{ .left = 0, .top = 0, .right = 32, .bottom = 32 }};
     try std.testing.expect(helpers.shouldUseFullAtlasUpload(&large, 64, 64));
+}
 
-    const many = [_]AtlasRect{.{ .left = 0, .top = 0, .right = 1, .bottom = 1 }} ** helpers.atlas_full_upload_rect_threshold;
-    try std.testing.expect(helpers.shouldUseFullAtlasUpload(&many, 4096, 4096));
+test "atlas upload bands merge one shelf and keep distant shelves apart" {
+    const AtlasRect = struct { left: u32, top: u32, right: u32, bottom: u32 };
+    var out: [helpers.atlas_upload_band_capacity]AtlasRect = undefined;
+
+    // Glyphs side by side in one shelf, one taller, and one far below.
+    const rects = [_]AtlasRect{
+        .{ .left = 0, .top = 100, .right = 30, .bottom = 120 },
+        .{ .left = 31, .top = 100, .right = 61, .bottom = 134 },
+        .{ .left = 500, .top = 3800, .right = 530, .bottom = 3834 },
+        .{ .left = 9, .top = 9, .right = 9, .bottom = 20 }, // empty, dropped
+    };
+    const bands = helpers.coalesceAtlasUploadBands(AtlasRect, &rects, &out);
+    try std.testing.expectEqual(@as(usize, 2), bands.len);
+    try std.testing.expectEqual(AtlasRect{ .left = 0, .top = 100, .right = 61, .bottom = 134 }, bands[0]);
+    try std.testing.expectEqual(AtlasRect{ .left = 500, .top = 3800, .right = 530, .bottom = 3834 }, bands[1]);
+    // Distant shelves cost their own rows, not the rows between them.
+    try std.testing.expect(!helpers.shouldUseFullAtlasUpload(bands, 4096, 4096));
+
+    // Adjacent shelves share no row and stay two bands.
+    const touching = [_]AtlasRect{
+        .{ .left = 0, .top = 0, .right = 10, .bottom = 10 },
+        .{ .left = 0, .top = 10, .right = 10, .bottom = 20 },
+    };
+    try std.testing.expectEqual(@as(usize, 2), helpers.coalesceAtlasUploadBands(AtlasRect, &touching, &out).len);
+}
+
+test "atlas upload bands past capacity merge into the nearest band" {
+    const AtlasRect = struct { left: u32, top: u32, right: u32, bottom: u32 };
+    var rects: [helpers.atlas_upload_band_capacity + 1]AtlasRect = undefined;
+    for (rects[0..helpers.atlas_upload_band_capacity], 0..) |*r, i| {
+        const y: u32 = @intCast(i * 100);
+        r.* = .{ .left = 0, .top = y, .right = 10, .bottom = y + 10 };
+    }
+    rects[helpers.atlas_upload_band_capacity] = .{ .left = 50, .top = 3015, .right = 60, .bottom = 3025 };
+
+    var out: [helpers.atlas_upload_band_capacity]AtlasRect = undefined;
+    const bands = helpers.coalesceAtlasUploadBands(AtlasRect, &rects, &out);
+    try std.testing.expectEqual(helpers.atlas_upload_band_capacity, bands.len);
+    try std.testing.expectEqual(AtlasRect{ .left = 0, .top = 3000, .right = 60, .bottom = 3025 }, bands[30]);
 }
 
 test "consumed atlas upload rects are released without moving the head sequence" {
