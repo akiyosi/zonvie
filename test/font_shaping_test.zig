@@ -751,7 +751,13 @@ test "a kana face shapes a kana and its sound mark to one glyph" {
         .{ 0x30AB, 0x309A }, // カ゚, no precomposed codepoint
     };
     var ran: usize = 0;
-    for (kana_faces) |files| {
+    for (kana_faces, 0..) |files, i| {
+        // Only Hiragino is guaranteed: probe the optional faces first so
+        // ZONVIE_REQUIRE_TEST_FONTS does not fail on their absence.
+        if (i > 0) {
+            const found = (try findFontFile(alloc, zonvie_core.clock.io(), files)) orelse continue;
+            alloc.free(found);
+        }
         var tf = (try TestFont.open(alloc, files, 0)) orelse continue;
         defer tf.deinit(alloc);
         for (clusters) |c| {
