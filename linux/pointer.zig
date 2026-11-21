@@ -172,7 +172,10 @@ const panel_drag_threshold = 3.0;
 fn surfacePanels(p: *const Pointer) ?struct { rects: [4]?overlay_layout.Rect, in: overlay_layout.Inputs } {
     const app = p.app;
     if (app.drawable_w_px == 0 or app.cell_w_px == 0 or app.cell_h_px == 0) return null;
-    const in = gl_renderer.overlayInputs(app, p.surface_id, app.drawable_w_px, app.drawable_h_px);
+    // Laid out at the size of the surface the pointer is on, as it is drawn.
+    const size: [2]u32 = if (p.surface_id == 1) .{ app.drawable_w_px, app.drawable_h_px } else if (app.ext_windows.get(p.surface_id)) |w| .{ w.w_px, w.h_px } else return null;
+    if (size[0] == 0 or size[1] == 0) return null;
+    const in = gl_renderer.overlayInputs(app, p.surface_id, size[0], size[1]);
     return .{ .rects = overlay_layout.place(&app.overlays, in), .in = in };
 }
 
@@ -250,7 +253,10 @@ pub fn dragPanel(p: *Pointer, pp: *PanelPress, x: f64, y: f64) void {
         r.x += @intFromFloat(@round(dx * app.scale));
         r.y += @intFromFloat(@round(dy * app.scale));
         switch (pp.kind) {
-            .cmdline => app.cmdline_user = r,
+            .cmdline => {
+                app.cmdline_user = r;
+                app.cmdline_user_surface = p.surface_id;
+            },
             .msg_show => {
                 app.msg_show_user = .{ r.x, r.y };
                 app.msg_chrome.dragEnded(true);

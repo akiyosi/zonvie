@@ -41,6 +41,7 @@ pub fn makeCallbacks() core.Callbacks {
         .on_grid_row_scroll = onGridRowScroll,
         .on_external_window = onExternalWindow,
         .on_external_window_close = onExternalWindowClose,
+        .on_cursor_grid_changed = onCursorGridChanged,
         .on_popupmenu_show = onPopupmenuShow,
         .on_cmdline_show = onCmdlineShow,
         .on_msg_show = onMsgShow,
@@ -213,6 +214,31 @@ fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u
         app.ext_ops.append(app.alloc, .{ .kind = .open, .grid_id = grid_id, .win = win, .rows = rows, .cols = cols, .start_row = start_row, .start_col = start_col }) catch return failFlush(app);
     }
     ext_window.queueApply(app);
+}
+
+/// The cursor moved onto `grid_id` (zonvie_core.h): the window showing it
+/// asks for the keyboard once the commit places the grid, as macOS and
+/// Windows activate it.
+fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+    const app = appFrom(ctx);
+    lock(app);
+    defer unlock(app);
+    app.cursor_grid_pending = grid_id;
+}
+
+/// The surface that shows `grid_id` in what is committed: an external
+/// window it is the root of or a layer in, else the main view. Null for a
+/// panel's grid, whose popup never takes the keyboard. Caller holds App.mu.
+fn surfaceShowing(app: *const App, grid_id: i64) ?i64 {
+    if (overlay_layout.kindOf(grid_id) != null) return null;
+    var it = app.surface.others.keyIterator();
+    while (it.next()) |id| {
+        if (id.* == grid_id) return id.*;
+        for (app.surface.committedSurfaceLayers(id.*)) |l| {
+            if (l.grid_id == grid_id) return id.*;
+        }
+    }
+    return 1;
 }
 
 fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
@@ -493,6 +519,12 @@ fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             scrollbar.commitViews(app);
             // The committed rows are the new atlas's from here on.
             app.atlas_pending.held = false;
+            // Resolved against this commit, which places a grid the cursor
+            // entered in the same flush.
+            if (app.cursor_grid_pending) |gid| {
+                app.cursor_grid_pending = null;
+                if (surfaceShowing(app, gid)) |s| app.activate_surface = s;
+            }
             committed = true;
             app.flush_outcome.store(.committed, .release);
             if (app.panel_colors_stale) {
@@ -575,6 +607,7 @@ fn runQueuedRender(app: *App) void {
         if (l.rows != 0) break true;
     } else false;
     unlock(app);
+    ext_window.activateCursorSurface(app);
     shell.placeMessages(app);
     panel_popup.update(app);
     input.refreshPanelHover(app);

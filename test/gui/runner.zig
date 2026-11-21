@@ -431,6 +431,14 @@ test "gui:visual_extwin_split_with_float_background" {
     try gated(can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
 }
 
+test "gui:visual_extwin_main_resize_matches_full" {
+    try gated(is_linux and can_capture, @import("scenarios/visual/extwin_main_resize_matches_full.zig"));
+}
+
+test "gui:visual_extwin_glyphs_added_while_open" {
+    try gated(can_capture, @import("scenarios/visual/extwin_glyphs_added_while_open.zig"));
+}
+
 test "gui:visual_per_grid_font_margin" {
     try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }
@@ -525,6 +533,11 @@ test "gui:clipboard_selections" {
 test "gui:cmdline_popup_pointer" {
     // Linux only: linux/panel_popup.zig through the virtual pointer.
     try gated(is_linux, @import("scenarios/linux/cmdline_popup_pointer.zig"));
+}
+
+test "gui:extwin_cmdline_popup_visible" {
+    // Linux only: linux/panel_popup.zig.
+    try gated(is_linux and can_capture, @import("scenarios/linux/extwin_cmdline_popup_visible.zig"));
 }
 
 test "gui:font_picker" {

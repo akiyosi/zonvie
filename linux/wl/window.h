@@ -9,7 +9,9 @@ typedef struct {
     // A configure was acked. Logical px; 0 leaves that dimension to the client.
     void (*configure)(void* data, int32_t w, int32_t h);
     void (*close)(void* data);
-    void (*focus)(void* data, int focused);
+    // `surface_id`: the surface that took the keyboard, 1 for the main
+    // window or an external window's id; 0 when unknown or on leave.
+    void (*focus)(void* data, int focused, int64_t surface_id);
     // `sym` / `base_sym`: the key's keysym, and the one it has with no
     // modifier held; `utf32` / `base_utf32` their characters or 0. `mods`:
     // keymap.zig's modifier masks.
@@ -101,6 +103,10 @@ int zwl_swap(void);
 // The main surface's back buffer: how many frames old its contents are, 0
 // when unknown (a new buffer, or no EGL_EXT_buffer_age).
 int zwl_buffer_age(void);
+// After zwl_buffer_age: the back buffer it took has another size than the
+// window's buffers were last asked for, since a resize applies to the
+// buffers taken after it. 0 without EGL_EXT_buffer_age.
+int zwl_buffer_stale(void);
 // A swap that tells the compositor only `n` rects changed: x, y, w, h each,
 // buffer px from the bottom-left. Falls back to a plain swap.
 int zwl_swap_damage(const int32_t* rects, int32_t n);
@@ -123,6 +129,9 @@ int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t 
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
 // The compositor sizes window `id`: maximized, fullscreen or tiled.
 int zwl_ext_placed(int64_t id);
+// Window `id` (1, or an external window's id) asks the compositor for the
+// keyboard (xdg-activation-v1); -1 when it cannot ask.
+int zwl_activate(int64_t id);
 // Makes the window's surface the one GL draws to; id 0 is the main window.
 int zwl_ext_make_current(int64_t id);
 int zwl_ext_swap(int64_t id);
