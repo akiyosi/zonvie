@@ -80,6 +80,9 @@ pub const Target = struct {
     /// What the last main frame drew besides committed rows (frameKey);
     /// another value draws the frame whole.
     last_key: u64 = 0,
+    /// The next main frame draws whole: what is on screen is not the
+    /// frames the history holds (drawWholeNext).
+    whole_next: bool = false,
     /// Where the last main frame drew the cursor, view px; null for nowhere.
     last_cursor: ?Band = null,
     /// A partial frame's bands: those it changed, and those it repaints
@@ -677,7 +680,9 @@ fn planFrame(app: *App, t: *Target, fx: bool, buffer_age: u32) Plan {
     const key = frameKey(app, t, fx);
     const key_changed = key != t.last_key;
     t.last_key = key;
-    if (owed.full or key_changed or fx or app.test_full_redraw or t.program == 0 or app.glyph_tex.w == 0) return .{ .whole = null };
+    const whole_next = t.whole_next;
+    t.whole_next = false;
+    if (owed.full or key_changed or whole_next or fx or app.test_full_redraw or t.program == 0 or app.glyph_tex.w == 0) return .{ .whole = null };
     // A scroll moves rows no commit sends, and so does the frame that ends it.
     for (app.surface.committedLayers()) |l| {
         const e = app.surface.gridEase(l.grid_id) orelse continue;
@@ -713,6 +718,12 @@ fn cursorBand(app: *App, t: *const Target) ?Band {
         return .{ .top_px = layer.y_px + @as(i32, @intFromFloat(@floor(lo))), .bottom_px = layer.y_px + @as(i32, @intFromFloat(@ceil(hi))) };
     }
     return null;
+}
+
+/// The next main frame draws whole, whatever changed: a buffer went to the
+/// compositor undrawn. Main thread.
+pub fn drawWholeNext(t: *Target) void {
+    t.whole_next = true;
 }
 
 /// What the main frame draws besides the committed rows, the cursor and the

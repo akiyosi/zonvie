@@ -431,6 +431,10 @@ test "gui:visual_extwin_split_with_float_background" {
     try gated(can_capture, @import("scenarios/visual/extwin_split_with_float_background.zig"));
 }
 
+test "gui:visual_extwin_main_resize_matches_full" {
+    try gated(is_linux and can_capture, @import("scenarios/visual/extwin_main_resize_matches_full.zig"));
+}
+
 test "gui:visual_extwin_glyphs_added_while_open" {
     try gated(can_capture, @import("scenarios/visual/extwin_glyphs_added_while_open.zig"));
 }

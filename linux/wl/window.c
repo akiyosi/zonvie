@@ -227,6 +227,8 @@ static struct {
     struct wl_proxy* decoration_manager;
 
     struct wl_egl_window* egl_window;
+    // The size the window's buffers were last asked for, device px.
+    int32_t egl_w_px, egl_h_px;
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
@@ -1364,6 +1366,8 @@ int zwl_egl_init(int32_t w_px, int32_t h_px) {
     if (w.egl_context == EGL_NO_CONTEXT) return -1;
     w.egl_window = wl_egl_window_create(w.surface, w_px, h_px);
     if (!w.egl_window) return -1;
+    w.egl_w_px = w_px;
+    w.egl_h_px = h_px;
     w.egl_surface = eglCreateWindowSurface(w.egl_display, w.egl_config, (EGLNativeWindowType)w.egl_window, NULL);
     if (w.egl_surface == EGL_NO_SURFACE) return -1;
     if (!eglMakeCurrent(w.egl_display, w.egl_surface, w.egl_surface, w.egl_context)) return -1;
@@ -1382,7 +1386,21 @@ int zwl_egl_init(int32_t w_px, int32_t h_px) {
 }
 
 void zwl_egl_resize(int32_t w_px, int32_t h_px) {
-    if (w.egl_window) wl_egl_window_resize(w.egl_window, w_px, h_px, 0, 0);
+    if (!w.egl_window) return;
+    wl_egl_window_resize(w.egl_window, w_px, h_px, 0, 0);
+    w.egl_w_px = w_px;
+    w.egl_h_px = h_px;
+}
+
+int zwl_buffer_stale(void) {
+    // Only a buffer age query takes the back buffer, which the size below
+    // then is; without one it is the size the next buffer will get.
+    if (!w.has_buffer_age) return 0;
+    EGLint bw = 0, bh = 0;
+    if (!eglQuerySurface(w.egl_display, w.egl_surface, EGL_WIDTH, &bw) ||
+        !eglQuerySurface(w.egl_display, w.egl_surface, EGL_HEIGHT, &bh))
+        return 0;
+    return bw != w.egl_w_px || bh != w.egl_h_px;
 }
 
 int zwl_swap(void) {

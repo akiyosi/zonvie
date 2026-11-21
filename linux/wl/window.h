@@ -103,6 +103,10 @@ int zwl_swap(void);
 // The main surface's back buffer: how many frames old its contents are, 0
 // when unknown (a new buffer, or no EGL_EXT_buffer_age).
 int zwl_buffer_age(void);
+// After zwl_buffer_age: the back buffer it took has another size than the
+// window's buffers were last asked for, since a resize applies to the
+// buffers taken after it. 0 without EGL_EXT_buffer_age.
+int zwl_buffer_stale(void);
 // A swap that tells the compositor only `n` rects changed: x, y, w, h each,
 // buffer px from the bottom-left. Falls back to a plain swap.
 int zwl_swap_damage(const int32_t* rects, int32_t n);

@@ -94,6 +94,7 @@ extern "c" fn zwl_selection_get(primary: c_int, out_len: *usize) ?[*]u8;
 extern "c" fn zwl_egl_init(w_px: i32, h_px: i32) c_int;
 extern "c" fn zwl_egl_resize(w_px: i32, h_px: i32) void;
 extern "c" fn zwl_swap() c_int;
+extern "c" fn zwl_buffer_stale() c_int;
 extern "c" fn zwl_buffer_age() c_int;
 extern "c" fn zwl_swap_damage(rects: [*]const [4]i32, n: i32) c_int;
 extern "c" fn zwl_dispatch() c_int;
@@ -212,7 +213,16 @@ fn draw() void {
     window.dirty = false;
     window.shown = true;
     if (applog.isEnabled()) applog.appLog("[wl] draw\n", .{});
-    const swap = gl_renderer.render(window.app, @intCast(@max(0, zwl_buffer_age())));
+    var age = zwl_buffer_age();
+    if (zwl_buffer_stale() != 0) {
+        // Taken before the window was resized: a frame drawn into it would
+        // be scaled to the window, and stay so while nothing changes. Given
+        // back undrawn; the frame goes whole into a buffer of the new size.
+        _ = zwl_swap();
+        gl_renderer.drawWholeNext(&window.app.gl);
+        age = zwl_buffer_age();
+    }
+    const swap = gl_renderer.render(window.app, @intCast(@max(0, age)));
     // Nothing changed: the frame on screen stays, and no buffer is spent.
     if (swap.skip) return pump();
     zwl_request_frame();
