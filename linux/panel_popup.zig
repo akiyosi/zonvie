@@ -107,7 +107,7 @@ pub fn update(app: *App) void {
             if (app.cell_w_px == 0 or app.cell_h_px == 0) break :blk null;
             const scale: i32 = @max(1, @as(i32, @intFromFloat(app.scale)));
             const main_in = gl_renderer.overlayInputs(app, 1, @max(1, app.drawable_w_px), @max(1, app.drawable_h_px));
-            const host = popup_place.hostSurface(p.kind, main_in.pum_surface, main_in.msg_surface);
+            const host = popup_place.hostSurface(p.kind, main_in.cmdline_surface, main_in.pum_surface, main_in.msg_surface);
             const hv = hostView(app, host) orelse break :blk null;
             if (hv.size[0] == 0 or hv.size[1] == 0) break :blk null;
             // A panel whose grid has no rows yet draws nothing.

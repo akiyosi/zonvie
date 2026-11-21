@@ -46,8 +46,8 @@ pub const AtlasOps = struct {
     mirror: []u8 = &.{},
     /// `mirror` is zero from this row down.
     dirty_rows: u32 = 0,
-    /// Bumped by every create and upload; external windows resync from
-    /// `mirror` when theirs differs.
+    /// Bumped by every create and upload: a frame that samples the atlas
+    /// draws whole when it changed (gl_renderer.frameKey).
     gen: u64 = 0,
 
     pub fn clearQueued(self: *AtlasOps) void {
@@ -152,6 +152,17 @@ pub const App = struct {
     /// session (overlay_layout.Inputs.cmdline_user). main thread writes, the
     /// paint reads; under `mu`.
     cmdline_user: ?overlay_layout.Rect = null,
+    /// The surface `cmdline_user` was dropped on; it holds there only.
+    cmdline_user_surface: i64 = 1,
+    /// The surface that has the keyboard, or had it last: 1, or an external
+    /// window's id. The cmdline is placed there. main thread writes, the
+    /// paint reads; under `mu`.
+    focus_surface: i64 = 1,
+    /// The grid the cursor moved onto (on_cursor_grid_changed), until a
+    /// commit resolves it to `activate_surface`: the window that asks for
+    /// the keyboard on the main thread. Under `mu`.
+    cursor_grid_pending: ?i64 = null,
+    activate_surface: ?i64 = null,
     /// msg_show's pointer and pin (frontend_rules.MsgShowChrome) and the
     /// corner it is pinned at; reset when it closes. Under `mu`.
     msg_chrome: core.frontend_rules.MsgShowChrome = .{},
@@ -189,6 +200,9 @@ pub const App = struct {
 
     /// The main window's GL objects; main thread only.
     gl: gl_renderer.Target = .{},
+    /// The glyph atlas texture every window samples; main thread only,
+    /// under App.mu.
+    glyph_tex: gl_renderer.GlyphTexture = .{},
     /// The main window's bloom and custom shader chain; main thread only.
     postfx: postfx.PostFx = .{},
     /// config.toml [shaders] paths when enabled; borrowed from the config,
