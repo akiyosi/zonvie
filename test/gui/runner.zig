@@ -66,12 +66,14 @@ const is_linux = builtin.os.tag == .linux;
 /// drawing whole: no row-scroll blit, scroll fast path or per-row gating, so
 /// the scenarios that assert those paths ran have nothing to observe there.
 const redraws_partially = !is_linux;
-/// The cmdline is an overlay in the main window on Linux, not a window of its
-/// own, and a tiling compositor sizes the window, not :set columns/lines.
+/// The cmdline is an xdg_popup on Linux, which a listing of toplevels does
+/// not count as a window, and a tiling compositor sizes the window, not
+/// :set columns/lines.
 const places_own_windows = !is_linux;
-/// Per-grid fonts (on_grid_font and the font slot callbacks) are not wired
-/// in the Linux frontend.
-const draws_grid_fonts = !is_linux;
+/// The Linux GUI driver has no fontInstalled, which the per-grid font
+/// workflow asks before it picks a second family. The frontend itself draws
+/// per-grid fonts, and the scenario that needs no second family runs there.
+const picks_installed_fonts = !is_linux;
 
 /// The build runner holds a test's stderr until the test process ends, so a
 /// scenario that hangs until the CI step timeout leaves no trace of which one
@@ -344,7 +346,7 @@ test "gui:visual_scrollbind_layers_blit_matches_jump" {
 }
 
 test "gui:visual_per_grid_font_workflow" {
-    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
+    try gated(picks_installed_fonts and can_capture, @import("scenarios/visual/per_grid_font_workflow.zig"));
 }
 
 test "gui:visual_proportional_font_support" {
@@ -444,7 +446,7 @@ test "gui:visual_extwin_glyphs_added_while_open" {
 }
 
 test "gui:visual_per_grid_font_margin" {
-    try gated(draws_grid_fonts and can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
+    try gated(can_capture, @import("scenarios/visual/per_grid_font_margin.zig"));
 }
 
 test "gui:visual_hosted_float_scroll_band" {
