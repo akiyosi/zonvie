@@ -148,6 +148,128 @@ fn matchFontFace(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bool,
     return face;
 }
 
+/// What drawing a scalar through the system's own font fallback produced.
+const FallbackDraw = enum {
+    /// Ink, in the bitmap.
+    drawn,
+    /// Laid out and drawn, and no pixel was touched: the scalar is invisible.
+    blank,
+    /// The canvas or the text format could not be made, or the draw failed.
+    failed,
+};
+
+/// Whether a premultiplied pixel D2D drew text into with a white brush
+/// carries colour of its own. The brush's ink is (c, c, c, c) under grayscale
+/// antialiasing and (r, g, b, 0) under ClearType -- which of the two is the
+/// system's setting -- so anything else with alpha is a colour font's layer.
+fn isColorFontPixel(r: u8, g: u8, b: u8, a: u8) bool {
+    return a != 0 and !(r == g and g == b and b == a);
+}
+
+/// The memory surface fallback glyphs are drawn into: a memory DC with a
+/// 32-bit top-down DIB selected into it, a D2D render target bound to the DC,
+/// and the white brush text is drawn with. Kept between glyphs, because
+/// making the four was most of what a fallback glyph cost, and remade only to
+/// grow. Guarded by Renderer.mu.
+const FallbackCanvas = struct {
+    hdc: c.HDC = null,
+    hbm: c.HBITMAP = null,
+    old_bm: c.HGDIOBJ = null,
+    bits: ?[*]const u8 = null,
+    rt: ?*c.ID2D1DCRenderTarget = null,
+    brush: ?*c.ID2D1SolidColorBrush = null,
+    /// The DIB's size. A draw binds and reads its top-left `bound` part.
+    w_px: i32 = 0,
+    h_px: i32 = 0,
+    bound_w_px: i32 = 0,
+    bound_h_px: i32 = 0,
+
+    /// Make the canvas hold at least `w_px` x `h_px` and bind the render
+    /// target to exactly that. Post: on true, `rt`, `brush` and `bits` are
+    /// set and a draw covers (0, 0)-(w_px, h_px); on false the canvas is
+    /// empty and the next call starts over.
+    fn prepare(self: *FallbackCanvas, d2d_factory: *c.ID2D1Factory, w_px: i32, h_px: i32) bool {
+        if (self.rt == null or w_px > self.w_px or h_px > self.h_px) {
+            const new_w = @max(w_px, self.w_px);
+            const new_h = @max(h_px, self.h_px);
+            self.release();
+            if (!self.create(d2d_factory, new_w, new_h)) {
+                self.release();
+                return false;
+            }
+        }
+        const rt = self.rt.?;
+        if (self.bound_w_px != w_px or self.bound_h_px != h_px) {
+            var rect: c.RECT = .{ .left = 0, .top = 0, .right = w_px, .bottom = h_px };
+            const bind_fn = rt.lpVtbl.*.BindDC orelse return self.fail();
+            if (bind_fn(rt, self.hdc, &rect) != 0) return self.fail();
+            self.bound_w_px = w_px;
+            self.bound_h_px = h_px;
+        }
+        if (self.brush == null) {
+            const rt_base: *c.ID2D1RenderTarget = @ptrCast(rt);
+            const create_brush = rt_base.lpVtbl.*.CreateSolidColorBrush orelse return self.fail();
+            const white = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
+            if (create_brush(rt_base, &white, null, &self.brush) != 0 or self.brush == null) return self.fail();
+        }
+        return true;
+    }
+
+    fn fail(self: *FallbackCanvas) bool {
+        self.release();
+        return false;
+    }
+
+    fn create(self: *FallbackCanvas, d2d_factory: *c.ID2D1Factory, w_px: i32, h_px: i32) bool {
+        self.hdc = c.CreateCompatibleDC(null);
+        if (self.hdc == null) return false;
+
+        var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+        bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w_px;
+        bmi.bmiHeader.biHeight = -h_px; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = c.BI_RGB;
+        var bits: ?*anyopaque = null;
+        self.hbm = c.CreateDIBSection(self.hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
+        if (self.hbm == null or bits == null) return false;
+        self.bits = @ptrCast(bits.?);
+        self.old_bm = c.SelectObject(self.hdc, self.hbm);
+
+        const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
+            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            .pixelFormat = .{
+                .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
+                .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            // 96 so DIPs are device pixels: the font size and the layout
+            // rect of a draw are already in pixels.
+            .dpiX = 96,
+            .dpiY = 96,
+            .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
+            .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        const create_fn = d2d_factory.lpVtbl.*.CreateDCRenderTarget orelse return false;
+        if (create_fn(d2d_factory, &rtp, &self.rt) != 0 or self.rt == null) return false;
+        self.w_px = w_px;
+        self.h_px = h_px;
+        return true;
+    }
+
+    /// Give everything back; the canvas is empty and can be prepared again.
+    fn release(self: *FallbackCanvas) void {
+        safeRelease(self.brush);
+        safeRelease(self.rt);
+        if (self.hdc != null) {
+            if (self.old_bm != null) _ = c.SelectObject(self.hdc, self.old_bm);
+            if (self.hbm != null) _ = c.DeleteObject(self.hbm);
+            _ = c.DeleteDC(self.hdc);
+        }
+        self.* = .{};
+    }
+};
+
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
@@ -179,6 +301,7 @@ pub const Renderer = struct {
     // Regular Segoe UI Emoji format at emoji_font_size; released with every
     // emoji_font_size reset.
     emoji_text_format: ?*c.IDWriteTextFormat = null,
+    fallback_canvas: FallbackCanvas = .{},
     base_point_size: f32 = 14.0, // original point size before DPI scaling
     // Base font weight/slant chosen via the font picker (`:set guifont=*`).
     // Normally regular; a picked Bold/Italic face sets these so the base font
@@ -604,6 +727,7 @@ pub const Renderer = struct {
         safeRelease(self.text_analyzer);
         safeRelease(self.text_format);
         safeRelease(self.emoji_text_format);
+        self.fallback_canvas.release();
         safeRelease(self.font_face);
         safeRelease(self.bold_font_face);
         safeRelease(self.italic_font_face);
@@ -771,69 +895,24 @@ pub const Renderer = struct {
 
     /// D2D color emoji rendering: render a Unicode scalar (or cluster) via D2D
     /// DrawTextW into a 32-bit BGRA DIB section, then copy to glyph_tmp as RGBA.
-    /// Returns true if color emoji was successfully rendered.
-    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, fallback_style: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
+    /// `.drawn` leaves the glyph in `out_bitmap`; `.blank` and `.failed` leave
+    /// `out_bitmap` untouched.
+    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, fallback_style: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) FallbackDraw {
         // Use oversized buffer so emoji glyphs are not clipped.
         // Emoji fonts often render taller than the cell height (ascent + descent
         // can exceed em size). The actual glyph bounds are scanned afterwards and
         // only the non-empty region is packed into the atlas.
         const bmp_w: i32 = @intCast(self.cell_w_px * 3);
         const bmp_h: i32 = @intCast(self.cell_h_px * 2);
-        if (bmp_w <= 0 or bmp_h <= 0) return false;
+        if (bmp_w <= 0 or bmp_h <= 0) return .failed;
 
-        const d2d_factory = self.d2d_factory orelse return false;
-        const dwrite_factory = self.dwrite_factory orelse return false;
+        const d2d_factory = self.d2d_factory orelse return .failed;
+        const dwrite_factory = self.dwrite_factory orelse return .failed;
 
-        // Create memory DC + 32-bit BGRA DIB section for D2D DC render target
-        const hdc = c.CreateCompatibleDC(null);
-        if (hdc == null) return false;
-        defer _ = c.DeleteDC(hdc);
-
-        var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
-        bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = bmp_w;
-        bmi.bmiHeader.biHeight = -bmp_h; // top-down
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = c.BI_RGB;
-
-        var bits: ?*anyopaque = null;
-        const hbm = c.CreateDIBSection(hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
-        if (hbm == null or bits == null) return false;
-        defer _ = c.DeleteObject(hbm);
-
-        const old_bm = c.SelectObject(hdc, hbm);
-        defer _ = c.SelectObject(hdc, old_bm);
-
-        // Create D2D DC render target
-        const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
-            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            .pixelFormat = .{
-                .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
-                .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            // 96 so DIPs are device pixels: emoji_font_size and the layout
-            // rect below are already in pixels.
-            .dpiX = 96,
-            .dpiY = 96,
-            .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
-            .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-
-        var dc_rt: ?*c.ID2D1DCRenderTarget = null;
-        const create_fn = d2d_factory.lpVtbl.*.CreateDCRenderTarget orelse return false;
-        const hr_rt = create_fn(d2d_factory, &rtp, &dc_rt);
-        if (hr_rt != 0 or dc_rt == null) return false;
-        defer {
-            const base: *c.IUnknown = @ptrCast(dc_rt.?);
-            _ = base.lpVtbl.*.Release.?(base);
-        }
-
-        // Bind D2D render target to the memory DC
-        var bind_rect: c.RECT = .{ .left = 0, .top = 0, .right = bmp_w, .bottom = bmp_h };
-        const bind_fn = dc_rt.?.lpVtbl.*.BindDC orelse return false;
-        const hr_bind = bind_fn(dc_rt.?, hdc, &bind_rect);
-        if (hr_bind != 0) return false;
+        const canvas = &self.fallback_canvas;
+        if (!canvas.prepare(d2d_factory, bmp_w, bmp_h)) return .failed;
+        const dc_rt = canvas.rt.?;
+        const brush = canvas.brush.?;
 
         // Compute emoji font size on first use: measure the actual line height
         // of Segoe UI Emoji at font_em_size and scale down if it exceeds cell_h_px.
@@ -857,7 +936,7 @@ pub const Renderer = struct {
             }
             break :blk self.emoji_text_format;
         };
-        if (text_format == null) return false;
+        if (text_format == null) return .failed;
 
         // Convert cluster scalars to UTF-16.
         // If flush set a multi-scalar cluster context, use the full cluster;
@@ -874,7 +953,7 @@ pub const Renderer = struct {
         }
 
         // Draw emoji using D2D DrawText (supports color emoji natively)
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(dc_rt.?);
+        const rt_base: *c.ID2D1RenderTarget = @ptrCast(dc_rt);
         const vtbl = rt_base.lpVtbl.*;
 
         if (vtbl.BeginDraw) |f| f(rt_base);
@@ -885,20 +964,9 @@ pub const Renderer = struct {
             f(rt_base, &transparent);
         }
 
-        // Create white brush for text (D2D will override with color emoji colors)
-        var brush: ?*c.ID2D1SolidColorBrush = null;
-        if (vtbl.CreateSolidColorBrush) |f| {
-            const white = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
-            _ = f(rt_base, &white, null, &brush);
-        }
-        defer {
-            if (brush) |b| {
-                const base: *c.IUnknown = @ptrCast(b);
-                _ = base.lpVtbl.*.Release.?(base);
-            }
-        }
-
-        if (brush) |b| {
+        // The white brush is for text; D2D overrides it with a colour font's
+        // own colours.
+        {
             const layout_rect = c.D2D1_RECT_F{
                 .left = 0,
                 .top = 0,
@@ -912,7 +980,7 @@ pub const Renderer = struct {
                     text_len,
                     text_format.?,
                     &layout_rect,
-                    @ptrCast(b),
+                    @ptrCast(brush),
                     c.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
                     c.DWRITE_MEASURING_MODE_NATURAL,
                 );
@@ -924,13 +992,17 @@ pub const Renderer = struct {
         if (vtbl.EndDraw) |f| {
             const hr_end = f(rt_base, &tag1, &tag2);
             if (hr_end != 0) {
-                return false;
+                // A target that asks to be recreated draws nothing again
+                // until it is: the next glyph makes a new canvas.
+                canvas.release();
+                return .failed;
             }
         }
 
-        // Scan the DIB to find the actual bounding box of non-zero pixels
-        const pixels_ptr: [*]const u8 = @ptrCast(bits.?);
-        const stride: usize = @intCast(bmp_w * 4);
+        // Scan the DIB to find the actual bounding box of non-zero pixels.
+        // The canvas may be wider than this draw: its stride is its own.
+        const pixels_ptr: [*]const u8 = canvas.bits.?;
+        const stride: usize = @intCast(canvas.w_px * 4);
         var min_x: i32 = bmp_w;
         var min_y: i32 = bmp_h;
         var max_x: i32 = 0;
@@ -939,7 +1011,7 @@ pub const Renderer = struct {
         while (y < bmp_h) : (y += 1) {
             var x_i: i32 = 0;
             while (x_i < bmp_w) : (x_i += 1) {
-                const off: usize = @intCast(y * bmp_w * 4 + x_i * 4);
+                const off: usize = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x_i)) * 4;
                 const b_val = pixels_ptr[off + 0];
                 const g_val = pixels_ptr[off + 1];
                 const r_val = pixels_ptr[off + 2];
@@ -954,22 +1026,21 @@ pub const Renderer = struct {
             }
         }
 
-        if (max_x <= min_x or max_y <= min_y) return false; // nothing rendered
+        if (max_x <= min_x or max_y <= min_y) return .blank; // nothing rendered
 
         const gw: u32 = @intCast(max_x - min_x);
         const gh: u32 = @intCast(max_y - min_y);
 
         // Copy BGRA -> RGBA into glyph_tmp
         const needed: usize = @as(usize, gw) * @as(usize, gh) * 4;
-        self.glyph_tmp.resize(self.alloc, needed) catch return false;
+        self.glyph_tmp.resize(self.alloc, needed) catch return .failed;
 
-        // Tracks whether ANY pixel had genuine D2D color-font alpha (real
-        // multi-hue color emoji), as opposed to every pixel needing the
-        // luminance-synthesis fallback below (a plain monochrome glyph drawn
-        // with the white brush — e.g. a CJK/symbol notdef fallback). This
-        // distinguishes "true color emoji" from "GDI fallback for a glyph
-        // missing from the base font" so the latter can be treated as a
-        // normal grayscale glyph and take the highlight fg color.
+        // Tracks whether ANY pixel carries a colour font's own colour (real
+        // multi-hue color emoji), as opposed to every pixel being the white
+        // brush's ink (a plain monochrome glyph — e.g. a CJK/symbol notdef
+        // fallback). This distinguishes "true color emoji" from "GDI fallback
+        // for a glyph missing from the base font" so the latter can be
+        // treated as a normal grayscale glyph and take the highlight fg color.
         var saw_real_color_alpha = false;
 
         var dy: u32 = 0;
@@ -987,12 +1058,12 @@ pub const Renderer = struct {
                 var a_val = pixels_ptr[src_off + 3];
 
                 // GDI color emoji: alpha is set by the system.
-                // Monochrome text: alpha=0 but RGB may be non-zero.
-                // For monochrome, synthesize alpha from luminance.
-                if (a_val == 0 and (r_val != 0 or g_val != 0 or b_val != 0)) {
-                    a_val = @max(r_val, @max(g_val, b_val));
-                } else if (a_val != 0) {
+                // Monochrome text under ClearType: alpha=0 but RGB may be
+                // non-zero. For those, synthesize alpha from luminance.
+                if (isColorFontPixel(r_val, g_val, b_val, a_val)) {
                     saw_real_color_alpha = true;
+                } else if (a_val == 0 and (r_val != 0 or g_val != 0 or b_val != 0)) {
+                    a_val = @max(r_val, @max(g_val, b_val));
                 }
 
                 // BGRA → RGBA
@@ -1022,9 +1093,11 @@ pub const Renderer = struct {
             // brush): compact to a single grayscale/alpha channel so the
             // core does not tag it DECO_COLOR_EMOJI, and the normal
             // highlight-fg-color shader path (main.hlsl grayscale branch)
-            // applies. R=G=B=A already for every pixel here (see synthesis
-            // above), so the alpha channel alone is the correct grayscale
-            // value — compact in place (dst index <= src index for all i).
+            // applies. The alpha channel holds the coverage for every pixel
+            // here (the brush's own under grayscale antialiasing, the
+            // synthesis above under ClearType), so it alone is the correct
+            // grayscale value — compact in place (dst index <= src index
+            // for all i).
             var i: usize = 0;
             const px_count: usize = @as(usize, gw) * @as(usize, gh);
             while (i < px_count) : (i += 1) {
@@ -1034,7 +1107,7 @@ pub const Renderer = struct {
             out_bitmap.bytes_per_pixel = 1;
         }
 
-        return true;
+        return .drawn;
     }
 
     /// What a glyph-run rasterization produced. `.empty` means DWrite gave
@@ -1183,7 +1256,15 @@ pub const Renderer = struct {
         const is_emoji = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0;
         const gdi_first = is_emoji or (glyph_index == 0 and non_ascii) or text_cl_len > 1;
         const fallback_style: u32 = if (is_emoji) 0 else style_flags;
-        if (gdi_first and self.rasterizeColorEmojiGDI(scalar, fallback_style, corep, out_bitmap)) return;
+        if (gdi_first) switch (self.rasterizeColorEmojiGDI(scalar, fallback_style, corep, out_bitmap)) {
+            .drawn => return,
+            // The system's fallback laid the scalar out and it has no ink:
+            // an ideographic space, a zero-width space. The primary face
+            // does not have it, and its .notdef box is not what it looks
+            // like.
+            .blank => if (glyph_index == 0) return self.emptyGlyph(out_bitmap),
+            .failed => {},
+        };
 
         // The by-scalar path always retries an empty ClearType bound as
         // aliased, then falls back to GDI colour emoji before giving up.
@@ -1192,7 +1273,7 @@ pub const Renderer = struct {
             // DWrite produced an empty bitmap. For non-ASCII scalars this may
             // be a colour emoji that DWrite ClearType/aliased cannot render.
             if (!gdi_first and non_ascii) {
-                if (self.rasterizeColorEmojiGDI(scalar, 0, corep, out_bitmap)) return;
+                if (self.rasterizeColorEmojiGDI(scalar, 0, corep, out_bitmap) == .drawn) return;
             }
             // Empty glyph (space etc.)
             out_bitmap.pixels = null;
@@ -1201,6 +1282,20 @@ pub const Renderer = struct {
             out_bitmap.pitch = 0;
             out_bitmap.bytes_per_pixel = 3;
         }
+    }
+
+    /// A glyph with a cell's advance and no ink.
+    fn emptyGlyph(self: *const Renderer, out_bitmap: *core.GlyphBitmap) void {
+        out_bitmap.pixels = null;
+        out_bitmap.width = 0;
+        out_bitmap.height = 0;
+        out_bitmap.pitch = 0;
+        out_bitmap.bytes_per_pixel = 3;
+        out_bitmap.bearing_x = 0;
+        out_bitmap.bearing_y = 0;
+        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
+        out_bitmap.ascent_px = self.ascent_px;
+        out_bitmap.descent_px = self.descent_px;
     }
 
     /// Phase 2: Upload glyph bitmap to atlas_cpu at (dest_x, dest_y).
@@ -2865,6 +2960,19 @@ fn expectRunMatchesTable(
 // through initMetrics (the core's candidate list and feature parser) into
 // GetGlyphs. Cascadia Code ships with Windows 11 and draws `->`, `==`, `!=`,
 // `<=`, `=>` as contextual alternates; skipped where it is not installed.
+test "white-brush ink is not a colour font's pixel under either antialiasing" {
+    // Grayscale antialiasing: the brush premultiplied by its coverage.
+    try std.testing.expect(!isColorFontPixel(128, 128, 128, 128));
+    try std.testing.expect(!isColorFontPixel(255, 255, 255, 255));
+    // ClearType on a transparent target: per-channel coverage, no alpha.
+    try std.testing.expect(!isColorFontPixel(200, 120, 40, 0));
+    // Untouched.
+    try std.testing.expect(!isColorFontPixel(0, 0, 0, 0));
+    // A colour layer: a hue, or a grey darker than its alpha.
+    try std.testing.expect(isColorFontPixel(255, 200, 0, 255));
+    try std.testing.expect(isColorFontPixel(90, 90, 90, 255));
+}
+
 test "[font] family features change what DirectWrite shapes" {
     const alloc = std.testing.allocator;
     const hwnd = c.GetDesktopWindow() orelse return error.SkipZigTest;
