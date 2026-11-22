@@ -4690,6 +4690,13 @@ pub export fn WndProc(
                 if (getApp(hwnd)) |app| {
                     scrollbar.updateScrollbar(hwnd, app);
                 }
+            } else if (wParam == app_mod.TIMER_LAYOUT_RETRY) {
+                // One-shot retry after a layout update found grid_mu busy;
+                // it re-arms itself while the lock stays busy.
+                _ = c.KillTimer(hwnd, app_mod.TIMER_LAYOUT_RETRY);
+                if (getApp(hwnd)) |app| {
+                    updateLayoutToCore(hwnd, app);
+                }
             } else if (wParam == app_mod.TIMER_DEVICE_LOST_RETRY) {
                 // One-shot retry after a failed device-loss recovery (device
                 // creation transiently fails while the driver is resetting).
