@@ -250,6 +250,8 @@ static struct {
         struct wl_callback* frame;
         struct wl_egl_window* egl_window;
         EGLSurface egl_surface;
+        // Its swap interval is zero (zwl_ext_make_current).
+        int swap_unpaced;
         int32_t pending_w, pending_h;
         // The compositor sizes the window (maximized, fullscreen or tiled).
         int pending_placed, placed;
@@ -1628,7 +1630,16 @@ int zwl_ext_make_current(int64_t id) {
     struct zwl_ext* e = ext_of_id(id);
     EGLSurface s = e ? e->egl_surface : w.egl_surface;
     if (id && !e) return -1;
-    return eglMakeCurrent(w.egl_display, s, s, w.egl_context) ? 0 : -1;
+    if (!eglMakeCurrent(w.egl_display, s, s, w.egl_context)) return -1;
+    // As the main surface (zwl_egl_init): paced by its frame callback, never
+    // by a swap that blocks the loop. The interval is the current surface's
+    // own and starts at one, where a swap waits for the last frame to be
+    // shown: forever, on a window no output shows.
+    if (e && !e->swap_unpaced) {
+        eglSwapInterval(w.egl_display, 0);
+        e->swap_unpaced = 1;
+    }
+    return 0;
 }
 
 int zwl_ext_swap(int64_t id) {
