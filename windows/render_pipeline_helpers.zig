@@ -382,9 +382,29 @@ pub fn mainRowDisposition(in: MainRowInputs) MainRowDisposition {
     );
 }
 
+/// Whether the union of two damage rects is exactly their bounding box: one
+/// contains the other, or they span the same columns with rows that overlap
+/// or touch, or the same rows with columns that overlap or touch.
+///
+/// This is the only pair damage merges. Merging it adds no pixel; merging any
+/// other overlapping or touching pair damages the rest of their bounding box
+/// for nothing, and a full-height strip beside a one-row band is then the
+/// whole client: every frame presented in full.
+pub fn damageUnionIsExact(comptime Rect: type, a: Rect, b: Rect) bool {
+    const a_in_b = a.left >= b.left and a.right <= b.right and a.top >= b.top and a.bottom <= b.bottom;
+    const b_in_a = b.left >= a.left and b.right <= a.right and b.top >= a.top and b.bottom <= a.bottom;
+    if (a_in_b or b_in_a) return true;
+    const same_cols = a.left == b.left and a.right == b.right;
+    const same_rows = a.top == b.top and a.bottom == b.bottom;
+    return (same_cols and a.top <= b.bottom and b.top <= a.bottom) or
+        (same_rows and a.left <= b.right and b.left <= a.right);
+}
+
 /// Damage not yet copied from a persistent back buffer into each rotating
 /// swapchain buffer. A buffer is either `full` or holds `count` rects, no two
-/// of which overlap or touch; overflowing `max_rects` promotes it to full.
+/// of which merge exactly (damageUnionIsExact), so together they cover what
+/// was queued and nothing beyond it; rects that only cross each other stay
+/// apart and may overlap. Overflowing `max_rects` promotes it to full.
 /// Fixed storage: queueing never allocates.
 pub fn BackDamageQueue(comptime Rect: type, comptime buffers: usize, comptime max_rects: usize) type {
     comptime std.debug.assert(max_rects <= std.math.maxInt(u8));
@@ -422,9 +442,7 @@ pub fn BackDamageQueue(comptime Rect: type, comptime buffers: usize, comptime ma
             var i: usize = 0;
             while (i < count) {
                 const old = self.rects[index][i];
-                if (merged.left <= old.right and merged.right >= old.left and
-                    merged.top <= old.bottom and merged.bottom >= old.top)
-                {
+                if (damageUnionIsExact(Rect, merged, old)) {
                     merged = .{
                         .left = @min(old.left, merged.left),
                         .top = @min(old.top, merged.top),
@@ -433,7 +451,7 @@ pub fn BackDamageQueue(comptime Rect: type, comptime buffers: usize, comptime ma
                     };
                     count -= 1;
                     self.rects[index][i] = self.rects[index][count];
-                    // The grown rect may now touch one already passed.
+                    // The grown rect may now merge with one already passed.
                     i = 0;
                     continue;
                 }
@@ -1591,6 +1609,10 @@ pub fn clampPresentRects(comptime Rect: type, rects: []Rect, max_right: i32, max
     return len;
 }
 
+/// Compact present damage in place and return the new length: top-sorted,
+/// each rect merged into the one before it when their union is exact
+/// (damageUnionIsExact). The result covers every input pixel and no pixel
+/// outside the inputs; rects that only cross each other are kept apart.
 pub fn compactDamageRects(comptime Rect: type, rects: []Rect) usize {
     if (rects.len < 2) return rects.len;
 
@@ -1606,10 +1628,7 @@ pub fn compactDamageRects(comptime Rect: type, rects: []Rect) usize {
     var out_len: usize = 0;
     var merged = rects[0];
     for (rects[1..]) |rect| {
-        const overlaps_or_touches =
-            rect.left <= merged.right and rect.right >= merged.left and
-            rect.top <= merged.bottom and rect.bottom >= merged.top;
-        if (overlaps_or_touches) {
+        if (damageUnionIsExact(Rect, merged, rect)) {
             merged.left = @min(merged.left, rect.left);
             merged.top = @min(merged.top, rect.top);
             merged.right = @max(merged.right, rect.right);
