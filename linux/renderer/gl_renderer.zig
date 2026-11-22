@@ -689,7 +689,7 @@ fn planFrame(app: *App, t: *Target, fx: bool, buffer_age: u32) Plan {
         if (e.movesRows()) return .{ .whole = null };
     }
     // A panel over the view changes with no row of the view.
-    if (!app.panel_popups) for (app.overlays) |o| if (o.open) return .{ .whole = null };
+    if (overlay_layout.inViewPanels(&app.overlays, app.panel_popups) != 0) return .{ .whole = null };
     if (owed.isEmpty()) return .none;
     const row_h: i32 = @intCast(app.cell_h_px);
     const h: i32 = @intCast(t.h_px);
@@ -737,6 +737,9 @@ fn frameKey(app: *App, t: *const Target, fx: bool) u64 {
         t.w_px,                     t.h_px,                  t.ox_px,              t.oy_px,        t.fb_w_px,        t.fb_h_px,
         app.cell_w_px,              app.cell_h_px,           app.scale,            app.island(),   app.captionless(), app.default_bg,
         app.window_cfg.opacity,     app.window_cfg.blur,     fx,                   app.panel_popups,
+        // A panel that closed is drawn by no frame, so only the set changing
+        // says its pixels are stale.
+        overlay_layout.inViewPanels(&app.overlays, app.panel_popups),
         // The UI layer and the textures the frame samples.
         app.chrome_gen,             app.ui_atlas.gen,        app.atlas_pending.gen,
         sb != null,                 view.grid,               view.topline,         view.botline,   view.line_count,  app.scrollbar.alpha,

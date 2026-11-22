@@ -45,6 +45,34 @@ pub const Surface = struct {
     start_col: i32 = -1,
 };
 
+/// The open panels drawn into the main view, one bit per Kind; none when each
+/// panel has a popup surface of its own. Such a panel changes pixels of the
+/// view that no row of the view names, so a frame is drawn whole while any
+/// bit is set and when the set differs from the last frame's: the frame after
+/// a close is what takes the panel's pixels away.
+pub fn inViewPanels(surfaces: *const [4]Surface, own_surfaces: bool) u4 {
+    if (own_surfaces) return 0;
+    var set: u4 = 0;
+    for (surfaces, 0..) |s, i| {
+        if (s.open) set |= @as(u4, 1) << @intCast(i);
+    }
+    return set;
+}
+
+test "panels drawn in the view are a set that a close changes" {
+    var surfaces: [4]Surface = @splat(.{});
+    try std.testing.expectEqual(@as(u4, 0), inViewPanels(&surfaces, false));
+    surfaces[@intFromEnum(Kind.cmdline)].open = true;
+    surfaces[@intFromEnum(Kind.msg_show)].open = true;
+    const both = inViewPanels(&surfaces, false);
+    try std.testing.expect(both != 0);
+    surfaces[@intFromEnum(Kind.cmdline)] = .{};
+    const one = inViewPanels(&surfaces, false);
+    try std.testing.expect(one != 0 and one != both);
+    // On popup surfaces of their own they are no part of the view's frame.
+    try std.testing.expectEqual(@as(u4, 0), inViewPanels(&surfaces, true));
+}
+
 pub const Rect = struct {
     x: i32,
     y: i32,
