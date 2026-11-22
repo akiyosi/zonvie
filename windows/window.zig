@@ -981,6 +981,21 @@ fn releaseRemainingDeviceLostRecoveryPins(app: *App, start_index: usize) void {
     }
 }
 
+/// An external window whose rebuild failed keeps its old renderer. That
+/// renderer is bound to the device this recovery replaced whether or not it
+/// saw the loss itself -- a window that has not presented since never does --
+/// so it is marked lost here. The mark is what the rest of recovery reads: it
+/// lets the retry through the stale-retry guard, and sends the window's
+/// paints to recovery instead of a paint retry that cannot succeed on a dead
+/// device. Releases the recovery's paint pin, which is what kept `ext_win`
+/// alive until now.
+fn leaveExternalWindowLost(app: *App, ext_win: *ExternalWindow, grid_id: i64) void {
+    app.mu.lockUncancelable(core.clock.io());
+    ext_win.renderer.device_lost = true;
+    app.mu.unlock(core.clock.io());
+    external_windows.finishExternalWindowPaint(app, grid_id);
+}
+
 pub fn serviceDeferredUiRetries(hwnd: c.HWND, app: *App) void {
     if (app.deferred_ui_service_in_progress) return;
     app.deferred_ui_service_in_progress = true;
@@ -5398,13 +5413,13 @@ pub export fn WndProc(
                     var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd, grid_id) orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
-                        external_windows.finishExternalWindowPaint(app, grid_id);
+                        leaveExternalWindowLost(app, ext_win, grid_id);
                         continue;
                     };
                     new_renderer.resize() catch {
                         new_renderer.deinit();
                         any_ext_failed = true;
-                        external_windows.finishExternalWindowPaint(app, grid_id);
+                        leaveExternalWindowLost(app, ext_win, grid_id);
                         continue;
                     };
                     // Replay any WM_SIZE delivered while the unlocked device
@@ -5413,7 +5428,7 @@ pub export fn WndProc(
                     new_renderer.resize() catch {
                         new_renderer.deinit();
                         any_ext_failed = true;
-                        external_windows.finishExternalWindowPaint(app, grid_id);
+                        leaveExternalWindowLost(app, ext_win, grid_id);
                         continue;
                     };
                     if (app.device_lost_recovery_cancelled) {
