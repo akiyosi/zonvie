@@ -272,7 +272,10 @@ pub const TIMER_CURSOR_BLINK_RETRY: c.UINT_PTR = 13;
 /// viewport under grid_mu contention (the WM_APP_UPDATE_SCROLLBAR message
 /// is one-shot; without a retry the post-scroll repaint would be dropped).
 pub const TIMER_SCROLLBAR_RETRY: c.UINT_PTR = 14;
-/// Retry cadence for the two grid_mu-contention retry timers above
+/// One-shot retry for a layout update whose grid try-lock was busy
+/// (updateLayoutToCore): the update is a write the core is owed.
+pub const TIMER_LAYOUT_RETRY: c.UINT_PTR = 27;
+/// Retry cadence for the grid_mu-contention retry timers above
 /// (mirrors macOS's 16ms timer re-arm for the same conversions).
 pub const LOCK_RETRY_INTERVAL_MS: c.UINT = 16;
 /// One-shot retry after a failed device-loss recovery. D3D11CreateDevice
@@ -7560,8 +7563,10 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         );
     }
 
-    // The cmdline's width budget goes in first so the flush the layout update
-    // retries already sizes the cmdline with it.
+    // The cmdline's width budget goes in with the layout so the flush the
+    // layout update retries already sizes the cmdline with it. Zero keeps the
+    // value the core has.
+    var budget: core.frontend_rules.CmdlineCols = .{ .screen_cols = 0, .default_cols = 0 };
     if (app.hwnd) |main_hwnd| {
         // Chrome that sits beside the cmdline grid inside its own window.
         const cmdline_chrome_w: u32 = @intCast(@max(0, external_windows.externalSurfaceInsetsPx(app, CMDLINE_GRID_ID, app.dpi_scale).w));
@@ -7576,11 +7581,20 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         var wr: c.RECT = undefined;
         if (c.GetWindowRect(main_hwnd, &wr) != 0) main_w = @intCast(@max(1, wr.right - wr.left));
 
-        const budget = core.frontend_rules.cmdlineCols(work_w, main_w, cmdline_chrome_w, @intCast(@max(0, external_windows.cmdlineScreenMarginPx(app))), cw);
-        if (budget.screen_cols != 0) core.zonvie_core_set_screen_cols(app.corep, budget.screen_cols);
-        if (budget.default_cols != 0) core.zonvie_core_set_cmdline_default_cols(app.corep, budget.default_cols);
+        budget = core.frontend_rules.cmdlineCols(work_w, main_w, cmdline_chrome_w, @intCast(@max(0, external_windows.cmdlineScreenMarginPx(app))), cw);
     }
 
+    // One try-lock for the layout and both budgets, as the other frontends
+    // publish theirs: this runs on the UI thread, mostly from WM_SIZE, and a
+    // blocking update waited out the core's flush three times over. Busy means
+    // the core is mid-flush with the old layout; the update is owed, so a
+    // one-shot timer brings it back. Every input is read again then, so the
+    // newest size wins.
+    if (core.zonvie_core_try_update_layout_px(app.corep, w, h, cw, ch, budget.screen_cols, budget.default_cols)) return;
+    if (c.SetTimer(hwnd, TIMER_LAYOUT_RETRY, LOCK_RETRY_INTERVAL_MS, null) != 0) return;
+    // No timer to retry on: wait for the lock rather than lose the update.
+    if (budget.screen_cols != 0) core.zonvie_core_set_screen_cols(app.corep, budget.screen_cols);
+    if (budget.default_cols != 0) core.zonvie_core_set_cmdline_default_cols(app.corep, budget.default_cols);
     core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
 }
 
