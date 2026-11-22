@@ -4092,8 +4092,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 }
 
 extension ExternalGridView {
-    /// One draw outside the live resize gives the back buffer's resize slack
-    /// back (surfaceTextureCapacity), even with no Neovim traffic behind it.
+    /// Asks for one draw outside the live resize, which gives the back
+    /// buffer's resize slack back (surfaceTextureCapacity) when it draws. A
+    /// frame with nothing to draw returns before the back buffer is sized, so
+    /// with no Neovim traffic behind it the slack stays until the next frame
+    /// that does draw.
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
         activateSurfaceDrawLoop()

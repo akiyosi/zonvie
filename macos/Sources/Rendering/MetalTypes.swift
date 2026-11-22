@@ -277,9 +277,10 @@ final class ScrollRetention {
     /// are bound straight to the encoder and are not tracked by any in-flight
     /// counter, so ring size is the only thing keeping them alive.
     ///
-    /// External surfaces allow TWO frames in flight; the main renderer allows
-    /// one. Pinned by ScrollRetentionTests' "ringSize must exceed the buffers
-    /// that can be live at once".
+    /// Both surfaces allow one frame in flight (their inflightSemaphore). The
+    /// ring is sized for two, which leaves one frame's rows of slack. Pinned
+    /// by ScrollRetentionTests' "ringSize must exceed the buffers that can be
+    /// live at once".
     static let maxInFlightFrames = 2
     /// Windows that can hold a band at the same time. Enforced in `beginStep`,
     /// not merely assumed: the ring is the only thing keeping a retained buffer
