@@ -1517,6 +1517,24 @@ test "accepted blit rectangles only refuse layers that share pixels" {
     ));
 }
 
+test "an accepted blit owes its whole rectangle as present damage, clipped to the client" {
+    const R = struct { left: i32, top: i32, right: i32, bottom: i32 };
+    const blit: helpers.BlitRectPx = .{ .left = 100, .top = 200, .right = 400, .bottom = 500 };
+    // Inside the client: the rectangle itself, moved rows included.
+    try std.testing.expectEqual(
+        @as(?R, .{ .left = 100, .top = 200, .right = 400, .bottom = 500 }),
+        helpers.blitPresentRect(R, blit, 800, 600),
+    );
+    // A client smaller than the back buffer bounds it.
+    try std.testing.expectEqual(
+        @as(?R, .{ .left = 100, .top = 200, .right = 300, .bottom = 450 }),
+        helpers.blitPresentRect(R, blit, 300, 450),
+    );
+    // Nothing of it inside the client owes nothing.
+    try std.testing.expectEqual(@as(?R, null), helpers.blitPresentRect(R, blit, 100, 600));
+    try std.testing.expectEqual(@as(?R, null), helpers.blitPresentRect(R, blit, 800, 200));
+}
+
 fn bitsFrom(alloc: std.mem.Allocator, len: usize, set: []const usize) !std.DynamicBitSetUnmanaged {
     var bits = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
     for (set) |i| bits.set(i);
