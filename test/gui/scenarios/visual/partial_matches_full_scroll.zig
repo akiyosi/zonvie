@@ -41,7 +41,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Scroll down by 7 lines.
     const scroll_start = try app_log.nowMs(alloc, log_path);
-    try g.exec("execute('normal! 7<C-e>')");
+    try g.remoteSend("7<C-e>");
     var partial = try g.captureStable(crop, 8000);
     defer partial.deinit(alloc);
 
