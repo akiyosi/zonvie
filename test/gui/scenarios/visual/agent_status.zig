@@ -9,8 +9,11 @@
 const std = @import("std");
 const driver = @import("../../driver.zig");
 const fixture = @import("fixture.zig");
+const visual = @import("../../visual.zig");
 const capture = driver.capture;
 const Gui = driver.Gui;
+
+const tab_bar: capture.Crop = .{ .w_pt = 900, .h_pt = 140 };
 
 pub fn run(alloc: std.mem.Allocator) !void {
     // This scenario needs its own config_dir, so it builds the Gui itself
@@ -29,6 +32,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('set showtabline=2')");
     // A named buffer so the single tab has a visible label.
     try g.exec("execute('edit agentwork.txt')");
+    var before = try g.captureStable(tab_bar, 8000);
+    defer before.deinit(alloc);
 
     // Mark tabpage handle 1 (the first/only tabpage) as a working agent,
     // bypassing the OSC reporter to test rendering directly. state=3 is the
@@ -37,8 +42,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Force a redraw so the dirty tabline re-emits with the indicator.
     try g.exec("execute('redraw!')");
 
-    var img = try g.captureStable(.{ .w_pt = 900, .h_pt = 140 }, 8000);
+    var img = try g.captureStable(tab_bar, 8000);
     defer img.deinit(alloc);
     try capture.writeImage(alloc, "tmp/agent_status_actual.png", img);
     std.debug.print("[gui] wrote tmp/agent_status_actual.png ({d}x{d})\n", .{ img.w, img.h });
+
+    // Nothing else changed between the two captures, so any difference is
+    // the indicator; none means the state never reached the tab.
+    if (visual.regionDiffRatio(before, img, .{}, 8) == 0) {
+        std.debug.print("[gui] agent_status: the working state changed nothing on the tab bar\n", .{});
+        return error.IndicatorNotPainted;
+    }
 }
