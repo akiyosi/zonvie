@@ -252,6 +252,10 @@ test "gui:visual_partial_matches_full" {
     try gated(can_capture, @import("scenarios/visual/partial_matches_full.zig"));
 }
 
+test "gui:visual_partial_matches_full_scroll" {
+    try gated(can_capture and redraws_partially, @import("scenarios/visual/partial_matches_full_scroll.zig"));
+}
+
 test "gui:visual_partial_matches_full_float_move" {
     try gated(can_capture, @import("scenarios/visual/partial_matches_full_float_move.zig"));
 }

@@ -1685,6 +1685,22 @@ pub fn blitRectsIntersect(a: BlitRectPx, b: BlitRectPx) bool {
     return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom;
 }
 
+/// The present damage an accepted copy owes: every pixel it rewrote, clipped
+/// to the client. The copy moves rows the plan never redraws, so no row or
+/// band damage names them, and a present that copies only its damage would
+/// leave them on screen as they were. Null when nothing of it is inside the
+/// client.
+pub fn blitPresentRect(comptime Rect: type, blit: BlitRectPx, client_right: i32, client_bottom: i32) ?Rect {
+    const rc: Rect = .{
+        .left = @max(0, blit.left),
+        .top = @max(0, blit.top),
+        .right = @min(client_right, blit.right),
+        .bottom = @min(client_bottom, blit.bottom),
+    };
+    if (rc.right <= rc.left or rc.bottom <= rc.top) return null;
+    return rc;
+}
+
 /// The ROOT rows a layer's pixels can occupy after the root's own scroll copy
 /// moved them, as a half-open [from, to) clamped to `surface_rows`.
 ///

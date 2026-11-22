@@ -4640,6 +4640,24 @@ pub fn appendBandPresentRects(
     });
 }
 
+/// Queue the rectangle each accepted layer copy rewrote as present damage.
+/// With the bands this completes the plan's side of the present contract:
+/// every back_tex pixel the plan changed is damaged, whether it was redrawn
+/// or only moved.
+pub fn appendBlitPresentRects(
+    paint: *SurfacePaintState,
+    layers: []const SurfaceLayer,
+    client_right: i32,
+    client_bottom: i32,
+    present: *PresentRectBuilder,
+) void {
+    for (layers[1..]) |layer| {
+        const state = paint.layerState(layer.grid_id) orelse continue;
+        const blit = state.draw_blit_rect orelse continue;
+        present.addOpt(render_pipeline_helpers.blitPresentRect(c.RECT, blit, client_right, client_bottom));
+    }
+}
+
 /// A row frame refused for its vertex-buffer budget: the layer damage this
 /// paint took is handed back whole, and the core is told the budget failed.
 /// Unlike every other failure, this one does not requeue a full paint.
@@ -6075,14 +6093,17 @@ pub fn drawSurfaceRowPass(
         drawn_layers = paint.drawn_layers.items;
         if (paint.layerState(in.snapshot.cursor_layer_grid_id)) |st|
             in.frame.cursor_layer_origin[1] += @floatFromInt(st.follow_dy_px);
-        if (in.layer_present) |lp| appendBandPresentRects(
-            paint.bands.items,
-            p.x_offset,
-            p.y_offset,
-            lp.right,
-            lp.bottom,
-            lp.present,
-        );
+        if (in.layer_present) |lp| {
+            appendBandPresentRects(
+                paint.bands.items,
+                p.x_offset,
+                p.y_offset,
+                lp.right,
+                lp.bottom,
+                lp.present,
+            );
+            appendBlitPresentRects(paint, drawn_layers, lp.right, lp.bottom, lp.present);
+        }
     }
 
     // An eased frame presents on vblank, so the paints that drive the ease
@@ -8264,6 +8285,29 @@ test "a band redraws the root rows and layer rows one row past its edges" {
     for (0..20) |r| {
         try std.testing.expectEqual(r >= 8 and r <= 12, layerRowDrawn(&fx.paint, 2, @intCast(r)));
     }
+}
+
+test "a layer's accepted copy is present damage, and a layer without one adds none" {
+    // The copy moved rows the plan does not redraw, so the bands alone leave
+    // them out of the present: the rectangle it rewrote is damage of its own.
+    const alloc = std.testing.allocator;
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 40, .cols = 40, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 40, .cols = 20, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 160, .y_px = 0, .rows = 40, .cols = 20, .z = 1, .follows_scroll = false },
+    };
+    var fx = LayerPlanFixture{};
+    defer fx.deinit(alloc);
+    try fx.init(alloc, &.{ 2, 3 }, &.{ 40, 40 }, &layers);
+    fx.paint.layerState(2).?.draw_blit_rect = .{ .left = 0, .top = 100, .right = 160, .bottom = 400 };
+
+    var rects: std.ArrayListUnmanaged(c.RECT) = .empty;
+    defer rects.deinit(alloc);
+    var present = PresentRectBuilder.begin(&rects, alloc, 4);
+    appendBlitPresentRects(&fx.paint, &layers, 320, 400, &present);
+    try std.testing.expect(!present.full);
+    try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+    try std.testing.expectEqual(c.RECT{ .left = 0, .top = 100, .right = 160, .bottom = 400 }, rects.items[0]);
 }
 
 test {
