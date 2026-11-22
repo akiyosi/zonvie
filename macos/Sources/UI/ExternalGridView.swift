@@ -2429,6 +2429,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             f.use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
+            // --- Ensure back buffer ---
+            // Before anything asks whether the buffer holds a presented
+            // frame: remaking the texture clears that latch, and a texture
+            // can be remade at an unchanged drawable size (the spare capacity
+            // of a live resize given back), where nothing else refuses the
+            // scroll blit below.
+            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
+
             // Whether a scroll blit MAY run this frame. `useGpuScrollCopy`
             // is whether one DID, which is what the load action and
             // the row-pass plan ask; the main surface has always answered
@@ -2476,8 +2484,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             f.retainedRows = f.hasScrollOffset ? f.retained : []
             f.smoothRowRange = 0..<(f.safeRowCount + f.retainedRows.count)
 
-            // --- Ensure back buffer ---
-            ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
             guard let backTex = backBuffer else {
                 bailWithoutSubmit("no backbuffer", &f, finishedRedraw: &finishedRedraw)
                 return
