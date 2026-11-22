@@ -950,6 +950,33 @@ fn updateMetrics(app: *App) void {
     ext_window.queueRefit(app);
 }
 
+/// The surface scale is now `scale`: the global faces are loaded again at
+/// their point size times it, and the core drops every glyph it rasterized at
+/// the old one. Main thread; takes the core's grid lock, which guards the
+/// faces, for as long as the load takes.
+///
+/// Post: App.scale is `scale` and the published cell is the new faces'. The
+/// caller owes the layout update for the window's new px size; the changed
+/// cell in it is what makes the core load the per-grid fonts again
+/// (on_font_slot_load reads App.scale).
+pub fn rescale(app: *App, scale: f32) void {
+    const cp = app.corep;
+    if (cp) |p| core.zonvie_core_lock_grid(p);
+    defer if (cp) |p| core.zonvie_core_unlock_grid(p);
+    lock(app);
+    app.scale = scale;
+    const pt = app.font_pt;
+    unlock(app);
+    // No face yet: the first load reads the new scale.
+    if (app.fonts.regular == null) return;
+    if (!app.fonts.reload(app.alloc, pixelSize(app, if (pt > 0) pt else configPt(app)))) {
+        applog.appLog("[linux] font: reload at scale {d} failed; the old faces stay\n", .{scale});
+        return;
+    }
+    if (cp) |p| core.zonvie_core_invalidate_glyph_cache(p);
+    updateMetrics(app);
+}
+
 fn sendLayout(app: *App) void {
     lock(app);
     const w = app.drawable_w_px;

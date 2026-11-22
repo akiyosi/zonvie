@@ -48,6 +48,22 @@ test "the state text reads back as written" {
     try std.testing.expectEqual([2]c_int{ 1000, 700 }, parseState(text).?.size);
 }
 
+/// `px` device px at buffer scale `old`, as device px at scale `new`: the same
+/// length on the glass, rounded down to a whole px. Pre: `old >= 1`,
+/// `new >= 1`.
+pub fn rescaledPx(px: u32, old: i32, new: i32) u32 {
+    std.debug.assert(old >= 1 and new >= 1);
+    return @intCast(@as(u64, px) * @as(u64, @intCast(new)) / @as(u64, @intCast(old)));
+}
+
+test "a length keeps its place on the glass across a scale change" {
+    try std.testing.expectEqual(@as(u32, 1800), rescaledPx(900, 1, 2));
+    try std.testing.expectEqual(@as(u32, 900), rescaledPx(1800, 2, 1));
+    try std.testing.expectEqual(@as(u32, 450), rescaledPx(901, 2, 1));
+    try std.testing.expectEqual(@as(u32, 1351), rescaledPx(901, 2, 3));
+    try std.testing.expectEqual(@as(u32, 0), rescaledPx(0, 1, 2));
+}
+
 /// What the last run closed with.
 pub fn restored() ?Saved {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;

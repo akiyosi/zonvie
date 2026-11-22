@@ -46,6 +46,12 @@ typedef struct {
     // The pointer entered a window: the events after it are that window's.
     // 0 is the main window.
     void (*pointer_window)(void* data, int64_t id);
+    // The main window's surface is best drawn at buffer scale `scale` (>= 1):
+    // it is on an output of that scale, or its output's scale changed. Sent
+    // when the scale differs from the last one sent; the first may repeat
+    // zwl_scale(), which stands until then. Never before the window is
+    // mapped, and not while it is on no output.
+    void (*scale)(void* data, int32_t scale);
 } zwl_listener;
 
 // Connects and binds the globals. 0, or -1 when no compositor answers.
@@ -61,6 +67,9 @@ void zwl_set_title(const char* title);
 int zwl_placed(void);
 // Blur behind the window, where the compositor offers it.
 void zwl_blur(void);
+// Takes effect with the next buffer committed, whose size must be a multiple
+// of it: set it between the last buffer of the old size and the first of the
+// new one.
 void zwl_set_buffer_scale(int32_t scale);
 void zwl_request_frame(void);
 int zwl_frame_pending(void);
@@ -127,6 +136,8 @@ void zwl_ext_close(int64_t id);
 int zwl_popup_open(int64_t id, int64_t parent_id, int32_t x, int32_t y, int32_t w_logical, int32_t h_logical,
                    int32_t anchor_x, int32_t anchor_y, int32_t scale);
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px);
+// As zwl_set_buffer_scale, for window `id`.
+void zwl_ext_set_buffer_scale(int64_t id, int32_t scale);
 // The compositor sizes window `id`: maximized, fullscreen or tiled.
 int zwl_ext_placed(int64_t id);
 // Window `id` (1, or an external window's id) asks the compositor for the
