@@ -2630,10 +2630,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// `backBufferSize` is the LOGICAL size (the drawable's); the texture may
     /// be larger during a live resize (surfaceTextureCapacity).
-    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat, inLiveResize: Bool) {
+    ///
+    /// Returns true when the back buffer no longer holds a previous frame: a
+    /// new texture is undefined, and a reused one is stale outside the old
+    /// logical region. The frame that called owes a clear and every row, and
+    /// has to be told, because the presented latch it snapshotted predates
+    /// this call. A texture can be remade at an unchanged logical size (the
+    /// spare capacity of a live resize given back), so the drawable's size
+    /// changing is not the same question.
+    private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat, inLiveResize: Bool) -> Bool {
         let capacity = surfaceTextureCapacity(current: backBuffer, logicalSize: drawableSize, inLiveResize: inLiveResize)
         let reallocate = backBuffer?.width != capacity.widthPx || backBuffer?.height != capacity.heightPx
-        if !reallocate, backBufferSize == drawableSize { return }
+        if !reallocate, backBufferSize == drawableSize { return false }
 
         let oldSize = backBufferSize
         let wasPresented = hasPresentedOnce
@@ -2660,6 +2668,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) capacity=\(capacity.widthPx)x\(capacity.heightPx) reallocated=\(reallocate) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+        return true
     }
 
     init?(view: MTKView, collectsGpuPerfSamples: Bool = true) {
@@ -3816,7 +3825,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_backbuf_start = CFAbsoluteTimeGetCurrent()
             }
-            ensureBackBuffer(drawableSize: gridDrawableSize(view), pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize)
+            if ensureBackBuffer(drawableSize: gridDrawableSize(view), pixelFormat: view.colorPixelFormat, inLiveResize: view.inLiveResize) {
+                // Every decision below reads the frame's snapshot, which was
+                // taken while the old texture still held a presented frame.
+                f.hasPresentedOnce = false
+            }
             if ZonvieCore.appLogEnabled {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
