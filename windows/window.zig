@@ -2593,9 +2593,12 @@ fn planMainRows(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInputs
         return null;
     }
 
-    // If atlas was uploaded but no rows will be drawn in this frame,
+    // If atlas was uploaded but no content row will be drawn in this frame,
     // request a full repaint so newly uploaded glyphs become visible.
-    if (render_helpers.atlasUploadOwesFullPaint(in.atlas_uploaded, rows_to_draw.items.len != 0)) {
+    if (render_helpers.atlasUploadOwesFullPaint(
+        in.atlas_uploaded,
+        app_mod.paintDrawsContentRows(rows_to_draw.items, in.tbs_snapshot.layer_damage),
+    )) {
         app_mod.requestMainFullPaint(app);
         app.surf.tbs.requestFullPaint();
         _ = c.InvalidateRect(hwnd, null, c.FALSE);

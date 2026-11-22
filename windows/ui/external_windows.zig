@@ -652,7 +652,7 @@ fn drawNormalExternalSurface(
 ) !ExternalPresentFacts {
     ext_win.surf.paint.present_rects.clearRetainingCapacity();
     // The pre-commit path redraws every row; the row path narrows this.
-    ext_win.paint_drew_root_rows = true;
+    ext_win.paint_drew_content_rows = true;
 
     // Both paths share the same retained back_tex. Restore a prior
     // scrollbar before either path mutates or clears it.
@@ -802,10 +802,10 @@ fn drawNormalExternalSurfaceRowMode(
     // Whether content rows were drawn is read before the erase rows join them,
     // as the main driver reads it: a frame that only redraws the cursor's two
     // rows leaves the rest sampling the atlas as it was before the upload.
-    ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0;
+    ext_win.paint_drew_content_rows = app_mod.paintDrawsContentRows(rows_to_draw.items, tbs_snap.layer_damage);
     // macOS's line for a frame that keeps every content row. Here the cursor's
     // two rows are still repainted from their vertices, below.
-    if (!ext_win.paint_drew_root_rows and !force_full_rows and applog.isVerbose()) {
+    if (rows_to_draw.items.len == 0 and !force_full_rows and applog.isVerbose()) {
         applog.appLog("[render_trace] side=windows event=retained_content_reuse surface={d} root_row_draws=0\n", .{grid_id});
     }
     if (!render_pipeline_helpers.insertCursorEraseRows(
@@ -4088,7 +4088,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
         // Asked for, not failed: this frame still presents what it drew, as
         // the main driver's does.
-        if (render_pipeline_helpers.atlasUploadOwesFullPaint(ext_atlas_uploaded, ext_win.paint_drew_root_rows)) {
+        if (render_pipeline_helpers.atlasUploadOwesFullPaint(ext_atlas_uploaded, ext_win.paint_drew_content_rows)) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: atlas uploaded with no root row drawn, repainting\n", .{});
             app_mod.requestSurfaceFullPaint(app, &ext_win.surf);
             _ = c.InvalidateRect(hwnd, null, 0);
