@@ -5,6 +5,7 @@ test {
     _ = @import("transform.zig");
     _ = @import("atlas_pixels.zig");
     _ = @import("fc.zig");
+    _ = @import("fallback_memo.zig");
     _ = @import("grid_ease.zig");
     _ = @import("overlay_layout.zig");
     _ = @import("popup_place.zig");
