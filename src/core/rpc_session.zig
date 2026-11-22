@@ -1985,8 +1985,15 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     const groups_changed = self.hl.groups_changed;
     if (self.hl.groups_changed) {
         self.hl.groups_changed = false;
+        const regrouped = self.hl.defined_ids_regrouped;
+        self.hl.defined_ids_regrouped = false;
+        const was_enabled = self.glow_enabled.load(.acquire);
         self.resolveGlowGroups();
-        if (self.glow_enabled.load(.acquire)) {
+        // The rows already generated are stale only when a cell they hold
+        // may glow differently: an id that was on screen changed groups, or
+        // glow as a whole just came on. An id defined for the first time is
+        // on no row yet, and nearly every redraw defines some.
+        if (self.glow_enabled.load(.acquire) and (regrouped or !was_enabled)) {
             self.grid.markEverySurfaceDirty();
             self.cursor_owner.force_recheck = true;
         }

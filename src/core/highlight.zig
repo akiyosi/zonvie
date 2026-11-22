@@ -120,6 +120,12 @@ pub const Highlights = struct {
 
     // Flags set by setGroup/setDefaults, consumed by rpc_session post-handleRedraw
     groups_changed: bool = false,
+    /// Set with `groups_changed` when the change can reach a cell already on
+    /// a grid: an `hl_group_set`, or new groups for an id that was defined
+    /// before. A first definition cannot: Neovim defines an id before any
+    /// grid_line uses it, so no row sent so far carries it, and the rows that
+    /// will are sent dirty.
+    defined_ids_regrouped: bool = false,
     default_colors_changed: bool = false,
 
     pub fn init(alloc: std.mem.Allocator) Highlights {
@@ -169,6 +175,7 @@ pub const Highlights = struct {
         self.default_bg = 0x00000000;
         self.default_sp = 0x00000000;
         self.groups_changed = false;
+        self.defined_ids_regrouped = false;
         self.default_colors_changed = false;
     }
 
@@ -183,12 +190,14 @@ pub const Highlights = struct {
         if (self.groups.getEntry(name)) |e| {
             e.value_ptr.* = hl_id;
             self.groups_changed = true;
+            self.defined_ids_regrouped = true;
             return;
         }
         const k = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(k);
         try self.groups.put(k, hl_id);
         self.groups_changed = true;
+        self.defined_ids_regrouped = true;
     }
 
     /// One hl_attr_define: the attribute plus the ext_hlstate group names it
@@ -225,6 +234,7 @@ pub const Highlights = struct {
             self.alloc.free(old);
             self.attr_names.putAssumeCapacity(id, fresh);
             self.groups_changed = true;
+            if (self.map.contains(id)) self.defined_ids_regrouped = true;
         }
 
         self.publish(id, a);
@@ -448,6 +458,8 @@ test "redefining an id with disjoint groups drops the old ones" {
     defer h.deinit();
     try h.defineWithNames(5, .{}, &.{ "Comment", "Comment", "@comment" });
     try std.testing.expect(h.groups_changed);
+    // A first definition is on no row yet.
+    try std.testing.expect(!h.defined_ids_regrouped);
     try std.testing.expectEqual(@as(usize, 2), h.attr_names.get(5).?.len);
     h.groups_changed = false;
     // The same set in another order is no change.
@@ -455,6 +467,8 @@ test "redefining an id with disjoint groups drops the old ones" {
     try std.testing.expect(!h.groups_changed);
     try h.defineWithNames(5, .{}, &.{"@markup.quote"});
     try std.testing.expect(h.groups_changed);
+    // An id that rows may already carry now belongs to other groups.
+    try std.testing.expect(h.defined_ids_regrouped);
     const names = h.attr_names.get(5).?;
     try std.testing.expectEqual(@as(usize, 1), names.len);
     try std.testing.expectEqualStrings("@markup.quote", names[0]);
