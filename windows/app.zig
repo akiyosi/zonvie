@@ -806,6 +806,18 @@ pub const LayerDamage = struct {
     }
 };
 
+/// Whether a paint redraws any content row of its surface: a root row of its
+/// redraw set, taken before the cursor's erase rows join it, or a row a
+/// layer's damage names. On a multigrid surface the text is all in layers, so
+/// the root's rows alone say nothing about whether content was drawn.
+pub fn paintDrawsContentRows(root_rows: []const u32, layer_damage: []const LayerDamage) bool {
+    if (root_rows.len != 0) return true;
+    for (layer_damage) |d| {
+        if (d.full or d.rows.findFirstSet() != null) return true;
+    }
+    return false;
+}
+
 /// Per-grid damage, kept in a list that never shrinks so its bitsets are
 /// reused; entries past `len` are free.
 pub const LayerDamageList = struct {
@@ -3093,8 +3105,9 @@ pub const ExternalWindow = struct {
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
     paint_scratch: std.ArrayListUnmanaged(Vertex) = .empty,
     paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .empty,
-    // Whether the last paint drew any root row, for atlasUploadOwesFullPaint.
-    paint_drew_root_rows: bool = false,
+    // Whether the last paint drew any content row (paintDrawsContentRows),
+    // for atlasUploadOwesFullPaint.
+    paint_drew_content_rows: bool = false,
     // back_tex holds the last row-mode frame. False until a full row frame
     // presents; every failure path and every recreate clears it.
     back_tex_valid: bool = false,
@@ -7842,6 +7855,22 @@ test "a layer that shrinks drops the rows past its height" {
     try LayerTestProbe.writeLayer(&tbs, alloc, 2, 0, 1.0, 1);
     tbs.commitFlush(alloc);
     try std.testing.expectEqual(@as(usize, 1), tbs.sets[tbs.committed_index].layerRows(2).?.row_map.items.len);
+}
+
+test "a paint draws content when a root row or a layer's damaged row is drawn" {
+    const alloc = std.testing.allocator;
+    var list: LayerDamageList = .{};
+    defer list.deinit(alloc);
+    try std.testing.expect(!paintDrawsContentRows(&.{}, list.slice()));
+    try std.testing.expect(paintDrawsContentRows(&.{3}, list.slice()));
+    // A layer the commit touched without naming a row draws nothing.
+    const d = list.getOrAdd(alloc, 2, 20) orelse return error.OutOfMemory;
+    try std.testing.expect(!paintDrawsContentRows(&.{}, list.slice()));
+    d.rows.set(7);
+    try std.testing.expect(paintDrawsContentRows(&.{}, list.slice()));
+    d.rows.unset(7);
+    d.full = true;
+    try std.testing.expect(paintDrawsContentRows(&.{}, list.slice()));
 }
 
 test "a layer that moves is redrawn whole" {

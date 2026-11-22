@@ -980,14 +980,13 @@ pub const AtlasUploadLedger = struct {
     }
 };
 
-/// A paint that uploaded glyphs but redrew no root row leaves those glyphs
+/// A paint that uploaded glyphs but redrew no content row leaves those glyphs
 /// invisible until an unrelated repaint: rows drawn before the upload sampled
 /// an atlas region that was still empty. Such a paint asks for a full one.
-/// The two drivers asked this differently — main of its root rows, the
-/// external driver of whether anything at all was presented, which missed a
-/// frame whose only damage was a layer.
-pub fn atlasUploadOwesFullPaint(atlas_uploaded: bool, drew_root_rows: bool) bool {
-    return atlas_uploaded and !drew_root_rows;
+/// Both drivers ask it of the same fact, a root row or a layer's damaged row
+/// drawn this paint; a frame that only repaints the cursor's rows drew none.
+pub fn atlasUploadOwesFullPaint(atlas_uploaded: bool, drew_content_rows: bool) bool {
+    return atlas_uploaded and !drew_content_rows;
 }
 
 /// Claim the two root rows a cursor move touches — where the previous cursor
