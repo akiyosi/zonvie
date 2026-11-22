@@ -47,6 +47,15 @@ pub const GridEase = struct {
         return !self.hold.held and self.spring.moving();
     }
 
+    /// The next frame draws this grid's rows where no commit put them, so no
+    /// damage names what changes: it is drawn whole. True while a gesture
+    /// holds the offset or the spring is off rest, whether or not a frame has
+    /// planned it yet, and for the frame after an eased one, which draws the
+    /// rows back at rest.
+    pub fn movesRows(self: *const GridEase) bool {
+        return self.hold.held or self.spring.moving() or self.easing or self.offset_px != 0;
+    }
+
     /// The scroll region `plan` settled on, half-open in grid rows; empty
     /// when this frame does not ease.
     pub fn region(self: *const GridEase) [2]u32 {
@@ -306,6 +315,31 @@ test "a held pan stands still in plan, is credited by the answer and springs bac
         now += std.time.ns_per_s / 60;
         try testing.expect(frames < 120);
     }
+}
+
+test "a gesture moves rows from its first step, before any frame planned it" {
+    var e: GridEase = .{};
+    defer e.deinit(testing.allocator);
+    try testing.expect(!e.movesRows());
+    // At an edge no wheel event goes out, so no commit will ask for a frame:
+    // the pan itself has to.
+    _ = e.pan(12, 0, 6, 10, 3, true, 1);
+    try testing.expect(!e.easing);
+    try testing.expectEqual(@as(f32, 0), e.offset_px);
+    try testing.expect(e.movesRows());
+    // Let go: the spring carries it, then one frame draws it back at rest.
+    e.release();
+    try testing.expect(e.movesRows());
+    var now: i64 = 2;
+    var frames: usize = 0;
+    while (e.moving()) : (frames += 1) {
+        e.plan(now, 10, 6);
+        now += std.time.ns_per_s / 60;
+        try testing.expect(frames < 120);
+    }
+    try testing.expect(e.movesRows());
+    e.plan(now, 10, 6);
+    try testing.expect(!e.movesRows());
 }
 
 test "a stretch at the edge bounces back on release" {
