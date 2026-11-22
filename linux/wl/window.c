@@ -207,9 +207,20 @@ static struct {
     struct axis_sample { uint32_t time_ms; double px[2]; } axis_recent[8];
     int axis_recent_n;
     int axis_finger, axis_stopped;
+    // A slot is free while its output is NULL: one that was unplugged.
     struct wl_output* outputs[MAX_OUTPUTS];
+    uint32_t output_name[MAX_OUTPUTS];
     int32_t output_scale[MAX_OUTPUTS];
     int n_outputs;
+    // The outputs the main surface is on, a bit per slot.
+    uint32_t entered;
+    // The compositor's own word on the main surface's scale (wl_surface v6),
+    // 0 while it has given none.
+    int32_t preferred_scale;
+    // The scale last reported through zwl_listener.scale, 0 before the first.
+    int32_t surface_scale;
+    // The scale the cursor theme was loaded for.
+    int cursor_theme_scale;
 
     struct wl_surface* surface;
     struct wl_proxy* xdg_surface;
@@ -284,7 +295,42 @@ static void output_geometry(void* d, struct wl_output* o, int32_t x, int32_t y, 
 static void output_mode(void* d, struct wl_output* o, uint32_t f, int32_t wd, int32_t h, int32_t r) {
     (void)d; (void)o; (void)f; (void)wd; (void)h; (void)r;
 }
-static void output_done(void* d, struct wl_output* o) { (void)d; (void)o; }
+int zwl_scale(void) {
+    int32_t s = 1;
+    for (int i = 0; i < w.n_outputs; i++) {
+        if (w.outputs[i] && w.output_scale[i] > s) s = w.output_scale[i];
+    }
+    return s;
+}
+
+// The scale the main surface is best drawn at, or 0 when nothing says: the
+// compositor's own word where it gives one, else the largest scale among the
+// outputs the surface is on. A surface on no output (unmapped, or on a
+// workspace no output shows) keeps the scale it had.
+static int32_t main_surface_scale(void) {
+    if (w.preferred_scale > 0) return w.preferred_scale;
+    int32_t s = 0;
+    for (int i = 0; i < w.n_outputs; i++) {
+        if (w.outputs[i] && (w.entered & (1u << i)) && w.output_scale[i] > s) s = w.output_scale[i];
+    }
+    return s;
+}
+
+// Reports the main surface's scale when it is known and not the one last
+// reported. The first report may name the scale the client already draws at
+// (zwl_scale()): what it is told and what it uses are the client's to compare.
+static void report_surface_scale(void) {
+    const int32_t s = main_surface_scale();
+    if (s <= 0 || s == w.surface_scale) return;
+    w.surface_scale = s;
+    if (w.l && w.l->scale) w.l->scale(w.data, s);
+}
+
+static void output_done(void* d, struct wl_output* o) {
+    (void)d; (void)o;
+    // A scale arrives between an output's other properties and this.
+    report_surface_scale();
+}
 static void output_scale(void* d, struct wl_output* o, int32_t factor) {
     (void)d;
     for (int i = 0; i < w.n_outputs; i++) {
@@ -295,13 +341,38 @@ static const struct wl_output_listener output_listener = {
     output_geometry, output_mode, output_done, output_scale,
 };
 
-int zwl_scale(void) {
-    int32_t s = 1;
+static void surface_enter(void* d, struct wl_surface* s, struct wl_output* o) {
+    (void)d; (void)s;
     for (int i = 0; i < w.n_outputs; i++) {
-        if (w.output_scale[i] > s) s = w.output_scale[i];
+        if (w.outputs[i] == o) w.entered |= 1u << i;
     }
-    return s;
+    report_surface_scale();
 }
+static void surface_leave(void* d, struct wl_surface* s, struct wl_output* o) {
+    (void)d; (void)s;
+    for (int i = 0; i < w.n_outputs; i++) {
+        if (w.outputs[i] == o) w.entered &= ~(1u << i);
+    }
+    report_surface_scale();
+}
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+static void surface_preferred_scale(void* d, struct wl_surface* s, int32_t factor) {
+    (void)d; (void)s;
+    w.preferred_scale = factor;
+    report_surface_scale();
+}
+static void surface_preferred_transform(void* d, struct wl_surface* s, uint32_t transform) {
+    (void)d; (void)s; (void)transform;
+}
+#endif
+static const struct wl_surface_listener main_surface_listener = {
+    surface_enter,
+    surface_leave,
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+    surface_preferred_scale,
+    surface_preferred_transform,
+#endif
+};
 
 // ---------------------------------------------------------------------------
 // Keyboard
@@ -490,8 +561,17 @@ static void set_cursor(uint32_t serial) {
         return;
     }
     if (!w.shm) return;
-    const int scale = zwl_scale();
-    if (!w.cursor_theme) w.cursor_theme = wl_cursor_theme_load(NULL, 24 * scale, w.shm);
+    // The scale the windows draw at; a theme loaded for another is loaded
+    // again, or the cursor would be scaled to it.
+    const int scale = w.surface_scale > 0 ? w.surface_scale : zwl_scale();
+    if (w.cursor_theme && w.cursor_theme_scale != scale) {
+        wl_cursor_theme_destroy(w.cursor_theme);
+        w.cursor_theme = NULL;
+    }
+    if (!w.cursor_theme) {
+        w.cursor_theme = wl_cursor_theme_load(NULL, 24 * scale, w.shm);
+        w.cursor_theme_scale = scale;
+    }
     if (!w.cursor_theme) return;
     const char* name;
     const char* old;
@@ -1110,7 +1190,12 @@ static const struct { void (*ping)(void*, struct wl_proxy*, uint32_t); } wm_base
 static void on_global(void* d, struct wl_registry* reg, uint32_t name, const char* iface, uint32_t version) {
     (void)d;
     if (strcmp(iface, wl_compositor_interface.name) == 0) {
-        w.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, version < 4 ? version : 4);
+        // 6: a surface is told the buffer scale to draw at. No higher than
+        // the library's own interface, which an older one keeps below that;
+        // the surface's outputs say the scale then.
+        uint32_t v = version < 6 ? version : 6;
+        if (v > (uint32_t)wl_compositor_interface.version) v = (uint32_t)wl_compositor_interface.version;
+        w.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, v);
     } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
         w.wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 2 ? version : 2);
         wl_proxy_add_listener(w.wm_base, (void (**)(void))&wm_base_listener, NULL);
@@ -1133,14 +1218,30 @@ static void on_global(void* d, struct wl_registry* reg, uint32_t name, const cha
         w.cursor_shape_manager = wl_registry_bind(reg, name, &cursor_shape_manager_interface, 1);
     } else if (strcmp(iface, activation_interface.name) == 0) {
         w.activation = wl_registry_bind(reg, name, &activation_interface, 1);
-    } else if (strcmp(iface, wl_output_interface.name) == 0 && w.n_outputs < MAX_OUTPUTS && version >= 2) {
-        const int i = w.n_outputs++;
+    } else if (strcmp(iface, wl_output_interface.name) == 0 && version >= 2) {
+        // An unplugged output's slot first, so plugging one in and out
+        // does not run through them.
+        int i = 0;
+        while (i < w.n_outputs && w.outputs[i]) i++;
+        if (i == MAX_OUTPUTS) return;
+        if (i == w.n_outputs) w.n_outputs++;
         w.outputs[i] = wl_registry_bind(reg, name, &wl_output_interface, 2);
+        w.output_name[i] = name;
         w.output_scale[i] = 1;
         wl_output_add_listener(w.outputs[i], &output_listener, NULL);
     }
 }
-static void on_global_remove(void* d, struct wl_registry* reg, uint32_t name) { (void)d; (void)reg; (void)name; }
+static void on_global_remove(void* d, struct wl_registry* reg, uint32_t name) {
+    (void)d; (void)reg;
+    for (int i = 0; i < w.n_outputs; i++) {
+        if (!w.outputs[i] || w.output_name[i] != name) continue;
+        // Its scale no longer counts, for the main surface or as the largest.
+        wl_output_destroy(w.outputs[i]);
+        w.outputs[i] = NULL;
+        w.entered &= ~(1u << i);
+        report_surface_scale();
+    }
+}
 static const struct wl_registry_listener registry_listener = { on_global, on_global_remove };
 
 int zwl_open(const zwl_listener* l, void* data) {
@@ -1286,6 +1387,7 @@ static void make_toplevel(const char* app_id, const char* title) {
 int zwl_window(const char* app_id, const char* title, int server_decorations) {
     w.surface = wl_compositor_create_surface(w.compositor);
     if (!w.surface) return -1;
+    wl_surface_add_listener(w.surface, &main_surface_listener, NULL);
     w.server_decorations = server_decorations;
     make_toplevel(app_id, title);
     return 0;
@@ -1601,6 +1703,11 @@ void zwl_ext_close(int64_t id) {
 void zwl_ext_resize(int64_t id, int32_t w_px, int32_t h_px) {
     struct zwl_ext* e = ext_of_id(id);
     if (e) wl_egl_window_resize(e->egl_window, w_px, h_px, 0, 0);
+}
+
+void zwl_ext_set_buffer_scale(int64_t id, int32_t scale) {
+    struct zwl_ext* e = ext_of_id(id);
+    if (e) wl_surface_set_buffer_scale(e->surface, scale);
 }
 
 int zwl_ext_placed(int64_t id) {
