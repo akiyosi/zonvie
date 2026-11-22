@@ -21,6 +21,7 @@ const scrollbar = @import("scrollbar.zig");
 extern "c" fn zwl_ext_open(id: i64, app_id: [*:0]const u8, title: [*:0]const u8, w_px: i32, h_px: i32, scale: i32) c_int;
 extern "c" fn zwl_ext_close(id: i64) void;
 extern "c" fn zwl_ext_resize(id: i64, w_px: i32, h_px: i32) void;
+extern "c" fn zwl_ext_set_buffer_scale(id: i64, scale: i32) void;
 extern "c" fn zwl_ext_placed(id: i64) c_int;
 extern "c" fn zwl_ext_make_current(id: i64) c_int;
 extern "c" fn zwl_ext_swap(id: i64) c_int;
@@ -295,6 +296,33 @@ pub fn onFrame(app: *App, id: i64) void {
 /// wl/window.c: the pointer entered window `id` (0: the main one).
 pub fn onPointerWindow(app: *App, id: i64) void {
     pointer_target = if (id == 0) null else app.ext_windows.get(id);
+}
+
+/// The surface scale went from `old` to `new`, and the cell with it
+/// (callbacks.rescale): every window keeps its logical size and draws it at
+/// the new scale now. Main thread. Pre: `old >= 1`, `new >= 1`.
+///
+/// The scale and the buffer of the new px size go to the compositor in one
+/// commit, the swap of this draw: a window takes its back buffer when it
+/// draws, never before, so none of the old size is left to commit.
+pub fn rescale(app: *App, old: i32, new: i32) void {
+    const from: u32 = @intCast(old);
+    const to: u32 = @intCast(new);
+    var it = app.ext_windows.valueIterator();
+    while (it.next()) |wp| {
+        const w = wp.*;
+        zwl_ext_set_buffer_scale(w.grid_id, new);
+        if (zwl_ext_placed(w.grid_id) != 0) {
+            // The compositor's size stands in logical px; the grid follows
+            // the cell.
+            setSize(w, w.w_px / from * to, w.h_px / from * to);
+            fit(w);
+        } else {
+            const sz = sizePx(app, w.grid_id, w.rows, w.cols);
+            setSize(w, sz[0], sz[1]);
+        }
+        draw(w);
+    }
 }
 
 /// Callable from any thread: the cell size changed, and every external

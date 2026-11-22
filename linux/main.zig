@@ -65,6 +65,7 @@ const Listener = extern struct {
     ext_close: ?*const fn (?*anyopaque, i64) callconv(.c) void,
     ext_frame: ?*const fn (?*anyopaque, i64) callconv(.c) void,
     pointer_window: ?*const fn (?*anyopaque, i64) callconv(.c) void,
+    scale: ?*const fn (?*anyopaque, i32) callconv(.c) void,
 };
 extern "c" fn zwl_open(l: *const Listener, data: ?*anyopaque) c_int;
 extern "c" fn zwl_fd() c_int;
@@ -118,6 +119,9 @@ const Window = struct {
     app: *App,
     loop: *anyopaque,
     scale: i32,
+    /// `scale` changed and the surface has not been told: it is, with the
+    /// first buffer of the new px size (draw).
+    buffer_scale_owed: bool = false,
     /// The size a configure that leaves it to the client gets: the last
     /// run's, else the default. Logical px.
     free_w: i32 = default_w_logical,
@@ -221,6 +225,14 @@ fn draw() void {
         _ = zwl_swap();
         gl_renderer.drawWholeNext(&window.app.gl);
         age = zwl_buffer_age();
+    }
+    if (window.buffer_scale_owed) {
+        // Only now, after a buffer of the old px size went back at the old
+        // scale: the scale applies to the next buffer committed, whose size
+        // must be a multiple of it, and every buffer from here on is one of
+        // the new size.
+        window.buffer_scale_owed = false;
+        zwl_set_buffer_scale(window.scale);
     }
     const swap = gl_renderer.render(window.app, @intCast(@max(0, age)));
     // Nothing changed: the frame on screen stays, and no buffer is spent.
@@ -1116,6 +1128,32 @@ fn onDrop(_: ?*anyopaque, uri_list: [*]const u8, len: usize) callconv(.c) void {
     core.zonvie_core_drop_paths(cp, ptrs.ptr, lens.ptr, paths.items.len, 0);
 }
 
+/// wl/window.c: the main window's surface is best drawn at `scale`. Every
+/// window follows the main one's: there is one set of faces, one cell and one
+/// atlas for all of them.
+///
+/// The faces are loaded again at their point size times the scale, each
+/// window keeps its logical size and gets a buffer of the new px size, and
+/// the layout that follows has Neovim's grids keep their rows and columns.
+fn onScale(_: ?*anyopaque, scale: i32) callconv(.c) void {
+    if (scale < 1 or scale == window.scale) return;
+    const app = window.app;
+    const old = window.scale;
+    applog.appLog("[wl] scale {d} -> {d}\n", .{ old, scale });
+    window.scale = scale;
+    window.buffer_scale_owed = true;
+    // The size last chosen for the view is a size on the glass: its px
+    // follow the scale, so the snap to the new cell keeps the grid.
+    window.desired_w_px = window_state.rescaledPx(window.desired_w_px, old, scale);
+    window.desired_h_px = window_state.rescaledPx(window.desired_h_px, old, scale);
+    callbacks.rescale(app, @floatFromInt(scale));
+    ext_window.rescale(app, old, scale);
+    // Before the first configure there is no size to apply; the one that
+    // comes reads the new scale.
+    if (window.configured) applyWindowSize(false);
+    panel_popup.update(app);
+}
+
 const listener: Listener = .{
     .configure = &onConfigure,
     .close = &onClose,
@@ -1135,6 +1173,7 @@ const listener: Listener = .{
     .ext_close = &onExtClose,
     .ext_frame = &onExtFrame,
     .pointer_window = &onPointerWindow,
+    .scale = &onScale,
 };
 
 // wl/window.c's further windows: an external window by its grid's id, a
