@@ -3445,8 +3445,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
         }
         let host = view as? MetalTerminalView
-        // Drive key-repeat synthesis off the render clock (main thread; 60Hz
-        // while the continuous draw loop is active). No-op unless armed.
+        // Key-repeat synthesis' safety check, once per draw (main thread): a
+        // lost keyUp or an IME taking over must not leave a key repeating.
+        // The repeats themselves are sent from the display link's own thread.
+        // No-op unless armed.
         host?.core?.keyInput.tickKeyRepeatSynthesis()
         if ZonvieCore.appLogEnabled,
            let inputTrace = host?.core?.currentInputTraceSnapshot(),
