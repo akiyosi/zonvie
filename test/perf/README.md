@@ -46,12 +46,13 @@ Build the Release app, keep its window visible, then run:
 ZONVIE_TRACE_CONFIG=Release test/perf/test_60fps.py
 ```
 
-This drives the real app at 60 updates/s over a no-wrap, high-cardinality CJK
-buffer whose 160-character lines stay populated past the viewport's right
-edge. It fails unless committed core flush p95 stays within the 16.67ms frame
-budget, committed content and on-glass presentation both sustain at least
-58fps, on-glass slips stay at or below 1/s, and visually stalled frames stay
-below 10%. The core flush bracket includes frontend admission, vertex
+This drives the real app at 60 updates/s over three no-wrap stress buffers
+(`--scenario atlas`, `emoji`, `dense`; all three by default) whose
+160-character lines stay populated past the viewport's right edge. It fails
+unless committed core flush p95 stays within the 16.67ms frame budget,
+committed content sustains 60 flushes/s, on-glass presentation sustains
+60.00fps (rounded to 0.01) with no slip, and visually stalled frames stay at
+or below 10%. The core flush bracket includes frontend admission, vertex
 generation, atlas work, and publication, so merely presenting the same stale
 content at 60fps cannot hide an abort/retry loop that turns sparse scrolling
 into a full-row rebuild.
