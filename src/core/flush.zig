@@ -3128,6 +3128,10 @@ pub fn generateRowVertices(
                     const RECENT_CAP = 8;
                     var recent_quads: [RECENT_CAP]RecentQuad = undefined;
                     var recent_quad_total: usize = 0; // total quads ever written (wraps index)
+                    // The cluster an earlier glyph of this run already drew
+                    // ink for, or null. A cluster can shape to several glyphs
+                    // and the last one may be invisible by design.
+                    var inked_cluster: ?u32 = null;
 
                     var gi: usize = 0;
                     while (gi < final_glyph_count) : (gi += 1) {
@@ -3337,7 +3341,15 @@ pub fn generateRowVertices(
                         // !glyph_ok) matches the single-scalar/emoji branch above —
                         // without it, a ligature glyph ID that resolves but rasterizes
                         // to nothing silently renders as blank instead of falling back.
-                        if ((!glyph_ok or glyph_empty) and next_cluster > this_cluster + 1 and !cluster_is_emoji) {
+                        //
+                        // An empty glyph is not that when an earlier glyph of the
+                        // same cluster already drew: the face shaped the base to a
+                        // glyph of its own and a default-ignorable after it (ZWNJ,
+                        // an unused variation selector) to an invisible one. The
+                        // cluster has its ink; drawing its scalars here would put
+                        // the base down a second time, uncached.
+                        const cluster_inked = inked_cluster != null and inked_cluster.? == this_cluster;
+                        if ((!glyph_ok or (glyph_empty and !cluster_inked)) and next_cluster > this_cluster + 1 and !cluster_is_emoji) {
                             var mci: u32 = this_cluster;
                             var mc_base_x = penX;
                             while (mci < next_cluster) : (mci += 1) {
@@ -3382,6 +3394,7 @@ pub fn generateRowVertices(
                         const cell_advance: f32 = @as(f32, @floatFromInt(cluster_cols)) * cellW;
 
                         if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
+                            inked_cluster = this_cluster;
                             const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
                             const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
                             const q = quads.quad(ge, penX, .{ x_off_px, y_off_px }, if (next_cluster == this_cluster + 1) first_scalar else 0);
@@ -12097,6 +12110,111 @@ test "a .notdef base with a combining mark is rasterized once, as a text cluster
     // The context does not outlive the callback.
     try std.testing.expect(!core.cluster_is_text);
     try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
+}
+
+/// A face that has every base and shapes a default-ignorable after it (ZWNJ,
+/// a variation selector it does not use) to an invisible glyph in the base's
+/// cluster, as HarfBuzz does.
+const IgnorableTailFont = struct {
+    scalar_calls: u32 = 0,
+
+    const base_gid: u32 = 7;
+    const invisible_gid: u32 = 3;
+
+    fn shape(
+        ctx: ?*anyopaque,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) callconv(.c) usize {
+        _ = ctx;
+        _ = style_flags;
+        if (out_cap < scalar_count) return scalar_count;
+        var base: u32 = 0;
+        for (0..scalar_count) |i| {
+            const ignorable = scalars[i] == 0x200C;
+            if (!ignorable) base = @intCast(i);
+            out_glyph_ids[i] = if (ignorable) invisible_gid else base_gid;
+            out_clusters[i] = base;
+            out_x_advance[i] = if (ignorable) 0 else 64;
+            out_x_offset[i] = 0;
+            out_y_offset[i] = 0;
+        }
+        return scalar_count;
+    }
+
+    fn rasterScalar(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+        _ = scalar;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.scalar_calls += 1;
+        out_bitmap.* = NotdefKanaFont.bitmap();
+        return 1;
+    }
+
+    fn rasterById(ctx: ?*anyopaque, glyph_id: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+        _ = ctx;
+        _ = style_flags;
+        out_bitmap.* = NotdefKanaFont.bitmap();
+        if (glyph_id == invisible_gid) {
+            out_bitmap.width = 0;
+            out_bitmap.height = 0;
+            out_bitmap.pitch = 0;
+        }
+        return 1;
+    }
+
+    fn install(self: *@This(), core: *Core) void {
+        core.ctx = self;
+        core.cb.on_shape_text_run = shape;
+        core.cb.on_rasterize_glyph = rasterScalar;
+        core.cb.on_rasterize_glyph_by_id = rasterById;
+        core.cb.on_atlas_upload = NotdefKanaFont.upload;
+        core.cb.on_atlas_create = NotdefKanaFont.create;
+    }
+};
+
+test "a base followed by an invisible default-ignorable is drawn once" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+    var font = IgnorableTailFont{};
+    font.install(&core);
+    core.cb.on_vertices_row = struct {
+        fn f(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, main_verts: ?[*]const c_api.Vertex, main_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = ctx;
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = main_verts;
+            _ = main_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+        }
+    }.f;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    // Persian writes ZWNJ after a letter: one cell, base then U+200C.
+    try core.grid.putCellGridCluster(1, 0, 0, 0x0633, 0, &.{0x200C});
+    try flush_ctx.onFlush(2, 2);
+
+    // The face shaped the base to its own glyph, which is the cell's ink. The
+    // invisible glyph beside it is not a missing ligature to draw scalar by
+    // scalar: that draws the base a second time, and uncached.
+    try std.testing.expectEqual(@as(u32, 0), font.scalar_calls);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
 }
 
 test "an emoji modifier joined to a space is drawn once and is not a glyph miss" {
