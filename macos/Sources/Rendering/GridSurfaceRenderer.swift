@@ -1221,10 +1221,22 @@ struct GpuPassSampler {
     private var statsEnabled = false
     private var statsSlots: [Slot] = []   // Render thread only; reset per draw
 
+    private var didSetUp = false
+
+    /// `setUp` once, the first time a frame is drawn with perf logging on.
+    /// Nothing here is used with logging off, and the setup allocates two
+    /// counter buffers and sleeps 2 ms to calibrate the GPU's clock: a
+    /// renderer that never logs pays for none of it.
+    mutating func setUpOnce(device: MTLDevice) {
+        if didSetUp { return }
+        didSetUp = true
+        setUp(device: device)
+    }
+
     /// Probe device support for stage-boundary counters and allocate the
     /// reusable sample buffers. On unsupported devices the gates stay false and
     /// the per-pass logs are silently skipped (gpu_execution still emits).
-    mutating func setUp(device: MTLDevice) {
+    private mutating func setUp(device: MTLDevice) {
         // Diagnostic dump of what the device actually exposes. M-series Macs
         // typically only show "timestamp" via runtime API; statistic and
         // stageutilization are restricted to Xcode GPU Capture on macOS.
@@ -2736,8 +2748,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // when multiple instances start simultaneously
         self.viewForPipeline = view
         shared.buildSampler()
-
-        if collectsGpuPerfSamples { gpuSampler.setUp(device: shared.device) }
     }
 
     // MARK: - Triple Buffer Flush Bracket
@@ -3854,6 +3864,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // internally, but beginFrame's removeAlls would otherwise run
             // unconditionally).
             if ZonvieCore.appLogEnabled {
+                if collectsGpuPerfSamples { gpuSampler.setUpOnce(device: shared.device) }
                 gpuSampler.beginFrame()
             }
 
