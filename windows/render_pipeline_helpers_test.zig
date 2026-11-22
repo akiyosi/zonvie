@@ -1262,6 +1262,49 @@ test "damage compaction preserves disjoint rectangles" {
     try std.testing.expectEqual(Rect{ .left = 20, .top = 20, .right = 30, .bottom = 30 }, rects[1]);
 }
 
+test "damage compaction keeps a full-height strip apart from the bands beside it" {
+    // The editor card's left gutter, a caption band over it, and two row
+    // bands of the content: only the bounding box of all four is the client.
+    var rects = [_]Rect{
+        .{ .left = 12, .top = 500, .right = 1000, .bottom = 560 },
+        .{ .left = 0, .top = 0, .right = 12, .bottom = 1100 },
+        .{ .left = 12, .top = 100, .right = 1000, .bottom = 140 },
+        .{ .left = 0, .top = 0, .right = 1000, .bottom = 32 },
+    };
+
+    const len = helpers.compactDamageRects(Rect, &rects);
+    try std.testing.expectEqual(@as(usize, 4), len);
+    var area: i64 = 0;
+    for (rects[0..len]) |r| area += @as(i64, r.right - r.left) * @as(i64, r.bottom - r.top);
+    // Far below the 1000x1100 client the bounding box would damage.
+    try std.testing.expect(area < 150_000);
+}
+
+test "a damage union is exact for containment and for a shared full edge only" {
+    const band: Rect = .{ .left = 12, .top = 100, .right = 1000, .bottom = 140 };
+    // Contained, either way round.
+    try std.testing.expect(helpers.damageUnionIsExact(Rect, band, .{ .left = 40, .top = 110, .right = 60, .bottom = 130 }));
+    try std.testing.expect(helpers.damageUnionIsExact(Rect, .{ .left = 40, .top = 110, .right = 60, .bottom = 130 }, band));
+    // Same columns, rows touching or overlapping.
+    try std.testing.expect(helpers.damageUnionIsExact(Rect, band, .{ .left = 12, .top = 140, .right = 1000, .bottom = 180 }));
+    try std.testing.expect(helpers.damageUnionIsExact(Rect, band, .{ .left = 12, .top = 120, .right = 1000, .bottom = 180 }));
+    // Same rows, columns touching.
+    try std.testing.expect(helpers.damageUnionIsExact(Rect, band, .{ .left = 0, .top = 100, .right = 12, .bottom = 140 }));
+    // Touching along part of an edge, or crossing: the bounding box is more.
+    try std.testing.expect(!helpers.damageUnionIsExact(Rect, band, .{ .left = 0, .top = 0, .right = 12, .bottom = 1100 }));
+    try std.testing.expect(!helpers.damageUnionIsExact(Rect, band, .{ .left = 12, .top = 140, .right = 500, .bottom = 180 }));
+    try std.testing.expect(!helpers.damageUnionIsExact(Rect, band, .{ .left = 500, .top = 0, .right = 520, .bottom = 1100 }));
+    // Same columns but a gap between the rows.
+    try std.testing.expect(!helpers.damageUnionIsExact(Rect, band, .{ .left = 12, .top = 141, .right = 1000, .bottom = 180 }));
+}
+
+test "back damage: a strip that only touches a band stays its own rect" {
+    var q = Damage{};
+    q.clear(0);
+    q.queue(&.{ tr(0, 0, 12, 100), tr(12, 40, 100, 50) }, false, 1, 100, 100);
+    try std.testing.expectEqual(@as(usize, 2), q.pending(0).len);
+}
+
 // ---------------------------------------------------------------------------
 // DWrite cluster-map inversion
 //
@@ -2099,8 +2142,8 @@ test "back damage: overlapping rects merge transitively into one" {
 }
 
 test "back damage: rects that touch without overlapping merge into one" {
-    // The buffer holds rects "no two of which overlap or touch": two adjacent
-    // full-width row spans share an edge and become one span.
+    // Two adjacent full-width row spans share a whole edge: their union is
+    // exact, and they become one span.
     var q = Damage{};
     q.clear(0);
     q.queue(&.{ tr(0, 0, 100, 10), tr(0, 10, 100, 20) }, false, 1, 100, 100);
