@@ -5,6 +5,7 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const hbft = @import("../hbft.zig");
 const fc = @import("../fc.zig");
+const fallback_memo = @import("../fallback_memo.zig");
 const applog = @import("../app_log.zig");
 const atlas_pixels = @import("../atlas_pixels.zig");
 
@@ -41,6 +42,12 @@ const FallbackIndex = struct {
     fonts_len: usize,
     /// The covering subset of `fonts` for one lookup; same capacity.
     covering: []*fc.FcPattern,
+    /// The same subset as a bitset over `fonts`' indices.
+    cover: []u64,
+    /// The matches already made, which decide most later ones: a script's
+    /// scalars are covered by much the same fonts, and the one that won among
+    /// them once wins among any of them again.
+    memo: fallback_memo.Memo,
 
     const Candidate = struct { pattern: *fc.FcPattern, charset: *const fc.FcCharSet };
 
@@ -61,6 +68,10 @@ const FallbackIndex = struct {
         const fonts = try alloc.alloc(Candidate, n);
         errdefer alloc.free(fonts);
         const covering = try alloc.alloc(*fc.FcPattern, n);
+        errdefer alloc.free(covering);
+        var memo = try fallback_memo.Memo.init(alloc, n);
+        errdefer memo.deinit(alloc);
+        const cover = try alloc.alloc(u64, memo.words);
         var len: usize = 0;
         for ([_]fc.FcSetName{ .system, .application }) |name| {
             const s = fc.FcConfigGetFonts(config, name) orelse continue;
@@ -72,33 +83,70 @@ const FallbackIndex = struct {
                 len += 1;
             }
         }
-        return .{ .config = config, .pattern = pattern, .fonts = fonts, .fonts_len = len, .covering = covering };
+        return .{ .config = config, .pattern = pattern, .fonts = fonts, .fonts_len = len, .covering = covering, .cover = cover, .memo = memo };
     }
 
     fn deinit(self: *FallbackIndex, alloc: std.mem.Allocator) void {
         alloc.free(self.fonts);
         alloc.free(self.covering);
+        alloc.free(self.cover);
+        self.memo.deinit(alloc);
         fc.FcPatternDestroy(self.pattern);
         fc.FcConfigDestroy(self.config);
     }
 
     fn match(self: *FallbackIndex, alloc: std.mem.Allocator, scalar: u32) ?Match {
+        @memset(self.cover, 0);
         var n: usize = 0;
-        for (self.fonts[0..self.fonts_len]) |f| {
+        for (self.fonts[0..self.fonts_len], 0..) |f, i| {
             if (fc.FcCharSetHasChar(f.charset, scalar) == 0) continue;
             self.covering[n] = f.pattern;
+            fallback_memo.add(self.cover, @intCast(i));
             n += 1;
         }
         if (n == 0) return null;
+        // An earlier match already ranked one of these above all the others:
+        // FcFontSetMatch would name the same font (fallback_memo.zig), and
+        // scoring every covering font against the family again is most of
+        // what a new scalar costs.
+        if (self.memo.lookup(self.cover)) |w| return fileOf(alloc, self.fonts[w].pattern);
         var set: fc.FcFontSet = .{ .nfont = @intCast(n), .sfont = @intCast(n), .fonts = self.covering.ptr };
         const sets = [_]*fc.FcFontSet{&set};
         var result: fc.FcResult = undefined;
         const m = fc.FcFontSetMatch(self.config, &sets, 1, self.pattern, &result) orelse return null;
         defer fc.FcPatternDestroy(m);
+        const picked = fileOf(alloc, m) orelse return null;
+        if (self.coveringFontOf(picked)) |w| self.memo.record(w, self.cover);
+        return picked;
+    }
+
+    /// The one covering font `picked` names, by file and face index; null
+    /// when none or more than one does. The match returns a prepared copy of
+    /// the font it picked, not the font, so this is how the winner is known.
+    /// Two entries for one face may rank apart, and taking the wrong one for
+    /// the winner would let the memo answer for it: then nothing is recorded.
+    fn coveringFontOf(self: *const FallbackIndex, picked: Match) ?u32 {
+        var found: ?u32 = null;
+        for (self.fonts[0..self.fonts_len], 0..) |f, i| {
+            if (!fallback_memo.has(self.cover, @intCast(i))) continue;
+            var file_ptr: [*c]fc.FcChar8 = undefined;
+            if (fc.FcPatternGetString(f.pattern, fc.FC_FILE, 0, &file_ptr) != .match) continue;
+            var index: c_int = 0;
+            _ = fc.FcPatternGetInteger(f.pattern, fc.FC_INDEX, 0, &index);
+            if (index != picked.index) continue;
+            if (!std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr))), picked.path)) continue;
+            if (found != null) return null;
+            found = @intCast(i);
+        }
+        return found;
+    }
+
+    /// The font file and face index `p` names, the path owned by the caller.
+    fn fileOf(alloc: std.mem.Allocator, p: *fc.FcPattern) ?Match {
         var file_ptr: [*c]fc.FcChar8 = undefined;
-        if (fc.FcPatternGetString(m, fc.FC_FILE, 0, &file_ptr) != .match) return null;
+        if (fc.FcPatternGetString(p, fc.FC_FILE, 0, &file_ptr) != .match) return null;
         var index: c_int = 0;
-        _ = fc.FcPatternGetInteger(m, fc.FC_INDEX, 0, &index);
+        _ = fc.FcPatternGetInteger(p, fc.FC_INDEX, 0, &index);
         const path = alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)))) catch return null;
         return .{ .path = path, .index = index };
     }
