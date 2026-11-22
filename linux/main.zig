@@ -226,7 +226,12 @@ fn draw() void {
     // Nothing changed: the frame on screen stays, and no buffer is spent.
     if (swap.skip) return pump();
     zwl_request_frame();
-    _ = zwl_swap_damage(swap.rects.ptr, @intCast(swap.rects.len));
+    if (zwl_swap_damage(swap.rects.ptr, @intCast(swap.rects.len)) != 0) {
+        // The frame never left: the damage history counts one no buffer
+        // holds, so the next frame owes the whole window.
+        gl_renderer.drawWholeNext(&window.app.gl);
+        applog.appLog("[wl] swap failed\n", .{});
+    }
     pump();
 }
 
