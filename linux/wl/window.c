@@ -1405,8 +1405,20 @@ int zwl_buffer_stale(void) {
     return bw != w.egl_w_px || bh != w.egl_h_px;
 }
 
+// A swap that failed committed nothing, so the frame callback asked for
+// with it never comes: it is dropped, or the surface would wait on it for
+// good and draw no more. Returns the swap's result, 0 or -1.
+static int swap_result(EGLBoolean swapped, struct wl_callback** frame) {
+    if (swapped) return 0;
+    if (*frame) {
+        wl_callback_destroy(*frame);
+        *frame = NULL;
+    }
+    return -1;
+}
+
 int zwl_swap(void) {
-    return eglSwapBuffers(w.egl_display, w.egl_surface) ? 0 : -1;
+    return swap_result(eglSwapBuffers(w.egl_display, w.egl_surface), &w.frame);
 }
 
 int zwl_buffer_age(void) {
@@ -1418,7 +1430,7 @@ int zwl_buffer_age(void) {
 
 int zwl_swap_damage(const int32_t* rects, int32_t n) {
     if (!w.swap_with_damage || n <= 0) return zwl_swap();
-    return w.swap_with_damage(w.egl_display, w.egl_surface, (EGLint*)rects, n) ? 0 : -1;
+    return swap_result(w.swap_with_damage(w.egl_display, w.egl_surface, (EGLint*)rects, n), &w.frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,7 +1657,7 @@ int zwl_ext_make_current(int64_t id) {
 int zwl_ext_swap(int64_t id) {
     struct zwl_ext* e = ext_of_id(id);
     if (!e) return -1;
-    return eglSwapBuffers(w.egl_display, e->egl_surface) ? 0 : -1;
+    return swap_result(eglSwapBuffers(w.egl_display, e->egl_surface), &e->frame);
 }
 
 void zwl_ext_request_frame(int64_t id) {
