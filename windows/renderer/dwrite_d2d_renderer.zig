@@ -238,7 +238,10 @@ const FallbackCanvas = struct {
         self.old_bm = c.SelectObject(self.hdc, self.hbm);
 
         const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
-            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            // Software: every glyph ends in a read of the DIB, and a
+            // hardware target pays a GPU readback for it in EndDraw, which
+            // for a few cells of text is most of the glyph's time.
+            .type = c.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             .pixelFormat = .{
                 .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
                 .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
