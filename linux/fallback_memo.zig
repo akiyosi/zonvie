@@ -17,7 +17,9 @@ const std = @import("std");
 
 /// Winners remembered. A query that no remembered winner decides is still
 /// answered correctly by the caller's full match; it is just not shortened.
-pub const max_winners = 16;
+/// One winner per script is typical, and a text mixing two dozen scripts
+/// reached fourteen.
+pub const max_winners = 32;
 
 pub const Memo = struct {
     /// u64 words per candidate set: `(candidates + 63) / 64`.
