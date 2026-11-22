@@ -75,6 +75,7 @@ pub fn init(app: *App) void {
 pub fn deinit(app: *App) void {
     for (&app.popups) |*p| {
         hide(app, p);
+        release(p);
         p.gl.deinit(app.alloc);
     }
 }
@@ -160,19 +161,27 @@ pub fn update(app: *App) void {
     }
 }
 
+/// The popup's surface goes; its GL objects stay. They belong to the one EGL
+/// context every surface draws with (wl/window.c), not to the surface, and a
+/// popup is made anew for every move and resize: remaking them each time
+/// compiled and linked the program and uploaded the UI atlas again.
 fn hide(app: *App, p: *Popup) void {
     if (!p.shown) return;
     p.shown = false;
     p.configured = false;
     p.dirty = false;
-    if (p.realized and zwl_ext_make_current(idOf(p.kind)) == 0) {
-        gl_renderer.unrealize(&p.gl);
-        p.realized = false;
-    }
     // Leaves the main window's surface current.
     zwl_ext_close(idOf(p.kind));
     _ = app;
     applog.appLog("[panel_popup] hide {s}\n", .{@tagName(p.kind)});
+}
+
+/// Gives a hidden popup's GL objects back, once it will not be shown again.
+/// The context must be current, on any surface.
+fn release(p: *Popup) void {
+    if (!p.realized) return;
+    gl_renderer.unrealize(&p.gl);
+    p.realized = false;
 }
 
 /// Draws popup `p` now, or at the frame callback of the frame before.
@@ -269,7 +278,10 @@ pub fn hideAll(app: *App) void {
 fn fallBack(app: *App) void {
     if (!app.panel_popups) return;
     applog.appLog("[panel_popup] unavailable; panels drawn in their windows\n", .{});
-    for (&app.popups) |*p| hide(app, p);
+    for (&app.popups) |*p| {
+        hide(app, p);
+        release(p);
+    }
     app.mu.lockUncancelable(clock.io());
     app.panel_popups = false;
     app.mu.unlock(clock.io());
