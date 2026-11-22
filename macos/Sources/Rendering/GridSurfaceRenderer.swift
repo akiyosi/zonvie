@@ -1969,7 +1969,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// absorb this is already there.
     ///
     /// Only a frame that would otherwise be dropped can wait, and only on a
-    /// surface that is smooth scrolling, so any other screen bails
+    /// surface whose producer is streaming -- it is smooth scrolling, or its
+    /// last commit is within `commitGuardBandStreamWindowNs` (the caller
+    /// passes both as `isSmoothScrolling`) -- so any other screen bails
     /// immediately. At most one surface waits per vsync: a wait that ended
     /// within `commitGuardBandSpacingNs` blocks the rest, which keeps the total
     /// main-thread cost per vsync under `commitGuardBandNs`. The wait ends the

@@ -1622,9 +1622,10 @@ func publishStagedSurfaceScroll(
 /// per-cell decoration counts, and hitting it terminates the redraw session
 /// (see failHardRender in nvim_core.zig).
 ///
-/// Kept equal to MAX_VERTEX_BYTES_PER_CALLBACK in src/core/flush.zig so the
-/// core never hands over a row this buffer would reject on size alone. Not the
-/// binding per-row ceiling: surfaceMaxProvisionedRowBytes below is lower once
+/// Below MAX_VERTEX_BYTES_PER_CALLBACK in src/core/flush.zig (1 GiB in a
+/// release build): the core can hand over a row this buffer rejects on size
+/// alone, and the rejection fails the render budget. Not the binding per-row
+/// ceiling either: surfaceMaxProvisionedRowBytes below is lower once
 /// spread across three sets with two private slots each (~42 MiB per row), and
 /// that is the limit the provisioning path actually enforces.
 // Not private: SurfaceRowProvisionTests pins the budget ceiling against it.

@@ -65,14 +65,15 @@ const MAX_VERTEX_BYTES_PER_SURFACE: usize =
 // extreme display setups; the ceiling only guards pathological per-cell
 // decoration counts (heavily stacked combining characters).
 //
-// These bound the CORE's own accounting only. They are matched against the
+// These bound the CORE's own accounting only, and they are above the
 // frontends' single-buffer ceilings (surfaceMaxVertexBufferCapacity in
 // macos/Sources/Rendering/MetalTypes.swift, max_buffer_bytes in
-// windows/renderer/d3d11_renderer.zig, both 256 MiB) so that a row the core
-// accepts is never rejected by a frontend purely on per-buffer size.
+// windows/renderer/d3d11_renderer.zig, both 256 MiB): a row between the two
+// passes here and is refused by the frontend, which then fails the render
+// budget itself (zonvie_core_fail_render_budget) with the same outcome.
 //
-// That is NOT a claim that a row the core accepts always allocates. Each
-// frontend also has an AGGREGATE physical budget that binds first and is
+// Nor does a row the frontend's per-buffer ceiling accepts always allocate.
+// Each frontend also has an AGGREGATE physical budget that binds first and is
 // legitimately lower: Windows row_vb_surface_budget_bytes (256 MiB, checked as
 // retained + new in windows/render_pipeline_helpers.zig), and on macOS
 // surfaceMaxProvisionedRowBytes spread over three sets x two private slots,
