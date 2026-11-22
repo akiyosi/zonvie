@@ -12099,6 +12099,45 @@ test "a .notdef base with a combining mark is rasterized once, as a text cluster
     try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
 }
 
+test "an emoji modifier joined to a space is drawn once and is not a glyph miss" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+    var font = NotdefKanaFont{ .core = &core };
+    font.install(&core);
+    core.cb.on_vertices_row = struct {
+        fn f(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, main_verts: ?[*]const c_api.Vertex, main_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = ctx;
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = main_verts;
+            _ = main_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+        }
+    }.f;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    // Neovim joins a skin-tone modifier to the space before it: one cell.
+    try core.grid.putCellGridCluster(1, 0, 0, 0x20, 0, &.{0x1F3FB});
+    try flush_ctx.onFlush(2, 2);
+
+    // A miss would leave the grid owing every row on every later flush.
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    // The modifier is what has ink: it goes to the emoji rasterizer with the
+    // cell's whole cluster.
+    try std.testing.expectEqual(@as(u32, 1), font.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 0x1F3FB), font.scalars[0]);
+    try std.testing.expectEqual(@as(u8, 2), font.emoji_cluster_lens[0]);
+}
+
 // The cursor shares the row's cluster cache key, so it must hand the
 // rasterizer the same text cluster; drawing the base alone would cache a
 // picture without the mark under that key (and hide the mark under the cursor).
