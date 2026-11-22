@@ -6123,12 +6123,12 @@ pub fn drawSurfaceRowPass(
     }
 
     // An eased frame presents on vblank, so the paints that drive the ease
-    // run at the display rate.
+    // run at the display rate. Each pass settles it for the present that
+    // shows it: a frame planned eased and never presented must not leave a
+    // later, unrelated present waiting for a vblank.
     var ease_moving = paint.root_ease.moving();
-    if (root_easing) {
-        g.vsync_next_present = true;
-        in.frame.draw_params.root_ease = &paint.root_ease;
-    }
+    g.vsync_next_present = root_easing;
+    if (root_easing) in.frame.draw_params.root_ease = &paint.root_ease;
     if (has_layers) for (layers[1..]) |layer| {
         const state = paint.layerState(layer.grid_id) orelse continue;
         if (state.ease.easing) g.vsync_next_present = true;
