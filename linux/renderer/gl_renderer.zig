@@ -686,7 +686,7 @@ fn planFrame(app: *App, t: *Target, fx: bool, buffer_age: u32) Plan {
     // A scroll moves rows no commit sends, and so does the frame that ends it.
     for (app.surface.committedLayers()) |l| {
         const e = app.surface.gridEase(l.grid_id) orelse continue;
-        if (e.easing or e.moving() or e.offset_px != 0) return .{ .whole = null };
+        if (e.movesRows()) return .{ .whole = null };
     }
     // A panel over the view changes with no row of the view.
     if (!app.panel_popups) for (app.overlays) |o| if (o.open) return .{ .whole = null };
