@@ -575,3 +575,8 @@ test "e2e:gui_doc_drop_into_cmdline" {
     try requireNvim();
     try gui_doc.runDropIntoCmdline(testing.allocator);
 }
+
+test "e2e:shader_ts_layer" {
+    try requireNvim();
+    try @import("scenarios/shader_ts_layer.zig").run(testing.allocator);
+}

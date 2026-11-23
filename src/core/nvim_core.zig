@@ -1023,6 +1023,9 @@ pub const Core = struct {
     /// declaration clears the ColorScheme augroup only where it exists.
     shader_hl_unlink_pending: bool = false,
     shader_hl_unlink_sent: bool = false,
+    /// grid_mu held. Whether the last unlink call carried the Tree-sitter
+    /// layer with a marker name, so a declaration without any tears it down.
+    shader_ts_layer_sent: bool = false,
     /// The Ghostty colour uniforms' source, read by zonvie_shader_fill_colors
     /// from any thread. Written only with grid_mu held.
     shader_colors: ShaderColors = .{},
@@ -5604,15 +5607,54 @@ pub const Core = struct {
         for (names) |n| try rpc.packStr(buf, alloc, n);
     }
 
+    /// Marker groups are the declared names with this prefix: the
+    /// Tree-sitter layer places them, no colorscheme defines them.
+    pub const shader_ts_prefix = "ZonvieTs";
+
+    /// Run with the declared marker names as `...`; see the file's header.
+    pub const shader_ts_layer_lua = @embedFile("shader_ts_layer.lua");
+
+    fn shaderTsMarkerCount(names: []const []const u8) usize {
+        var n: usize = 0;
+        for (names) |name| {
+            if (std.mem.startsWith(u8, name, shader_ts_prefix)) n += 1;
+        }
+        return n;
+    }
+
+    /// The nvim_exec_lua notification carrying the marker names among
+    /// `names` to shader_ts_layer_lua; with none it tears the layer down.
+    pub fn packShaderTsLayer(buf: *rpc.Buf, alloc: std.mem.Allocator, names: []const []const u8) !void {
+        try rpc.packArray(buf, alloc, 3);
+        try rpc.packInt(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, "nvim_exec_lua");
+        try rpc.packArray(buf, alloc, 2);
+        try rpc.packStr(buf, alloc, shader_ts_layer_lua);
+        try rpc.packArray(buf, alloc, 1);
+        try rpc.packArray(buf, alloc, shaderTsMarkerCount(names));
+        for (names) |name| {
+            if (std.mem.startsWith(u8, name, shader_ts_prefix)) try rpc.packStr(buf, alloc, name);
+        }
+    }
+
     /// grid_mu held. Packs the pending unlink call into `buf` and clears the
     /// pending mark; false (buf untouched) when nothing is pending or the
-    /// UI is not attached yet.
+    /// UI is not attached yet. The Tree-sitter layer rides behind it while
+    /// a marker is declared, and once more to tear down after the last.
     pub fn takeShaderHlUnlinkLocked(self: *Core, buf: *rpc.Buf) bool {
         if (!self.shader_hl_unlink_pending or !self.ui_attached.load(.seq_cst)) return false;
         packShaderHlUnlink(buf, self.alloc, self.shader_hl_groups.items) catch {
             buf.clearRetainingCapacity();
             return false;
         };
+        const wants_ts_layer = shaderTsMarkerCount(self.shader_hl_groups.items) != 0;
+        if (wants_ts_layer or self.shader_ts_layer_sent) {
+            packShaderTsLayer(buf, self.alloc, self.shader_hl_groups.items) catch {
+                buf.clearRetainingCapacity();
+                return false;
+            };
+        }
+        self.shader_ts_layer_sent = wants_ts_layer;
         self.shader_hl_unlink_pending = false;
         self.shader_hl_unlink_sent = self.shader_hl_groups.items.len != 0;
         return true;
@@ -10352,6 +10394,41 @@ test "the unlink call waits for attach, goes once, and an unchanged declaration 
     // A later attach has nothing left to clear.
     core.markShaderHlUnlinkPendingLocked();
     try std.testing.expect(!core.takeShaderHlUnlinkLocked(&buf));
+}
+
+test "the Tree-sitter layer rides behind the unlink call while a marker is declared, then once to tear down" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    core.ui_attached.store(true, .seq_cst);
+    const layer_head = Core.shader_ts_layer_lua[0..40];
+
+    // No marker among the names: the layer is not sent.
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, layer_head) == null);
+    buf.clearRetainingCapacity();
+
+    // A marker: the layer follows the unlink call, with the markers only.
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment ZonvieTsFnCursor ZonvieTsArg1\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    const layer_at = std.mem.indexOf(u8, buf.items, layer_head).?;
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\xa7Comment").? < layer_at);
+    const tail = buf.items[layer_at + Core.shader_ts_layer_lua.len ..];
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x92 }, tail[0..2]);
+    try std.testing.expectEqualStrings("\xb0ZonvieTsFnCursor\xacZonvieTsArg1", tail[2..]);
+    buf.clearRetainingCapacity();
+
+    // The last marker dropped: one layer call with no names, then none.
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, layer_head) != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x90 }, buf.items[buf.items.len - 2 ..]);
+    buf.clearRetainingCapacity();
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment Normal\n");
+    try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, layer_head) == null);
 }
 
 test "a mask rebuild that changes an existing id marks every surface dirty" {

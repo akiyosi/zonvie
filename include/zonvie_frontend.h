@@ -890,7 +890,14 @@ ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len
    directly is left alone. Declaring no names (after some) only removes the
    ColorScheme autocmd; links are not restored. Lookups never create a
    group; the state lives in the Lua global `zonvie_shader_hl` and the
-   augroup `ZonvieShaderHlGroups`. Same thread rules as zonvie_core_set_shader_inputs_enabled: not
+   augroup `ZonvieShaderHlGroups`.
+   A name starting with `ZonvieTs` is a marker: while one is declared the
+   core also runs its Tree-sitter layer in Neovim (src/core/shader_ts_layer.lua
+   lists the markers), which defines those groups and places them from each
+   buffer's syntax tree; a declaration without any tears the layer down. Its
+   state lives in the Lua global `zonvie_shader_ts`, the augroup
+   `ZonvieShaderTs` and the namespaces `zonvie_shader_ts_*`.
+   Same thread rules as zonvie_core_set_shader_inputs_enabled: not
    from inside a core callback. */
 ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
 
