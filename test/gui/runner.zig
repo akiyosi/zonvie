@@ -589,6 +589,51 @@ test "gui:float_survives_closed_float_anchor" {
     try gated(true, @import("scenarios/common/float_survives_closed_float_anchor.zig"));
 }
 
+// The use cases of Neovim's gui.txt that need the real app, one test each
+// (`-Dtest-filter=gui_doc`). macOS only: capture and CGEvent clicks.
+const gui_doc = if (is_macos) @import("scenarios/macos/gui_doc.zig") else struct {
+    pub const Restart = struct {};
+    pub const Connect = struct {};
+    pub const DetachThenReattach = struct {};
+    pub const DetachEmbedded = struct {};
+    pub const DetachBang = struct {};
+    pub const MouseClick = struct {};
+    pub const FileDrop = struct {};
+    pub const ReattachShowsContent = struct {};
+};
+
+test "gui:gui_doc_reattach_shows_content" {
+    try gated(is_macos, gui_doc.ReattachShowsContent);
+}
+
+test "gui:gui_doc_file_drop" {
+    try gated(is_macos, gui_doc.FileDrop);
+}
+
+test "gui:gui_doc_restart" {
+    try gated(is_macos, gui_doc.Restart);
+}
+
+test "gui:gui_doc_connect" {
+    try gated(is_macos, gui_doc.Connect);
+}
+
+test "gui:gui_doc_detach_then_reattach" {
+    try gated(is_macos, gui_doc.DetachThenReattach);
+}
+
+test "gui:gui_doc_detach_embedded" {
+    try gated(is_macos, gui_doc.DetachEmbedded);
+}
+
+test "gui:gui_doc_detach_bang" {
+    try gated(is_macos, gui_doc.DetachBang);
+}
+
+test "gui:gui_doc_mouse_click" {
+    try gated(is_macos, gui_doc.MouseClick);
+}
+
 test "gui:extwin_float_wheel_scroll" {
     // Windows only: the external-window wheel path and the HWND-addressed
     // notch this uses live in the Windows frontend and windows_window.zig.

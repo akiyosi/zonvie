@@ -114,13 +114,21 @@ pub const Options = struct {
     /// app reads from the environment rather than from config.toml, which a
     /// fixture cannot reach.
     app_env: []const [2][]const u8 = &.{},
+    /// Let the app spawn its own `nvim --embed` (still listening at
+    /// `listen_addr`, so the oracle channel works) instead of attaching to a
+    /// server the driver started. The server is then the app's child: what a
+    /// plain `zonvie` launch is, and the only way to see what the app does
+    /// when that child outlives its UI. A scenario that leaves the server
+    /// running ends it itself.
+    embedded: bool = false,
 };
 
 pub const Gui = struct {
     alloc: std.mem.Allocator,
     nvim_path: []u8,
     listen_addr: []u8,
-    nvim_child: std.process.Child,
+    /// Null when the app spawned the server itself (Options.embedded).
+    nvim_child: ?std.process.Child,
     app_child: std.process.Child,
     app_env: std.process.Environ.Map,
     /// Owned argv for the app, kept so the scenario can relaunch it.
@@ -140,7 +148,7 @@ pub const Gui = struct {
             .alloc = alloc,
             .nvim_path = nvim_path,
             .listen_addr = undefined,
-            .nvim_child = undefined,
+            .nvim_child = null,
             .app_child = undefined,
             .app_env = undefined,
             .app_argv = undefined,
@@ -175,16 +183,18 @@ pub const Gui = struct {
         // state directory. They accumulate across runs until nvim answers
         // E325 "swap file exists" with a |hit-enter| prompt — in the user's
         // own editor, not just in the tests. A harness never needs swap.
-        g.nvim_child = try std.process.spawn(gui_io.io(), .{
-            .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        });
-        errdefer g.nvim_child.kill(gui_io.io());
+        if (!opts.embedded) {
+            g.nvim_child = try std.process.spawn(gui_io.io(), .{
+                .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            });
+        }
+        errdefer if (g.nvim_child) |*c| c.kill(gui_io.io());
 
         // Wait until the server answers a trivial expression.
-        try g.waitServerReady(10_000);
+        if (!opts.embedded) try g.waitServerReady(10_000);
 
         // 2. Real frontend, attached to the same nvim. Keep an owned argv
         // so relaunchApp() can spawn an identical instance.
@@ -194,13 +204,27 @@ pub const Gui = struct {
             argv.deinit(alloc);
         }
         try argv.append(alloc, try alloc.dupe(u8, app_path));
-        try argv.append(alloc, try std.fmt.allocPrint(alloc, "--connect-nvim={s}", .{g.listen_addr}));
+        if (opts.embedded) {
+            // --nofork: the forked GUI would not be the child this driver
+            // tracks by pid.
+            try argv.append(alloc, try alloc.dupe(u8, "--nofork"));
+            try argv.append(alloc, try alloc.dupe(u8, "--nvim"));
+            try argv.append(alloc, try alloc.dupe(u8, nvim_path));
+        } else {
+            try argv.append(alloc, try std.fmt.allocPrint(alloc, "--connect-nvim={s}", .{g.listen_addr}));
+        }
         for (opts.app_args) |a| try argv.append(alloc, try alloc.dupe(u8, a));
         // AppKit window restoration lives in the real user's Saved
         // Application State, like the frame autosave below: never read it.
         if (builtin.os.tag == .macos) {
             try argv.append(alloc, try alloc.dupe(u8, "-ApplePersistenceIgnoreState"));
             try argv.append(alloc, try alloc.dupe(u8, "YES"));
+        }
+        if (opts.embedded) {
+            // Everything after `--` is the embedded nvim's own.
+            for ([_][]const u8{ "--", "--clean", "-n", "--listen", g.listen_addr }) |a| {
+                try argv.append(alloc, try alloc.dupe(u8, a));
+            }
         }
         g.app_argv = try argv.toOwnedSlice(alloc);
 
@@ -269,6 +293,7 @@ pub const Gui = struct {
 
         // 3. Wait for the main window to actually appear on screen.
         try g.waitWindowCount(1, 15_000);
+        if (opts.embedded) try g.waitServerReady(10_000);
         return g;
     }
 
@@ -311,7 +336,7 @@ pub const Gui = struct {
         // Exact-PID teardown of OUR children only, app first, then nvim.
         // Skip the kill when the app already exited (appAlive reaped it).
         if (!g.app_exited) g.app_child.kill(gui_io.io());
-        g.nvim_child.kill(gui_io.io());
+        if (g.nvim_child) |*c| c.kill(gui_io.io());
         g.app_env.deinit();
         for (g.app_argv) |a| g.alloc.free(a);
         g.alloc.free(g.app_argv);
@@ -487,6 +512,17 @@ pub const Gui = struct {
         g.app_exited = true;
         std.debug.print("[gui] zonvie app exited unexpectedly (pid={d})\n", .{g.app_pid});
         return false;
+    }
+
+    /// Whether the app process ends within `timeout_ms`: for scenarios whose
+    /// subject is the app going away (`:detach`).
+    pub fn waitAppExit(g: *Gui, timeout_ms: u64) bool {
+        var timer = gui_io.Timer.start();
+        while (g.appAlive()) {
+            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return false;
+            gui_io.sleepNs(100 * std.time.ns_per_ms);
+        }
+        return true;
     }
 
     /// Poll until the app owns exactly `target` on-screen windows.

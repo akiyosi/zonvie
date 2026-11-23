@@ -91,6 +91,9 @@ pub const Options = struct {
     /// Install deterministic per-grid font callbacks: the global cell is
     /// 10x20 px, a slot is 10x20 x scale, doubled when its size field is 28.
     font_slots: bool = false,
+    /// Attach to the server listening here (as `--remote-ui` does) instead
+    /// of spawning an embedded one. Borrowed for the init call.
+    connect_addr: ?[]const u8 = null,
     /// Default per-wait timeout. Generous: CI machines are slow.
     timeout_ms: u64 = 5000,
 };
@@ -246,7 +249,10 @@ pub const Harness = struct {
         if (opts.msg_routes) |routes| h.core.msg_config.messages.routes = routes;
         if (opts.msg_views) |views| h.core.msg_config.messages.views = views;
 
-        try h.core.start(h.nvim_cmd, opts.rows, opts.cols);
+        if (opts.connect_addr) |addr|
+            try h.core.startConnect(addr, opts.rows, opts.cols)
+        else
+            try h.core.start(h.nvim_cmd, opts.rows, opts.cols);
         errdefer h.core.stop();
         // No renderer in this harness: layout is "ready" immediately, which
         // unblocks the RPC thread's nvim_ui_attach.
@@ -1110,6 +1116,56 @@ pub const Harness = struct {
         while (end > 0 and buf.items[end - 1] == ' ') end -= 1;
         buf.items.len = end;
         return buf.toOwnedSlice(alloc);
+    }
+
+    /// Whether any row of any grid contains `needle`: for text whose grid the
+    /// scenario cannot name ahead of time (messages, popup menus).
+    pub fn screenContains(h: *Harness, needle: []const u8) bool {
+        const line = h.screenLineAlloc(h.alloc, needle) catch return false;
+        if (line) |l| h.alloc.free(l);
+        return line != null;
+    }
+
+    /// Print every non-empty row of every grid: what a failed wait was
+    /// looking at.
+    pub fn dumpScreen(h: *Harness) void {
+        _ = h.screenScanAlloc(h.alloc, null) catch {};
+    }
+
+    /// The first row of any grid that contains `needle`. Caller owns it.
+    pub fn screenLineAlloc(h: *Harness, alloc: std.mem.Allocator, needle: []const u8) !?[]u8 {
+        return h.screenScanAlloc(alloc, needle);
+    }
+
+    fn screenScanAlloc(h: *Harness, alloc: std.mem.Allocator, needle: ?[]const u8) !?[]u8 {
+        var ids: std.ArrayListUnmanaged(i64) = .empty;
+        defer ids.deinit(alloc);
+        var rows: std.ArrayListUnmanaged(u32) = .empty;
+        defer rows.deinit(alloc);
+        {
+            h.core.grid_mu.lockUncancelable(zc.clock.io());
+            defer h.core.grid_mu.unlock(zc.clock.io());
+            try ids.append(alloc, 1);
+            try rows.append(alloc, h.core.grid.rows);
+            var it = h.core.grid.sub_grids.iterator();
+            while (it.next()) |e| {
+                try ids.append(alloc, e.key_ptr.*);
+                try rows.append(alloc, e.value_ptr.rows);
+            }
+        }
+        for (ids.items, rows.items) |id, n| {
+            var row: u32 = 0;
+            while (row < n) : (row += 1) {
+                const text = try h.rowTextAlloc(alloc, id, row);
+                if (needle) |wanted| {
+                    if (std.mem.indexOf(u8, text, wanted) != null) return text;
+                } else if (text.len != 0) {
+                    std.debug.print("[e2e] grid={d} row={d}: \"{s}\"\n", .{ id, row, text });
+                }
+                alloc.free(text);
+            }
+        }
+        return null;
     }
 
     // ── High-level asserts ─────────────────────────────────────────────
