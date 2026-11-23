@@ -55,12 +55,13 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at or right of it. A box starts at its
+// Whether the row of `c` has `bits` at it or within 16 cells right of it:
+// far enough for an indent, short of a window beside this one. A box starts at its
 // scope's indent, so a cursor left of that (a blank line) is still in it.
 bool tsRowHas(ivec2 c, uint bits) {
     uint g = 0u;
-    for (int i = 0; i < 7; ++i) {
-        int dx = i == 0 ? 0 : (1 << i);
+    for (int i = 0; i < 6; ++i) {
+        int dx = i == 0 ? 0 : (1 << (i - 1));
         g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
     }
     return (g & bits) != 0u;
@@ -180,11 +181,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
 
         // A cursor arriving from outside this scope draws the rail outward
-        // from its own row.
+        // from its own row. A cursor in another window is on no cell of the
+        // scope here, and the rail stands whole.
         float since = iTime - iTimeCursorChange;
         float reveal = 1.0;
         float flash = 0.0;
-        if (since < SWEEP_S && !tsRowHas(tsCursorCell(iPreviousCursor), SCOPE)) {
+        if (since < SWEEP_S && tsRowHas(tsCursorCell(iCurrentCursor), SCOPE) &&
+            !tsRowHas(tsCursorCell(iPreviousCursor), SCOPE)) {
             float cursor_y = iCurrentCursor.y - 0.5 * iCurrentCursor.w;
             float front = since * SWEEP_PT_PER_S * scale;
             reveal = clamp(front - abs(fragCoord.y - cursor_y), 0.0, 1.0);

@@ -6,13 +6,17 @@
 // statusline and floating windows are left alone. Entering a function
 // beats the frame twice, then it rests with a faint slow breath.
 //
+// What is framed and what steps back comes from the markers alone, so
+// splits and external windows agree: every window showing the buffer
+// frames the function, every other function in any window steps back.
+//
 // Needs Zonvie's Tree-sitter layer (it starts by itself when a shader
 // declares ZonvieTs* groups) and a Tree-sitter parser for the buffer.
 //
-// @zonvie-hl-groups: ZonvieTsFnCursor ZonvieTsFn ZonvieTsFnName
+// @zonvie-hl-groups: ZonvieTsFnCursor ZonvieTsFnOther ZonvieTsFnName
 
 const uint FN_CURSOR = 1u; // cells of the innermost function holding the cursor
-const uint FN_ANY = 2u; // cells of any function
+const uint FN_OTHER = 2u; // cells of the other functions, while one holds the cursor
 const uint FN_NAME = 4u; // the name in a function definition
 
 // ---- tuning ----
@@ -50,12 +54,13 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at or right of it. A box starts at its
+// Whether the row of `c` has `bits` at it or within 16 cells right of it:
+// far enough for an indent, short of a window beside this one. A box starts at its
 // function's indent, so a cursor left of that (a blank line) is still in it.
 bool tsRowHas(ivec2 c, uint bits) {
     uint g = 0u;
-    for (int i = 0; i < 7; ++i) {
-        int dx = i == 0 ? 0 : (1 << i);
+    for (int i = 0; i < 6; ++i) {
+        int dx = i == 0 ? 0 : (1 << (i - 1));
         g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
     }
     return (g & bits) != 0u;
@@ -110,8 +115,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     ivec2 cell;
     vec2 cellMin, cellSize;
     if (!zonvieCellGeom(fragCoord, cell, cellMin, cellSize)) return;
-    // No function holds the cursor: nothing steps back.
-    if (!tsRowHas(tsCursorCell(iCurrentCursor), FN_CURSOR)) return;
 
     uint groups = zonvieCellGroupsAt(cell);
     float scale = tsScale(cellSize);
@@ -120,15 +123,18 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float reach = min(hs.x, hs.y);
     float r = min(CORNER_PT * scale, reach);
     float d_cur = tsRegionSD(cell, l, hs, FN_CURSOR, r);
-    float d_any = tsRegionSD(cell, l, hs, FN_ANY | FN_CURSOR, r);
+    float d_other = tsRegionSD(cell, l, hs, FN_OTHER, r);
 
     bool dark = dot(iBackgroundColor, vec3(0.2126, 0.7152, 0.0722)) < 0.5;
     vec3 accent = dark ? ACCENT_ON_DARK : ACCENT_ON_LIGHT;
 
     // A cursor arriving from outside the function starts the entry: the
-    // others fade back and the frame beats. A move inside it starts nothing.
+    // others fade back and the frame beats. A move inside it starts
+    // nothing, and neither does a cursor that is in another window (its
+    // rect then lands on no cell of the function here).
     float since = iTime - iTimeCursorChange;
-    bool entered = !tsRowHas(tsCursorCell(iPreviousCursor), FN_CURSOR);
+    bool entered = tsRowHas(tsCursorCell(iCurrentCursor), FN_CURSOR) &&
+        !tsRowHas(tsCursorCell(iPreviousCursor), FN_CURSOR);
     float enter = entered ? smoothstep(0.0, ENTER_S, since) : 1.0;
     float beat = 0.0;
     if (entered && since < BEAT_S) {
@@ -141,7 +147,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     // Other functions step back: what a pixel adds to its background (the
     // text) shrinks and loses colour. The background itself stays as it is.
-    float in_other = clamp(0.5 - d_any, 0.0, 1.0) * clamp(0.5 + d_cur, 0.0, 1.0);
+    float in_other = clamp(0.5 - d_other, 0.0, 1.0);
     if (in_other > 0.0) {
         vec3 bg = zonvieCellBgAt(cell);
         vec3 ink = col - bg;

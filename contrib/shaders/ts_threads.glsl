@@ -72,12 +72,13 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at or right of it. A box starts at its
+// Whether the row of `c` has `bits` at it or within 16 cells right of it:
+// far enough for an indent, short of a window beside this one. A box starts at its
 // function's indent, so a cursor left of that (a blank line) is still in it.
 bool tsRowHas(ivec2 c, uint bits) {
     uint g = 0u;
-    for (int i = 0; i < 7; ++i) {
-        int dx = i == 0 ? 0 : (1 << i);
+    for (int i = 0; i < 6; ++i) {
+        int dx = i == 0 ? 0 : (1 << (i - 1));
         g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
     }
     return (g & bits) != 0u;
@@ -174,10 +175,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         float d = tsRegionSD(cell, l, hs, 1u << uint(arg), r);
         float inside = clamp(0.5 - d, 0.0, 1.0);
 
-        // One ripple from the cursor when it arrives from outside the function.
+        // One ripple from the cursor when it arrives from outside the
+        // function. A cursor in another window is on no cell of it here.
         float since = iTime - iTimeCursorChange;
         float ripple = 0.0;
-        if (since < RIPPLE_S && !tsRowHas(tsCursorCell(iPreviousCursor), FN_CURSOR)) {
+        if (since < RIPPLE_S && tsRowHas(tsCursorCell(iCurrentCursor), FN_CURSOR) &&
+            !tsRowHas(tsCursorCell(iPreviousCursor), FN_CURSOR)) {
             vec2 from = iCurrentCursor.xy + vec2(0.5 * iCurrentCursor.z, -0.5 * iCurrentCursor.w);
             float x = (distance(fragCoord, from) - since * RIPPLE_PT_PER_S * scale) / (RIPPLE_WIDTH_PT * scale);
             ripple = (1.0 - since / RIPPLE_S) * exp(-x * x);

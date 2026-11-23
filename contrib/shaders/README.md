@@ -64,11 +64,13 @@ Placed for the visible rows, redrawn with the text:
 | Name | Cells |
 |---|---|
 | `ZonvieTsFn` | a function, from its line's indent to the window's right edge |
+| `ZonvieTsFnOther` | the same cells, in every window, of the functions other than the one holding the cursor; none while the cursor is outside every function |
 | `ZonvieTsFnHead` | a function's first line, from the function rightward |
 | `ZonvieTsFnName` | the name in a function definition |
 | `ZonvieTsParam` | a parameter name in a function definition |
 | `ZonvieTsExit` | a `return`, `break`, `continue`, `throw` or `goto` statement |
 | `ZonvieTsError` | an `ERROR` or `MISSING` node (the first line of one spanning several) |
+| `ZonvieTsErrorRow` | one blank cell at the window's right edge, on each row that has such a node |
 | `ZonvieTsDepthB0` `B1` `B2` | the cell's nesting depth as a 3-bit number, 0 to 7 |
 
 Following the cursor of the current window:
@@ -96,6 +98,25 @@ Blank lines inside a scope carry the same steps.
 Raw Tree-sitter captures (`@keyword.return`, `@markup.heading.1`, ...) and
 ordinary groups (`Comment`, `DiagnosticUnderlineError`) can be declared in
 the same line and need no layer.
+
+### Several windows
+
+A shader runs once per surface: the main window with all its splits, and
+each external window. The cursor's rect is one value handed to all of them,
+so in a window that does not hold the cursor it lands on unrelated cells. A
+shader that should look the same in every window therefore reads what to
+draw from the markers of the cells it shades, and uses the cursor only to
+time an animation:
+
+- The cursor markers live in the current window's buffer. Every window
+  showing that buffer carries them, split or external; a buffer left behind
+  in another window keeps none.
+- What depends on the cursor but must show in other buffers is a marker of
+  its own: `ZonvieTsFnOther` is placed in every window while a function
+  holds the cursor.
+- A marker that needs a window's edge is placed there by the layer
+  (`ZonvieTsErrorRow`), not searched for along the row: in a split, the
+  cells further along a row belong to the next window.
 
 ## Design notes
 
@@ -135,6 +156,12 @@ of the reading research behind them:
   that reuses the name is not.
 - The cursor markers are per buffer and follow the current window: two
   windows on one buffer show the same spotlight.
+- External windows have been run as `nvim_open_win(..., { external = true })`.
+  `--extwindows` takes the same surface path but has not been run: it needs
+  a Neovim that accepts the `ext_windows` UI option.
+- A sample asks "is this row inside the cursor's function" by looking up
+  to 16 cells along the row. A window narrower than that beside another one
+  can pick up its neighbour's answer.
 - A shader that names `iTime` is redrawn every frame. Four of the five do,
   for their entry animations; `ts_gutter_glyphs` does not.
 - The layer's cost, measured on a 1656-line Lua file with every marker
@@ -150,8 +177,12 @@ of the reading research behind them:
 zig build e2e -Dtest-filter=shader_ts_layer              # markers reach the cell masks, real Neovim (Lua, C)
 zig build test -Dtest-filter="sample shaders"            # the samples compile to MSL, HLSL and GLSL 3.3
 zig build gui-test -Dtest-filter=visual_ts_shader_samples # the samples draw in the real app
+zig build gui-test -Dtest-filter=visual_ts_shader_windows # ... in splits and external windows
 ```
 
-The last one shows each sample a Lua and a C buffer on a dark and a light
-background, compares every view against the same view without markers, and
-writes the captures to `tmp/ts_shader_samples/`.
+`visual_ts_shader_samples` shows each sample a Lua and a C buffer on a dark
+and a light background and compares every view against the same view
+without markers. `visual_ts_shader_windows` does the same for a vertical
+split of two buffers and for two external windows beside the main one, and
+checks that no window draws from its neighbour's rows. Both write their
+captures under `tmp/`.

@@ -13,13 +13,14 @@ const zc = @import("zonvie_core");
 const Harness = @import("../harness.zig").Harness;
 
 const declaration =
-    "// @zonvie-hl-groups: ZonvieTsFnCursor ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsArg1 ZonvieTsParam ZonvieTsSignFn\n";
+    "// @zonvie-hl-groups: ZonvieTsFnCursor ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsArg1 ZonvieTsParam ZonvieTsSignFn ZonvieTsFnOther\n";
 const fn_cursor: u32 = 1 << 0;
 const depth_b0: u32 = 1 << 1;
 const depth_b1: u32 = 1 << 2;
 const arg1: u32 = 1 << 3;
 const param: u32 = 1 << 4;
 const sign_fn: u32 = 1 << 5;
+const fn_other: u32 = 1 << 6;
 
 /// 'signcolumn=yes': buffer column c is grid column c + sign_cols.
 const sign_cols: u32 = 2;
@@ -146,4 +147,40 @@ pub fn run(alloc: std.mem.Allocator) !void {
             return maskAt(hh, grid, 0, 0) == sign_fn;
         }
     }.check, h.opts.timeout_ms);
+
+    // Two functions: while the cursor is in one, the other is marked as
+    // "other"; with the cursor in neither, neither is.
+    //  0  local function a()
+    //  1    return 1
+    //  2  end
+    //  3  (blank)
+    //  4  local function b()
+    //  5    return 2
+    //  6  end
+    try h.command(
+        \\lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'local function a()', '  return 1', 'end', '', 'local function b()', '  return 2', 'end' }) vim.bo.filetype = 'lua'
+    );
+    try h.command("normal! 2G");
+    try h.waitUntil(g, struct {
+        fn check(grid: i64, hh: *Harness) bool {
+            return maskAt(hh, grid, 5, 2 + sign_cols) == (fn_other | depth_b0);
+        }
+    }.check, h.opts.timeout_ms);
+    try expectMask(h, g, 1, 2, fn_cursor | depth_b0);
+    try expectMask(h, g, 4, 0, fn_other);
+    try expectMask(h, g, 3, 0, 0);
+    try h.command("normal! 6G");
+    try h.waitUntil(g, struct {
+        fn check(grid: i64, hh: *Harness) bool {
+            return maskAt(hh, grid, 1, 2 + sign_cols) == (fn_other | depth_b0);
+        }
+    }.check, h.opts.timeout_ms);
+    try expectMask(h, g, 5, 2, fn_cursor | depth_b0);
+    try h.command("normal! 4G");
+    try h.waitUntil(g, struct {
+        fn check(grid: i64, hh: *Harness) bool {
+            return maskAt(hh, grid, 1, 2 + sign_cols) == depth_b0;
+        }
+    }.check, h.opts.timeout_ms);
+    try expectMask(h, g, 5, 2, depth_b0);
 }
