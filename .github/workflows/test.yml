@@ -8,8 +8,10 @@ env:
   # release cannot change test results between runs. Stock Neovim: the
   # ext_windows attach option (unmerged upstream PR) is not available, so
   # ext_windows scenarios skip here (ZONVIE_REQUIRE_EXT_WINDOWS makes them
-  # fail instead); external floats use ext_multigrid.
-  NVIM_VERSION: "v0.12.5"
+  # fail instead); external floats use ext_multigrid. The reattach-content
+  # scenarios need neovim/neovim#42667, which no release has, so they stay
+  # off (ZONVIE_TEST_REATTACH_CONTENT turns them on).
+  NVIM_VERSION: "v0.12.6"
 
 jobs:
   # The e2e runner skips every scenario when it finds no nvim;

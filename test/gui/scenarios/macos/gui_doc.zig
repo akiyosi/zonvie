@@ -191,9 +191,14 @@ pub const DetachThenReattach = struct {
 /// multigrid UI attaching after another one is sent only the cells that
 /// differ from the window grids the server already holds, so the buffer area
 /// stays empty under a drawn statusline (test/e2e/scenarios/gui_doc.zig, runReattachShowsWindowContent,
-/// has the event-level account). Skips while the server does that.
+/// has the event-level account). No release has the fix, so this runs only
+/// when ZONVIE_TEST_REATTACH_CONTENT is set, for a server built with it.
 pub const ReattachShowsContent = struct {
     pub fn run(alloc: std.mem.Allocator) !void {
+        if (!std.process.Environ.containsConstant(std.testing.environ, "ZONVIE_TEST_REATTACH_CONTENT")) {
+            std.debug.print("[gui] skipped, needs neovim#42667 (set ZONVIE_TEST_REATTACH_CONTENT to run)\n", .{});
+            return error.SkipZigTest;
+        }
         var g = try Gui.init(alloc, .{});
         defer g.deinit();
         if (try g.evalInt("exists(':detach')") != 2) return error.SkipZigTest;
@@ -223,10 +228,10 @@ pub const ReattachShowsContent = struct {
         // text missing is well over 1%.
         if (diff > 0.005) {
             std.debug.print(
-                "[gui] skipped, server lacks neovim#42667: the reattached window differs from the detached one in {d:.2}% of the text corner\n",
+                "[gui] the reattached window differs from the detached one in {d:.2}% of the text corner\n",
                 .{diff * 100},
             );
-            return error.SkipZigTest;
+            return error.ReattachedWindowDiffers;
         }
     }
 };
