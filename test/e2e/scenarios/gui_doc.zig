@@ -1,8 +1,9 @@
 // gui_doc — the use cases of Neovim's `gui.txt`, from "Stop or detach the
 // current UI" to the end, driven through the real core against a real nvim.
 //
-// One `run*` per use case, so a run reports each on its own line. Commands the
-// server lacks (`:detach!`, `:connect`, `:restart` are 0.12+/0.13) skip.
+// One `run*` per use case, so a run reports each on its own line. gui.txt is
+// the development branch's: a use case the attached server does not have yet
+// (`:detach!`, `:%detach`, `:restart!`, the `:connect` menu) skips.
 //
 // The frontend half of these (a real window surviving :restart, real pointer
 // events, a real file drag) is test/gui/scenarios/macos/gui_doc_*.zig.
@@ -220,6 +221,35 @@ fn requireCommand(h: *Harness, alloc: std.mem.Allocator, name: []const u8) !void
     }
 }
 
+/// Skip unless the server accepts `cmdline` as written: a bang or a range a
+/// command only gained in a later release fails to parse on an older one.
+fn requireParses(h: *Harness, alloc: std.mem.Allocator, comptime cmdline: []const u8) !void {
+    if (try evalInt(h, alloc, "pcall(vim.api.nvim_parse_cmd, '" ++ cmdline ++ "', {}) and 1 or 0") != 1) {
+        std.debug.print("[e2e] gui_doc: skipped, server has no :{s}\n", .{cmdline});
+        return error.SkipZigTest;
+    }
+}
+
+/// Skip unless `:connect` is the one gui.txt describes. It arrived together
+/// with the optional argument: the 0.12 command requires an address, switches
+/// away from unsaved changes, and leaves the server it left running.
+fn requireConnectOfDoc(h: *Harness, alloc: std.mem.Allocator) !void {
+    try requireCommand(h, alloc, "connect");
+    const nargs = try evalAlloc(h, alloc, "vim.api.nvim_parse_cmd('connect x', {}).nargs");
+    defer alloc.free(nargs);
+    if (!std.mem.eql(u8, nargs, "?")) {
+        std.debug.print("[e2e] gui_doc: skipped, server has the 0.12 :connect\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
+/// Return once the server has run every command sent so far. nvim_input and
+/// nvim_input_mouse are handled on arrival and nvim_command is queued, so keys
+/// or a click sent right behind a command can reach the server before it ran.
+fn settle(h: *Harness, alloc: std.mem.Allocator) !void {
+    _ = try evalInt(h, alloc, "1");
+}
+
 /// Run a `:restart` variant and wait for the UI to be attached to the new
 /// server. Valid once per harness: the wait keys on the first move to a socket.
 fn restartAndWait(h: *Harness, cmd: []const u8) !void {
@@ -337,9 +367,13 @@ pub fn runDetachRemoteThenReattach(alloc: std.mem.Allocator) !void {
 /// no `win_pos` and no `grid_line`, so the window stays empty and `:mode`
 /// does not bring it back; at another size only the cells the resize changed
 /// arrive. A raw msgpack client with no zonvie code in it gets the same
-/// events. Skips on a server that still does that (0.12.2, and a 0.13-dev
-/// older than the fix), and passes on one that has it.
+/// events. No release has the fix, so this runs only when
+/// ZONVIE_TEST_REATTACH_CONTENT is set, for a server built with it.
 pub fn runReattachShowsWindowContent(alloc: std.mem.Allocator) !void {
+    if (!std.process.Environ.containsConstant(std.testing.environ, "ZONVIE_TEST_REATTACH_CONTENT")) {
+        std.debug.print("[e2e] gui_doc: skipped, needs neovim#42667 (set ZONVIE_TEST_REATTACH_CONTENT to run)\n", .{});
+        return error.SkipZigTest;
+    }
     var s = try Server.start(alloc, true, "call setline(1, 'server-marker')");
     defer s.stop();
     {
@@ -358,9 +392,9 @@ pub fn runReattachShowsWindowContent(alloc: std.mem.Allocator) !void {
         fn check(_: void, hh: *Harness) bool {
             return hh.screenContains("server-marker");
         }
-    }.check, 3000) catch {
-        std.debug.print("[e2e] gui_doc: skipped, server lacks neovim#42667: no window content on a same-size multigrid reattach\n", .{});
-        return error.SkipZigTest;
+    }.check, wait_ms) catch {
+        same.dumpScreen();
+        return error.NoWindowContentOnReattach;
     };
 }
 
@@ -370,7 +404,7 @@ pub fn runDetachOthers(alloc: std.mem.Allocator) !void {
     defer s.stop();
     var a = try Harness.init(alloc, .{ .connect_addr = s.addr });
     defer a.deinit();
-    try requireCommand(a, alloc, "detach");
+    try requireParses(a, alloc, "%detach");
     var b = try Harness.init(alloc, .{ .connect_addr = s.addr });
     defer b.deinit();
     // Not asserted here: what either UI shows. A second UI attaching at the
@@ -441,6 +475,10 @@ pub fn runRestartRestoresSession(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
     try requireCommand(h, alloc, "restart");
+    if (try evalInt(h, alloc, "vim.v.startreason and 1 or 0") != 1) {
+        std.debug.print("[e2e] gui_doc: skipped, server has no v:startreason\n", .{});
+        return error.SkipZigTest;
+    }
 
     const file = try tmpPathAlloc(alloc, "restart.txt");
     defer alloc.free(file);
@@ -452,6 +490,7 @@ pub fn runRestartRestoresSession(alloc: std.mem.Allocator) !void {
     const edit = try std.fmt.allocPrint(alloc, "edit {s}", .{file});
     defer alloc.free(edit);
     try h.command(edit);
+    try settle(h, alloc);
     try h.input("isession-line<Esc>");
     try h.waitRowText(h.winGrid(), 0, "session-line", wait_ms);
     try h.command("write");
@@ -487,7 +526,7 @@ pub fn runRestartRestoresSession(alloc: std.mem.Allocator) !void {
 pub fn runRestartBangDropsSession(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
-    try requireCommand(h, alloc, "restart");
+    try requireParses(h, alloc, "restart!");
 
     const file = try tmpPathAlloc(alloc, "restart_bang.txt");
     defer alloc.free(file);
@@ -556,7 +595,7 @@ pub fn runConnectAddress(alloc: std.mem.Allocator) !void {
     defer s.stop();
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
-    try requireCommand(h, alloc, "connect");
+    try requireConnectOfDoc(h, alloc);
     try h.input("iserver-a<Esc>");
     try h.waitRowText(h.winGrid(), 0, "server-a", wait_ms);
     try h.command("set nomodified");
@@ -585,7 +624,7 @@ pub fn runConnectRefusedWithUnsavedChanges(alloc: std.mem.Allocator) !void {
     defer s.stop();
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
-    try requireCommand(h, alloc, "connect");
+    try requireConnectOfDoc(h, alloc);
     try h.input("iunsaved-on-a<Esc>");
     try h.waitRowText(h.winGrid(), 0, "unsaved-on-a", wait_ms);
     const old_pid = try evalInt(h, alloc, "vim.fn.getpid()");
@@ -612,7 +651,7 @@ pub fn runConnectMenu(alloc: std.mem.Allocator) !void {
     defer s.stop();
     var h = try Harness.init(alloc, .{ .cols = 200, .rows = 40 });
     defer h.deinit();
-    try requireCommand(h, alloc, "connect");
+    try requireConnectOfDoc(h, alloc);
     const old_pid = try evalInt(h, alloc, "vim.fn.getpid()");
     defer killProcess(alloc, old_pid);
 
@@ -760,6 +799,7 @@ pub fn runMouseKeycodeMappings(alloc: std.mem.Allocator) !void {
     }) |key| {
         try h.command("noremap <" ++ key ++ "> <Cmd>call add(g:gd_seen, '" ++ key ++ "')<CR>");
     }
+    try settle(h, alloc);
 
     click(h, "x1", "", g, 0, 0);
     mouse(h,"x2", "press", "", g, 0, 0);
@@ -767,6 +807,7 @@ pub fn runMouseKeycodeMappings(alloc: std.mem.Allocator) !void {
     mouse(h,"x2", "release", "", g, 0, 3);
     click(h, "middle", "", g, 0, 0);
     try h.command("set mousemodel=extend");
+    try settle(h, alloc);
     mouse(h,"right", "press", "", g, 1, 0);
     mouse(h,"right", "drag", "", g, 1, 3);
     mouse(h,"right", "release", "", g, 1, 3);
@@ -796,6 +837,7 @@ pub fn runMouseDocExamples(alloc: std.mem.Allocator) !void {
     // :map <X1Mouse> <C-O> / :map <X2Mouse> <C-I>
     try h.command("map <X1Mouse> <C-O>");
     try h.command("map <X2Mouse> <C-I>");
+    try settle(h, alloc);
     try h.input("gg");
     try h.input("G");
     try h.waitCursor(2, 0, wait_ms);
@@ -806,6 +848,7 @@ pub fn runMouseDocExamples(alloc: std.mem.Allocator) !void {
 
     // :noremap <LeftRelease> <LeftRelease>y
     try h.command("noremap <LeftRelease> <LeftRelease>y");
+    try settle(h, alloc);
     mouse(h,"left", "press", "", g, 1, 0);
     mouse(h,"left", "drag", "", g, 1, 4);
     mouse(h,"left", "release", "", g, 1, 4);
@@ -815,12 +858,14 @@ pub fn runMouseDocExamples(alloc: std.mem.Allocator) !void {
     // :noremap <MiddleMouse> <LeftMouse><MiddleMouse>
     try h.setClipboard("PASTED");
     try h.command("noremap <MiddleMouse> <LeftMouse><MiddleMouse>");
+    try settle(h, alloc);
     click(h, "middle", "", g, 2, 0);
     try h.waitRowText(g, 2, "PASTEDzeta", wait_ms);
 
     // Swapped left and right buttons, the first line of the doc's block.
     try h.command("set mousemodel=extend");
     try h.command("noremap <RightMouse> <LeftMouse>");
+    try settle(h, alloc);
     click(h, "right", "", g, 0, 6);
     try h.waitCursor(0, 6, wait_ms);
 }
@@ -871,6 +916,7 @@ pub fn runPopupCommand(alloc: std.mem.Allocator) !void {
     _ = try mouseBuffer(h);
     try h.command("amenu ]GdHidden.First\\ Entry <Cmd>let g:gd_popup = 'first'<CR>");
     try h.command("amenu ]GdHidden.Second\\ Entry <Cmd>let g:gd_popup = 'second'<CR>");
+    try settle(h, alloc);
     try h.input(":popup ]GdHidden<CR>");
     try waitScreen(h, "Second Entry");
     try h.input("<Down><Down><CR>");
