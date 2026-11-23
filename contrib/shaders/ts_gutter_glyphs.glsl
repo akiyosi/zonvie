@@ -16,7 +16,8 @@
 // `:set signcolumn=yes` keeps the gutter from appearing and disappearing.
 //
 // @zonvie-hl-groups: ZonvieTsSignFn ZonvieTsSignClass ZonvieTsSignLoop ZonvieTsSignBranch ZonvieTsSignExit
-// @zonvie-hl-groups: ZonvieTsFnHead ZonvieTsFnCursor
+// @zonvie-hl-groups: ZonvieTsFnHead ZonvieTsFnB0 ZonvieTsFnB1 ZonvieTsFnB2 ZonvieTsFnB3 ZonvieTsFnB4 ZonvieTsFnB5
+// @zonvie-hl-groups: ZonvieTsCursorBuf
 
 const uint SIGN_FN = 1u;
 const uint SIGN_CLASS = 2u;
@@ -25,7 +26,8 @@ const uint SIGN_BRANCH = 8u;
 const uint SIGN_EXIT = 16u;
 const uint SIGN_ANY = 31u;
 const uint FN_HEAD = 32u; // a function's first line, from the function rightward
-const uint FN_CURSOR = 64u; // cells of the function holding the cursor
+const int FN_ID_SHIFT = 6; // bits 6..11: id of the function the cell is in, 0 = none
+const uint CURSOR_BUF = 4096u; // the cell is in the buffer holding the cursor
 
 // ---- tuning ----
 const vec3 ACCENT_ON_DARK = vec3(0.47, 0.76, 1.00);
@@ -52,15 +54,25 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at it or within 16 cells right of it:
-// far enough for an indent, short of a window beside this one.
-bool tsRowHas(ivec2 c, uint bits) {
-    uint g = 0u;
+// Whether a cell with mask `g` is in the function holding the cursor, or
+// in one of the (up to four) functions nested in it.
+bool tsInCursorFn(uint g) {
+    uint f = (g >> uint(FN_ID_SHIFT)) & 63u;
+    uint c = uint(iTsCursorFn + 0.5);
+    if (f == 0u || c == 0u || (g & CURSOR_BUF) == 0u) return false;
+    uint n = uint(iTsCursorNested + 0.5);
+    return f == c || f == (n & 63u) || f == ((n >> 6) & 63u) || f == ((n >> 12) & 63u) || f == ((n >> 18) & 63u);
+}
+
+// Whether the row of `c` is in the cursor's function at it or within 16
+// cells right of it: far enough for an indent, short of a window beside
+// this one.
+bool tsRowInCursorFn(ivec2 c) {
     for (int i = 0; i < 6; ++i) {
         int dx = i == 0 ? 0 : (1 << (i - 1));
-        g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
+        if (tsInCursorFn(zonvieCellGroupsAt(c + ivec2(dx, 0)))) return true;
     }
-    return (g & bits) != 0u;
+    return false;
 }
 
 // ---- icons: distance in px from p to the icon's strokes; u is half its box ----
@@ -155,7 +167,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
         // The row's text cells say whether it lies in the cursor's function.
         ivec2 text_cell = cell + ivec2(right_cell ? 1 : 2, 0);
-        bool here = tsRowHas(text_cell, FN_CURSOR);
+        bool here = tsRowInCursorFn(text_cell);
         vec3 ink = here ? accent : mix(bg, iForegroundColor, ICON_ALPHA);
         float cov = clamp(0.5 * STROKE_PT * scale + 0.5 - d, 0.0, 1.0);
         col = mix(col, ink, cov);
@@ -163,7 +175,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     if ((groups & FN_HEAD) != 0u) {
         float paper = 1.0 - tsInk(base.rgb, cell);
-        bool here = (groups & FN_CURSOR) != 0u;
+        bool here = tsInCursorFn(groups);
         if (here) col += (mix(bg, accent, HEAD_TINT) - bg) * paper;
         // A hairline along the top of the function's first line.
         if ((zonvieCellGroupsAt(cell - ivec2(0, 1)) & FN_HEAD) == 0u) {

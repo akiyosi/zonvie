@@ -126,6 +126,10 @@ pub const Highlights = struct {
     /// grid_line uses it, so no row sent so far carries it, and the rows that
     /// will are sent dirty.
     defined_ids_regrouped: bool = false,
+    /// Lowest id that got names with its first definition since this was
+    /// last reset (maxInt = none). A table indexed by id that is already
+    /// longer than this cannot be brought up to date by appending.
+    first_named_min: u32 = std.math.maxInt(u32),
     default_colors_changed: bool = false,
 
     pub fn init(alloc: std.mem.Allocator) Highlights {
@@ -234,7 +238,11 @@ pub const Highlights = struct {
             self.alloc.free(old);
             self.attr_names.putAssumeCapacity(id, fresh);
             self.groups_changed = true;
-            if (self.map.contains(id)) self.defined_ids_regrouped = true;
+            if (self.map.contains(id)) {
+                self.defined_ids_regrouped = true;
+            } else {
+                self.first_named_min = @min(self.first_named_min, id);
+            }
         }
 
         self.publish(id, a);

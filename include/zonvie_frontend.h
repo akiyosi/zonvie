@@ -896,7 +896,10 @@ ZONVIE_API bool zonvie_core_shader_uses_cell_text(const char *source, size_t len
    lists the markers), which defines those groups and places them from each
    buffer's syntax tree; a declaration without any tears the layer down. Its
    state lives in the Lua global `zonvie_shader_ts`, the augroup
-   `ZonvieShaderTs` and the namespaces `zonvie_shader_ts_*`.
+   `ZonvieShaderTs` and the namespaces `zonvie_shader_ts_*`. The layer
+   reports the ids of the function and scope holding the cursor with the
+   `zonvie_ts_cursor` notification; zonvie_shader_fill_colors hands them to
+   the shader, and a change has every surface drawn again.
    Same thread rules as zonvie_core_set_shader_inputs_enabled: not
    from inside a core callback. */
 ZONVIE_API void zonvie_core_set_shader_hl_groups(zonvie_core *core, const char *source, size_t len);
@@ -1146,7 +1149,11 @@ typedef struct zonvie_shader_uniforms {
     float    iCurrentCursorColor[4];  /* 112..127 */
     float    iPreviousCursorColor[4]; /* 128..143 */
     float    iTimeCursorChange;       /* 144..147 */
-    float    _pad_cursor[3];          /* 148..159 — UBO size must be 16-aligned */
+    float    _pad_cursor[3];          /* 148..159 — UBO size must be 16-aligned.
+                                         The shader reads them as
+                                         iTsCursorFn, iTsCursorScope and
+                                         iTsCursorNested; written by
+                                         zonvie_shader_fill_colors */
     /* Zonvie edit-effect extensions. Appended after the Ghostty-compatible
        block so shaders compiled against the 160-byte layout keep reading the
        same offsets.

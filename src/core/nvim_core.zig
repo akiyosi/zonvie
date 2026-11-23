@@ -1269,6 +1269,15 @@ pub const Core = struct {
     // Columns one horizontal wheel event scrolls: the 'hor' component, from
     // the same reporter. Neovim's default is 6.
     mousescroll_hor: std.atomic.Value(u32) = std.atomic.Value(u32).init(6),
+    // The ids of the function and of the scope holding the cursor, as the
+    // Tree-sitter layer numbers them on its cells (shader_ts_layer.lua);
+    // 0 = none. From the RPC notification "zonvie_ts_cursor"; read by
+    // zonvie_shader_fill_colors on the frontend's render thread.
+    ts_cursor_fn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    ts_cursor_scope: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    // Ids of up to four functions nested in the cursor's function, six
+    // bits each: 24 bits, which a float uniform holds exactly.
+    ts_cursor_nested: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
@@ -5763,11 +5772,43 @@ pub const Core = struct {
         return if (hl_id < masks.len) masks[hl_id] else 0;
     }
 
+    /// Give the attr ids defined past the mask table their masks. Costs the
+    /// new ids, not the whole attribute table: nearly every redraw defines
+    /// some, and a marker scheme that numbers scopes defines many.
+    /// Pre: no id inside the table changed its groups (the caller rebuilds
+    /// in full otherwise). No cell shows an id past the table yet, so
+    /// nothing is resent.
+    fn extendShaderHlMasks(self: *Core) void {
+        const wanted: []const []const u8 = self.shader_hl_groups.items;
+        if (wanted.len == 0) return;
+        const old_len = self.shader_hl_masks.items.len;
+        var len: usize = old_len;
+        var kit = self.hl.map.keyIterator();
+        while (kit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        var nit = self.hl.attr_names.keyIterator();
+        while (nit.next()) |id| len = @max(len, @as(usize, id.*) + 1);
+        if (len == old_len) return;
+        self.shader_hl_masks.ensureTotalCapacity(self.alloc, len) catch {
+            self.rebuildShaderHlMasks();
+            return;
+        };
+        self.shader_hl_masks.appendNTimesAssumeCapacity(0, len - old_len);
+        const masks = self.shader_hl_masks.items;
+        var it = self.hl.attr_names.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.* >= old_len) masks[e.key_ptr.*] = hlGroupMask(e.value_ptr.*, wanted);
+        }
+    }
+
     /// Pre-flush, grid_mu held. Texels hold group masks and resolved
-    /// colours: a group change rebuilds the masks (which resend what they
-    /// change), and new default colours resend every surface's text.
-    pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool) void {
-        if (groups_changed) self.rebuildShaderHlMasks();
+    /// colours: a group change brings the masks up to date, and new default
+    /// colours resend every surface's text. `masks_stale`: an id the table
+    /// already covers changed its groups, so the table is rebuilt (which
+    /// resends what it changes); otherwise only new ids are appended.
+    pub fn refreshShaderTexelSources(self: *Core, groups_changed: bool, masks_stale: bool) void {
+        if (groups_changed) {
+            if (masks_stale) self.rebuildShaderHlMasks() else self.extendShaderHlMasks();
+        }
         if (self.hl.default_colors_changed and self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
         // Every flush: an attr redefinition or a mode change can recolour
         // the cursor without a cursor emission.
@@ -10411,13 +10452,13 @@ test "the Tree-sitter layer rides behind the unlink call while a marker is decla
     buf.clearRetainingCapacity();
 
     // A marker: the layer follows the unlink call, with the markers only.
-    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment ZonvieTsFnCursor ZonvieTsArg1\n");
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment ZonvieTsErrorRow ZonvieTsFnB0\n");
     try std.testing.expect(core.takeShaderHlUnlinkLocked(&buf));
     const layer_at = std.mem.indexOf(u8, buf.items, layer_head).?;
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\xa7Comment").? < layer_at);
     const tail = buf.items[layer_at + Core.shader_ts_layer_lua.len ..];
     try std.testing.expectEqualSlices(u8, &.{ 0x91, 0x92 }, tail[0..2]);
-    try std.testing.expectEqualStrings("\xb0ZonvieTsFnCursor\xacZonvieTsArg1", tail[2..]);
+    try std.testing.expectEqualStrings("\xb0ZonvieTsErrorRow\xacZonvieTsFnB0", tail[2..]);
     buf.clearRetainingCapacity();
 
     // The last marker dropped: one layer call with no names, then none.
@@ -10442,12 +10483,12 @@ test "a mask rebuild that changes an existing id marks every surface dirty" {
     core.grid.clearDirty();
     // A new id past the table is no change: no cell shows it yet.
     try core.hl.defineWithNames(2, .{}, &.{"@markup.quote"});
-    core.refreshShaderTexelSources(true);
+    core.refreshShaderTexelSources(true, true);
     try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(2));
     try std.testing.expect(!core.grid.main_buf.anyDirty());
     // `:colorscheme` relinks id 1: its cells must be resent.
     try core.hl.defineWithNames(1, .{}, &.{"@markup.quote"});
-    core.refreshShaderTexelSources(true);
+    core.refreshShaderTexelSources(true, true);
     try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(1));
     try std.testing.expect(core.grid.main_buf.anyDirty());
     // Dropping every declared group empties the table and resends.
@@ -10455,6 +10496,44 @@ test "a mask rebuild that changes an existing id marks every surface dirty" {
     core.setShaderHlGroupsLocked("void main() {}\n");
     try std.testing.expectEqual(@as(usize, 0), core.shader_hl_masks.items.len);
     try std.testing.expect(core.grid.main_buf.anyDirty());
+}
+
+test "attr ids defined past the mask table are appended without a rebuild, and agree with one" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 4);
+    core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
+    try core.hl.defineWithNames(1, .{}, &.{"Comment"});
+    core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment ZonvieTsFnB0 ZonvieTsFnB1\n");
+    try std.testing.expectEqual(@as(usize, 2), core.shader_hl_masks.items.len);
+    core.grid.clearDirty();
+    core.hl.groups_changed = false;
+    core.hl.first_named_min = std.math.maxInt(u32);
+
+    // New ids, as a redraw defines them: the table grows by them alone, and
+    // no cell is resent (none shows them yet).
+    try core.hl.defineWithNames(2, .{}, &.{ "Comment", "ZonvieTsFnB0" });
+    try core.hl.defineWithNames(5, .{}, &.{ "ZonvieTsFnB1", "ZonvieTsFnB0" });
+    try std.testing.expectEqual(@as(u32, 2), core.hl.first_named_min);
+    try std.testing.expect(!core.hl.defined_ids_regrouped);
+    core.refreshShaderTexelSources(true, false);
+    try std.testing.expectEqual(@as(usize, 6), core.shader_hl_masks.items.len);
+    try std.testing.expectEqual(@as(u32, 0b001), core.shaderHlMask(1));
+    try std.testing.expectEqual(@as(u32, 0b011), core.shaderHlMask(2));
+    try std.testing.expectEqual(@as(u32, 0), core.shaderHlMask(3));
+    try std.testing.expectEqual(@as(u32, 0b110), core.shaderHlMask(5));
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
+
+    // A full rebuild gives the same table.
+    var appended: [6]u32 = undefined;
+    @memcpy(&appended, core.shader_hl_masks.items);
+    core.rebuildShaderHlMasks();
+    try std.testing.expectEqualSlices(u32, &appended, core.shader_hl_masks.items);
+
+    // An id inside the table that gets its first names is not an append.
+    core.hl.first_named_min = std.math.maxInt(u32);
+    try core.hl.defineWithNames(3, .{}, &.{"Comment"});
+    try std.testing.expect(core.hl.first_named_min < core.shader_hl_masks.items.len);
 }
 
 test "a first declaration of groups resends cells already on screen" {
@@ -10481,12 +10560,12 @@ test "a nameless id later given a declared group resends its cells" {
     core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
     core.setShaderHlGroupsLocked("// @zonvie-hl-groups: Comment @markup.quote\n");
     try core.hl.defineWithNames(7, .{}, &.{});
-    core.refreshShaderTexelSources(true);
+    core.refreshShaderTexelSources(true, true);
     try std.testing.expectEqual(@as(u32, 0), core.shaderHlMask(7));
     core.grid.putCell(0, 0, 'q', 7);
     core.grid.clearDirty();
     try core.hl.defineWithNames(7, .{}, &.{"@markup.quote"});
-    core.refreshShaderTexelSources(true);
+    core.refreshShaderTexelSources(true, true);
     try std.testing.expectEqual(@as(u32, 0b10), core.shaderHlMask(7));
     try std.testing.expect(core.grid.main_buf.anyDirty());
 }
@@ -10497,10 +10576,10 @@ test "new default colours resend every surface's text only while cell text is on
     try core.grid.resizeGrid(1, 2, 4);
     core.grid.clearDirty();
     core.hl.setDefaults(0x111111, 0x222222, null);
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     try std.testing.expect(!core.grid.main_buf.anyDirty());
     core.setShaderInputsEnabledLocked(c_api.SHADER_INPUT_CELL_TEXT);
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     try std.testing.expect(core.grid.main_buf.anyDirty());
 }
 
@@ -10510,7 +10589,7 @@ test "with cursor attr 0 the shader colours swap the defaults" {
     core.hl.setDefaults(0x112233, 0x445566, null);
     core.hl.default_colors_changed = false; // published regardless
     core.grid.cursor_attr_id = 0;
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     const s = core.shader_colors.read();
     try std.testing.expectEqual(@as(u32, 0x112233), s.default_fg);
     try std.testing.expectEqual(@as(u32, 0x445566), s.default_bg);
@@ -10537,7 +10616,7 @@ test "a redefined cursor attr is republished by the next flush without a cursor 
     core.grid.cursor_attr_id = 7;
     core.publishShaderColors();
     try core.hl.define(7, 0xAA0000, 0x0000CC, null, false, 0, .{}, false);
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     try std.testing.expectEqual(@as(u32, 0x0000CC), core.shader_colors.read().cursor);
 }
 
@@ -10546,11 +10625,11 @@ test "a mode change of the cursor attr is republished by the next flush" {
     defer core.deinitForTest();
     core.hl.setDefaults(0x112233, 0x445566, null);
     try core.hl.define(9, 0x010101, 0x020202, null, false, 0, .{}, false);
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     try std.testing.expectEqual(@as(u32, 0x112233), core.shader_colors.read().cursor);
     // What applyModeInfo does on mode_change / mode_info_set.
     core.grid.cursor_attr_id = 9;
-    core.refreshShaderTexelSources(false);
+    core.refreshShaderTexelSources(false, false);
     try std.testing.expectEqual(@as(u32, 0x020202), core.shader_colors.read().cursor);
     try std.testing.expectEqual(@as(u32, 0x010101), core.shader_colors.read().cursor_text);
 }

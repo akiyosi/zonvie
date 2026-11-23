@@ -1983,10 +1983,16 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     // vertex generation so the flush that terminates this redraw batch carries
     // the new glow state.
     const groups_changed = self.hl.groups_changed;
+    // The shader masks are rebuilt in full only when an id that cells may
+    // already show changed its groups, or a first definition landed inside
+    // the table; ids defined past it are appended.
+    var masks_stale = false;
     if (self.hl.groups_changed) {
         self.hl.groups_changed = false;
         const regrouped = self.hl.defined_ids_regrouped;
         self.hl.defined_ids_regrouped = false;
+        masks_stale = regrouped or self.hl.first_named_min < self.shader_hl_masks.items.len;
+        self.hl.first_named_min = std.math.maxInt(u32);
         const was_enabled = self.glow_enabled.load(.acquire);
         self.resolveGlowGroups();
         // The rows already generated are stale only when a cell they hold
@@ -1998,7 +2004,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
             self.cursor_owner.force_recheck = true;
         }
     }
-    self.refreshShaderTexelSources(groups_changed);
+    self.refreshShaderTexelSources(groups_changed, masks_stale);
 
     // Promote an external editor grid before the frontend transaction. A
     // successful flush must represent the final composition state of the
@@ -2351,6 +2357,33 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             const v = params[1].int;
             const clamped: u32 = if (v <= 0) 0 else if (v > 256) 256 else @intCast(v);
             self.mousescroll_hor.store(clamped, .release);
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_ts_cursor")) {
+        // The Tree-sitter layer's cursor: [function id, scope id, nested],
+        // ids 0..63 with 0 = none, `nested` the ids of up to four functions
+        // inside that function, six bits each. Shaders get them as uniforms
+        // and compare them with the ids on their cells, so no cell changes
+        // with them.
+        if (params.len > 1 and params[0] == .int and params[1] == .int) {
+            const fn_id: u32 = if (params[0].int < 0 or params[0].int > 63) 0 else @intCast(params[0].int);
+            const scope_id: u32 = if (params[1].int < 0 or params[1].int > 63) 0 else @intCast(params[1].int);
+            const nested: u32 = if (params.len > 2 and params[2] == .int and params[2].int >= 0 and params[2].int < (1 << 24))
+                @intCast(params[2].int)
+            else
+                0;
+            const fn_was = self.ts_cursor_fn.swap(fn_id, .acq_rel);
+            const scope_was = self.ts_cursor_scope.swap(scope_id, .acq_rel);
+            const nested_was = self.ts_cursor_nested.swap(nested, .acq_rel);
+            if (fn_was != fn_id or scope_was != scope_id or nested_was != nested) {
+                // No cell changes with these ids, so nothing else would
+                // have a surface drawn again: a shader that is not animated
+                // would keep its old picture, and so would a window the
+                // cursor is not in. The flush that follows the cursor's
+                // move delivers the rows.
+                self.grid_mu.lockUncancelable(clock.io());
+                if (self.grid.cell_text_enabled) self.grid.markEverySurfaceDirty();
+                self.grid_mu.unlock(clock.io());
+            }
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
