@@ -69,9 +69,9 @@ local CLASS = words([[
 ]])
 local LOOP = words([[
   for_statement for_in_statement for_of_statement for_numeric_statement
-  for_generic_statement for_expression for_range_loop foreach_statement
-  while_statement while_expression repeat_statement do_statement
-  do_while_statement loop_expression
+  for_generic_statement for_expression for_range_loop for_loop
+  foreach_statement while_statement while_expression while_loop
+  repeat_statement do_statement do_while_statement loop_expression
 ]])
 local BRANCH = words([[
   if_statement if_expression switch_statement switch_expression
@@ -123,7 +123,13 @@ end
 local function scope_kind(node)
   if not node:named() then return nil end
   local t = node:type()
-  if FN[t] then return 'Fn' end
+  if FN[t] then
+    -- A function's signature can be a node of a function type itself
+    -- (Vim script: function_definition > function_declaration).
+    local p = node:parent()
+    if p and FN[p:type()] and #node:field('body') == 0 then return nil end
+    return 'Fn'
+  end
   if CLASS[t] then return 'Class' end
   if LOOP[t] then return 'Loop' end
   if BRANCH[t] then
@@ -249,8 +255,21 @@ local function param_ident(n)
   return nil
 end
 
+--- The node holding a function's name and parameters: the function, or
+--- its signature child where the grammar has one.
+local function signature_of(func)
+  for _, f in ipairs({ 'parameters', 'parameter', 'name', 'declarator' }) do
+    if #func:field(f) > 0 then return func end
+  end
+  for c in func:iter_children() do
+    if c:named() and FN[c:type()] and #c:field('body') == 0 then return c end
+  end
+  return func
+end
+
 --- The identifiers of a function's parameters, in order.
 local function params_of(func)
+  func = signature_of(func)
   local list = func:field('parameters')[1]
   if not list then
     local single = func:field('parameter')[1]
@@ -277,6 +296,7 @@ end
 
 --- The node naming a function definition, or nil.
 local function name_of(func)
+  func = signature_of(func)
   local n = func:field('name')[1]
   if n then return n end
   local d = func:field('declarator')[1]
@@ -438,16 +458,26 @@ local function cursor_marks(buf, win, st, parser)
     end
   end
 
-  local func, scope, call_args, call_arg
+  local func, scope, call_span, call_arg
   local prev = nil
   local n = node
   while n do
     local t = n:type()
-    if not call_args and prev and ARGS[t] then
+    if not call_span and prev and ARGS[t] then
       local p = n:parent()
       if p and CALL[p:type()] then
-        call_args = n
+        call_span = { n:range() }
         if prev:named() then call_arg = prev end
+      end
+    elseif not call_span and prev and prev:named() and CALL[t] and #n:field('arguments') == 0 then
+      -- A call whose arguments are its own children (Vim script): the
+      -- list runs from the end of the callee to the end of the call.
+      local callee = n:field('function')[1] or n:field('name')[1]
+      if callee and not callee:equal(prev) and not ARGS[prev:type()] then
+        local _, _, cr, cc = callee:range()
+        local _, _, er, ec = n:range()
+        call_span = { cr, cc, er, ec }
+        call_arg = prev
       end
     end
     local kind = scope_kind(n)
@@ -463,9 +493,8 @@ local function cursor_marks(buf, win, st, parser)
     n = n:parent()
   end
 
-  if want.ZonvieTsCallCursor and call_args then
-    local sr, sc, er, ec = call_args:range()
-    put(sr, sc, { end_row = er, end_col = ec, hl_group = 'ZonvieTsCallCursor' })
+  if want.ZonvieTsCallCursor and call_span then
+    put(call_span[1], call_span[2], { end_row = call_span[3], end_col = call_span[4], hl_group = 'ZonvieTsCallCursor' })
   end
   if want.ZonvieTsCallArg and call_arg then
     local sr, sc, er, ec = call_arg:range()

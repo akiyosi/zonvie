@@ -114,4 +114,36 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }.check, h.opts.timeout_ms);
     try expectMask(h, g, 1, 21, depth_b0 | param);
     try expectMask(h, g, 4, 2, depth_b1);
+
+    // A second grammar, and a buffer no Tree-sitter highlighter runs on:
+    // C names its nodes differently (parameters hang off a declarator, the
+    // braces are rows of their own) and gets the same markers.
+    //  0  int sum(const int *items, int count)
+    //  1  {
+    //  2      int total = 0;
+    //  3      for (int i = 0; i < count; i++) {
+    //  4          total += items[i];
+    //  5      }
+    //  6      return total;
+    //  7  }
+    try h.command(
+        \\lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'int sum(const int *items, int count)', '{', '    int total = 0;', '    for (int i = 0; i < count; i++) {', '        total += items[i];', '    }', '    return total;', '}' }) vim.bo.filetype = 'c'
+    );
+    try h.command("normal! 5G");
+    try h.waitUntil(g, struct {
+        fn check(grid: i64, hh: *Harness) bool {
+            return maskAt(hh, grid, 4, 8 + sign_cols) == (fn_cursor | depth_b1);
+        }
+    }.check, h.opts.timeout_ms);
+    try expectMask(h, g, 4, 0, fn_cursor | depth_b0);
+    try expectMask(h, g, 4, 17, fn_cursor | depth_b1 | arg1);
+    try expectMask(h, g, 0, 19, fn_cursor | param | arg1);
+    try expectMask(h, g, 0, 30, fn_cursor | param);
+    try expectMask(h, g, 1, 0, fn_cursor | depth_b0);
+    try expectMask(h, g, 7, 0, fn_cursor);
+    try h.waitUntil(g, struct {
+        fn check(grid: i64, hh: *Harness) bool {
+            return maskAt(hh, grid, 0, 0) == sign_fn;
+        }
+    }.check, h.opts.timeout_ms);
 }

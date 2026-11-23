@@ -123,8 +123,13 @@ of the reading research behind them:
 ## Limits
 
 - Constructs are recognised by node type across the common grammars (the
-  tables at the top of `shader_ts_layer.lua`). A grammar that names its
-  nodes differently gets fewer markers until its types are added.
+  tables at the top of `shader_ts_layer.lua`). The layer has been run on
+  Lua, C and Vim script, the grammars Neovim bundles; the entries for other
+  languages are written from their grammars and not yet exercised. A
+  grammar that names its nodes differently gets fewer markers until its
+  types are added.
+- The samples have been run on macOS, on dark and light backgrounds. For
+  Windows and Linux they are only known to compile (HLSL, GLSL 3.3).
 - Parameter uses are matched by name inside the function. A nested
   function's own parameter of the same name is left out; a local variable
   that reuses the name is not.
@@ -142,9 +147,11 @@ of the reading research behind them:
 ## Checking
 
 ```bash
-zig build e2e -Dtest-filter=shader_ts_layer              # markers reach the cell masks, real Neovim
+zig build e2e -Dtest-filter=shader_ts_layer              # markers reach the cell masks, real Neovim (Lua, C)
 zig build test -Dtest-filter="sample shaders"            # the samples compile to MSL, HLSL and GLSL 3.3
 zig build gui-test -Dtest-filter=visual_ts_shader_samples # the samples draw in the real app
 ```
 
-The last one writes a capture of each sample to `tmp/ts_shader_samples/`.
+The last one shows each sample a Lua and a C buffer on a dark and a light
+background, compares every view against the same view without markers, and
+writes the captures to `tmp/ts_shader_samples/`.
