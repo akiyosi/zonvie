@@ -28,13 +28,18 @@ const Sample = struct {
     min_changed: f64,
     /// Whether the views get a syntax error to show.
     breaks_syntax: bool = false,
+    /// Accent-coloured pixels the markers must add: what the sample draws
+    /// on the function or scope holding the cursor (a frame, icons, a
+    /// rail). A sample that marks every function alike draws none, however
+    /// many pixels it changes.
+    min_accent_px: usize = 0,
 };
 
 const samples = [_]Sample{
-    .{ .name = "ts_spotlight", .config_dir = "test/gui/fixtures/config_ts_spotlight", .min_changed = 0.008 },
-    .{ .name = "ts_threads", .config_dir = "test/gui/fixtures/config_ts_threads", .min_changed = 0.002 },
-    .{ .name = "ts_gutter_glyphs", .config_dir = "test/gui/fixtures/config_ts_gutter_glyphs", .min_changed = 0.008 },
-    .{ .name = "ts_strata", .config_dir = "test/gui/fixtures/config_ts_strata", .min_changed = 0.15 },
+    .{ .name = "ts_spotlight", .config_dir = "test/gui/fixtures/config_ts_spotlight", .min_changed = 0.008, .min_accent_px = 2000 },
+    .{ .name = "ts_threads", .config_dir = "test/gui/fixtures/config_ts_threads", .min_changed = 0.004 },
+    .{ .name = "ts_gutter_glyphs", .config_dir = "test/gui/fixtures/config_ts_gutter_glyphs", .min_changed = 0.008, .min_accent_px = 300 },
+    .{ .name = "ts_strata", .config_dir = "test/gui/fixtures/config_ts_strata", .min_changed = 0.15, .min_accent_px = 300 },
     // One broken token: a zigzag, a halo and a tick, about a thousandth of
     // the window. What it must add is red (see runSample).
     .{ .name = "ts_faultline", .config_dir = "test/gui/fixtures/config_ts_faultline", .min_changed = 0.0006, .breaks_syntax = true },
@@ -102,6 +107,18 @@ fn redPixels(img: Image) usize {
     return n;
 }
 
+/// Pixels in the accent's blue (dark theme) or deep blue (light theme).
+fn accentPixels(img: Image) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < img.rgba.len) : (i += 4) {
+        const r: u16 = img.rgba[i];
+        const b: u16 = img.rgba[i + 2];
+        if (b > r + 60) n += 1;
+    }
+    return n;
+}
+
 fn show(g: *driver.Gui, sample: Sample, buffer: Buffer, background: []const u8) !void {
     var expr_buf: [64]u8 = undefined;
     try g.exec(buffer.open);
@@ -164,6 +181,12 @@ fn runSample(alloc: std.mem.Allocator, sample: Sample) !void {
             if (changed < sample.min_changed) {
                 std.debug.print("[gui] {s} drew too little from its markers (want {d:.4})\n", .{ sample.name, sample.min_changed });
                 return error.SampleShaderInert;
+            }
+            if (sample.min_accent_px > 0) {
+                const with = accentPixels(marked);
+                const without = accentPixels(plain);
+                std.debug.print("[gui] {s} {s} {s}: accent pixels {d} with markers, {d} without\n", .{ sample.name, buffer.tag, background, with, without });
+                if (with < without + sample.min_accent_px) return error.CursorScopeNotMarked;
             }
             if (sample.breaks_syntax) {
                 const red_with = redPixels(marked);

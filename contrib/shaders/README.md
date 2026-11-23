@@ -38,7 +38,8 @@ colours for dark and light themes, durations.
 1. A shader declares the highlight groups it wants to read:
 
    ```glsl
-   // @zonvie-hl-groups: ZonvieTsFnCursor ZonvieTsFn ZonvieTsFnName
+   // @zonvie-hl-groups: ZonvieTsFnB0 ZonvieTsFnB1 ZonvieTsFnB2 ZonvieTsFnB3 ZonvieTsFnB4 ZonvieTsFnB5
+   // @zonvie-hl-groups: ZonvieTsCursorBuf ZonvieTsFnName
    ```
 
 2. Names starting with `ZonvieTs` are markers. While a loaded shader
@@ -48,41 +49,55 @@ colours for dark and light themes, durations.
    only a cterm colour, so it changes nothing an RGB UI draws, and no
    colorscheme needs to know about it.
 
-3. The shader reads the markers per cell, next to the cell's character and
-   colours:
+3. The markers say what a cell *is*, never where the cursor is: which
+   function and scope it belongs to (as small numbers, a few marker bits
+   each), how deep it is nested, whether it is a parameter. They are placed
+   once and follow edits, so moving the cursor resends no text.
+
+4. Where the cursor is arrives separately, as three uniforms:
+
+   | Uniform | Value |
+   |---|---|
+   | `iTsCursorFn` | id of the innermost function holding the cursor, 0 = none |
+   | `iTsCursorScope` | id of the innermost multi-line scope holding it, 0 = none |
+   | `iTsCursorNested` | ids of up to four functions nested in that function, 6 bits each |
+
+   The shader compares them with the ids on the cell it shades:
 
    ```glsl
-   bool in_cursor_fn = zonvieCellHasGroup(fragCoord, 0); // the first declared name
+   uint g = zonvieCellGroupsAt(cell);              // bit i = the i-th declared name
+   bool here = (g & 63u) == uint(iTsCursorFn + 0.5) // same function id ...
+       && (g & 64u) != 0u;                          // ... in the cursor's buffer
    ```
 
 Removing the shader, or declaring no marker, tears the layer down.
 
 ## Markers
 
-Placed for the visible rows, redrawn with the text:
+On the cells of scopes (functions, classes, loops and branches that span
+several lines). A scope covers its rows from its first line's indent to the
+window's right edge; where scopes nest, a cell belongs to the innermost one.
 
 | Name | Cells |
 |---|---|
-| `ZonvieTsFn` | a function, from its line's indent to the window's right edge |
-| `ZonvieTsFnOther` | the same cells, in every window, of the functions other than the one holding the cursor; none while the cursor is outside every function |
+| `ZonvieTsFnB0` .. `B5` | id of the function the cell is in, a 6-bit number, 0 = none |
+| `ZonvieTsScopeB0` .. `B5` | id of the cell's scope, 0 = none |
+| `ZonvieTsDepthB0` `B1` `B2` | the cell's nesting depth, 0 to 7 |
+
+Ids are 1 to 63, per buffer. Scopes within 400 rows of each other get
+different ids, and a scope keeps its id while the text around it is edited.
+
+On tokens and rows:
+
+| Name | Cells |
+|---|---|
 | `ZonvieTsFnHead` | a function's first line, from the function rightward |
 | `ZonvieTsFnName` | the name in a function definition |
 | `ZonvieTsParam` | a parameter name in a function definition |
+| `ZonvieTsParamB0` `B1` `B2` | on a parameter's name, where it is declared and where its function's body uses it: its position, 1 to 7 (cycling) |
 | `ZonvieTsExit` | a `return`, `break`, `continue`, `throw` or `goto` statement |
 | `ZonvieTsError` | an `ERROR` or `MISSING` node (the first line of one spanning several) |
 | `ZonvieTsErrorRow` | one blank cell at the window's right edge, on each row that has such a node |
-| `ZonvieTsDepthB0` `B1` `B2` | the cell's nesting depth as a 3-bit number, 0 to 7 |
-
-Following the cursor of the current window:
-
-| Name | Cells |
-|---|---|
-| `ZonvieTsFnCursor` | the innermost function holding the cursor |
-| `ZonvieTsScopeCursor` | the innermost multi-line scope holding the cursor |
-| `ZonvieTsArg1` .. `ZonvieTsArg6` | parameter i of that function (cycling past six), declared and used |
-| `ZonvieTsRef` | the identifier under the cursor, wherever that function names it |
-| `ZonvieTsCallCursor` | the argument list holding the cursor |
-| `ZonvieTsCallArg` | the argument holding the cursor |
 
 On blank sign-column cells of a construct's first row:
 
@@ -91,13 +106,24 @@ On blank sign-column cells of a construct's first row:
 | `ZonvieTsSignFn` `ZonvieTsSignClass` `ZonvieTsSignLoop` `ZonvieTsSignBranch` | where a multi-line function, class, loop or branch starts |
 | `ZonvieTsSignExit` | an exit statement, on a row no construct starts on |
 
+Following the cursor of the current window (a few cells each, apart from
+the first):
+
+| Name | Cells |
+|---|---|
+| `ZonvieTsCursorBuf` | every cell of the buffer the cursor is in: ids are per buffer, so this says which buffer the cursor uniforms speak of |
+| `ZonvieTsRef` | the identifier under the cursor, wherever its function names it |
+| `ZonvieTsCallCursor` | the argument list holding the cursor |
+| `ZonvieTsCallArg` | the argument holding the cursor |
+
 Depth is per cell, not per row: scope k of a row covers the cells from the
 column of its first line rightward, so a shader can draw nested blocks.
 Blank lines inside a scope carry the same steps.
 
 Raw Tree-sitter captures (`@keyword.return`, `@markup.heading.1`, ...) and
 ordinary groups (`Comment`, `DiagnosticUnderlineError`) can be declared in
-the same line and need no layer.
+the same line and need no layer. At most 32 names are read across the
+shader chain.
 
 ### Several windows
 
@@ -105,15 +131,16 @@ A shader runs once per surface: the main window with all its splits, and
 each external window. The cursor's rect is one value handed to all of them,
 so in a window that does not hold the cursor it lands on unrelated cells. A
 shader that should look the same in every window therefore reads what to
-draw from the markers of the cells it shades, and uses the cursor only to
-time an animation:
+draw from the cells it shades and from the cursor uniforms, and uses the
+cursor's rect only to time an animation:
 
-- The cursor markers live in the current window's buffer. Every window
-  showing that buffer carries them, split or external; a buffer left behind
-  in another window keeps none.
-- What depends on the cursor but must show in other buffers is a marker of
-  its own: `ZonvieTsFnOther` is placed in every window while a function
-  holds the cursor.
+- The cursor uniforms are the same on every surface, and every window
+  showing the cursor's buffer carries `ZonvieTsCursorBuf`, split or
+  external. A cell in another buffer may carry the same id by chance; the
+  marker tells them apart.
+- "Some function holds the cursor" is `iTsCursorFn > 0.5`, whatever buffer
+  the shaded cell is in: `ts_spotlight` dims the functions of every window
+  with it.
 - A marker that needs a window's edge is placed there by the layer
   (`ZonvieTsErrorRow`), not searched for along the row: in a split, the
   cells further along a row belong to the next window.
@@ -151,11 +178,15 @@ of the reading research behind them:
   types are added.
 - The samples have been run on macOS, on dark and light backgrounds. For
   Windows and Linux they are only known to compile (HLSL, GLSL 3.3).
-- Parameter uses are matched by name inside the function. A nested
-  function's own parameter of the same name is left out; a local variable
-  that reuses the name is not.
-- The cursor markers are per buffer and follow the current window: two
-  windows on one buffer show the same spotlight.
+- Ids are 6 bits. Two scopes more than 400 rows apart can share one, so two
+  windows showing distant parts of one buffer can both light a function.
+  A function holding more than four nested functions lights the first four
+  with it.
+- Parameter positions are marked in the function's own body. A use inside
+  a nested function is not marked; a local variable that reuses the name
+  is.
+- The cursor uniforms follow the current window: two windows on one buffer
+  show the same spotlight.
 - External windows have been run as `nvim_open_win(..., { external = true })`.
   `--extwindows` takes the same surface path but has not been run: it needs
   a Neovim that accepts the `ext_windows` UI option.
@@ -164,10 +195,15 @@ of the reading research behind them:
   can pick up its neighbour's answer.
 - A shader that names `iTime` is redrawn every frame. Four of the five do,
   for their entry animations; `ts_gutter_glyphs` does not.
-- The layer's cost, measured on a 1656-line Lua file with every marker
-  declared: 1.9 ms to compute the markers of 60 visible rows (once per edit
-  or scroll), 0.1 to 0.5 ms per cursor move. Signs are placed for the rows
-  around the windows only.
+- Marks follow an edit one redraw after the edit itself: typed text is not
+  held back, and a line whose structure just changed shows its old marks
+  for that one frame.
+- Cost, measured through the core with a real Neovim on a large Lua
+  file, Neovim's own `lsp.lua` (key to first flush, release build): scrolling, cursor moves and
+  typing stay within 0.1 to 0.6 ms of running no layer with one sample
+  declared. Every combination of syntax colour and marker bits on screen is
+  an attribute id Neovim defines once; paging through new text with all 32
+  names declared defines thousands and costs 3 to 4 ms a page.
 - A buffer over 20,000 lines is left alone unless Tree-sitter highlighting
   already keeps its tree.
 

@@ -299,6 +299,16 @@ fn externals(alloc: std.mem.Allocator, sample: Sample) !void {
     // from the same markers.
     try expectDrawn(sample.name, "external: main window (same buffer)", changed(main_img, main_plain, 0.0, 1.0), true);
     try expectDrawn(sample.name, "external: other window (C)", changed(c_img, c_plain, 0.0, 1.0), sample.other_buffer_draws);
+    if (std.mem.eql(u8, sample.name, "ts_gutter_glyphs")) {
+        // The cursor moved in another window and no cell of the main window
+        // changed, yet the main window must be drawn again: its icons for
+        // the cursor's function take the accent. This sample does not
+        // animate, so nothing else would redraw it.
+        const sign_px = 32.0 / @as(f64, @floatFromInt(main_img.w));
+        const main_accent = count(main_img, 0.0, sign_px, isBlue);
+        std.debug.print("[gui] ts_gutter_glyphs external: accent pixels in the main window's gutter: {d}\n", .{main_accent});
+        if (main_accent < 100) return error.MainWindowNotRedrawn;
+    }
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {

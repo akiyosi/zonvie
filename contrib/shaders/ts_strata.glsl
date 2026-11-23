@@ -11,13 +11,21 @@
 // Depth here is syntactic (Tree-sitter scopes), not indentation: a wrapped
 // argument list does not make a plate, a one-line `if` does not either.
 //
+// Every cell carries its depth and the id of its scope, all the time;
+// which scope gets the rail is decided here, by comparing that id with the
+// cursor's. Moving the cursor changes no cell.
+//
 // Needs Zonvie's Tree-sitter layer (it starts by itself when a shader
 // declares ZonvieTs* groups) and a Tree-sitter parser for the buffer.
 //
-// @zonvie-hl-groups: ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsDepthB2 ZonvieTsScopeCursor
+// @zonvie-hl-groups: ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsDepthB2
+// @zonvie-hl-groups: ZonvieTsScopeB0 ZonvieTsScopeB1 ZonvieTsScopeB2 ZonvieTsScopeB3 ZonvieTsScopeB4 ZonvieTsScopeB5
+// @zonvie-hl-groups: ZonvieTsCursorBuf
 
 const uint DEPTH = 7u; // bits 0..2: the cell's nesting depth, 0..7
-const uint SCOPE = 8u; // cells of the innermost multi-line scope holding the cursor
+const int SCOPE_ID_SHIFT = 3; // bits 3..8: id of the cell's innermost scope, 0 = none
+const uint SCOPE_ID = 504u; // those six bits
+const uint CURSOR_BUF = 512u; // the cell is in the buffer holding the cursor
 
 // ---- tuning ----
 const float STEP = 0.022; // each level moves the background this far toward the text colour
@@ -30,7 +38,6 @@ const vec3 ACCENT_ON_DARK = vec3(0.47, 0.76, 1.00);
 const vec3 ACCENT_ON_LIGHT = vec3(0.04, 0.36, 0.78);
 const float RAIL_PT = 1.5; // the rail down the cursor scope's left edge
 const float RAIL_ALPHA = 0.90;
-const float SCOPE_RIM_ALPHA = 0.26; // the rest of that scope's outline
 const float SWEEP_S = 0.30; // the rail is drawn over this long
 const float SWEEP_PT_PER_S = 1400.0;
 
@@ -55,16 +62,23 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at it or within 16 cells right of it:
-// far enough for an indent, short of a window beside this one. A box starts at its
-// scope's indent, so a cursor left of that (a blank line) is still in it.
-bool tsRowHas(ivec2 c, uint bits) {
-    uint g = 0u;
+// Whether a cell with mask `g` belongs to the innermost scope holding the
+// cursor. Scopes nested in it have ids of their own.
+bool tsInCursorScope(uint g) {
+    uint id = (g & SCOPE_ID) >> uint(SCOPE_ID_SHIFT);
+    return id != 0u && (g & CURSOR_BUF) != 0u && id == uint(iTsCursorScope + 0.5);
+}
+
+// Whether the row of `c` is in the cursor's scope at it or within 16 cells
+// right of it: far enough for an indent, short of a window beside this
+// one. A scope's cells start at its indent, so a cursor left of that (a
+// blank line) is still in it.
+bool tsRowInCursorScope(ivec2 c) {
     for (int i = 0; i < 6; ++i) {
         int dx = i == 0 ? 0 : (1 << (i - 1));
-        g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
+        if (tsInCursorScope(zonvieCellGroupsAt(c + ivec2(dx, 0)))) return true;
     }
-    return (g & bits) != 0u;
+    return false;
 }
 
 // Signed distance in px (negative inside) from a pixel to the edge of the
@@ -124,7 +138,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     uint gh = zonvieCellGroupsAt(cell + ivec2(s.x, 0));
     uint gv = zonvieCellGroupsAt(cell + ivec2(0, s.y));
     uint gd = zonvieCellGroupsAt(cell + s);
-    if (((g | gh | gv | gd) & (DEPTH | SCOPE)) == 0u) return;
+    if (((g | gh | gv | gd) & (DEPTH | SCOPE_ID)) == 0u) return;
 
     int depth = int(g & DEPTH);
     int depth_h = int(gh & DEPTH);
@@ -157,27 +171,22 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         col = mix(col, rim_col, EDGE_ALPHA * rim * paper);
     }
 
-    // The cursor's scope: a faint outline, and a rail along its left edge.
-    // The rail sits in the cell left of the scope (indent or gutter), clear
-    // of the text; a scope at the window's first column has no such cell
-    // and keeps it just inside.
-    bool in_scope = (g & SCOPE) != 0u;
-    bool left_of_scope = !in_scope && s.x > 0 && (gh & SCOPE) != 0u;
-    if (in_scope || left_of_scope) {
+    // The cursor's scope: a rail along its left edge. The rail sits in the
+    // cell left of the scope (indent or gutter), clear of the text; a scope
+    // at the window's first column has no such cell and keeps it just
+    // inside.
+    bool in_scope = tsInCursorScope(g);
+    bool left_of_scope = !in_scope && s.x > 0 && tsInCursorScope(gh);
+    bool at_left_edge = in_scope && s.x < 0 && !tsInCursorScope(gh);
+    if (left_of_scope || at_left_edge) {
         bool dark = dot(iBackgroundColor, vec3(0.2126, 0.7152, 0.0722)) < 0.5;
         vec3 accent = dark ? ACCENT_ON_DARK : ACCENT_ON_LIGHT;
         float rail_band = clamp(RAIL_PT * scale + 0.5 - q.x, 0.0, 1.0);
-        float outline = 0.0;
         float rail = left_of_scope ? rail_band : 0.0;
         float halo = 0.0;
-        if (in_scope) {
-            float d_scope = tsCornerSD(true, (gh & SCOPE) != 0u, (gv & SCOPE) != 0u, (gd & SCOPE) != 0u, q, r, big);
-            float inside = clamp(0.5 - d_scope, 0.0, 1.0);
-            outline = inside * clamp(d_scope + scale + 0.5, 0.0, 1.0);
-            if (s.x < 0 && (gh & SCOPE) == 0u) {
-                halo = inside * exp(-q.x / (2.5 * scale));
-                if (zonvieCellTextAt(cell - ivec2(1, 0)) == 0u) rail = inside * rail_band;
-            }
+        if (at_left_edge) {
+            halo = exp(-q.x / (2.5 * scale));
+            if (zonvieCellTextAt(cell - ivec2(1, 0)) == 0u) rail = rail_band;
         }
 
         // A cursor arriving from outside this scope draws the rail outward
@@ -186,15 +195,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         float since = iTime - iTimeCursorChange;
         float reveal = 1.0;
         float flash = 0.0;
-        if (since < SWEEP_S && tsRowHas(tsCursorCell(iCurrentCursor), SCOPE) &&
-            !tsRowHas(tsCursorCell(iPreviousCursor), SCOPE)) {
+        if (since < SWEEP_S && tsRowInCursorScope(tsCursorCell(iCurrentCursor)) &&
+            !tsRowInCursorScope(tsCursorCell(iPreviousCursor))) {
             float cursor_y = iCurrentCursor.y - 0.5 * iCurrentCursor.w;
             float front = since * SWEEP_PT_PER_S * scale;
             reveal = clamp(front - abs(fragCoord.y - cursor_y), 0.0, 1.0);
             flash = 1.0 - since / SWEEP_S;
         }
         vec3 rail_col = mix(accent, vec3(1.0), 0.5 * flash);
-        col = mix(col, accent, SCOPE_RIM_ALPHA * outline * paper);
         col += (mix(bg, accent, 0.12) - bg) * halo * reveal * paper;
         col = mix(col, rail_col, RAIL_ALPHA * rail * reveal * paper);
     }

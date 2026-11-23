@@ -136,9 +136,15 @@ const shadertoy_preamble =
     \\    // Three separate floats, NOT a vec2+float: std140 aligns a vec2 to
     \\    // 8 bytes, which would push it to offset 152 and shift every field
     \\    // below it out of step with zonvie_shader_uniforms.
-    \\    float _zonvie_pad_cursor0;
-    \\    float _zonvie_pad_cursor1;
-    \\    float _zonvie_pad_cursor2;
+    \\    // They carry the Tree-sitter layer's cursor: the ids of the
+    \\    // function and of the scope holding it, as numbered on the cells
+    \\    // of the cursor's buffer (ZonvieTsFnB*, ZonvieTsScopeB*; 0 = none),
+    \\    // and the ids of up to four functions nested in that function,
+    \\    // six bits each. The same values for every surface, and no cell
+    \\    // changes with them.
+    \\    float iTsCursorFn;
+    \\    float iTsCursorScope;
+    \\    float iTsCursorNested;
     \\    // Zonvie edit-effect extensions (see zonvie_shader_uniforms).
     \\    vec2 iCellSize;
     \\    vec2 iGridOrigin;
@@ -714,7 +720,11 @@ test "preamble iLayers offsets match zonvie_shader_uniforms" {
     // and pushes iCellSize from offset 160 to 168.
     const pad_region = tail[0..i_cell];
     try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 _zonvie_pad") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pad_region, "_zonvie_pad_cursor2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 iTsCursor") == null);
+    // The three scalars are the Tree-sitter layer's cursor uniforms.
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "iTsCursorFn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "iTsCursorScope") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "iTsCursorNested") != null);
 }
 
 const ghostty_colour_glsl =

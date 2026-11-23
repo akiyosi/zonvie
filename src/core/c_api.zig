@@ -4010,10 +4010,15 @@ pub fn colorsToUniform(c: [4]u32) [4][4]f32 {
 }
 
 /// Write iBackgroundColor, iForegroundColor, iCursorColor and iCursorText
-/// from the core's latest published colour snapshot. Touches only bytes
-/// 976..1039 of `u`. Safe from any thread.
+/// from the core's latest published colour snapshot (bytes 976..1039 of
+/// `u`), and the Tree-sitter layer's cursor into the three padding floats
+/// (148..159: iTsCursorFn, iTsCursorScope, iTsCursorNested). Touches
+/// nothing else. Safe from any thread.
 pub export fn zonvie_shader_fill_colors(p: ?*const zonvie_core, u: *zonvie_shader_uniforms) callconv(.c) void {
     const box: *const CoreBox = @ptrCast(@alignCast(p orelse return));
+    u._pad_cursor[0] = @floatFromInt(box.core.ts_cursor_fn.load(.acquire));
+    u._pad_cursor[1] = @floatFromInt(box.core.ts_cursor_scope.load(.acquire));
+    u._pad_cursor[2] = @floatFromInt(box.core.ts_cursor_nested.load(.acquire));
     const s = box.core.shader_colors.read();
     const slots = colorsToUniform(.{ s.default_bg, s.default_fg, s.cursor, s.cursor_text });
     u.iBackgroundColor = slots[0];
