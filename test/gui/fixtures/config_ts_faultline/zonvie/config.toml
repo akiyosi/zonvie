@@ -1,0 +1,9 @@
+# Fixture for visual/ts_shader_samples: one sample shader, opaque window so
+# a capture holds only what the shader drew.
+[window]
+blur = false
+opacity = 1.0
+
+[shaders]
+enabled = true
+paths = ["contrib/shaders/ts_faultline.glsl"]

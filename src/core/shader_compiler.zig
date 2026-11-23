@@ -1033,3 +1033,21 @@ test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
     defer std.testing.allocator.free(pinned);
     try std.testing.expect(std.mem.indexOf(u8, pinned, "out.zonvie_fragColor = color;") == null);
 }
+
+test "the Tree-sitter sample shaders in contrib/shaders compile on all targets" {
+    const io = @import("clock.zig").io();
+    const names = [_][]const u8{ "ts_spotlight", "ts_threads", "ts_gutter_glyphs", "ts_strata", "ts_faultline" };
+    for (names) |name| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "contrib/shaders/{s}.glsl", .{name});
+        const src = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 20));
+        defer std.testing.allocator.free(src);
+        for ([_]Target{ .msl, .hlsl, .glsl }) |target| {
+            const out = compileGlslToTarget(std.testing.allocator, src, target) catch |e| {
+                std.debug.print("{s} -> {s}: {any}\n", .{ name, @tagName(target), e });
+                return e;
+            };
+            std.testing.allocator.free(out);
+        }
+    }
+}

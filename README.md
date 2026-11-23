@@ -436,6 +436,17 @@ containing the comment token `@zonvie-owns-cursor` draws the cursor itself;
 the native cursor pass is skipped. With `preserve_alpha = true` a shader
 owns its output alpha.
 
+Zonvie additions for structure-aware effects:
+a comment line `// @zonvie-hl-groups: name name ...` declares up to 32
+highlight groups, and `zonvieCellHasGroup(fragCoord, i)` tells whether the
+cell under a pixel carries the i-th of them; `zonvieCellText`,
+`zonvieCellFg`, `zonvieCellBg` and `zonvieCellAttr` give its character,
+colours and attributes. A name starting with `ZonvieTs` is a marker Zonvie
+places from the buffer's Tree-sitter tree (the function under the cursor,
+its parameters, nesting depth, syntax errors, ...). See
+[`contrib/shaders/`](contrib/shaders/README.md) for the markers and five
+sample shaders.
+
 `iChannel0` aliases the terminal contents (back buffer) so existing
 Ghostty / Shadertoy shaders that sample `texture(iChannel0, uv)`
 work without modification.
