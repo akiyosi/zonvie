@@ -10,7 +10,7 @@ parameters, how deep a line is nested, where the syntax is broken.
 | `ts_threads.glsl` | Each parameter of the cursor's function gets its own colour: a pill where it is declared, an underline at every use. The argument under the cursor in a call is ringed. |
 | `ts_gutter_glyphs.glsl` | Icons in the sign column for functions, classes, loops, branches and exits, drawn by the shader. A hairline rules off each function. |
 | `ts_strata.glsl` | Nesting as stacked plates behind the text, warm past four levels. A rail marks the scope holding the cursor. |
-| `ts_faultline.glsl` | Syntax errors get a zigzag, a halo and a tick at the window edge, but only once you stop typing. |
+| `ts_faultline.glsl` | Broken syntax goes out of register: its colour plates slip apart, red light spills over the rows around it, and a tail of light reaches in from the window edge. Only once you stop typing; the text tears for half a second as the marks arrive. |
 
 ## Use
 
@@ -156,9 +156,14 @@ of the reading research behind them:
   (`ts_threads`), shape carries it too.
 - **The text is not touched.** Tints go to the background only: each
   sample recovers how much of a pixel is glyph from the cell's own colours
-  and paints under it. Nothing blurs or glows over a letter. The one
-  exception is `ts_spotlight`, which moves other functions' text toward its
-  background by 38% (it keeps 62% of the contrast).
+  and paints under it. Nothing blurs or glows over a letter. Two samples
+  touch text on purpose: `ts_spotlight` moves other functions' text toward
+  its background by 38% (it keeps 62% of the contrast), and `ts_faultline`
+  prints the red and blue of a broken token one point to either side of
+  where it belongs, which leaves it readable and plainly wrong.
+- **Not a highlight.** Each sample draws something a highlight group
+  cannot: a frame around many rows, an icon, a plate under a block, light
+  that crosses rows, glyphs moved by a fraction of a cell.
 - **Only the active thing is loud.** Ambient layers (plates, icons, rules)
   stay near the background. The accent colour is spent on the scope the
   cursor is in.
@@ -166,7 +171,8 @@ of the reading research behind them:
   enters a new function or scope, never on a move inside it, and ends
   within 0.3 to 1.5 s. `ts_spotlight` keeps a faint breath at rest; set
   `BREATH` to 0 for a still frame. `ts_faultline` waits for the keys to be
-  quiet instead of flagging every half-typed line.
+  quiet instead of flagging every half-typed line, then tears the broken
+  text for 0.55 s and holds it still (`EMBER` = 0 stills its light too).
 
 ## Limits
 

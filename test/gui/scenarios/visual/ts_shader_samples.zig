@@ -78,8 +78,8 @@ const settle_ms: u64 = 2600;
 /// Without markers nothing animates.
 const settle_plain_ms: u64 = 700;
 
-/// Pixels the broken token must turn red in ts_faultline: its zigzag and
-/// its tick alone are a few hundred.
+/// Pixels ts_faultline must turn red around a broken token: its tick and
+/// the tail of light beside it alone are a couple of hundred.
 const min_red_px: usize = 150;
 
 fn changedFraction(a: Image, b: Image) f64 {
