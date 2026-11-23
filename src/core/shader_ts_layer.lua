@@ -9,12 +9,17 @@
 --
 -- Markers placed for every visible row (ephemeral, redrawn with the text):
 --   ZonvieTsFn          cells of a function, from its line's indent rightward
+--   ZonvieTsFnOther     the same cells, in every window, of the functions
+--                       other than the one holding the cursor; none while
+--                       the cursor is outside every function
 --   ZonvieTsFnHead      a function's first line, from the function rightward
 --   ZonvieTsFnName      the name in a function definition
 --   ZonvieTsParam       a parameter name in a function definition
 --   ZonvieTsExit        a return / break / continue / throw / goto statement
 --   ZonvieTsError       an ERROR or MISSING node (the first line of one
 --                       that spans several)
+--   ZonvieTsErrorRow    one blank cell at the window's right edge, on each
+--                       row that has such a node
 --   ZonvieTsDepthB0..2  nesting depth of the cell, as a 3-bit number (0..7):
 --                       scope k of a row covers the cells from its header's
 --                       indent rightward
@@ -91,13 +96,13 @@ local CALL = words([[
 local ARGS = words('arguments argument_list')
 local IDENT = words('identifier variable_name simple_identifier')
 
-local view_wanted = want.ZonvieTsFn or want.ZonvieTsFnHead or want.ZonvieTsFnName
-  or want.ZonvieTsParam or want.ZonvieTsExit or want.ZonvieTsError
+local view_wanted = want.ZonvieTsFn or want.ZonvieTsFnOther or want.ZonvieTsFnHead or want.ZonvieTsFnName
+  or want.ZonvieTsParam or want.ZonvieTsExit or want.ZonvieTsError or want.ZonvieTsErrorRow
   or want.ZonvieTsDepthB0 or want.ZonvieTsDepthB1 or want.ZonvieTsDepthB2
 local args_wanted = false
 for i = 1, 6 do args_wanted = args_wanted or want['ZonvieTsArg' .. i] end
 local cursor_wanted = want.ZonvieTsFnCursor or want.ZonvieTsScopeCursor or args_wanted
-  or want.ZonvieTsRef or want.ZonvieTsCallCursor or want.ZonvieTsCallArg
+  or want.ZonvieTsRef or want.ZonvieTsCallCursor or want.ZonvieTsCallArg or want.ZonvieTsFnOther
 local sign_wanted = want.ZonvieTsSignFn or want.ZonvieTsSignClass or want.ZonvieTsSignLoop
   or want.ZonvieTsSignBranch or want.ZonvieTsSignExit
 
@@ -347,20 +352,43 @@ local function view_marks(buf, top, bot)
     put(sr, sc, { end_row = er, end_col = ec, hl_group = group })
   end
   local depth_wanted = want.ZonvieTsDepthB0 or want.ZonvieTsDepthB1 or want.ZonvieTsDepthB2
+  local error_wanted = want.ZonvieTsError or want.ZonvieTsErrorRow
+  local error_rows = {} -- rows that already carry their ZonvieTsErrorRow cell
   local row_scopes = {} -- row -> scopes holding it in their body, outer first
   local fn_rows = {} -- row -> { b, w } of the outermost function box
+  -- The groups a function's cells take on a row: ZonvieTsFn, and
+  -- ZonvieTsFnOther while some function holds the cursor and this row is
+  -- not one of its own.
+  local focus = want.ZonvieTsFnOther and S.focus or nil
+  local fn_groups = nil
+  if want.ZonvieTsFn or focus then
+    fn_groups = function(r)
+      local g = {}
+      if want.ZonvieTsFn then g[#g + 1] = 'ZonvieTsFn' end
+      if focus and not (focus.buf == buf and r >= focus.sr and r <= focus.er) then
+        g[#g + 1] = 'ZonvieTsFnOther'
+      end
+      return g
+    end
+  end
 
   local function visit(node, sr, sc, er, ec)
-    if want.ZonvieTsError and (node:missing() or node:type() == 'ERROR') then
-      if er == sr and ec == sc then
-        -- A MISSING node has no width: mark the cell before it.
-        if sc > 0 then put_range('ZonvieTsError', sr, sc - 1, er, ec) end
-      elseif er > sr then
-        -- An ERROR node can swallow the rest of the buffer; where it
-        -- starts is where to look.
-        put_range('ZonvieTsError', sr, sc, sr, #line_of(sr))
-      else
-        put_range('ZonvieTsError', sr, sc, er, ec)
+    if error_wanted and (node:missing() or node:type() == 'ERROR') then
+      if want.ZonvieTsError then
+        if er == sr and ec == sc then
+          -- A MISSING node has no width: mark the cell before it.
+          if sc > 0 then put_range('ZonvieTsError', sr, sc - 1, er, ec) end
+        elseif er > sr then
+          -- An ERROR node can swallow the rest of the buffer; where it
+          -- starts is where to look.
+          put_range('ZonvieTsError', sr, sc, sr, #line_of(sr))
+        else
+          put_range('ZonvieTsError', sr, sc, er, ec)
+        end
+      end
+      if want.ZonvieTsErrorRow and sr >= top and not error_rows[sr] then
+        error_rows[sr] = true
+        put(sr, 0, { virt_text = { { ' ', 'ZonvieTsErrorRow' } }, virt_text_pos = 'right_align' })
       end
     end
     if not node:named() then return end
@@ -378,9 +406,9 @@ local function view_marks(buf, top, bot)
         if want.ZonvieTsParam then
           for _, id in ipairs(params_of(node)) do put_range('ZonvieTsParam', id:range()) end
         end
-        if want.ZonvieTsFn then
+        if fn_groups then
           if er == sr then
-            put_range('ZonvieTsFn', sr, sc, er, ec)
+            for _, g in ipairs(fn_groups(sr)) do put_range(g, sr, sc, er, ec) end
           else
             for r = math.max(sr, top), math.min(er, bot) do
               if not fn_rows[r] then fn_rows[r] = { b = ib, w = iw } end
@@ -419,7 +447,8 @@ local function view_marks(buf, top, bot)
   end)
 
   for r, box in pairs(fn_rows) do
-    put_row(put, r, line_of(r), { { b = box.b, w = box.w, groups = { 'ZonvieTsFn' } } })
+    local groups = fn_groups(r)
+    if #groups > 0 then put_row(put, r, line_of(r), { { b = box.b, w = box.w, groups = groups } }) end
   end
   for r, scopes in pairs(row_scopes) do
     local segs, b, w = {}, 0, 0
@@ -569,7 +598,7 @@ local function cursor_marks(buf, win, st, parser)
     end
     for _, m in ipairs(st.scan_marks) do marks[#marks + 1] = m end
   end
-  return marks
+  return marks, func
 end
 
 local function marks_key(marks)
@@ -589,13 +618,35 @@ local function update_cursor()
   if S.dead or not cursor_wanted then return end
   local win = api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
+  -- The cursor markers belong to the current window's buffer alone: a
+  -- buffer left behind in another window keeps none.
+  local last = S.cursor_buf
+  if last and last ~= buf and api.nvim_buf_is_valid(last) then
+    api.nvim_buf_clear_namespace(last, ns_cur, 0, -1)
+    if S.bufs[last] then S.bufs[last].cursor_key = nil end
+  end
+  S.cursor_buf = buf
   local parser, st = get_parser(buf)
   local marks = {}
+  local focus, focus_key = nil, ''
   if parser then
-    local ok, res = pcall(cursor_marks, buf, win, st, parser)
-    if ok then marks = res end
+    local ok, res, func = pcall(cursor_marks, buf, win, st, parser)
+    if ok then
+      marks = res
+      if func then
+        local sr, _, er = func:range()
+        focus = { buf = buf, sr = sr, er = er }
+        focus_key = table.concat({ buf, sr, er }, ':')
+      end
+    end
   else
     st = S.bufs[buf] or {}
+  end
+  -- The function holding the cursor decides ZonvieTsFnOther in every
+  -- window, so a change of it redraws them all.
+  if want.ZonvieTsFnOther and focus_key ~= (S.focus_key or '') then
+    S.focus, S.focus_key = focus, focus_key
+    pcall(api.nvim__redraw, { valid = false })
   end
   local key = marks_key(marks)
   if st.cursor_key == key then return end
@@ -691,7 +742,7 @@ local function on_win(_, _, buf, top, bot)
   if not parser then return false end
   if sign_wanted then schedule_signs(buf, st, top, bot) end
   if not view_wanted then return false end
-  local key = table.concat({ api.nvim_buf_get_changedtick(buf), top, bot }, ':')
+  local key = table.concat({ api.nvim_buf_get_changedtick(buf), top, bot, S.focus_key or '' }, ':')
   if st.view_key ~= key then
     local ok, marks = pcall(view_marks, buf, top, bot)
     if not ok then return false end

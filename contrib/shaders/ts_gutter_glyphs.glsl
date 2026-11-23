@@ -52,11 +52,12 @@ float tsInk(vec3 pix, ivec2 c) {
     return clamp(dot(pix - bg, ax) / max(dot(ax, ax), 1e-4), 0.0, 1.0);
 }
 
-// Whether the row of `c` has `bits` at or right of it.
+// Whether the row of `c` has `bits` at it or within 16 cells right of it:
+// far enough for an indent, short of a window beside this one.
 bool tsRowHas(ivec2 c, uint bits) {
     uint g = 0u;
-    for (int i = 0; i < 7; ++i) {
-        int dx = i == 0 ? 0 : (1 << i);
+    for (int i = 0; i < 6; ++i) {
+        int dx = i == 0 ? 0 : (1 << (i - 1));
         g |= zonvieCellGroupsAt(c + ivec2(dx, 0));
     }
     return (g & bits) != 0u;

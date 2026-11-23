@@ -14,9 +14,10 @@
 // Needs Zonvie's Tree-sitter layer (it starts by itself when a shader
 // declares ZonvieTs* groups) and a Tree-sitter parser for the buffer.
 //
-// @zonvie-hl-groups: ZonvieTsError
+// @zonvie-hl-groups: ZonvieTsError ZonvieTsErrorRow
 
 const uint ERR = 1u; // an ERROR or MISSING node
+const uint ERR_ROW = 2u; // the cell at the window's right edge, on a row that has one
 
 // ---- tuning ----
 const vec3 ERR_ON_DARK = vec3(1.00, 0.42, 0.36);
@@ -28,7 +29,6 @@ const float HALO_PT = 5.0; // how fast the halo falls off outside it
 const float WAVE_ALPHA = 0.95; // the zigzag underline
 const float TICK_PT = 3.0; // width of the tick at the right edge
 const float TICK_ALPHA = 0.85;
-const int SCAN_COLS = 240; // columns searched for the right-edge tick
 
 // ---- helpers shared by the ts_*.glsl samples ----
 
@@ -63,31 +63,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     ivec2 cell;
     vec2 cellMin, cellSize;
-    bool on_grid = zonvieCellGeom(fragCoord, cell, cellMin, cellSize);
+    if (!zonvieCellGeom(fragCoord, cell, cellMin, cellSize)) return;
+    uint groups = zonvieCellGroupsAt(cell);
 
-    // The tick: only the pixels of a narrow band at the right edge look for
-    // an error anywhere on their row.
-    float tick_w = TICK_PT * scale;
-    float right = iWindowOffset.x + iWindowSize.x;
-    if (fragCoord.x >= right - tick_w - 2.0 * scale) {
-        ivec2 first;
-        vec2 firstMin, firstSize;
-        if (zonvieCellGeom(vec2(iGridOrigin.x + 0.5 * iCellSize.x, fragCoord.y), first, firstMin, firstSize)) {
-            bool broken = false;
-            for (int i = 0; i < SCAN_COLS; ++i) {
-                if ((zonvieCellGroupsAt(first + ivec2(i, 0)) & ERR) != 0u) broken = true;
-            }
-            if (broken) {
-                vec2 half_size = vec2(0.5 * tick_w, 0.5 * firstSize.y - 2.0 * scale);
-                vec2 p = fragCoord - vec2(right - scale - half_size.x, firstMin.y + 0.5 * firstSize.y);
-                vec2 w = abs(p) - half_size + half_size.x;
-                float d = min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - half_size.x;
-                col = mix(col, err, TICK_ALPHA * show * clamp(0.5 - d, 0.0, 1.0));
-            }
-        }
+    // The tick: the layer leaves one marked cell at the right edge of the
+    // window, on each row that has an error. A split or an external window
+    // gets the tick at its own edge.
+    if ((groups & ERR_ROW) != 0u) {
+        vec2 half_size = vec2(0.5 * TICK_PT * scale, 0.5 * cellSize.y - 2.0 * scale);
+        vec2 p = fragCoord - vec2(cellMin.x + cellSize.x - scale - half_size.x, cellMin.y + 0.5 * cellSize.y);
+        vec2 w = abs(p) - half_size + half_size.x;
+        float d = min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - half_size.x;
+        col = mix(col, err, TICK_ALPHA * show * clamp(0.5 - d, 0.0, 1.0));
     }
 
-    if (on_grid) {
+    {
         // Distance to the nearest broken cell, within two columns and one row.
         vec2 hs = 0.5 * cellSize;
         float nearest = 1e9;
