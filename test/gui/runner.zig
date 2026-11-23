@@ -357,6 +357,10 @@ test "gui:visual_shader_covers_all_grids" {
     try gated(can_capture, @import("scenarios/visual/shader_covers_all_grids.zig"));
 }
 
+test "gui:visual_ts_shader_samples" {
+    try gated(can_capture, @import("scenarios/visual/ts_shader_samples.zig"));
+}
+
 test "gui:cmdline_cursor_shader_rect" {
     // macOS only: the shader cursor plumbing and the window enumeration this
     // uses live in the macOS frontend and macos_window.zig.
