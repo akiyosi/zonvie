@@ -507,6 +507,59 @@ pub fn dragResizeWindowByMouse(
     return true;
 }
 
+/// Press at (x0, y0), on a window of `from_pid`, drag to (x1, y1), on a
+/// window of `to_pid`, and release there: a drag from one app to another,
+/// which is how a file drop arrives. Both ends are ownership-checked before
+/// the button goes down. The pointer is put back.
+pub fn dragBetween(from_pid: i32, x0: f64, y0: f64, to_pid: i32, x1: f64, y1: f64) bool {
+    const end_owner = ownerPidAtPoint(x1, y1);
+    if (end_owner != to_pid) {
+        std.debug.print(
+            "[gui] drag end point ({d:.0},{d:.0}) is owned by pid {d}, not {d}; not dragging\n",
+            .{ x1, y1, end_owner, to_pid },
+        );
+        return false;
+    }
+    const restore = cursorLocation();
+    defer _ = CGWarpMouseCursorPosition(restore);
+
+    if (!postMouseChecked(from_pid, kCGEventMouseMoved, x0, y0)) return false;
+    gui_io.sleepNs(100 * std.time.ns_per_ms);
+    if (!postMouseChecked(from_pid, kCGEventLeftMouseDown, x0, y0)) return false;
+    gui_io.sleepNs(150 * std.time.ns_per_ms);
+
+    // The last quarter of the events rest on the end point: the destination
+    // answers draggingEntered/Updated between events, and a release that
+    // arrives before it has answered is a drop on nothing.
+    const steps: u32 = 60;
+    const travel: u32 = 45;
+    var i: u32 = 1;
+    while (i <= steps) : (i += 1) {
+        const t: f64 = @as(f64, @floatFromInt(@min(i, travel))) / @as(f64, @floatFromInt(travel));
+        // Unchecked: the button is down, and the pointer crosses whatever
+        // lies between the two windows.
+        const e = CGEventCreateMouseEvent(null, kCGEventLeftMouseDragged, .{
+            .x = x0 + (x1 - x0) * t,
+            .y = y0 + (y1 - y0) * t,
+        }, kCGMouseButtonLeft);
+        if (e) |ev| {
+            CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1);
+            CGEventPost(kCGHIDEventTap, ev);
+            CFRelease(ev);
+        }
+        gui_io.sleepNs(16 * std.time.ns_per_ms);
+    }
+
+    const up = CGEventCreateMouseEvent(null, kCGEventLeftMouseUp, .{ .x = x1, .y = y1 }, kCGMouseButtonLeft);
+    if (up) |ev| {
+        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1);
+        CGEventPost(kCGHIDEventTap, ev);
+        CFRelease(ev);
+    }
+    gui_io.sleepNs(200 * std.time.ns_per_ms);
+    return true;
+}
+
 /// One left click at (x, y), CGWindowList coordinates. Every event is
 /// ownership-checked like the drag above, and the press and release are at
 /// the same point, so nothing is dragged. The pointer is put back.

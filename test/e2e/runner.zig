@@ -442,3 +442,136 @@ test "e2e:born_external_anchor_float" {
     try requireNvim();
     try @import("scenarios/born_external_anchor_float.zig").run(testing.allocator);
 }
+
+// The use cases of Neovim's gui.txt, one test each: `-Dtest-filter=gui_doc`.
+const gui_doc = @import("scenarios/gui_doc.zig");
+
+test "e2e:gui_doc_detach_embedded" {
+    try requireNvim();
+    try gui_doc.runDetachEmbedded(testing.allocator);
+}
+
+test "e2e:gui_doc_detach_remote_then_reattach" {
+    try requireNvim();
+    try gui_doc.runDetachRemoteThenReattach(testing.allocator);
+}
+
+test "e2e:gui_doc_reattach_shows_window_content" {
+    try requireNvim();
+    try gui_doc.runReattachShowsWindowContent(testing.allocator);
+}
+
+test "e2e:gui_doc_detach_others" {
+    try requireNvim();
+    try gui_doc.runDetachOthers(testing.allocator);
+}
+
+test "e2e:gui_doc_detach_bang" {
+    try requireNvim();
+    try gui_doc.runDetachBang(testing.allocator);
+}
+
+test "e2e:gui_doc_detach_bang_survives_restart" {
+    try requireNvim();
+    try gui_doc.runDetachBangSurvivesRestart(testing.allocator);
+}
+
+test "e2e:gui_doc_restart_restores_session" {
+    try requireNvim();
+    try gui_doc.runRestartRestoresSession(testing.allocator);
+}
+
+test "e2e:gui_doc_restart_bang_drops_session" {
+    try requireNvim();
+    try gui_doc.runRestartBangDropsSession(testing.allocator);
+}
+
+test "e2e:gui_doc_restart_plus_cmd" {
+    try requireNvim();
+    try gui_doc.runRestartPlusCmd(testing.allocator);
+}
+
+test "e2e:gui_doc_restart_then_command" {
+    try requireNvim();
+    try gui_doc.runRestartThenCommand(testing.allocator);
+}
+
+test "e2e:gui_doc_connect_address" {
+    try requireNvim();
+    try gui_doc.runConnectAddress(testing.allocator);
+}
+
+test "e2e:gui_doc_connect_refused_with_unsaved_changes" {
+    try requireNvim();
+    try gui_doc.runConnectRefusedWithUnsavedChanges(testing.allocator);
+}
+
+test "e2e:gui_doc_connect_menu" {
+    try requireNvim();
+    try gui_doc.runConnectMenu(testing.allocator);
+}
+
+test "e2e:gui_doc_winpos_commands" {
+    try requireNvim();
+    try gui_doc.runWinposCommands(testing.allocator);
+}
+
+test "e2e:gui_doc_lines_columns" {
+    try requireNvim();
+    try gui_doc.runLinesColumns(testing.allocator);
+}
+
+test "e2e:gui_doc_mouse_click_and_drag" {
+    try requireNvim();
+    try gui_doc.runMouseClickAndDrag(testing.allocator);
+}
+
+test "e2e:gui_doc_mouse_multi_click" {
+    try requireNvim();
+    try gui_doc.runMouseMultiClick(testing.allocator);
+}
+
+test "e2e:gui_doc_mouse_keycode_mappings" {
+    try requireNvim();
+    try gui_doc.runMouseKeycodeMappings(testing.allocator);
+}
+
+test "e2e:gui_doc_mouse_doc_examples" {
+    try requireNvim();
+    try gui_doc.runMouseDocExamples(testing.allocator);
+}
+
+test "e2e:gui_doc_menu_commands" {
+    try requireNvim();
+    try gui_doc.runMenuCommands(testing.allocator);
+}
+
+test "e2e:gui_doc_popup_menu_by_right_click" {
+    try requireNvim();
+    try gui_doc.runPopupMenuByRightClick(testing.allocator);
+}
+
+test "e2e:gui_doc_popup_command" {
+    try requireNvim();
+    try gui_doc.runPopupCommand(testing.allocator);
+}
+
+test "e2e:gui_doc_drop_files" {
+    try requireNvim();
+    try gui_doc.runDropFiles(testing.allocator);
+}
+
+test "e2e:gui_doc_drop_on_modified_buffer" {
+    try requireNvim();
+    try gui_doc.runDropOnModifiedBuffer(testing.allocator);
+}
+
+test "e2e:gui_doc_drop_directory" {
+    try requireNvim();
+    try gui_doc.runDropDirectory(testing.allocator);
+}
+
+test "e2e:gui_doc_drop_into_cmdline" {
+    try requireNvim();
+    try gui_doc.runDropIntoCmdline(testing.allocator);
+}
