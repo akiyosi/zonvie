@@ -139,12 +139,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     vec3 col = base.rgb;
 
-    // Other functions step back: text toward its background, colour toward grey.
+    // Other functions step back: what a pixel adds to its background (the
+    // text) shrinks and loses colour. The background itself stays as it is.
     float in_other = clamp(0.5 - d_any, 0.0, 1.0) * clamp(0.5 + d_cur, 0.0, 1.0);
     if (in_other > 0.0) {
-        vec3 back = mix(col, zonvieCellBgAt(cell), DIM);
-        back = mix(back, vec3(dot(back, vec3(0.2126, 0.7152, 0.0722))), DESATURATE);
-        col = mix(col, back, in_other * enter);
+        vec3 bg = zonvieCellBgAt(cell);
+        vec3 ink = col - bg;
+        ink = mix(ink, vec3(dot(ink, vec3(0.2126, 0.7152, 0.0722))), DESATURATE);
+        col = mix(col, bg + (1.0 - DIM) * ink, in_other * enter);
     }
 
     // The frame: a hairline just inside the function's edge, and a soft

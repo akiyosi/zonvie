@@ -156,16 +156,28 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         col = mix(col, rim_col, EDGE_ALPHA * rim * paper);
     }
 
-    // The cursor's scope: a faint outline, and a rail down its left edge.
-    if ((g & SCOPE) != 0u) {
+    // The cursor's scope: a faint outline, and a rail along its left edge.
+    // The rail sits in the cell left of the scope (indent or gutter), clear
+    // of the text; a scope at the window's first column has no such cell
+    // and keeps it just inside.
+    bool in_scope = (g & SCOPE) != 0u;
+    bool left_of_scope = !in_scope && s.x > 0 && (gh & SCOPE) != 0u;
+    if (in_scope || left_of_scope) {
         bool dark = dot(iBackgroundColor, vec3(0.2126, 0.7152, 0.0722)) < 0.5;
         vec3 accent = dark ? ACCENT_ON_DARK : ACCENT_ON_LIGHT;
-        bool left_open = s.x < 0 && (gh & SCOPE) == 0u;
-        float d_scope = tsCornerSD(true, (gh & SCOPE) != 0u, (gv & SCOPE) != 0u, (gd & SCOPE) != 0u, q, r, big);
-        float inside = clamp(0.5 - d_scope, 0.0, 1.0);
-        float outline = inside * clamp(d_scope + scale + 0.5, 0.0, 1.0);
-        float rail = left_open ? inside * clamp(RAIL_PT * scale + 0.5 - q.x, 0.0, 1.0) : 0.0;
-        float halo = left_open ? inside * exp(-q.x / (2.5 * scale)) : 0.0;
+        float rail_band = clamp(RAIL_PT * scale + 0.5 - q.x, 0.0, 1.0);
+        float outline = 0.0;
+        float rail = left_of_scope ? rail_band : 0.0;
+        float halo = 0.0;
+        if (in_scope) {
+            float d_scope = tsCornerSD(true, (gh & SCOPE) != 0u, (gv & SCOPE) != 0u, (gd & SCOPE) != 0u, q, r, big);
+            float inside = clamp(0.5 - d_scope, 0.0, 1.0);
+            outline = inside * clamp(d_scope + scale + 0.5, 0.0, 1.0);
+            if (s.x < 0 && (gh & SCOPE) == 0u) {
+                halo = inside * exp(-q.x / (2.5 * scale));
+                if (zonvieCellTextAt(cell - ivec2(1, 0)) == 0u) rail = inside * rail_band;
+            }
+        }
 
         // A cursor arriving from outside this scope draws the rail outward
         // from its own row.
