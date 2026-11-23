@@ -70,6 +70,7 @@ const World = struct {
             Stub.onDefaultColors,
             Stub.onRestart,
             Stub.onConnect,
+            null,
         );
     }
 };

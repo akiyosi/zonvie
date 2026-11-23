@@ -4496,6 +4496,12 @@ pub const FlushCtx = struct {
     pub fn onConnect(ctx: *FlushCtx, server_addr: []const u8) !void {
         try ctx.core.handleConnectEvent(server_addr);
     }
+
+    pub fn onErrorExit(ctx: *FlushCtx, status: i64) !void {
+        // Only a detach leaves the server running; a nonzero status is the
+        // server exiting, which the session's end already handles.
+        if (status == 0) ctx.core.server_detached_ui = true;
+    }
 };
 
 /// What was last published for one surface, so a layout is re-sent only when it

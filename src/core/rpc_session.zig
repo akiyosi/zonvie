@@ -2133,6 +2133,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             flush.FlushCtx.onDefaultColors,
             flush.FlushCtx.onRestart,
             flush.FlushCtx.onConnect,
+            flush.FlushCtx.onErrorExit,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
             redraw_error = re;
@@ -3119,8 +3120,14 @@ pub fn runLoop(self: *Core) void {
         const redraw_recovery_failed = self.redraw_recovery_failed.load(.seq_cst);
         const preserve_recovery_child = redraw_recovery_failed and
             !self.stop_flag.load(.seq_cst);
-        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any}, redraw_recovery_failed={any})\n", .{ remote_restart_break, redraw_recovery_failed });
-        if (cleanupSession(self, &child, have_child, false, remote_restart_break, preserve_recovery_child)) |t| last_term = t;
+        // A detached server outlives this session by design, so its process
+        // is handed off like a `:connect` hot-swap's instead of waited for.
+        // A user stop still ends it: stop() means the app is going away.
+        const preserve_detached_child = self.server_detached_ui and
+            !self.stop_flag.load(.seq_cst);
+        self.server_detached_ui = false;
+        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any}, redraw_recovery_failed={any}, server_detached_ui={any})\n", .{ remote_restart_break, redraw_recovery_failed, preserve_detached_child });
+        if (cleanupSession(self, &child, have_child, false, remote_restart_break, preserve_recovery_child or preserve_detached_child)) |t| last_term = t;
         if (redraw_recovery_failed) session_failed = true;
         self.log.write("session loop: cleanupSession returned\n", .{});
 
@@ -3680,6 +3687,7 @@ const RedrawDriver = struct {
             flush.FlushCtx.onDefaultColors,
             flush.FlushCtx.onRestart,
             flush.FlushCtx.onConnect,
+            flush.FlushCtx.onErrorExit,
         );
     }
 };

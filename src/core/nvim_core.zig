@@ -860,6 +860,13 @@ pub const Core = struct {
     /// Consumed (reset to false) by the run loop before the next iteration.
     connect_keeps_child_alive: bool = false,
 
+    /// Set by the `error_exit` event with status 0: the server detached this
+    /// UI (`:detach`) and keeps running. The channel closes next, and the
+    /// spawned child must then be handed off rather than waited for, or
+    /// child.wait() blocks for as long as the server lives and on_exit never
+    /// fires. Consumed by the run loop when the session ends.
+    server_detached_ui: bool = false,
+
     drawable_w_px: u32 = 1,
     drawable_h_px: u32 = 1,
     cell_w_px: u32 = 1,

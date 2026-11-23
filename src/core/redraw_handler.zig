@@ -71,6 +71,7 @@ pub const RedrawEvent = enum {
     set_title,
     restart,
     connect,
+    error_exit,
     flush,
 };
 
@@ -993,6 +994,7 @@ fn runRedrawEventsLogged(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator,
         null,
         null,
         null,
+        null,
     );
 }
 
@@ -1133,6 +1135,7 @@ fn runRedrawEventsCounting(
         cb.guifont,
         counts,
         cb.linespace,
+        null,
         null,
         null,
         null,
@@ -1692,6 +1695,7 @@ pub fn handleRedraw(
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8, detach: ?bool) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
+    error_exit_fn: ?*const fn (ctx: @TypeOf(opt_ctx), status: i64) anyerror!void,
 ) !void {
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
@@ -1863,6 +1867,7 @@ pub fn handleRedraw(
             .set_title => try onSetTitle(log, tuples, opt_ctx, set_title_fn),
             .restart => try onRestart(log, tuples, opt_ctx, restart_fn),
             .connect => try onConnect(log, tuples, opt_ctx, connect_fn),
+            .error_exit => try onErrorExit(log, tuples, opt_ctx, error_exit_fn),
             .flush => try onFlush(grid, log, flush_ctx, pre_flush_fn, flush_fn),
         }
     }
@@ -3551,6 +3556,28 @@ fn onConnect(
     }
 }
 
+fn onErrorExit(
+    log: *Logger,
+    tuples: []mp.Value,
+    opt_ctx: anytype,
+    error_exit_fn: ?*const fn (ctx: @TypeOf(opt_ctx), status: i64) anyerror!void,
+) !void {
+    // error_exit: [status, addr]
+    // The last event on this channel before the server closes it. Status 0
+    // is a detach (`:detach`, another UI's `:%detach`, the first half of
+    // `:connect`): the server goes on running. A nonzero status precedes the
+    // server's own exit. `addr` (where to attach again) is not sent by 0.12.
+    if (error_exit_fn) |fn_ptr| {
+        for (tuples) |tv| {
+            if (tv != .arr) continue;
+            const t = tv.arr;
+            if (t.len < 1 or t[0] != .int) continue;
+            if (log.cb != null) log.write("error_exit: status={d}\n", .{t[0].int});
+            try fn_ptr(opt_ctx, t[0].int);
+        }
+    }
+}
+
 fn onFlush(
     grid: *Grid,
     log: *Logger,
@@ -3620,7 +3647,7 @@ const RestartProbe = struct {
             fn linespace(_: *RestartProbe, _: i32) anyerror!void {}
         };
         var log = Logger{};
-        try handleRedraw(grid, hl, arena, try testEvent(arena, "restart", tuple), &log, self, noop.preFlush, noop.flush, self, noop.guifont, self, noop.linespace, null, null, RestartProbe.onRestart, null);
+        try handleRedraw(grid, hl, arena, try testEvent(arena, "restart", tuple), &log, self, noop.preFlush, noop.flush, self, noop.guifont, self, noop.linespace, null, null, RestartProbe.onRestart, null, null);
     }
 };
 
@@ -3663,6 +3690,48 @@ test "a restart event passes the chan_config detach flag, or null without the di
     probe.detach = true;
     try probe.run(&grid, &hl, arena, empty_dict);
     try std.testing.expectEqual(@as(?bool, null), probe.detach);
+}
+
+// `error_exit` is [status, addr] on 0.13 and [status] on 0.12; the status is
+// what tells a detach (0, the server lives on) from the server's own exit.
+test "an error_exit event passes its status with or without the address" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    var hl = Highlights.init(alloc);
+    defer hl.deinit();
+
+    const Probe = struct {
+        calls: u32 = 0,
+        status: i64 = -1,
+
+        fn onErrorExit(self: *@This(), status: i64) anyerror!void {
+            self.calls += 1;
+            self.status = status;
+        }
+        fn preFlush(_: *@This()) anyerror!void {}
+        fn flush(_: *@This(), _: u32, _: u32) anyerror!void {}
+        fn guifont(_: *@This(), _: []const u8) anyerror!void {}
+        fn linespace(_: *@This(), _: i32) anyerror!void {}
+    };
+    var probe = Probe{};
+    var log = Logger{};
+
+    const with_addr = try arena.alloc(mp.Value, 2);
+    with_addr[0] = .{ .int = 0 };
+    with_addr[1] = .{ .str = "/tmp/nvim.sock" };
+    try handleRedraw(&grid, &hl, arena, try testEvent(arena, "error_exit", with_addr), &log, &probe, Probe.preFlush, Probe.flush, &probe, Probe.guifont, &probe, Probe.linespace, null, null, null, null, Probe.onErrorExit);
+    try std.testing.expectEqual(@as(u32, 1), probe.calls);
+    try std.testing.expectEqual(@as(i64, 0), probe.status);
+
+    const bare = try arena.alloc(mp.Value, 1);
+    bare[0] = .{ .int = 1 };
+    try handleRedraw(&grid, &hl, arena, try testEvent(arena, "error_exit", bare), &log, &probe, Probe.preFlush, Probe.flush, &probe, Probe.guifont, &probe, Probe.linespace, null, null, null, null, Probe.onErrorExit);
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+    try std.testing.expectEqual(@as(i64, 1), probe.status);
 }
 
 /// cmdline_show tuple: [content, pos, firstc, prompt, indent]
