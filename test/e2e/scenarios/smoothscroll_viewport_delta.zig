@@ -45,8 +45,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var step: usize = 0;
     while (step < 8) : (step += 1) try scrollOneRow(h);
 
-    // The last keystroke's win_viewport can still be in flight, so wait for the
-    // reports to stop rather than reading once.
+    // The last keystrokes' win_viewport can still be in flight. Wait for the
+    // whole distance first: on a machine that stalls for longer than the
+    // quiet window, a report that is late would read as one that is missing.
+    // Then for the reports to stop, so that one too many shows as well.
+    waitRowsReported(h, 8);
     waitReportsQuiet(h);
 
     const reported = h.grid_scroll_rows.load(.seq_cst);
@@ -76,11 +79,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // measurement that follows.
     step = 0;
     while (step < 4) : (step += 1) try scrollOneRow(h);
+    // All four lines, then quiet: a keystroke still unanswered when the
+    // baseline below is taken would be counted into the measurement, and
+    // until topline has advanced scroll_delta still belongs to the gg.
+    try waitToplineAdvance(h, g, 3);
     waitReportsQuiet(h);
     // Here one <C-e> moves a whole buffer line, so scroll_delta reports the
-    // number of screen rows that line occupies. Wait for topline to advance
-    // first, or the value still belongs to the preceding gg.
-    try waitToplineAdvance(h, g, 0);
+    // number of screen rows that line occupies.
     const wrapped_rows_per_line = h.getViewportScrollDelta(g);
     if (wrapped_rows_per_line < 2) {
         std.debug.print(
@@ -95,8 +100,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const control_baseline = h.grid_scroll_rows.load(.seq_cst);
     step = 0;
     while (step < 8) : (step += 1) try scrollOneRow(h);
-    waitReportsQuiet(h);
     const want_rows = 8 * wrapped_rows_per_line;
+    waitRowsReported(h, control_baseline + want_rows);
+    waitReportsQuiet(h);
     const control_rows = h.grid_scroll_rows.load(.seq_cst) - control_baseline;
     if (control_rows != want_rows) {
         std.debug.print(
@@ -132,6 +138,17 @@ fn waitReportsQuiet(h: *Harness) void {
             }
         }.check, 50) catch {};
     }
+}
+
+/// Wait until `rows` have been reported in all, or the harness timeout. A
+/// total that never arrives is left for the caller's own check to report.
+fn waitRowsReported(h: *Harness, rows: i64) void {
+    const Ctx = struct { rows: i64 };
+    h.waitUntil(Ctx{ .rows = rows }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return hh.grid_scroll_rows.load(.seq_cst) >= c.rows;
+        }
+    }.check, h.opts.timeout_ms) catch {};
 }
 
 fn waitToplineAdvance(h: *Harness, g: i64, from: u32) !void {
