@@ -356,70 +356,10 @@ pub const Gui = struct {
         return g.remoteExprInner(expr, false);
     }
 
-    /// Longest a remote command may take, in seconds. One evaluates in
-    /// milliseconds; a client still waiting after this long is waiting on a
-    /// server that will not answer. Without a bound the run stalls until the
-    /// CI job's own timeout, and reports nothing.
-    const remote_timeout_s: i64 = 60;
-
-    fn deadlineIn(seconds: i64) std.Io.Timeout {
-        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(seconds), .clock = .awake } };
-        return t.toDeadline(gui_io.io());
-    }
-
-    /// Run `nvim --server <addr> <flag> <arg>` and collect its output.
-    fn runClient(g: *Gui, flag: []const u8, arg: []const u8, quiet: bool) !std.process.RunResult {
-        return std.process.run(g.alloc, gui_io.io(), .{
-            .argv = &.{ g.nvim_path, "--server", g.listen_addr, flag, arg },
-            .timeout = deadlineIn(remote_timeout_s),
-        }) catch |e| {
-            if (e == error.Timeout and !quiet) g.reportRemoteTimeout(flag, arg);
-            return e;
-        };
-    }
-
-    /// What can be told of a remote command that got no answer: whether the
-    /// server answers another client, and which nvim processes are left.
-    fn reportRemoteTimeout(g: *Gui, flag: []const u8, arg: []const u8) void {
-        std.debug.print("[gui] nvim {s} got no answer in {d} s: {s}\n", .{ flag, remote_timeout_s, arg });
-        // --headless: this client evaluates in its own process. Without it
-        // nvim on Windows starts a TUI and an embedded server of its own to
-        // make the request, and those are among what may be stuck.
-        if (std.process.run(g.alloc, gui_io.io(), .{
-            .argv = &.{ g.nvim_path, "--headless", "--server", g.listen_addr, "--remote-expr", "mode(1)" },
-            .timeout = deadlineIn(10),
-        })) |probe| {
-            defer g.alloc.free(probe.stdout);
-            defer g.alloc.free(probe.stderr);
-            std.debug.print("[gui] the server answers another client: mode(1)=\"{s}\" {s}\n", .{ probe.stdout, probe.stderr });
-        } else |e| {
-            std.debug.print("[gui] the server does not answer another client either: {s}\n", .{@errorName(e)});
-        }
-        if (builtin.os.tag != .windows) return;
-        // Twice: a process whose CPU time grew in between is busy, one whose
-        // did not is waiting.
-        for (0..2) |i| {
-            if (i > 0) gui_io.sleepNs(3 * std.time.ns_per_s);
-            const list = std.process.run(g.alloc, gui_io.io(), .{
-                .argv = &.{
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process | Where-Object Name -match nvim | Format-List ProcessId,ParentProcessId,UserModeTime,KernelModeTime,CommandLine",
-                },
-                .timeout = deadlineIn(30),
-            }) catch |e| {
-                std.debug.print("[gui] could not list the nvim processes: {s}\n", .{@errorName(e)});
-                return;
-            };
-            defer g.alloc.free(list.stdout);
-            defer g.alloc.free(list.stderr);
-            std.debug.print("[gui] nvim processes:\n{s}{s}\n", .{ list.stdout, list.stderr });
-        }
-    }
-
     fn remoteExprInner(g: *Gui, expr: []const u8, quiet: bool) ![]u8 {
-        const result = try g.runClient("--remote-expr", expr, quiet);
+        const result = try std.process.run(g.alloc, gui_io.io(), .{
+            .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-expr", expr },
+        });
         errdefer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
         switch (result.term) {
@@ -469,7 +409,9 @@ pub const Gui = struct {
 
     /// Send keys (nvim notation) to the shared server.
     pub fn remoteSend(g: *Gui, keys: []const u8) !void {
-        const result = try g.runClient("--remote-send", keys, false);
+        const result = try std.process.run(g.alloc, gui_io.io(), .{
+            .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-send", keys },
+        });
         defer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
         switch (result.term) {
