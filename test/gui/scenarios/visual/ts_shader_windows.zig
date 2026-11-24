@@ -64,14 +64,25 @@ const min_drawn: f64 = 0.0004;
 /// And as untouched below this (capture noise is zero on an opaque window).
 const max_untouched: f64 = 0.0001;
 
+/// Share of a capture's height, from its top, that the comparisons leave
+/// out. A macOS capture includes the title bar, whose buttons change colour
+/// with the window's focus: nothing the shader drew. A tenth covers it on
+/// the smallest window opened here; the rows compared are further down.
+const chrome_frac: f64 = if (@import("builtin").os.tag == .macos) 0.10 else 0.0;
+
+fn firstRow(img: Image) usize {
+    return @intFromFloat(@as(f64, @floatFromInt(img.h)) * chrome_frac);
+}
+
 /// Fraction of differing pixels in the columns [x0_frac, x1_frac) of two
-/// captures of one view.
+/// captures of one view, below the window's chrome.
 fn changed(a: Image, b: Image, x0_frac: f64, x1_frac: f64) f64 {
     if (a.w != b.w or a.h != b.h) return 1.0;
     const x0: usize = @intFromFloat(@as(f64, @floatFromInt(a.w)) * x0_frac);
     const x1: usize = @intFromFloat(@as(f64, @floatFromInt(a.w)) * x1_frac);
+    const top = firstRow(a);
     var n: usize = 0;
-    var y: usize = 0;
+    var y: usize = top;
     while (y < a.h) : (y += 1) {
         var x = x0;
         while (x < x1) : (x += 1) {
@@ -82,7 +93,7 @@ fn changed(a: Image, b: Image, x0_frac: f64, x1_frac: f64) f64 {
             if (dr + dg + db > 6) n += 1;
         }
     }
-    const total = (x1 - x0) * a.h;
+    const total = (x1 - x0) * (a.h - top);
     if (total == 0) return 0;
     return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(total));
 }
@@ -258,6 +269,11 @@ fn externals(alloc: std.mem.Allocator, sample: Sample) !void {
     defer g.deinit();
     try g.exec("execute('edit " ++ lua_path ++ "')");
     if (sample.breaks_syntax) try g.exec(break_lua);
+    // Every window gets the rows its checks look at put at its top: a
+    // tiling compositor sizes the windows as it likes (nine rows have been
+    // seen), whatever nvim_open_win asks for. Here: M.blend, which will
+    // hold the cursor in the other window on this buffer.
+    try g.exec("execute('normal! 11Gzt')");
 
     var before = driver.snapshotWindows(g.app_pid);
     try g.exec(
@@ -267,6 +283,8 @@ fn externals(alloc: std.mem.Allocator, sample: Sample) !void {
     );
     const ext_c = try driver.waitNewWindow(g.app_pid, before.slice(), 150);
     if (sample.breaks_syntax) try g.exec(break_c);
+    // `sum` from its first line: the broken row is its third.
+    try g.exec("execute('normal! 18Gzt')");
     try g.exec("execute('normal! 26G30|')");
     try g.exec("execute('wincmd p')");
 
@@ -277,6 +295,7 @@ fn externals(alloc: std.mem.Allocator, sample: Sample) !void {
     );
     const ext_lua = try driver.waitNewWindow(g.app_pid, before.slice(), 150);
     try g.exec("execute('normal! gg0')");
+    try g.exec("execute('normal! 11Gzt')");
     try g.exec("execute('normal! 12G25|')");
     gui_io.sleepNs(settle_ms * std.time.ns_per_ms);
 

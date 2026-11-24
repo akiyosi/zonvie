@@ -86,22 +86,36 @@ const settle_plain_ms: u64 = 700;
 /// hundred.
 const min_red_px: usize = 80;
 
+/// Share of a capture's height, from its top, that the counts leave out. A
+/// macOS capture includes the title bar, whose buttons (one of them red)
+/// change colour with the window's focus: nothing the shader drew. The rows
+/// the samples draw on are further down.
+const chrome_frac: f64 = if (@import("builtin").os.tag == .macos) 0.10 else 0.0;
+
+/// Index in `rgba` of the first pixel below the window's chrome.
+fn firstPixel(img: Image) usize {
+    const row: usize = @intFromFloat(@as(f64, @floatFromInt(img.h)) * chrome_frac);
+    return row * img.w * 4;
+}
+
 fn changedFraction(a: Image, b: Image) f64 {
     if (a.w != b.w or a.h != b.h) return 1.0;
+    const first = firstPixel(a);
+    if (first >= a.rgba.len) return 0;
     var changed: usize = 0;
-    var i: usize = 0;
+    var i: usize = first;
     while (i < a.rgba.len) : (i += 4) {
         const dr = @abs(@as(i16, a.rgba[i]) - @as(i16, b.rgba[i]));
         const dg = @abs(@as(i16, a.rgba[i + 1]) - @as(i16, b.rgba[i + 1]));
         const db = @abs(@as(i16, a.rgba[i + 2]) - @as(i16, b.rgba[i + 2]));
         if (dr + dg + db > 6) changed += 1;
     }
-    return @as(f64, @floatFromInt(changed)) / @as(f64, @floatFromInt(a.rgba.len / 4));
+    return @as(f64, @floatFromInt(changed)) / @as(f64, @floatFromInt((a.rgba.len - first) / 4));
 }
 
 fn redPixels(img: Image) usize {
     var n: usize = 0;
-    var i: usize = 0;
+    var i: usize = firstPixel(img);
     while (i < img.rgba.len) : (i += 4) {
         const r: u16 = img.rgba[i];
         const g: u16 = img.rgba[i + 1];
@@ -114,7 +128,7 @@ fn redPixels(img: Image) usize {
 /// Pixels in the accent's blue (dark theme) or deep blue (light theme).
 fn accentPixels(img: Image) usize {
     var n: usize = 0;
-    var i: usize = 0;
+    var i: usize = firstPixel(img);
     while (i < img.rgba.len) : (i += 4) {
         const r: u16 = img.rgba[i];
         const b: u16 = img.rgba[i + 2];
