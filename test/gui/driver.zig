@@ -356,9 +356,15 @@ pub const Gui = struct {
         return g.remoteExprInner(expr, false);
     }
 
+    // `--headless` on a remote client: nvim on Windows takes every start for
+    // one with a terminal, and without the flag it makes the request from an
+    // embedded server it spawns and runs a TUI on top. That costs over a
+    // second per command, which adds up to minutes over a scenario. With the
+    // flag the client makes the request itself, as it does on the other
+    // platforms, where it has no terminal here.
     fn remoteExprInner(g: *Gui, expr: []const u8, quiet: bool) ![]u8 {
         const result = try std.process.run(g.alloc, gui_io.io(), .{
-            .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-expr", expr },
+            .argv = &.{ g.nvim_path, "--headless", "--server", g.listen_addr, "--remote-expr", expr },
         });
         errdefer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
@@ -410,7 +416,7 @@ pub const Gui = struct {
     /// Send keys (nvim notation) to the shared server.
     pub fn remoteSend(g: *Gui, keys: []const u8) !void {
         const result = try std.process.run(g.alloc, gui_io.io(), .{
-            .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-send", keys },
+            .argv = &.{ g.nvim_path, "--headless", "--server", g.listen_addr, "--remote-send", keys },
         });
         defer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
