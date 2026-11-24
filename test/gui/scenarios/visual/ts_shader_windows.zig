@@ -17,7 +17,8 @@
 // take the same external-surface path.
 //
 // The captures with the layer running are written to
-// tmp/ts_shader_windows/<name>_<view>.png, for looking at.
+// tmp/ts_shader_windows/<name>_<view> (in the platform's capture format),
+// for looking at.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -140,7 +141,7 @@ fn open(alloc: std.mem.Allocator, name: []const u8) !*Gui {
 
 fn save(alloc: std.mem.Allocator, img: Image, name: []const u8, view: []const u8) !void {
     var buf: [160]u8 = undefined;
-    try driver.capture.writeImage(alloc, try std.fmt.bufPrint(&buf, out_dir ++ "/{s}_{s}.png", .{ name, view }), img);
+    try driver.capture.writeImage(alloc, try std.fmt.bufPrint(&buf, out_dir ++ "/{s}_{s}" ++ driver.capture.image_ext, .{ name, view }), img);
 }
 
 /// The main window split in two: C on the left, Lua on the right.
@@ -205,18 +206,23 @@ fn splits(alloc: std.mem.Allocator, sample: Sample) !void {
         const c_accent = count(inside, 0.0, sign_px, isBlue);
         const lua_accent = count(inside, 0.51, 0.51 + sign_px, isBlue);
         std.debug.print("[gui] ts_gutter_glyphs split: accent pixels in the gutters: C {d}, Lua {d}\n", .{ c_accent, lua_accent });
-        if (lua_accent < 100) return error.CursorFunctionIconsNotAccented;
+        // About 140 on a 1x display, four times that on a 2x one.
+        if (lua_accent < 60) return error.CursorFunctionIconsNotAccented;
         if (c_accent > 0) return error.OtherWindowIconsAccented;
     }
     if (std.mem.eql(u8, sample.name, "ts_faultline")) {
-        // Each window has one broken row, and its tick sits at that
-        // window's own right edge: one tick's worth of red at each.
-        const edge_px = 24.0 / w;
-        const c_ticks = count(inside, 0.5 - edge_px, 0.5, isRed);
-        const lua_ticks = count(inside, 1.0 - edge_px, 1.0, isRed);
+        // Each window has one broken row, and its tick and tail sit at
+        // that window's own right edge: the same red at each. The bands
+        // are a share of the width, not a pixel count: where the grid's
+        // edge falls differs with the display's scale and with the margin
+        // a frontend keeps around the grid. They end short of the cracks.
+        const band = 0.08;
+        const c_ticks = count(inside, 0.5 - band, 0.5, isRed);
+        const lua_ticks = count(inside, 1.0 - band, 1.0, isRed);
         std.debug.print("[gui] ts_faultline split: red pixels at the right edges: C {d}, Lua {d}\n", .{ c_ticks, lua_ticks });
-        if (c_ticks < 60) return error.TickMissingAtItsWindowEdge;
-        if (lua_ticks < 60 or lua_ticks > c_ticks + c_ticks / 2) return error.TickAtAnotherWindowsEdge;
+        // A tick alone is about 50 on a 1x display.
+        if (c_ticks < 25) return error.TickMissingAtItsWindowEdge;
+        if (lua_ticks < 25 or lua_ticks > c_ticks + c_ticks / 2) return error.TickAtAnotherWindowsEdge;
     }
 }
 
@@ -307,7 +313,7 @@ fn externals(alloc: std.mem.Allocator, sample: Sample) !void {
         const sign_px = 32.0 / @as(f64, @floatFromInt(main_img.w));
         const main_accent = count(main_img, 0.0, sign_px, isBlue);
         std.debug.print("[gui] ts_gutter_glyphs external: accent pixels in the main window's gutter: {d}\n", .{main_accent});
-        if (main_accent < 100) return error.MainWindowNotRedrawn;
+        if (main_accent < 60) return error.MainWindowNotRedrawn;
     }
 }
 

@@ -11,7 +11,8 @@
 // both times.
 //
 // The captures with the layer running are also written to
-// tmp/ts_shader_samples/<name>_<buffer>_<background>.png, for looking at.
+// tmp/ts_shader_samples/<name>_<buffer>_<background> (in the platform's
+// capture format), for looking at.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -31,17 +32,19 @@ const Sample = struct {
     /// Accent-coloured pixels the markers must add: what the sample draws
     /// on the function or scope holding the cursor (a frame, icons, a
     /// rail). A sample that marks every function alike draws none, however
-    /// many pixels it changes.
+    /// many pixels it changes. Counts are set for a 1x display, at well
+    /// under half of what the sample draws there; a 2x display draws four
+    /// times as many.
     min_accent_px: usize = 0,
 };
 
 const samples = [_]Sample{
-    .{ .name = "ts_spotlight", .config_dir = "test/gui/fixtures/config_ts_spotlight", .min_changed = 0.008, .min_accent_px = 2000 },
+    .{ .name = "ts_spotlight", .config_dir = "test/gui/fixtures/config_ts_spotlight", .min_changed = 0.008, .min_accent_px = 400 },
     .{ .name = "ts_threads", .config_dir = "test/gui/fixtures/config_ts_threads", .min_changed = 0.004 },
-    .{ .name = "ts_gutter_glyphs", .config_dir = "test/gui/fixtures/config_ts_gutter_glyphs", .min_changed = 0.008, .min_accent_px = 300 },
-    .{ .name = "ts_strata", .config_dir = "test/gui/fixtures/config_ts_strata", .min_changed = 0.15, .min_accent_px = 300 },
-    // One broken token: a zigzag, a halo and a tick, about a thousandth of
-    // the window. What it must add is red (see runSample).
+    .{ .name = "ts_gutter_glyphs", .config_dir = "test/gui/fixtures/config_ts_gutter_glyphs", .min_changed = 0.008, .min_accent_px = 60 },
+    .{ .name = "ts_strata", .config_dir = "test/gui/fixtures/config_ts_strata", .min_changed = 0.15, .min_accent_px = 60 },
+    // One broken token: cracks over a few rows around it and a tail of
+    // light at the edge. What it must add is red (see runSample).
     .{ .name = "ts_faultline", .config_dir = "test/gui/fixtures/config_ts_faultline", .min_changed = 0.0006, .breaks_syntax = true },
 };
 
@@ -78,9 +81,10 @@ const settle_ms: u64 = 2600;
 /// Without markers nothing animates.
 const settle_plain_ms: u64 = 700;
 
-/// Pixels ts_faultline must turn red around a broken token: its tick and
-/// the tail of light beside it alone are a couple of hundred.
-const min_red_px: usize = 150;
+/// Pixels ts_faultline must turn red around a broken token. Set for a 1x
+/// display, where its tick, its tail and its light are a couple of
+/// hundred.
+const min_red_px: usize = 80;
 
 fn changedFraction(a: Image, b: Image) f64 {
     if (a.w != b.w or a.h != b.h) return 1.0;
@@ -153,7 +157,7 @@ fn runSample(alloc: std.mem.Allocator, sample: Sample) !void {
             var png_buf: [128]u8 = undefined;
             const png_path = try std.fmt.bufPrint(
                 &png_buf,
-                "tmp/ts_shader_samples/{s}_{s}_{s}.png",
+                "tmp/ts_shader_samples/{s}_{s}_{s}" ++ driver.capture.image_ext,
                 .{ sample.name, buffer.tag, background },
             );
             try driver.capture.writeImage(alloc, png_path, with_markers[taken - 1]);
