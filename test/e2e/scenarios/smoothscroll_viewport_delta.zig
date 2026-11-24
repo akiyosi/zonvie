@@ -79,13 +79,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // measurement that follows.
     step = 0;
     while (step < 4) : (step += 1) try scrollOneRow(h);
-    // All four lines, then quiet: a keystroke still unanswered when the
-    // baseline below is taken would be counted into the measurement, and
-    // until topline has advanced scroll_delta still belongs to the gg.
-    try waitToplineAdvance(h, g, 3);
     waitReportsQuiet(h);
     // Here one <C-e> moves a whole buffer line, so scroll_delta reports the
-    // number of screen rows that line occupies.
+    // number of screen rows that line occupies. Wait for topline to advance
+    // first, or the value still belongs to the preceding gg.
+    try waitToplineAdvance(h, g, 0);
     const wrapped_rows_per_line = h.getViewportScrollDelta(g);
     if (wrapped_rows_per_line < 2) {
         std.debug.print(
