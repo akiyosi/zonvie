@@ -10,7 +10,7 @@ parameters, how deep a line is nested, where the syntax is broken.
 | `ts_threads.glsl` | Each parameter of the cursor's function gets its own colour: a pill where it is declared, an underline at every use. The argument under the cursor in a call is ringed. |
 | `ts_gutter_glyphs.glsl` | Icons in the sign column for functions, classes, loops, branches and exits, drawn by the shader. A hairline rules off each function. |
 | `ts_strata.glsl` | Nesting as stacked plates behind the text, warm past four levels. A rail marks the scope holding the cursor. |
-| `ts_faultline.glsl` | Broken syntax goes out of register: its colour plates slip apart, red light spills over the rows around it, and a tail of light reaches in from the window edge. Only once you stop typing; the text tears for half a second as the marks arrive. |
+| `ts_faultline.glsl` | The page cracks like glass where the syntax is broken: cracks run over the rows around the break, each shard shows its text a little out of place, red light leaks through, and the broken token is printed out of register. A tail of light reaches in from the window edge. Only once you stop typing; the cracks spread in a third of a second. |
 
 ## Use
 
@@ -98,6 +98,7 @@ On tokens and rows:
 | `ZonvieTsExit` | a `return`, `break`, `continue`, `throw` or `goto` statement |
 | `ZonvieTsError` | an `ERROR` or `MISSING` node (the first line of one spanning several) |
 | `ZonvieTsErrorRow` | one blank cell at the window's right edge, on each row that has such a node |
+| `ZonvieTsErrorLine` | every cell of such a row, to the window's right edge: a shader that draws around an error over several rows reads it to find the rows worth searching |
 
 On blank sign-column cells of a construct's first row:
 
@@ -160,10 +161,12 @@ of the reading research behind them:
   touch text on purpose: `ts_spotlight` moves other functions' text toward
   its background by 38% (it keeps 62% of the contrast), and `ts_faultline`
   prints the red and blue of a broken token one point to either side of
-  where it belongs, which leaves it readable and plainly wrong.
+  where it belongs and shows the text under each shard up to 1.5 points
+  out of place, which leaves it readable and plainly wrong. Its cracks
+  fade where they cross a letter.
 - **Not a highlight.** Each sample draws something a highlight group
-  cannot: a frame around many rows, an icon, a plate under a block, light
-  that crosses rows, glyphs moved by a fraction of a cell.
+  cannot: a frame around many rows, an icon, a plate under a block,
+  cracks and light that cross rows, glyphs moved by a fraction of a cell.
 - **Only the active thing is loud.** Ambient layers (plates, icons, rules)
   stay near the background. The accent colour is spent on the scope the
   cursor is in.
@@ -171,8 +174,9 @@ of the reading research behind them:
   enters a new function or scope, never on a move inside it, and ends
   within 0.3 to 1.5 s. `ts_spotlight` keeps a faint breath at rest; set
   `BREATH` to 0 for a still frame. `ts_faultline` waits for the keys to be
-  quiet instead of flagging every half-typed line, then tears the broken
-  text for 0.55 s and holds it still (`EMBER` = 0 stills its light too).
+  quiet instead of flagging every half-typed line, then spreads its cracks
+  for 0.32 s, tears the broken token for 0.55 s and holds still (`EMBER` =
+  0 stills its light too).
 
 ## Limits
 
@@ -196,6 +200,10 @@ of the reading research behind them:
 - External windows have been run as `nvim_open_win(..., { external = true })`.
   `--extwindows` takes the same surface path but has not been run: it needs
   a Neovim that accepts the `ext_windows` UI option.
+- `ts_faultline` cracks the glass up to 4 rows and 10 columns from the
+  break. The cracks stop at the sides of the break's window but not at its
+  top or bottom: an error on a window's last row cracks its statusline and
+  the top of the window below.
 - A sample asks "is this row inside the cursor's function" by looking up
   to 16 cells along the row. A window narrower than that beside another one
   can pick up its neighbour's answer.

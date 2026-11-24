@@ -17,7 +17,8 @@ const Harness = @import("../harness.zig").Harness;
 
 const declaration =
     "// @zonvie-hl-groups: ZonvieTsFnB0 ZonvieTsFnB1 ZonvieTsScopeB0 ZonvieTsScopeB1 ZonvieTsScopeB2 " ++
-    "ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsParam ZonvieTsParamB0 ZonvieTsParamB1 ZonvieTsSignFn ZonvieTsCursorBuf\n";
+    "ZonvieTsDepthB0 ZonvieTsDepthB1 ZonvieTsParam ZonvieTsParamB0 ZonvieTsParamB1 ZonvieTsSignFn ZonvieTsCursorBuf " ++
+    "ZonvieTsError ZonvieTsErrorLine\n";
 const fn0: u32 = 1 << 0;
 const fn1: u32 = 1 << 1;
 const sc0: u32 = 1 << 2;
@@ -30,6 +31,9 @@ const p1: u32 = 1 << 9;
 const sign_fn: u32 = 1 << 10;
 /// Every cell of the buffer the cursor is in.
 const cb: u32 = 1 << 11;
+const err: u32 = 1 << 12;
+/// Every cell of a row that has an error, to the window's edge.
+const err_line: u32 = 1 << 13;
 
 /// 'signcolumn=yes': buffer column c is grid column c + sign_cols.
 const sign_cols: u32 = 2;
@@ -212,4 +216,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // ...and `b`, which only moved, is what it was.
     try expectMask(h, g, 6, 2, sc1 | fn1 | d0 | cb);
     try expectMask(h, g, 5, 0, sc1 | fn1 | cb);
+
+    // Broken syntax: the stray `+` is the error, and its whole row says so,
+    // past the end of the text too. The row below says nothing.
+    //  0  local x = (1 + )
+    //  1  local y = 2
+    try h.command(
+        \\lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'local x = (1 + )', 'local y = 2' })
+    );
+    try waitMask(h, g, 0, 13, cb | err | err_line);
+    try expectMask(h, g, 0, 0, cb | err_line);
+    try expectMask(h, g, 0, 40, cb | err_line);
+    try expectMask(h, g, 1, 0, cb);
+    try expectMask(h, g, 1, 40, cb);
 }

@@ -37,6 +37,7 @@
 --                       that spans several)
 --   ZonvieTsErrorRow    one blank cell at the window's right edge, on each
 --                       row that has such a node
+--   ZonvieTsErrorLine   every cell of such a row, to the window's right edge
 --   ZonvieTsSignFn  ZonvieTsSignClass  ZonvieTsSignLoop  ZonvieTsSignBranch
 --   ZonvieTsSignExit    blank sign-column cells on a scope's or exit's row
 -- Markers that follow the cursor (a few cells each):
@@ -140,7 +141,7 @@ end
 local region_wanted = any_wanted('ZonvieTsScopeB', 6) or any_wanted('ZonvieTsFnB', 6)
   or any_wanted('ZonvieTsDepthB', 3)
 local param_index_wanted = any_wanted('ZonvieTsParamB', 3)
-local error_wanted = want.ZonvieTsError or want.ZonvieTsErrorRow
+local error_wanted = want.ZonvieTsError or want.ZonvieTsErrorRow or want.ZonvieTsErrorLine
 local cursor_tokens_wanted = want.ZonvieTsRef or want.ZonvieTsCallCursor or want.ZonvieTsCallArg
 
 -- Ids are 1..63 and handed out in turn, so scopes near each other differ.
@@ -366,9 +367,14 @@ local function block_marks(buf, node, line_of, ids)
           put_range('ZonvieTsError', sr, sc, er, ec)
         end
       end
-      if want.ZonvieTsErrorRow and not error_rows[sr] then
+      if not error_rows[sr] then
         error_rows[sr] = true
-        put(sr, 0, { virt_text = { { ' ', 'ZonvieTsErrorRow' } }, virt_text_pos = 'right_align' })
+        if want.ZonvieTsErrorRow then
+          put(sr, 0, { virt_text = { { ' ', 'ZonvieTsErrorRow' } }, virt_text_pos = 'right_align' })
+        end
+        if want.ZonvieTsErrorLine then
+          put(sr, 0, { end_row = sr + 1, end_col = 0, hl_group = 'ZonvieTsErrorLine', hl_eol = true })
+        end
       end
     end
     if not n:named() then return end
