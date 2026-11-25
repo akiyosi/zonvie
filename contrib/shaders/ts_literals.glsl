@@ -73,6 +73,12 @@ bool tsEditing(int row, int x0, int x1) {
     return cc.y == row && cc.x >= x0 && cc.x <= x1 + 1;
 }
 
+// Whether the cursor is on `row` between columns x0 and x1, both included.
+bool tsCursorIn(int row, int x0, int x1) {
+    ivec2 cc = tsCursorCell(iCurrentCursor);
+    return cc.y == row && cc.x >= x0 && cc.x <= x1;
+}
+
 // The first column of the run of `bit` cells holding c, at most n back.
 int tsRunLeft(ivec2 c, uint bit, int n) {
     int x = c.x;
@@ -208,9 +214,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
         vec3 col = tsSwitch(fragCoord, org, cs, k, paper, zonvieCellFgAt(ivec2(x0, cell.y)));
 
-        // The comma after the word moves up beside the switch.
+        // The comma after the word moves up beside the switch. It stays
+        // where it is while the cursor is on the word or on the comma: the
+        // cursor's cell shows the character really there, and a comma moved
+        // up would stand before a letter it follows, or show the cursor twice.
         uint after = zonvieCellTextAt(ivec2(x0 + len, cell.y));
-        if (cell.x - x0 == SWITCH_CELLS && (after == 0x2Cu || after == 0x3Bu)) {
+        if (cell.x - x0 == SWITCH_CELLS && (after == 0x2Cu || after == 0x3Bu) &&
+            !tsCursorIn(cell.y, x0, x0 + len)) {
             vec2 from = fragCoord + vec2(float(x0 + len - cell.x) * cs.x, 0.0);
             col = texture(iChannel0, from / iResolution.xy).rgb;
         }
@@ -218,12 +228,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         return;
     }
 
-    // That comma's own cell is left blank.
+    // That comma's own cell is left blank, when the comma has moved.
     uint here = zonvieCellTextAt(cell);
     if ((here == 0x2Cu || here == 0x3Bu) && tsHas(cell - ivec2(1, 0), BOOLEAN)) {
         int x0, len;
         if (tsBoolAt(cell - ivec2(1, 0), x0, len) >= 0 && x0 + len == cell.x &&
-            !tsEditing(cell.y, x0, x0 + len - 1)) {
+            !tsEditing(cell.y, x0, x0 + len - 1) && !tsCursorIn(cell.y, x0, x0 + len)) {
             fragColor = vec4(paper, base.a);
         }
         return;

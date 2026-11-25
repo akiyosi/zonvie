@@ -238,7 +238,9 @@ of the reading research behind them:
   digits, a colour only as a quoted `#` and six hex digits. The native
   cursor is part of the frame a shader reads, so the cursor's cell is left
   as the frame has it: a block cursor on a literal shows the character
-  really in that cell. While a string is typed and its closing quote is
+  really in that cell. The comma after a Boolean is drawn beside its
+  switch; while the cursor is on the word or on the comma, the comma stays
+  in its own cell. While a string is typed and its closing quote is
   not there yet, the parser can lose the lines after it, and their
   literals are plain text for that moment.
 - `ts_literals` slides a switch for a Boolean typed a key at a time. A
