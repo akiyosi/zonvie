@@ -431,10 +431,12 @@ Zonvie additions for edit effects:
 `iTimeLastEdit` (`iTime` of the most recent cell edit), `iPrevFrame` (the
 previous frame's final output, sampled like `iChannel0`) and `iCellAge`,
 read through the helper `zonvieCellAge(fragCoord)` — seconds since the
-cell under a pixel was last edited, or a large value if never. A shader
-containing the comment token `@zonvie-owns-cursor` draws the cursor itself;
-the native cursor pass is skipped. With `preserve_alpha = true` a shader
-owns its output alpha.
+cell under a pixel was last edited, or a large value if never. The native
+cursor is part of `iChannel0`, so a shader that moves or repaints the frame
+meets the cursor in it. A shader containing the comment token
+`@zonvie-owns-cursor` draws the cursor itself; the native cursor is then
+left out of the frame. With `preserve_alpha = true` a shader owns its
+output alpha.
 
 Zonvie additions for structure-aware effects:
 a comment line `// @zonvie-hl-groups: name name ...` declares up to 32
