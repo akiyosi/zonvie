@@ -171,6 +171,12 @@ float tsLand(float ys, float oy, float top, float bottom, float zoom, float rest
     return seam + zoom * (bottom - top) + rest * (ys - bottom);
 }
 
+// How far from the grid's left edge a row draws the point `s` pixels along
+// it: scaled by `rest` up to `turn`, by `past` from there on.
+float tsAcross(float s, float turn, float rest, float past) {
+    return rest * min(s, turn) + past * max(s - turn, 0.0);
+}
+
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     fragColor = texture(iChannel0, fragCoord / iResolution.xy);
     if (iCellSize.x <= 0.0 || iCellSize.y <= 0.0 || iRootRows <= 0) return;
@@ -225,14 +231,28 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
 
         // Sideways a row is scaled by the factor it has upward, so its
-        // letters keep their shape: a shrunk row from the grid's left edge,
-        // a stretched one about its scope's indent, which stays in line
-        // with the same column of the rows above and below.
+        // letters keep their shape. A stretched row is stretched only from
+        // its scope's indent rightward. Left of the indent it keeps the
+        // shrunk rows' scale: the indent stays in line with the same
+        // column above and below, and what stands there (a cursor in the
+        // indent, the number column) is not pushed off the window's left
+        // edge. As with the heights, the mix of the two arrangements is
+        // straight between their turns, here the two indents.
         bool in_now = src.y >= top && src.y < bottom;
         bool in_before = src.y >= top_b && src.y < bottom_b;
-        float scale = mix(in_before ? zoom_b : rest_b, in_now ? zoom : rest, way);
-        float shift = mix(in_before ? held_b * (rest_b - zoom_b) : 0.0, in_now ? held * (rest - zoom) : 0.0, way);
-        src.x = org.x + (fragCoord.x - org.x - shift) / scale;
+        float turn = in_now ? held : 0.0;
+        float past = in_now ? zoom : rest;
+        float turn_b = in_before ? held_b : 0.0;
+        float past_b = in_before ? zoom_b : rest_b;
+        float k1 = min(turn, turn_b);
+        float k2 = max(turn, turn_b);
+        float at1 = mix(tsAcross(k1, turn_b, rest_b, past_b), tsAcross(k1, turn, rest, past), way);
+        float at2 = mix(tsAcross(k2, turn_b, rest_b, past_b), tsAcross(k2, turn, rest, past), way);
+        float x = fragCoord.x - org.x;
+        float along = k2 + (x - at2) / mix(past_b, past, way);
+        if (x < at1) along = x * k1 / at1;
+        else if (x < at2) along = k1 + (x - at1) * (k2 - k1) / (at2 - at1);
+        src.x = org.x + along;
     }
 
     // A shrunk row ends short of the window's right edge: plain paper there.
