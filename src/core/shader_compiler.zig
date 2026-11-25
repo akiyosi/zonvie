@@ -1046,7 +1046,7 @@ test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
 
 test "the Tree-sitter sample shaders in contrib/shaders compile on all targets" {
     const io = @import("clock.zig").io();
-    const names = [_][]const u8{ "ts_spotlight", "ts_threads", "ts_gutter_glyphs", "ts_strata", "ts_faultline" };
+    const names = [_][]const u8{ "ts_spotlight", "ts_threads", "ts_gutter_glyphs", "ts_strata", "ts_faultline", "ts_zoom", "ts_literals" };
     for (names) |name| {
         var path_buf: [96]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "contrib/shaders/{s}.glsl", .{name});

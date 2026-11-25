@@ -1,8 +1,9 @@
 # Tree-sitter shader samples
 
-Five post-process shaders that draw from the structure of the code, not from
+Seven post-process shaders that draw from the structure of the code, not from
 its pixels: which function holds the cursor, which identifiers are its
-parameters, how deep a line is nested, where the syntax is broken.
+parameters, how deep a line is nested, where the syntax is broken, which
+cells are a literal.
 
 | Shader | What it shows |
 |---|---|
@@ -11,6 +12,8 @@ parameters, how deep a line is nested, where the syntax is broken.
 | `ts_gutter_glyphs.glsl` | Icons in the sign column for functions, classes, loops, branches and exits, drawn by the shader. A hairline rules off each function. |
 | `ts_strata.glsl` | Nesting as stacked plates behind the text, warm past four levels. A rail marks the scope holding the cursor. |
 | `ts_faultline.glsl` | The page cracks like glass where the syntax is broken: cracks run over the rows around the break, each shard shows its text a little out of place, red light leaks through, and the broken token is printed out of register. A tail of light reaches in from the window edge. Only once you stop typing; the cracks spread in a third of a second. |
+| `ts_zoom.glsl` | The innermost scope holding the cursor (an `if`, a loop, a function) is drawn larger, as one unit of the syntax tree. The rows outside it shrink a little to make the room, so nothing leaves the screen. When the cursor moves to another scope the page goes from one arrangement to the next in a quarter of a second. |
+| `ts_literals.glsl` | Literals drawn as what they stand for: a Boolean is a switch, a fraction (`0.35`) has a dial in place of its leading zero, a colour string (`"#rrggbb"`) is a paint chip with its code printed on it. A literal is plain text again while it is edited in Insert mode. |
 
 ## Use
 
@@ -124,7 +127,9 @@ Blank lines inside a scope carry the same steps.
 Raw Tree-sitter captures (`@keyword.return`, `@markup.heading.1`, ...) and
 ordinary groups (`Comment`, `DiagnosticUnderlineError`) can be declared in
 the same line and need no layer. At most 32 names are read across the
-shader chain.
+shader chain. `ts_literals` is written with captures alone (`@boolean`,
+`@number`, `@string`): it declares no marker, so the layer does not run for
+it, and it works in any buffer with Tree-sitter highlighting.
 
 ### Several windows
 
@@ -164,6 +169,12 @@ of the reading research behind them:
   where it belongs and shows the text under each shard up to 1.5 points
   out of place, which leaves it readable and plainly wrong. Its cracks
   fade where they cross a letter.
+- **Two samples redraw the text itself.** `ts_zoom` resamples the page:
+  the cursor's scope is stretched, the rest shrunk, each row sideways by
+  the factor it has upward so its letters keep their shape. `ts_literals`
+  paints over a literal's cells and draws the thing it stands for; the
+  text comes back while the cursor is on it in Insert or Replace mode.
+  Neither is a mark on a range, which is what a decoration could do.
 - **Not a highlight.** Each sample draws something a highlight group
   cannot: a frame around many rows, an icon, a plate under a block,
   cracks and light that cross rows, glyphs moved by a fraction of a cell.
@@ -207,8 +218,28 @@ of the reading research behind them:
 - A sample asks "is this row inside the cursor's function" by looking up
   to 16 cells along the row. A window narrower than that beside another one
   can pick up its neighbour's answer.
-- A shader that names `iTime` is redrawn every frame. Four of the five do,
-  for their entry animations; `ts_gutter_glyphs` does not.
+- A shader that names `iTime` is redrawn every frame. Six of the seven do,
+  for their animations; `ts_gutter_glyphs` does not.
+- `ts_zoom` moves pixels, so the mouse still addresses the page as Neovim
+  laid it out: a click lands where the text was, not where it is drawn.
+  Stretched and shrunk text is the frame resampled, a little softer than
+  text set at that size. The shader draws the cursor itself
+  (`@zonvie-owns-cursor`): a block with its character, a bar or an
+  underline as a solid rect. It scales whole rows of the grid, so in a
+  split the windows beside the cursor's are zoomed with it.
+- `ts_zoom` finds the scope the cursor left from the previous cursor
+  position. Several moves in quick succession each start from the last
+  resting arrangement, not from where the page was mid-way.
+- `ts_literals` reads a literal off its cells' text: a Boolean by its first
+  letter (`t` or `f`, either case), a fraction only when written `0.` and
+  digits, a colour only as a quoted `#` and six hex digits. The native
+  cursor is drawn over the shader's output, so a block cursor on a
+  literal shows the character really in that cell. While a string is
+  typed and its closing quote is not there yet, the parser can lose the
+  lines after it, and their literals are plain text for that moment.
+- `ts_zoom` and `ts_literals` have been run on Lua, on a light background
+  (`tokyonight-day`), `ts_zoom` also with `linespace` set. They are in the
+  compile test below and not in the two visual tests.
 - Marks follow an edit one redraw after the edit itself: typed text is not
   held back, and a line whose structure just changed shows its old marks
   for that one frame.
