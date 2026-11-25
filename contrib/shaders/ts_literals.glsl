@@ -182,6 +182,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     ivec2 cell;
     vec2 cellMin, cs;
     if (!zonvieCellGeom(fragCoord, cell, cellMin, cs)) return;
+    // The cursor's cell is left as the frame has it: the native cursor is
+    // part of the frame, and painting over its cell would hide it. The
+    // cursor shows on the character really there.
+    if (iCursorVisible != 0 && cell == tsCursorCell(iCurrentCursor)) return;
     uint g = zonvieCellGroupsAt(cell);
     vec3 paper = zonvieCellBgAt(cell);
 

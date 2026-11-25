@@ -171,7 +171,10 @@ of the reading research behind them:
   fade where they cross a letter.
 - **Two samples redraw the text itself.** `ts_zoom` resamples the page:
   the cursor's scope is stretched, the rest shrunk, each row sideways by
-  the factor it has upward so its letters keep their shape. `ts_literals`
+  the factor it has upward so its letters keep their shape. A stretched
+  row is stretched from its scope's indent rightward; left of the indent
+  it keeps the shrunk rows' width, so the number column and a cursor in
+  the indent stay in the window, drawn narrow. `ts_literals`
   paints over a literal's cells and draws the thing it stands for; the
   text comes back while the cursor is on it in Insert or Replace mode.
   Neither is a mark on a range, which is what a decoration could do.
@@ -233,10 +236,17 @@ of the reading research behind them:
 - `ts_literals` reads a literal off its cells' text: a Boolean by its first
   letter (`t` or `f`, either case), a fraction only when written `0.` and
   digits, a colour only as a quoted `#` and six hex digits. The native
-  cursor is drawn over the shader's output, so a block cursor on a
-  literal shows the character really in that cell. While a string is
-  typed and its closing quote is not there yet, the parser can lose the
-  lines after it, and their literals are plain text for that moment.
+  cursor is part of the frame a shader reads, so the cursor's cell is left
+  as the frame has it: a block cursor on a literal shows the character
+  really in that cell. While a string is typed and its closing quote is
+  not there yet, the parser can lose the lines after it, and their
+  literals are plain text for that moment.
+- `ts_literals` slides a switch for a Boolean typed a key at a time. A
+  word replaced by keys that reach Neovim as one batch (`ciwtrue` sent at
+  once) was seen to get no cell age from the core, and its switch is then
+  drawn where it ends up.
+- On Linux Zonvie's scrollbar is part of the frame a shader reads, so
+  `ts_zoom` scales it with the rows it lies over.
 - `ts_zoom` and `ts_literals` have been run on Lua, on a light background
   (`tokyonight-day`), `ts_zoom` also with `linespace` set. They are in the
   compile test below and not in the two visual tests.
