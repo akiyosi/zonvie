@@ -229,4 +229,29 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try expectMask(h, g, 0, 40, cb | err_line);
     try expectMask(h, g, 1, 0, cb);
     try expectMask(h, g, 1, 40, cb);
+
+    // A function holding a multi-line function: with the cursor in the
+    // outer one, the core gets the inner one's id as its first nested
+    // function. The buffer's ids run on from the functions it held before,
+    // so the two are told by their order: the inner one is numbered next.
+    //  0  local function outer()   function n
+    //  1    return function()      function n + 1
+    //  2      return 1
+    //  3    end
+    //  4  end
+    try h.command(
+        \\lua vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'local function outer()', '  return function()', '    return 1', '  end', 'end' })
+    );
+    try h.command("normal! 1G");
+    h.waitUntil({}, struct {
+        fn check(_: void, hh: *Harness) bool {
+            const outer = hh.core.ts_cursor_fn.load(.acquire);
+            return outer != 0 and hh.core.ts_cursor_nested.load(.acquire) == outer + 1;
+        }
+    }.check, h.opts.timeout_ms) catch |e| {
+        std.debug.print("[e2e] cursor fn={d} nested={d}, waited for nested = fn + 1\n", .{
+            h.core.ts_cursor_fn.load(.acquire), h.core.ts_cursor_nested.load(.acquire),
+        });
+        return e;
+    };
 }

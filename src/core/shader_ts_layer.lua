@@ -787,11 +787,10 @@ local function nested_fns(buf, st, func)
   local function scan(nd)
     for c in nd:iter_children() do
       if count >= 4 then return end
-      local sr, _, er2 = c:range()
+      local sr, sc, er2 = c:range()
       if c:named() and er2 > sr then
         if scope_kind(c) == 'Fn' then
-          local m = api.nvim_buf_get_extmarks(buf, ns_anchor, { sr, select(2, c:range()) },
-            { sr, select(2, c:range()) }, { limit = 1 })[1]
+          local m = api.nvim_buf_get_extmarks(buf, ns_anchor, { sr, sc }, { sr, sc }, { limit = 1 })[1]
           local id = m and math.floor(m[1] / 64) % 64 or 0
           if id ~= 0 then
             packed = packed + id * 64 ^ count
