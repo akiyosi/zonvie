@@ -357,6 +357,10 @@ test "gui:visual_shader_covers_all_grids" {
     try gated(can_capture, @import("scenarios/visual/shader_covers_all_grids.zig"));
 }
 
+test "gui:visual_shader_reads_cursor" {
+    try gated(can_capture, @import("scenarios/visual/shader_reads_cursor.zig"));
+}
+
 test "gui:visual_ts_shader_samples" {
     try gated(can_capture, @import("scenarios/visual/ts_shader_samples.zig"));
 }

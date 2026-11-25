@@ -1,0 +1,10 @@
+# Fixture for visual/shader_reads_cursor: an opaque window, so the colour
+# test reads the shader's output alone, and a shader that swaps the red and
+# blue channels of the frame it is handed.
+[window]
+blur = false
+opacity = 1.0
+
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/swap_red_blue.glsl"]

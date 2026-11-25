@@ -4364,13 +4364,14 @@ func beginSurfaceRowPass(
 /// `.notEncoded` means nothing could be encoded. Both callers read that as
 /// "submit what is already encoded, present nothing, and do not consume this
 /// frame's state" — the drawable would otherwise be presented untouched.
-/// The cursor, composited onto the drawable after the copy.
+/// The cursor, composited onto the drawable after the copy, or onto the frame
+/// a custom shader chain reads before it runs (`drawableTexture` either way).
 ///
-/// It goes on the drawable and never into the back buffer, so a GPU scroll copy
-/// cannot drag stale cursor pixels, and so nothing repaints over it — which is
-/// also why the fixed-float mask has to be bound here: without it a cursor
-/// easing with a scroll slides across a hosted fixed float instead of being
-/// discarded under it.
+/// It never goes into the back buffer, so a GPU scroll copy cannot drag stale
+/// cursor pixels, and so nothing repaints over it — which is also why the
+/// fixed-float mask has to be bound here: without it a cursor easing with a
+/// scroll slides across a hosted fixed float instead of being discarded
+/// under it.
 ///
 /// Both surfaces wrote this pass out in full. The two that could not be plain
 /// parameters are closures: `prepare` because only the main surface attaches GPU
@@ -4428,6 +4429,14 @@ func encodeSurfaceCursorOverlay(
     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cursorVertexCount)
     enc.endEncoding()
     return true
+}
+
+/// Whether the native cursor is drawn into the frame the custom shader chain
+/// reads, in place of onto the drawable after it. So whenever a chain runs
+/// and no shader in it draws the cursor itself (`@zonvie-owns-cursor`): the
+/// cursor is part of iChannel0, as on the other frontends.
+func surfaceCursorGoesInShaderInput(runsChain: Bool, chainIsEmpty: Bool, shaderDrawsCursor: Bool) -> Bool {
+    runsChain && !chainIsEmpty && !shaderDrawsCursor
 }
 
 func encodeSurfaceDrawableCopy(

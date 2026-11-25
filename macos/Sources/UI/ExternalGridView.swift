@@ -697,6 +697,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// iBelowFloats for this window, at the back buffer's extent. Nil while
     /// no loaded shader reads it; remade only when the extent changes.
     private var belowFloatsTexture: MTLTexture?
+    /// The frame this window's custom shader chain reads: the back buffer
+    /// with the native cursor drawn in, at the back buffer's extent. Nil
+    /// while no chain reads the cursor from its frame; remade only when the
+    /// extent changes.
+    private var shaderInputTexture: MTLTexture?
     private let scrollScratch = SurfaceScrollScratchTexture()
 
     // Blur transparency support
@@ -2724,7 +2729,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             let presentation = encodeBackBufferToDrawable(
                 &f, cmd: cmd, backTex: backTex, drawable: drawable, view: view,
                 cursorVisible: f.fontIsCurrent && f.cursorBlink && committedCursor.vertexCount > 0,
-                belowFloats: belowFloats
+                belowFloats: belowFloats,
+                committedCursor: committedCursor, pipeline: pipeline, sampler: sampler, atlasTex: atlasTex
             )
 
             guard presentation.encoded else {
@@ -2740,10 +2746,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // A shader that declared @zonvie-owns-cursor draws the cursor
             // itself, on a frame its chain actually ran. Without this check
             // the cmdline surface kept painting its own undeformed cursor on
-            // top.
+            // top. Any other shader found the cursor in the frame it read.
             let shaderDrawsCursor = presentation.tookCustomShaderChain && shared.shaderDrawsCursorNow()
-            if !shaderDrawsCursor, !encodeCursorOverlay(
-                &f, cmd: cmd, drawable: drawable, committedCursor: committedCursor,
+            if !shaderDrawsCursor, !f.cursorInShaderInput, !encodeCursorOverlay(
+                &f, cmd: cmd, target: drawable.texture, committedCursor: committedCursor,
                 pipeline: pipeline, sampler: sampler, atlasTex: atlasTex
             ) {
                 abandonSubmittedFrame("cursor encoder creation failed", cmd: cmd, release: releaseAbandonedFrame,
@@ -3530,10 +3536,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         drawable: CAMetalDrawable,
         view: MTKView,
         cursorVisible: Bool,
-        belowFloats: MTLTexture?
+        belowFloats: MTLTexture?,
+        committedCursor: SurfaceCursorSlot,
+        pipeline: MTLRenderPipelineState,
+        sampler: MTLSamplerState,
+        atlasTex: MTLTexture
     ) -> SurfaceDrawablePresentation {
         // Cleared here, past every bail, as on the main surface.
         shaderCursorMovedThisFrame = false
+        f.cursorInShaderInput = false
         let cursorShaderOffsetPx = f.cursorShaderOffsetPx
         let lastKnownCursorRowSnapshot = f.lastKnownCursorRow
         let runsChain = shared.customShaderPostProcess == .afterBloom
@@ -3566,11 +3577,30 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // surface insets its viewport for its icon/padding (the same mapping
         // the cursor rect uses).
         let gridOriginInViewPx = CGPoint(x: f.vpOriginX, y: f.vpOriginY)
+        // The native cursor is part of the frame a shader reads, as on the
+        // main surface: the chain gets a copy of the back buffer with the
+        // cursor drawn in, on every shaded frame so its input does not
+        // alternate with the blink.
+        let chain = surfaceCustomShaderPipelines()
+        var source = backTex
+        if surfaceCursorGoesInShaderInput(
+            runsChain: runsChain, chainIsEmpty: chain.isEmpty, shaderDrawsCursor: shared.shaderDrawsCursorNow())
+        {
+            guard let input = encodeShaderInputCopy(cmd: cmd, backTex: backTex),
+                  encodeCursorOverlay(
+                      &f, cmd: cmd, target: input, committedCursor: committedCursor,
+                      pipeline: pipeline, sampler: sampler, atlasTex: atlasTex)
+            else { return .notEncoded }
+            source = input
+            f.cursorInShaderInput = true
+        } else {
+            shaderInputTexture = nil
+        }
         return encodeSurfaceBackBufferToDrawable(
             cmd: cmd,
-            backTex: backTex,
+            backTex: source,
             drawableTexture: drawable.texture,
-            customShaderPipelines: surfaceCustomShaderPipelines(),
+            customShaderPipelines: chain,
             runsCustomShaderChain: runsChain,
             customShaderPong: customShaderPong,
             pongSize: view.drawableSize,
@@ -3643,15 +3673,36 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         )
     }
 
-    /// --- Cursor overlay: composited on drawable (not backbuffer) ---
-    /// Keeps persistent backbuffer cursor-free so GPU scroll copies
-    /// don't shift stale cursor pixels (same as GridSurfaceRenderer).
+    /// The back buffer copied whole into `shaderInputTexture`, texel for
+    /// texel. Nil when the copy could not be encoded.
+    private func encodeShaderInputCopy(cmd: MTLCommandBuffer, backTex: MTLTexture) -> MTLTexture? {
+        guard let copyPipe = shared.copyPipeline, let copyVB = shared.copyVertexBuffer,
+              let samp = shared.sampler else { return nil }
+        if shaderInputTexture?.width != backTex.width || shaderInputTexture?.height != backTex.height {
+            shaderInputTexture = shared.device.makeTexture(descriptor: makeSurfaceTextureDescriptor(
+                size: CGSize(width: backTex.width, height: backTex.height),
+                pixelFormat: backTex.pixelFormat,
+                usage: [.renderTarget, .shaderRead]))
+        }
+        guard let input = shaderInputTexture else { return nil }
+        let copied = encodeSurfaceDrawableCopy(
+            cmd: cmd, input: backTex, output: input,
+            pipeline: copyPipe, copyVertexBuffer: copyVB, sampler: samp,
+            uvScale: SIMD2<Float>(1, 1), prepare: { _ in })
+        return copied ? input : nil
+    }
+
+    /// --- Cursor overlay: composited on `target` (not the back buffer) ---
+    /// The drawable, or the frame the custom shader chain reads; both are
+    /// laid out as the back buffer is. Keeps the persistent back buffer
+    /// cursor-free so GPU scroll copies don't shift stale cursor pixels
+    /// (same as GridSurfaceRenderer).
     /// Returns false only when a cursor was owed and its encoder could not
     /// be made.
     private func encodeCursorOverlay(
         _ f: inout ExternalSurfaceFrame,
         cmd: MTLCommandBuffer,
-        drawable: CAMetalDrawable,
+        target: MTLTexture,
         committedCursor: SurfaceCursorSlot,
         pipeline: MTLRenderPipelineState,
         sampler: MTLSamplerState,
@@ -3666,7 +3717,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // one binds an array, and it attaches no perf samples.
         return encodeSurfaceCursorOverlay(
             cmd: cmd,
-            drawableTexture: drawable.texture,
+            drawableTexture: target,
             pipeline: pipeline,
             atlasTexture: atlasTex,
             sampler: sampler,
@@ -4177,6 +4228,9 @@ fileprivate struct ExternalSurfaceFrame {
     var rootFont: GridFontPx?
     var lastKnownCursorRow = 0
     var cursorBlink = false
+    /// The frame handed to the custom shader chain already holds the native
+    /// cursor, so none is owed on the drawable.
+    var cursorInShaderInput = false
     var fontIsCurrent = false
     /// The root's offset, nil when it is not displaced this frame.
     var scrollOffset: GridSurfaceRenderer.ScrollOffset?
