@@ -1044,9 +1044,9 @@ test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
     try std.testing.expect(std.mem.indexOf(u8, pinned, "out.zonvie_fragColor = color;") == null);
 }
 
-test "the Tree-sitter sample shaders in contrib/shaders compile on all targets" {
+test "the sample shaders in contrib/shaders compile on all targets" {
     const io = @import("clock.zig").io();
-    const names = [_][]const u8{ "ts_spotlight", "ts_threads", "ts_gutter_glyphs", "ts_strata", "ts_faultline", "ts_zoom", "ts_literals" };
+    const names = [_][]const u8{ "ts_spotlight", "ts_threads", "ts_gutter_glyphs", "ts_strata", "ts_faultline", "ts_zoom", "ts_literals", "diff_ribbons" };
     for (names) |name| {
         var path_buf: [96]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "contrib/shaders/{s}.glsl", .{name});

@@ -15,6 +15,10 @@ cells are a literal.
 | `ts_zoom.glsl` | The innermost scope holding the cursor (an `if`, a loop, a function) is drawn larger, as one unit of the syntax tree. The rows outside it shrink a little to make the room, so nothing leaves the screen. When the cursor moves to another scope the page goes from one arrangement to the next in a quarter of a second. |
 | `ts_literals.glsl` | Literals drawn as what they stand for: a Boolean is a switch, a fraction (`0.35`) has a dial in place of its leading zero, a colour string (`"#rrggbb"`) is a paint chip with its code printed on it. A literal is plain text again while it is edited in Insert mode. |
 
+One more sample, `diff_ribbons.glsl`, reads no syntax tree: it draws diff
+mode from the `Diff*` highlight groups. It has [its own section](#diff_ribbonsglsl)
+below.
+
 ## Use
 
 ```toml
@@ -263,6 +267,63 @@ of the reading research behind them:
   names declared defines thousands and costs 3 to 4 ms a page.
 - A buffer over 20,000 lines is left alone unless Tree-sitter highlighting
   already keeps its tree.
+
+## diff_ribbons.glsl
+
+For `nvim -d old new`, its two windows side by side. Neovim lines the two
+files up by putting rows of dashes where the other file has more lines. This
+sample does not draw those rows: each window shows only its own lines, and a
+ribbon between the windows joins each change to its other side, fanning out
+from a single line where one side has nothing (Meld calls this a link map).
+A change has a thin line along its top and bottom, through the ribbon and
+both windows. Unchanged lines are drawn fainter.
+
+```toml
+[shaders]
+enabled = true
+paths = ["/absolute/path/to/contrib/shaders/diff_ribbons.glsl"]
+```
+
+It needs no Tree-sitter parser and no layer: it declares `DiffAdd`,
+`DiffChange`, `DiffDelete`, `DiffText`, `DiffTextAdd` and `WinSeparator`.
+The colours are the colorscheme's. A ribbon and a border line are made from
+the background `DiffAdd` or `DiffChange` gives the row, so the look follows
+`:highlight DiffAdd guibg=...`.
+
+Tuning, at the top of the file:
+
+| Constant | Effect |
+|---|---|
+| `STYLE` | 1 ribbons; 0 keeps the rows of the two windows lined up, with the rows of dashes as blank blocks |
+| `FADE` | how far an unchanged line fades into the background, 0 = not at all |
+| `SMALL` | an unchanged line's size, 1 = full size |
+| `ANCHOR` | where a page shorter than its window sits: 0 at the top, 0.5 in the middle |
+| `ACCENT`, `ACCENT_DROP`, `LINE`, `RIBBON` | strength of the border lines and of the ribbons |
+
+Limits:
+
+- Two windows side by side, the right one reaching the last column, on an
+  opaque window background. The last row of the grid is taken to be the
+  command line. At most 62 rows are laid out.
+- Leaving the rows of dashes out makes a page shorter than its window by
+  that many rows; the rest of the window is blank.
+- The ribbons take the divider's column and the right window's sign and
+  fold columns: signs there are hidden.
+- It moves pixels, so the mouse still addresses the page as Neovim laid it
+  out, and the text cursor is drawn where the frame has it.
+- A line scrolling out of a window is no longer in the grid; the sample
+  reads what it is from the frame's colours. A row of dashes with under
+  about 40% of its height left in view can be taken for a change for a
+  frame.
+- Scrolling the window without the cursor with the mouse moves it alone
+  ('scrollbind' follows only the current window). The two pages then no
+  longer correspond and no ribbons are drawn until they do.
+- Run on macOS on light backgrounds (`tokyonight-day`, the light style of
+  `winteriscoming.nvim`) with smooth scrolling from the keyboard and from
+  synthetic trackpad gestures, not from a real trackpad with momentum; one
+  still on a dark background. For Windows and Linux it is only known to
+  compile. GPU time on a 2424 x 1380 window: about 7 ms a frame, 2 ms
+  without a shader (every pixel lays the page out).
 
 ## Checking
 
