@@ -59,9 +59,7 @@ const log_path = "tmp/gui_extwin_hosted_layer_glow.log";
 /// over RPC with a startup retry, so it is not in force when `exec` returns.
 const glow_ready_marker = "glow config: enabled";
 
-/// External window and the float it hosts, in cells.
-const ext_rows: u32 = 20;
-const ext_cols: u32 = 60;
+/// The float the external window hosts, in cells.
 const float_rows: u32 = 12;
 const float_row0: u32 = 3;
 const float_col0: u32 = 2;
@@ -88,12 +86,12 @@ const blank_band_max = 0.01;
 /// along the window's right edge fades out between the two captures, and a
 /// full-width band counted that as light reaching the blank rows. The capture
 /// width includes the scrollbar, so the columns likewise come out narrower.
-fn floatBand(img: capture.Image, row0: u32, count: u32) visual.Region {
+fn floatBand(img: capture.Image, row0: u32, count: u32, grid_rows: i64, grid_cols: i64) visual.Region {
     const h: f64 = @floatFromInt(img.h);
-    const cell_h = h / @as(f64, @floatFromInt(ext_rows));
+    const cell_h = h / @as(f64, @floatFromInt(grid_rows));
     const top = (@as(f64, @floatFromInt(float_row0 + row0))) * cell_h;
     const bottom = top + @as(f64, @floatFromInt(count)) * cell_h;
-    const cols: f64 = @floatFromInt(ext_cols);
+    const cols: f64 = @floatFromInt(grid_cols);
     return .{
         .x0 = @as(f64, @floatFromInt(float_col0)) / cols,
         .x1 = @as(f64, @floatFromInt(float_col0 + float_cols)) / cols,
@@ -184,8 +182,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     driver.capture.writeImage(alloc, "tmp/glow_off" ++ driver.capture.image_ext, glow_off) catch {};
     driver.capture.writeImage(alloc, "tmp/glow_on" ++ driver.capture.image_ext, glow_on) catch {};
 
-    const glyph_band = floatBand(glow_on, 0, glow_rows);
-    const blank_band = floatBand(glow_on, glow_rows + gap_rows, glow_rows);
+    // The grid's own size, not the one asked for: a tiling compositor sizes
+    // the external window as it likes, and the grid follows it.
+    const grid_rows = try g.evalInt("luaeval('vim.api.nvim_win_get_height(_G.z_ext)')");
+    const grid_cols = try g.evalInt("luaeval('vim.api.nvim_win_get_width(_G.z_ext)')");
+    const glyph_band = floatBand(glow_on, 0, glow_rows, grid_rows, grid_cols);
+    const blank_band = floatBand(glow_on, glow_rows + gap_rows, glow_rows, grid_rows, grid_cols);
     const lit = visual.regionDiffRatio(glow_off, glow_on, glyph_band, 12);
     const blank = visual.regionDiffRatio(glow_off, glow_on, blank_band, 12);
 

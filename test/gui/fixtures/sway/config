@@ -8,3 +8,6 @@ default_floating_border none
 gaps inner 0
 gaps outer 0
 focus_follows_mouse no
+# sway's default only marks a window urgent on xdg_activation; the app's
+# activate on a cursor-grid change must move the keyboard, as Hyprland does.
+focus_on_window_activation focus

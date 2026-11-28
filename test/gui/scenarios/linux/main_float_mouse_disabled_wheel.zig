@@ -73,12 +73,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const float_top1 = try g.evalInt("luaeval('vim.fn.getwininfo(_G.z_float)[1].topline')");
     const host_top3 = try g.evalInt("line('w0')");
     std.debug.print("[gui] mouse=false float: float {d} -> {d}, host {d} -> {d}\n", .{ float_top0, float_top1, host_top2, host_top3 });
-    // DIAG(ci-linux-gui-sway): whether the wheel point is over the float.
-    if (g.mainWindowBounds()) |b| std.debug.print("[gui] DIAG window ({d:.0},{d:.0}) {d:.0}x{d:.0}, grid {d}x{d} cells, float rows {d}..{d} cols {d}..{d}\n", .{
-        b.x,                       b.y,                     b.w,       b.h,
-        try g.evalInt("&columns"), try g.evalInt("&lines"), float_row, float_row + float_rows,
-        float_col,                 float_col + float_cols,
-    });
     if (float_top1 != float_top0) return error.MouseDisabledFloatTookScroll;
     if (host_top3 <= host_top2) return error.ScrollSwallowedByFloat;
 }
