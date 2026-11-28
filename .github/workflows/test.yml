@@ -284,6 +284,13 @@ jobs:
           done
           if [ -z "$sock" ] || [ -z "$wl" ]; then cat tmp/sway.log; exit 1; fi
           SWAYSOCK="$sock" swaymsg -t get_outputs
+          # A seat with no keyboard gives no client the focus: hold a virtual
+          # one for the whole job (test/gui/ci/virtual_keyboard.zig).
+          zig build-exe test/gui/ci/virtual_keyboard.zig -lc -lwayland-client -lxkbcommon -femit-bin=tmp/virtual_keyboard
+          WAYLAND_DISPLAY="$wl" nohup tmp/virtual_keyboard > tmp/virtual_keyboard.log 2>&1 &
+          for _ in $(seq 1 50); do grep -q ready tmp/virtual_keyboard.log && break; sleep 0.2; done
+          if ! grep -q ready tmp/virtual_keyboard.log; then cat tmp/virtual_keyboard.log; exit 1; fi
+          SWAYSOCK="$sock" swaymsg -t get_inputs
           {
             echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
             echo "SWAYSOCK=$sock"
