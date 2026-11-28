@@ -255,6 +255,18 @@ pub fn dumpWindowsForPid(pid: i32) void {
     const n = clients(std.heap.page_allocator, pid, &buf);
     std.debug.print("[gui] windows of pid {d}: {d}\n", .{ pid, n });
     for (buf[0..n]) |c| std.debug.print("[gui]   number={x} focus={d} at=({d:.0},{d:.0}) size={d:.0}x{d:.0}\n", .{ c.number, c.focus_rank, c.bounds.x, c.bounds.y, c.bounds.w, c.bounds.h });
+    // The whole tree, for what the list above leaves out (a window sway
+    // keeps but this driver does not count). CI uploads tmp/.
+    if (compositor() == .sway) {
+        const alloc = std.heap.page_allocator;
+        const result = std.process.run(alloc, gui_io.io(), .{ .argv = &.{ "swaymsg", "-r", "-t", "get_tree" } }) catch return;
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "tmp/sway_tree_{d}.json", .{pid}) catch return;
+        std.Io.Dir.cwd().writeFile(gui_io.io(), .{ .sub_path = name, .data = result.stdout }) catch return;
+        std.debug.print("[gui]   sway tree saved to {s}\n", .{name});
+    }
 }
 
 /// The output layout's extent in logical px: what a virtual pointer's

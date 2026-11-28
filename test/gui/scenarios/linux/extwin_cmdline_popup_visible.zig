@@ -136,6 +136,9 @@ fn runWith(alloc: std.mem.Allocator, case: Case) !void {
     const on_main = std.mem.endsWith(u8, last, " surface 1");
     if (on_main != (case != .ext_focused)) {
         std.debug.print("[gui] the cmdline is not on the surface with the keyboard\n", .{});
+        // DIAG(ci-linux-gui-sway): where the windows are and which has the focus.
+        if (g.mainWindowBounds()) |b| std.debug.print("[gui] DIAG main bounds ({d:.0},{d:.0}) {d:.0}x{d:.0}, clicked ({d:.0},{d:.0})\n", .{ b.x, b.y, b.w, b.h, b.x + b.w / 2, b.y + b.h * 0.8 });
+        platform.dumpWindowsForPid(g.app_pid);
         return error.CmdlineOnWrongSurface;
     }
 
