@@ -1,0 +1,10 @@
+# Headless sway for the Linux GUI scenarios on CI (.github/workflows/test.yml).
+# One fixed output, and no decoration of sway's own: window bounds are the
+# surface, as Hyprland reports them locally.
+xwayland disable
+output * resolution 1920x1080 position 0 0 scale 1
+default_border none
+default_floating_border none
+gaps inner 0
+gaps outer 0
+focus_follows_mouse no

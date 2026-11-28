@@ -43,13 +43,13 @@ fn requirePrereqs() !void {
     };
     testing.allocator.free(app);
     if (builtin.os.tag == .linux and !driver.platform.available()) {
-        std.debug.print("[gui] no compositor IPC to observe windows (Hyprland)\n", .{});
+        std.debug.print("[gui] no compositor IPC to observe windows (Hyprland or sway)\n", .{});
         return missingPrereq();
     }
 }
 
 // Scenarios are grouped by platform applicability (Linux observes windows
-// through Hyprland's IPC: linux_window.zig):
+// through Hyprland's or sway's IPC: linux_window.zig):
 //   common/  — run on every host (behavior-level, driven via nvim RPC)
 //   macos/   — macOS-only behavior
 //   windows/ — Windows-only behavior

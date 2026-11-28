@@ -13,7 +13,7 @@
 // are observed read-only via the platform window module:
 //   macOS:   CGWindowList   (test/gui/macos_window.zig)
 //   Windows: EnumWindows    (test/gui/windows_window.zig)
-//   Linux:   Hyprland IPC   (test/gui/linux_window.zig)
+//   Linux:   Hyprland / sway IPC (test/gui/linux_window.zig)
 //
 // Platform notes:
 //   - listen address: absolute unix socket path on macOS (the core's

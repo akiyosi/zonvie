@@ -236,13 +236,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The Linux driver observes windows through Hyprland's IPC and drives the
-  # pointer through wlroots' virtual-pointer protocol (test/gui/linux_window.zig,
-  # linux_pointer.zig). A hosted runner has no such session, so every scenario
-  # skips here: this job builds the app and the scenarios, so a change that
-  # breaks either fails here, and runs the driver's own tests (the capture
-  # codec). The scenarios themselves run locally under Hyprland, with
-  # ZONVIE_GUI_REQUIRE to make a missing prerequisite fail.
+  # The Linux driver observes windows through the compositor's IPC and drives
+  # the pointer through wlroots' virtual-pointer protocol (test/gui/linux_window.zig,
+  # linux_pointer.zig). Locally that is Hyprland; here it is sway with the
+  # headless backend and the pixman renderer, since a hosted runner has no GPU
+  # or display, and the app's EGL renders through Mesa's software path.
+  # ZONVIE_GUI_REQUIRE turns a missing compositor, nvim or app into a failure.
   gui-tests-linux:
     runs-on: ubuntu-24.04
     steps:
@@ -252,7 +251,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwayland-dev libxkbcommon-dev \
             libopengl-dev libegl-dev libglib2.0-dev \
-            libfreetype-dev libharfbuzz-dev libfontconfig-dev
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev \
+            sway grim libegl-mesa0 libgl1-mesa-dri fonts-dejavu-core
+      - name: Install Neovim
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nvim.tar.gz" "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --version
+          echo "$RUNNER_TEMP/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "ZONVIE_TEST_NVIM=$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" >> "$GITHUB_ENV"
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -260,9 +267,42 @@ jobs:
       - name: Build Linux app
         run: zig build linux --summary all
         timeout-minutes: 30
-      - name: GUI Tests (scenarios skip without Hyprland)
-        run: zig build gui-test --summary all
-        timeout-minutes: 20
+      - name: Start headless sway
+        run: |
+          mkdir -p tmp
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+          unset DISPLAY
+          WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
+            nohup sway -c test/gui/fixtures/sway/config > tmp/sway.log 2>&1 &
+          # sway picks its own wayland-N socket: read back what it made.
+          for _ in $(seq 1 50); do
+            sock=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -n1)
+            wl=$(cd "$XDG_RUNTIME_DIR" && ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -n1)
+            [ -n "$sock" ] && [ -n "$wl" ] && break
+            sleep 0.2
+          done
+          if [ -z "$sock" ] || [ -z "$wl" ]; then cat tmp/sway.log; exit 1; fi
+          SWAYSOCK="$sock" swaymsg -t get_outputs
+          {
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+            echo "SWAYSOCK=$sock"
+            echo "WAYLAND_DISPLAY=$wl"
+            echo "LIBGL_ALWAYS_SOFTWARE=1"
+          } >> "$GITHUB_ENV"
+      - name: GUI Tests
+        run: env -u DISPLAY zig build gui-test --summary all
+        env:
+          ZONVIE_GUI_REQUIRE: "1"
+        timeout-minutes: 40
+      - name: Upload GUI test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-test-linux
+          path: tmp/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The same driver on macOS: CGWindowList, CGEvent input, window capture.
   # As on Windows, golden-only visual checks SKIP on CI (no committed
